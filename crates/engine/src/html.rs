@@ -15,7 +15,7 @@
 use crate::{
     Block, BorderStroke, BorderStyle, CellBorders, CellProperties, FontFamily, InlineKind,
     InlineObject, ParaProperties, Paragraph, RowProperties, SpanStyle, StyleRun, Table, TableCell,
-    TableProperties, TableRow,
+    TableProperties, TableRow, TextDirection,
 };
 
 /// `<w:sz>` is in eighths of a point. CSS borders are typed in CSS px;
@@ -523,7 +523,8 @@ fn collapse_ws(s: &str) -> String {
 }
 
 /// Value of attribute `name` in a start-tag body (`span style="..."`),
-/// quoted with `"` or `'`.
+/// quoted with `"` or `'`, or unquoted (`p dir=RTL` — Word's clipboard
+/// HTML), in which case it runs to the next whitespace.
 fn extract_attr(body: &str, name: &str) -> Option<String> {
     let lower = body.to_ascii_lowercase();
     let mut from = 0;
@@ -538,6 +539,10 @@ fn extract_attr(body: &str, name: &str) -> Option<String> {
             if quote == '"' || quote == '\'' {
                 let end = v[1..].find(quote)?;
                 return Some(v[1..1 + end].to_string());
+            }
+            let end = v.find(|c: char| c.is_ascii_whitespace()).unwrap_or(v.len());
+            if end > 0 {
+                return Some(v[..end].to_string());
             }
         }
         from = after;
@@ -609,7 +614,9 @@ fn tag_style(name: &str, body: &str) -> Option<SpanStyle> {
         }
         _ => return None,
     }
-    Some(s)
+    /* Issue #359 — CSS has no per-script slot: pasted formatting applies
+    to Latin and complex-script text alike. */
+    Some(s.with_cs_twins())
 }
 
 const VOID_TAGS: [&str; 6] = ["br", "hr", "img", "meta", "link", "input"];
@@ -619,6 +626,96 @@ fn is_block(name: &str) -> bool {
         name,
         "p" | "div" | "br" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "tr"
     )
+}
+
+/// Issue #339 — elements whose content is never document text: metadata
+/// and raw-text elements. A whole `.html` file carries a `<head>` (title,
+/// `<style>` sheets — Word's clipboard HTML too), so its text must not leak
+/// into paragraphs.
+const SKIPPED_ELEMENTS: [&str; 7] = [
+    "head", "script", "style", "title", "template", "noscript", "xml",
+];
+
+/// Issue #339 — block containers whose `dir` attribute (or CSS
+/// `direction`) sets the base direction of the paragraphs inside them.
+/// Inline elements (`<span dir>`) never decide a paragraph's direction.
+fn is_dir_container(name: &str) -> bool {
+    is_block(name)
+        || matches!(
+            name,
+            "html"
+                | "body"
+                | "section"
+                | "article"
+                | "main"
+                | "header"
+                | "footer"
+                | "aside"
+                | "nav"
+                | "ul"
+                | "ol"
+                | "dl"
+                | "dd"
+                | "dt"
+                | "td"
+                | "th"
+                | "figure"
+                | "figcaption"
+                | "address"
+                | "pre"
+        )
+}
+
+/// The base direction a start tag declares: `dir="rtl|ltr"` (any case),
+/// else a CSS `direction: rtl|ltr` declaration. `Some(None)` is an explicit
+/// `dir="auto"` (first-strong); `None` declares nothing.
+fn declared_direction(body: &str) -> Option<Option<TextDirection>> {
+    let parse = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+        "rtl" => Some(Some(TextDirection::Rtl)),
+        "ltr" => Some(Some(TextDirection::Ltr)),
+        "auto" => Some(None),
+        _ => None,
+    };
+    if let Some(dir) = extract_attr(body, "dir").and_then(|v| parse(&v)) {
+        return Some(dir);
+    }
+    let css = extract_attr(body, "style")?;
+    css.split(';').find_map(|decl| {
+        let (k, v) = decl.split_once(':')?;
+        if k.trim().eq_ignore_ascii_case("direction") {
+            parse(v)
+        } else {
+            None
+        }
+    })
+}
+
+/// One open block container that declared a direction.
+struct DirFrame {
+    tag: String,
+    dir: Option<TextDirection>,
+}
+
+/// Bake the current paragraph, stamping the innermost declared direction
+/// as an explicit, DIRECT paragraph direction (so `ApplyStyle` keeps it —
+/// issue #218 — and the `.docx` writer emits `<w:bidi>`).
+fn finish_paragraph(cur: &mut ParaBuilder, dirs: &[DirFrame]) -> Option<Paragraph> {
+    let mut p = cur.finish()?;
+    if let Some(d) = dirs.last().and_then(|f| f.dir) {
+        p.props.direction = Some(d);
+        p.direct_overrides.direction = Some(d);
+    }
+    Some(p)
+}
+
+/// Byte index just past the first case-insensitive `</name ...>` at or
+/// after `from`, or `None` when the element is never closed.
+fn skip_past_close(html: &str, from: usize, name: &str) -> Option<usize> {
+    let lower = html[from..].to_ascii_lowercase();
+    let needle = format!("</{name}");
+    let at = lower.find(&needle)?;
+    let gt = lower[at..].find('>')?;
+    Some(from + at + gt + 1)
 }
 
 /// Object replacement character used as the anchor byte for an inline
@@ -1074,6 +1171,8 @@ pub fn from_html(html: &str) -> Vec<Paragraph> {
     let mut paras: Vec<Paragraph> = Vec::new();
     let mut cur = ParaBuilder::default();
     let mut stack: Vec<Frame> = Vec::new();
+    /* Issue #339 — open block containers that declared a direction. */
+    let mut dirs: Vec<DirFrame> = Vec::new();
     let bytes = html.as_bytes();
     let mut i = 0;
 
@@ -1086,13 +1185,24 @@ pub fn from_html(html: &str) -> Vec<Paragraph> {
 
     while i < bytes.len() {
         if bytes[i] == b'<' {
+            /* Issue #339 — a comment runs to `-->`, not to the first `>`
+            (Word's conditional comments carry `>` inside). */
+            if html[i..].starts_with("<!--") {
+                match html[i + 4..].find("-->") {
+                    Some(end) => {
+                        i += 4 + end + 3;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
             let Some(close_rel) = html[i..].find('>') else {
                 break;
             };
             let raw = &html[i + 1..i + close_rel];
             i += close_rel + 1;
 
-            /* Skip comments / CDATA / doctype / processing instructions. */
+            /* Skip CDATA / doctype / processing instructions. */
             if raw.starts_with('!') || raw.starts_with('?') {
                 continue;
             }
@@ -1109,7 +1219,7 @@ pub fn from_html(html: &str) -> Vec<Paragraph> {
 
             if is_end {
                 if is_block(&name) {
-                    if let Some(p) = cur.finish() {
+                    if let Some(p) = finish_paragraph(&mut cur, &dirs) {
                         paras.push(p);
                     }
                 }
@@ -1117,9 +1227,26 @@ pub fn from_html(html: &str) -> Vec<Paragraph> {
                 if let Some(pos) = stack.iter().rposition(|f| f.tag == name) {
                     stack.truncate(pos);
                 }
+                if let Some(pos) = dirs.iter().rposition(|f| f.tag == name) {
+                    /* A container closing ends its paragraph even when it
+                    is not a paragraph-breaking block itself (`</body>`). */
+                    if let Some(p) = finish_paragraph(&mut cur, &dirs) {
+                        paras.push(p);
+                    }
+                    dirs.truncate(pos);
+                }
             } else {
+                if SKIPPED_ELEMENTS.contains(&name.as_str()) && !raw.ends_with('/') {
+                    match skip_past_close(html, i, &name) {
+                        Some(next) => {
+                            i = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
                 if is_block(&name) {
-                    if let Some(p) = cur.finish() {
+                    if let Some(p) = finish_paragraph(&mut cur, &dirs) {
                         paras.push(p);
                     }
                 }
@@ -1131,6 +1258,20 @@ pub fn from_html(html: &str) -> Vec<Paragraph> {
                 }
                 if VOID_TAGS.contains(&name.as_str()) {
                     continue;
+                }
+                if is_dir_container(&name)
+                    && !raw.ends_with('/')
+                    && let Some(dir) = declared_direction(tag_body)
+                {
+                    /* The new container's content starts a fresh
+                    paragraph under its own direction. */
+                    if let Some(p) = finish_paragraph(&mut cur, &dirs) {
+                        paras.push(p);
+                    }
+                    dirs.push(DirFrame {
+                        tag: name.clone(),
+                        dir,
+                    });
                 }
                 if let Some(style) = tag_style(&name, tag_body) {
                     stack.push(Frame { tag: name, style });
@@ -1147,10 +1288,76 @@ pub fn from_html(html: &str) -> Vec<Paragraph> {
             i += next_rel;
         }
     }
-    if let Some(p) = cur.finish() {
+    if let Some(p) = finish_paragraph(&mut cur, &dirs) {
         paras.push(p);
     }
     paras
+}
+
+/// Issue #339 — a whole HTML document parsed for `OpenDocument`.
+pub struct HtmlDocument {
+    /// The body's paragraphs and tables ([`from_html_blocks`]), with every
+    /// paragraph that declared no direction of its own given the
+    /// document-level one (below).
+    pub blocks: Vec<Block>,
+    /// The base direction `<body dir>` (else `<html dir>`) declares;
+    /// `None` when neither does (or says `auto`).
+    pub direction: Option<TextDirection>,
+}
+
+/// Issue #339 — parse a complete `.html` file: the `<body>` content when
+/// there is one (`<head>` metadata never becomes text either way), through
+/// the same parser the rich paste uses — paragraphs, tables, inline
+/// styles, `dir` / CSS `direction` on block containers. A document-level
+/// `dir` on `<body>` / `<html>` is inherited by every paragraph (table
+/// cells included) that declares none itself; an explicit `dir="auto"`
+/// paragraph inside an RTL body is indistinguishable from an undeclared
+/// one here and inherits too.
+pub fn from_html_document(html: &str) -> HtmlDocument {
+    let tag_dir = |name: &str| -> Option<TextDirection> {
+        let at = find_open_tag(html, name)?;
+        let end = html[at..].find('>')?;
+        declared_direction(&html[at + 1..at + end]).flatten()
+    };
+    let direction = tag_dir("body").or_else(|| tag_dir("html"));
+    let body = match find_open_tag(html, "body") {
+        Some(at) => {
+            let start = html[at..].find('>').map_or(html.len(), |gt| at + gt + 1);
+            let lower = html[start..].to_ascii_lowercase();
+            let end = lower.rfind("</body").map_or(html.len(), |e| start + e);
+            &html[start..end]
+        }
+        None => html,
+    };
+    let mut blocks = from_html_blocks(body);
+    if let Some(d) = direction {
+        for b in &mut blocks {
+            inherit_direction(b, d);
+        }
+    }
+    HtmlDocument { blocks, direction }
+}
+
+/// Give every paragraph in `block` (recursively through table cells) that
+/// has no direction of its own the inherited `dir`, as a direct override.
+fn inherit_direction(block: &mut Block, dir: TextDirection) {
+    match block {
+        Block::Paragraph(p) => {
+            if p.props.direction.is_none() {
+                p.props.direction = Some(dir);
+                p.direct_overrides.direction = Some(dir);
+            }
+        }
+        Block::Table(t) => {
+            for row in &mut t.rows {
+                for cell in &mut row.cells {
+                    for b in &mut cell.blocks {
+                        inherit_direction(b, dir);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1475,5 +1682,105 @@ mod tests {
             }
             _ => panic!("expected InlineKind::Image, got {kind:?}"),
         }
+    }
+    fn dirs(paras: &[Paragraph]) -> Vec<Option<TextDirection>> {
+        paras.iter().map(|p| p.props.direction).collect()
+    }
+
+    /// Issue #339 — `dir` on a paragraph (quoted or Word's unquoted
+    /// `dir=RTL`) becomes an explicit, direct paragraph direction.
+    #[test]
+    fn from_html_honours_paragraph_dir() {
+        let parsed = from_html(
+            "<p dir=\"rtl\">مرحبا</p><p dir=LTR>hello</p><p>plain</p><p dir='auto'>x</p>",
+        );
+        assert_eq!(
+            dirs(&parsed),
+            vec![
+                Some(TextDirection::Rtl),
+                Some(TextDirection::Ltr),
+                None,
+                None
+            ]
+        );
+        assert_eq!(
+            parsed[0].direct_overrides.direction,
+            Some(TextDirection::Rtl),
+            "a direct override, so ApplyStyle keeps it (#218)"
+        );
+    }
+
+    /// Issue #339 — a container's `dir` (or CSS `direction`) is inherited
+    /// by the paragraphs inside it until a nested one overrides it; an
+    /// inline `<span dir>` never decides the paragraph direction.
+    #[test]
+    fn from_html_inherits_container_dir() {
+        let parsed = from_html(
+            "<div dir=\"rtl\"><p>one</p><p dir=\"ltr\">two</p>three</div>\
+             <p>four <span dir=\"rtl\">x</span> five</p>\
+             <div style=\"color:red; direction: rtl\">six</div>",
+        );
+        let texts: Vec<&str> = parsed.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "three", "four x five", "six"]);
+        assert_eq!(
+            dirs(&parsed),
+            vec![
+                Some(TextDirection::Rtl),
+                Some(TextDirection::Ltr),
+                Some(TextDirection::Rtl),
+                None,
+                Some(TextDirection::Rtl),
+            ]
+        );
+    }
+
+    /// Issue #339 — `<head>`, `<style>`, `<script>`, `<title>` content and
+    /// comments containing `>` never leak into the document text.
+    #[test]
+    fn from_html_skips_metadata_and_raw_text_elements() {
+        let parsed = from_html(
+            "<html><head><title>Ignored title</title><style>p > b { color: red }</style>\
+             </head><body><!--[if gte mso 9]><xml>junk</xml><![endif]-->\
+             <script>var a = 1 > 0;</script><p>kept</p></body></html>",
+        );
+        let texts: Vec<&str> = parsed.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, ["kept"]);
+    }
+
+    /// Issue #339 — a whole document: the body's blocks (tables included),
+    /// with `<body dir>` inherited by every paragraph that declares none
+    /// (table-cell paragraphs too).
+    #[test]
+    fn from_html_document_parses_the_body_with_its_direction() {
+        let doc = from_html_document(
+            "<!DOCTYPE html><html lang=\"ar\"><head><meta charset=\"utf-8\">\
+             <title>Doc</title></head><body dir=\"rtl\"><p>مرحبا</p>\
+             <table><tr><td>a</td><td><p dir=\"ltr\">b</p></td></tr></table>\
+             <p>بعد</p></body></html>",
+        );
+        assert_eq!(doc.direction, Some(TextDirection::Rtl));
+        assert_eq!(doc.blocks.len(), 3, "paragraph, table, paragraph");
+        let Block::Paragraph(first) = &doc.blocks[0] else {
+            panic!("a paragraph first");
+        };
+        assert_eq!(first.text, "مرحبا");
+        assert_eq!(first.props.direction, Some(TextDirection::Rtl));
+        let Block::Table(t) = &doc.blocks[1] else {
+            panic!("a table second");
+        };
+        let cell_dir = |c: usize| match &t.rows[0].cells[c].blocks[0] {
+            Block::Paragraph(p) => p.props.direction,
+            Block::Table(_) => None,
+        };
+        assert_eq!(cell_dir(0), Some(TextDirection::Rtl), "inherited");
+        assert_eq!(cell_dir(1), Some(TextDirection::Ltr), "own dir wins");
+        let Block::Paragraph(last) = &doc.blocks[2] else {
+            panic!("a paragraph last");
+        };
+        assert_eq!(last.props.direction, Some(TextDirection::Rtl));
+
+        let plain = from_html_document("<p>no envelope</p>");
+        assert_eq!(plain.direction, None);
+        assert_eq!(plain.blocks.len(), 1);
     }
 }

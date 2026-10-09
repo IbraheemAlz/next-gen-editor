@@ -81,6 +81,7 @@ pub mod html;
 pub mod numbering;
 pub mod package;
 pub mod snapshot;
+pub mod theme;
 
 pub mod toc;
 pub use fields::{
@@ -88,6 +89,11 @@ pub use fields::{
     TypedField, render_date_time_picture,
 };
 pub use package::{MediaRef, PackageEntry, SourcePackage};
+pub use theme::{
+    ColorScheme, ColorSchemeMapping, DocumentTheme, FontBinding, FontClass, FontScheme,
+    ResolvedFont, RunFontBindings, SchemeColor, ThemeColorRef, ThemeFontLang, ThemeFontRef,
+    ThemeFonts,
+};
 pub use toc::{TocEntry, TocHeading};
 
 /// Top-level document block (Phase 5 PR 1). Tables sit alongside
@@ -249,6 +255,20 @@ pub struct DocumentTree {
     /// expressed in `LogicalPos` so a comment can span across paragraph
     /// (and table-cell) boundaries.
     pub comment_ranges: Vec<CommentRange>,
+    /// Issue #282 — tombstones: the `w:id` of every comment
+    /// [`Self::delete_comment`] removed (whole threads), sorted. A
+    /// document read from `.docx` keeps untouched paragraphs as their
+    /// source bytes, which still carry a deleted comment's anchors (and
+    /// `word/comments.xml` still carries its body); the writer strips
+    /// exactly these ids from every replayed byte and part, so a dangling
+    /// anchor the SOURCE already had (no tombstone) still round-trips
+    /// byte-identical. New ids are minted above every tombstone
+    /// ([`Self::next_comment_id`]) so a stale source anchor can never be
+    /// mistaken for a new comment's. Rides the tree, so undo restores
+    /// the comment and drops its tombstone together. Skipped when empty:
+    /// a pre-#282 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_comments: Vec<u32>,
     /// Phase 2 audit — typed `word/settings.xml` flags. Currently only
     /// `even_and_odd_headers`; grows as more settings get modelled.
     pub settings: DocumentSettings,
@@ -327,6 +347,16 @@ pub struct DocumentTree {
     /// the `Arc`; never mutated after open.
     #[serde(with = "package::arc_option", skip_serializing_if = "Option::is_none")]
     pub source_package: Option<std::sync::Arc<SourcePackage>>,
+    /// Issue #355 — the parsed `word/theme/theme1.xml` (+ the
+    /// `<w:themeFontLang>` / `<w:clrSchemeMapping>` settings that select
+    /// into it). Read-only: the part itself rides [`Self::source_package`]
+    /// verbatim; layout resolves `<w:rFonts>` theme attributes and
+    /// `<w:color w:themeColor>` against this model. `None` for an
+    /// engine-authored document or a package without a theme part.
+    /// Shared by every undo state via the `Arc`; skipped when `None`, so a
+    /// theme-less snapshot encodes byte-identically to a pre-#355 one.
+    #[serde(with = "theme::arc_option", skip_serializing_if = "Option::is_none")]
+    pub theme: Option<std::sync::Arc<DocumentTheme>>,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -1500,6 +1530,41 @@ impl GrabBag {
     }
 }
 
+/// Issue #359 — `true` when `fragment` is an OOXML on/off toggle element
+/// named `qname` that is ON: bare `<w:rtl/>`, or a `w:val` other than
+/// `false` / `0` / `off` (ECMA-376 Part 1 §17.17.4, `ST_OnOff`). A
+/// different element, including one whose name merely starts with
+/// `qname` (`<w:rtlGutter/>`), is `false`.
+pub fn toggle_fragment_on(fragment: &[u8], qname: &[u8]) -> bool {
+    let Some(rest) = fragment
+        .strip_prefix(b"<")
+        .and_then(|f| f.strip_prefix(qname))
+    else {
+        return false;
+    };
+    match rest.first() {
+        Some(b'/' | b'>') => true,
+        Some(c) if c.is_ascii_whitespace() => {
+            let Some(at) = rest.windows(6).position(|w| w == b"w:val=") else {
+                return true;
+            };
+            let value = &rest[at + 6..];
+            let Some((&quote, value)) = value.split_first() else {
+                return true;
+            };
+            let end = value
+                .iter()
+                .position(|&b| b == quote)
+                .unwrap_or(value.len());
+            !matches!(
+                value[..end].to_ascii_lowercase().as_slice(),
+                b"false" | b"0" | b"off"
+            )
+        }
+        _ => false,
+    }
+}
+
 /// Issues #199 / #106 — one raw XML attribute captured from a source
 /// element the model reads only partially (`<w:p w:rsidR="…">`,
 /// `<w:r w:rsidRPr="…">`, `<w:t xml:space="preserve">`). `name` is the
@@ -2096,17 +2161,58 @@ impl DocumentEnvelope {
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
+///
+/// Issues #359 / #104 / #249 — OOXML formats every character with ONE of
+/// two property sets chosen by its script class: the Latin slots
+/// (`font_size` = `<w:sz>`, …) or their complex-script twins
+/// (`font_size_cs` = `<w:szCs>`, …) for Arabic / Hebrew / Thai / …
+/// characters ([`text_pipeline`'s `is_complex_script`]) and for every
+/// character of a run flagged `<w:rtl/>` / `<w:cs/>`
+/// ([`Self::forces_complex_script`]). The twins cascade independently,
+/// exactly like Word: a run with `<w:sz w:val="22"/><w:szCs
+/// w:val="28"/>` lays its Latin text out at 11 pt and its Arabic at 14 pt.
+/// Engine-authored formatting writes both slots
+/// ([`Self::with_cs_twins`]) unless the caller names one.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct SpanStyle {
     pub font_size: Option<f32>,
+    /// Issue #359 — `<w:szCs>`: the complex-script twin of
+    /// [`Self::font_size`], in points. Absent from snapshots while unset,
+    /// so a document without complex-script sizes snapshots byte-for-byte
+    /// as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_size_cs: Option<f32>,
     pub color: Option<[u8; 4]>,
     pub bold: Option<bool>,
+    /// Issue #104 — `<w:bCs>`: the complex-script twin of [`Self::bold`].
+    /// Word bolds Arabic text by `bCs`, so un-bolding through the UI must
+    /// clear it too. Absent from snapshots while unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold_cs: Option<bool>,
     pub italic: Option<bool>,
+    /// Issue #104 — `<w:iCs>`: the complex-script twin of [`Self::italic`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic_cs: Option<bool>,
     pub underline: Option<UnderlineStyle>,
     pub strike: Option<bool>,
     pub bg_color: Option<[u8; 4]>,
     pub font_family: Option<FontFamily>,
+    /// Issue #249 — `<w:rFonts w:cs>`: the complex-script twin of
+    /// [`Self::font_family`] (which holds `w:ascii` / `w:hAnsi`). Arabic
+    /// documents name a Latin face and an Arabic face on the same run;
+    /// folding them into one slot shaped the Arabic with the Latin face.
+    /// The slot's theme binding (`w:cstheme`) rides
+    /// [`Self::font_bindings`]`.cs` (issue #355).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_family_cs: Option<FontFamily>,
+    /// Issue #104 — the run's `<w:rStyle>` character-style id. The reader
+    /// still folds the style's properties into the span (the layout and
+    /// toolbar read one flat style); the id rides along so a regenerated
+    /// run writes `<w:rStyle>` back instead of flattening the character
+    /// style into direct formatting (Word's "clear formatting" keeps it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub char_style: Option<String>,
     /// `<w:caps/>` — display every character of the run as its uppercase
     /// equivalent. Applied as a `to_uppercase` transform at shape time so
     /// glyph metrics + BiDi + line breaking all see the visible string.
@@ -2139,6 +2245,23 @@ pub struct SpanStyle {
     /// `.docx` reader (see [`GrabBag`]). `None` for every engine-authored
     /// style and for runs whose `<w:rPr>` the model fully expresses.
     pub grab_bag: Option<Box<GrabBag>>,
+    /// Issue #355 — this level's `<w:rFonts>` slot bindings (name vs
+    /// theme reference per ascii / hAnsi / eastAsia / cs slot), what
+    /// layout resolves theme fonts from ([`SpanStyle::resolve_font`]) and
+    /// the writer re-emits the theme attributes from. Supersedes the
+    /// single-slot [`Self::font_theme`] wherever it is set (`font_theme`
+    /// is still read so older snapshots keep writing their binding).
+    /// `None` for engine-authored styles; skipped when `None`, so their
+    /// snapshot bytes are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_bindings: Option<Box<RunFontBindings>>,
+    /// Issue #355 — `<w:color w:themeColor w:themeTint w:themeShade>`:
+    /// the theme colour layout paints with ([`SpanStyle::resolve_color`])
+    /// in place of [`Self::color`] (the `w:val` producers cache), and the
+    /// writer re-emits. Travels with `color`: a level that sets a colour
+    /// replaces both. Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_theme: Option<Box<ThemeColorRef>>,
 }
 
 impl SpanStyle {
@@ -2166,27 +2289,140 @@ impl SpanStyle {
         }
     }
 
+    /// Issue #359 — mirror every set Latin slot onto its unset
+    /// complex-script twin: the "both slots" rule of engine-authored
+    /// formatting (Word's ribbon size / bold / italic / font apply to both
+    /// script classes). A twin the caller already set is kept.
+    pub fn with_cs_twins(mut self) -> SpanStyle {
+        if self.font_size_cs.is_none() {
+            self.font_size_cs = self.font_size;
+        }
+        if self.bold_cs.is_none() {
+            self.bold_cs = self.bold;
+        }
+        if self.italic_cs.is_none() {
+            self.italic_cs = self.italic;
+        }
+        if self.font_family_cs.is_none() {
+            self.font_family_cs = self.font_family.clone();
+        }
+        self
+    }
+
+    /// Issue #359 — the `cs_only` form of a formatting patch: every Latin
+    /// slot moves onto its complex-script twin and the Latin slot is left
+    /// unset, so applying the patch touches only complex-script text.
+    pub fn into_cs_only(mut self) -> SpanStyle {
+        if let Some(size) = self.font_size.take() {
+            self.font_size_cs = Some(size);
+        }
+        if let Some(bold) = self.bold.take() {
+            self.bold_cs = Some(bold);
+        }
+        if let Some(italic) = self.italic.take() {
+            self.italic_cs = Some(italic);
+        }
+        if let Some(family) = self.font_family.take() {
+            self.font_family_cs = Some(family);
+        }
+        self
+    }
+
+    /// Issue #359 — `self` as complex-script text sees it: every Latin
+    /// slot replaced by its complex-script twin (unset twin ⇒ unset, the
+    /// caller's default applies — the twins never fall back on each
+    /// other). The toolbar read-back uses it so a caret in Arabic text
+    /// reports the size Word shows there. Issue #355 — the `cs` slot
+    /// binding moves onto the Latin slots too, so resolving the view's
+    /// Latin family ([`SpanStyle::resolve_font`]) answers what Arabic
+    /// text resolves.
+    pub fn complex_script_view(&self) -> SpanStyle {
+        let font_bindings = self.font_bindings.as_deref().and_then(|b| {
+            let view = RunFontBindings {
+                ascii: b.cs.clone(),
+                h_ansi: b.cs.clone(),
+                east_asia: b.east_asia.clone(),
+                cs: b.cs.clone(),
+            };
+            (!view.is_empty()).then(|| Box::new(view))
+        });
+        SpanStyle {
+            font_size: self.font_size_cs,
+            bold: self.bold_cs,
+            italic: self.italic_cs,
+            font_family: self.font_family_cs.clone(),
+            raw_font_family: None,
+            font_theme: None,
+            font_bindings,
+            ..self.clone()
+        }
+    }
+
+    /// Issue #359 — `true` when the run carries `<w:rtl/>` or `<w:cs/>`
+    /// (both ride the grab bag): OOXML then formats EVERY character of the
+    /// run — Latin digits and punctuation included — with the
+    /// complex-script twins (ECMA-376 Part 1 §17.3.2.7 / §17.3.2.30).
+    pub fn forces_complex_script(&self) -> bool {
+        GrabBag::fragments_of(&self.grab_bag)
+            .iter()
+            .any(|f| toggle_fragment_on(f, b"w:rtl") || toggle_fragment_on(f, b"w:cs"))
+    }
+
     /// Overlay `patch`'s set fields onto `self`.
     pub fn merged_with(self, patch: SpanStyle) -> SpanStyle {
+        /* Issue #355 — an engine-authored family (no slot bindings) claims
+        the slots its writer spells; see `theme::merge_font_bindings`.
+        Issue #249 — per script slot: a Latin family (`w:ascii` /
+        `w:hAnsi`) claims those two, a complex-script one (`w:cs`) the
+        `cs` slot, so a Latin-only font pick leaves the Arabic text on
+        its theme face. */
+        let claims = theme::SlotClaims {
+            latin: patch.font_bindings.is_none()
+                && (patch.font_family.is_some() || patch.raw_font_family.is_some()),
+            complex_script: patch.font_bindings.is_none() && patch.font_family_cs.is_some(),
+        };
+        let font_theme = if claims.latin && patch.font_theme.is_none() {
+            None
+        } else {
+            patch.font_theme.or(self.font_theme)
+        };
+        /* Issue #355 — a level that sets a colour (`<w:color>`, the colour
+        picker) replaces the theme binding with its own (or none). */
+        let color_theme = if patch.color.is_some() || patch.color_theme.is_some() {
+            patch.color_theme
+        } else {
+            self.color_theme
+        };
         SpanStyle {
             font_size: patch.font_size.or(self.font_size),
+            font_size_cs: patch.font_size_cs.or(self.font_size_cs),
             color: patch.color.or(self.color),
             bold: patch.bold.or(self.bold),
+            bold_cs: patch.bold_cs.or(self.bold_cs),
             italic: patch.italic.or(self.italic),
+            italic_cs: patch.italic_cs.or(self.italic_cs),
             underline: patch.underline.or(self.underline),
             strike: patch.strike.or(self.strike),
             bg_color: patch.bg_color.or(self.bg_color),
             font_family: patch.font_family.or(self.font_family),
+            font_family_cs: patch.font_family_cs.or(self.font_family_cs),
+            char_style: patch.char_style.or(self.char_style),
             caps: patch.caps.or(self.caps),
             small_caps: patch.small_caps.or(self.small_caps),
             vert_align: patch.vert_align.or(self.vert_align),
             raw_font_family: patch.raw_font_family.or(self.raw_font_family),
-            font_theme: patch.font_theme.or(self.font_theme),
+            font_theme,
             /* Issue #84 — same "set field wins" rule as every slot above:
             a formatting patch (no bag) keeps the run's bag; a direct
             `<w:rPr>` folded onto a cascade baseline (which never carries
             one) contributes its own. */
             grab_bag: patch.grab_bag.or(self.grab_bag),
+            font_bindings: theme::merge_font_bindings(
+                self.font_bindings,
+                patch.font_bindings,
+                claims,
+            ),
+            color_theme,
         }
     }
 }
@@ -5208,6 +5444,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5220,6 +5457,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5261,6 +5499,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5273,6 +5512,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5316,6 +5556,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5328,6 +5569,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5351,6 +5593,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5363,6 +5606,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5386,6 +5630,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5398,6 +5643,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5474,6 +5720,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5486,6 +5733,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -6598,6 +6846,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -6610,6 +6859,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -6659,6 +6909,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -6671,6 +6922,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -6797,6 +7049,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -6809,6 +7062,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         if let Some(e) = edit {
             out.remap_text_edit_record(&target, e);
@@ -6896,6 +7150,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -6908,6 +7163,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -6948,6 +7204,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -6960,6 +7217,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7007,6 +7265,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7019,6 +7278,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7072,6 +7332,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7084,6 +7345,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7142,6 +7404,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7154,6 +7417,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7282,6 +7546,7 @@ impl DocumentTree {
             notes_dirty: split.notes_dirty.clone(),
             comment_defs: split.comment_defs.clone(),
             comment_ranges: split.comment_ranges.clone(),
+            deleted_comments: split.deleted_comments.clone(),
             settings: split.settings.clone(),
             styles: split.styles.clone(),
             style_defaults: split.style_defaults.clone(),
@@ -7294,6 +7559,7 @@ impl DocumentTree {
             part_root_attrs: split.part_root_attrs.clone(),
             document_envelope: split.document_envelope.clone(),
             source_package: split.source_package.clone(),
+            theme: split.theme.clone(),
         }
     }
 
@@ -7390,6 +7656,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7402,6 +7669,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7419,8 +7687,25 @@ impl DocumentTree {
     `revision_refs` and runs through the same resolver as accept-all
     (`revisions::DocumentTree::resolve_revisions`). */
 
+    /// Issue #282 — the `w:id` the next new comment / reply gets: one
+    /// above every id the document knows — `comment_defs`, every range
+    /// (an anchor whose body is missing still owns its id) and every
+    /// [`Self::deleted_comments`] tombstone (a deleted comment's source
+    /// anchors may still sit in replayed bytes until the writer strips
+    /// them; a reused id would let them stand in for the new comment's).
+    pub fn next_comment_id(&self) -> u32 {
+        self.comment_defs
+            .keys()
+            .copied()
+            .chain(self.comment_ranges.iter().map(|r| r.id))
+            .chain(self.deleted_comments.iter().copied())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
     /// Sprint 7 (UI Edition) — append a new comment anchored to a
-    /// logical range. Picks a fresh `id` (max existing + 1) and
+    /// logical range. Picks a fresh `id` ([`Self::next_comment_id`]) and
     /// installs both a `CommentDef` (with `paragraphs = [text]`)
     /// and a matching `CommentRange`. Returns `(new_doc, id)`.
     pub fn insert_comment(
@@ -7432,13 +7717,7 @@ impl DocumentTree {
         date: String,
     ) -> (Self, u32) {
         let (start, end) = order_positions(self.snap_pos(start), self.snap_pos(end));
-        let new_id = self
-            .comment_defs
-            .keys()
-            .max()
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let new_id = self.next_comment_id();
         let mut comment_defs = self.comment_defs.clone();
         comment_defs.insert(
             new_id,
@@ -7473,6 +7752,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7485,13 +7765,14 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         (doc, new_id)
     }
 
     /// Issue #27 — append a threaded reply to an existing comment.
-    /// Mints the next `w:id` (max existing + 1, same discipline as
-    /// [`Self::insert_comment`]) and installs a `CommentDef` with
+    /// Mints the next `w:id` ([`Self::next_comment_id`], same discipline
+    /// as [`Self::insert_comment`]) and installs a `CommentDef` with
     /// `parent_id = Some(parent_id)`. The reply's `CommentRange` is
     /// CLONED from the parent's range (same `start` / `end`) — Word
     /// anchors replies on the parent's span, and the snapshot loop
@@ -7512,13 +7793,7 @@ impl DocumentTree {
         if !self.comment_defs.contains_key(&parent_id) {
             return None;
         }
-        let new_id = self
-            .comment_defs
-            .keys()
-            .max()
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let new_id = self.next_comment_id();
         let mut comment_defs = self.comment_defs.clone();
         comment_defs.insert(
             new_id,
@@ -7554,6 +7829,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7566,6 +7842,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         Some((doc, new_id))
     }
@@ -7577,6 +7854,10 @@ impl DocumentTree {
     /// comment whose `parent_id` chain (walked transitively) reaches
     /// the deleted id is removed too, along with its ranges. Deleting
     /// a reply leaves its parent untouched.
+    ///
+    /// Issue #282 — every removed id is tombstoned in
+    /// [`Self::deleted_comments`] (the writer strips its anchors from
+    /// replayed source bytes and its body from `comments.xml`).
     pub fn delete_comment(&self, id: u32) -> Self {
         /* Transitive closure of the thread rooted at `id`. Fixpoint
         loop — reply chains are short (Word nests one level, but a
@@ -7597,6 +7878,15 @@ impl DocumentTree {
                 break;
             }
         }
+        /* Issue #282 — tombstone every id that existed (a def or a
+        range), so the writer strips its anchors from replayed source
+        bytes and its body from `comments.xml`. */
+        let mut deleted_comments = self.deleted_comments.clone();
+        deleted_comments.extend(doomed.iter().copied().filter(|cid| {
+            self.comment_defs.contains_key(cid) || self.comment_ranges.iter().any(|r| r.id == *cid)
+        }));
+        deleted_comments.sort_unstable();
+        deleted_comments.dedup();
         let mut comment_defs = self.comment_defs.clone();
         comment_defs.retain(|cid, _| !doomed.contains(cid));
         let mut comment_ranges = self.comment_ranges.clone();
@@ -7614,6 +7904,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
+            deleted_comments,
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7626,6 +7917,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7650,6 +7942,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7662,6 +7955,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7739,6 +8033,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7751,6 +8046,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7850,6 +8146,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7862,6 +8159,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7959,6 +8257,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles,
             style_defaults: self.style_defaults.clone(),
@@ -7971,6 +8270,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8044,6 +8344,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8056,6 +8357,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8105,6 +8407,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8117,6 +8420,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8163,6 +8467,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8175,6 +8480,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8289,6 +8595,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8301,6 +8608,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8364,6 +8672,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8376,6 +8685,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8418,6 +8728,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8430,6 +8741,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -8537,6 +8849,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8549,6 +8862,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         if let Some(e) = edit {
             out.remap_text_edit_record(&target, e);
@@ -8598,6 +8912,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8610,6 +8925,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8930,6 +9246,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8942,6 +9259,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8983,6 +9301,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -8995,6 +9314,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             };
             if let Some(e) = edit {
                 out.remap_text_edit_record(&start.path, e);
@@ -9124,6 +9444,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -9136,6 +9457,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         /* Issue #252 — the merge removed blocks `sp+1..=ep` and spliced
         `ep`'s tail onto `sp`: anchors follow their text. */
@@ -9165,6 +9487,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -9177,6 +9500,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -9214,6 +9538,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -9226,6 +9551,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         /* Issue #152 — the right half is a new block: comment anchors
         behind the split point (and in every later block) follow it. */
@@ -9418,6 +9744,7 @@ impl DocumentTree {
                     notes_dirty: self.notes_dirty.clone(),
                     comment_defs: self.comment_defs.clone(),
                     comment_ranges: self.comment_ranges.clone(),
+                    deleted_comments: self.deleted_comments.clone(),
                     settings: self.settings.clone(),
                     styles: self.styles.clone(),
                     style_defaults: self.style_defaults.clone(),
@@ -9430,6 +9757,7 @@ impl DocumentTree {
                     part_root_attrs: self.part_root_attrs.clone(),
                     document_envelope: self.document_envelope.clone(),
                     source_package: self.source_package.clone(),
+                    theme: self.theme.clone(),
                 }
                 .with_list_markers_refreshed(),
                 caret,
@@ -9470,6 +9798,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -9482,6 +9811,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -9709,6 +10039,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -9721,6 +10052,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -9886,6 +10218,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -9898,6 +10231,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         /* Issue #152 — the table (+ its escape paragraph) slid every
         later block down: keep comment anchors on their paragraphs. */
@@ -9929,6 +10263,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -9941,6 +10276,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         /* Issue #152 — later blocks slid up by one. */
         if removed {
@@ -10514,6 +10850,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -10526,6 +10863,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 }
@@ -11662,6 +12000,103 @@ impl UndoStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* ---- issues #359 / #104 / #249: complex-script twins ---------- */
+
+    #[test]
+    fn toggle_fragment_on_reads_st_on_off() {
+        assert!(toggle_fragment_on(b"<w:rtl/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl w:val=\"true\"/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl w:val='1'/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl></w:rtl>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"false\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"0\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"off\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtlGutter/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:lang w:bidi=\"ar-SA\"/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:cs/>", b"w:cs"));
+    }
+
+    #[test]
+    fn rtl_or_cs_in_the_bag_forces_complex_script() {
+        let mut s = SpanStyle::default();
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:lang w:val=\"en-US\"/>".to_vec());
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:rtl w:val=\"0\"/>".to_vec());
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:cs/>".to_vec());
+        assert!(s.forces_complex_script());
+    }
+
+    #[test]
+    fn cs_twins_mirror_move_and_view() {
+        let latin = SpanStyle {
+            font_size: Some(11.0),
+            ..Default::default()
+        };
+        let both = latin.clone().with_cs_twins();
+        assert_eq!(both.font_size_cs, Some(11.0));
+        /* A twin the caller set is kept. */
+        let kept = SpanStyle {
+            font_size_cs: Some(14.0),
+            ..latin.clone()
+        }
+        .with_cs_twins();
+        assert_eq!(kept.font_size_cs, Some(14.0));
+        let cs_only = latin.clone().into_cs_only();
+        assert_eq!(
+            (cs_only.font_size, cs_only.font_size_cs),
+            (None, Some(11.0))
+        );
+        /* The view never falls back across twins. */
+        assert_eq!(latin.complex_script_view().font_size, None);
+        assert_eq!(kept.complex_script_view().font_size, Some(14.0));
+        /* The twins cascade independently. */
+        let base = SpanStyle {
+            font_size: Some(12.0),
+            font_size_cs: Some(16.0),
+            ..Default::default()
+        };
+        let merged = base.merged_with(latin);
+        assert_eq!(
+            (merged.font_size, merged.font_size_cs),
+            (Some(11.0), Some(16.0))
+        );
+        /* Issue #104 — the weight / slant twins follow the same rules. */
+        let bold = SpanStyle {
+            bold: Some(true),
+            italic: Some(false),
+            ..Default::default()
+        };
+        let both = bold.clone().with_cs_twins();
+        assert_eq!((both.bold_cs, both.italic_cs), (Some(true), Some(false)));
+        let cs_only = bold.clone().into_cs_only();
+        assert_eq!((cs_only.bold, cs_only.bold_cs), (None, Some(true)));
+        let view = SpanStyle {
+            bold_cs: Some(false),
+            ..bold
+        }
+        .complex_script_view();
+        assert_eq!((view.bold, view.italic), (Some(false), None));
+        /* Issue #249 — the family slot too. */
+        let fam = SpanStyle {
+            font_family: Some(FontFamily::LiberationSans),
+            font_theme: Some("minorHAnsi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fam.clone().with_cs_twins().font_family_cs,
+            Some(FontFamily::LiberationSans)
+        );
+        let cs_only = fam.clone().into_cs_only();
+        assert_eq!(
+            (cs_only.font_family, cs_only.font_family_cs),
+            (None, Some(FontFamily::LiberationSans))
+        );
+        let view = fam.complex_script_view();
+        assert_eq!((view.font_family, view.font_theme), (None, None));
+    }
 
     /* ---- issue #23: dynamic, string-backed FontFamily ------------- */
 
@@ -15142,6 +15577,7 @@ mod tests {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -15154,6 +15590,7 @@ mod tests {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();
@@ -15281,6 +15718,46 @@ mod tests {
         assert!(!doc.comment_defs.contains_key(&reply));
         assert!(doc.comment_ranges.iter().any(|r| r.id == parent));
         assert!(!doc.comment_ranges.iter().any(|r| r.id == reply));
+    }
+
+    /// Issue #282 — deleting a thread tombstones every id it removed (the
+    /// writer strips their source anchors), a new comment never reuses a
+    /// tombstoned id, and undo — the previous tree — has no tombstone.
+    #[test]
+    fn delete_comment_tombstones_the_thread_and_ids_are_never_reused() {
+        let (doc, parent) = doc_with_comment();
+        let (doc, reply) = doc
+            .reply_to_comment(parent, "reply".into(), "Bob".into(), "d".into())
+            .expect("parent exists");
+        let before = doc.clone();
+        let doc = doc.delete_comment(parent);
+        assert_eq!(doc.deleted_comments, vec![parent, reply]);
+        assert!(before.deleted_comments.is_empty(), "the undo state");
+        /* Deleting an unknown id tombstones nothing. */
+        assert_eq!(
+            doc.delete_comment(999).deleted_comments,
+            vec![parent, reply]
+        );
+        let (doc, fresh) = doc.insert_comment(
+            LogicalPos::new(BlockPath::top(0), 0),
+            LogicalPos::new(BlockPath::top(0), 1),
+            "x".into(),
+            "C".into(),
+            "d".into(),
+        );
+        assert_eq!(fresh, reply + 1, "above every tombstone");
+        let (_, again) = doc
+            .reply_to_comment(fresh, "y".into(), "D".into(), "d".into())
+            .expect("parent exists");
+        assert_eq!(again, fresh + 1);
+        /* A range whose body is missing still owns its id. */
+        let mut orphan = DocumentTree::from_text("ab");
+        orphan.comment_ranges.push(CommentRange {
+            id: 7,
+            start: LogicalPos::new(BlockPath::top(0), 0),
+            end: LogicalPos::new(BlockPath::top(0), 1),
+        });
+        assert_eq!(orphan.next_comment_id(), 8);
     }
 
     /* ================================================================

@@ -32,6 +32,11 @@ pub(crate) fn format_change_revision(
     baseline: &SpanStyle,
 ) -> engine::Revision {
     let (direct, r_style) = recorded_rpr(frag, ns);
+    let mut prev = resolver.resolve_run(baseline.clone(), r_style.as_deref(), direct);
+    /* Issue #104 — like a live run, the recorded formatting keeps its
+    character-style id, so a rejected change writes `<w:rStyle>` back
+    instead of flattening the style into direct formatting. */
+    prev.char_style = r_style;
     engine::Revision {
         start: 0,
         end: 0,
@@ -39,7 +44,7 @@ pub(crate) fn format_change_revision(
         author: attr_val(e, b"w:author").unwrap_or_default(),
         date: attr_val(e, b"w:date").unwrap_or_default(),
         id: attr_val(e, b"w:id").and_then(|v| v.trim().parse().ok()),
-        prev_attrs: Some(resolver.resolve_run(baseline.clone(), r_style.as_deref(), direct)),
+        prev_attrs: Some(prev),
         move_name: None,
     }
 }

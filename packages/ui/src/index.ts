@@ -69,6 +69,9 @@ export type { StatusBarProps } from './StatusBar';
 
 export { SettingsMenu } from './SettingsMenu';
 
+export { ErrorToast, ERROR_TOAST_COPY, toastMessageFor } from './ErrorToast';
+export type { ErrorToastProps } from './ErrorToast';
+
 export { TrapOverlay } from './TrapOverlay';
 export type { TrapOverlayProps } from './TrapOverlay';
 

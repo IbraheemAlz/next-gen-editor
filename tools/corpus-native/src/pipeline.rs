@@ -55,6 +55,21 @@ pub enum Outcome {
     Crash,
 }
 
+/// Issue #418 — what the first (timed-out) attempt looked like, and
+/// whether the lone retry got through.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TimeoutRetry {
+    /// The stage that timed out on the first attempt (`engine_layout`, or
+    /// absent for the driver's whole-document wall-clock kill).
+    pub first_stage: Option<String>,
+    /// Wall / CPU ms at the first abandonment, when the worker reported them.
+    pub first_wall_ms: Option<u128>,
+    pub first_cpu_ms: Option<u128>,
+    /// The retry finished inside the budget: the first timeout was a load
+    /// artefact, not a property of the document.
+    pub recovered: bool,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct EditCheck {
     pub inserted_bytes: usize,
@@ -124,6 +139,144 @@ pub struct EditCheck {
     /// a real diff — see [`classify_rewrite`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite_cause: Option<String>,
+}
+
+/// Issue #282 — a comment added to an untouched paragraph and a comment
+/// deleted from the source, each saved on its own: the anchors of a new
+/// comment must be spliced into the replayed source bytes (a pure
+/// insertion) and survive a re-read on the same text with their body in
+/// `comments.xml`; a deleted comment's anchors must leave every replayed
+/// byte (a pure deletion) and its body the comment parts.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CommentCheck {
+    /// Top-level block index of the paragraph the comment was added to
+    /// (the first untouched one with three characters); `None` when the
+    /// document has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_block: Option<u32>,
+    /// `document.xml` of the save is the original plus insertions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_pure_insertion: Option<bool>,
+    /// [`EditCheck::source_bytes_rewritten`] of that save (the single-
+    /// region metric: two separate insertions count the bytes between).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_source_bytes_rewritten: Option<u64>,
+    /// The re-read range covers the same text and the body round-tripped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_anchored: Option<bool>,
+    /// The source comment deleted (the first ranged one), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_id: Option<u32>,
+    /// `document.xml` of that save is the original minus deletions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_pure_deletion: Option<bool>,
+    /// Anchor pieces of the deleted id left in the saved `document.xml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_anchors_left: Option<u32>,
+    /// The deleted comment re-reads as gone (no def, no range).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_gone: Option<bool>,
+}
+
+/// Issue #282 — `edited` is `orig` plus insertions only (a byte-level
+/// minimal diff with no deletion; prefix and suffix are trimmed first, so
+/// a local edit of a large part stays cheap).
+fn is_pure_insertion(orig: &[u8], edited: &[u8]) -> bool {
+    let Some(budget) = edited.len().checked_sub(orig.len()) else {
+        return false;
+    };
+    format_docx::schema::anchor_patch::diff_by(
+        orig.len(),
+        edited.len(),
+        |i, j| orig[i] == edited[j],
+        budget,
+    )
+    .is_some_and(|ops| {
+        !ops.iter()
+            .any(|o| matches!(o, format_docx::schema::anchor_patch::Op::Delete(_)))
+    })
+}
+
+/// Issue #282 — see [`CommentCheck`]. `None` when the document has
+/// neither an untouched top-level paragraph with three characters to
+/// comment on nor a source comment to delete.
+fn comment_check(archive: &DocxArchive, orig_xml: &[u8]) -> Option<CommentCheck> {
+    let doc = &archive.document;
+    let mut check = CommentCheck::default();
+    let target = doc.blocks.iter().enumerate().find_map(|(i, b)| match b {
+        engine::Block::Paragraph(p)
+            if !p.dirty && p.source_xml.is_some() && p.text.chars().count() >= 3 =>
+        {
+            Some((i as u32, p))
+        }
+        _ => None,
+    });
+    if let Some((block, p)) = target
+        && let Some(lo) = p.text.char_indices().nth(1).map(|(i, _)| i as u32)
+        && let Some(hi) = p.text.char_indices().last().map(|(i, _)| i as u32)
+    {
+        let path = engine::BlockPath::top(block);
+        let (with_comment, id) = doc.insert_comment(
+            engine::LogicalPos::new(path.clone(), lo),
+            engine::LogicalPos::new(path, hi),
+            "corpus-native probe".into(),
+            "corpus-native".into(),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        let expected = with_comment
+            .comment_ranges
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| {
+                with_comment
+                    .paragraph_at_path(&r.start.path)?
+                    .text
+                    .get(r.start.offset as usize..r.end.offset as usize)
+                    .map(str::to_string)
+            });
+        check.insert_block = Some(block);
+        if let Ok(bytes) = format_docx::write_docx(archive, &with_comment)
+            && let Ok(xml) = extract_doc_xml(&bytes)
+        {
+            check.insert_pure_insertion = Some(is_pure_insertion(orig_xml, &xml));
+            check.insert_source_bytes_rewritten = Some(rewritten_region(orig_xml, &xml).1);
+            check.insert_anchored = Some(format_docx::read_docx(&bytes).is_ok_and(|back| {
+                let d = &back.document;
+                d.comment_defs.contains_key(&id)
+                    && d.comment_ranges.iter().any(|r| {
+                        r.id == id
+                            && d.paragraph_at_path(&r.start.path).and_then(|p| {
+                                p.text.get(r.start.offset as usize..r.end.offset as usize)
+                            }) == expected.as_deref()
+                    })
+            }));
+        }
+    }
+    if let Some(victim) = doc
+        .comment_ranges
+        .iter()
+        .map(|r| r.id)
+        .find(|id| doc.comment_defs.contains_key(id))
+    {
+        check.delete_id = Some(victim);
+        let without = doc.delete_comment(victim);
+        if let Ok(bytes) = format_docx::write_docx(archive, &without)
+            && let Ok(xml) = extract_doc_xml(&bytes)
+        {
+            check.delete_pure_deletion = Some(is_pure_insertion(&xml, orig_xml));
+            let text = String::from_utf8_lossy(&xml);
+            let left = ["commentRangeStart", "commentRangeEnd", "commentReference"]
+                .iter()
+                .map(|el| text.matches(&format!("<w:{el} w:id=\"{victim}\"")).count() as u32)
+                .sum();
+            check.delete_anchors_left = Some(left);
+            check.delete_gone = Some(format_docx::read_docx(&bytes).is_ok_and(|back| {
+                !back.document.comment_defs.contains_key(&victim)
+                    && back.document.comment_ranges.iter().all(|r| r.id != victim)
+            }));
+        }
+    }
+    (check.insert_block.is_some() || check.delete_id.is_some()).then_some(check)
 }
 
 /// Issue #250 — `Some(in step)` for the paragraph at `pos`, `None` when it
@@ -361,6 +514,9 @@ pub struct DocResult {
     /// save and — with the scripted edit — the edited one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_save_matches_write_docx: Option<bool>,
+    /// Issue #282 — see [`CommentCheck`] (with the scripted edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_check: Option<CommentCheck>,
     /// Issue #318 — wall-clock ms of the PRODUCTION layout
     /// (`engine-wasm`'s `Engine::build_pages`: the real table grid +
     /// autofit, header/footer bands, notes, wrap convergence), driven
@@ -374,6 +530,29 @@ pub struct DocResult {
     /// Issue #318 — page count of the production layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_page_count: Option<usize>,
+    /// Issue #418 — CPU milliseconds (user + system) the production
+    /// layout consumed. THIS is what `--layout-budget-ms` bounds: wall
+    /// clock stretches under machine load (two different documents
+    /// "timed out" at load 30-60 and lay out in 2-3.5 s alone), CPU time
+    /// does not. Also set on a timeout (the CPU spent when the layout
+    /// was abandoned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_layout_cpu_ms: Option<u128>,
+    /// Issue #418 — wall-clock ms the production layout was observed to
+    /// take: the full duration when it finished (same value as
+    /// [`Self::engine_layout_ms`]), the time at which it was abandoned on
+    /// a timeout. Together with the CPU column it tells a load-inflated
+    /// run (wall >> cpu) from a genuinely slow one (cpu ~ wall).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_layout_wall_ms: Option<u128>,
+    /// Issue #418 — present when the first attempt at this document
+    /// timed out and it was run a second time, alone. If `recovered`,
+    /// the record IS the second (non-timeout) attempt and the first was
+    /// a false timeout (load); otherwise the record is the second
+    /// timeout too, i.e. a CONFIRMED one - the only kind
+    /// `tools/corpus/report.mjs` flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_retry: Option<TimeoutRetry>,
     /// Issue #318 — `layout::geometry_fingerprint` of the production
     /// layout (hex), so two corpus runs on two builds of the engine can
     /// be diffed document by document.
@@ -383,6 +562,113 @@ pub struct DocResult {
     /// reported (`Event::Painted.layout_degraded`), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engine_degradations: Vec<String>,
+    /// Issue #355 — how the document's runs resolve theme fonts. Absent
+    /// when the read failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_fonts: Option<ThemeFontCensus>,
+}
+
+/// Issue #355 — theme-font resolution over every paragraph (body, table
+/// cells, headers / footers): each style span and each unstyled stretch
+/// is one "run", resolved (`SpanStyle::resolve_font` over the run
+/// cascade) for the text it actually holds — the Latin slot when it has
+/// non-Arabic letters (`ascii` / `hAnsi` by `FontClass::latin_for`), the
+/// complex-script slot when it has Arabic.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ThemeFontCensus {
+    /// The package has a theme part.
+    pub has_theme: bool,
+    /// Runs inspected.
+    pub runs: u64,
+    /// Runs whose Latin face comes from the theme.
+    pub latin_from_theme: u64,
+    /// Runs whose complex-script (Arabic) face comes from the theme.
+    pub cs_from_theme: u64,
+    /// Runs with a theme-resolved face for some class and no explicit
+    /// family — before #355 they fell to the font stack's fallback.
+    pub newly_resolved: u64,
+    /// The distinct theme faces those runs resolve to, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub faces: Vec<String>,
+}
+
+impl ThemeFontCensus {
+    fn of(doc: &engine::DocumentTree) -> ThemeFontCensus {
+        fn walk(blocks: &[engine::Block], f: &mut impl FnMut(&engine::Paragraph)) {
+            for b in blocks {
+                match b {
+                    engine::Block::Paragraph(p) => f(p),
+                    engine::Block::Table(t) => {
+                        for row in &t.rows {
+                            for cell in &row.cells {
+                                walk(&cell.blocks, f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let theme = doc.theme.as_deref();
+        let mut c = ThemeFontCensus {
+            has_theme: theme.is_some(),
+            ..Default::default()
+        };
+        let mut faces = std::collections::BTreeSet::new();
+        let mut visit = |p: &engine::Paragraph| {
+            let base = doc.resolve_style_run_cascade(p.style_id.as_deref());
+            /* `(style, text)` per span plus every unstyled gap. */
+            let mut runs: Vec<(engine::SpanStyle, &str)> = Vec::new();
+            let mut cursor = 0usize;
+            for r in &p.spans {
+                let (s, e) = (r.start as usize, r.end as usize);
+                if s > cursor {
+                    runs.push((base.clone(), p.text.get(cursor..s).unwrap_or("")));
+                }
+                runs.push((
+                    base.clone().merged_with(r.style.clone()),
+                    p.text.get(s..e).unwrap_or(""),
+                ));
+                cursor = cursor.max(e);
+            }
+            if cursor < p.text.len() {
+                runs.push((base.clone(), p.text.get(cursor..).unwrap_or("")));
+            }
+            let arabic = |ch: char| matches!(ch, '\u{0600}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}');
+            for (style, text) in runs {
+                c.runs += 1;
+                let latin = text
+                    .chars()
+                    .any(|ch| ch.is_alphanumeric() && !arabic(ch))
+                    .then(|| style.resolve_font(theme, engine::FontClass::latin_for(text), None))
+                    .flatten();
+                let cs = text
+                    .chars()
+                    .any(arabic)
+                    .then(|| {
+                        style.resolve_font(theme, engine::FontClass::ComplexScript, Some("Arab"))
+                    })
+                    .flatten();
+                let mut themed = false;
+                for (r, count) in [(latin, &mut c.latin_from_theme), (cs, &mut c.cs_from_theme)] {
+                    if let Some(r) = r.filter(|r| r.from_theme) {
+                        *count += 1;
+                        themed = true;
+                        faces.insert(r.family.display_name().to_string());
+                    }
+                }
+                if themed && style.font_family.is_none() && style.raw_font_family.is_none() {
+                    c.newly_resolved += 1;
+                }
+            }
+        };
+        let body: Vec<engine::Block> = doc.blocks.iter().cloned().collect();
+        walk(&body, &mut visit);
+        for blocks in doc.headers.values().chain(doc.footers.values()) {
+            walk(blocks, &mut visit);
+        }
+        c.faces = faces.into_iter().collect();
+        c
+    }
 }
 
 /// Issue #318 — the production-layout stage's switches.
@@ -390,8 +676,11 @@ pub struct DocResult {
 pub struct EngineLayoutOpts {
     /// Run the stage at all (`--no-engine-layout` turns it off).
     pub enabled: bool,
-    /// Per-document budget (`--layout-budget-ms`). A layout still running
-    /// past it is reported as [`Outcome::Timeout`] with stage
+    /// Per-document budget (`--layout-budget-ms`), in **CPU** time since
+    /// issue #418 (wall-clock only where the OS gives no process CPU
+    /// clock), with a wall-clock backstop of [`WALL_BUDGET_FACTOR`] x the
+    /// budget so a layout that blocks without burning CPU still ends. A
+    /// layout still running past it is reported as [`Outcome::Timeout`] with stage
     /// `engine_layout` — every other column of the record is kept — and
     /// the worker process exits, abandoning the layout thread. The
     /// driver's `--timeout-secs` stays the hard backstop for the rest of
@@ -428,9 +717,14 @@ impl DocResult {
             edit_check: None,
             ui_save_siblings_identical: None,
             ui_save_matches_write_docx: None,
+            comment_check: None,
             engine_layout_ms: None,
+            engine_layout_cpu_ms: None,
+            engine_layout_wall_ms: None,
+            timeout_retry: None,
             engine_page_count: None,
             engine_fingerprint: None,
+            theme_fonts: None,
             engine_degradations: Vec::new(),
         }
     }
@@ -579,6 +873,7 @@ pub fn run_one(
     /* 1. read_docx. */
     let archive_a: DocxArchive = stage!("read_docx_1", format_docx::read_docx(bytes));
     rec.paragraph_count = Some(archive_a.document.paragraph_count());
+    rec.theme_fonts = Some(ThemeFontCensus::of(&archive_a.document));
 
     /* 2. Full layout (native — `crates/layout`, no browser). */
     let layout_t0 = Instant::now();
@@ -763,6 +1058,9 @@ pub fn run_one(
                 within_secondary_bound,
                 rewrite_cause,
             });
+            /* Issue #282 — comments on untouched paragraphs. */
+            rec.comment_check =
+                stage_infallible!("comment_check", comment_check(&archive_a, &doc_xml_orig));
         }
     }
 
@@ -786,14 +1084,29 @@ const ENGINE_LAYOUT_STACK_BYTES: usize = 256 << 20;
 /// What the production-layout thread reports back.
 type EngineLayoutReport = Result<Result<engine_wasm::LayoutProbe, String>, CaughtPanic>;
 
-/// Issue #318 — run `engine-wasm`'s production layout over `doc` on a
-/// helper thread and wait at most `budget` for it. A layout cannot be
-/// cancelled from outside, so a blown budget marks the record
+/// Issue #418 — the wall-clock backstop is this many times the (CPU)
+/// budget: generous enough that a machine at load 8x its core count still
+/// finishes a layout that needs the whole budget, tight enough that a
+/// layout blocked without burning CPU (a lock, a sleeping dependency)
+/// still ends well before the driver's `--timeout-secs`.
+const WALL_BUDGET_FACTOR: u32 = 8;
+
+/// How often the waiter re-reads the CPU clock while the layout runs.
+const CPU_POLL: Duration = Duration::from_millis(25);
+
+/// Issue #318 / #418 - run `engine-wasm`'s production layout over `doc` on
+/// a helper thread and wait for it, bounded by `budget` of CPU time (and
+/// the wall-clock backstop, see [`WALL_BUDGET_FACTOR`]). A layout cannot
+/// be cancelled from outside, so a blown budget marks the record
 /// [`Outcome::Timeout`] (stage `engine_layout`) and leaves the thread
-/// behind — the worker process exits right after printing the record.
+/// behind - the worker process exits right after printing the record.
 fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Duration) {
     let doc = doc.clone();
     let (tx, rx) = mpsc::channel::<(EngineLayoutReport, Duration)>();
+    /* The worker process runs nothing else concurrently with the layout
+    thread, so the process CPU clock's delta from here is the layout's. */
+    let cpu_base = cputime::process_cpu();
+    let wall_start = Instant::now();
     let spawned = std::thread::Builder::new()
         .name("engine-layout".into())
         .stack_size(ENGINE_LAYOUT_STACK_BYTES)
@@ -814,27 +1127,89 @@ fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Durati
         rec.mark_error("engine_layout", &format!("spawn failed: {e}"));
         return;
     }
+    let cpu_used = || match (cpu_base, cputime::process_cpu()) {
+        (Some(base), Some(now)) => Some(now.saturating_sub(base)),
+        _ => None,
+    };
+    /* Without a CPU clock the budget degrades to the old wall-clock rule. */
+    let wall_cap = if cpu_base.is_some() {
+        budget.saturating_mul(WALL_BUDGET_FACTOR)
+    } else {
+        budget
+    };
     /* A failure an earlier stage recorded outranks anything found here. */
     let first_failure = rec.outcome == Outcome::Ok;
-    match rx.recv_timeout(budget) {
-        Ok((Ok(Ok(probe)), took)) => {
+    let received = loop {
+        match rx.recv_timeout(CPU_POLL) {
+            Ok(msg) => break Some(msg),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let over_cpu = cpu_used().is_some_and(|c| c > budget);
+                if over_cpu || wall_start.elapsed() > wall_cap {
+                    break None;
+                }
+            }
+        }
+    };
+    let cpu_ms = cpu_used().map(|c| c.as_millis());
+    let wall_ms = wall_start.elapsed().as_millis();
+    rec.engine_layout_cpu_ms = cpu_ms;
+    rec.engine_layout_wall_ms = Some(wall_ms);
+    match received {
+        Some((Ok(Ok(probe)), took)) => {
             rec.engine_layout_ms = Some(took.as_millis());
             rec.engine_page_count = Some(probe.page_count);
             rec.engine_fingerprint = Some(format!("{:#018x}", probe.fingerprint));
             rec.engine_degradations = probe.degradations;
         }
-        Ok((Ok(Err(e)), _)) if first_failure => rec.mark_error("engine_layout", &e),
-        Ok((Err(p), _)) if first_failure => rec.mark_panic("engine_layout", &p),
-        Ok(_) => {}
-        Err(_) if first_failure => {
+        Some((Ok(Err(e)), _)) if first_failure => rec.mark_error("engine_layout", &e),
+        Some((Err(p), _)) if first_failure => rec.mark_panic("engine_layout", &p),
+        Some(_) => {}
+        None if first_failure => {
             rec.outcome = Outcome::Timeout;
             rec.stage = Some("engine_layout".into());
             rec.message = Some(format!(
-                "production layout exceeded the {} ms per-document budget",
-                budget.as_millis()
+                "production layout exceeded the {} ms per-document budget \
+                 (cpu {} ms, wall {wall_ms} ms)",
+                budget.as_millis(),
+                cpu_ms.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
             ));
         }
-        Err(_) => {}
+        None => {}
+    }
+}
+
+/// Issue #418 - process CPU time, the load-independent half of the layout
+/// budget.
+mod cputime {
+    use std::time::Duration;
+
+    /// User + system CPU time this process has consumed so far, `None`
+    /// where the platform has no such clock (the budget then falls back to
+    /// wall-clock).
+    #[cfg(unix)]
+    pub fn process_cpu() -> Option<Duration> {
+        let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `getrusage` writes a full `rusage` through the pointer
+        // and reads nothing else; `RUSAGE_SELF` is always valid.
+        let ru = unsafe {
+            if libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) != 0 {
+                return None;
+            }
+            ru.assume_init()
+        };
+        let tv = |t: libc::timeval| {
+            Duration::new(
+                u64::try_from(t.tv_sec).unwrap_or(0),
+                u32::try_from(t.tv_usec).unwrap_or(0).saturating_mul(1000),
+            )
+        };
+        Some(tv(ru.ru_utime) + tv(ru.ru_stime))
+    }
+
+    #[cfg(not(unix))]
+    pub fn process_cpu() -> Option<Duration> {
+        None
     }
 }
 

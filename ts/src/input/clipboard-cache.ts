@@ -9,26 +9,33 @@
  * the trusted event — no await, no focus dependency.
  *
  * Freshness contract (the cache is only ever a prediction of what the
- * engine would answer right now; a miss falls back to the async path):
+ * engine would answer right now; a miss falls back to the async path).
+ * Issue #260 — an entry is keyed on three engine-derived values, with no
+ * hand-kept list of "invalidating" event types:
  *
- * - Every engine event that can reflect a selection move or a document
- *   change (SELECTION_CHANGED, the post-mutation ACCESSIBILITY_TREE_DELTA
- *   broadcast, document loads, …) bumps a generation counter and drops the
- *   entry. Only pure read-backs (paints, hit-tests, clipboard payloads,
- *   stats, errors, announcements, the IME preview) leave it alone.
+ * - `EngineClient.writeEpoch` — moves as every write command is answered
+ *   (write = `CommandMeta.read_only` is false, generated from
+ *   `bridge::meta`) and on trap / respawn, BEFORE the reply reaches
+ *   subscribers;
+ * - the engine document revision — `SELECTION_CHANGED.document_revision`
+ *   and `PAINTED.mutation_seq` (the same #194 counter), which also catches
+ *   worker-internal mutations no client command answered;
+ * - the selection key — range + editing story from SELECTION_CHANGED.
+ *
  * - A prefetch is dispatched only while no write command is in flight
  *   (`EngineClient.writesInFlight === 0`), so the serialized worker queue
  *   reads exactly the state the main thread has already observed; its reply
- *   is kept only when the generation did not move meanwhile.
+ *   is kept only when none of the three moved meanwhile.
  * - A hit additionally requires zero writes in flight at copy time (a
  *   Shift+Arrow still on its way would otherwise copy the pre-move range)
- *   and the entry's selection key to equal the live one.
+ *   and all three to equal the live values.
  *
  * Load: the prefetch fires ~150 ms after the selection SETTLES (trailing
  * debounce — a drag-selection emits no GET_SELECTION_AS_CLIPBOARD until it
  * pauses), only for non-collapsed selections, and asks the engine to skip
- * the `.docx` fragment ZIP (`include_docx: false`). Kill switch:
- * `?clipboardPrefetch=0`. */
+ * the `.docx` fragment ZIP (`include_docx: false`). Kill switch: the build
+ * constant `VITE_NGE_CLIPBOARD_PREFETCH=0`, or `?clipboardPrefetch=0` under
+ * the dev-hooks flag only (issue #389). */
 import { createEffect, createMemo, on, onCleanup } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type { Event, LogicalPos } from '../engine/types';
@@ -36,20 +43,6 @@ import type { EngineStore } from '../state/engine-store';
 
 /** Trailing debounce between the last selection change and the prefetch. */
 export const PREFETCH_DEBOUNCE_MS = 150;
-
-/** Engine events that never reflect a selection or document change. */
-const NON_INVALIDATING: ReadonlySet<Event['type']> = new Set<Event['type']>([
-    'PONG',
-    'LOG',
-    'HIT_RESULT',
-    'IMAGE_RECTS',
-    'CLIPBOARD_PAYLOAD',
-    'PAINTED',
-    'ANNOUNCEMENT',
-    'ERROR',
-    'COMPOSITION_UPDATED',
-    'SNAPSHOT',
-]);
 
 export interface CachedClipboardPayload {
     plain: string;
@@ -101,9 +94,26 @@ export function createClipboardPrefetch(
     store: EngineStore,
     enabled = true,
 ): ClipboardPrefetch {
-    let gen = 0;
+    /* Bumped only by `invalidate()` (the e2e hook) — drops an in-flight
+       prefetch whose epoch / revision / key happen to still match. */
+    let dropGen = 0;
     let liveKey: string | null = null;
-    let entry: (CachedClipboardPayload & { gen: number; key: string }) | null = null;
+    /* Issue #260 — the engine document revision last observed. */
+    let liveRevision = -1;
+    let liveEpoch = client.writeEpoch;
+    type Stamp = { dropGen: number; epoch: number; revision: number; key: string };
+    let entry: (CachedClipboardPayload & Stamp) | null = null;
+    const current = (key: string): Stamp => ({
+        dropGen,
+        epoch: client.writeEpoch,
+        revision: liveRevision,
+        key,
+    });
+    const matches = (s: Stamp): boolean =>
+        s.dropGen === dropGen &&
+        s.epoch === client.writeEpoch &&
+        s.revision === liveRevision &&
+        s.key === liveKey;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const counters = { prefetches: 0, allSkippedDocx: true, hits: 0, misses: 0 };
 
@@ -131,16 +141,15 @@ export function createClipboardPrefetch(
             schedule();
             return;
         }
-        const g = gen;
-        const key = liveKey;
+        const stamp = current(liveKey);
         const cmd = { type: 'GET_SELECTION_AS_CLIPBOARD', include_docx: false } as const;
         counters.prefetches += 1;
         counters.allSkippedDocx &&= cmd.include_docx === false;
         client
             .dispatch(cmd)
             .then((evt) => {
-                if (g !== gen || evt.type !== 'CLIPBOARD_PAYLOAD') return;
-                entry = { gen: g, key, plain: evt.plain, html: evt.html };
+                if (!matches(stamp) || evt.type !== 'CLIPBOARD_PAYLOAD') return;
+                entry = { ...stamp, plain: evt.plain, html: evt.html };
             })
             .catch(() => {
                 /* Non-fatal: a failed prefetch only means the next copy
@@ -155,12 +164,30 @@ export function createClipboardPrefetch(
     }
 
     const unsubscribe = client.subscribe((ev: Event) => {
-        if (NON_INVALIDATING.has(ev.type)) return;
-        gen += 1;
-        entry = null;
-        if (ev.type === 'SELECTION_CHANGED') {
-            liveKey = isCollapsed(ev.range.start, ev.range.end) ? null : selectionKey(ev);
+        let moved = false;
+        if (client.writeEpoch !== liveEpoch) {
+            liveEpoch = client.writeEpoch;
+            moved = true;
         }
+        /* Both revision fields are additive (`#[serde(default)]` → optional
+           on the wire); a producer that omits one leaves it unchanged. */
+        if (ev.type === 'SELECTION_CHANGED') {
+            const key = isCollapsed(ev.range.start, ev.range.end) ? null : selectionKey(ev);
+            const revision = ev.document_revision ?? liveRevision;
+            if (key !== liveKey || revision !== liveRevision) {
+                liveKey = key;
+                liveRevision = revision;
+                moved = true;
+            }
+        } else if (ev.type === 'PAINTED') {
+            const revision = ev.mutation_seq ?? liveRevision;
+            if (revision !== liveRevision) {
+                liveRevision = revision;
+                moved = true;
+            }
+        }
+        if (!moved) return;
+        entry = null;
         schedule();
     });
 
@@ -184,11 +211,7 @@ export function createClipboardPrefetch(
     return {
         take() {
             const hit =
-                enabled &&
-                entry !== null &&
-                entry.gen === gen &&
-                entry.key === liveKey &&
-                client.writesInFlight === 0;
+                enabled && entry !== null && matches(entry) && client.writesInFlight === 0;
             if (hit && entry) {
                 counters.hits += 1;
                 return { plain: entry.plain, html: entry.html };
@@ -198,13 +221,13 @@ export function createClipboardPrefetch(
         },
         invalidate() {
             cancel();
-            gen += 1;
+            dropGen += 1;
             entry = null;
         },
         stats() {
             return {
                 ...counters,
-                warm: entry !== null && entry.gen === gen && entry.key === liveKey,
+                warm: entry !== null && matches(entry),
             };
         },
     };

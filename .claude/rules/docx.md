@@ -129,7 +129,16 @@ The `tools/roundtrip/` harness asserts:
   (`parts::table::parse_cell_paragraph` re-roots the `<w:p>` under the
   part's namespace scope and calls `parse_document_xml`), so cells carry
   the same spans / grab bags / pictures / fields as body paragraphs. Never
-  grow a second, cell-only run parser.
+  grow a second, cell-only run parser. Issue #284 — the same parse reports
+  the paragraph's comment anchor pieces (`parse_document_xml_with_events`),
+  and the table walk roots them at the cell (`CommentSink`: a nested
+  table's pieces under its `Cell` + `Block` steps, a range marker between
+  cell blocks / cells / rows at offset 0 of what follows), so
+  `comment_ranges` carries full cell paths; the body parser pairs every
+  piece in document order (`pair_comment_events`). The walk recurses once
+  per nesting level: keep new per-level work out of line (`#[inline(never)]`
+  helpers) — a debug test thread's 2 MiB stack bounds
+  `MAX_TABLE_NESTING_DEPTH`.
 - Harness: `tools/roundtrip` default mode step 9 edits
   `grab_bag_exotic.docx` and asserts the regenerated `document.xml` is
   byte-identical to the source plus the inserted text.
@@ -229,7 +238,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   (`SourceMarker::comment`, `schema::comment_anchors`): a
   `<w:commentRangeStart/End/>` replays verbatim only where the tree-level
   `comment_ranges` puts that end of that comment (a comment with no tree
-  range — cell anchors, unpaired ends — only while it exists), the
+  range — unpaired ends, story anchors — only while it exists), the
   `<w:commentReference>` run only while the comment exists; a deleted
   comment is never resurrected. Every tree endpoint no verbatim byte
   carries (engine-minted comment, stale markup) is synthesized at its
@@ -240,6 +249,36 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   through `positioned_markers` with every other marker; anchors inside
   always-kept markup (a #244 content span, a #245 sdt end) count as
   already carried, so nothing is duplicated.
+- **Comments on replayed paragraphs (issue #282).** The plan covers clean
+  paragraphs too. A tree endpoint no verbatim byte carries (a comment
+  added to an untouched paragraph / cell, a reply) is SPLICED into the
+  source bytes: the paragraph is regenerated twice
+  (`comment_anchors::AnchorMode::Verbatim` = no anchor work, `Patch` =
+  plus the missing endpoints) and `schema::anchor_patch::transplant`
+  re-applies exactly what `Patch` inserted to the source, aligned over
+  XML tokens (a tag never matches part of another tag); the splice is
+  verified by re-reading it and falls back to the regenerated paragraph
+  (anchors never lost, only respelled). A clean table splices its
+  patched cell paragraphs into its own bytes (`patch_clean_table`): each
+  is located by searching for its bytes — a prediction, verified by
+  re-reading the table (issue #351: an unselected `mc:Choice` the reader
+  skips can spell the same paragraph first); a mismatch regenerates the
+  table after `comment_anchors::rollback` forgets the reference runs the
+  discarded attempt synthesized. Comment markers inside an
+  `mc:AlternateContent` are read from the selected branch only (body and
+  cell paragraphs alike); a deleted comment's markers leave every branch.
+  `delete_comment` tombstones the thread (`DocumentTree::
+  deleted_comments`; new ids are minted above every tombstone) and the
+  writer strips exactly those ids from the whole written body
+  (`comment_anchors::strip_deleted` — replayed paragraphs, block-level
+  fragments, always-kept spans; an empty reference run goes whole), so a
+  dangling anchor the SOURCE had still round-trips. `comments.xml` is
+  patched in place (`parts::comments::patch_comments_xml`: new comments
+  appended with minted paraIds, tombstoned ones removed, their
+  `commentsExtended` / `commentsIds` / `commentsExtensible` rows too), and
+  synthesized for ANY comment on a package without one.
+  `tools/corpus-native` reports the `comment_check` (pure insertion /
+  re-read anchored / pure deletion).
 - `<w:hyperlink>` attributes ride the link itself (`Hyperlink::attrs`,
   issue #242) and re-emit in source order. The source `r:id` is kept only
   while the rels part still maps it to the link's target (*verified* —
@@ -443,6 +482,42 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   fresh row / cell has none and is written plainly; the property bytes
   re-verify at every write. Never add an index-keyed side table.
 - Harness: `tools/roundtrip` step 30 (`table_source_markup.docx`).
+
+## Complex-script run properties (issues #359 / #104 / #249)
+
+- Every Latin run slot has a complex-script twin on `SpanStyle`:
+  `font_size` / `font_size_cs` (`<w:sz>` / `<w:szCs>`), `bold` /
+  `bold_cs` (`<w:b>` / `<w:bCs>`), `italic` / `italic_cs`, `font_family`
+  (`w:ascii`, else `w:hAnsi`) / `font_family_cs` (`w:cs`), `font_theme` /
+  `font_theme_cs` (`w:cstheme`). Read apart, cascaded independently (an
+  unset twin takes the cascade's twin, never the Latin value — Word's
+  rule), written from their own slot. Never fold one into the other.
+- Layout picks the set per piece by script class
+  (`text_pipeline::is_complex_script`; a grab-bag `<w:rtl/>` / `<w:cs/>`
+  forces the twins for the whole run — `SpanStyle::forces_complex_script`).
+- Engine-authored formatting sets both (`SpanStyle::with_cs_twins`:
+  `ApplyFormatting` with no `font_slot`, ModifyStyle, HTML paste);
+  `TextAttrsPatch.font_slot` = `Latin` / `ComplexScript` (the `cs_only`
+  flag) narrows it.
+- `SpanStyle::char_style` keeps the run's `<w:rStyle>` id next to the
+  folded style properties; the writer emits it first. A source
+  `<w:rPrChange>`'s recorded `<w:rStyle>` rides `Revision::prev_attrs`
+  the same way, so rejecting the change writes it back (#295 × #104).
+- The paragraph mark (`Paragraph::mark_style`, #293) goes through the
+  same `apply_rpr`, so its twins (`<w:bCs>`, `<w:szCs>`, `w:cs`) are
+  modeled there too; `<w:rStyle>` stays verbatim on a mark.
+- On/off properties write an explicit OFF (`<w:b w:val="0"/>`).
+- A regenerated `<w:rPr>` adopts its source by MEANING
+  (`schema::source_markup::adopt_source_rpr_children`): a child whose
+  source twin folds to the same model value keeps the source bytes
+  (`<w:b w:val="false" />`, `<w:rFonts w:ascii="X" />` without the
+  regenerated `w:hAnsi`, `<w:highlight>` for a regenerated `<w:shd>`); a
+  changed `<w:rFonts>` / `<w:u>` keeps its unowned attributes
+  (`w:eastAsia`, `w:hint`, `w:color`); a source child the model reads as
+  nothing (`<w:rFonts w:hint="cs"/>`, `<w:color w:val="auto"/>`) is
+  re-emitted. `<w:rStyle>` is never resurrected.
+- Harness: `tools/roundtrip` step 45 (`complex_script_size.docx`, a
+  `<w:bCs/>` + `<w:rStyle>` run, a Word-shaped Arabic run).
 
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.

@@ -11,20 +11,30 @@
  * (via `tsify-next`) into the `engine-wasm` wasm-pack package, so that is the
  * real import site. */
 import type {
+    BlockPath,
     Command,
     DocFormat,
     DocumentDefaults,
     Event,
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import { commandMeta } from '@nge/core/command-meta';
 import {
+    archiveActiveLog,
     clearRendererStreak,
+    discardArchive,
+    inspectActiveLog,
+    loadArchiveInfo,
+    loadCleanMarker,
     loadRendererStreak,
     loadRecoveryLog,
+    restoreArchive,
     saveRendererStreak,
+    type ArchiveInfo,
     type RecoveryLog,
     type RendererStreak,
 } from './event-log';
+import { nextCleanState } from './clean-state';
 
 type WorkerReply = {
     ok: boolean;
@@ -62,6 +72,8 @@ type WorkerReply = {
     tailDropped?: boolean;
     /** Issue #315 — RECOVER reply: see `RecoveryInfo.baseSnapshotAt`. */
     baseTakenAt?: number;
+    /** Issue #390 — RECOVER reply: see `RecoveryInfo.journalGap`. */
+    journalGap?: number;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -80,6 +92,9 @@ export interface CommentSnapshot {
     start_offset: number;
     end_block: number;
     end_offset: number;
+    /** Issue #254 — full anchor paths (cell comments address their cell). */
+    start_path: BlockPath;
+    end_path: BlockPath;
     resolved: boolean;
     /** Issue #27 — parent comment `w:id` when this row is a threaded
      *  reply; `undefined` on top-level comments. */
@@ -177,6 +192,10 @@ export interface RecoveryInfo {
      *  predates the timestamp. Lets the shell say since when edits were
      *  lost (`tailDropped`). */
     baseSnapshotAt: number | undefined;
+    /** Issue #390 — logged commands after the restored base whose row was
+     *  never written (the journal failed): the recovery replayed the
+     *  commands around them and could not replay these. `0` = none. */
+    journalGap: number;
     /** Issue #270 — why the recovery ran: a worker `trap`, or the Dev
      *  HUD's in-place `renderer-retry` (a planned respawn, no crash). */
     cause: RecoveryCause;
@@ -185,7 +204,17 @@ export interface RecoveryInfo {
 /** Issue #270 — see `RecoveryInfo.cause`. Issue #330 — `engine-reload`
  *  is the crash overlay's "Reload engine" (an in-place restart from the
  *  log) and `page-reload` a boot that honoured a carry-over. */
-export type RecoveryCause = 'trap' | 'renderer-retry' | 'engine-reload' | 'page-reload';
+export type RecoveryCause =
+    | 'trap'
+    | 'renderer-retry'
+    | 'engine-reload'
+    | 'page-reload'
+    | 'session-restore';
+
+/** Issue #388 - a previous page generation's session that ended with
+ *  unsaved edits, set aside at boot and waiting for the user to recover
+ *  or discard it. */
+export type PreviousSession = ArchiveInfo;
 
 /** Issue #330 — `sessionStorage` key of the one-shot "carry the document
  *  across this reload" token (see `EngineClient.prepareCarryOver`). */
@@ -231,8 +260,13 @@ function takeCarryOver(documentId: string): boolean {
  *  and cleared by the next successful write. */
 export interface CheckpointStatus {
     failing: boolean;
-    /** Consecutive failed snapshot writes in the current run. */
+    /** Consecutive failed attempts in the current run. */
     failures: number;
+    /** Issue #390 — the command journal specifically is not being written
+     *  (a recovery now would miss the commands in the gap). */
+    journalFailing?: boolean;
+    /** Issue #390 — the most recent failure's message. */
+    lastError?: string;
 }
 
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
@@ -304,22 +338,15 @@ export function crashLoopBootPolicy(
 
 type Resolver = (v: WorkerReply) => void;
 
-/** Issue #57 — commands that can never move the selection or change the
- *  document (pure read-backs + view probes). Everything else counts toward
- *  `EngineClient.writesInFlight`, conservatively: a command missing here
- *  only costs the synchronous clipboard path a cache miss, never a stale
- *  copy. */
-const READ_ONLY_COMMANDS: ReadonlySet<Command['type']> = new Set<Command['type']>([
-    'PING',
-    'HIT_TEST',
-    'HIT_TEST_IN_PAGE',
-    'REQUEST_PAINT',
-    'REQUEST_ACCESSIBILITY_DELTA',
-    'GET_SELECTION_AS_CLIPBOARD',
-    'GET_IMAGE_RECTS',
-    'REQUEST_STATS',
-    'SNAPSHOT',
-]);
+/** Issue #57 — whether a command can move the selection or change the
+ *  document. Pure read-backs + view probes are excluded from
+ *  `EngineClient.writesInFlight`; everything else counts, conservatively (a
+ *  command wrongly counted only costs the synchronous clipboard path a cache
+ *  miss, never a stale copy — and an unknown wire type counts).
+ *  Issue #342 — `CommandMeta.read_only`, generated from the single list in
+ *  `crates/bridge/src/meta.rs`, replaces the hand-kept `READ_ONLY_COMMANDS`
+ *  set (which had drifted from the worker's log filter on GET_IMAGE_RECTS). */
+const isWrite = (cmd: Command): boolean => !commandMeta(cmd.type).read_only;
 
 export class EngineClient {
     private worker!: Worker;
@@ -327,6 +354,12 @@ export class EngineClient {
     private pending = new Map<number, Resolver>();
     private subscribers = new Set<(e: Event) => void>();
     private pendingWrites = 0;
+    /** Issue #260 — request ids of in-flight write commands (`isWrite`). */
+    private writeIds = new Set<number>();
+    /** Issue #260 — bumped as each write's reply arrives (before the reply
+     *  event fans out to subscribers) and whenever in-flight writes are
+     *  abandoned (trap / respawn / retire). See `writeEpoch`. */
+    private writeEpochCounter = 0;
     private documentId: string;
     private onCrash: () => void;
     private recovering = false;
@@ -358,6 +391,16 @@ export class EngineClient {
     private checkpointListeners = new Set<(s: CheckpointStatus) => void>();
     private checkpointFailureListeners = new Set<(failures: number) => void>();
     private checkpointFailureTotal = 0;
+    /** Issue #388 - whether the document in the engine equals what the
+     *  user last saved (or opened / seeded); folded from every dispatched
+     *  command and its reply (`nextCleanState`). */
+    private clean = true;
+    /** Issue #388 - a reload that carries the document was prepared: the
+     *  document is not at risk, so the unload guard stays quiet. */
+    private carryOverPrepared = false;
+    /** Issue #388 - the previous session waiting for a decision. */
+    private previous: PreviousSession | undefined;
+    private previousListeners = new Set<(p: PreviousSession | undefined) => void>();
     /** Issue #330 — set from the moment the shell is asked to remount a
      *  canvas and call `recover()` until that recovery settles. Lets
      *  "Reload engine" join a recovery already under way instead of
@@ -446,6 +489,7 @@ export class EngineClient {
             resolve({ ok: false, error: 'engine worker respawned; request abandoned' });
         }
         this.pending.clear();
+        this.abandonWrites();
         this.generations += 1;
         this.setCheckpoint({ failing: false, failures: 0 });
         this.worker = new Worker(new URL('./engine.worker.ts', import.meta.url), {
@@ -488,12 +532,18 @@ export class EngineClient {
                 log &&
                 (log.commands.length > 0 || log.candidates.some((c) => c.snapshot.length > 0))
             ) {
+                /* Issue #388 - the carried log keeps its own marker. */
+                this.clean = (await loadCleanMarker().catch(() => undefined)) !== false;
                 this.worker.terminate();
                 this.pendingCause = 'page-reload';
                 await this.recover(canvas);
                 return;
             }
         }
+        /* Issue #388 - a plain reload: `INIT` clears the event log, so a
+           previous generation's UNSAVED session is set aside first and
+           offered back instead of being silently lost. */
+        await this.stashPreviousSession();
         const r = await this.send(
             {
                 type: 'INIT',
@@ -510,6 +560,91 @@ export class EngineClient {
         this.bootProbed = r.probed !== false;
         this.noteGenerationStart();
         this.armStableTimer();
+    }
+
+    /** Issue #388 - copy the previous generation's log into the archive
+     *  when it holds unsaved edits (clean marker `false`), then publish
+     *  whatever the archive holds (it may predate this boot: an undecided
+     *  session survives further reloads). A storage failure must not
+     *  block the boot - it degrades to the pre-#388 behaviour. */
+    private async stashPreviousSession(): Promise<void> {
+        try {
+            const status = await inspectActiveLog();
+            if (status.clean === false && status.hasContent) await archiveActiveLog();
+            this.setPrevious(await loadArchiveInfo());
+        } catch (e: unknown) {
+            console.warn('[recovery] previous session could not be set aside', e);
+        }
+    }
+
+    private setPrevious(next: PreviousSession | undefined): void {
+        this.previous = next;
+        for (const fn of this.previousListeners) fn(next);
+    }
+
+    /** Issue #388 - the previous session awaiting Recover / Discard. */
+    get previousSession(): PreviousSession | undefined {
+        return this.previous;
+    }
+
+    /** Issue #388 - observe `previousSession` changes. */
+    onPreviousSession(fn: (p: PreviousSession | undefined) => void): () => void {
+        this.previousListeners.add(fn);
+        return () => {
+            this.previousListeners.delete(fn);
+        };
+    }
+
+    /** Issue #388 - whether closing the page now would lose edits: the
+     *  document differs from the last save and no carry-over is prepared. */
+    get hasUnsavedChanges(): boolean {
+        return !this.clean && !this.carryOverPrepared;
+    }
+
+    /**
+     * Issue #388 - the banner's "Recover": replace the live (fresh)
+     * session with the archived one. The live worker is retired (its
+     * log head flushed), the archive becomes the active event log in one
+     * transaction, and the engine respawns through the normal recovery
+     * path (`cause = 'session-restore'`). Resolves once the recovery
+     * settles. A failed restore leaves the archive in place.
+     */
+    async recoverPreviousSession(): Promise<void> {
+        if (!this.previous) return;
+        if (this.recoveryPending) return this.recoveryPending.promise;
+        if (this.recovering || this.retiring) return;
+        this.retiring = true;
+        const generation = this.generations;
+        let retired: WorkerReply;
+        try {
+            retired = await this.retireWorker();
+        } finally {
+            this.retiring = false;
+        }
+        if (this.generations !== generation || retired.trap || this.recovering) return;
+        const restored = await restoreArchive().catch((e: unknown) => {
+            console.error('[recovery] the previous session could not be restored', e);
+            return false;
+        });
+        if (!restored) {
+            /* Nothing was swapped: bring the live session back as it was. */
+            this.markRecoveryPending();
+            const back = this.recoveryPending!.promise;
+            this.respawnAfterRetire('engine-reload');
+            return back;
+        }
+        this.setPrevious(undefined);
+        this.clean = false;
+        this.markRecoveryPending();
+        const done = this.recoveryPending!.promise;
+        this.respawnAfterRetire('session-restore');
+        return done;
+    }
+
+    /** Issue #388 - the banner's "Discard": drop the archived session. */
+    async discardPreviousSession(): Promise<void> {
+        await discardArchive();
+        this.setPrevious(undefined);
     }
 
     /** Issue #240 — whether the current worker generation probed the GPU
@@ -640,6 +775,7 @@ export class EngineClient {
             resolve({ ok: false, error: 'engine worker restarted in place' });
         }
         this.pending.clear();
+        this.abandonWrites();
         this.pendingCause = cause;
         this.onCrash();
     }
@@ -662,6 +798,7 @@ export class EngineClient {
             }
         }
         writeCarryOver(this.documentId);
+        this.carryOverPrepared = true;
     }
 
     /** Issue #333 — current checkpoint health (`failing` once the retries
@@ -694,23 +831,34 @@ export class EngineClient {
     }
 
     private setCheckpoint(next: CheckpointStatus): void {
-        if (next.failing === this.checkpoint.failing && next.failures === this.checkpoint.failures) {
+        const prev = this.checkpoint;
+        if (
+            next.failing === prev.failing &&
+            next.failures === prev.failures &&
+            next.journalFailing === prev.journalFailing &&
+            next.lastError === prev.lastError
+        ) {
             return;
         }
         this.checkpoint = next;
         for (const fn of this.checkpointListeners) fn(next);
     }
 
-    private onCheckpointNotice(msg: { state?: string; failures?: number }): void {
-        const failures = typeof msg.failures === 'number' ? msg.failures : 0;
-        if (msg.state === 'failed') {
+    /** Issue #390 - every event with `failures > 0` reports exactly one
+     *  failed attempt (the worker sends the exhausting failure as a single
+     *  `ok: false` event); a `failures: 0` event ends the run. */
+    private onCheckpointState(evt: Extract<Event, { type: 'CHECKPOINT_STATE' }>): void {
+        if (evt.failures > 0) {
             this.checkpointFailureTotal += 1;
-            for (const fn of this.checkpointFailureListeners) fn(failures);
-        } else if (msg.state === 'exhausted') {
-            this.setCheckpoint({ failing: true, failures });
-        } else if (msg.state === 'ok') {
-            this.setCheckpoint({ failing: false, failures: 0 });
+            for (const fn of this.checkpointFailureListeners) fn(evt.failures);
         }
+        const next: CheckpointStatus = {
+            failing: !evt.ok,
+            failures: evt.failures,
+            journalFailing: evt.journal_failing === true,
+        };
+        if (evt.last_error !== undefined) next.lastError = evt.last_error;
+        this.setCheckpoint(next);
     }
 
     /** Worker generations spawned so far (1 = boot; +1 per recovery). */
@@ -810,6 +958,7 @@ export class EngineClient {
                 commands: [],
                 lastSeq: 0,
                 logComplete: false,
+                journalGapSeqs: [],
             };
         });
         /* Issue #99 — N traps in a row on Vello: stop re-probing the GPU
@@ -844,6 +993,7 @@ export class EngineClient {
                 commands: recoveryLog.commands,
                 lastSeq: recoveryLog.lastSeq,
                 logComplete: recoveryLog.logComplete,
+                journalGapSeqs: recoveryLog.journalGapSeqs,
                 ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
                 ...(this.downgrade
                     ? { forceRenderer: 'canvas2d', rendererDowngrade: this.downgrade }
@@ -861,6 +1011,8 @@ export class EngineClient {
                     ),
                 ),
             ],
+            /* Issue #260 — RECOVER rebuilds the whole engine: a write. */
+            true,
         );
         if (!r.ok) throw new Error(r.error);
         this.activeRenderer = r.renderer ?? 'canvas2d';
@@ -885,6 +1037,7 @@ export class EngineClient {
             tailDropped: r.tailDropped === true,
             rendererDowngraded: downgradedNow && recovered?.renderer_downgrade !== undefined,
             baseSnapshotAt: r.restored === true ? r.baseTakenAt : undefined,
+            journalGap: r.journalGap ?? 0,
             cause,
         };
         this.noteGenerationStart();
@@ -952,15 +1105,16 @@ export class EngineClient {
     }
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {
-        const write = !READ_ONLY_COMMANDS.has(cmd.type);
+        const write = isWrite(cmd);
         if (write) this.pendingWrites += 1;
         let r: WorkerReply;
         try {
-            r = await this.send({ cmd }, transfer);
+            r = await this.send({ cmd }, transfer, write);
         } finally {
             if (write) this.pendingWrites -= 1;
         }
         if (!r.ok) throw new Error(r.error);
+        this.clean = nextCleanState(this.clean, cmd, r.evt!);
         return r.evt!;
     }
 
@@ -970,6 +1124,21 @@ export class EngineClient {
      *  the synchronous clipboard cache must not be trusted. */
     get writesInFlight(): number {
         return this.pendingWrites;
+    }
+
+    /** Issue #260 — a counter that moves whenever a write command (any
+     *  command whose `CommandMeta.read_only` is false — generated from
+     *  `bridge::meta`, no hand list) has been answered, and whenever
+     *  in-flight writes are abandoned. It moves BEFORE the reply event
+     *  reaches subscribers, so a cache keyed on it can never serve a value
+     *  captured before a write the main thread has already observed. */
+    get writeEpoch(): number {
+        return this.writeEpochCounter;
+    }
+
+    private abandonWrites(): void {
+        this.writeIds.clear();
+        this.writeEpochCounter += 1;
     }
 
     /**
@@ -1057,7 +1226,7 @@ export class EngineClient {
         this.onTrap('forced trap (test hook)');
     }
 
-    private send(payload: any, transfer: Transferable[] = []) {
+    private send(payload: any, transfer: Transferable[] = [], write = false) {
         if (this.recovering) {
             /* The worker is dead and the respawn has not completed yet — a
                postMessage would hang forever. Settle immediately instead. */
@@ -1071,17 +1240,21 @@ export class EngineClient {
             (resolve) => {
                 const id = this.nextId++;
                 this.pending.set(id, resolve);
+                if (write) this.writeIds.add(id);
                 this.worker.postMessage({ id, ...payload }, transfer);
             },
         );
     }
 
     private handle(msg: any): void {
-        /* Issue #333 — an unsolicited worker notice (no id, no reply). */
-        if (msg.notice === 'CHECKPOINT') {
-            this.onCheckpointNotice(msg);
-            return;
+        /* Issue #390 — the worker's unsolicited `Event::CheckpointState`
+           (id-less, like the a11y delta): fold it into the client's own
+           health view, then fan it out to subscribers like any event. */
+        if (msg.evt?.type === 'CHECKPOINT_STATE' && msg.id === undefined) {
+            this.onCheckpointState(msg.evt);
         }
+        /* Issue #260 — the epoch moves before subscribers see the reply. */
+        if (this.writeIds.delete(msg.id)) this.writeEpochCounter += 1;
         const cb = this.pending.get(msg.id);
         if (cb) {
             this.pending.delete(msg.id);
@@ -1129,6 +1302,7 @@ export class EngineClient {
             resolve({ ok: false, error: 'engine worker trapped; recovering', trap: true });
         }
         this.pending.clear();
+        this.abandonWrites();
         /* The worker dies before it can emit `Event::Trap` itself, so
            synthesize the bridge-shaped event (crates/bridge/src/event.rs) —
            subscribers (TrapOverlay, telemetry ENGINE_TRAP) see the crash. */

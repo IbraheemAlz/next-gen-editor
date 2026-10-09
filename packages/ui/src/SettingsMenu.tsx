@@ -3,10 +3,11 @@
  *
  * Active renderer (Canvas2D / Vello) is read-only at runtime: the
  * choice is baked at `Engine::new` vs `Engine::with_vello` boot.
- * Switching requires a fresh worker spawn — surfaced here as a
- * "Switch to Vello" / "Switch to Canvas2D" button that reloads the
- * page with `?renderer=vello` or `?renderer=canvas2d`. The TS shell
- * worker boot reads the URL parameter and routes accordingly.
+ * Issue #389 - the "Switch to Vello" / "Switch to Canvas2D" buttons
+ * reload the page with `?renderer=...`; that URL-driven toggle is a debug
+ * surface, rendered only when the host opted in
+ * (`<EngineProvider debugSurfaces>`, which the reference shell ties to
+ * its dev-hooks flag). A production page shows the active renderer only.
  *
  * Toggle Dev HUD action mirrors the `Ctrl+Shift+D` shortcut so the
  * keyboard-averse can still find it. The HUD itself owns its
@@ -14,12 +15,13 @@
  * `window` that the HUD subscribes to.
  */
 import { createSignal, onCleanup, Show, type Component } from 'solid-js';
-import { useEngine, useTelemetryConfig } from '@nge/core';
+import { useDebugSurfaces, useEngine, useTelemetryConfig } from '@nge/core';
 import './SettingsMenu.css';
 
 export const SettingsMenu: Component = () => {
     const engine = useEngine();
     const telemetry = useTelemetryConfig();
+    const debugSurfaces = useDebugSurfaces();
     const [open, setOpen] = createSignal(false);
 
     const switchRenderer = (target: 'vello' | 'canvas2d') => {
@@ -65,28 +67,30 @@ export const SettingsMenu: Component = () => {
                                 Active: <strong>{isVello() ? 'Vello (WebGPU)' : 'Canvas2D'}</strong>
                             </span>
                         </div>
-                        <div class="nge-settings__row">
-                            <button
-                                class="nge-btn nge-settings__action"
-                                type="button"
-                                disabled={isVello()}
-                                onClick={() => switchRenderer('vello')}
-                            >
-                                Switch to Vello…
-                            </button>
-                            <button
-                                class="nge-btn nge-settings__action"
-                                type="button"
-                                disabled={!isVello()}
-                                onClick={() => switchRenderer('canvas2d')}
-                            >
-                                Switch to Canvas2D…
-                            </button>
-                        </div>
-                        <div class="nge-settings__hint">
-                            Switching reloads the page so the worker
-                            can pick a fresh backend at boot.
-                        </div>
+                        <Show when={debugSurfaces}>
+                            <div class="nge-settings__row">
+                                <button
+                                    class="nge-btn nge-settings__action"
+                                    type="button"
+                                    disabled={isVello()}
+                                    onClick={() => switchRenderer('vello')}
+                                >
+                                    Switch to Vello…
+                                </button>
+                                <button
+                                    class="nge-btn nge-settings__action"
+                                    type="button"
+                                    disabled={!isVello()}
+                                    onClick={() => switchRenderer('canvas2d')}
+                                >
+                                    Switch to Canvas2D…
+                                </button>
+                            </div>
+                            <div class="nge-settings__hint">
+                                Switching reloads the page so the worker
+                                can pick a fresh backend at boot.
+                            </div>
+                        </Show>
                     </div>
 
                     <div class="nge-settings__separator" />

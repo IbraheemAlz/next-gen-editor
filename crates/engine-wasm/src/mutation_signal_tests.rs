@@ -85,6 +85,7 @@ fn no_attrs() -> TextAttrsPatch {
         language: None,
         caps: None,
         small_caps: None,
+        font_slot: None,
     }
 }
 
@@ -712,5 +713,51 @@ fn a_missed_class_now_yields_a_fine_grained_a11y_update() {
     assert!(
         matches!(patches.as_slice(), [A11yPatch::Update { index: 0, .. }]),
         "{patches:?}"
+    );
+}
+
+/// Issue #260 — `SelectionChanged.document_revision` is the revision the
+/// command LEFT the document at: an edit's own reply already carries the
+/// bumped value (the handler builds the event before `apply` bumps, so
+/// `apply` re-stamps it), and a pure selection move keeps it unchanged —
+/// which is what lets the shell's clipboard cache key on it.
+#[test]
+fn selection_changed_carries_the_post_command_document_revision() {
+    let mut e = engine_with(text_doc());
+    let before = e.mutation_seq;
+    let Event::SelectionChanged {
+        document_revision, ..
+    } = apply(
+        &mut e,
+        Command::InsertText {
+            at: None,
+            text: "x".into(),
+        },
+    )
+    else {
+        panic!("an interactive insert answers SelectionChanged");
+    };
+    assert!(e.mutation_seq > before, "the insert mutated");
+    assert_eq!(
+        document_revision, e.mutation_seq,
+        "reply carries the post-edit revision"
+    );
+
+    let edited = e.mutation_seq;
+    let Event::SelectionChanged {
+        document_revision, ..
+    } = apply(
+        &mut e,
+        Command::SetSelection {
+            range: range(1, 0, 3),
+            caret: bpos_top(1, 3),
+        },
+    )
+    else {
+        panic!("SetSelection answers SelectionChanged");
+    };
+    assert_eq!(
+        document_revision, edited,
+        "a selection move keeps the revision"
     );
 }

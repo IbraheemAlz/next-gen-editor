@@ -24,9 +24,9 @@ use engine::{
     Paragraph, SpanStyle, Table, TextDirection,
 };
 use layout::{
-    LayoutBlock, Margins, PageBox, PaginatePageGeometry as LayoutPageGeometry, Paginator,
-    ParagraphBox, ParagraphConfig, Point, Size, StyleSpan, TableBox, TableCellBox, TableRowBox,
-    layout_paragraph,
+    ComplexScriptAttrs, LayoutBlock, Margins, PageBox, PaginatePageGeometry as LayoutPageGeometry,
+    Paginator, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan, TableBox, TableCellBox,
+    TableRowBox, layout_paragraph,
 };
 use text_pipeline::{
     Alignment as TpAlignment, FontStack, ShapingDirection, first_strong_direction,
@@ -172,7 +172,7 @@ fn resolve_line_height(line_height: Option<engine::LineHeight>) -> (f32, bool) {
 }
 
 fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
-    StyleSpan {
+    let span = StyleSpan {
         start,
         end,
         px_size: style.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT),
@@ -185,7 +185,20 @@ fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
         font_family: style.font_family.as_ref().map(|f| f.id().to_string()),
         caps_transform: style.caps.unwrap_or(false),
         baseline_shift_px: 0.0,
-    }
+        cs: None,
+    };
+    /* Issues #359 / #104 / #249 — complex-script text lays out with the
+    run's complex-script twins, exactly as engine-wasm's
+    `build_style_spans` resolves them. */
+    let cs = ComplexScriptAttrs {
+        px_size: style.font_size_cs.unwrap_or(DEFAULT_FONT_SIZE_PT),
+        baseline_shift_px: 0.0,
+        bold: style.bold_cs.unwrap_or(false),
+        italic: style.italic_cs.unwrap_or(false),
+        font_family: style.font_family_cs.as_ref().map(|f| f.id().to_string()),
+        whole_span: style.forces_complex_script(),
+    };
+    span.with_cs(cs)
 }
 
 /// Fold `style_run_defaults → pStyle-chain <w:rPr> → direct span formatting`

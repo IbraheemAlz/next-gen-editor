@@ -19,8 +19,8 @@
 
 use crate::error::{DocxError, DocxWarning};
 use crate::opc::archive::{
-    COMMENTS_EXTENDED_XML, COMMENTS_XML, CORE_PROPS_XML, DOC_XML, ENDNOTES_XML, FOOTNOTES_XML,
-    NUMBERING_XML, SETTINGS_XML, STYLES_XML,
+    COMMENTS_EXTENDED_XML, COMMENTS_EXTENSIBLE_XML, COMMENTS_IDS_XML, COMMENTS_XML, CORE_PROPS_XML,
+    DOC_XML, ENDNOTES_XML, FOOTNOTES_XML, NUMBERING_XML, SETTINGS_XML, STYLES_XML, THEME_XML,
 };
 use crate::opc::relationships::{TargetMode, parse_relationships};
 
@@ -29,6 +29,12 @@ const REL_CORE_PROPS: &str =
     "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
 const REL_COMMENTS_EXTENDED: &str =
     "http://schemas.microsoft.com/office/2011/relationships/commentsExtended";
+/// Issue #282 — Word 2016+ comment side parts (rows keyed by paraId /
+/// durable id; a deleted comment's rows are removed from them).
+const REL_COMMENTS_IDS: &str =
+    "http://schemas.microsoft.com/office/2016/09/relationships/commentsIds";
+const REL_COMMENTS_EXTENSIBLE: &str =
+    "http://schemas.microsoft.com/office/2018/08/relationships/commentsExtensible";
 
 /// The archive entry names of the main part and the siblings the reader
 /// and writer treat specially. Every field is an archive entry name (no
@@ -44,7 +50,13 @@ pub struct PartNames {
     pub endnotes: String,
     pub comments: String,
     pub comments_extended: String,
+    /// Issue #282 — `word/commentsIds.xml` / `word/commentsExtensible.xml`.
+    pub comments_ids: String,
+    pub comments_extensible: String,
     pub core_props: String,
+    /// Issue #355 — the theme part (`…/relationships/theme`), read for its
+    /// font and colour schemes.
+    pub theme: String,
 }
 
 impl Default for PartNames {
@@ -89,7 +101,10 @@ impl PartNames {
             endnotes: next_to_main("endnotes.xml", ENDNOTES_XML),
             comments: next_to_main("comments.xml", COMMENTS_XML),
             comments_extended: next_to_main("commentsExtended.xml", COMMENTS_EXTENDED_XML),
+            comments_ids: next_to_main("commentsIds.xml", COMMENTS_IDS_XML),
+            comments_extensible: next_to_main("commentsExtensible.xml", COMMENTS_EXTENSIBLE_XML),
             core_props: CORE_PROPS_XML.to_string(),
+            theme: next_to_main("theme/theme1.xml", THEME_XML),
         }
     }
 
@@ -168,23 +183,43 @@ impl PartNames {
             pick(&format!("{REL_BASE}endnotes"), &mut names.endnotes);
             pick(&format!("{REL_BASE}comments"), &mut names.comments);
             pick(REL_COMMENTS_EXTENDED, &mut names.comments_extended);
+            pick(REL_COMMENTS_IDS, &mut names.comments_ids);
+            pick(REL_COMMENTS_EXTENSIBLE, &mut names.comments_extensible);
+            pick(&format!("{REL_BASE}theme"), &mut names.theme);
         }
         /* 3. Core properties hang off the package root, not the main part. */
-        if let Some(rels) = &root_rels {
-            for rel in rels
-                .by_type(REL_CORE_PROPS)
-                .filter(|r| r.target_mode == TargetMode::Internal)
-            {
-                if let Ok(cs) = target_candidates("", &rel.target)
-                    && let Some(found) = cs.into_iter().find(|c| exists(c))
-                {
-                    names.core_props = found;
-                    break;
-                }
-            }
+        if let Some(found) = core_props_target(root_rels.as_ref(), &exists) {
+            names.core_props = found;
         }
         Ok(names)
     }
+
+    /// Issue #360 — just the core-properties part name ([`Self::
+    /// discover`]'s step 3, with the same fixed fallback) for a caller
+    /// that holds a retained package rather than the reader's entry list
+    /// (the PDF exporter's `/Info`). `get` looks an entry up by name.
+    pub fn core_props_name<'d>(get: &dyn Fn(&str) -> Option<&'d [u8]>) -> String {
+        let root_rels = get("_rels/.rels").and_then(|b| parse_relationships(b).ok());
+        core_props_target(root_rels.as_ref(), &|name: &str| get(name).is_some())
+            .unwrap_or_else(|| CORE_PROPS_XML.to_string())
+    }
+}
+
+/// The first internal core-properties relationship target of the package
+/// root's rels that names an existing part.
+fn core_props_target(
+    root_rels: Option<&crate::opc::relationships::Relationships>,
+    exists: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    root_rels?
+        .by_type(REL_CORE_PROPS)
+        .filter(|r| r.target_mode == TargetMode::Internal)
+        .find_map(|rel| {
+            target_candidates("", &rel.target)
+                .ok()?
+                .into_iter()
+                .find(|c| exists(c))
+        })
 }
 
 /// `%XX` escapes decoded; an invalid escape or a result that is not UTF-8
@@ -330,9 +365,11 @@ mod tests {
                         (&ty("styles"), "../styles/s%201.xml"),
                         (&ty("settings"), "settings.xml"),
                         (REL_COMMENTS_EXTENDED, "cx.xml"),
+                        (&ty("theme"), "theme/th%201.xml"),
                     ]),
                 ),
                 ("styles/s 1.xml".to_string(), b"<s/>".to_vec()),
+                ("office/theme/th 1.xml".to_string(), b"<a:theme/>".to_vec()),
                 ("office/settings.xml".to_string(), b"<s/>".to_vec()),
                 ("office/cx.xml".to_string(), b"<s/>".to_vec()),
             ];
@@ -349,6 +386,7 @@ mod tests {
             assert_eq!(names.styles, "styles/s 1.xml");
             assert_eq!(names.settings, "office/settings.xml");
             assert_eq!(names.comments_extended, "office/cx.xml");
+            assert_eq!(names.theme, "office/theme/th 1.xml");
             /* Unreferenced siblings fall back next to the main part. */
             assert_eq!(names.numbering, "office/numbering.xml");
         }
@@ -412,5 +450,26 @@ mod tests {
                 target: "../../styles.xml".into()
             }]
         );
+    }
+
+    #[test]
+    fn core_props_name_follows_the_root_relationship() {
+        let entries = [
+            (
+                "_rels/.rels".to_string(),
+                rels(&[(REL_CORE_PROPS, "/meta/props.xml")]),
+            ),
+            ("meta/props.xml".to_string(), b"<c/>".to_vec()),
+        ];
+        let get = |name: &str| {
+            entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, b)| b.as_slice())
+        };
+        assert_eq!(PartNames::core_props_name(&get), "meta/props.xml");
+        /* No (usable) relationship: the fixed name. */
+        let none = |_: &str| -> Option<&[u8]> { None };
+        assert_eq!(PartNames::core_props_name(&none), CORE_PROPS_XML);
     }
 }

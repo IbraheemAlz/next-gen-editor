@@ -4,13 +4,19 @@
  * Open / Save / Export the active document. Live capabilities track
  * the engine surface:
  *
- *   - **Open** → hidden file input → `Command::OpenDocument { format: Docx }`.
+ *   - **Open** → hidden file input → `Command::OpenDocument`. Issue #339 —
+ *     `.docx`, `.txt` and `.html` / `.htm` are all engine-real; the format
+ *     comes from the file name (`docFormatForFileName`), so no entry here
+ *     needs an "Engine pending" badge.
  *   - **Save** → `Command::SaveDocument { format: Docx }`. Bound to
  *     `Ctrl/Cmd+S` globally.
- *   - **Export PDF** → `Command::ExportPdf { conformance }`. All three
+ *   - **Export PDF** → `Command::ExportPdf { conformance }`. All four
  *     conformance targets are engine-real: `A1b` → PDF/A-1b, `A2u` →
  *     PDF/A-2u, `X3` → PDF/X-3:2003 (issue #28 closed the former
- *     `PdfProfile::Plain` fallback that kept A2u / X3 gated).
+ *     `PdfProfile::Plain` fallback that kept A2u / X3 gated), `Ua1` →
+ *     PDF/UA-1 (issue #360): the tagged, accessible export — structure
+ *     tree, reading order, `/Lang`, figure alt text — on a PDF/A-2u base.
+ *     `A2u` itself stays untagged.
  *   - **Export HTML / Plain Text** → `Command::SaveDocument { format }`
  *     with `html` / `plain_text`. Sprint 9 wired the engine
  *     serializers (`crates/format-html` + `DocumentTree::to_plain_text`);
@@ -36,6 +42,18 @@ import {
 } from '@nge/core';
 import './FileMenu.css';
 
+/** Issue #339 — every format `OpenDocument` implements (see
+ *  `docFormatForFileName` in @nge/core for the extension mapping). */
+const OPEN_ACCEPT = [
+    '.docx',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.txt',
+    'text/plain',
+    '.html',
+    '.htm',
+    'text/html',
+].join(',');
+
 const PDF_CONFORMANCES: {
     value: PdfConformance;
     label: string;
@@ -44,6 +62,7 @@ const PDF_CONFORMANCES: {
     { value: 'A1b', label: 'PDF/A-1b', hint: 'Archival (default)' },
     { value: 'A2u', label: 'PDF/A-2u', hint: 'Archival, Unicode' },
     { value: 'X3', label: 'PDF/X-3', hint: 'Print-ready' },
+    { value: 'Ua1', label: 'PDF/UA-1', hint: 'Accessible (tagged), archival' },
 ];
 
 export interface FileMenuProps {
@@ -215,10 +234,11 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                 class="nge-fm__item"
                                 type="button"
                                 role="menuitem"
+                                data-nge-command="OPEN_DOCUMENT"
                                 onClick={() => fileInput?.click()}
                             >
                                 <span>Open…</span>
-                                <span class="nge-fm__shortcut">.docx</span>
+                                <span class="nge-fm__shortcut">.docx · .txt · .html</span>
                             </button>
                         </li>
                         <li role="none">
@@ -226,6 +246,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                 class="nge-fm__item"
                                 type="button"
                                 role="menuitem"
+                                data-nge-command="SAVE_DOCUMENT"
                                 onClick={() => void onSave()}
                             >
                                 <span>Save</span>
@@ -267,6 +288,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                                             class="nge-fm__item nge-fm__item--stacked"
                                                             type="button"
                                                             role="menuitem"
+                                                            data-nge-command="EXPORT_PDF"
                                                             title={c.hint}
                                                             onClick={() => void onExportPdf(c.value)}
                                                         >
@@ -283,6 +305,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                             class="nge-fm__item"
                                             type="button"
                                             role="menuitem"
+                                            data-nge-command="SAVE_DOCUMENT"
                                             onClick={() => void onExportHtml()}
                                         >
                                             <span>HTML</span>
@@ -294,6 +317,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                             class="nge-fm__item"
                                             type="button"
                                             role="menuitem"
+                                            data-nge-command="SAVE_DOCUMENT"
                                             onClick={() => void onExportPlainText()}
                                         >
                                             <span>Plain Text</span>
@@ -309,7 +333,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                 <input
                     ref={(el) => (fileInput = el)}
                     type="file"
-                    accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    accept={OPEN_ACCEPT}
                     style={{ display: 'none' }}
                     onChange={(e) => {
                         const file = e.currentTarget.files?.[0];

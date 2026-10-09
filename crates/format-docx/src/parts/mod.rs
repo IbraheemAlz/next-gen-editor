@@ -18,3 +18,4 @@ pub mod settings;
 pub mod styles;
 pub mod table;
 pub mod textbox;
+pub mod theme;

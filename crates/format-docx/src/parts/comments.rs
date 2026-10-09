@@ -387,6 +387,325 @@ fn escape_attr(out: &mut String, src: &str) {
     }
 }
 
+/// Issue #282 — what [`patch_comments_xml`] did to a source
+/// `word/comments.xml`.
+#[derive(Debug, Clone, Default)]
+pub struct CommentsPatch {
+    /// The part, rewritten.
+    pub bytes: Vec<u8>,
+    /// `comment_id → w14:paraId` minted for every appended comment (the
+    /// `commentsExtended.xml` builder keys its rows on it).
+    pub minted: HashMap<u32, String>,
+    /// Every `w14:paraId` of the removed comments' paragraphs — their rows
+    /// in `commentsExtended.xml` / `commentsIds.xml` go too.
+    pub removed_para_ids: std::collections::HashSet<String>,
+}
+
+/// One `<w:comment>` element of a source part.
+struct SourceComment {
+    id: Option<u32>,
+    /// Byte span of the whole element.
+    start: usize,
+    end: usize,
+    para_ids: Vec<String>,
+}
+
+/// The root start tag's `>` (or `/>`) offset, whether the root is
+/// self-closing, where `</w:comments>` starts, the comments, every
+/// `w14:paraId` / `w14:textId` value, and whether the root binds `w14`.
+struct CommentsScan {
+    root_open_end: usize,
+    root_empty: bool,
+    root_close: Option<usize>,
+    comments: Vec<SourceComment>,
+    ids_in_use: std::collections::HashSet<String>,
+    binds_w14: bool,
+}
+
+fn scan_comments_part(xml: &[u8]) -> Option<CommentsScan> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut scan = CommentsScan {
+        root_open_end: 0,
+        root_empty: false,
+        root_close: None,
+        comments: Vec::new(),
+        ids_in_use: std::collections::HashSet::new(),
+        binds_w14: false,
+    };
+    let mut depth = 0usize;
+    let mut open: Option<SourceComment> = None;
+    let mut prev = 0usize;
+    loop {
+        let event = reader.read_event_into(&mut buf).ok()?;
+        let pos = reader.buffer_position() as usize;
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                let empty = matches!(event, Event::Empty(_));
+                if depth == 0 {
+                    if e.name().as_ref() != b"w:comments" {
+                        return None;
+                    }
+                    scan.root_open_end = pos - if empty { 2 } else { 1 };
+                    scan.root_empty = empty;
+                    scan.binds_w14 = e
+                        .attributes()
+                        .flatten()
+                        .any(|a| a.key.as_ref() == b"xmlns:w14");
+                } else if depth == 1 && e.name().as_ref() == b"w:comment" {
+                    let c = SourceComment {
+                        id: e
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"w:id")
+                            .and_then(|a| std::str::from_utf8(&a.value).ok()?.trim().parse().ok()),
+                        start: prev,
+                        end: pos,
+                        para_ids: Vec::new(),
+                    };
+                    if empty {
+                        scan.comments.push(c);
+                    } else {
+                        open = Some(c);
+                    }
+                }
+                for a in e.attributes().flatten() {
+                    if matches!(a.key.as_ref(), b"w14:paraId" | b"w14:textId")
+                        && let Ok(v) = std::str::from_utf8(&a.value)
+                    {
+                        scan.ids_in_use.insert(v.to_string());
+                        if a.key.as_ref() == b"w14:paraId"
+                            && let Some(c) = open.as_mut()
+                        {
+                            c.para_ids.push(v.to_string());
+                        }
+                    }
+                }
+                if !empty {
+                    depth += 1;
+                }
+            }
+            Event::End(e) => {
+                depth = depth.checked_sub(1)?;
+                if depth == 1 && e.name().as_ref() == b"w:comment" {
+                    if let Some(mut c) = open.take() {
+                        c.end = pos;
+                        scan.comments.push(c);
+                    }
+                } else if depth == 0 {
+                    scan.root_close = Some(prev);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        prev = pos;
+        buf.clear();
+    }
+    (scan.root_open_end > 0).then_some(scan)
+}
+
+/// Issue #282 — bring a SOURCE `word/comments.xml` in line with the tree,
+/// as an edit of its bytes (every untouched comment keeps its rich body
+/// and attributes byte for byte): the `<w:comment>` of every `deleted`
+/// (tombstoned, see `engine::DocumentTree::deleted_comments`) id is
+/// removed, and every comment in `defs` the part does not carry — added
+/// in the editor — is appended before `</w:comments>` with a minted
+/// `w14:paraId` (declaring `xmlns:w14` on the root when the part never
+/// did). `None` when nothing changes (or the part does not parse; it then
+/// rides the passthrough untouched).
+pub fn patch_comments_xml(
+    src: &[u8],
+    defs: &HashMap<u32, CommentDef>,
+    deleted: &[u32],
+) -> Option<CommentsPatch> {
+    let scan = scan_comments_part(src)?;
+    let present: std::collections::HashSet<u32> =
+        scan.comments.iter().filter_map(|c| c.id).collect();
+    let doomed: Vec<&SourceComment> = scan
+        .comments
+        .iter()
+        .filter(|c| {
+            c.id.is_some_and(|id| deleted.contains(&id) && !defs.contains_key(&id))
+        })
+        .collect();
+    let mut added: Vec<(&u32, &CommentDef)> = defs
+        .iter()
+        .filter(|(id, _)| !present.contains(id))
+        .collect();
+    if doomed.is_empty() && added.is_empty() {
+        return None;
+    }
+    added.sort_by_key(|(id, _)| **id);
+
+    /* Mint paraIds / textIds no element of the part uses (8 hex digits,
+    below 0x80000000 as Word requires, never 0). */
+    let mut in_use = scan.ids_in_use.clone();
+    let mut counter: u32 = 1;
+    let mut mint = || loop {
+        let v = format!("{counter:08X}");
+        counter = counter.saturating_add(1);
+        if in_use.insert(v.clone()) {
+            return v;
+        }
+    };
+    let mut minted = HashMap::new();
+    let mut appended = String::new();
+    for (id, def) in &added {
+        appended.push_str("<w:comment w:id=\"");
+        appended.push_str(&id.to_string());
+        appended.push_str("\" w:author=\"");
+        escape_attr(&mut appended, &def.author);
+        if !def.date.is_empty() {
+            appended.push_str("\" w:date=\"");
+            escape_attr(&mut appended, &def.date);
+        }
+        appended.push_str("\">");
+        for (pi, body) in def
+            .paragraphs
+            .iter()
+            .map(String::as_str)
+            .chain(def.paragraphs.is_empty().then_some(""))
+            .enumerate()
+        {
+            let para_id = mint();
+            let text_id = mint();
+            if pi == 0 {
+                minted.insert(**id, para_id.clone());
+            }
+            appended.push_str("<w:p w14:paraId=\"");
+            appended.push_str(&para_id);
+            appended.push_str("\" w14:textId=\"");
+            appended.push_str(&text_id);
+            appended.push_str("\"><w:r><w:t xml:space=\"preserve\">");
+            escape_text(&mut appended, body);
+            appended.push_str("</w:t></w:r></w:p>");
+        }
+        appended.push_str("</w:comment>");
+    }
+
+    /* Splice: root `xmlns:w14` (when minting), removals, the appendix. */
+    let mut cuts: Vec<(usize, usize, String)> = Vec::new();
+    if !added.is_empty() && !scan.binds_w14 {
+        cuts.push((
+            scan.root_open_end,
+            scan.root_open_end,
+            " xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\"".to_string(),
+        ));
+    }
+    let mut removed_para_ids = std::collections::HashSet::new();
+    for c in &doomed {
+        cuts.push((c.start, c.end, String::new()));
+        removed_para_ids.extend(c.para_ids.iter().cloned());
+    }
+    if !added.is_empty() {
+        if scan.root_empty {
+            /* `<w:comments …/>` → `<w:comments …>…</w:comments>`. */
+            cuts.push((
+                scan.root_open_end,
+                scan.root_open_end + 1,
+                format!(">{appended}</w:comments"),
+            ));
+        } else {
+            let at = scan.root_close?;
+            cuts.push((at, at, appended));
+        }
+    }
+    cuts.sort_by_key(|(lo, hi, _)| (*lo, *hi));
+    let mut out = Vec::with_capacity(src.len() + 256);
+    let mut cursor = 0usize;
+    for (lo, hi, with) in cuts {
+        if lo < cursor {
+            return None;
+        }
+        out.extend_from_slice(&src[cursor..lo]);
+        out.extend_from_slice(with.as_bytes());
+        cursor = hi;
+    }
+    out.extend_from_slice(&src[cursor..]);
+    Some(CommentsPatch {
+        bytes: out,
+        minted,
+        removed_para_ids,
+    })
+}
+
+/// Issue #282 — remove from a comments side part every row element named
+/// `row` (`w15:commentEx`, `w16cid:commentId`, `w16cex:commentExtensible`)
+/// whose `key` attribute is in `values`; also returns the `collect`
+/// attribute of every removed row (a `commentsIds.xml` row's
+/// `w16cid:durableId` keys `commentsExtensible.xml`). `None` when no row
+/// matches or the part does not parse.
+pub fn remove_comment_rows(
+    xml: &[u8],
+    row: &[u8],
+    key: &[u8],
+    values: &std::collections::HashSet<String>,
+    collect: Option<&[u8]>,
+) -> Option<(Vec<u8>, std::collections::HashSet<String>)> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut collected = std::collections::HashSet::new();
+    let mut open: Option<(usize, u32)> = None;
+    let mut prev = 0usize;
+    loop {
+        let event = reader.read_event_into(&mut buf).ok()?;
+        let pos = reader.buffer_position() as usize;
+        if let Some((start, depth)) = open.as_mut() {
+            match &event {
+                Event::Start(_) => *depth += 1,
+                Event::End(_) if *depth == 0 => {
+                    cuts.push((*start, pos));
+                    open = None;
+                }
+                Event::End(_) => *depth -= 1,
+                Event::Eof => return None,
+                _ => {}
+            }
+        } else if let Event::Start(e) | Event::Empty(e) = &event
+            && e.name().as_ref() == row
+        {
+            let attr = |name: &[u8]| {
+                e.attributes()
+                    .flatten()
+                    .find(|a| a.key.as_ref() == name)
+                    .and_then(|a| std::str::from_utf8(&a.value).ok().map(str::to_string))
+            };
+            if attr(key).is_some_and(|v| values.contains(&v)) {
+                if let Some(c) = collect.and_then(attr) {
+                    collected.insert(c);
+                }
+                if matches!(event, Event::Empty(_)) {
+                    cuts.push((prev, pos));
+                } else {
+                    open = Some((prev, 0));
+                }
+            }
+        } else if let Event::Eof = event {
+            break;
+        }
+        prev = pos;
+        buf.clear();
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(xml.len());
+    let mut cursor = 0usize;
+    for (lo, hi) in cuts {
+        out.extend_from_slice(&xml[cursor..lo]);
+        cursor = hi;
+    }
+    out.extend_from_slice(&xml[cursor..]);
+    Some((out, collected))
+}
+
 fn escape_text(out: &mut String, src: &str) {
     for ch in src.chars() {
         match ch {
@@ -401,6 +720,98 @@ fn escape_text(out: &mut String, src: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn def(author: &str, text: &str) -> CommentDef {
+        CommentDef {
+            author: author.into(),
+            date: "2026-10-09T00:00:00Z".into(),
+            paragraphs: vec![text.into()],
+            ..CommentDef::default()
+        }
+    }
+
+    /// Issue #282 — a comment added in the editor is appended to the
+    /// source part (rich bodies of the others untouched), a deleted one's
+    /// element is removed; nothing else moves.
+    #[test]
+    fn patch_comments_xml_appends_and_removes_elements() {
+        let src = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:comment w:id="0" w:author="A" w:initials="A"><w:p><w:r><w:t>keep</w:t></w:r></w:p></w:comment>"#,
+            r#"<w:comment w:id="1" w:author="B"><w:p w14:paraId="00000001" xmlns:w14="x"><w:r><w:t>gone</w:t></w:r></w:p></w:comment>"#,
+            r#"</w:comments>"#,
+        );
+        let parsed = parse_comments_xml(src.as_bytes()).unwrap();
+        let mut defs = parsed.comments.clone();
+        defs.remove(&1);
+        defs.insert(2, def("Me", "new & <shiny>"));
+        let p = patch_comments_xml(src.as_bytes(), &defs, &[1]).expect("changed");
+        let out = String::from_utf8(p.bytes.clone()).unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                "\n",
+                r#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">"#,
+                r#"<w:comment w:id="0" w:author="A" w:initials="A"><w:p><w:r><w:t>keep</w:t></w:r></w:p></w:comment>"#,
+                r#"<w:comment w:id="2" w:author="Me" w:date="2026-10-09T00:00:00Z"><w:p w14:paraId="00000002" w14:textId="00000003"><w:r><w:t xml:space="preserve">new &amp; &lt;shiny&gt;</w:t></w:r></w:p></w:comment>"#,
+                r#"</w:comments>"#,
+            )
+        );
+        assert_eq!(p.minted.get(&2).map(String::as_str), Some("00000002"));
+        assert!(p.removed_para_ids.contains("00000001"));
+        let back = parse_comments_xml(&p.bytes).unwrap();
+        assert_eq!(back.comments.len(), 2);
+        assert_eq!(
+            back.comments[&2].paragraphs,
+            vec!["new & <shiny>".to_string()]
+        );
+        /* Nothing to do: None. */
+        assert!(patch_comments_xml(src.as_bytes(), &parsed.comments, &[]).is_none());
+        /* A deleted id the part never had changes nothing either. */
+        assert!(patch_comments_xml(src.as_bytes(), &parsed.comments, &[9]).is_none());
+    }
+
+    #[test]
+    fn remove_comment_rows_drops_matching_rows_only() {
+        let xml = concat!(
+            r#"<w16cid:commentsIds xmlns:w16cid="x">"#,
+            r#"<w16cid:commentId w16cid:paraId="00000001" w16cid:durableId="1A"/>"#,
+            r#"<w16cid:commentId w16cid:paraId="00000002" w16cid:durableId="2B"/>"#,
+            r#"</w16cid:commentsIds>"#,
+        );
+        let values: std::collections::HashSet<String> = ["00000002".to_string()].into();
+        let (out, durable) = remove_comment_rows(
+            xml.as_bytes(),
+            b"w16cid:commentId",
+            b"w16cid:paraId",
+            &values,
+            Some(b"w16cid:durableId"),
+        )
+        .expect("removed");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                r#"<w16cid:commentsIds xmlns:w16cid="x">"#,
+                r#"<w16cid:commentId w16cid:paraId="00000001" w16cid:durableId="1A"/>"#,
+                r#"</w16cid:commentsIds>"#,
+            )
+        );
+        assert!(durable.contains("2B"));
+        let none: std::collections::HashSet<String> = ["FFFFFFFF".to_string()].into();
+        assert!(
+            remove_comment_rows(
+                xml.as_bytes(),
+                b"w16cid:commentId",
+                b"w16cid:paraId",
+                &none,
+                None
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn extended_parser_picks_paraid_and_done() {

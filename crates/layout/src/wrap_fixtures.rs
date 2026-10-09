@@ -68,6 +68,7 @@ fn span(len: usize) -> StyleSpan {
         font_family: None,
         caps_transform: false,
         baseline_shift_px: 0.0,
+        cs: None,
     }
 }
 

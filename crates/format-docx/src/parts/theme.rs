@@ -1,0 +1,493 @@
+//! Issue #355 — `word/theme/theme1.xml` (`a:theme`, ECMA-376 Part 1
+//! §20.1.6.9) → [`engine::DocumentTheme`]: the font scheme (`a:fontScheme`,
+//! §20.1.4.1.18 — `a:majorFont` / `a:minorFont`, each with `a:latin`,
+//! `a:ea`, `a:cs` and the supplemental `<a:font script typeface>` list) and
+//! the colour scheme (`a:clrScheme`, §20.1.6.2 — twelve slots, each an
+//! `a:srgbClr val` or an `a:sysClr` whose `lastClr` caches the system
+//! colour). Read-only: the part keeps riding `other_entries` verbatim.
+//!
+//! Matching is by LOCAL name (`latin`, not `a:latin`): DrawingML parts are
+//! not bound to a fixed prefix, and a producer that declares the namespace
+//! as the default (`<theme xmlns="…/drawingml/2006/main">`) is legal.
+
+use crate::error::DocxError;
+use engine::{DocumentTheme, FontBinding, RunFontBindings, SchemeColor, ThemeColorRef, ThemeFonts};
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::reader::Reader;
+
+fn local_name(qname: &[u8]) -> &[u8] {
+    match qname.iter().rposition(|b| *b == b':') {
+        Some(i) => &qname[i + 1..],
+        None => qname,
+    }
+}
+
+/// Unprefixed attribute `key`, unescaped.
+fn attr(e: &BytesStart, key: &[u8]) -> Option<String> {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.as_ref() == key)
+        .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
+}
+
+fn parse_rgb(v: &str) -> Option<[u8; 3]> {
+    let v = v.trim();
+    if v.len() != 6 || !v.is_ascii() {
+        return None;
+    }
+    let d = |i: usize| u8::from_str_radix(&v[i..i + 2], 16).ok();
+    Some([d(0)?, d(2)?, d(4)?])
+}
+
+/// The document's theme part `theme_part` (an archive entry name —
+/// [`crate::opc::part_names::PartNames::theme`]: the main part's
+/// `…/relationships/theme` target in either namespace family, Word's
+/// `word/theme/theme1.xml` as the fallback), parsed and joined with the
+/// `<w:themeFontLang>` / `<w:clrSchemeMapping>` settings. `None` when the
+/// package has no such part or it does not parse.
+pub fn read_document_theme(
+    entries: &[(String, Vec<u8>)],
+    theme_part: &str,
+    settings: Option<&crate::parts::settings::SettingsPart>,
+) -> Option<DocumentTheme> {
+    let bytes = entries
+        .iter()
+        .find_map(|(n, b)| (n == theme_part).then_some(b.as_slice()))?;
+    let mut theme = parse_theme_xml(bytes).ok()?;
+    if let Some(s) = settings {
+        theme.font_lang = s.theme_font_lang.clone();
+        theme.color_map = s.clr_scheme_mapping.clone();
+    }
+    Some(theme)
+}
+
+/// Issue #355 — the slot bindings of one `<w:rFonts>` element
+/// (§17.3.2.26): per slot, the theme attribute when present (it
+/// supersedes a name on the same element), else [`FontBinding::Name`] when
+/// the slot is named, else nothing.
+///
+/// `None` when the element binds no slot (a bare `w:hint`) and for the
+/// canonical shapes — no theme attribute, and exactly the name claims the
+/// model's own names imply: a Latin name on both `ascii` and `hAnsi` (or
+/// neither), a complex-script name on `cs` only when the model holds it
+/// (`cs_modeled` — the reader resolved it into `font_family_cs`, issue
+/// #249), an `eastAsia` name only alongside the Latin pair. A family
+/// without bindings claims exactly those slots in
+/// [`engine::SpanStyle::merged_with`] (`ascii` + `hAnsi` for a Latin name,
+/// `cs` for `font_family_cs`), so the two are the same statement for
+/// everything layout resolves (it has no East Asian class), an
+/// engine-authored family round-trips to an equal style (whichever script
+/// slots it set), and Word's common all-four-names spelling keeps
+/// coalescing with an equally formatted neighbour instead of splitting a
+/// shaping run over a slot nothing reads. A `w:cs` name the model cannot
+/// hold keeps the bindings explicit, so its `cs` claim survives the
+/// cascade (an inherited `w:cstheme` must not take that run's Arabic
+/// text over).
+pub fn rfonts_bindings(e: &BytesStart, cs_modeled: bool) -> Option<Box<RunFontBindings>> {
+    let w_attr = |key: &[u8]| crate::schema::ct_rpr::attr_val(e, key);
+    let slot = |name: &[u8], theme: &[u8]| match w_attr(theme) {
+        Some(t) => Some(FontBinding::Theme(t)),
+        None => w_attr(name).map(|_| FontBinding::Name),
+    };
+    let b = RunFontBindings {
+        ascii: slot(b"w:ascii", b"w:asciiTheme"),
+        h_ansi: slot(b"w:hAnsi", b"w:hAnsiTheme"),
+        east_asia: slot(b"w:eastAsia", b"w:eastAsiaTheme"),
+        cs: slot(b"w:cs", b"w:cstheme"),
+    };
+    let named = Some(FontBinding::Name);
+    let latin_pair = b.ascii == named && b.h_ansi == named;
+    let latin_none = b.ascii.is_none() && b.h_ansi.is_none();
+    let cs_implied = b.cs.is_none() || (b.cs == named && cs_modeled);
+    let east_asia_implied = b.east_asia.is_none() || (latin_pair && b.east_asia == named);
+    let canonical =
+        (latin_pair || (latin_none && b.cs == named)) && cs_implied && east_asia_implied;
+    (!b.is_empty() && !canonical).then(|| Box::new(b))
+}
+
+/// Issue #355 — the theme half of a `<w:color>` (§17.3.2.6), verbatim:
+/// `Some` whenever `w:themeColor` is present (`none` included, so it
+/// round-trips).
+pub fn theme_color_ref(e: &BytesStart) -> Option<Box<ThemeColorRef>> {
+    let w_attr = |key: &[u8]| crate::schema::ct_rpr::attr_val(e, key);
+    Some(Box::new(ThemeColorRef {
+        color: w_attr(b"w:themeColor")?,
+        tint: w_attr(b"w:themeTint"),
+        shade: w_attr(b"w:themeShade"),
+    }))
+}
+
+/// Which font collection a `typeface` child belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Collection {
+    Major,
+    Minor,
+}
+
+/// Parse a theme part. Unknown / unmodeled content is skipped; a part with
+/// no font or colour scheme yields the empty model (every lookup misses
+/// and layout falls back exactly as it did before the theme was read).
+pub fn parse_theme_xml(xml: &[u8]) -> Result<DocumentTheme, DocxError> {
+    let mut reader = Reader::from_reader(crate::parts::document::strip_utf8_bom(xml));
+    reader.config_mut().trim_text(false);
+    let mut theme = DocumentTheme::default();
+    let mut buf = Vec::new();
+    /* Element stack by local name, so a child is interpreted only under
+    the parent the schema puts it in (an `a:latin` inside an effect style
+    or an `a:srgbClr` inside a fill list never leaks into the schemes). */
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut collection: Option<Collection> = None;
+    loop {
+        let evt = reader.read_event_into(&mut buf)?;
+        let (e, empty) = match &evt {
+            Event::Start(e) => (e, false),
+            Event::Empty(e) => (e, true),
+            Event::End(_) => {
+                if let Some(name) = stack.pop()
+                    && matches!(name.as_slice(), b"majorFont" | b"minorFont")
+                {
+                    collection = None;
+                }
+                buf.clear();
+                continue;
+            }
+            Event::Eof => break,
+            _ => {
+                buf.clear();
+                continue;
+            }
+        };
+        let name = local_name(e.name().as_ref()).to_vec();
+        let parent = stack.last().map(Vec::as_slice);
+        match (parent, name.as_slice()) {
+            (None, b"theme") => theme.name = attr(e, b"name").unwrap_or_default(),
+            (Some(b"themeElements"), b"clrScheme") => {
+                theme.colors.name = attr(e, b"name").unwrap_or_default();
+            }
+            (Some(p), b"srgbClr" | b"sysClr")
+                if stack.len() >= 2 && stack[stack.len() - 2] == b"clrScheme" =>
+            {
+                /* `a:sysClr` names a live system colour (`windowText`); its
+                `lastClr` is the value the producer saw, which is what Word
+                itself renders with when it cannot ask the OS. */
+                let key: &[u8] = if name == b"srgbClr" {
+                    b"val"
+                } else {
+                    b"lastClr"
+                };
+                if let Some(slot) = SchemeColor::from_scheme_element(&String::from_utf8_lossy(p))
+                    && let Some(rgb) = attr(e, key).as_deref().and_then(parse_rgb)
+                    && theme.colors.get(slot).is_none()
+                {
+                    theme.colors.set(slot, rgb);
+                }
+            }
+            (Some(b"fontScheme"), b"majorFont") => collection = Some(Collection::Major),
+            (Some(b"fontScheme"), b"minorFont") => collection = Some(Collection::Minor),
+            (Some(b"majorFont" | b"minorFont"), child) if collection.is_some() => {
+                let fonts: &mut ThemeFonts = match collection {
+                    Some(Collection::Major) => &mut theme.fonts.major,
+                    _ => &mut theme.fonts.minor,
+                };
+                let typeface = attr(e, b"typeface").unwrap_or_default();
+                match child {
+                    b"latin" => fonts.latin = typeface,
+                    b"ea" => fonts.ea = typeface,
+                    b"cs" => fonts.cs = typeface,
+                    b"font" => {
+                        if let Some(script) = attr(e, b"script")
+                            && !script.is_empty()
+                        {
+                            /* First entry wins — a duplicate script row is
+                            malformed; Word keeps the first it reads. */
+                            fonts.by_script.entry(script).or_insert(typeface);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if !empty {
+            stack.push(name);
+        }
+        buf.clear();
+    }
+    Ok(theme)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opc::archive::{DOC_XML, RELS_XML, THEME_XML};
+
+    /// The shape Word writes for its stock "Office" theme (2013+): empty
+    /// `a:ea` / `a:cs`, the complex-script and East Asian faces per
+    /// script, system colours for dk1 / lt1.
+    const WORD_THEME: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        "\r\n",
+        r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">"#,
+        r#"<a:themeElements><a:clrScheme name="Office">"#,
+        r#"<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>"#,
+        r#"<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>"#,
+        r#"<a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>"#,
+        r#"<a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2>"#,
+        r#"<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4>"#,
+        r#"<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6>"#,
+        r#"<a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink>"#,
+        r#"</a:clrScheme><a:fontScheme name="Office">"#,
+        r#"<a:majorFont><a:latin typeface="Calibri Light" panose="020F0302020204030204"/><a:ea typeface=""/><a:cs typeface=""/>"#,
+        r#"<a:font script="Jpan" typeface="游ゴシック Light"/><a:font script="Arab" typeface="Times New Roman"/>"#,
+        r#"<a:font script="Hebr" typeface="Times New Roman"/></a:majorFont>"#,
+        r#"<a:minorFont><a:latin typeface="Calibri" panose="020F0502020204030204"/><a:ea typeface=""/><a:cs typeface=""/>"#,
+        r#"<a:font script="Jpan" typeface="游明朝"/><a:font script="Arab" typeface="Arial"/>"#,
+        r#"<a:font script="Hebr" typeface="Arial"/></a:minorFont></a:fontScheme>"#,
+        r#"<a:fmtScheme name="Office"><a:fillStyleLst><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>"#,
+        r#"</a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#,
+    );
+
+    #[test]
+    fn reads_the_word_default_font_and_colour_schemes() {
+        let t = parse_theme_xml(WORD_THEME.as_bytes()).expect("parse");
+        assert_eq!(t.name, "Office Theme");
+        assert_eq!(t.fonts.major.latin, "Calibri Light");
+        assert_eq!(t.fonts.minor.latin, "Calibri");
+        assert_eq!(t.fonts.minor.cs, "");
+        assert_eq!(t.fonts.minor.by_script["Arab"], "Arial");
+        assert_eq!(t.fonts.major.by_script["Arab"], "Times New Roman");
+        assert_eq!(t.fonts.minor.by_script["Jpan"], "游明朝");
+        assert_eq!(t.fonts.minor.by_script.len(), 3);
+        assert_eq!(t.colors.name, "Office");
+        assert_eq!(t.colors.get(SchemeColor::Dark1), Some([0, 0, 0]));
+        assert_eq!(t.colors.get(SchemeColor::Light1), Some([255, 255, 255]));
+        assert_eq!(t.colors.get(SchemeColor::Accent1), Some([0x44, 0x72, 0xC4]));
+        assert_eq!(
+            t.colors.get(SchemeColor::FollowedHyperlink),
+            Some([0x95, 0x4F, 0x72])
+        );
+        assert!(SchemeColor::ALL.iter().all(|c| t.colors.get(*c).is_some()));
+    }
+
+    /// A default-namespace theme (no `a:` prefix) parses the same; a
+    /// colour under a fill list never lands in a scheme slot.
+    #[test]
+    fn matches_by_local_name_and_scope() {
+        let xml = concat!(
+            r#"<theme xmlns="http://schemas.openxmlformats.org/drawingml/2006/main" name="T">"#,
+            r#"<themeElements><clrScheme name="C"><accent2><srgbClr val="112233"/></accent2></clrScheme>"#,
+            r#"<fontScheme name="F"><minorFont><latin typeface="Amiri"/><cs typeface="Noto Naskh Arabic"/>"#,
+            r#"<font script="Arab" typeface="Amiri"/><font script="Arab" typeface="Second"/></minorFont></fontScheme>"#,
+            r#"<fmtScheme><fillStyleLst><solidFill><srgbClr val="FF0000"/></solidFill></fillStyleLst>"#,
+            r#"<effectStyleLst><latin typeface="Nope"/></effectStyleLst></fmtScheme>"#,
+            r#"</themeElements></theme>"#,
+        );
+        let t = parse_theme_xml(xml.as_bytes()).expect("parse");
+        assert_eq!(t.colors.get(SchemeColor::Accent2), Some([0x11, 0x22, 0x33]));
+        assert_eq!(t.colors.get(SchemeColor::Accent1), None);
+        assert_eq!(t.fonts.minor.latin, "Amiri");
+        assert_eq!(t.fonts.minor.cs, "Noto Naskh Arabic");
+        assert_eq!(t.fonts.minor.by_script["Arab"], "Amiri", "first entry wins");
+        assert_eq!(t.fonts.major, ThemeFonts::default());
+    }
+
+    fn themed_package(settings: bool) -> Vec<u8> {
+        let base = crate::writer::build_minimal_docx(&engine::DocumentTree::from_text("Body"))
+            .expect("minimal");
+        let settings_xml = crate::test_fixtures::theme_settings_xml();
+        crate::test_fixtures::with_theme_parts(
+            &base,
+            &crate::test_fixtures::word_default_theme_xml(),
+            settings.then_some(settings_xml.as_str()),
+        )
+    }
+
+    /// The reader lands the theme on the tree, joined with the settings
+    /// that select into it; the part itself stays a byte-identical
+    /// sibling on both save paths.
+    #[test]
+    fn read_docx_lands_the_theme_and_keeps_the_part_verbatim() {
+        let bytes = themed_package(true);
+        let archive = crate::read_docx(&bytes).expect("read");
+        let theme = archive.document.theme.as_deref().expect("theme read");
+        assert_eq!(theme.fonts.minor.latin, "Calibri");
+        assert_eq!(theme.fonts.major.by_script["Arab"], "Times New Roman");
+        assert_eq!(theme.font_lang.bidi.as_deref(), Some("ar-SA"));
+        assert_eq!(theme.color_map.entries["t1"], "dark1");
+        let source = archive.part_by_name(THEME_XML).expect("part").to_vec();
+        for saved in [
+            crate::write_docx(&archive, &archive.document).expect("write"),
+            crate::save_docx(&archive.document).expect("save"),
+        ] {
+            let back = crate::read_docx(&saved).expect("reread");
+            assert_eq!(back.part_by_name(THEME_XML), Some(source.as_slice()));
+            assert_eq!(back.document.theme, archive.document.theme);
+        }
+        /* No settings part → the identity defaults (empty selections). */
+        let bare = crate::read_docx(&themed_package(false)).expect("read");
+        let theme = bare.document.theme.as_deref().expect("theme read");
+        assert_eq!(theme.font_lang, engine::ThemeFontLang::default());
+        assert!(theme.color_map.entries.is_empty());
+        /* No theme part at all → no model. */
+        let plain = crate::writer::build_minimal_docx(&engine::DocumentTree::from_text("x"))
+            .expect("minimal");
+        assert!(
+            crate::read_docx(&plain)
+                .expect("read")
+                .document
+                .theme
+                .is_none()
+        );
+    }
+
+    /// The shared default-template fixture reads back as authored: the
+    /// docDefaults / heading / run bindings, the theme colours and the
+    /// theme itself; a zero-edit save is byte-identical.
+    #[test]
+    fn the_default_template_fixture_reads_back_as_authored() {
+        use engine::{FontBinding, FontClass};
+        let bytes = crate::test_fixtures::theme_word_default_docx();
+        let archive = crate::read_docx(&bytes).expect("read");
+        let doc = &archive.document;
+        let entry = |b: &[u8], name: &str| {
+            let mut z = zip::ZipArchive::new(std::io::Cursor::new(b)).expect("zip");
+            let mut f = z.by_name(name).expect(name);
+            let mut out = String::new();
+            std::io::Read::read_to_string(&mut f, &mut out).expect("utf8");
+            out
+        };
+        let styles = entry(&bytes, "word/styles.xml");
+        assert!(
+            styles.contains(r#"<w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia" w:hAnsiTheme="minorHAnsi" w:cstheme="minorBidi"/>"#),
+            "{styles}"
+        );
+        let document = entry(&bytes, "word/document.xml");
+        assert!(
+            document.contains(r#"<w:rFonts w:cstheme="majorBidi"/>"#),
+            "{document}"
+        );
+        assert!(
+            document.contains(r#"<w:color w:val="595959" w:themeColor="text1" w:themeTint="A6"/>"#),
+            "{document}"
+        );
+        let theme = doc.theme.as_deref().expect("theme");
+        let texts: Vec<&str> = (0..4).map(|i| doc.paragraph_text(i).unwrap()).collect();
+        assert_eq!(texts, crate::test_fixtures::THEME_FIXTURE_TEXTS);
+        /* Body Latin + Arabic through the docDefaults. */
+        let base = doc.resolve_style_run_cascade(None);
+        let f = |s: &engine::SpanStyle, c| {
+            s.resolve_font(Some(theme), c, Some("Arab"))
+                .map(|r| r.family.display_name().to_string())
+        };
+        assert_eq!(f(&base, FontClass::Latin).as_deref(), Some("Calibri"));
+        assert_eq!(f(&base, FontClass::ComplexScript).as_deref(), Some("Arial"));
+        let heading = doc.resolve_style_run_cascade(Some("Heading1"));
+        assert_eq!(
+            f(&heading, FontClass::Latin).as_deref(),
+            Some("Calibri Light")
+        );
+        assert_eq!(
+            f(&heading, FontClass::ComplexScript).as_deref(),
+            Some("Times New Roman")
+        );
+        assert_eq!(
+            heading.resolve_color(Some(theme)),
+            Some([0x2F, 0x54, 0x96, 255])
+        );
+        /* The Arabic run rebinding only cs. */
+        let p2 = doc.nth_paragraph(2).unwrap();
+        let run = base.clone().merged_with(p2.spans[0].style.clone());
+        assert_eq!(
+            run.font_bindings.as_deref().unwrap().cs,
+            Some(FontBinding::Theme("majorBidi".into()))
+        );
+        assert_eq!(
+            f(&run, FontClass::ComplexScript).as_deref(),
+            Some("Times New Roman")
+        );
+        assert_eq!(f(&run, FontClass::Latin).as_deref(), Some("Calibri"));
+        /* The explicit run claims every slot its writer names. */
+        let p1 = doc.nth_paragraph(1).unwrap();
+        let amiri = base.clone().merged_with(p1.spans[0].style.clone());
+        assert_eq!(f(&amiri, FontClass::Latin).as_deref(), Some("Amiri"));
+        assert_eq!(
+            f(&amiri, FontClass::ComplexScript).as_deref(),
+            Some("Amiri")
+        );
+        /* Zero-edit save: every part byte-identical. */
+        let saved = crate::write_docx(&archive, doc).expect("write");
+        for name in [
+            "word/document.xml",
+            "word/styles.xml",
+            "word/settings.xml",
+            THEME_XML,
+        ] {
+            assert_eq!(entry(&saved, name), entry(&bytes, name), "{name}");
+        }
+    }
+
+    /// The part is the one `PartNames` discovers: the main part's theme
+    /// relationship (percent-decoded, `..`-relative, either family) wins
+    /// over the conventional path, which stays the fallback.
+    #[test]
+    fn the_theme_relationship_locates_the_part() {
+        use crate::opc::part_names::PartNames;
+        let theme_at = |rel_type: &str, target: &str, part: &str| {
+            let rels = format!(
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+                 <Relationship Id=\"rId9\" Type=\"{rel_type}\" Target=\"{target}\"/></Relationships>"
+            );
+            let entries = vec![
+                (DOC_XML.to_string(), b"<w:document/>".to_vec()),
+                (RELS_XML.to_string(), rels.into_bytes()),
+                (part.to_string(), WORD_THEME.as_bytes().to_vec()),
+            ];
+            let mut warnings = Vec::new();
+            let names = PartNames::discover(
+                &entries,
+                &|n| entries.iter().any(|(e, _)| e == n),
+                &mut warnings,
+            )
+            .expect("part names");
+            assert!(warnings.is_empty(), "{warnings:?}");
+            read_document_theme(&entries, &names.theme, None).map(|t| t.fonts.minor.latin)
+        };
+        let calibri = Some("Calibri".to_string());
+        let rel = crate::test_fixtures::THEME_REL;
+        let strict = crate::schema::family::to_family(rel, crate::schema::NsFamily::Strict);
+        assert_eq!(
+            theme_at(rel, "theme/theme7.xml", "word/theme/theme7.xml"),
+            calibri
+        );
+        assert_eq!(
+            theme_at(&strict, "theme/theme7.xml", "word/theme/theme7.xml"),
+            calibri
+        );
+        assert_eq!(
+            theme_at(rel, "../themes/my%20theme.xml", "themes/my theme.xml"),
+            calibri
+        );
+        /* A relationship naming a missing part falls back to Word's path. */
+        assert_eq!(theme_at(rel, "theme/gone.xml", THEME_XML), calibri);
+        /* Neither → no model. */
+        assert_eq!(
+            theme_at(rel, "theme/gone.xml", "word/theme/elsewhere.xml"),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_values_are_skipped_not_fatal() {
+        let xml = concat!(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#,
+            r#"<a:themeElements><a:clrScheme name="C"><a:dk1><a:srgbClr val="nothex"/></a:dk1>"#,
+            r#"<a:lt1><a:scrgbClr r="0" g="0" b="0"/></a:lt1></a:clrScheme>"#,
+            r#"<a:fontScheme name="F"><a:majorFont><a:font typeface="NoScript"/></a:majorFont>"#,
+            r#"</a:fontScheme></a:themeElements></a:theme>"#,
+        );
+        let t = parse_theme_xml(xml.as_bytes()).expect("parse");
+        assert_eq!(t.colors.get(SchemeColor::Dark1), None);
+        assert_eq!(t.colors.get(SchemeColor::Light1), None);
+        assert!(t.fonts.major.by_script.is_empty());
+    }
+}

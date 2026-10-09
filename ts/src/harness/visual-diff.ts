@@ -36,9 +36,15 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
         testCase === 'table-merges' ||
         testCase === 'autofit-long-url-overflow' ||
         testCase === 'list-bullet-numbered' ||
-        testCase === 'rich-text-caps'
+        testCase === 'rich-text-caps' ||
+        testCase === 'rich-text-cs-size'
     ) {
         return { w: 595, h: 842 };
+    }
+    /* Issue #355 — an A4 page at zoom 2 (the fixture's 11 pt body text
+       stays legible); `run.mjs` screenshots only its top band. */
+    if (testCase === 'theme-fonts') {
+        return { w: 1190, h: 1684 };
     }
     return { w: 400, h: 400 };
 }
