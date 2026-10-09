@@ -329,6 +329,20 @@ Engine backlog" references a real issue.
   `roundtrip-dump` artifact on failure (the harness has no separate
   diff-file dump — its `FAIL:` line carries the inline diff).
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
+- `pnpm -r test` (issue #332) — the TypeScript **unit** tests: `vitest`
+  (pinned, workspace root dev dep; shared node-environment config in
+  `vitest.shared.ts`, **no jsdom** — a module under test must not touch
+  the DOM), `fake-indexeddb` for `ts/src/engine/event-log.ts`, a scripted
+  fake `Worker` for `EngineClient`. Tests sit beside the code
+  (`*.test.ts`, `src/**` of `ts/`, `packages/core`, `packages/ui`) and run in
+  about a second. Pure TS logic (event-log scoring / pruning / package GC /
+  the #314 write-confirm, the #333 retry schedule, `recoveryNotices()`,
+  `nextCleanState`, `devHooksEnabled` / `resolveTelemetryEndpoint`) is
+  tested here, **not** through Playwright; the e2e suite keeps what needs a
+  real browser + the wasm engine. `engine.worker.ts` imports the wasm
+  engine and cannot be loaded by vitest: extract a pure decision into its
+  own module (as `retry-schedule.ts`) to unit-test it. CI runs it as the
+  `unit` step of the `e2e` job, before Playwright.
 - `pnpm exec playwright test` (from `ts/`) — the full e2e suite in `ts/e2e/`
   (`workers: 1`, well under a minute locally) all green.
   **Blocking since issue #230**: `ci.yml`'s `e2e` job reuses the `wasm`
