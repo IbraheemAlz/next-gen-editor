@@ -22,7 +22,7 @@
  * Pass an explicit `range` to override.
  */
 import { useEngine, useDocumentDefaults, type EngineHandle } from './EngineProvider';
-import { createEditorState, type EditorState } from './createEditorState';
+import { clearOpenWarnings, createEditorState, type EditorState } from './createEditorState';
 import type {
     Command,
     Event,
@@ -1055,7 +1055,12 @@ function build(
         exportHtml: () => dispatch({ type: 'SAVE_DOCUMENT', format: 'html' }),
         exportPlainText: () =>
             dispatch({ type: 'SAVE_DOCUMENT', format: 'plain_text' }),
-        closeDocument: () => dispatch({ type: 'CLOSE_DOCUMENT' }),
+        closeDocument: async () => {
+            const evt = await dispatch({ type: 'CLOSE_DOCUMENT' });
+            /* Issue #406 - the closed document's reader warnings go with it. */
+            if (evt.type !== 'ERROR') clearOpenWarnings(engine);
+            return evt;
+        },
 
         getSelectionAsClipboard: (opts) =>
             dispatch(

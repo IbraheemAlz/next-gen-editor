@@ -99,6 +99,62 @@ pub enum DocxWarning {
     UnsafeRelationshipTarget { target: String },
 }
 
+impl DocxWarning {
+    /// Issue #406 — the archive entry this warning concerns, when the
+    /// reader knows it (`None` for diagnostics raised deep inside a part
+    /// walk — measures, fields, table nesting).
+    pub fn part(&self) -> Option<&str> {
+        match self {
+            DocxWarning::NonCanonicalNamespaces { part, .. } => Some(part),
+            DocxWarning::MainPartFallback { .. } => Some("_rels/.rels"),
+            DocxWarning::TableNestingTooDeep { .. }
+            | DocxWarning::InvalidMeasure { .. }
+            | DocxWarning::MeasureClamped { .. }
+            | DocxWarning::UnclosedField { .. }
+            | DocxWarning::StrayFieldChar { .. }
+            | DocxWarning::FieldNestingTooDeep { .. }
+            | DocxWarning::NotWordprocessingMl
+            | DocxWarning::UnsafeRelationshipTarget { .. } => None,
+        }
+    }
+
+    /// Issue #406 — the specifics of this warning in one line, for the
+    /// shell's details list (the attribute and its raw value, the limit
+    /// that was hit, the relationship target). Never document text.
+    pub fn detail(&self) -> String {
+        match self {
+            DocxWarning::TableNestingTooDeep { limit } => {
+                format!("tables nested {limit} or more levels deep kept as-is")
+            }
+            DocxWarning::InvalidMeasure { attr, value } => format!("{attr} = \"{value}\""),
+            DocxWarning::MeasureClamped { attr, value, twips } => {
+                format!("{attr} = \"{value}\" → {twips} twips")
+            }
+            DocxWarning::UnclosedField { count } => {
+                format!("{count} field(s) closed at the end of their paragraph")
+            }
+            DocxWarning::StrayFieldChar { kind } => format!("fldCharType=\"{kind}\""),
+            DocxWarning::FieldNestingTooDeep { limit } => {
+                format!("fields nested deeper than {limit} levels")
+            }
+            DocxWarning::NonCanonicalNamespaces {
+                detail, normalized, ..
+            } => {
+                if *normalized {
+                    detail.clone()
+                } else {
+                    format!("{detail} (normalisation failed; read as-is)")
+                }
+            }
+            DocxWarning::NotWordprocessingMl => {
+                "the main part's root is not a WordprocessingML element".to_string()
+            }
+            DocxWarning::MainPartFallback { target }
+            | DocxWarning::UnsafeRelationshipTarget { target } => target.clone(),
+        }
+    }
+}
+
 /// Most reader warnings one read collects; later ones are dropped (a
 /// hostile part can repeat the same bad value a million times).
 const MAX_READ_WARNINGS: usize = 1000;

@@ -17,7 +17,7 @@
  * an opaque per-session id; the crash sample's `recent_commands` carries only
  * dispatched `Command.type` tags (e.g. `"INSERT_TEXT"`), never a command's
  * payload (which, for `InsertText`, IS document content). */
-import type { Command, Event } from '../engine/types';
+import type { Command, Event, ReadWarning, ReadWarningKind } from '../engine/types';
 import { installDevHook } from '../dev-hooks';
 
 type ErrorCode =
@@ -104,7 +104,53 @@ type TelemetryKind =
            *  Rust `skip_serializing_if`). */
           recovery?: RecoveryFlags;
       }
-    | { type: 'DOC_OPEN'; size_bytes: number; page_count: number; open_ms: number; backend: string };
+    | {
+          type: 'DOC_OPEN';
+          size_bytes: number;
+          page_count: number;
+          open_ms: number;
+          backend: string;
+          /** Issue #406 — per-kind reader-warning counts of a degraded open
+           *  (kinds ascending, like the Rust `read_warning_counts`); omitted
+           *  on a clean open, like the Rust `skip_serializing_if`. Codes and
+           *  counts only — never a warning's detail. */
+          read_warnings?: ReadWarningCount[];
+      };
+
+/** Issue #406 — mirrors `bridge::ReadWarningCount`. */
+interface ReadWarningCount {
+    kind: ReadWarningKind;
+    count: number;
+}
+
+/** Issue #406 — `bridge::read_warning_counts`: fold an open's coalesced
+ *  warnings by kind, kinds in ascending (declaration) order. */
+const READ_WARNING_KIND_ORDER: readonly ReadWarningKind[] = [
+    'TableNestingTooDeep',
+    'InvalidMeasure',
+    'MeasureClamped',
+    'UnclosedField',
+    'StrayFieldChar',
+    'FieldNestingTooDeep',
+    'NonCanonicalNamespaces',
+    'NotWordprocessingMl',
+    'MainPartFallback',
+    'UnsafeRelationshipTarget',
+];
+
+export function readWarningCounts(warnings: readonly ReadWarning[]): ReadWarningCount[] {
+    const byKind = new Map<ReadWarningKind, number>();
+    for (const w of warnings) {
+        byKind.set(w.kind, (byKind.get(w.kind) ?? 0) + Math.max(1, w.count ?? 1));
+    }
+    const rank = (k: ReadWarningKind): number => {
+        const i = READ_WARNING_KIND_ORDER.indexOf(k);
+        return i < 0 ? READ_WARNING_KIND_ORDER.length : i;
+    };
+    return [...byKind]
+        .sort(([a], [b]) => rank(a) - rank(b))
+        .map(([kind, count]) => ({ kind, count }));
+}
 
 interface TelemetryEvent {
     doc_id: string;
@@ -242,7 +288,12 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
     /* Issue #390 - one JOURNAL_FAILED sample per exhausted-journal run. */
     let journalFailedReported = false;
     const recentCommands: string[] = [];
-    let pendingDocOpen: { sizeBytes: number; openMs: number; deadlineMs: number } | null = null;
+    let pendingDocOpen: {
+        sizeBytes: number;
+        openMs: number;
+        deadlineMs: number;
+        readWarnings: ReadWarningCount[];
+    } | null = null;
 
     const sample = (kind: TelemetryKind): TelemetryEvent => ({
         doc_id: docId,
@@ -340,6 +391,9 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                             page_count: e.page_count,
                             open_ms: pendingDocOpen.openMs,
                             backend: client.renderer,
+                            ...(pendingDocOpen.readWarnings.length > 0
+                                ? { read_warnings: pendingDocOpen.readWarnings }
+                                : {}),
                         }),
                     );
                 }
@@ -398,6 +452,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                 sizeBytes: openSizeBytes,
                 openMs: performance.now() - openStart,
                 deadlineMs: performance.now() + DOC_OPEN_CORRELATION_MS,
+                readWarnings: readWarningCounts(result.warnings ?? []),
             };
         }
         return result;

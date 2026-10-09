@@ -199,7 +199,13 @@ fn open_plain_text_splits_lines_and_auto_directs_them() {
     bytes.extend_from_slice("Hello\r\nمرحبا بالعالم\n\n123\rEnd\n".as_bytes());
     let loaded = open(&mut e, &bytes, DocFormat::PlainText, "dir/notes.txt");
     assert!(
-        matches!(loaded, Event::DocumentLoaded { paragraph_count: 5 }),
+        matches!(
+            loaded,
+            Event::DocumentLoaded {
+                paragraph_count: 5,
+                ..
+            }
+        ),
         "{loaded:?}"
     );
     assert_eq!(
@@ -256,7 +262,13 @@ fn open_plain_text_decodes_utf16_and_tolerates_invalid_utf8() {
 
     let loaded = open(&mut e, b"", DocFormat::PlainText, "empty.txt");
     assert!(
-        matches!(loaded, Event::DocumentLoaded { paragraph_count: 1 }),
+        matches!(
+            loaded,
+            Event::DocumentLoaded {
+                paragraph_count: 1,
+                ..
+            }
+        ),
         "{loaded:?}"
     );
 }
@@ -368,4 +380,43 @@ fn open_text_honours_the_host_package_limits() {
         },
     );
     assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+}
+
+/// Issue #406 — the reader's warning report reaches the open reply: a
+/// clamped page margin and an unusable one ride `DocumentLoaded.warnings`
+/// (typed kinds, the attribute + raw value as detail), and a clean open
+/// carries none.
+#[test]
+fn open_docx_reports_the_reader_warnings_on_the_reply() {
+    let mut e = engine_with(DocumentTree::from_text("old"));
+    let document = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+        <w:body><w:p><w:r><w:t>margins</w:t></w:r></w:p>\
+        <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
+        <w:pgMar w:top=\"99999\" w:right=\"NaN\" w:bottom=\"1440\" w:left=\"1440\" \
+        w:header=\"720\" w:footer=\"720\"/></w:sectPr></w:body></w:document>";
+    let bytes = format_docx::test_fixtures::package_with_document_xml(document, &[]);
+    let loaded = open(&mut e, &bytes, DocFormat::Docx, "margins.docx");
+    let Event::DocumentLoaded { warnings, .. } = loaded else {
+        panic!("expected DocumentLoaded, got {loaded:?}");
+    };
+    let clamped = warnings
+        .iter()
+        .find(|w| w.kind == bridge::ReadWarningKind::MeasureClamped)
+        .expect("the 99999-twip top margin is clamped");
+    assert_eq!(clamped.detail, "w:pgMar/@w:top = \"99999\" → 31680 twips");
+    assert_eq!(clamped.count, 1);
+    let invalid = warnings
+        .iter()
+        .find(|w| w.kind == bridge::ReadWarningKind::InvalidMeasure)
+        .expect("the NaN right margin is ignored");
+    assert_eq!(invalid.detail, "w:pgMar/@w:right = \"NaN\"");
+
+    let clean =
+        format_docx::test_fixtures::docx_with_body("<w:p><w:r><w:t>clean</w:t></w:r></w:p>");
+    let loaded = open(&mut e, &clean, DocFormat::Docx, "clean.docx");
+    assert!(
+        matches!(&loaded, Event::DocumentLoaded { warnings, .. } if warnings.is_empty()),
+        "{loaded:?}"
+    );
 }

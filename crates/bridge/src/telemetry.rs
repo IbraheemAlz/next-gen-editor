@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{RendererDowngrade, Script};
-use crate::event::{EngineStats, LayoutDegradeReason};
+use crate::event::{EngineStats, LayoutDegradeReason, ReadWarningKind};
 
 /// One telemetry sample. `doc_id` is anonymized — never a document title or
 /// path, only an opaque per-session identifier.
@@ -84,7 +84,39 @@ pub enum TelemetryKind {
         page_count: u32,
         open_ms: f32,
         backend: String,
+        /// Issue #406 — the reader's warnings for this open, as per-kind
+        /// counts (`Event::DocumentLoaded::warnings` folded by kind, kinds
+        /// in ascending order): how often field documents open degraded,
+        /// and how. Codes and counts only — never a warning's detail (an
+        /// attribute value is document bytes). Omitted from the wire when
+        /// the open was clean, so a clean sample keeps its exact #86 shape.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[tsify(optional)]
+        read_warnings: Vec<ReadWarningCount>,
     },
+}
+
+/// Issue #406 — one warning kind's count on
+/// [`TelemetryKind::DocOpen::read_warnings`].
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadWarningCount {
+    pub kind: ReadWarningKind,
+    pub count: u32,
+}
+
+/// Issue #406 — fold an open's warnings into per-kind counts, kinds in
+/// ascending ([`ReadWarningKind`] declaration) order, each kind once.
+pub fn read_warning_counts(warnings: &[crate::ReadWarning]) -> Vec<ReadWarningCount> {
+    let mut counts: std::collections::BTreeMap<ReadWarningKind, u32> =
+        std::collections::BTreeMap::new();
+    for w in warnings {
+        let c = counts.entry(w.kind).or_insert(0);
+        *c = c.saturating_add(w.count.max(1));
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| ReadWarningCount { kind, count })
+        .collect()
 }
 
 /// Outcome of a post-trap recovery attempt (`Command::Recover`), carried on
@@ -359,6 +391,7 @@ mod tests {
             page_count: 12,
             open_ms: 87.5,
             backend: "vello".to_string(),
+            read_warnings: vec![],
         };
         let json = roundtrip(&kind);
         assert_eq!(
@@ -371,6 +404,70 @@ mod tests {
                 "backend": "vello",
             })
         );
+    }
+
+    /// Issue #406 — a degraded open carries per-kind warning counts (codes
+    /// + counts, no detail); a #86-era sample without the key decodes.
+    #[test]
+    fn doc_open_carries_read_warning_counts() {
+        use crate::{ReadWarning, ReadWarningKind as K};
+        let w = |kind, detail: &str, count| ReadWarning {
+            kind,
+            part: None,
+            detail: detail.to_string(),
+            count,
+        };
+        let counts = read_warning_counts(&[
+            w(K::NonCanonicalNamespaces, "x", 1),
+            w(K::MeasureClamped, "w:pgMar/@w:top", 2),
+            w(K::MeasureClamped, "w:pgMar/@w:left", 1),
+            w(K::InvalidMeasure, "w:tab/@w:pos", 0),
+        ]);
+        assert_eq!(
+            counts,
+            vec![
+                ReadWarningCount {
+                    kind: K::InvalidMeasure,
+                    count: 1
+                },
+                ReadWarningCount {
+                    kind: K::MeasureClamped,
+                    count: 3
+                },
+                ReadWarningCount {
+                    kind: K::NonCanonicalNamespaces,
+                    count: 1
+                },
+            ]
+        );
+        let kind = TelemetryKind::DocOpen {
+            size_bytes: 1,
+            page_count: 1,
+            open_ms: 1.0,
+            backend: "canvas2d".to_string(),
+            read_warnings: counts,
+        };
+        let json = roundtrip(&kind);
+        assert_eq!(
+            json["read_warnings"],
+            serde_json::json!([
+                { "kind": "InvalidMeasure", "count": 1 },
+                { "kind": "MeasureClamped", "count": 3 },
+                { "kind": "NonCanonicalNamespaces", "count": 1 },
+            ])
+        );
+        let legacy: TelemetryKind = serde_json::from_value(serde_json::json!({
+            "type": "DOC_OPEN",
+            "size_bytes": 1,
+            "page_count": 1,
+            "open_ms": 1.0,
+            "backend": "vello",
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            TelemetryKind::DocOpen { read_warnings, .. } if read_warnings.is_empty()
+        ));
     }
 
     #[test]

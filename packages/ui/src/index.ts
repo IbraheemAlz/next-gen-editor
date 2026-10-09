@@ -78,6 +78,8 @@ export type { TrapOverlayProps } from './TrapOverlay';
 export { RecoveryBanner } from './RecoveryBanner';
 export type { RecoveryBannerProps } from './RecoveryBanner';
 
+export { OpenWarningsBanner } from './OpenWarningsBanner';
+
 export { Ruler } from './Ruler';
 export type { RulerProps } from './Ruler';
 

@@ -44,6 +44,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod pdf_semantics;
+mod read_report;
 
 #[wasm_bindgen(start)]
 pub fn boot() {
@@ -16712,7 +16713,10 @@ impl Engine {
         if let Err(e) = self.install_new_document(doc) {
             return *e;
         }
-        Event::DocumentLoaded { paragraph_count }
+        Event::DocumentLoaded {
+            paragraph_count,
+            warnings: Vec::new(),
+        }
     }
 
     /// Issue #338 — `Command::CloseDocument`: back to the seeded empty
@@ -16790,10 +16794,18 @@ impl Engine {
                 the status bar reported the new one. Surface the error; the
                 document itself is loaded, and the shell decides how to
                 present the failure. */
+                /* Issue #406 — the reader's warning report rides the
+                reply: an open that clamped a margin or normalised a part
+                is visibly degraded, never indistinguishable from a clean
+                one. */
+                let warnings = read_report::bridge_read_warnings(&archive.warnings);
                 if let Err(e) = self.install_new_document(archive.document) {
                     return *e;
                 }
-                Event::DocumentLoaded { paragraph_count }
+                Event::DocumentLoaded {
+                    paragraph_count,
+                    warnings,
+                }
             }
             Err(e) => {
                 let kind = matches!(e, format_docx::DocxError::PackageTooLarge { .. })

@@ -49,6 +49,8 @@ export type {
     PdfConformance,
     Point,
     Rect,
+    ReadWarning,
+    ReadWarningKind,
     Script,
     SelectionKind,
     SelectionModifier,
