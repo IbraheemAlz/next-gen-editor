@@ -1156,6 +1156,9 @@ pub fn parse_document_xml_with_warnings(
     let mut r_style_id: Option<String> = None;
     let mut direct_rpr = SpanStyle::default();
     let mut run_text = String::new();
+    /* Issue #295 — the open run's `<w:rPrChange>` as a FormatChange
+    revision template; the run's text range is stamped at its close. */
+    let mut run_format_change: Option<engine::Revision> = None;
 
     /* Source-byte capture for the passthrough optimisation. `prev_pos` is
     the byte offset of the just-yielded event's end — equivalently the
@@ -1439,6 +1442,7 @@ pub fn parse_document_xml_with_warnings(
                         run_start_byte = prev_pos;
                         r_style_id = None;
                         direct_rpr = SpanStyle::default();
+                        run_format_change = None;
                         run_text.clear();
                         markup.open_run(&e, &ns, prev_pos, para_text.len() as u32);
                     }
@@ -1651,6 +1655,14 @@ pub fn parse_document_xml_with_warnings(
                         grab bag and the parser skips it, so nothing inside
                         can masquerade as live run formatting. */
                         if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            /* Issue #295 — a tracked formatting change is
+                            also modeled, for review. */
+                            if n == b"w:rPrChange" {
+                                run_format_change =
+                                    Some(crate::parts::format_change::format_change_revision(
+                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                    ));
+                            }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
                         }
                     }
@@ -2102,6 +2114,14 @@ pub fn parse_document_xml_with_warnings(
                         `<w14:glow>`, …) → the run's grab bag, verbatim. */
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            /* Issue #295 — an empty tracked formatting
+                            change (no recorded rPr) is modeled too. */
+                            if n == b"w:rPrChange" {
+                                run_format_change =
+                                    Some(crate::parts::format_change::format_change_revision(
+                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                    ));
+                            }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
                         }
                     }
@@ -2484,6 +2504,15 @@ pub fn parse_document_xml_with_warnings(
                             &style,
                             &para_text[start as usize..end as usize],
                         );
+                        /* Issue #295 — the run's tracked formatting change
+                        covers the run's text. */
+                        if let Some(change) = run_format_change.take() {
+                            para_revisions.push(engine::Revision {
+                                start,
+                                end,
+                                ..change
+                            });
+                        }
                         if style != SpanStyle::default() {
                             match spans.last_mut() {
                                 Some(last) if last.end == start && last.style == style => {

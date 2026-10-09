@@ -469,3 +469,66 @@ fn ids_survive_unrelated_edits_and_stay_unique() {
     assert_eq!(ids.len(), 2);
     assert_ne!(ids[0], ids[1]);
 }
+
+/* ============ issue #295 — a source formatting change, split ======== */
+
+/// A run carrying a source `<w:rPrChange>` (grab bag) and the matching
+/// FormatChange revision, split by sub-range formatting: accepting the
+/// revision drops the record from EVERY piece and keeps the formatting;
+/// rejecting restores the recorded formatting on every piece.
+#[test]
+fn a_split_format_change_resolves_on_both_halves() {
+    use crate::{GrabBag, SpanStyle, StyleRun};
+    let mut bag = None;
+    GrabBag::push_into(&mut bag, br#"<w:rPrChange w:id="8"/>"#.to_vec());
+    let live = SpanStyle {
+        bold: Some(true),
+        grab_bag: bag,
+        ..SpanStyle::default()
+    };
+    let prev = SpanStyle {
+        italic: Some(true),
+        ..SpanStyle::default()
+    };
+    let mut d = DocumentTree::from_paragraphs(["abcdef".to_string()]);
+    let mut blocks = d.blocks.clone();
+    if let Block::Paragraph(p) = &mut blocks[0] {
+        p.spans = vec![StyleRun {
+            start: 0,
+            end: 6,
+            style: live.clone(),
+        }];
+        p.revisions = vec![Revision {
+            id: Some(8),
+            prev_attrs: Some(prev.clone()),
+            ..rev(RevisionKind::FormatChange, 0, 6)
+        }];
+    }
+    d.blocks = blocks;
+    let underline = SpanStyle {
+        underline: Some(crate::UnderlineStyle::Single),
+        ..SpanStyle::default()
+    };
+    let split = d.apply_style(pos(0, 2), pos(0, 4), underline);
+    assert_eq!(split.nth_paragraph(0).unwrap().spans.len(), 3);
+    let at = split
+        .revision_by_id(id_of(&split, 0, RevisionSlot::Text(0)))
+        .unwrap();
+
+    let accepted = split.resolve_revision(&at, true).unwrap();
+    let p = accepted.nth_paragraph(0).unwrap();
+    assert!(p.revisions.is_empty());
+    assert!(
+        p.spans
+            .iter()
+            .all(|s| s.style.bold == Some(true) && s.style.grab_bag.is_none()),
+        "{:?}",
+        p.spans
+    );
+    assert_eq!(p.spans.len(), 3, "the new formatting stays");
+
+    let rejected = split.resolve_revision(&at, false).unwrap();
+    let p = rejected.nth_paragraph(0).unwrap();
+    assert!(p.revisions.is_empty());
+    assert!(p.spans.iter().all(|s| s.style == prev), "{:?}", p.spans);
+}

@@ -319,13 +319,13 @@ fn resolve_text_revisions(
             para.revisions.push(r);
         }
     }
-    if !accept {
-        for r in &revs {
-            if r.kind == RevisionKind::FormatChange
-                && let Some(prev) = &r.prev_attrs
-            {
+    for r in revs.iter().filter(|r| r.kind == RevisionKind::FormatChange) {
+        if !accept {
+            if let Some(prev) = &r.prev_attrs {
                 restyle(para, r.start, r.end, prev);
             }
+        } else {
+            drop_format_change_records(para, r.start, r.end);
         }
     }
     let mut cuts: Vec<(u32, u32)> = revs
@@ -409,6 +409,22 @@ pub(crate) fn shift_overlays_after_removal(para: &mut Paragraph, from: u32, remo
         shift(&mut f.end);
     }
     para.fields.retain(|f| f.start < f.end);
+}
+
+/// Issue #295 — an accepted formatting change keeps the new formatting
+/// but drops its record: the `<w:rPrChange>` a source run carries in its
+/// grab bag over `[s, e)` (`SpanStyle::for_typing` — the element a split
+/// run carries on both halves goes from both). An engine-made change has
+/// no such record.
+fn drop_format_change_records(para: &mut Paragraph, s: u32, e: u32) {
+    let (s, e) = (para.snap_offset(s), para.snap_offset(e));
+    let recorded = para
+        .spans
+        .iter()
+        .any(|r| r.start < e && s < r.end && r.style.for_typing() != r.style);
+    if s < e && recorded {
+        *para = para.restyle_with(s, e, |style| style.for_typing());
+    }
 }
 
 /// Give bytes `[s, e)` of `para` the style `style` (a rejected

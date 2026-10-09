@@ -255,6 +255,24 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   `AcceptRevision` / `RejectRevision` take instead of the range, so two
   wrappers over one range are both reachable; resolving either half of
   a tracked move resolves every move revision sharing its `move_name`.
+- **Annotation ids (issue #295).** Regenerated content never prints a
+  tracked-change annotation `w:id` (`ins` / `del` / `moveFrom` /
+  `moveTo` / `rPrChange` / `pPrChange` / …) directly: `writer::
+  revision_ids` writes a KEEP-`n` token for an id the model carries
+  (`serialize_paragraph` tokenizes its whole output, verbatim run /
+  paragraph properties included) and a FRESH token for an engine-made
+  revision; `write_docx_inner` resolves them over every regenerated part
+  together (body first, then headers / footers, notes) — a KEEP keeps
+  its id the first time unless passthrough bytes of its own part spell
+  it, the rest get ids above every id in the package (fidelity first: an
+  id two source parts already shared is left alone). A run split in two (sub-
+  range formatting, a paragraph split, a writer cut) writes its
+  `<w:rPrChange>` once with the source id; range markers are never
+  rewritten; a save that regenerates nothing is untouched. The reader
+  also models a run's `<w:rPrChange>` as a `FormatChange` revision over
+  the run (`parts::format_change`: `prev_attrs` = the recorded rPr) —
+  the element still rides the grab bag; accepting drops it
+  (`SpanStyle::for_typing`), rejecting restores `prev_attrs`.
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

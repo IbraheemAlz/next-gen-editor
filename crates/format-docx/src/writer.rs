@@ -35,6 +35,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
 
+/// Issue #295 — package-unique tracked-change annotation ids.
+#[path = "writer_revision_ids.rs"]
+mod revision_ids;
+
 /// Standard OOXML document namespace boilerplate (matches what Word emits).
 const DOC_XML_HEADER: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
@@ -477,13 +481,14 @@ fn push_escaped_attr(text: &str, out: &mut String) {
     }
 }
 
-/// Emit the opening tag of a `<w:ins>` / `<w:del>` wrapper. `id` defaults
-/// to the writer-assigned fallback when the engine model carries none —
-/// Word requires `w:id` on every wrapper, the value must be unique within
-/// the document, but is otherwise opaque.
-fn emit_revision_open(rev: &Revision, fallback_id: u32, out: &mut String) {
+/// Emit the opening tag of a `<w:ins>` / `<w:del>` wrapper. Word requires
+/// `w:id` on every wrapper and the value must be unique within the
+/// document: issue #295 — the id is a [`revision_ids::token`] (the model's
+/// id, or a fresh one when the engine model carries none — an
+/// engine-made revision), resolved package-wide when the save finishes.
+fn emit_revision_open(rev: &Revision, out: &mut String) {
     let tag = revision_tag(rev.kind);
-    let id = rev.id.unwrap_or(fallback_id);
+    let id = revision_ids::token(rev.id);
     out.push_str(&format!("<{tag} w:id=\"{id}\""));
     if !rev.author.is_empty() {
         out.push_str(" w:author=\"");
@@ -815,6 +820,19 @@ fn serialize_paragraph(
     out: &mut String,
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
+    /* Issue #295 — every annotation id this paragraph writes (its verbatim
+    or regenerated run / paragraph properties included) becomes a token
+    the save resolves package-wide (`revision_ids`). */
+    let from = out.len();
+    serialize_paragraph_body(para, out, hyperlink_rel_map);
+    revision_ids::tokenize_annotations(out, from);
+}
+
+fn serialize_paragraph_body(
+    para: &Paragraph,
+    out: &mut String,
+    hyperlink_rel_map: &HashMap<String, String>,
+) {
     /* Issues #199 / #106 — the source paragraph's attributes (rsids,
     `w14:paraId` / `w14:textId`) and markup survive regeneration. */
     let markup = para.source_markup.as_deref();
@@ -1032,7 +1050,9 @@ fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
 /// elements), or a fresh `<w:rPr>` fragment when the mark had none.
 fn with_mark_revision(props: &ParaProperties, rev: &Revision) -> ParaProperties {
     let mut el = String::new();
-    emit_revision_open(rev, 0, &mut el);
+    /* Issue #295 — a mark revision without a source id gets a fresh,
+    package-unique id (it used to be written as `w:id="0"`). */
+    emit_revision_open(rev, &mut el);
     /* `<w:ins …>` → `<w:ins …/>`: the mark element is empty. */
     el.pop();
     el.push_str("/>");
@@ -1315,7 +1335,6 @@ fn emit_styled_runs_with_objects(
     it opened (`None`: the standard end run). */
     let mut field_close: Vec<Option<&[u8]>> = Vec::new();
     let mut hyperlink_stack: Vec<&Hyperlink> = Vec::new();
-    let mut next_fallback_id: u32 = 1;
     /* Issues #199 / #106 — the `<w:r>` still open in `sink`: consecutive
     text / tab / break segments of ONE source run (same style, same
     deletion state, no markup emitted between them) share it, the way the
@@ -1430,9 +1449,7 @@ fn emit_styled_runs_with_objects(
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *r as *const _))
             {
-                let fallback = next_fallback_id;
-                next_fallback_id += 1;
-                emit_revision_open(r, fallback, out);
+                emit_revision_open(r, out);
                 rev_stack.push(r);
             }
         }
@@ -2652,7 +2669,9 @@ fn extra_root_attrs(declared: &str, extra: &[(String, String)]) -> String {
 /// goes through `write_docx`, which always has the archive in hand.
 #[cfg(test)]
 fn build_document_xml(doc: &DocumentTree, hyperlink_rel_map: &HashMap<String, String>) -> String {
-    build_document_xml_with_root(doc, hyperlink_rel_map, &[])
+    /* Issue #295 — standalone (no package save around it): resolve the
+    annotation-id tokens over this one part. */
+    revision_ids::finalize_one(build_document_xml_with_root(doc, hyperlink_rel_map, &[]))
 }
 
 /// `build_document_xml` re-declaring `root_attrs` (the source
@@ -3205,12 +3224,12 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 };
                 (present, Some(build_notes_xml(kind, doc, &root_attrs)))
             };
-        let (footnotes_present, footnotes_bytes) = notes_plan(
+        let (footnotes_present, mut footnotes_bytes) = notes_plan(
             engine::NoteKind::Footnote,
             FOOTNOTES_XML,
             doc.notes_dirty.footnotes,
         );
-        let (endnotes_present, endnotes_bytes) = notes_plan(
+        let (endnotes_present, mut endnotes_bytes) = notes_plan(
             engine::NoteKind::Endnote,
             ENDNOTES_XML,
             doc.notes_dirty.endnotes,
@@ -3471,6 +3490,46 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         }
         let body_media_rows = media_rels_rows.get(RELS_XML).cloned().unwrap_or_default();
         let mut media_rels_written: Vec<String> = Vec::new();
+
+        /* Issue #295 — build the body now (it is still written last) and
+        resolve the tracked-change annotation-id tokens of every part this
+        save regenerates together, in document order (body, headers /
+        footers, notes), so no `w:id` repeats across the package; the parts
+        written through untouched reserve the ids they spell. */
+        let mut doc_xml = build_document_xml_with_root(
+            doc,
+            &hyperlink_rid_by_target,
+            &archive.document_root_attrs,
+        )
+        .into_bytes();
+        {
+            let mut reserved = std::collections::HashSet::new();
+            for (name, bytes) in &archive.other_entries {
+                let regenerated = hf_replacements.contains_key(name.as_str())
+                    || (name == FOOTNOTES_XML && footnotes_bytes.is_some())
+                    || (name == ENDNOTES_XML && endnotes_bytes.is_some())
+                    || (name == STYLES_XML && styles_bytes.is_some())
+                    || (name == NUMBERING_XML && numbering_bytes.is_some())
+                    || (name == COMMENTS_XML && comments_bytes.is_some());
+                if !regenerated && name.starts_with("word/") && name.ends_with(".xml") {
+                    revision_ids::literal_ids(bytes, &mut reserved);
+                }
+            }
+            let mut hf: Vec<(&String, &mut Vec<u8>)> = hf_replacements
+                .iter_mut()
+                .chain(
+                    hf_new_parts
+                        .iter_mut()
+                        .map(|(_, name, bytes, ..)| (&*name, bytes)),
+                )
+                .collect();
+            hf.sort_by(|a, b| a.0.cmp(b.0));
+            let mut parts: Vec<&mut Vec<u8>> = vec![&mut doc_xml];
+            parts.extend(hf.into_iter().map(|(_, bytes)| bytes));
+            parts.extend(footnotes_bytes.as_mut());
+            parts.extend(endnotes_bytes.as_mut());
+            revision_ids::finalize(&mut parts, &reserved);
+        }
 
         /* Write sibling entries verbatim, in original order — except
         for parts we have a regenerated copy for (replace in-place).
@@ -3837,14 +3896,10 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
             zip.write_all(new_bytes)?;
         }
 
-        /* Write the regenerated document.xml. */
+        /* Write the regenerated document.xml (built and finalized above,
+        issue #295). */
         zip.start_file(DOC_XML, opts)?;
-        let xml = build_document_xml_with_root(
-            doc,
-            &hyperlink_rid_by_target,
-            &archive.document_root_attrs,
-        );
-        zip.write_all(xml.as_bytes())?;
+        zip.write_all(&doc_xml)?;
 
         zip.finish()?;
     }
@@ -10264,3 +10319,8 @@ mod inline_span_tests;
 #[cfg(test)]
 #[path = "writer_table_markup_tests.rs"]
 mod table_markup_tests;
+
+/// Issue #295 — package-unique tracked-change annotation ids.
+#[cfg(test)]
+#[path = "writer_revision_id_tests.rs"]
+mod revision_id_tests;
