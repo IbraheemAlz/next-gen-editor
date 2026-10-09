@@ -355,6 +355,7 @@ fn run_default() -> Result<()> {
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
     tracked_coverage::run_tracked_paste_roundtrip()?;
+    tracked_coverage::run_tracked_table_rows_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4988,6 +4989,25 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             name: "theme_loaded_faces.docx",
             bytes: format_docx::test_fixtures::theme_loaded_faces_docx(),
             entry: theme_fixture_entry(),
+        },
+        /* Issue #365 — a table under review: a tracked row deletion, a
+        tracked row insertion, `<w:tblPrChange>` / `<w:trPrChange>`
+        history. Zero-edit drift 0; the default harness's step 48 edits,
+        resolves and re-records it. */
+        PrebuiltFixture {
+            name: "tracked_table_rows.docx",
+            bytes: format_docx::test_fixtures::tracked_table_rows_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec!["Rows under review".into(), "after".into()],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
         },
     ]
 }

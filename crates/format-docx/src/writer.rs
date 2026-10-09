@@ -2925,8 +2925,11 @@ fn emit_table_row(row: &TableRow, out: &mut String, hyperlink_rel_map: &HashMap<
 }
 
 fn emit_tr_pr(props: &engine::RowProperties, source: Option<&[u8]>, out: &mut String) {
-    let has =
-        props.height.is_some() || props.cant_split || props.header || props.grab_bag.is_some();
+    let has = props.height.is_some()
+        || props.cant_split
+        || props.header
+        || props.grab_bag.is_some()
+        || !props.revisions.is_empty();
     if !has {
         return;
     }
@@ -2953,9 +2956,43 @@ fn emit_tr_pr(props: &engine::RowProperties, source: Option<&[u8]>, out: &mut St
     if props.header {
         ch.push(rank(b"w:tblHeader"), "<w:tblHeader/>".into());
     }
+    /* Issue #365 — the tracked row insertion / deletion (`CT_TrPr`'s
+    `ins` / `del` tail, before `trPrChange`); the id is a #295 token. */
+    for rev in &props.revisions {
+        let tag: &[u8] = match rev.kind {
+            RevisionKind::Insert | RevisionKind::MoveTo => b"w:ins",
+            RevisionKind::Delete | RevisionKind::MoveFrom => b"w:del",
+            RevisionKind::FormatChange => continue,
+        };
+        ch.push(rank(tag), empty_track_change(rev, tag));
+    }
     ch.push_bag(&props.grab_bag, tr_pr_child_rank);
     ch.adopt(source);
     ch.finish("w:trPr", out);
+}
+
+/// Issue #365 — an empty `CT_TrackChange` element `<tag w:id w:author
+/// w:date/>` for `rev` (a table row's `<w:trPr><w:del/>`); the id is a
+/// [`revision_ids::token`] like every regenerated annotation id.
+fn empty_track_change(rev: &Revision, tag: &[u8]) -> String {
+    let mut s = String::new();
+    s.push('<');
+    push_utf8(tag, &mut s);
+    s.push_str(" w:id=\"");
+    s.push_str(&revision_ids::token(rev.id));
+    s.push('"');
+    if !rev.author.is_empty() {
+        s.push_str(" w:author=\"");
+        push_escaped_attr(&rev.author, &mut s);
+        s.push('"');
+    }
+    if !rev.date.is_empty() {
+        s.push_str(" w:date=\"");
+        push_escaped_attr(&rev.date, &mut s);
+        s.push('"');
+    }
+    s.push_str("/>");
+    s
 }
 
 fn emit_table_cell(
@@ -11108,3 +11145,8 @@ mod complex_script_tests;
 #[cfg(test)]
 #[path = "writer_theme_tests.rs"]
 mod theme_tests;
+
+/// Issue #365 — tracked table-row revisions.
+#[cfg(test)]
+#[path = "writer_row_revision_tests.rs"]
+mod row_revision_tests;

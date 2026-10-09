@@ -1379,6 +1379,10 @@ struct RevisionOut {
     /// addressed by the empty range `start == end == text length`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mark: bool,
+    /// Issue #365 — a tracked table-ROW insertion / deletion: the row's
+    /// index in the top-level table at `block` (`start == end == 0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row: Option<u32>,
     /// Issue #304 — the revision's stable id
     /// (`DocumentTree::revision_entries`): what `AcceptRevision` /
     /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
@@ -1389,9 +1393,10 @@ struct RevisionOut {
 /// The `revisions_snapshot()` rows: every tracked change of the
 /// top-level paragraphs, in document order — per paragraph its text
 /// revisions, then its mark's changes (issue #262: the empty range at
-/// the paragraph end; issue #303: one row per change, in order) — each
-/// with its issue #304 `revision_id` (the range alone addresses only a
-/// mark's FIRST change; the id addresses each).
+/// the paragraph end; issue #303: one row per change, in order) — and,
+/// issue #365, every row change of a top-level table — each with its
+/// issue #304 `revision_id` (the range alone addresses only a mark's
+/// FIRST change, and no row change; the id addresses each).
 fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
     doc.revision_entries()
         .into_iter()
@@ -1402,9 +1407,15 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
             };
             let r = e.revision;
             let mark = matches!(e.at.slot, engine::RevisionSlot::Mark(_));
+            let row = match e.at.slot {
+                engine::RevisionSlot::Row { row, .. } => Some(row),
+                _ => None,
+            };
             let (start, end) = if mark {
-                let end = e.paragraph.text.len() as u32;
+                let end = e.paragraph.map_or(0, |p| p.text.len() as u32);
                 (end, end)
+            } else if row.is_some() {
+                (0, 0)
             } else {
                 (r.start, r.end)
             };
@@ -1417,6 +1428,7 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
                 date: r.date.clone(),
                 move_name: r.move_name.clone(),
                 mark,
+                row,
                 revision_id: e.id,
             })
         })

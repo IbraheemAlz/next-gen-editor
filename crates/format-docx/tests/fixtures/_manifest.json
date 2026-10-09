@@ -485,6 +485,20 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "tracked_table_rows.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "Rows under review",
+          "after"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "w14_paraid_word.docx": {
       "generator": "handcrafted",
       "phase_introduced": 11,

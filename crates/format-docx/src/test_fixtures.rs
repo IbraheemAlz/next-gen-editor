@@ -791,3 +791,62 @@ pub fn theme_loaded_faces_docx() -> Vec<u8> {
         ("Amiri", "Amiri"),
     ))
 }
+
+/// Issue #365 — the cell texts of [`tracked_table_rows_docx`], row by row.
+pub const TRACKED_ROWS_CELLS: [[&str; 2]; 3] = [
+    ["kept A", "kept B"],
+    ["gone A", "gone B"],
+    ["new A", "new B"],
+];
+
+/// Issue #365 — a table under review, in Word's shape (no corpus document
+/// with a tracked row was at hand; this is our own XML): row 0 untouched
+/// but carrying a `<w:trPrChange>` (and the table a `<w:tblPrChange>`) —
+/// property history the model keeps as verbatim grab-bag bytes; row 1 a
+/// tracked row DELETION (`<w:trPr><w:del/>`, its cells' text in `<w:del>`
+/// runs and their marks deleted); row 2 a tracked row INSERTION
+/// (`<w:trPr><w:ins/>`, inserted text and marks). Source of
+/// `tools/roundtrip`'s `tracked_table_rows.docx` (step 48).
+pub fn tracked_table_rows_docx() -> Vec<u8> {
+    const D1: &str = "w:author=\"Author\" w:date=\"2026-01-01T00:00:00Z\"";
+    const D2: &str = "w:author=\"Author\" w:date=\"2026-01-02T00:00:00Z\"";
+    const D3: &str = "w:author=\"Author\" w:date=\"2026-01-03T00:00:00Z\"";
+    let cell = |inner: &str| {
+        format!("<w:tc><w:tcPr><w:tcW w:w=\"4675\" w:type=\"dxa\"/></w:tcPr>{inner}</w:tc>")
+    };
+    let [[k0, k1], [g0, g1], [n0, n1]] = TRACKED_ROWS_CELLS;
+    let kept = |t: &str| cell(&format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>"));
+    let gone = |t: &str, mark: u32| {
+        cell(&format!(
+            "<w:p><w:pPr><w:rPr><w:del w:id=\"{mark}\" {D2}/></w:rPr></w:pPr>\
+             <w:del w:id=\"{}\" {D2}><w:r><w:delText>{t}</w:delText></w:r></w:del></w:p>",
+            mark + 1
+        ))
+    };
+    let new = |t: &str, mark: u32| {
+        cell(&format!(
+            "<w:p><w:pPr><w:rPr><w:ins w:id=\"{mark}\" {D3}/></w:rPr></w:pPr>\
+             <w:ins w:id=\"{}\" {D3}><w:r><w:t>{t}</w:t></w:r></w:ins></w:p>",
+            mark + 1
+        ))
+    };
+    let body = format!(
+        "<w:p w:rsidR=\"00D0A1B2\"><w:r><w:t>Rows under review</w:t></w:r></w:p>\
+         <w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"0\" w:type=\"auto\"/>\
+         <w:tblLook w:val=\"04A0\"/><w:tblPrChange w:id=\"1\" {D1}><w:tblPr>\
+         <w:tblW w:w=\"5000\" w:type=\"pct\"/></w:tblPr></w:tblPrChange></w:tblPr>\
+         <w:tblGrid><w:gridCol w:w=\"4675\"/><w:gridCol w:w=\"4675\"/></w:tblGrid>\
+         <w:tr w:rsidR=\"00D0A1B2\" w:rsidTr=\"00E3F4A5\"><w:trPr><w:trHeight w:val=\"400\"/>\
+         <w:trPrChange w:id=\"2\" {D1}><w:trPr/></w:trPrChange></w:trPr>{}{}</w:tr>\
+         <w:tr w:rsidR=\"00D0A1B2\" w:rsidTr=\"00E3F4A5\"><w:trPr><w:del w:id=\"3\" {D2}/></w:trPr>{}{}</w:tr>\
+         <w:tr w:rsidR=\"00F6A7B8\"><w:trPr><w:ins w:id=\"8\" {D3}/></w:trPr>{}{}</w:tr>\
+         </w:tbl><w:p><w:r><w:t>after</w:t></w:r></w:p>",
+        kept(k0),
+        kept(k1),
+        gone(g0, 4),
+        gone(g1, 6),
+        new(n0, 9),
+        new(n1, 11),
+    );
+    docx_with_body(&body)
+}

@@ -216,3 +216,74 @@ test('a tracked IME commit through the hidden input is an insertion reject remov
     ]);
     expect(await plain(page)).toBe('alpha beta');
 });
+
+/* Issue #365 — tracked table rows: selecting two rows and pressing Delete
+ * with review mode on marks the rows deleted (`<w:trPr><w:del/>`) instead
+ * of answering an error; the sidebar lists each row, accepting one removes
+ * exactly that row, accept-all the rest. Row counts read the a11y mirror's
+ * table (engine truth, valid under headless Chrome). */
+
+const inCell = (row: number, col: number, offset: number) => ({
+    path: {
+        steps: [
+            { kind: 'BLOCK', idx: 1 },
+            { kind: 'CELL', row, col },
+            { kind: 'BLOCK', idx: 0 },
+        ],
+    },
+    offset,
+});
+const caretIn = (row: number, col: number) => ({
+    type: 'SET_SELECTION',
+    range: { start: inCell(row, col, 0), end: inCell(row, col, 0) },
+    caret: inCell(row, col, 0),
+});
+
+test('select two table rows in review mode, Delete, accept', async ({ page }) => {
+    await boot(page);
+    const cells: unknown[] = [];
+    for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 2; c++) {
+            cells.push(caretIn(r, c), { type: 'INSERT_TEXT', at: undefined, text: `r${r}c${c}` });
+        }
+    }
+    await run(page, [
+        { type: 'SELECT_ALL' },
+        { type: 'INSERT_TEXT', at: undefined, text: 'before' },
+        { type: 'INSERT_TABLE', at: { steps: [{ kind: 'BLOCK', idx: 1 }] }, rows: 3, cols: 2 },
+        ...cells,
+        { type: 'TOGGLE_TRACK_CHANGES', enabled: true },
+    ]);
+    const tableRows = page.locator('table[role="table"] tr[role="row"]');
+    await expect(tableRows).toHaveCount(3);
+
+    const depth = (await run(page, [caretIn(0, 0)])).undo_depth as number;
+    const deleted = await run(page, [
+        {
+            type: 'SET_SELECTION',
+            range: { start: inCell(0, 0, 0), end: inCell(1, 1, 4) },
+            caret: inCell(1, 1, 4),
+        },
+        { type: 'DELETE_AT_CARET', forward: true, by_word: false },
+    ]);
+    /* Not an error, one undo step; the rows stay (struck) until accepted. */
+    expect(deleted.type).toBe('SELECTION_CHANGED');
+    expect(deleted.undo_depth).toBe(depth + 1);
+    await expect(tableRows).toHaveCount(3);
+
+    const sidebar = page.getByRole('complementary', { name: 'Track changes' });
+    const rows = sidebar.locator('.nge-tc__row');
+    await sidebar.getByRole('button', { name: 'Refresh' }).click();
+    await expect(rows).toHaveCount(2);
+    await expect(rows.first()).toContainText('Table row deleted');
+    await expect(rows.first()).toContainText('row 1');
+
+    await rows.first().getByRole('button', { name: 'Accept revision' }).click();
+    await expect(rows).toHaveCount(1);
+    await expect(tableRows).toHaveCount(2);
+
+    await run(page, [{ type: 'ACCEPT_ALL_REVISIONS' }]);
+    await expect(tableRows).toHaveCount(1);
+    await expect(page.locator('table[role="table"]')).toContainText('r2c0');
+    await expect(page.locator('table[role="table"]')).not.toContainText('r1c0');
+});

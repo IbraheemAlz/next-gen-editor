@@ -25,18 +25,25 @@
 
 use std::collections::HashSet;
 
-use crate::{Block, BlockPath, DocumentTree, Paragraph, PathStep, Revision, RevisionKind};
+use crate::{
+    Block, BlockPath, DocumentTree, Paragraph, PathStep, Revision, RevisionKind, TableRow,
+};
 
-/// Which revision of a paragraph a [`RevisionRef`] means.
+/// Which revision of a paragraph (or, issue #365, of a table row) a
+/// [`RevisionRef`] means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RevisionSlot {
     /// `Paragraph::revisions[i]`.
     Text(u32),
     /// `Paragraph::mark_revisions[i]`.
     Mark(u32),
+    /// Issue #365 — `rows[row].props.revisions[index]` of the TABLE at
+    /// [`RevisionRef::path`] (a tracked row insertion / deletion).
+    Row { row: u32, index: u32 },
 }
 
-/// One tracked change: the paragraph it lives in and its slot there.
+/// One tracked change: the paragraph it lives in (the table, for a
+/// [`RevisionSlot::Row`]) and its slot there.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RevisionRef {
     pub path: BlockPath,
@@ -75,6 +82,20 @@ impl RevisionPick {
             }),
         }
     }
+
+    /// Issue #365 — revision `i` of row `row` of the table at `table`.
+    pub(crate) fn row(&self, table: &BlockPath, row: usize, i: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(set) => set.contains(&RevisionRef {
+                path: table.clone(),
+                slot: RevisionSlot::Row {
+                    row: row as u32,
+                    index: i as u32,
+                },
+            }),
+        }
+    }
 }
 
 /// Issue #304 — one tracked change as the review UI lists it.
@@ -84,45 +105,67 @@ pub struct RevisionEntry<'a> {
     pub id: u32,
     pub at: RevisionRef,
     pub revision: &'a Revision,
-    /// The paragraph the revision lives in.
-    pub paragraph: &'a Paragraph,
+    /// The paragraph the revision lives in; `None` for a table-row
+    /// revision (issue #365 — [`RevisionSlot::Row`]).
+    pub paragraph: Option<&'a Paragraph>,
 }
 
 impl DocumentTree {
     /// Issue #304 — every tracked change the resolver reaches (the body
     /// and one level of table cells), in document order — per paragraph
     /// its text revisions, then its mark's changes in order (one entry
-    /// each, issue #303) — each with its stable `revision_id`. Ids are
-    /// unique within the document.
+    /// each, issue #303); issue #365 — per row of a top-level table its
+    /// row changes, ahead of the row's cell paragraphs — each with its
+    /// stable `revision_id`. Ids are unique within the document.
     pub fn revision_entries(&self) -> Vec<RevisionEntry<'_>> {
         let mut used = HashSet::new();
         let mut out = Vec::new();
-        for (path, p) in paragraphs_deep(&self.blocks) {
-            let slots = p
-                .revisions
-                .iter()
-                .enumerate()
-                .map(|(i, r)| (RevisionSlot::Text(i as u32), r))
-                .chain(
-                    p.mark_revisions
+        let mut push = |at: RevisionRef, key: u32, revision, paragraph| {
+            let mut id = key;
+            while !used.insert(id) {
+                id = id.wrapping_add(1);
+            }
+            out.push(RevisionEntry {
+                id,
+                at,
+                revision,
+                paragraph,
+            });
+        };
+        for item in items_deep(&self.blocks) {
+            match item {
+                Item::Paragraph(path, p) => {
+                    let slots = p
+                        .revisions
                         .iter()
                         .enumerate()
-                        .map(|(i, r)| (RevisionSlot::Mark(i as u32), r)),
-                );
-            for (slot, r) in slots {
-                let mut id = content_key(p, slot, r);
-                while !used.insert(id) {
-                    id = id.wrapping_add(1);
+                        .map(|(i, r)| (RevisionSlot::Text(i as u32), r))
+                        .chain(
+                            p.mark_revisions
+                                .iter()
+                                .enumerate()
+                                .map(|(i, r)| (RevisionSlot::Mark(i as u32), r)),
+                        );
+                    for (slot, r) in slots {
+                        let at = RevisionRef {
+                            path: path.clone(),
+                            slot,
+                        };
+                        push(at, content_key(p, slot, r), r, Some(p));
+                    }
                 }
-                out.push(RevisionEntry {
-                    id,
-                    at: RevisionRef {
-                        path: path.clone(),
-                        slot,
-                    },
-                    revision: r,
-                    paragraph: p,
-                });
+                Item::Row(table, row, tr) => {
+                    for (i, r) in tr.props.revisions.iter().enumerate() {
+                        let at = RevisionRef {
+                            path: table.clone(),
+                            slot: RevisionSlot::Row {
+                                row,
+                                index: i as u32,
+                            },
+                        };
+                        push(at, row_key(tr, r), r, None);
+                    }
+                }
             }
         }
         out
@@ -176,10 +219,19 @@ impl DocumentTree {
     /// restores the source). `None` when `at` names no revision (the
     /// tree is unchanged — no undo step for the caller).
     pub fn resolve_revision(&self, at: &RevisionRef, accept: bool) -> Option<Self> {
-        let p = self.paragraph_at_path(&at.path)?;
         let target = match at.slot {
-            RevisionSlot::Text(i) => p.revisions.get(i as usize),
-            RevisionSlot::Mark(i) => p.mark_revisions.get(i as usize),
+            RevisionSlot::Text(i) => self.paragraph_at_path(&at.path)?.revisions.get(i as usize),
+            RevisionSlot::Mark(i) => self
+                .paragraph_at_path(&at.path)?
+                .mark_revisions
+                .get(i as usize),
+            RevisionSlot::Row { row, index } => self
+                .table_at_path(&at.path)?
+                .rows
+                .get(row as usize)?
+                .props
+                .revisions
+                .get(index as usize),
         }?;
         let mut picked = HashSet::from([at.clone()]);
         if let Some(name) = move_of(target) {
@@ -244,12 +296,33 @@ fn move_of(r: &Revision) -> Option<&str> {
 /// cells, `fields::for_each_paragraph_deep`'s reach — with its path, in
 /// document order.
 fn paragraphs_deep(blocks: &im::Vector<Block>) -> Vec<(BlockPath, &Paragraph)> {
+    items_deep(blocks)
+        .into_iter()
+        .filter_map(|item| match item {
+            Item::Paragraph(path, p) => Some((path, p)),
+            Item::Row(..) => None,
+        })
+        .collect()
+}
+
+/// One stop of [`items_deep`].
+enum Item<'a> {
+    Paragraph(BlockPath, &'a Paragraph),
+    /// Issue #365 — row `.1` of the top-level table at `.0`.
+    Row(BlockPath, u32, &'a TableRow),
+}
+
+/// Every paragraph [`paragraphs_deep`] walks and, issue #365, every row
+/// of a top-level table (ahead of its cell paragraphs), in document
+/// order.
+fn items_deep(blocks: &im::Vector<Block>) -> Vec<Item<'_>> {
     let mut out = Vec::new();
     for (bi, block) in blocks.iter().enumerate() {
         match block {
-            Block::Paragraph(p) => out.push((BlockPath::top(bi as u32), p)),
+            Block::Paragraph(p) => out.push(Item::Paragraph(BlockPath::top(bi as u32), p)),
             Block::Table(t) => {
                 for (ri, row) in t.rows.iter().enumerate() {
+                    out.push(Item::Row(BlockPath::top(bi as u32), ri as u32, row));
                     for (ci, cell) in row.cells.iter().enumerate() {
                         for (pi, nested) in cell.blocks.iter().enumerate() {
                             if let Block::Paragraph(p) = nested {
@@ -261,7 +334,7 @@ fn paragraphs_deep(blocks: &im::Vector<Block>) -> Vec<(BlockPath, &Paragraph)> {
                                     },
                                     PathStep::Block(pi as u32),
                                 ];
-                                out.push((BlockPath { steps }, p));
+                                out.push(Item::Paragraph(BlockPath { steps }, p));
                             }
                         }
                     }
@@ -272,17 +345,45 @@ fn paragraphs_deep(blocks: &im::Vector<Block>) -> Vec<(BlockPath, &Paragraph)> {
     out
 }
 
-/// The content half of a revision's id: FNV-1a over what the revision
-/// IS — never where it sits.
-fn content_key(p: &Paragraph, slot: RevisionSlot, r: &Revision) -> u32 {
+/// Issue #365 — the content half of a row revision's id: what the
+/// revision is (kind, author, date, `w:id`) and the row's text (its
+/// direct cell paragraphs', cell by cell) — never where the row sits.
+fn row_key(row: &TableRow, r: &Revision) -> u32 {
     let mut h = Fnv1a::new();
-    let kind = match r.kind {
+    h.write(&[kind_code(r.kind), 2]);
+    h.write_str(&r.author);
+    h.write_str(&r.date);
+    match r.id {
+        Some(id) => {
+            h.write(b"#");
+            h.write(&id.to_le_bytes());
+        }
+        None => h.write(b"-"),
+    }
+    for cell in &row.cells {
+        for p in cell.blocks.iter().filter_map(Block::as_paragraph) {
+            h.write_str(&p.text);
+        }
+        h.write(&[0xFE]);
+    }
+    h.0
+}
+
+fn kind_code(kind: RevisionKind) -> u8 {
+    match kind {
         RevisionKind::Insert => 1,
         RevisionKind::Delete => 2,
         RevisionKind::FormatChange => 3,
         RevisionKind::MoveFrom => 4,
         RevisionKind::MoveTo => 5,
-    };
+    }
+}
+
+/// The content half of a revision's id: FNV-1a over what the revision
+/// IS — never where it sits.
+fn content_key(p: &Paragraph, slot: RevisionSlot, r: &Revision) -> u32 {
+    let mut h = Fnv1a::new();
+    let kind = kind_code(r.kind);
     let covered = match slot {
         RevisionSlot::Text(_) => {
             let len = p.text.len() as u32;
@@ -290,7 +391,7 @@ fn content_key(p: &Paragraph, slot: RevisionSlot, r: &Revision) -> u32 {
             let e = p.snap_offset(r.end.min(len)).max(s);
             p.text.get(s as usize..e as usize).unwrap_or("")
         }
-        RevisionSlot::Mark(_) => p.text.as_str(),
+        RevisionSlot::Mark(_) | RevisionSlot::Row { .. } => p.text.as_str(),
     };
     h.write(&[kind, u8::from(matches!(slot, RevisionSlot::Mark(_)))]);
     h.write_str(&r.author);

@@ -21,20 +21,22 @@ use std::collections::HashSet;
 use crate::revision_refs::RevisionPick;
 use crate::text_remap::TextEdit;
 use crate::{
-    Block, BlockPath, DocumentTree, Paragraph, PathStep, Revision, RevisionKind, SpanStyle,
-    StyleRun, delete_block_at_path, mutate_paragraph_in_top, parent_container_snapshot,
+    Block, BlockPath, CellMove, DocumentTree, Paragraph, PathStep, Revision, RevisionKind,
+    SpanStyle, StyleRun, delete_block_at_path, mutate_paragraph_in_top, parent_container_snapshot,
     replace_block_in_top,
 };
 
 impl DocumentTree {
     /// `true` when any body paragraph (table cells included) carries a
-    /// tracked change — text overlay or paragraph mark.
+    /// tracked change — text overlay or paragraph mark — or, issue #365,
+    /// any table row (nested tables included) a tracked row insertion /
+    /// deletion.
     pub fn has_revisions(&self) -> bool {
         let mut any = false;
         crate::fields::for_each_paragraph_deep(&self.blocks, &mut |_, p| {
             any |= !p.revisions.is_empty() || !p.mark_revisions.is_empty();
         });
-        any
+        any || self.blocks.iter().any(block_has_row_revisions)
     }
 
     /// Issue #262 — accept (`accept == true`) or reject every tracked
@@ -53,6 +55,13 @@ impl DocumentTree {
     ///    container, or carrying a section break cannot merge and only
     ///    loses its revision. A mark carrying several changes (issue #303)
     ///    resolves them in order: any one that removes the mark merges.
+    ///    Issue #365 — a table's rows resolve in the same walk, after the
+    ///    marks inside its cells and before the paragraph in front of it:
+    ///    an accepted row deletion or a rejected row insertion removes
+    ///    the row (a table left without rows goes), any other decision
+    ///    just drops the row's revision — so a paragraph whose deleted
+    ///    mark stood in front of a fully deleted table merges with the
+    ///    paragraph after it.
     /// 3. With every move resolved, the orphaned in-paragraph move-range
     ///    markers (`<w:moveFromRangeStart/>` …) are dropped.
     pub fn resolve_all_revisions(&self, accept: bool) -> Self {
@@ -186,6 +195,8 @@ impl DocumentTree {
                         inner.push(PathStep::Cell { row, col });
                         self.resolve_marks_in(&inner, accept, pick);
                     }
+                    /* Issue #365 — then the rows themselves. */
+                    self.resolve_rows(&path, accept, pick);
                 }
                 Some(Block::Paragraph(p))
                     if (0..p.mark_revisions.len()).any(|j| pick.mark(&path, j)) =>
@@ -238,6 +249,135 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #365 — resolve the row revisions `pick` selects of the table
+    /// at `table`: per row, in order, a decided change that removes the
+    /// row (an accepted deletion, a rejected insertion) removes it — and
+    /// every other change with it — otherwise the decided changes are
+    /// dropped and the rest stay pending ([`Self::remove_table_rows`]).
+    fn resolve_rows(&mut self, table: &BlockPath, accept: bool, pick: &RevisionPick) {
+        let Some(t) = self.table_at_path(table) else {
+            return;
+        };
+        let mut gone = Vec::new();
+        let mut kept: Vec<(usize, Vec<Revision>)> = Vec::new();
+        for (r, row) in t.rows.iter().enumerate() {
+            let revs = &row.props.revisions;
+            let decided: Vec<bool> = (0..revs.len()).map(|j| pick.row(table, r, j)).collect();
+            if !decided.contains(&true) {
+                continue;
+            }
+            if revs
+                .iter()
+                .zip(&decided)
+                .any(|(rv, &d)| d && rv.kind.removes_text(accept))
+            {
+                gone.push(r as u32);
+            } else {
+                let rest = revs
+                    .iter()
+                    .zip(&decided)
+                    .filter(|&(_, &d)| !d)
+                    .map(|(rv, _)| rv.clone())
+                    .collect();
+                kept.push((r, rest));
+            }
+        }
+        if !kept.is_empty() {
+            let mut t = t.clone();
+            for (r, rest) in kept {
+                t.rows[r].props.revisions = rest;
+            }
+            t.dirty = true;
+            t.source_xml = None;
+            let mut top = self.blocks.clone();
+            let _ = replace_block_in_top(&mut top, table, Block::Table(t));
+            self.blocks = top;
+        }
+        self.remove_table_rows(table, &gone);
+    }
+
+    /// Issue #365 — remove rows `rows` (indices into the table as it is
+    /// now, any order) of the table at `table`, comment anchors following
+    /// ([`Self::remap_table_cells`]: an anchor in a removed row collapses
+    /// onto the start of the next surviving row, else the end of the
+    /// previous one). A table left without rows goes too
+    /// ([`Self::remap_block_splice`]) — replaced by an empty paragraph
+    /// when it was its container's only block, so a cell or the body is
+    /// never left empty. Returns `true` when the table left its container
+    /// (the blocks after it moved up one).
+    pub(crate) fn remove_table_rows(&mut self, table: &BlockPath, rows: &[u32]) -> bool {
+        let Some(t) = self.table_at_path(table) else {
+            return false;
+        };
+        let before = t.rows.len() as u32;
+        let mut gone: Vec<u32> = rows.iter().copied().filter(|&r| r < before).collect();
+        gone.sort_unstable();
+        gone.dedup();
+        if gone.is_empty() {
+            return false;
+        }
+        let Some((PathStep::Block(idx), container)) = table.steps.split_last() else {
+            return false;
+        };
+        let mut t = t.clone();
+        for &r in gone.iter().rev() {
+            t.rows.remove(r as usize);
+        }
+        t.dirty = true;
+        t.source_xml = None;
+        let mut top = self.blocks.clone();
+        if t.rows.is_empty() {
+            let alone = container_blocks(self, container).is_some_and(|b| b.len() == 1);
+            if alone {
+                let _ =
+                    replace_block_in_top(&mut top, table, Block::Paragraph(Paragraph::default()));
+                self.blocks = top;
+                self.remap_block_splice(container, *idx, 1, 1);
+            } else {
+                let _ = delete_block_at_path(&mut top, table);
+                self.blocks = top;
+                self.remap_block_splice(container, *idx, 1, 0);
+            }
+            return !alone;
+        }
+        let last_cols: Vec<u32> = t
+            .rows
+            .iter()
+            .map(|r| r.cells.len().saturating_sub(1) as u32)
+            .collect();
+        let _ = replace_block_in_top(&mut top, table, Block::Table(t));
+        self.blocks = top;
+        let new_index = |r: u32| r - gone.iter().filter(|&&g| g < r).count() as u32;
+        self.remap_table_cells(table, |r, col| {
+            if gone.binary_search(&r).is_err() {
+                let to = new_index(r);
+                return if to == r {
+                    CellMove::Keep
+                } else {
+                    CellMove::To { row: to, col }
+                };
+            }
+            if let Some(next) = (r + 1..before).find(|x| gone.binary_search(x).is_err()) {
+                return CellMove::Collapse {
+                    row: new_index(next),
+                    col: 0,
+                    at_end: false,
+                };
+            }
+            let prev = (0..r)
+                .rev()
+                .find(|x| gone.binary_search(x).is_err())
+                .unwrap_or(0);
+            let row = new_index(prev);
+            CellMove::Collapse {
+                row,
+                col: last_cols.get(row as usize).copied().unwrap_or(0),
+                at_end: true,
+            }
+        });
+        false
+    }
+
     /// Remove the MARK of paragraph `i` of `container`: merge it with the
     /// paragraph after it (the merged paragraph ends with the tail's mark
     /// and its revisions), remapping the comment anchors. `false` — and
@@ -275,6 +415,20 @@ impl DocumentTree {
             self.remap_paragraph_merge(&path, head_len, i + 1, 0);
         }
         true
+    }
+}
+
+/// Issue #365 — `block` is (or holds, at any depth) a table row carrying
+/// a tracked change.
+fn block_has_row_revisions(block: &Block) -> bool {
+    match block {
+        Block::Paragraph(_) => false,
+        Block::Table(t) => t.rows.iter().any(|r| {
+            !r.props.revisions.is_empty()
+                || r.cells
+                    .iter()
+                    .any(|c| c.blocks.iter().any(block_has_row_revisions))
+        }),
     }
 }
 

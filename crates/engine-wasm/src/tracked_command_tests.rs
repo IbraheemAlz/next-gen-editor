@@ -299,32 +299,164 @@ fn typing_over_a_cross_paragraph_selection_marks_and_inserts() {
     assert_eq!(texts(&e), vec!["oXwo"]);
 }
 
-#[test]
-fn a_tracked_delete_over_a_table_answers_an_error() {
-    let doc = DocumentTree::from_paragraphs(["before".to_string(), "after".to_string()])
-        .insert_table(engine::BlockPath::top(1), 1, 1);
-    let after = doc
-        .blocks
-        .iter()
-        .rposition(|b| b.as_paragraph().is_some())
-        .expect("paragraph") as u32;
+/* ======================= issue #365 — tracked table rows ==== */
+
+/// `["before", <2 × 2 table "r{r}c{c}">, "after"]`, review mode on.
+fn table_engine() -> Engine {
+    let mut doc = DocumentTree::from_paragraphs(["before".to_string(), "after".to_string()])
+        .insert_table(engine::BlockPath::top(1), 2, 2);
+    for r in 0..2 {
+        for c in 0..2 {
+            let at = engine::LogicalPos::new(bridge_to_engine_path(cell_path(r, c)), 0);
+            doc = doc.insert_text(at, &format!("r{r}c{c}"));
+        }
+    }
     let mut e = tracking_engine(&["x"]);
     e.undo = UndoStack::new(doc, 100);
-    let depth = e.undo.depth();
-    let evt = block_on(e.apply(Command::DeleteRange {
-        range: BridgeLogicalRange {
-            start: bpos_top(0, 2),
-            end: bpos_top(after, 2),
-        },
-    }));
-    match evt {
-        Event::Error { message, .. } => {
-            assert!(message.starts_with("DeleteRange: "), "{message}");
-            assert!(message.contains("table"), "{message}");
-        }
-        other => panic!("expected a typed error, got {other:?}"),
+    caret(&mut e, 0, 0);
+    e
+}
+
+/// The bridge path of cell `(row, col)`'s first paragraph of the table at
+/// block 1.
+fn cell_path(row: u32, col: u32) -> BridgeBlockPath {
+    BridgeBlockPath {
+        steps: vec![
+            BridgePathStep::Block { idx: 1 },
+            BridgePathStep::Cell { row, col },
+            BridgePathStep::Block { idx: 0 },
+        ],
     }
-    assert_eq!(e.undo.depth(), depth, "nothing pushed");
+}
+
+fn row_kinds(e: &Engine) -> Vec<Vec<engine::RevisionKind>> {
+    e.undo
+        .current()
+        .table_at_path(&engine::BlockPath::top(1))
+        .map(|t| {
+            t.rows
+                .iter()
+                .map(|r| r.props.revisions.iter().map(|x| x.kind).collect())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn shape(e: &Engine) -> Vec<String> {
+    e.undo
+        .current()
+        .blocks
+        .iter()
+        .map(|b| match b {
+            engine::Block::Paragraph(p) => p.text.clone(),
+            engine::Block::Table(t) => format!("<table {}>", t.rows.len()),
+        })
+        .collect()
+}
+
+#[test]
+fn a_tracked_delete_over_a_table_marks_its_rows() {
+    let mut e = table_engine();
+    let depth = e.undo.depth();
+    apply(
+        &mut e,
+        Command::DeleteRange {
+            range: BridgeLogicalRange {
+                start: bpos_top(0, 2),
+                end: bpos_top(2, 2),
+            },
+        },
+    );
+    assert_eq!(e.undo.depth(), depth + 1, "one undo step");
+    assert_eq!(shape(&e), vec!["before", "<table 2>", "after"]);
+    assert_eq!(row_kinds(&e), vec![vec![DEL], vec![DEL]]);
+    apply(&mut e, Command::AcceptAllRevisions);
+    assert_eq!(shape(&e), vec!["beter"]);
+    assert!(selection_valid(&e));
+    apply(&mut e, Command::Undo);
+    apply(&mut e, Command::RejectAllRevisions);
+    assert_eq!(shape(&e), vec!["before", "<table 2>", "after"]);
+    assert!(!e.undo.current().has_revisions());
+}
+
+/// Select two rows (start of the first cell to the end of the last),
+/// Delete: both rows are marked deleted; the review rows list each under
+/// its own id; accepting one by id removes exactly that row.
+#[test]
+fn deleting_two_selected_rows_marks_them_and_accept_removes_them() {
+    let mut e = table_engine();
+    e.selection = Some(SelectionState {
+        anchor: BridgeLogicalPos {
+            path: cell_path(0, 0),
+            offset: 0,
+        },
+        caret: BridgeLogicalPos {
+            path: cell_path(1, 1),
+            offset: 4,
+        },
+        ideal_x: None,
+        kind: SelectionKind::Linear,
+    });
+    delete_at_caret(&mut e, true);
+    assert_eq!(row_kinds(&e), vec![vec![DEL], vec![DEL]]);
+    let rows: Vec<_> = revision_rows(e.undo.current())
+        .into_iter()
+        .filter(|r| r.row.is_some())
+        .collect();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.block, r.row, r.kind, r.start, r.end))
+            .collect::<Vec<_>>(),
+        vec![(1, Some(0), "delete", 0, 0), (1, Some(1), "delete", 0, 0)]
+    );
+    apply(
+        &mut e,
+        Command::AcceptRevision {
+            block: 1,
+            start: 0,
+            end: 0,
+            revision_id: Some(rows[0].revision_id),
+        },
+    );
+    assert_eq!(shape(&e), vec!["before", "<table 1>", "after"]);
+    assert_eq!(row_kinds(&e), vec![vec![DEL]]);
+    assert!(selection_valid(&e));
+    apply(&mut e, Command::AcceptAllRevisions);
+    assert_eq!(shape(&e), vec!["before", "after"]);
+    assert!(selection_valid(&e));
+}
+
+/// Across two cells of one row: each cell's sub-range, no row change.
+#[test]
+fn deleting_across_cells_of_a_row_marks_each_cell() {
+    let mut e = table_engine();
+    e.selection = Some(SelectionState {
+        anchor: BridgeLogicalPos {
+            path: cell_path(1, 0),
+            offset: 2,
+        },
+        caret: BridgeLogicalPos {
+            path: cell_path(1, 1),
+            offset: 2,
+        },
+        ideal_x: None,
+        kind: SelectionKind::Linear,
+    });
+    delete_at_caret(&mut e, false);
+    assert_eq!(row_kinds(&e), vec![vec![], vec![]]);
+    apply(&mut e, Command::AcceptAllRevisions);
+    let t = e
+        .undo
+        .current()
+        .table_at_path(&engine::BlockPath::top(1))
+        .unwrap()
+        .clone();
+    let texts: Vec<&str> = t.rows[1]
+        .cells
+        .iter()
+        .filter_map(|c| c.blocks[0].as_paragraph().map(|p| p.text.as_str()))
+        .collect();
+    assert_eq!(texts, vec!["r1", "c1"]);
 }
 
 /* ======================= issue #366 — paste + IME commit ==== */

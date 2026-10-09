@@ -184,3 +184,201 @@ pub(crate) fn run_tracked_paste_roundtrip() -> Result<()> {
     );
     Ok(())
 }
+
+/// The path of cell `(row, col)`'s first paragraph of the table at block 1.
+fn cell(row: u32, col: u32, offset: u32) -> LogicalPos {
+    LogicalPos::new(
+        BlockPath {
+            steps: vec![
+                engine::PathStep::Block(1),
+                engine::PathStep::Cell { row, col },
+                engine::PathStep::Block(0),
+            ],
+        },
+        offset,
+    )
+}
+
+/// Per row of the table at block 1: its revision kinds, and its cells'
+/// first-paragraph texts.
+type Rows = Vec<(Vec<RevisionKind>, Vec<String>)>;
+
+fn table_rows(doc: &DocumentTree) -> Rows {
+    doc.table_at_path(&BlockPath::top(1))
+        .map(|t| {
+            t.rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.props.revisions.iter().map(|x| x.kind).collect(),
+                        r.cells
+                            .iter()
+                            .map(|c| {
+                                c.blocks
+                                    .first()
+                                    .and_then(Block::as_paragraph)
+                                    .map_or(String::new(), |p| p.text.clone())
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn row(kinds: &[RevisionKind], cells: [&str; 2]) -> (Vec<RevisionKind>, Vec<String>) {
+    (
+        kinds.to_vec(),
+        cells.iter().map(|s| s.to_string()).collect(),
+    )
+}
+
+/// Issue #365 — step 48: tracked table rows (`tracked_table_rows.docx`:
+/// a deleted row, an inserted row, `<w:tblPrChange>` / `<w:trPrChange>`
+/// history).
+///
+/// a. `<w:trPr><w:del/>` / `<w:ins/>` read as row revisions; the
+///    untouched save is byte-identical on both save paths.
+/// b. Typing in any row regenerates the table as a pure insertion: the
+///    row revisions and the property history re-emit verbatim.
+/// c. Accept-all removes the deleted row and keeps the inserted one,
+///    reject-all the reverse; both save with no `<w:ins>` / `<w:del>`
+///    left (the property history stays) and re-read clean.
+/// d. A tracked deletion of the first two rows (start of the first cell
+///    to the end of the second row) saves `<w:trPr><w:del …/>` on the
+///    source row under a fresh id; on the re-read, accepting that row
+///    alone (by its `revision_id`) removes it, accept-all the rest.
+pub(crate) fn run_tracked_table_rows_roundtrip() -> Result<()> {
+    let bytes = format_docx::test_fixtures::tracked_table_rows_docx();
+    let source = extract_doc_xml(&bytes)?;
+    let archive = read_docx(&bytes).context("read tracked-rows fixture")?;
+    let doc = &archive.document;
+    let fixture = vec![
+        row(&[], ["kept A", "kept B"]),
+        row(&[RevisionKind::Delete], ["gone A", "gone B"]),
+        row(&[RevisionKind::Insert], ["new A", "new B"]),
+    ];
+    if table_rows(doc) != fixture {
+        bail!("step 48a: rows read as {:?}", table_rows(doc));
+    }
+    for (path, out) in [
+        ("write_docx", write_docx(&archive, doc).context("write")?),
+        ("save_docx", format_docx::save_docx(doc).context("ui save")?),
+    ] {
+        if extract_doc_xml(&out)? != source {
+            bail!("step 48a: the untouched {path} save drifted");
+        }
+    }
+    println!(
+        "[roundtrip] step 48a OK — trPr ins / del read as row revisions; zero-edit save byte-identical"
+    );
+
+    for (r, c) in [(0, 0), (1, 1), (2, 0)] {
+        let edited = doc.insert_text(cell(r, c, 2), "XY");
+        for (path, out) in [
+            (
+                "write_docx",
+                write_docx(&archive, &edited).context("write")?,
+            ),
+            (
+                "save_docx",
+                format_docx::save_docx(&edited).context("ui save")?,
+            ),
+        ] {
+            assert_document_xml_well_formed(&out).with_context(|| format!("step 48b {path}"))?;
+            let got = extract_doc_xml(&out)?;
+            let (_, rewritten, _) = rewritten_region(&source, &got);
+            if rewritten != 0 {
+                bail!(
+                    "step 48b {path}: typing in row {r} rewrote {rewritten} source bytes\n{}",
+                    String::from_utf8_lossy(&got)
+                );
+            }
+        }
+    }
+    println!(
+        "[roundtrip] step 48b OK — typing in a tracked table is a pure insertion (row revisions + trPrChange / tblPrChange verbatim)"
+    );
+
+    for (accept, want) in [
+        (
+            true,
+            vec![row(&[], ["kept A", "kept B"]), row(&[], ["new A", "new B"])],
+        ),
+        (
+            false,
+            vec![
+                row(&[], ["kept A", "kept B"]),
+                row(&[], ["gone A", "gone B"]),
+            ],
+        ),
+    ] {
+        let resolved = doc.resolve_all_revisions(accept);
+        if table_rows(&resolved) != want || resolved.has_revisions() {
+            bail!(
+                "step 48c (accept={accept}): resolved to {:?}",
+                table_rows(&resolved)
+            );
+        }
+        for (got, reread) in save_and_reread("step 48c", &archive, &resolved)? {
+            if got.contains("<w:del ")
+                || got.contains("<w:ins ")
+                || got.contains("<w:delText")
+                || !got.contains("<w:trPrChange ")
+                || !got.contains("<w:tblPrChange ")
+                || reread.has_revisions()
+                || table_rows(&reread) != want
+            {
+                bail!(
+                    "step 48c (accept={accept}): saved {:?}\n{got}",
+                    table_rows(&reread)
+                );
+            }
+        }
+    }
+    println!(
+        "[roundtrip] step 48c OK — accept-all / reject-all remove the right row; saves clean, property history kept"
+    );
+
+    let deleted = doc
+        .try_tracked_delete_range(cell(0, 0, 0), cell(1, 1, 6), REVIEWER, REVIEW_DATE)
+        .map_err(|e| anyhow::anyhow!("step 48d: refused: {e}"))?
+        .doc;
+    let want = vec![
+        row(&[RevisionKind::Delete], ["kept A", "kept B"]),
+        row(&[RevisionKind::Delete], ["gone A", "gone B"]),
+        row(&[RevisionKind::Insert], ["new A", "new B"]),
+    ];
+    if table_rows(&deleted) != want {
+        bail!("step 48d: recorded {:?}", table_rows(&deleted));
+    }
+    let mut reread_deleted = None;
+    for (got, reread) in save_and_reread("step 48d", &archive, &deleted)? {
+        let minted = format!(r#"" w:author="{REVIEWER}" w:date="{REVIEW_DATE}"/><w:trPrChange "#);
+        if !got.contains(&minted) || table_rows(&reread) != want {
+            bail!("step 48d: saved {:?}\n{got}", table_rows(&reread));
+        }
+        reread_deleted = Some(reread);
+    }
+    let reread = reread_deleted.context("no re-read")?;
+    let first = reread
+        .revision_entries()
+        .into_iter()
+        .find(|e| e.at.slot == (engine::RevisionSlot::Row { row: 0, index: 0 }))
+        .context("step 48d: the first row's change is not listed")?;
+    let one = reread
+        .resolve_revision(&first.at, true)
+        .context("step 48d: no such revision")?;
+    if table_rows(&one) != want[1..] {
+        bail!("step 48d: accepting row 0 left {:?}", table_rows(&one));
+    }
+    let all = one.resolve_all_revisions(true);
+    if table_rows(&all) != vec![row(&[], ["new A", "new B"])] || all.has_revisions() {
+        bail!("step 48d: accept-all left {:?}", table_rows(&all));
+    }
+    println!(
+        "[roundtrip] step 48d OK — a tracked deletion of two rows saves trPr/del (fresh id); one row accepts by id, accept-all the rest"
+    );
+    Ok(())
+}

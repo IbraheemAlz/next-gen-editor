@@ -20,19 +20,15 @@ use std::fmt;
 use crate::text_remap::TextEdit;
 use crate::{
     Block, BlockPath, DocumentTree, LogicalPos, Paragraph, PathStep, Revision, RevisionKind,
-    bump_last_block_index, mutate_paragraph_in_top, order_positions, same_parent,
+    bump_last_block_index, mutate_paragraph_in_top, order_positions,
 };
 
 /// Issue #298 — why a tracked deletion could not be recorded. The editor
-/// answers it as an `Event::Error` (never a silent no-op).
+/// answers it as an `Event::Error` (never a silent no-op). Since issue
+/// #365 every range between two paragraphs is recordable — across cells
+/// and over tables too — so the only refusal left is a malformed end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackedEditError {
-    /// The range crosses a container boundary (body ↔ table cell, two
-    /// cells): the deletion would have to reshape the table.
-    CrossContainer,
-    /// The range spans a table (or another non-paragraph block): tracked
-    /// table-row deletion (`<w:trPr><w:del/>`) is not modeled.
-    SpansTable,
     /// An end of the range does not address a paragraph.
     NoParagraph,
 }
@@ -40,13 +36,6 @@ pub enum TrackedEditError {
 impl fmt::Display for TrackedEditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::CrossContainer => {
-                "with track changes on, a deletion cannot cross a table-cell boundary yet"
-            }
-            Self::SpansTable => {
-                "with track changes on, a deletion cannot span a table yet \
-                 (tracked table-row deletion is not modeled)"
-            }
             Self::NoParagraph => "the deletion range does not address a paragraph",
         })
     }
@@ -249,8 +238,8 @@ impl DocumentTree {
         (out, caret)
     }
 
-    /// Sprint 14 (#14) / issue #298 — a deletion with review mode on, over
-    /// any range inside ONE container (the body, or one table cell):
+    /// Sprint 14 (#14) / issues #298 / #365 — a deletion with review mode
+    /// on, over any range between two paragraphs:
     ///
     /// - text: per paragraph (the head's tail, every whole middle
     ///   paragraph, the last one's head), bytes inside one of `author`'s
@@ -262,12 +251,22 @@ impl DocumentTree {
     ///   (a tracked Enter of theirs, issue #301) is removed — the two
     ///   paragraphs merge — and every other one is marked `Delete`
     ///   (next to an insertion by someone else, issue #303), unless
-    ///   already deleted.
+    ///   already deleted. Issue #365 — a mark is swallowed when the
+    ///   paragraph it would merge with on accept (the next one, past any
+    ///   table the range deletes whole) is inside the range;
+    /// - issue #365 — table rows, Word's way: a range that crosses a row
+    ///   boundary (or enters a table from outside) deletes every row it
+    ///   touches WHOLE — the row is marked deleted (`<w:trPr><w:del/>`)
+    ///   and its cells' contents like text above (a nested table's rows
+    ///   marked too); a row `author` inserted is removed outright. A
+    ///   range across cells of ONE row deletes each cell's sub-range,
+    ///   with no structural change. A range from body text into a table
+    ///   is the body part plus the whole rows it reaches.
     ///
-    /// Accepting the result removes the text and merges the paragraphs
-    /// ([`Self::resolve_all_revisions`]); rejecting restores everything.
-    /// `start` stays put; `end` is returned where it landed. A range that
-    /// crosses a container boundary or spans a table is refused
+    /// Accepting the result removes the text and rows and merges the
+    /// paragraphs ([`Self::resolve_all_revisions`]); rejecting restores
+    /// everything. `start` stays put; `end` is returned where it landed.
+    /// An end that addresses no paragraph is refused
     /// ([`TrackedEditError`]) — never silently ignored.
     pub fn try_tracked_delete_range(
         &self,
@@ -277,103 +276,412 @@ impl DocumentTree {
         date: &str,
     ) -> Result<TrackedDeletion, TrackedEditError> {
         let (start, end) = order_positions(start, end);
-        if !same_parent(&start.path, &end.path) {
-            return Err(TrackedEditError::CrossContainer);
-        }
-        let (Some((PathStep::Block(s_idx), container)), Some(PathStep::Block(e_idx))) =
-            (start.path.steps.split_last(), end.path.steps.last())
-        else {
+        if self.paragraph_at_path(&start.path).is_none()
+            || self.paragraph_at_path(&end.path).is_none()
+        {
             return Err(TrackedEditError::NoParagraph);
-        };
-        let (s_idx, e_idx) = (*s_idx, *e_idx);
-        let at = |i: u32| child(container, i);
-        for i in s_idx..=e_idx {
-            if self.paragraph_at_path(&at(i)).is_none() {
-                return Err(if i == s_idx || i == e_idx {
-                    TrackedEditError::NoParagraph
-                } else {
-                    TrackedEditError::SpansTable
-                });
-            }
         }
-        let snap = |i: u32, off: u32| {
-            self.paragraph_at_path(&at(i))
-                .map_or(off, |p| p.snap_offset(off))
-        };
-        let (s_off, e_off) = (snap(s_idx, start.offset), snap(e_idx, end.offset));
-        let start = LogicalPos::new(at(s_idx), s_off);
         let mut out = self.clone();
-        /* 1. Text, paragraph by paragraph. */
-        let mut end_off = e_off;
-        for i in s_idx..=e_idx {
-            let path = at(i);
-            let len = out
-                .paragraph_at_path(&path)
-                .map_or(0, |p| p.text.len() as u32);
-            let s = if i == s_idx { s_off } else { 0 };
-            let e = if i == e_idx { e_off } else { len };
-            if s >= e {
-                continue;
-            }
-            let mut edits = Vec::new();
-            let mut blocks = out.blocks.clone();
-            let _ = mutate_paragraph_in_top(&mut blocks, &path, |p| {
-                edits = tracked_delete_span(p, s, e, author, date);
-            });
-            out.blocks = blocks;
-            for edit in edits {
-                if i == e_idx {
-                    end_off -= edit.removed;
-                }
-                out.remap_text_edit_record(&path, edit);
-            }
-        }
-        /* 2. The swallowed marks (paragraphs `s_idx .. e_idx`), from the
-        back so a merge never shifts a mark still to visit. */
-        let mut end_idx = e_idx;
-        let mut merged = false;
-        for i in (s_idx..e_idx).rev() {
-            let Some(head) = out.paragraph_at_path(&at(i)) else {
-                continue;
-            };
-            let own = head
-                .mark_revisions
-                .iter()
-                .any(|r| r.kind == RevisionKind::Insert && r.author == author);
-            let dead = head
-                .mark_revisions
-                .iter()
-                .any(|r| matches!(r.kind, RevisionKind::Delete | RevisionKind::MoveFrom));
-            let head_len = head.text.len() as u32;
-            if own && out.merge_paragraph_with_next(container, i) {
-                merged = true;
-                if end_idx == i + 1 {
-                    end_off += head_len;
-                    end_idx = i;
-                } else {
-                    end_idx -= 1;
-                }
-                continue;
-            }
-            if !dead {
-                let mut blocks = out.blocks.clone();
-                let _ = mutate_paragraph_in_top(&mut blocks, &at(i), |p| {
-                    p.mark_revisions
-                        .push(mark_change(RevisionKind::Delete, author, date));
-                    p.dirty = true;
-                });
-                out.blocks = blocks;
-            }
-        }
-        if merged {
-            out = out.with_list_markers_refreshed();
-        }
+        let (start, end) = out.tracked_delete_between(&start, &end, author, date)?;
+        let (start, end) = (out.settle_pos(start), out.settle_pos(end));
         Ok(TrackedDeletion {
-            doc: out,
+            doc: out.with_list_markers_refreshed(),
             start,
-            end: LogicalPos::new(at(end_idx), end_off),
+            end,
         })
     }
+
+    /// [`Self::try_tracked_delete_range`]'s dispatch on where the two
+    /// (ordered, paragraph-addressing) ends meet: one container, or
+    /// different cells of one table. Returns where the ends landed.
+    fn tracked_delete_between(
+        &mut self,
+        start: &LogicalPos,
+        end: &LogicalPos,
+        author: &str,
+        date: &str,
+    ) -> Result<(LogicalPos, LogicalPos), TrackedEditError> {
+        let (ss, es) = (&start.path.steps, &end.path.steps);
+        let common = ss.iter().zip(es).take_while(|(a, b)| a == b).count();
+        match (ss.get(common), es.get(common)) {
+            /* One paragraph. */
+            (None, None) => match ss.split_last() {
+                Some((PathStep::Block(i), container)) => {
+                    Ok(self.tracked_delete_in(container, *i, *i, start, end, author, date))
+                }
+                _ => Err(TrackedEditError::NoParagraph),
+            },
+            /* Blocks `s ..= e` of one container (either end may lie in a
+            table among them). */
+            (Some(PathStep::Block(s)), Some(PathStep::Block(e))) => {
+                Ok(self.tracked_delete_in(&ss[..common], *s, *e, start, end, author, date))
+            }
+            /* Different cells of the table at `ss[..common]`. */
+            (
+                Some(PathStep::Cell { row: r1, col: c1 }),
+                Some(PathStep::Cell { row: r2, col: _ }),
+            ) => {
+                let table = BlockPath {
+                    steps: ss[..common].to_vec(),
+                };
+                if r1 == r2 {
+                    self.tracked_delete_across_cells(&table, *r1, *c1, start, end, author, date)
+                } else {
+                    let (r1, r2) = (*r1, *r2);
+                    self.mark_rows_deleted(&table, r1, r2, author, date);
+                    Ok((start.clone(), end.clone()))
+                }
+            }
+            _ => Err(TrackedEditError::NoParagraph),
+        }
+    }
+
+    /// Issue #365 — a range across cells `c1 ..` of row `row` of `table`
+    /// (both ends in that row): each cell's sub-range — the first cell
+    /// from `start` to its end, the middle ones whole, the last one from
+    /// its start to `end` — deleted like a range of its own (each cell is
+    /// its own container: no structural change).
+    #[allow(clippy::too_many_arguments)]
+    fn tracked_delete_across_cells(
+        &mut self,
+        table: &BlockPath,
+        row: u32,
+        c1: u32,
+        start: &LogicalPos,
+        end: &LogicalPos,
+        author: &str,
+        date: &str,
+    ) -> Result<(LogicalPos, LogicalPos), TrackedEditError> {
+        let d = table.steps.len();
+        let Some(PathStep::Cell { col: c2, .. }) = end.path.steps.get(d) else {
+            return Err(TrackedEditError::NoParagraph);
+        };
+        let mut end_at = end.clone();
+        /* From the last cell back, so the end's report is taken first and
+        no earlier cell's edit can move it. */
+        for c in (c1..=*c2).rev() {
+            let cell = child_cell(table, row, c);
+            let (Some(first), Some(last)) = (
+                self.cell_text_edge(&cell, false),
+                self.cell_text_edge(&cell, true),
+            ) else {
+                continue;
+            };
+            let from = if c == c1 { start.clone() } else { first };
+            let to = if c == *c2 { end.clone() } else { last };
+            let (_, landed) = self.tracked_delete_between(&from, &to, author, date)?;
+            if c == *c2 {
+                end_at = landed;
+            }
+        }
+        Ok((start.clone(), end_at))
+    }
+
+    /// The first paragraph start (`at_end == false`) or the last paragraph
+    /// end directly inside the cell container `cell` (its steps lead into
+    /// the cell's block list).
+    fn cell_text_edge(&self, cell: &BlockPath, at_end: bool) -> Option<LogicalPos> {
+        let blocks = crate::parent_container_snapshot(self, &child(&cell.steps, 0))?;
+        let mut paras = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_paragraph().map(|p| (i as u32, p)));
+        let (i, p) = if at_end {
+            paras.next_back()?
+        } else {
+            paras.next()?
+        };
+        let offset = if at_end { p.text.len() as u32 } else { 0 };
+        Some(LogicalPos::new(child(&cell.steps, i), offset))
+    }
+
+    /// Blocks `s ..= e` of `container` (its steps lead into the block
+    /// list): `start` lies in block `s` — the paragraph itself, or deep
+    /// inside a table there — and `end` in block `e`. Text, swallowed
+    /// marks and whole rows are recorded from the back, so a merge or a
+    /// removed table never shifts a block still to visit. Returns where
+    /// the ends landed (`start` never moves).
+    #[allow(clippy::too_many_arguments)]
+    fn tracked_delete_in(
+        &mut self,
+        container: &[PathStep],
+        s: u32,
+        e: u32,
+        start: &LogicalPos,
+        end: &LogicalPos,
+        author: &str,
+        date: &str,
+    ) -> (LogicalPos, LogicalPos) {
+        let d = container.len();
+        let row_of = |pos: &LogicalPos| match pos.path.steps.get(d + 1) {
+            Some(PathStep::Cell { row, .. }) => Some(*row),
+            _ => None,
+        };
+        let (start_row, end_row) = (row_of(start), row_of(end));
+        let Some(blocks) = crate::parent_container_snapshot(self, &child(container, 0)) else {
+            return (start.clone(), end.clone());
+        };
+        let is_para = |i: u32| matches!(blocks.get(i as usize), Some(Block::Paragraph(_)));
+        /* The last paragraph a swallowed mark may merge into: `e` itself,
+        or — when the range ends inside a table — the one before it. */
+        let limit = if end_row.is_none() {
+            Some(e)
+        } else {
+            e.checked_sub(1)
+        };
+        let swallowed =
+            |i: u32| limit.is_some_and(|limit| (i + 1..=limit).find(|&j| is_para(j)).is_some());
+        let snap = |pos: &LogicalPos| {
+            self.paragraph_at_path(&pos.path)
+                .map_or(pos.offset, |p| p.snap_offset(pos.offset))
+        };
+        let (s_off, e_off) = (snap(start), snap(end));
+        let mut end_idx = e;
+        let mut end_off = e_off;
+        let at = |i: u32| child(container, i);
+        for i in (s..=e).rev() {
+            match blocks.get(i as usize) {
+                Some(Block::Paragraph(_)) => {
+                    /* 1. Its text. */
+                    let path = at(i);
+                    let len = self
+                        .paragraph_at_path(&path)
+                        .map_or(0, |p| p.text.len() as u32);
+                    let from = if i == s && start_row.is_none() {
+                        s_off
+                    } else {
+                        0
+                    };
+                    let to = if i == e && end_row.is_none() {
+                        e_off
+                    } else {
+                        len
+                    };
+                    for edit in self.tracked_delete_text(&path, from, to, author, date) {
+                        if i == end_idx && end_row.is_none() {
+                            end_off -= edit.removed;
+                        }
+                    }
+                    /* 2. Its mark, when the range swallows it. */
+                    if i < e && swallowed(i) {
+                        let head_len = self
+                            .paragraph_at_path(&path)
+                            .map_or(0, |p| p.text.len() as u32);
+                        if self.delete_mark(container, i, author, date) {
+                            if end_row.is_none() && end_idx == i + 1 {
+                                end_off += head_len;
+                                end_idx = i;
+                            } else {
+                                end_idx -= 1;
+                            }
+                        }
+                    }
+                }
+                Some(Block::Table(t)) => {
+                    let Some(last) = (t.rows.len() as u32).checked_sub(1) else {
+                        continue;
+                    };
+                    let from = if i == s { start_row.unwrap_or(0) } else { 0 };
+                    let to = if i == e {
+                        end_row.unwrap_or(last)
+                    } else {
+                        last
+                    };
+                    if self.mark_rows_deleted(&at(i), from, to, author, date) && end_idx > i {
+                        end_idx -= 1;
+                    }
+                }
+                None => {}
+            }
+        }
+        let end_at = if end_row.is_none() {
+            LogicalPos::new(at(end_idx), end_off)
+        } else {
+            let mut steps = end.path.steps.clone();
+            steps[d] = PathStep::Block(end_idx);
+            LogicalPos::new(BlockPath { steps }, end.offset)
+        };
+        (LogicalPos::new(start.path.clone(), s_off), end_at)
+    }
+
+    /// Record the tracked deletion of bytes `[from, to)` of the paragraph
+    /// at `path` (see [`tracked_delete_span`]); the comment anchors and
+    /// source markup follow every edit. Returns the edits performed.
+    fn tracked_delete_text(
+        &mut self,
+        path: &BlockPath,
+        from: u32,
+        to: u32,
+        author: &str,
+        date: &str,
+    ) -> Vec<TextEdit> {
+        if from >= to {
+            return Vec::new();
+        }
+        let mut edits = Vec::new();
+        let mut blocks = self.blocks.clone();
+        let _ = mutate_paragraph_in_top(&mut blocks, path, |p| {
+            edits = tracked_delete_span(p, from, to, author, date);
+        });
+        self.blocks = blocks;
+        for edit in &edits {
+            self.remap_text_edit_record(path, *edit);
+        }
+        edits
+    }
+
+    /// The mark of paragraph `i` of `container` is swallowed by a tracked
+    /// deletion: `author`'s own inserted mark is removed (the paragraph
+    /// merges with the next one — `true`), any other one is marked
+    /// `Delete` unless already deleted.
+    fn delete_mark(&mut self, container: &[PathStep], i: u32, author: &str, date: &str) -> bool {
+        let path = child(container, i);
+        let Some(head) = self.paragraph_at_path(&path) else {
+            return false;
+        };
+        let own = head
+            .mark_revisions
+            .iter()
+            .any(|r| r.kind == RevisionKind::Insert && r.author == author);
+        let dead = head
+            .mark_revisions
+            .iter()
+            .any(|r| matches!(r.kind, RevisionKind::Delete | RevisionKind::MoveFrom));
+        if own && self.merge_paragraph_with_next(container, i) {
+            return true;
+        }
+        if !dead {
+            let mut blocks = self.blocks.clone();
+            let _ = mutate_paragraph_in_top(&mut blocks, &path, |p| {
+                p.mark_revisions
+                    .push(mark_change(RevisionKind::Delete, author, date));
+                p.dirty = true;
+            });
+            self.blocks = blocks;
+        }
+        false
+    }
+
+    /// Issue #365 — delete rows `from ..= to` of the table at `table`
+    /// whole, with review mode on: each row is marked deleted by `author`
+    /// (`<w:trPr><w:del/>`, unless already deleted) and its contents
+    /// recorded as deleted — every paragraph of its cells like text (the
+    /// reviewer's own insertions removed), every mark but each cell's
+    /// last swallowed, a nested table's rows deleted the same way (its
+    /// text is left alone: the resolver's text walk does not reach that
+    /// deep, and the row goes with its parent on accept anyway). A row
+    /// `author` inserted is removed outright. `true` when the table
+    /// itself left its container (every row was such a row).
+    pub(crate) fn mark_rows_deleted(
+        &mut self,
+        table: &BlockPath,
+        from: u32,
+        to: u32,
+        author: &str,
+        date: &str,
+    ) -> bool {
+        let Some(t) = self.table_at_path(table) else {
+            return false;
+        };
+        let to = to.min((t.rows.len() as u32).saturating_sub(1));
+        let mut own = Vec::new();
+        let mut marked = Vec::new();
+        let mut t = t.clone();
+        for r in from..=to {
+            let Some(row) = t.rows.get_mut(r as usize) else {
+                continue;
+            };
+            let revs = &mut row.props.revisions;
+            if revs
+                .iter()
+                .any(|x| x.kind == RevisionKind::Insert && x.author == author)
+            {
+                own.push(r);
+                continue;
+            }
+            if !revs.iter().any(|x| x.kind == RevisionKind::Delete) {
+                revs.push(mark_change(RevisionKind::Delete, author, date));
+            }
+            marked.push((r, row.cells.len() as u32));
+        }
+        t.dirty = true;
+        t.source_xml = None;
+        let mut top = self.blocks.clone();
+        let _ = crate::replace_block_in_top(&mut top, table, Block::Table(t));
+        self.blocks = top;
+        /* The contents of every marked row, cell by cell. */
+        let reaches_text = table.steps.len() == 1;
+        for (r, cells) in marked {
+            for c in 0..cells {
+                let cell = child_cell(table, r, c);
+                let Some(blocks) = crate::parent_container_snapshot(self, &child(&cell.steps, 0))
+                else {
+                    continue;
+                };
+                let n = blocks.len() as u32;
+                for k in (0..n).rev() {
+                    let path = child(&cell.steps, k);
+                    match &blocks[k as usize] {
+                        Block::Paragraph(p) if reaches_text => {
+                            let len = p.text.len() as u32;
+                            self.tracked_delete_text(&path, 0, len, author, date);
+                            if k + 1 < n {
+                                self.delete_mark(&cell.steps, k, author, date);
+                            }
+                        }
+                        Block::Paragraph(_) => {}
+                        Block::Table(inner) => {
+                            let rows = inner.rows.len() as u32;
+                            if rows > 0 {
+                                self.mark_rows_deleted(&path, 0, rows - 1, author, date);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.remove_table_rows(table, &own)
+    }
+
+    /// `pos` if it still addresses a paragraph (offset snapped), else the
+    /// nearest paragraph of the same container: the start of the first
+    /// one at or after its block, else the end of the last one before.
+    fn settle_pos(&self, pos: LogicalPos) -> LogicalPos {
+        if let Some(p) = self.paragraph_at_path(&pos.path) {
+            let offset = p.snap_offset(pos.offset);
+            return LogicalPos::new(pos.path, offset);
+        }
+        let mut steps = pos.path.steps.clone();
+        while let Some(PathStep::Block(i)) = steps.pop() {
+            if let Some(blocks) = crate::parent_container_snapshot(self, &child(&steps, 0)) {
+                let found = (i as usize..blocks.len())
+                    .find(|&k| blocks[k].as_paragraph().is_some())
+                    .map(|k| LogicalPos::new(child(&steps, k as u32), 0))
+                    .or_else(|| {
+                        (0..(i as usize).min(blocks.len())).rev().find_map(|k| {
+                            blocks[k].as_paragraph().map(|p| {
+                                LogicalPos::new(child(&steps, k as u32), p.text.len() as u32)
+                            })
+                        })
+                    });
+                if let Some(found) = found {
+                    return found;
+                }
+            }
+            /* Up one container: drop the `Cell` step too. */
+            if !matches!(steps.pop(), Some(PathStep::Cell { .. })) {
+                break;
+            }
+        }
+        pos
+    }
+}
+
+/// `table` + `Cell { row, col }`: the steps leading into a cell's blocks.
+fn child_cell(table: &BlockPath, row: u32, col: u32) -> BlockPath {
+    let mut steps = table.steps.clone();
+    steps.push(PathStep::Cell { row, col });
+    BlockPath { steps }
 }
 
 /// Issue #366 — `block` as pasted new text by `author`: every paragraph
@@ -402,6 +710,11 @@ fn stamp_inserted(block: &Block, author: &str, date: &str) -> Block {
         }
         Block::Table(t) => {
             let mut t = t.clone();
+            /* Issue #365 — a pasted row is an inserted row
+            (`<w:trPr><w:ins/>`): rejecting the paste removes it. */
+            for row in t.rows.iter_mut() {
+                row.props.revisions = vec![mark_change(RevisionKind::Insert, author, date)];
+            }
             for cell in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
                 let n = cell.blocks.len();
                 for (i, b) in cell.blocks.iter_mut().enumerate() {
