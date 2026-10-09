@@ -12,6 +12,9 @@
 //!   place. They trail the last body block, so their absence from a
 //!   shorter band never disagrees with the body prefix the verifier
 //!   checks.
+//!
+//! Issue #141 — and a floating object near the page bottom is lifted
+//! clear of the page's footnote band.
 
 use super::*;
 
@@ -279,3 +282,107 @@ fn document_end_endnotes_never_demote_an_expanding_band() {
         layout::geometry_fingerprint(&full)
     );
 }
+
+/* ====================================================================
+Issue #141 — a floating object never paints over the footnote band.
+==================================================================== */
+
+/// A paragraph whose head is a 2" × 1" square-wrapped floating picture
+/// aligned to the BOTTOM of the margin frame (left edge on the margin) —
+/// exactly where a page-bottom footnote band sits.
+fn bottom_float_host() -> engine::Block {
+    engine::Block::Paragraph(engine::Paragraph {
+        text: format!("{SENTINEL}The picture anchors here."),
+        inline_objects: vec![engine::InlineObject {
+            at: 0,
+            kind: engine::InlineKind::Image {
+                rel_id: "rIdBandPic".to_string(),
+                width_emu: 1_828_800,
+                height_emu: 914_400,
+                media_key: None,
+            },
+            anchor: Some(Box::new(engine::FloatAnchor {
+                position_h: engine::HPosition {
+                    relative_from: engine::HRelativeFrom::Margin,
+                    offset: engine::FloatOffset::Emu(0),
+                },
+                position_v: engine::VPosition {
+                    relative_from: engine::VRelativeFrom::Margin,
+                    offset: engine::FloatOffset::Align(engine::FloatAlign::Bottom),
+                },
+                wrap: engine::WrapKind::Square,
+                ..engine::FloatAnchor::default()
+            })),
+            source_xml: None,
+        }],
+        ..Default::default()
+    })
+}
+
+/// `[footnote-referencing paragraph, bottom-aligned float host]`.
+fn float_over_band_doc() -> DocumentTree {
+    let mut d = DocumentTree::new();
+    d.blocks = vec![
+        note_ref_para(
+            "Body text cites the source",
+            engine::NoteKind::Footnote,
+            1,
+            " and moves on.",
+        ),
+        bottom_float_host(),
+    ]
+    .into();
+    d.footnote_stories.insert(
+        1,
+        note_story(
+            engine::NoteKind::Footnote,
+            1,
+            &"The footnote runs over a few lines at the bottom of the page. ".repeat(4),
+        ),
+    );
+    d.media.insert(
+        "rIdBandPic".into(),
+        engine::ImageBlob {
+            content_type: "image/jpeg".to_string(),
+            data: format_pdf::test_images::jpeg(24, 16, 3),
+        },
+    );
+    d
+}
+
+/// Acceptance (#141): the bottom-aligned picture would sit on the
+/// footnote band; the laid-out page lifts it so its bottom edge meets
+/// the band's separator gap (x unchanged) through the real pipeline —
+/// note reservation, float resolution and the wrap loop — with nothing
+/// reported. Pinned.
+#[test]
+fn a_float_at_the_page_bottom_clears_the_footnote_band() {
+    let engine = tests::test_engine_with_doc(float_over_band_doc());
+    let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+    assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+    assert_eq!(pages.len(), 1);
+    let p = &pages[0];
+    assert_eq!(p.footnotes.entries.len(), 1, "the footnote is on the page");
+    let f = p
+        .floats
+        .iter()
+        .find(|f| f.rel_id == "rIdBandPic")
+        .expect("the picture resolves");
+    let limit = p.footnotes.y - layout::FOOTNOTE_SEPARATOR_HEIGHT_PT;
+    let unclamped_bottom = p.size.height - p.margins.bottom;
+    assert!(
+        unclamped_bottom > limit + 1.0,
+        "the frame position would overlap the band"
+    );
+    assert!(
+        (f.origin.y + f.size.height - limit).abs() < 0.01,
+        "bottom edge meets the separator gap: {} vs {limit}",
+        f.origin.y + f.size.height
+    );
+    assert!((f.origin.x - p.margins.left).abs() < 0.01, "x unchanged");
+    let fp = layout::geometry_fingerprint(&pages);
+    eprintln!("NOTE BAND FINGERPRINT float_over_band = {fp:#x}");
+    assert_eq!(fp, PINNED_FLOAT_OVER_BAND, "float-over-band fixture moved");
+}
+
+const PINNED_FLOAT_OVER_BAND: u64 = 0xaf1490d945e3c9a9;

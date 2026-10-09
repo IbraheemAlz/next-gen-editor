@@ -507,6 +507,7 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::WrapPolygonFallback => LayoutDegradeReason::WrapPolygonFallback,
         R::PageRefCap => LayoutDegradeReason::PageRefCap,
         R::NoteRestartCap => LayoutDegradeReason::NoteRestartCap,
+        R::FloatClampedByNotes => LayoutDegradeReason::FloatClampedByNotes,
     };
     LayoutDegraded {
         reason,
@@ -27021,7 +27022,8 @@ mod note_container_tests;
 #[cfg(test)]
 mod note_corpus_probe_tests;
 
-/// Issue #181 — note bands vs. the viewport-culled band.
+/// Issues #181 / #141 — note bands vs. the viewport-culled band and
+/// floating objects.
 #[cfg(test)]
 mod note_band_tests;
 
