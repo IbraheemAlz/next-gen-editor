@@ -7,7 +7,7 @@ import type {
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
-import type { LoggedCommand, RecoveryCandidate } from './event-log';
+import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
    GitHub Pages /next-gen-editor/); `?url` imports are hashed + base-aware. */
@@ -91,6 +91,11 @@ type ArmTrapMsg = { id: number; type: 'ARM_TRAP'; after_commands: number };
 /* Issue #96 — DEV-only test hook: per-page opaque-ink counts read back
    from the surfaces this worker holds (see the handler). */
 type ProbePageInkMsg = { id: number; type: 'PROBE_PAGE_INK' };
+/* Issue #270 — planned retirement (the Dev HUD's in-place "retry Vello"):
+   finish everything already queued, snapshot the log head, flush the
+   event log, reply, close. The client then respawns a generation that
+   recovers from the log — the document survives, unlike a reload. */
+type RetireMsg = { id: number; type: 'RETIRE' };
 
 type Msg =
     | InitMsg
@@ -102,7 +107,8 @@ type Msg =
     | GetRevisionsMsg
     | RegisterPageCanvasMsg
     | ArmTrapMsg
-    | ProbePageInkMsg;
+    | ProbePageInkMsg
+    | RetireMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -140,10 +146,22 @@ let pendingLogWrites: Promise<unknown> = Promise.resolve();
 /* Issue #85 — fault-injection countdown; `null` = disarmed. */
 let trapAfterCommands: number | null = null;
 /* Issue #212 — content key of the detached source package the event
-   log's `packages` store holds (or is about to: set when the write is
-   issued, cleared if it fails), passed as `known_package_hash` so the
-   engine ships the package bytes only when they changed. */
-let persistedPackageHash: string | undefined;
+   log's `packages` store holds, passed as `known_package_hash` so the
+   engine ships the package bytes only when they changed.
+   Issue #314 — set only once a snapshot transaction holding that
+   package COMMITTED (never when the write is merely issued: a snapshot
+   taken while that write is in flight would otherwise name a hash whose
+   bytes may never land), and cleared when one fails, so the next
+   snapshot re-ships the bytes. */
+let committedPackageHash: string | undefined;
+/* Issue #314 — package bytes the engine shipped whose write has not
+   committed yet. A snapshot taken meanwhile carries THESE bytes in its
+   own transaction (written only if still absent — `persistSnapshot`),
+   so it never depends on the in-flight one succeeding, and the engine
+   does not re-encode a multi-MB package for it. Dropped once a
+   transaction holding it settles (committed → `committedPackageHash`;
+   failed → the next snapshot re-ships from the engine). */
+let pendingPackage: { hash: string; bytes: Uint8Array } | undefined;
 /* Issue #268 — the next persisted snapshot becomes the document's pinned
    base (never pruned; see `event-log.ts`). Set when the log opens, after
    every document-replacing command, and after a recovery whose pinned
@@ -920,7 +938,8 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
         await openEventLog(msg.documentId);
-        persistedPackageHash = undefined;
+        committedPackageHash = undefined;
+        pendingPackage = undefined;
         /* Issue #268 — the session's first snapshot is its pinned base. */
         pinNextSnapshot = true;
         /* Issue #43 — inject today's date so DATE fields resolve at
@@ -988,7 +1007,9 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            engine every time, so a failed attempt leaves nothing behind. */
         /* Issue #268 — candidates are SCORED, not just tried until one
            restores: a readable snapshot whose detached package is gone
-           (a failed `packages` write that later snapshots still name)
+           (a `packages` row lost after its snapshot landed — issue #314
+           keeps a failed write from producing one, but stored data can
+           still be damaged or evicted)
            restores, but saves through the minimal writer — silently
            losing the sibling parts. An older base that still has its
            package (or the complete bare log, which re-opens the file)
@@ -1070,11 +1091,14 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
         /* Issue #212 — the store holds the package the restored snapshot
            named (the engine re-attached it and primed its key), so the
            next snapshot need not ship it again. Anything else ships.
-           Issue #268 — unless the engine could not attach it. */
-        persistedPackageHash =
+           Issue #268 — unless the engine could not attach it.
+           Issue #314 — the bytes were READ from the store, so it is a
+           committed package (and `persistSnapshot` re-verifies it). */
+        committedPackageHash =
             lastSnapshotAt > 0 && base.package !== undefined && !packageLost
                 ? base.packageHash
                 : undefined;
+        pendingPackage = undefined;
         /* Issue #268 — re-pin when the pinned base proved unreadable or
            nothing was restored (the document now descends from no
            persisted base). */
@@ -1122,6 +1146,9 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             packageLost,
             pinnedBase: restored && base.pinned === true,
             tailDropped,
+            /* Issue #315 — when the restored snapshot was persisted, so
+               the shell can say since when edits were lost. */
+            ...(restored && base.takenAt !== undefined ? { baseTakenAt: base.takenAt } : {}),
         });
         /* §10 — the recovered engine has no a11y cache, so this delta is a
            full `Replace`: the mirror DOM rebuilds from the restored tree
@@ -1433,14 +1460,16 @@ async function takeSnapshot(seq: number): Promise<void> {
     if (!engine || seq <= lastSnapshotAt) return;
     try {
         /* Issue #212 — detached: the retained source package is persisted
-           once per document (`packages` store), not inside every snapshot. */
+           once per document (`packages` store), not inside every snapshot.
+           Issue #314 — "known" is a COMMITTED package, or one whose bytes
+           this worker still holds from an in-flight write (attached
+           below): never a hash whose bytes might not land. */
+        const known = committedPackageHash ?? pendingPackage?.hash;
         const evt = await dispatch({
             type: 'SNAPSHOT',
             seq,
             detach_package: true,
-            ...(persistedPackageHash !== undefined
-                ? { known_package_hash: persistedPackageHash }
-                : {}),
+            ...(known !== undefined ? { known_package_hash: known } : {}),
         });
         if (evt.type !== 'SNAPSHOT') {
             console.warn('[worker] engine snapshot failed', evt);
@@ -1448,19 +1477,46 @@ async function takeSnapshot(seq: number): Promise<void> {
         }
         lastSnapshotAt = seq;
         const hash = evt.package_hash;
-        const pkg =
-            hash === undefined ? undefined : evt.package ? { hash, bytes: evt.package } : { hash };
-        if (hash !== undefined) persistedPackageHash = hash;
+        let pkg: SnapshotPackage | undefined;
+        if (hash !== undefined) {
+            if (evt.package) {
+                pendingPackage = { hash, bytes: evt.package };
+                pkg = { hash, bytes: evt.package };
+            } else if (hash !== committedPackageHash && pendingPackage?.hash === hash) {
+                /* Issue #314 — the engine skipped the bytes because an
+                   earlier snapshot shipped them, but that write has not
+                   committed: carry them, so this row cannot outlive a
+                   failure of that one. */
+                pkg = { hash, bytes: pendingPackage.bytes };
+            } else {
+                /* Committed: `persistSnapshot` verifies the store still
+                   holds it and aborts the write otherwise. */
+                pkg = { hash };
+            }
+        }
         /* Issue #268 — the document's first snapshot is its pinned base. */
         const pin = pinNextSnapshot;
         pinNextSnapshot = false;
-        const write = persistSnapshot(seq, evt.bytes, pkg, { pin }).catch((e: unknown) => {
-            console.warn('[worker] event-log snapshot failed', e);
-            /* The package may not have landed: ship it with the next one. */
-            if (persistedPackageHash === hash) persistedPackageHash = undefined;
-            /* Nor the pin: pin the next one instead. */
-            if (pin) pinNextSnapshot = true;
-        });
+        const write = persistSnapshot(seq, evt.bytes, pkg, { pin }).then(
+            () => {
+                if (hash === undefined) return;
+                /* Issue #314 — only now is the package known stored. */
+                committedPackageHash = hash;
+                if (pendingPackage?.hash === hash) pendingPackage = undefined;
+            },
+            (e: unknown) => {
+                console.warn('[worker] event-log snapshot failed', e);
+                /* Issue #314 — the package may not be stored (this write
+                   carried it, or the store lost it: `PackageMissingError`):
+                   forget it, so the next snapshot re-ships the bytes. */
+                if (hash !== undefined) {
+                    if (committedPackageHash === hash) committedPackageHash = undefined;
+                    if (pendingPackage?.hash === hash) pendingPackage = undefined;
+                }
+                /* Nor the pin: pin the next one instead. */
+                if (pin) pinNextSnapshot = true;
+            },
+        );
         pendingLogWrites = pendingLogWrites.then(() => write);
     } catch (e: unknown) {
         console.warn('[worker] snapshot dispatch failed', e);
@@ -1605,6 +1661,32 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
 
     if (msg.type === 'RECOVER') {
         void enqueue(() => handleClientRecover(msg));
+        return;
+    }
+
+    /* Issue #270 — planned retirement. Queued: every command posted
+       before it is applied (and logged) first; nothing posted after it
+       runs — the worker closes inside this task, and the client settles
+       those requests itself. */
+    if (msg.type === 'RETIRE') {
+        void enqueue(async () => {
+            if (idleSnapshotTimer !== undefined) {
+                clearTimeout(idleSnapshotTimer);
+                idleSnapshotTimer = undefined;
+            }
+            trapAfterCommands = null;
+            /* The respawned generation replays from here: snapshot the
+               log head so its tail is empty (the commands are logged
+               regardless — recovery would replay them without it). */
+            if (engine && logSequence > lastSnapshotAt) {
+                await takeSnapshot(logSequence);
+            }
+            /* Every event-log write issued so far has landed (or failed
+               and been accounted for) before the worker goes away. */
+            await pendingLogWrites;
+            self.postMessage({ id: msg.id, ok: true });
+            self.close();
+        });
         return;
     }
 

@@ -127,6 +127,11 @@ pub enum DegradeReason {
     /// references across pages. The last pass's labels were kept, so a
     /// reference may show an ordinal counted against a neighbouring page.
     NoteRestartCap,
+    /// Issue #141 — an in-front body float reached into the page's
+    /// footnote band and was too tall to be lifted clear of it (taller
+    /// than the room between the body top and the band): it was pinned
+    /// at the body top and paints over the band.
+    FloatClampedByNotes,
     /// Issue #318 — a table nested past the layout's nesting cap
     /// (`MAX_TABLE_LAYOUT_DEPTH` in the engine) was flattened: its
     /// paragraphs were stacked, in document order, in the cell holding
@@ -157,6 +162,7 @@ impl DegradeReason {
             DegradeReason::WrapPolygonFallback => "WRAP_POLYGON_FALLBACK",
             DegradeReason::PageRefCap => "PAGE_REF_CAP",
             DegradeReason::NoteRestartCap => "NOTE_RESTART_CAP",
+            DegradeReason::FloatClampedByNotes => "FLOAT_CLAMPED_BY_NOTES",
             DegradeReason::NestingCapped => "NESTING_CAPPED",
         }
     }

@@ -101,7 +101,8 @@ The protocol (clean-room design notes: PRD_LIBREOFFICE §4C, the
   lines, a tail re-collects its own when it is re-pushed.
 - Endnotes are a trailing story: [`Paginator::push_trailing_notes`]
   stacks them beneath the body at section / document end, splitting
-  across pages the same way.
+  across pages the same way. They never reserve per-page band space
+  (issue #317): only footnotes take part in the deadline fit.
 - Issue #278 — references outside the body flow. A table cell's ride
   its row (the row is the flow item). A text box's story is laid out
   after pagination, so its references ride the box's SENTINEL glyph
@@ -720,6 +721,16 @@ impl Paginator {
         &self.pages
     }
 
+    /// Issue #181 — a footnote cut on the page in progress (or a
+    /// continuation cut again on it) is still waiting for the next
+    /// page's band. A flow that stops here — a viewport-culled band —
+    /// drains it in [`Self::finish`] onto notes-only pages that a longer
+    /// flow fills with body text, so the page in progress and every page
+    /// after it are provisional.
+    pub fn has_pending_note_continuation(&self) -> bool {
+        !self.footnote_carry.is_empty()
+    }
+
     /// The blocks placed on the in-progress page so far.
     pub fn current_blocks(&self) -> &[LayoutBlock] {
         &self.cur_blocks
@@ -986,6 +997,12 @@ impl Paginator {
     /// even one line fits, the item moves forward, unless it is the first
     /// item of a fresh page (`fresh`), where the rule is waived and the
     /// first line is clipped (`FootnoteOverflow`) so the flow terminates.
+    ///
+    /// Issue #317 — only FOOTNOTES reserve page-bottom space. An endnote
+    /// reference rides its line like any other glyph: the note itself
+    /// trails the body ([`Self::push_trailing_notes`], at section or
+    /// document end), so reserving it here painted it twice and stole
+    /// body budget from the referencing page.
     fn fit_items(&self, items: &[FlowItem], remaining: f32, fresh: bool) -> FitPlan {
         let mut plan = FitPlan {
             count: 0,
@@ -1002,6 +1019,9 @@ impl Paginator {
         for (i, item) in items.iter().enumerate() {
             let mut bodies: Vec<(NoteAnchor, String, Vec<LayoutBlock>)> = Vec::new();
             for (anchor, marker) in &item.anchors {
+                if !is_page_band_note(*anchor) {
+                    continue;
+                }
                 let seen = self.cur_notes.iter().any(|n| n.anchor == *anchor)
                     || plan.notes.iter().any(|n| n.anchor == *anchor)
                     || bodies.iter().any(|(a, _, _)| a == anchor);
@@ -2527,6 +2547,27 @@ impl Paginator {
                 gutter: self.column_gutter,
             },
         );
+        /* Issue #141 — the footnote band was reserved line by line
+        before this flush, so it is final here: lift every in-front body
+        float that reaches into it (separator gap included) back into the
+        body area. No loop — one pass over the page's floats; an object
+        too tall to clear the band is pinned at the body top, painted
+        over the band and reported. A `beneathText` band trails the body
+        like the endnote band and is not a page-bottom keep-out. */
+        if !page.footnotes.is_empty() && self.footnote_position == NotePosition::PageBottom {
+            let keep_out = crate::floats::NoteBandKeepOut {
+                x0: self.geometry.margins.left,
+                x1: self.geometry.width - self.geometry.margins.right,
+                top: page.footnotes.y - FOOTNOTE_SEPARATOR_HEIGHT_PT,
+                bottom: page.footnotes.y + page.footnotes.content_height(),
+                floor: self.geometry.margins.top + self.header_intrusion(role),
+            };
+            let stuck = crate::floats::clamp_floats_above_band(&mut page.floats, keep_out);
+            for _ in 0..stuck {
+                let at = self.cur_page_index();
+                self.watchdog.note(DegradeReason::FloatClampedByNotes, at);
+            }
+        }
         self.pages.push(page);
 
         /* Clear the section-first-page flag once a page has flushed for
@@ -2557,15 +2598,24 @@ impl Paginator {
     /// [`Self::finish`] plus every degradation note the watchdog
     /// recorded for this flow (issue #87). The engine forwards the notes
     /// on `Event::Painted`.
+    ///
+    /// Issue #141 — the notes are taken AFTER the final flushes: the last
+    /// page's float clamp, and the continuation drain's own
+    /// `FootnoteOverflow` / `PageCap`, are recorded while finishing.
     pub fn finish_with_notes(mut self) -> (Vec<PageBox>, Vec<LayoutDegradation>) {
-        let notes = self.watchdog.take_notes();
-        (self.finish(), notes)
+        let pages = self.finish_pages();
+        (pages, self.watchdog.take_notes())
     }
 
     /// Finalize — drain the in-progress page and return every page emitted.
     /// Always returns at least one page so the renderer has somewhere to
     /// draw the empty document.
     pub fn finish(mut self) -> Vec<PageBox> {
+        self.finish_pages()
+    }
+
+    /// The body of [`Self::finish`] / [`Self::finish_with_notes`].
+    fn finish_pages(&mut self) -> Vec<PageBox> {
         if !self.cur_blocks.is_empty()
             || self.pages.is_empty()
             || !self.cur_notes.is_empty()
@@ -2620,7 +2670,7 @@ impl Paginator {
             page.footnotes.for_each_paragraph_mut(&mut stamp);
             page.endnotes.for_each_paragraph_mut(&mut stamp);
         }
-        self.pages
+        std::mem::take(&mut self.pages)
     }
 }
 
@@ -2954,17 +3004,28 @@ fn anchors_in_row(row: &TableRowBox) -> Vec<(NoteAnchor, String)> {
     out
 }
 
-/// `true` when any line of `p` carries a note reference (issue #278: a
-/// text box whose story references a note counts).
+/// Issue #317 — does `anchor` reserve space in the page's footnote band?
+/// Footnotes do; endnotes never do — they trail the body as their own
+/// story (`Paginator::push_trailing_notes`).
+fn is_page_band_note(anchor: NoteAnchor) -> bool {
+    anchor.kind == engine::NoteKind::Footnote
+}
+
+/// `true` when any line of `p` carries a FOOTNOTE reference (issue #278:
+/// a text box whose story references one counts) — the paragraphs the
+/// deadline fitter must see. Issue #317 — an endnote-only paragraph
+/// reserves nothing on its page, so it keeps the note-free fast path.
 fn paragraph_has_note_anchors(p: &ParagraphBox) -> bool {
     p.lines.iter().any(|l| {
         l.runs.iter().any(|r| {
             r.glyphs.iter().any(|g| {
-                g.inline_note_anchor.is_some()
+                g.inline_note_anchor.is_some_and(is_page_band_note)
                     || g.float
                         .as_deref()
                         .and_then(|f| f.text_box.as_deref())
-                        .is_some_and(|tb| !tb.note_anchors.is_empty())
+                        .is_some_and(|tb| {
+                            tb.note_anchors.iter().any(|(a, _)| is_page_band_note(*a))
+                        })
             })
         })
     })
@@ -4711,6 +4772,25 @@ mod tests {
         n_lines: usize,
         line_height: f32,
     ) -> ParagraphBox {
+        fake_paragraph_with_note_ref_on_line(fn_anchor(id), line_idx, n_lines, line_height)
+    }
+
+    /// Issue #317 — an endnote anchor.
+    fn en_anchor(id: u32) -> NoteAnchor {
+        NoteAnchor {
+            kind: engine::NoteKind::Endnote,
+            id,
+        }
+    }
+
+    /// An `n_lines` paragraph whose line `line_idx` carries a reference
+    /// to `anchor` (either kind).
+    fn fake_paragraph_with_note_ref_on_line(
+        anchor: NoteAnchor,
+        line_idx: usize,
+        n_lines: usize,
+        line_height: f32,
+    ) -> ParagraphBox {
         let mut p = fake_paragraph(n_lines, line_height);
         let glyph = crate::boxes::PositionedGlyph {
             id: 0,
@@ -4721,8 +4801,8 @@ mod tests {
             y_offset: 0.0,
             synthetic: false,
             inline_image_rel_id: None,
-            inline_footnote_marker: Some(id.to_string()),
-            inline_note_anchor: Some(fn_anchor(id)),
+            inline_footnote_marker: Some(anchor.id.to_string()),
+            inline_note_anchor: Some(anchor),
             inline_object_height: 0.0,
             float: None,
             leader: None,
@@ -4846,6 +4926,75 @@ mod tests {
         );
         pag.push_block(LayoutBlock::Paragraph(fake_paragraph(30, 16.0)), 0.0, 0.0);
         finish("footnotes", pag);
+
+        /* Issue #317 — footnote + endnote references on one page (the
+        note table carries both kinds, as the engine's does): only the
+        footnote reserves page-bottom space; both endnotes trail. */
+        let mut bodies = fake_note_bodies(&[(1, 3, 14.0)]);
+        for (id, n) in [(1, 2), (2, 30)] {
+            bodies.insert(
+                en_anchor(id),
+                vec![LayoutBlock::Paragraph(fake_paragraph(n, 14.0))],
+            );
+        }
+        let mut pag =
+            Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies.clone());
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_note_ref_on_line(
+                en_anchor(1),
+                1,
+                3,
+                16.0,
+            )),
+            0.0,
+            0.0,
+        );
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 2, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(36, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_note_ref_on_line(
+                en_anchor(2),
+                4,
+                6,
+                16.0,
+            )),
+            0.0,
+            0.0,
+        );
+        pag.push_trailing_notes(
+            [1, 2]
+                .into_iter()
+                .map(|id| {
+                    (
+                        en_anchor(id),
+                        id.to_string(),
+                        bodies[&en_anchor(id)].clone(),
+                    )
+                })
+                .collect(),
+        );
+        finish("endnotes_reserve_nothing_per_page", pag);
+
+        /* Issue #141 — a body float aligned to the bottom of the margin
+        frame on a page whose footnote band sits there: lifted above the
+        band (recorded on the #141 paginator). */
+        let mut pag = Paginator::with_default_bands(geom, None, None)
+            .with_note_bodies(fake_note_bodies(&[(1, 4, 14.0)]));
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 3, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_float(margin_bottom_float_spec())),
+            0.0,
+            0.0,
+        );
+        finish("float_lifted_above_footnote_band", pag);
 
         let mut pag = Paginator::with_default_bands(geom, None, None);
         pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
@@ -4987,6 +5136,13 @@ mod tests {
         ("page_break_before", 0x000c3f543ec6f6a7, &[]),
         ("intruding_bands_title_pg", 0xd740800cab2c8c6d, &[]),
         ("footnotes", 0xd598c54612629596, &[]),
+        /* Issue #317 — new fixture, recorded on the #317 paginator (the
+        pre-#317 one reserved both endnotes in the footnote band too:
+        0x3b2b158ed3ed041d). */
+        ("endnotes_reserve_nothing_per_page", 0x40c5e9f069666949, &[]),
+        /* Issue #141 — new fixture, recorded on the #141 paginator (the
+        float overlapped the band before: 0xc8660bff5b7bb01b). */
+        ("float_lifted_above_footnote_band", 0x8d7999418bc8be31, &[]),
         ("sections_and_forced_breaks", 0xc92c5638ce1f2440, &[]),
         /* Re-pinned by issue #91 (was 0x7e5c0eabb84250c6 with a single
         `(OversizeLine, 2)`): neither table fits where it lands, so both
@@ -5808,6 +5964,204 @@ mod tests {
             .map(|b| b.as_paragraph().map_or(0, |p| p.lines.len()))
             .sum();
         assert_eq!(total, 30, "every endnote line painted once");
+    }
+
+    /// Issue #141 — a float aligned to the BOTTOM of the margin frame:
+    /// exactly where a page-bottom footnote band sits.
+    fn margin_bottom_float_spec() -> crate::boxes::FloatSpec {
+        crate::boxes::FloatSpec {
+            h_frame: engine::HRelativeFrom::Margin,
+            h_offset: crate::boxes::FloatOffsetPx::Px(0.0),
+            v_frame: engine::VRelativeFrom::Margin,
+            v_offset: crate::boxes::FloatOffsetPx::Align(engine::FloatAlign::Bottom),
+            simple_pos: None,
+            z_order: 0,
+            behind_doc: false,
+            hidden: false,
+        }
+    }
+
+    /// Issue #141 — `[footnote-referencing paragraph, float host]` with
+    /// the float's height overridden to `float_h`.
+    fn float_over_band_paginator(float_h: f32, position: NotePosition) -> Paginator {
+        let mut host = fake_paragraph_with_float(margin_bottom_float_spec());
+        for g in host.lines[0]
+            .runs
+            .iter_mut()
+            .flat_map(|r| r.glyphs.iter_mut())
+        {
+            if let Some(f) = g.float.as_deref_mut() {
+                f.height = float_h;
+            }
+        }
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None)
+            .with_note_bodies(fake_note_bodies(&[(1, 4, 14.0)]));
+        pag.set_footnote_position(position);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 3, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(host), 0.0, 0.0);
+        pag
+    }
+
+    /// Issue #141 — acceptance: the bottom-aligned float would sit on the
+    /// footnote band; the paginator lifts it so its bottom edge meets the
+    /// band's separator gap — no overlap, x unchanged, nothing reported
+    /// (strict watchdog). Under `beneathText` the band trails the body and
+    /// the float keeps its frame position.
+    #[test]
+    fn body_float_at_the_page_bottom_is_lifted_above_the_footnote_band() {
+        let geom = a4_geometry();
+        let pag =
+            float_over_band_paginator(50.0, NotePosition::PageBottom).with_strict_watchdog(true);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 1);
+        let p = &pages[0];
+        assert_eq!(p.footnotes.entries.len(), 1);
+        let f = &p.floats[0];
+        let unclamped = geom.height - geom.margins.bottom - 50.0;
+        assert!(
+            unclamped + 50.0 > p.footnotes.y - FOOTNOTE_SEPARATOR_HEIGHT_PT,
+            "the fixture's float would overlap the band"
+        );
+        assert!(
+            (f.origin.y + f.size.height - (p.footnotes.y - FOOTNOTE_SEPARATOR_HEIGHT_PT)).abs()
+                < 0.01,
+            "bottom edge meets the band's separator gap"
+        );
+        assert_eq!(f.origin.x, geom.margins.left);
+        /* beneathText: no page-bottom keep-out. */
+        let pages = float_over_band_paginator(50.0, NotePosition::BeneathText).finish();
+        assert!((pages[0].floats[0].origin.y - unclamped).abs() < 0.01);
+    }
+
+    /// Issue #141 — the escape hatch: a float taller than the body area
+    /// cannot clear the band; it is pinned at the body top, still paints,
+    /// and the page reports `FloatClampedByNotes` (a hard failure under
+    /// the strict watchdog).
+    #[test]
+    fn float_too_tall_to_clear_the_band_is_pinned_and_reported() {
+        let geom = a4_geometry();
+        let (pages, notes) =
+            float_over_band_paginator(geom.content_height(), NotePosition::PageBottom)
+                .finish_with_notes();
+        assert_eq!(reasons(&notes), vec![DegradeReason::FloatClampedByNotes]);
+        assert_eq!(notes[0].page, 0);
+        assert_eq!(pages[0].floats.len(), 1, "the float still paints");
+        assert!((pages[0].floats[0].origin.y - geom.margins.top).abs() < 0.01);
+        let strict = std::panic::catch_unwind(|| {
+            float_over_band_paginator(geom.content_height(), NotePosition::PageBottom)
+                .with_strict_watchdog(true)
+                .finish()
+        });
+        assert!(
+            strict.is_err(),
+            "strict mode fails hard on the escape hatch"
+        );
+    }
+
+    /// Issue #181 — the culled-band hook: a footnote cut under its
+    /// reference is pending while its page is in progress (a band that
+    /// stops here drains it onto notes-only pages), and settled once the
+    /// next page opens with the continuation.
+    #[test]
+    fn pending_note_continuation_is_visible_until_the_next_page_opens() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None)
+            .with_note_bodies(fake_note_bodies(&[(1, 40, 14.0)]))
+            .with_strict_watchdog(true);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(10, 16.0)), 0.0, 0.0);
+        assert!(!pag.has_pending_note_continuation());
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 1, 16.0)),
+            0.0,
+            0.0,
+        );
+        assert_eq!(pag.page_count_emitted(), 0, "still on the reference page");
+        assert!(
+            pag.has_pending_note_continuation(),
+            "the 560 pt note was cut under its reference"
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        assert_eq!(pag.page_count_emitted(), 1, "the follower opened page 2");
+        assert!(
+            !pag.has_pending_note_continuation(),
+            "page 2's band took the continuation"
+        );
+        let pages = pag.finish();
+        assert!(pages[1].footnotes.continuation);
+    }
+
+    /// Issue #317 — an endnote reference reserves nothing in the page's
+    /// footnote band (the engine's note table holds BOTH kinds, keyed by
+    /// anchor): a paragraph that exactly fills the page with an endnote
+    /// reference on its last line stays whole, the footnote band stays
+    /// empty, and the note paints once — in the trailing endnote band.
+    #[test]
+    fn endnote_reference_reserves_nothing_in_the_footnote_band() {
+        let geom = a4_geometry();
+        let mut bodies = fake_note_bodies(&[(1, 2, 14.0)]);
+        bodies.insert(
+            en_anchor(1),
+            vec![LayoutBlock::Paragraph(fake_paragraph(3, 14.0))],
+        );
+        let page_lines = (geom.content_height() / 16.0).floor() as usize;
+        let mut pag = Paginator::with_default_bands(geom, None, None)
+            .with_note_bodies(bodies.clone())
+            .with_strict_watchdog(true);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_note_ref_on_line(
+                en_anchor(1),
+                page_lines - 1,
+                page_lines,
+                16.0,
+            )),
+            0.0,
+            0.0,
+        );
+        pag.push_trailing_notes(vec![(
+            en_anchor(1),
+            "i".to_string(),
+            bodies[&en_anchor(1)].clone(),
+        )]);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2, "body fills page 1, the endnote trails");
+        assert_eq!(
+            pages[0].blocks[0].as_paragraph().map(|p| p.lines.len()),
+            Some(page_lines),
+            "the referencing paragraph is not split by a phantom reservation"
+        );
+        assert!(
+            pages.iter().all(|p| p.footnotes.is_empty()),
+            "an endnote never enters a footnote band"
+        );
+        let endnote_entries: Vec<(engine::NoteKind, u32)> = pages
+            .iter()
+            .flat_map(|p| p.endnotes.entries.iter())
+            .map(|e| (e.kind, e.id))
+            .collect();
+        assert_eq!(endnote_entries, vec![(engine::NoteKind::Endnote, 1)]);
+        /* A footnote on the same line still reserves as before. */
+        let mut pag = Paginator::with_default_bands(geom, None, None)
+            .with_note_bodies(bodies)
+            .with_strict_watchdog(true);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref_on_line(
+                1,
+                page_lines - 1,
+                page_lines,
+                16.0,
+            )),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(pages[0].footnotes.entries.len(), 0, "the line moved on");
+        assert_eq!(pages[1].footnotes.entries.len(), 1);
     }
 
     /// Issue #80 — `beneathText` pins the band right under the body's
