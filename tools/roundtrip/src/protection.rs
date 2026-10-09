@@ -12,7 +12,7 @@ fn at(block: u32, offset: u32) -> LogicalPos {
     LogicalPos::new(BlockPath::top(block), offset)
 }
 
-/// Step 52:
+/// Step 55:
 ///
 /// a. The restriction is modeled (`forms`, enforced) and the zero-edit
 ///    save is byte-identical — `settings.xml` (the protection element)
@@ -39,7 +39,7 @@ pub fn run_document_protection_roundtrip() -> Result<()> {
     {
         bail!("zero-edit save drifted");
     }
-    println!("[roundtrip] step 52a OK — forms protection modeled; zero-edit save byte-identical");
+    println!("[roundtrip] step 55a OK — forms protection modeled; zero-edit save byte-identical");
 
     /* b. The run-level control holds bytes [6, 20) of paragraph 1. */
     let closer = at(1, 20);
@@ -61,7 +61,7 @@ pub fn run_document_protection_roundtrip() -> Result<()> {
     if entry_bytes(&back, settings) != entry_bytes(&archive, settings) {
         bail!("settings part drifted on an edited save");
     }
-    println!("[roundtrip] step 52b OK — a filled content control is a pure insertion inside it");
+    println!("[roundtrip] step 55b OK — a filled content control is a pure insertion inside it");
 
     /* c. The text form field (paragraph 2, result = the placeholder). */
     let field_start = FORMS_FIXTURE_TEXTS[2]
@@ -109,7 +109,7 @@ pub fn run_document_protection_roundtrip() -> Result<()> {
         bail!("protection drifted on a filled save");
     }
     println!(
-        "[roundtrip] step 52c OK — a filled FORMTEXT field keeps its prologue + end around the result"
+        "[roundtrip] step 55c OK — a filled FORMTEXT field keeps its prologue + end around the result"
     );
     Ok(())
 }

@@ -1381,6 +1381,10 @@ struct RevisionOut {
     /// addressed by the empty range `start == end == text length`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mark: bool,
+    /// Issue #365 — a tracked table-ROW insertion / deletion: the row's
+    /// index in the top-level table at `block` (`start == end == 0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row: Option<u32>,
     /// Issue #304 — the revision's stable id
     /// (`DocumentTree::revision_entries`): what `AcceptRevision` /
     /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
@@ -1391,9 +1395,10 @@ struct RevisionOut {
 /// The `revisions_snapshot()` rows: every tracked change of the
 /// top-level paragraphs, in document order — per paragraph its text
 /// revisions, then its mark's changes (issue #262: the empty range at
-/// the paragraph end; issue #303: one row per change, in order) — each
-/// with its issue #304 `revision_id` (the range alone addresses only a
-/// mark's FIRST change; the id addresses each).
+/// the paragraph end; issue #303: one row per change, in order) — and,
+/// issue #365, every row change of a top-level table — each with its
+/// issue #304 `revision_id` (the range alone addresses only a mark's
+/// FIRST change, and no row change; the id addresses each).
 fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
     doc.revision_entries()
         .into_iter()
@@ -1404,9 +1409,15 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
             };
             let r = e.revision;
             let mark = matches!(e.at.slot, engine::RevisionSlot::Mark(_));
+            let row = match e.at.slot {
+                engine::RevisionSlot::Row { row, .. } => Some(row),
+                _ => None,
+            };
             let (start, end) = if mark {
-                let end = e.paragraph.text.len() as u32;
+                let end = e.paragraph.map_or(0, |p| p.text.len() as u32);
                 (end, end)
+            } else if row.is_some() {
+                (0, 0)
             } else {
                 (r.start, r.end)
             };
@@ -1419,6 +1430,7 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
                 date: r.date.clone(),
                 move_name: r.move_name.clone(),
                 mark,
+                row,
                 revision_id: e.id,
             })
         })
@@ -15417,8 +15429,9 @@ impl Engine {
     /// struck text the way Word does, so the next Backspace reaches the
     /// character before it), else the plain `delete_range` (text removed,
     /// caret lands at start). Issue #298 — a tracked range the engine
-    /// refuses (across a table-cell boundary, over a table) is an
-    /// `Event::Error`, never a silent no-op.
+    /// refuses is an `Event::Error`, never a silent no-op (since issue
+    /// #365 a range across cells or over a table is recorded — rows
+    /// marked deleted — so only a malformed end is refused).
     fn delete_or_mark(
         &self,
         start: BridgeLogicalPos,
@@ -15878,15 +15891,47 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = if start == end {
-            self.undo.current().clone()
-        } else {
-            self.undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        let base = match self.paste_base("PastePlain", &start, end) {
+            Ok(d) => d,
+            Err(e) => return *e,
         };
-        let (new_doc, caret) = base.insert_multiline(to_engine_pos(start), &normalized);
+        /* Issue #366 — with review mode on, every pasted line is a
+        tracked insertion and every newline an inserted paragraph mark. */
+        let (new_doc, caret) = if self.tracking_changes {
+            base.tracked_insert_multiline(
+                to_engine_pos(start),
+                &normalized,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            base.insert_multiline(to_engine_pos(start), &normalized)
+        };
         self.commit_edit(new_doc, to_bridge_pos(caret))
+    }
+
+    /// Issue #366 — the tree a paste over `[start, end)` lands in: the
+    /// range removed (`start == end`: the current tree) or, with review
+    /// mode on, recorded as a tracked deletion first (the reviewer's own
+    /// pending insertions inside it removed outright, #265) — the typed
+    /// replacement's order. A tracked range the engine refuses answers a
+    /// typed `Event::Error`.
+    fn paste_base(
+        &self,
+        cmd: &str,
+        start: &BridgeLogicalPos,
+        end: BridgeLogicalPos,
+    ) -> Result<engine::DocumentTree, Box<Event>> {
+        if *start == end {
+            Ok(self.undo.current().clone())
+        } else if self.tracking_changes {
+            self.tracked_delete(cmd, start, &end).map(|t| t.doc)
+        } else {
+            Ok(self
+                .undo
+                .current()
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end)))
+        }
     }
 
     /// `Command::PasteHtml` (Backlog #12) — parse HTML into styled paragraphs
@@ -15909,14 +15954,22 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = if start == end {
-            self.undo.current().clone()
-        } else {
-            self.undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        let base = match self.paste_base("PasteHtml", &start, end) {
+            Ok(d) => d,
+            Err(e) => return *e,
         };
-        let (new_doc, caret) = base.insert_rich_blocks(to_engine_pos(start), &blocks_in);
+        /* Issue #366 — with review mode on, the pasted content (and every
+        paragraph mark it creates) is a tracked insertion. */
+        let (new_doc, caret) = if self.tracking_changes {
+            base.tracked_insert_rich_blocks(
+                to_engine_pos(start),
+                &blocks_in,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            base.insert_rich_blocks(to_engine_pos(start), &blocks_in)
+        };
         self.commit_edit(new_doc, to_bridge_pos(caret))
     }
 

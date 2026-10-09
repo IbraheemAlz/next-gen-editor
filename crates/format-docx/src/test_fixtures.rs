@@ -892,6 +892,139 @@ pub fn styled_paragraph_borders_docx() -> Vec<u8> {
     ])
 }
 
+/// Issue #367 — the paragraph texts of [`section_break_revision_docx`].
+pub const SECTION_BREAK_TEXTS: [&str; 3] = [
+    "The first section ends here",
+    "The second section",
+    "and its last paragraph",
+];
+
+/// Issue #367 — a section break under review, in Word's shape (our own
+/// XML): paragraph 0's mark carries the first section's `<w:sectPr>`
+/// (a small 5.5 × 4 in page, a default header `rIdH1` "Header A", a
+/// first-page header `rIdH2` "Header A first" with `<w:titlePg/>`) and
+/// is a tracked DELETION (`<w:pPr><w:rPr><w:del/>`). The final section
+/// (A4) owns no header reference: it inherits both (absence =
+/// link-to-previous). Accepting the deletion makes paragraph 0 part of
+/// the final section; its empty header slots take `rIdH1` / `rIdH2`.
+/// With `inserted`, the mark is a tracked INSERTION instead (a tracked
+/// section break: rejecting removes it). Source of `tools/roundtrip`'s
+/// `section_break_revision.docx` (step 54).
+pub fn section_break_revision_docx(inserted: bool) -> Vec<u8> {
+    let ns = ns_decls();
+    let [t0, t1, t2] = SECTION_BREAK_TEXTS;
+    let tag = if inserted { "w:ins" } else { "w:del" };
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <w:document {ns}><w:body>\
+         <w:p w:rsidR=\"00A1B2C3\"><w:pPr><w:rPr><{tag} w:id=\"1\" w:author=\"Author\" \
+         w:date=\"2026-01-02T00:00:00Z\"/></w:rPr><w:sectPr w:rsidR=\"00A1B2C3\">\
+         <w:headerReference w:type=\"default\" r:id=\"rIdH1\"/>\
+         <w:headerReference w:type=\"first\" r:id=\"rIdH2\"/>\
+         <w:pgSz w:w=\"7920\" w:h=\"5760\"/>\
+         <w:pgMar w:top=\"720\" w:right=\"720\" w:bottom=\"720\" w:left=\"720\" \
+         w:header=\"360\" w:footer=\"360\" w:gutter=\"0\"/><w:titlePg/></w:sectPr></w:pPr>\
+         <w:r><w:t>{t0}</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>{t1}</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>{t2}</w:t></w:r></w:p>\
+         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
+         <w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" \
+         w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>\
+         </w:body></w:document>"
+    );
+    let header = |text: &str| {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+             <w:hdr {ns}><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:hdr>"
+        )
+    };
+    let (h1, h2) = (header("Header A"), header("Header A first"));
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+<Override PartName=\"/word/header1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>\
+<Override PartName=\"/word/header2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>\
+</Types>";
+    let dot_rels = rels(&[(
+        "rId1",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+        "word/document.xml",
+    )]);
+    let doc_rels = rels(&[
+        ("rIdH1", HEADER_REL, "header1.xml"),
+        ("rIdH2", HEADER_REL, "header2.xml"),
+    ]);
+    zip_entries(vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", dot_rels.as_bytes()),
+        ("word/document.xml", document.as_bytes()),
+        ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+        ("word/header1.xml", h1.as_bytes()),
+        ("word/header2.xml", h2.as_bytes()),
+    ])
+}
+
+/// Issue #365 — the cell texts of [`tracked_table_rows_docx`], row by row.
+pub const TRACKED_ROWS_CELLS: [[&str; 2]; 3] = [
+    ["kept A", "kept B"],
+    ["gone A", "gone B"],
+    ["new A", "new B"],
+];
+
+/// Issue #365 — a table under review, in Word's shape (no corpus document
+/// with a tracked row was at hand; this is our own XML): row 0 untouched
+/// but carrying a `<w:trPrChange>` (and the table a `<w:tblPrChange>`) —
+/// property history the model keeps as verbatim grab-bag bytes; row 1 a
+/// tracked row DELETION (`<w:trPr><w:del/>`, its cells' text in `<w:del>`
+/// runs and their marks deleted); row 2 a tracked row INSERTION
+/// (`<w:trPr><w:ins/>`, inserted text and marks). Source of
+/// `tools/roundtrip`'s `tracked_table_rows.docx` (step 53).
+pub fn tracked_table_rows_docx() -> Vec<u8> {
+    const D1: &str = "w:author=\"Author\" w:date=\"2026-01-01T00:00:00Z\"";
+    const D2: &str = "w:author=\"Author\" w:date=\"2026-01-02T00:00:00Z\"";
+    const D3: &str = "w:author=\"Author\" w:date=\"2026-01-03T00:00:00Z\"";
+    let cell = |inner: &str| {
+        format!("<w:tc><w:tcPr><w:tcW w:w=\"4675\" w:type=\"dxa\"/></w:tcPr>{inner}</w:tc>")
+    };
+    let [[k0, k1], [g0, g1], [n0, n1]] = TRACKED_ROWS_CELLS;
+    let kept = |t: &str| cell(&format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>"));
+    let gone = |t: &str, mark: u32| {
+        cell(&format!(
+            "<w:p><w:pPr><w:rPr><w:del w:id=\"{mark}\" {D2}/></w:rPr></w:pPr>\
+             <w:del w:id=\"{}\" {D2}><w:r><w:delText>{t}</w:delText></w:r></w:del></w:p>",
+            mark + 1
+        ))
+    };
+    let new = |t: &str, mark: u32| {
+        cell(&format!(
+            "<w:p><w:pPr><w:rPr><w:ins w:id=\"{mark}\" {D3}/></w:rPr></w:pPr>\
+             <w:ins w:id=\"{}\" {D3}><w:r><w:t>{t}</w:t></w:r></w:ins></w:p>",
+            mark + 1
+        ))
+    };
+    let body = format!(
+        "<w:p w:rsidR=\"00D0A1B2\"><w:r><w:t>Rows under review</w:t></w:r></w:p>\
+         <w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"0\" w:type=\"auto\"/>\
+         <w:tblLook w:val=\"04A0\"/><w:tblPrChange w:id=\"1\" {D1}><w:tblPr>\
+         <w:tblW w:w=\"5000\" w:type=\"pct\"/></w:tblPr></w:tblPrChange></w:tblPr>\
+         <w:tblGrid><w:gridCol w:w=\"4675\"/><w:gridCol w:w=\"4675\"/></w:tblGrid>\
+         <w:tr w:rsidR=\"00D0A1B2\" w:rsidTr=\"00E3F4A5\"><w:trPr><w:trHeight w:val=\"400\"/>\
+         <w:trPrChange w:id=\"2\" {D1}><w:trPr/></w:trPrChange></w:trPr>{}{}</w:tr>\
+         <w:tr w:rsidR=\"00D0A1B2\" w:rsidTr=\"00E3F4A5\"><w:trPr><w:del w:id=\"3\" {D2}/></w:trPr>{}{}</w:tr>\
+         <w:tr w:rsidR=\"00F6A7B8\"><w:trPr><w:ins w:id=\"8\" {D3}/></w:trPr>{}{}</w:tr>\
+         </w:tbl><w:p><w:r><w:t>after</w:t></w:r></w:p>",
+        kept(k0),
+        kept(k1),
+        gone(g0, 4),
+        gone(g1, 6),
+        new(n0, 9),
+        new(n1, 11),
+    );
+    docx_with_body(&body)
+}
+
 /* ------------------------------------------------------------------ */
 /* Issue #345 — encrypted packages + document protection               */
 /* ------------------------------------------------------------------ */

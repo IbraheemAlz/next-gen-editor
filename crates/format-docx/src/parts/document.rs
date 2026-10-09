@@ -576,7 +576,10 @@ fn mark_revision_kind(qname: &[u8]) -> Option<engine::RevisionKind> {
     }
 }
 
-fn mark_revision(kind: engine::RevisionKind, e: &BytesStart<'_>) -> engine::Revision {
+/// A `CT_TrackChange` element (`w:id` / `w:author` / `w:date`) as a
+/// range-less revision of `kind`: a paragraph mark's (issue #262) or a
+/// table row's (`<w:trPr><w:ins/>`, issue #365).
+pub(crate) fn mark_revision(kind: engine::RevisionKind, e: &BytesStart<'_>) -> engine::Revision {
     engine::Revision {
         start: 0,
         end: 0,
