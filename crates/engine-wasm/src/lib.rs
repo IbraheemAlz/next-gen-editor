@@ -2744,16 +2744,47 @@ struct StyleContext<'a> {
     /// Issue #80 — the marker the `NoteSelfRef` heading a note body
     /// paints; set only while laying out that note's blocks.
     note_self_mark: Option<&'a str>,
+    /// Issue #355 — the document theme run fonts resolve through.
+    theme: Option<&'a engine::DocumentTheme>,
+    /// Issue #355 — content hash of [`Self::theme`] (0 without one), folded
+    /// into every paragraph layout key: the same text and bindings under
+    /// another theme must never hit a cached box.
+    theme_key: u64,
 }
 
 impl<'a> StyleContext<'a> {
     fn of(doc: &'a engine::DocumentTree) -> StyleContext<'a> {
+        let theme = doc.theme.as_deref();
         StyleContext {
             styles: &doc.styles,
             run_defaults: &doc.style_run_defaults,
             note_markers: None,
             note_self_mark: None,
+            theme,
+            theme_key: theme.map_or(0, |t| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                t.hash(&mut h);
+                h.finish()
+            }),
         }
+    }
+
+    /// Issue #355 — the layout font ids for a cascade-merged run style:
+    /// `(Latin slot, complex-script slot)`, theme bindings resolved
+    /// through the document theme (`SpanStyle::resolve_font`). The
+    /// complex-script slot is resolved for Arabic text — the only
+    /// complex script `layout` segments (`text_pipeline::Script`).
+    fn run_font_ids(&self, style: &engine::SpanStyle) -> (Option<String>, Option<String>) {
+        let id = |class, hint| {
+            style
+                .resolve_font(self.theme, class, hint)
+                .map(|r| font_family_id(&r.family).to_string())
+        };
+        (
+            id(engine::FontClass::Latin, None),
+            id(engine::FontClass::ComplexScript, Some("Arab")),
+        )
     }
 
     fn run_base(&self, style_id: Option<&str>) -> engine::SpanStyle {
@@ -2798,6 +2829,7 @@ fn build_style_spans(
     empty in fresh documents — byte-identical to the old flat gap. */
     let run_base = sctx.run_base(para.style_id.as_deref());
     let emit = |style: &engine::SpanStyle, start: u32, end: u32, out: &mut Vec<StyleSpan>| {
+        let (font_family, font_family_cs) = sctx.run_font_ids(style);
         let raw_base_px = style.font_size.unwrap_or(default_size) * scale;
         let vert = style.vert_align.unwrap_or(engine::VertAlign::Baseline);
         let (px_factor, shift_factor) = match vert {
@@ -2817,11 +2849,8 @@ fn build_style_spans(
             underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
             strike: style.strike.unwrap_or(false),
             bg_color: style.bg_color,
-            font_family: style
-                .font_family
-                .as_ref()
-                .map(font_family_id)
-                .map(str::to_string),
+            font_family,
+            font_family_cs,
             caps_transform: false,
             baseline_shift_px,
         };
@@ -3008,6 +3037,13 @@ fn composition_layout_spans(
         }
     }
     let st = para.style_at(off);
+    /* Issue #355 — the preview shapes in the face the committed text
+    around it resolves to (cascade + theme). */
+    let (font_family, font_family_cs) = sctx.run_font_ids(
+        &sctx
+            .run_base(para.style_id.as_deref())
+            .merged_with(st.clone()),
+    );
     out.push(StyleSpan {
         start: off,
         end: off + comp_len,
@@ -3018,11 +3054,8 @@ fn composition_layout_spans(
         underline: engine::UnderlineStyle::Single,
         strike: st.strike.unwrap_or(false),
         bg_color: st.bg_color,
-        font_family: st
-            .font_family
-            .as_ref()
-            .map(font_family_id)
-            .map(str::to_string),
+        font_family,
+        font_family_cs,
         caps_transform: false,
         baseline_shift_px: 0.0,
     });
@@ -3059,6 +3092,11 @@ fn paragraph_layout_key(
     run_base.strike.hash(&mut h);
     run_base.bg_color.hash(&mut h);
     run_base.raw_font_family.hash(&mut h);
+    /* Issue #355 — the base family and slot bindings feed the resolved
+    font ids, and the theme decides what a binding names. */
+    run_base.font_family.hash(&mut h);
+    run_base.font_bindings.hash(&mut h);
+    sctx.theme_key.hash(&mut h);
     run_base.caps.hash(&mut h);
     run_base.small_caps.hash(&mut h);
     /* Audit gap A.H2 — the cache key now folds the laid-out max width
@@ -3078,6 +3116,8 @@ fn paragraph_layout_key(
         run.style.strike.hash(&mut h);
         run.style.bg_color.hash(&mut h);
         run.style.font_family.hash(&mut h);
+        run.style.raw_font_family.hash(&mut h);
+        run.style.font_bindings.hash(&mut h);
         /* Without these three, flipping `<w:caps>`, `<w:smallCaps>`, or
         `<w:vertAlign>` produces the same hash as the prior state and
         the cache returns a stale `ParagraphBox` — the visible bug the
@@ -7311,6 +7351,9 @@ fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
         /* Issue #84 — a formatting patch never carries a grab bag; the
         run's own bag survives the merge (`SpanStyle::merged_with`). */
         grab_bag: None,
+        /* Issue #355 — a patch naming a family claims the slots its
+        writer spells (`SpanStyle::merged_with`). */
+        font_bindings: None,
     }
 }
 
@@ -15913,6 +15956,7 @@ impl Engine {
             raw_font_family: r.font_family,
             font_theme: None,
             grab_bag: None,
+            font_bindings: None,
         });
         let based_on = if props.clear_based_on == Some(true) {
             Some(None)
@@ -18832,6 +18876,8 @@ mod tests {
             run_defaults: Box::leak(Box::default()),
             note_markers: None,
             note_self_mark: None,
+            theme: None,
+            theme_key: 0,
         }
     }
 
@@ -18862,6 +18908,8 @@ mod tests {
             run_defaults: &run_defaults,
             note_markers: None,
             note_self_mark: None,
+            theme: None,
+            theme_key: 0,
         };
         let mut para = engine::Paragraph {
             text: "hello world".into(),
@@ -18893,6 +18941,74 @@ mod tests {
             paragraph_layout_key(&para, &cfg, 1.0, 451.0, sctx),
             paragraph_layout_key(&para, &cfg, 1.0, 451.0, plain),
             "two style-table states must not collide on a cache key"
+        );
+    }
+
+    /// Issue #355 — theme-bound docDefaults lay out in the faces the theme
+    /// names, per script slot (Latin vs Arabic); a run naming a family
+    /// claims its slots; no theme part → no family (the font stack's
+    /// fallback, exactly as before). The layout key sees the theme.
+    #[test]
+    fn style_spans_resolve_theme_fonts_per_script_slot() {
+        let bind = |v: &str| Some(engine::FontBinding::Theme(v.into()));
+        let run_defaults = engine::SpanStyle {
+            font_bindings: Some(Box::new(engine::RunFontBindings {
+                ascii: bind("minorHAnsi"),
+                h_ansi: bind("minorHAnsi"),
+                east_asia: bind("minorEastAsia"),
+                cs: bind("minorBidi"),
+            })),
+            ..Default::default()
+        };
+        let mut theme = engine::DocumentTheme::default();
+        theme.fonts.minor.latin = "Liberation Sans".into();
+        theme
+            .fonts
+            .minor
+            .by_script
+            .insert("Arab".into(), "Noto Naskh Arabic".into());
+        let styles = std::collections::HashMap::new();
+        let ctx = |theme: Option<&'static engine::DocumentTheme>, key| StyleContext {
+            styles: Box::leak(Box::new(styles.clone())),
+            run_defaults: Box::leak(Box::new(run_defaults.clone())),
+            note_markers: None,
+            note_self_mark: None,
+            theme,
+            theme_key: key,
+        };
+        let theme: &'static engine::DocumentTheme = Box::leak(Box::new(theme));
+        let mut para = engine::Paragraph {
+            text: "body Amiri".into(),
+            ..Default::default()
+        };
+        para.spans.push(engine::StyleRun {
+            start: 5,
+            end: 10,
+            style: engine::SpanStyle {
+                font_family: Some(engine::FontFamily::Amiri),
+                ..Default::default()
+            },
+        });
+        let spans = build_style_spans(&para, ctx(Some(theme), 1), 12.0, [0, 0, 0, 255], 1.0);
+        let ids: Vec<(Option<&str>, Option<&str>)> = spans
+            .iter()
+            .map(|s| (s.font_family.as_deref(), s.font_family_cs.as_deref()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                (Some("liberation"), Some("noto-naskh")),
+                (Some("amiri"), Some("amiri"))
+            ]
+        );
+        let bare = build_style_spans(&para, ctx(None, 0), 12.0, [0, 0, 0, 255], 1.0);
+        assert_eq!(bare[0].font_family, None, "no theme part: fallback");
+        assert_eq!(bare[0].font_family_cs, None);
+        let cfg = autofit_test_cfg();
+        assert_ne!(
+            paragraph_layout_key(&para, &cfg, 1.0, 451.0, ctx(Some(theme), 1)),
+            paragraph_layout_key(&para, &cfg, 1.0, 451.0, ctx(Some(theme), 2)),
+            "another theme must not hit a cached box"
         );
     }
 
@@ -18945,6 +19061,7 @@ mod tests {
                 strike: false,
                 bg_color: None,
                 font_family: None,
+                font_family_cs: None,
                 caps_transform: false,
                 baseline_shift_px: 0.0,
             }];
@@ -18996,6 +19113,7 @@ mod tests {
             strike: false,
             bg_color: None,
             font_family: None,
+            font_family_cs: None,
             caps_transform: false,
             baseline_shift_px: 0.0,
         }

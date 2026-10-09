@@ -11,7 +11,7 @@
 //! as the default (`<theme xmlns="…/drawingml/2006/main">`) is legal.
 
 use crate::error::DocxError;
-use engine::{DocumentTheme, SchemeColor, ThemeFonts};
+use engine::{DocumentTheme, FontBinding, RunFontBindings, SchemeColor, ThemeFonts};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
@@ -74,6 +74,34 @@ pub fn read_document_theme(
         theme.color_map = s.clr_scheme_mapping.clone();
     }
     Some(theme)
+}
+
+/// Issue #355 — the slot bindings of one `<w:rFonts>` element
+/// (§17.3.2.26): per slot, the theme attribute when present (it
+/// supersedes a name on the same element), else [`FontBinding::Name`] when
+/// the slot is named, else nothing.
+///
+/// `None` when the element binds no slot (a bare `w:hint`) and for the
+/// canonical shape — no theme attribute, names on exactly `ascii`, `hAnsi`
+/// and `cs` (what the engine's own writer spells for a family): a family
+/// without bindings claims precisely those slots in
+/// [`engine::SpanStyle::merged_with`], so the two are the same statement
+/// and an engine-authored family round-trips to an equal style.
+pub fn rfonts_bindings(e: &BytesStart) -> Option<Box<RunFontBindings>> {
+    let w_attr = |key: &[u8]| crate::schema::ct_rpr::attr_val(e, key);
+    let slot = |name: &[u8], theme: &[u8]| match w_attr(theme) {
+        Some(t) => Some(FontBinding::Theme(t)),
+        None => w_attr(name).map(|_| FontBinding::Name),
+    };
+    let b = RunFontBindings {
+        ascii: slot(b"w:ascii", b"w:asciiTheme"),
+        h_ansi: slot(b"w:hAnsi", b"w:hAnsiTheme"),
+        east_asia: slot(b"w:eastAsia", b"w:eastAsiaTheme"),
+        cs: slot(b"w:cs", b"w:cstheme"),
+    };
+    let named = Some(FontBinding::Name);
+    let canonical = b.ascii == named && b.h_ansi == named && b.cs == named && b.east_asia.is_none();
+    (!b.is_empty() && !canonical).then(|| Box::new(b))
 }
 
 /// Which font collection a `typeface` child belongs to.

@@ -83,8 +83,8 @@ pub use fields::{
 };
 pub use package::{MediaRef, PackageEntry, SourcePackage};
 pub use theme::{
-    ColorScheme, ColorSchemeMapping, DocumentTheme, FontScheme, SchemeColor, ThemeFontLang,
-    ThemeFonts,
+    ColorScheme, ColorSchemeMapping, DocumentTheme, FontBinding, FontClass, FontScheme,
+    ResolvedFont, RunFontBindings, SchemeColor, ThemeFontLang, ThemeFontRef, ThemeFonts,
 };
 pub use toc::{TocEntry, TocHeading};
 
@@ -2139,6 +2139,16 @@ pub struct SpanStyle {
     /// `.docx` reader (see [`GrabBag`]). `None` for every engine-authored
     /// style and for runs whose `<w:rPr>` the model fully expresses.
     pub grab_bag: Option<Box<GrabBag>>,
+    /// Issue #355 — this level's `<w:rFonts>` slot bindings (name vs
+    /// theme reference per ascii / hAnsi / eastAsia / cs slot), what
+    /// layout resolves theme fonts from ([`SpanStyle::resolve_font`]) and
+    /// the writer re-emits the theme attributes from. Supersedes the
+    /// single-slot [`Self::font_theme`] wherever it is set (`font_theme`
+    /// is still read so older snapshots keep writing their binding).
+    /// `None` for engine-authored styles; skipped when `None`, so their
+    /// snapshot bytes are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_bindings: Option<Box<RunFontBindings>>,
 }
 
 impl SpanStyle {
@@ -2168,6 +2178,15 @@ impl SpanStyle {
 
     /// Overlay `patch`'s set fields onto `self`.
     pub fn merged_with(self, patch: SpanStyle) -> SpanStyle {
+        /* Issue #355 — an engine-authored family (no slot bindings) claims
+        the slots its writer spells; see `theme::merge_font_bindings`. */
+        let names_family = patch.font_bindings.is_none()
+            && (patch.font_family.is_some() || patch.raw_font_family.is_some());
+        let font_theme = if names_family && patch.font_theme.is_none() {
+            None
+        } else {
+            patch.font_theme.or(self.font_theme)
+        };
         SpanStyle {
             font_size: patch.font_size.or(self.font_size),
             color: patch.color.or(self.color),
@@ -2181,12 +2200,17 @@ impl SpanStyle {
             small_caps: patch.small_caps.or(self.small_caps),
             vert_align: patch.vert_align.or(self.vert_align),
             raw_font_family: patch.raw_font_family.or(self.raw_font_family),
-            font_theme: patch.font_theme.or(self.font_theme),
+            font_theme,
             /* Issue #84 — same "set field wins" rule as every slot above:
             a formatting patch (no bag) keeps the run's bag; a direct
             `<w:rPr>` folded onto a cascade baseline (which never carries
             one) contributes its own. */
             grab_bag: patch.grab_bag.or(self.grab_bag),
+            font_bindings: theme::merge_font_bindings(
+                self.font_bindings,
+                patch.font_bindings,
+                names_family,
+            ),
         }
     }
 }

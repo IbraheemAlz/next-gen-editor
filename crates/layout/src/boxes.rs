@@ -133,8 +133,14 @@ pub struct StyleSpan {
     pub strike: bool,
     pub bg_color: Option<[u8; 4]>,
     /// Resolved font id for an explicit family request; `None` keeps the
-    /// per-script default face (Backlog #9).
+    /// per-script default face (Backlog #9). Issue #355 — serves every
+    /// segment except Arabic-script ones (see [`Self::font_family_cs`]).
     pub font_family: Option<String>,
+    /// Issue #355 — resolved font id for the span's Arabic-script segments
+    /// (the `<w:rFonts>` complex-script slot: `w:cs` / `w:cstheme`);
+    /// `None` keeps the per-script default face. A theme can name
+    /// different body faces for Latin and Arabic text in one run.
+    pub font_family_cs: Option<String>,
     /// Audit gap A.H3 — uppercase the source bytes of this span before
     /// shaping. Set by `build_style_spans` for `<w:caps>` and `<w:smallCaps>`
     /// spans; the shaper guards against case-changing length deltas

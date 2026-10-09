@@ -1513,7 +1513,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
         for (rel_start, rel_end, script, span, marker) in subs {
             let Some((font_id, face, synth)) =
                 cfg.fonts
-                    .resolve(script, span.font_family.as_deref(), span.bold, span.italic)
+                    .resolve(script, span_family(&span, script), span.bold, span.italic)
             else {
                 continue;
             };
@@ -1831,6 +1831,17 @@ fn transform_for_shape(
     (Cow::Owned(upper), Some(map))
 }
 
+/// Issue #355 — the font id a span requests for a `script` segment: the
+/// complex-script slot for Arabic text, the Latin slot for everything
+/// else. [`build_line`] and the width probe both pick through here, so a
+/// fitted line shapes against the face it was measured with.
+fn span_family(span: &StyleSpan, script: Script) -> Option<&str> {
+    match script {
+        Script::Arabic => span.font_family_cs.as_deref(),
+        _ => span.font_family.as_deref(),
+    }
+}
+
 /// The style span covering byte `offset`. `cfg.spans` covers the whole
 /// paragraph with no gaps, so a miss only happens past the text end.
 fn style_at(spans: &[StyleSpan], offset: u32) -> Option<StyleSpan> {
@@ -1864,7 +1875,7 @@ fn measure_text(
             /* Resolve per span: an explicit font family changes shaping (and
             width); faux bold/italic do not, so weight/slant stay `false`. */
             let Some((_, face, _)) =
-                fonts.resolve(script, span.font_family.as_deref(), false, false)
+                fonts.resolve(script, span_family(&span, script), false, false)
             else {
                 break;
             };

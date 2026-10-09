@@ -183,6 +183,9 @@ fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
         strike: style.strike.unwrap_or(false),
         bg_color: style.bg_color,
         font_family: style.font_family.as_ref().map(|f| f.id().to_string()),
+        /* Issue #355 — the explicit family for Arabic segments too, as
+        before the per-script slot existed. */
+        font_family_cs: style.font_family.as_ref().map(|f| f.id().to_string()),
         caps_transform: style.caps.unwrap_or(false),
         baseline_shift_px: 0.0,
     }

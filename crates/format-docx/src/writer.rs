@@ -257,6 +257,23 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
     emit_rpr_adopting(style, None, out);
 }
 
+/// Issue #355 — the `<w:rFonts>` theme attributes a regenerated run
+/// writes: slot by slot from [`SpanStyle::font_bindings`] (exactly the
+/// slots the source bound — a `w:cstheme="minorBidi"` stays `minorBidi`,
+/// an unbound `w:eastAsiaTheme` is not synthesized), else — a style with
+/// no bindings (an older snapshot) — the legacy single `font_theme` on
+/// the three slots it always wrote. Never the resolved family: the
+/// binding, not the face the theme currently names, is the document's
+/// statement.
+fn rfonts_theme_attrs(style: &SpanStyle) -> Vec<(&'static str, &str)> {
+    match style.font_bindings.as_deref() {
+        Some(b) => b.theme_attrs().collect(),
+        None => style.font_theme.as_deref().map_or_else(Vec::new, |t| {
+            vec![("w:asciiTheme", t), ("w:hAnsiTheme", t), ("w:cstheme", t)]
+        }),
+    }
+}
+
 /// [`emit_rpr`] for a run regenerated from a source `<w:rPr>` (`source`):
 /// regenerated children keep the source spelling of an unchanged element
 /// (issue #106, [`PrChildren::adopt`]).
@@ -276,7 +293,8 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
         .as_ref()
         .map(|f| family_docx_name(f).to_string())
         .or_else(|| style.raw_font_family.clone());
-    if rfonts_name.is_some() || style.font_theme.is_some() {
+    let theme_attrs = rfonts_theme_attrs(style);
+    if rfonts_name.is_some() || !theme_attrs.is_empty() {
         let mut s = String::from("<w:rFonts");
         if let Some(n) = rfonts_name.as_deref() {
             s.push_str(" w:ascii=\"");
@@ -287,13 +305,11 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
             push_escaped_attr(n, &mut s);
             s.push('"');
         }
-        if let Some(t) = style.font_theme.as_deref() {
-            s.push_str(" w:asciiTheme=\"");
-            push_escaped_attr(t, &mut s);
-            s.push_str("\" w:hAnsiTheme=\"");
-            push_escaped_attr(t, &mut s);
-            s.push_str("\" w:cstheme=\"");
-            push_escaped_attr(t, &mut s);
+        for (attr, value) in theme_attrs {
+            s.push(' ');
+            s.push_str(attr);
+            s.push_str("=\"");
+            push_escaped_attr(value, &mut s);
             s.push('"');
         }
         s.push_str("/>");
@@ -10282,3 +10298,8 @@ mod inline_span_tests;
 #[cfg(test)]
 #[path = "writer_table_markup_tests.rs"]
 mod table_markup_tests;
+
+/// Issue #355 — `<w:rFonts>` theme bindings.
+#[cfg(test)]
+#[path = "writer_theme_tests.rs"]
+mod theme_tests;
