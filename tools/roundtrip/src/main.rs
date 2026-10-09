@@ -40,6 +40,7 @@ mod revision_ids;
 mod revisions;
 mod table_markup;
 mod theme;
+mod tracked_coverage;
 
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
@@ -353,6 +354,7 @@ fn run_default() -> Result<()> {
     comments::run_comment_patch_roundtrip()?;
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
+    tracked_coverage::run_tracked_paste_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

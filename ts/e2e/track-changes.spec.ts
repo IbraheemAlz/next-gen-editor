@@ -149,3 +149,70 @@ test('tracked Backspace at a paragraph start marks the break; Backspace over you
     const nothing = await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
     expect(nothing.undo_depth).toBe(depth);
 });
+
+/* Issue #366 — pasted text and IME commits are tracked insertions too:
+ * reject all removes them (merging the paragraphs a multi-line paste
+ * split), accept all keeps them. */
+
+for (const [how, cmd] of [
+    ['plain', { type: 'PASTE_PLAIN', text: 'one\ntwo' }],
+    ['HTML', { type: 'PASTE_HTML', html: '<p>one</p><p>two</p>' }],
+] as const) {
+    test(`a tracked ${how} paste of two paragraphs rejects to the original`, async ({ page }) => {
+        await boot(page);
+        await seed(page, ['alpha beta']);
+        const depth = (await run(page, [caret(0, 5)])).undo_depth as number;
+        const pasted = await run(page, [cmd]);
+        expect(pasted.type).toBe('SELECTION_CHANGED');
+        expect(pasted.undo_depth).toBe(depth + 1);
+        expect(await plain(page)).toBe('alphaone\ntwo beta');
+        await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
+        expect(await plain(page)).toBe('alpha beta');
+        await run(page, [{ type: 'UNDO' }]);
+        expect(await plain(page)).toBe('alphaone\ntwo beta');
+        await run(page, [{ type: 'ACCEPT_ALL_REVISIONS' }]);
+        expect(await plain(page)).toBe('alphaone\ntwo beta');
+        /* Nothing left pending. */
+        const settled = (await run(page, [caret(0, 0)])).undo_depth as number;
+        const again = await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
+        expect(again.undo_depth).toBe(settled);
+    });
+}
+
+test('a tracked IME commit through the hidden input is an insertion reject removes', async ({
+    page,
+}) => {
+    await boot(page);
+    await seed(page, ['alpha beta']);
+    await run(page, [caret(0, 6)]);
+    /* The real HiddenInput composition handlers (BEGIN / UPDATE /
+     * END_COMPOSITION), fired as one synchronous burst. */
+    await page.evaluate(() => {
+        const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-nge-hidden-input]');
+        if (!ta) throw new Error('editor hidden input missing');
+        const fire = (type: string, data: string): void => {
+            ta.dispatchEvent(new CompositionEvent(type, { data, bubbles: true }));
+        };
+        fire('compositionstart', '');
+        fire('compositionupdate', 'に');
+        fire('compositionupdate', '日本');
+        fire('compositionend', '日本');
+    });
+    expect(await plain(page)).toBe('alpha 日本beta');
+    /* One change, by the reviewer: the sidebar's single reject removes it. */
+    const rows = await page.evaluate(async () => {
+        const client = (window as any).__engineClient;
+        return (await client.revisionsSnapshot()) as Array<{ kind: string; start: number; end: number; revision_id: number }>;
+    });
+    expect(rows.map((r) => [r.kind, r.start, r.end])).toEqual([['insert', 6, 12]]);
+    await run(page, [
+        {
+            type: 'REJECT_REVISION',
+            block: 0,
+            start: 6,
+            end: 12,
+            revision_id: rows[0]!.revision_id,
+        },
+    ]);
+    expect(await plain(page)).toBe('alpha beta');
+});

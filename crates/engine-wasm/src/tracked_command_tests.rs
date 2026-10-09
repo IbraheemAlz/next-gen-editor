@@ -326,3 +326,232 @@ fn a_tracked_delete_over_a_table_answers_an_error() {
     }
     assert_eq!(e.undo.depth(), depth, "nothing pushed");
 }
+
+/* ======================= issue #366 — paste + IME commit ==== */
+
+fn text_revs(e: &Engine) -> Vec<Vec<(engine::RevisionKind, u32, u32)>> {
+    e.undo
+        .current()
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .map(|p| {
+            let mut v: Vec<_> = p
+                .revisions
+                .iter()
+                .map(|r| (r.kind, r.start, r.end))
+                .collect();
+            v.sort_by_key(|r| (r.1, r.2));
+            v
+        })
+        .collect()
+}
+
+const INS: engine::RevisionKind = engine::RevisionKind::Insert;
+const DEL: engine::RevisionKind = engine::RevisionKind::Delete;
+
+#[test]
+fn a_multiline_plain_paste_is_tracked_and_rejects_to_the_original() {
+    let mut e = tracking_engine(&["alpha beta"]);
+    caret(&mut e, 0, 5);
+    let depth = e.undo.depth();
+    apply(
+        &mut e,
+        Command::PastePlain {
+            text: "one\r\ntwo".into(),
+        },
+    );
+    assert_eq!(e.undo.depth(), depth + 1, "one undo step");
+    assert_eq!(texts(&e), vec!["alphaone", "two beta"]);
+    assert_eq!(text_revs(&e), vec![vec![(INS, 5, 8)], vec![(INS, 0, 3)]]);
+    assert_eq!(mark_kinds(&e), vec![vec![INS], vec![]]);
+    let mark = &e.undo.current().nth_paragraph(0).unwrap().mark_revisions[0];
+    assert_eq!(mark.author, e.review_author);
+    assert_eq!(caret_pos(&e), (1, 3));
+    apply(&mut e, Command::RejectAllRevisions);
+    assert_eq!(texts(&e), vec!["alpha beta"]);
+    assert!(!e.undo.current().has_revisions());
+    assert!(selection_valid(&e));
+    apply(&mut e, Command::Undo);
+    apply(&mut e, Command::AcceptAllRevisions);
+    assert_eq!(texts(&e), vec!["alphaone", "two beta"]);
+    assert!(!e.undo.current().has_revisions());
+}
+
+#[test]
+fn a_single_line_plain_paste_is_a_tracked_insertion() {
+    let mut e = tracking_engine(&["alpha beta"]);
+    caret(&mut e, 0, 6);
+    apply(
+        &mut e,
+        Command::PastePlain {
+            text: "new ".into(),
+        },
+    );
+    assert_eq!(texts(&e), vec!["alpha new beta"]);
+    assert_eq!(text_revs(&e), vec![vec![(INS, 6, 10)]]);
+    apply(&mut e, Command::RejectAllRevisions);
+    assert_eq!(texts(&e), vec!["alpha beta"]);
+}
+
+/// Pasting over a selection: the selection is marked deleted first — the
+/// reviewer's own pending insertion inside it is removed outright (#265)
+/// — then the paste lands at its start as an insertion.
+#[test]
+fn pasting_over_a_selection_marks_it_deleted_and_drops_your_own_insertion() {
+    let mut e = tracking_engine(&["alpha beta"]);
+    caret(&mut e, 0, 6);
+    apply(
+        &mut e,
+        Command::InsertText {
+            at: None,
+            text: "XX".into(),
+        },
+    );
+    assert_eq!(texts(&e), vec!["alpha XXbeta"]);
+    select(&mut e, (0, 6), (0, 12));
+    apply(
+        &mut e,
+        Command::PastePlain {
+            text: "1\n2".into(),
+        },
+    );
+    /* "XX" (own) is gone; "beta" is struck behind the paste. */
+    assert_eq!(texts(&e), vec!["alpha 1", "2beta"]);
+    assert_eq!(
+        text_revs(&e),
+        vec![vec![(INS, 6, 7)], vec![(INS, 0, 1), (DEL, 1, 5)]]
+    );
+    assert_eq!(mark_kinds(&e), vec![vec![INS], vec![]]);
+    apply(&mut e, Command::RejectAllRevisions);
+    assert_eq!(texts(&e), vec!["alpha beta"]);
+    apply(&mut e, Command::Undo);
+    apply(&mut e, Command::AcceptAllRevisions);
+    assert_eq!(texts(&e), vec!["alpha 1", "2"]);
+}
+
+#[test]
+fn an_html_paste_is_tracked_and_rejects_to_the_original() {
+    let mut e = tracking_engine(&["alpha beta"]);
+    caret(&mut e, 0, 5);
+    apply(
+        &mut e,
+        Command::PasteHtml {
+            html: "<p>one</p><p>two</p>".into(),
+        },
+    );
+    assert_eq!(texts(&e), vec!["alphaone", "two beta"]);
+    assert_eq!(text_revs(&e), vec![vec![(INS, 5, 8)], vec![(INS, 0, 3)]]);
+    assert_eq!(mark_kinds(&e), vec![vec![INS], vec![]]);
+    apply(&mut e, Command::RejectAllRevisions);
+    assert_eq!(texts(&e), vec!["alpha beta"]);
+    assert!(!e.undo.current().has_revisions());
+    apply(&mut e, Command::Undo);
+    apply(&mut e, Command::AcceptAllRevisions);
+    assert_eq!(texts(&e), vec!["alphaone", "two beta"]);
+}
+
+#[test]
+fn an_html_paste_over_a_selection_marks_it_deleted() {
+    let mut e = tracking_engine(&["alpha beta"]);
+    select(&mut e, (0, 0), (0, 5));
+    apply(
+        &mut e,
+        Command::PasteHtml {
+            html: "<p>A</p><p>B</p>".into(),
+        },
+    );
+    assert_eq!(texts(&e), vec!["A", "Balpha beta"]);
+    assert_eq!(
+        text_revs(&e),
+        vec![vec![(INS, 0, 1)], vec![(INS, 0, 1), (DEL, 1, 6)]]
+    );
+    apply(&mut e, Command::AcceptAllRevisions);
+    assert_eq!(texts(&e), vec!["A", "B beta"]);
+}
+
+#[test]
+fn pasting_with_review_mode_off_stays_plain() {
+    let mut e = tracking_engine(&["alpha beta"]);
+    apply(&mut e, Command::ToggleTrackChanges { enabled: false });
+    caret(&mut e, 0, 5);
+    apply(
+        &mut e,
+        Command::PastePlain {
+            text: "1\n2".into(),
+        },
+    );
+    apply(
+        &mut e,
+        Command::PasteHtml {
+            html: "<p>3</p><p>4</p>".into(),
+        },
+    );
+    assert_eq!(texts(&e), vec!["alpha1", "23", "4 beta"]);
+    assert!(!e.undo.current().has_revisions());
+}
+
+/// An IME commit goes through the tracked typing path: the composed text
+/// is the reviewer's insertion (one undo step), reject removes it.
+#[test]
+fn an_ime_commit_is_a_tracked_insertion() {
+    let mut e = tracking_engine(&["alpha beta"]);
+    caret(&mut e, 0, 6);
+    let depth = e.undo.depth();
+    apply(&mut e, Command::BeginComposition { at: None });
+    apply(
+        &mut e,
+        Command::UpdateComposition {
+            text: "に".into(),
+            target_range: None,
+        },
+    );
+    apply(
+        &mut e,
+        Command::UpdateComposition {
+            text: "日本".into(),
+            target_range: None,
+        },
+    );
+    assert_eq!(e.undo.depth(), depth, "the preview is no edit");
+    apply(&mut e, Command::EndComposition { commit: true });
+    assert_eq!(e.undo.depth(), depth + 1);
+    assert_eq!(texts(&e), vec!["alpha 日本beta"]);
+    assert_eq!(text_revs(&e), vec![vec![(INS, 6, 12)]]);
+    assert_eq!(caret_pos(&e), (0, 12));
+    apply(&mut e, Command::RejectAllRevisions);
+    assert_eq!(texts(&e), vec!["alpha beta"]);
+    /* A cancelled composition records nothing. */
+    let depth = e.undo.depth();
+    apply(&mut e, Command::BeginComposition { at: None });
+    apply(
+        &mut e,
+        Command::UpdateComposition {
+            text: "x".into(),
+            target_range: None,
+        },
+    );
+    apply(&mut e, Command::EndComposition { commit: false });
+    assert_eq!(e.undo.depth(), depth);
+    assert!(!e.undo.current().has_revisions());
+}
+
+/// An IME commit over a selection marks the selection deleted first.
+#[test]
+fn an_ime_commit_over_a_selection_marks_it_deleted() {
+    let mut e = tracking_engine(&["alpha beta"]);
+    select(&mut e, (0, 6), (0, 10));
+    apply(&mut e, Command::BeginComposition { at: None });
+    apply(
+        &mut e,
+        Command::UpdateComposition {
+            text: "日本".into(),
+            target_range: None,
+        },
+    );
+    apply(&mut e, Command::EndComposition { commit: true });
+    assert_eq!(texts(&e), vec!["alpha 日本beta"]);
+    assert_eq!(text_revs(&e), vec![vec![(INS, 6, 12), (DEL, 12, 16)]]);
+    apply(&mut e, Command::AcceptAllRevisions);
+    assert_eq!(texts(&e), vec!["alpha 日本"]);
+}

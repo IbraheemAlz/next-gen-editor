@@ -73,6 +73,8 @@ mod revisions;
 mod text_remap;
 mod tracked;
 #[cfg(test)]
+mod tracked_paste_tests;
+#[cfg(test)]
 mod tracked_tests;
 pub use text_remap::TextEdit;
 use text_remap::join_at_seam;

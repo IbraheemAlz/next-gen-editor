@@ -1,9 +1,11 @@
 //! Issues #301 / #298 — recording tracked deletions and STRUCTURAL tracked
 //! changes: a paragraph break typed with review mode on (an inserted
 //! paragraph mark) and a deletion of any range inside one container —
-//! paragraph marks included (deleted marks). The other text-level
-//! recorders (`tracked_insert_text`, `tracked_format_change`) live with
-//! the mutators in `lib.rs`; resolution (accept / reject) lives in
+//! paragraph marks included (deleted marks). Issue #366 — a paste (plain
+//! multi-line or rich) with review mode on records its text and every
+//! paragraph mark it creates as inserted. The other text-level recorders
+//! (`tracked_insert_text`, `tracked_format_change`) live with the
+//! mutators in `lib.rs`; resolution (accept / reject) lives in
 //! `revisions.rs`.
 //!
 //! Every text change goes through [`crate::Paragraph::splice_text`] (via
@@ -17,8 +19,8 @@ use std::fmt;
 
 use crate::text_remap::TextEdit;
 use crate::{
-    BlockPath, DocumentTree, LogicalPos, Paragraph, PathStep, Revision, RevisionKind,
-    mutate_paragraph_in_top, order_positions, same_parent,
+    Block, BlockPath, DocumentTree, LogicalPos, Paragraph, PathStep, Revision, RevisionKind,
+    bump_last_block_index, mutate_paragraph_in_top, order_positions, same_parent,
 };
 
 /// Issue #298 — why a tracked deletion could not be recorded. The editor
@@ -138,6 +140,113 @@ impl DocumentTree {
             out.blocks = blocks;
         }
         out
+    }
+
+    /// Issue #366 — a multi-line plain paste with review mode on: exactly
+    /// [`Self::insert_multiline`], with every line going through the
+    /// tracked typing path ([`Self::tracked_insert_text`] — one `Insert`
+    /// per line, growing an adjacent insertion of `author`'s, splitting a
+    /// deletion it lands in) and every newline through the tracked
+    /// paragraph break ([`Self::tracked_split_paragraph`] — the new mark
+    /// is inserted). Rejecting the result removes the text and merges the
+    /// paragraphs back; accepting keeps both. Returns the new tree and the
+    /// caret at the end of the last pasted line.
+    pub fn tracked_insert_multiline(
+        &self,
+        at: LogicalPos,
+        text: &str,
+        author: &str,
+        date: &str,
+    ) -> (Self, LogicalPos) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let lines: Vec<&str> = normalized.split('\n').collect();
+        let mut doc = self.clone();
+        let mut cur = at;
+        for (i, line) in lines.iter().enumerate() {
+            /* Where the line lands: `tracked_insert_text` snaps the
+            offset against the pre-insert text and appends at the
+            document end when the path is stale — mirror both. */
+            let landed = doc
+                .paragraph_at_path(&cur.path)
+                .map(|p| p.snap_offset(cur.offset));
+            doc = doc.tracked_insert_text(cur.clone(), line, author.to_owned(), date.to_owned());
+            let path = if landed.is_some() {
+                cur.path.clone()
+            } else {
+                doc.path_to_last_top_paragraph()
+                    .unwrap_or(BlockPath::top(0))
+            };
+            let start = landed.unwrap_or_else(|| {
+                doc.paragraph_at_path(&path)
+                    .map_or(0, |p| p.text.len().saturating_sub(line.len()) as u32)
+            });
+            let after = LogicalPos::new(path.clone(), start + line.len() as u32);
+            if i + 1 < lines.len() {
+                doc = doc.tracked_split_paragraph(after, author, date);
+                cur = LogicalPos::new(bump_last_block_index(&path), 0);
+            } else {
+                cur = after;
+            }
+        }
+        (doc, cur)
+    }
+
+    /// Issue #366 — a rich (HTML) paste with review mode on: exactly
+    /// [`Self::insert_rich_blocks`], with the pasted content recorded as
+    /// `author`'s insertion. The fragment is new text whatever it carried:
+    /// each pasted paragraph (table cells included) becomes ONE `Insert`
+    /// over its text. Every paragraph mark the paste CREATES is an
+    /// inserted mark: the one now ending the head (the first pasted
+    /// paragraph's, or — when the paste opens with a table — the head's
+    /// fresh mark) and each middle paragraph's; the last pasted
+    /// paragraph's mark gives way to the target's original one, which
+    /// ends the tail (`Paragraph::concat`), so a one-paragraph paste
+    /// creates none. Rejecting the result removes the text and merges the
+    /// paragraphs back; accepting keeps everything.
+    pub fn tracked_insert_rich_blocks(
+        &self,
+        at: LogicalPos,
+        blocks_in: &[Block],
+        author: &str,
+        date: &str,
+    ) -> (Self, LogicalPos) {
+        let stamped: Vec<Block> = blocks_in
+            .iter()
+            .map(|b| stamp_inserted(b, author, date))
+            .collect();
+        let target = self.rich_paste_target(&at);
+        let (mut out, caret) = self.insert_rich_blocks(at, &stamped);
+        let Some((PathStep::Block(idx), container)) =
+            target.as_ref().and_then(|(t, _)| t.steps.split_last())
+        else {
+            return (out, caret);
+        };
+        /* The created marks, by their block index in the container (the
+        layout `insert_rich_blocks` builds): the head at `idx`, the
+        opening table (when the paste opens with one) after it, then the
+        middle blocks; the last pasted block ends at the original mark. */
+        let n = blocks_in.len();
+        let opens_with_paragraph = matches!(blocks_in.first(), Some(Block::Paragraph(_)));
+        let mut created = Vec::new();
+        if n >= 2 || !opens_with_paragraph {
+            created.push(*idx);
+        }
+        let first_middle = idx + 1 + u32::from(!opens_with_paragraph);
+        let middles = blocks_in.get(1..n.saturating_sub(1)).unwrap_or(&[]);
+        created.extend(
+            (first_middle..)
+                .zip(middles)
+                .filter(|(_, b)| matches!(b, Block::Paragraph(_)))
+                .map(|(k, _)| k),
+        );
+        let mut blocks = out.blocks.clone();
+        for i in created {
+            let _ = mutate_paragraph_in_top(&mut blocks, &child(container, i), |p| {
+                p.mark_revisions = vec![mark_change(RevisionKind::Insert, author, date)];
+            });
+        }
+        out.blocks = blocks;
+        (out, caret)
     }
 
     /// Sprint 14 (#14) / issue #298 — a deletion with review mode on, over
@@ -264,6 +373,53 @@ impl DocumentTree {
             start,
             end: LogicalPos::new(at(end_idx), end_off),
         })
+    }
+}
+
+/// Issue #366 — `block` as pasted new text by `author`: every paragraph
+/// (table cells included) one `Insert` over its whole text, whatever
+/// revisions the fragment carried. Inside a pasted table every cell
+/// paragraph's mark but the cell's last (which ends the cell) is a
+/// pasted paragraph break — an inserted mark; a top-level paragraph's
+/// mark is the paste's business ([`DocumentTree::insert_rich_blocks`]
+/// strips fragment marks).
+fn stamp_inserted(block: &Block, author: &str, date: &str) -> Block {
+    match block {
+        Block::Paragraph(p) => {
+            let mut p = p.clone();
+            let len = p.text.len() as u32;
+            p.revisions = if len > 0 {
+                vec![Revision {
+                    start: 0,
+                    end: len,
+                    ..mark_change(RevisionKind::Insert, author, date)
+                }]
+            } else {
+                Vec::new()
+            };
+            p.dirty = true;
+            Block::Paragraph(p)
+        }
+        Block::Table(t) => {
+            let mut t = t.clone();
+            for cell in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+                let n = cell.blocks.len();
+                for (i, b) in cell.blocks.iter_mut().enumerate() {
+                    let mut stamped = stamp_inserted(b, author, date);
+                    if let Block::Paragraph(p) = &mut stamped {
+                        p.mark_revisions = if i + 1 < n {
+                            vec![mark_change(RevisionKind::Insert, author, date)]
+                        } else {
+                            Vec::new()
+                        };
+                    }
+                    *b = stamped;
+                }
+            }
+            t.dirty = true;
+            t.source_xml = None;
+            Block::Table(t)
+        }
     }
 }
 

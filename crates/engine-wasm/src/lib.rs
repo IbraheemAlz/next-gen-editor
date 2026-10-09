@@ -15603,15 +15603,47 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = if start == end {
-            self.undo.current().clone()
-        } else {
-            self.undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        let base = match self.paste_base("PastePlain", &start, end) {
+            Ok(d) => d,
+            Err(e) => return *e,
         };
-        let (new_doc, caret) = base.insert_multiline(to_engine_pos(start), &normalized);
+        /* Issue #366 — with review mode on, every pasted line is a
+        tracked insertion and every newline an inserted paragraph mark. */
+        let (new_doc, caret) = if self.tracking_changes {
+            base.tracked_insert_multiline(
+                to_engine_pos(start),
+                &normalized,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            base.insert_multiline(to_engine_pos(start), &normalized)
+        };
         self.commit_edit(new_doc, to_bridge_pos(caret))
+    }
+
+    /// Issue #366 — the tree a paste over `[start, end)` lands in: the
+    /// range removed (`start == end`: the current tree) or, with review
+    /// mode on, recorded as a tracked deletion first (the reviewer's own
+    /// pending insertions inside it removed outright, #265) — the typed
+    /// replacement's order. A tracked range the engine refuses answers a
+    /// typed `Event::Error`.
+    fn paste_base(
+        &self,
+        cmd: &str,
+        start: &BridgeLogicalPos,
+        end: BridgeLogicalPos,
+    ) -> Result<engine::DocumentTree, Box<Event>> {
+        if *start == end {
+            Ok(self.undo.current().clone())
+        } else if self.tracking_changes {
+            self.tracked_delete(cmd, start, &end).map(|t| t.doc)
+        } else {
+            Ok(self
+                .undo
+                .current()
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end)))
+        }
     }
 
     /// `Command::PasteHtml` (Backlog #12) — parse HTML into styled paragraphs
@@ -15634,14 +15666,22 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = if start == end {
-            self.undo.current().clone()
-        } else {
-            self.undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        let base = match self.paste_base("PasteHtml", &start, end) {
+            Ok(d) => d,
+            Err(e) => return *e,
         };
-        let (new_doc, caret) = base.insert_rich_blocks(to_engine_pos(start), &blocks_in);
+        /* Issue #366 — with review mode on, the pasted content (and every
+        paragraph mark it creates) is a tracked insertion. */
+        let (new_doc, caret) = if self.tracking_changes {
+            base.tracked_insert_rich_blocks(
+                to_engine_pos(start),
+                &blocks_in,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            base.insert_rich_blocks(to_engine_pos(start), &blocks_in)
+        };
         self.commit_edit(new_doc, to_bridge_pos(caret))
     }
 
