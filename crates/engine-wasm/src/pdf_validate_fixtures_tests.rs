@@ -76,6 +76,11 @@ fn build_fixture_engine(doc: DocumentTree, primary_font_id: &str) -> Engine {
 /// to avoid this net needing to know X-3's `/Title` / date requirements).
 /// A failure here means the fixture is broken before it ever reaches
 /// `tools/pdf-validate`'s browser harness.
+///
+/// Issue #327 — also the native twin of `tools/pdf-validate`'s size gate,
+/// so `--regen` / `--check-fixtures` (which run these generators) catch a
+/// font-subsetting regression without a browser: a ONE-PAGE fixture's PDF
+/// must be under 10 % of the raw size of the font files it embeds.
 fn assert_exports_cleanly(engine: &Engine, label: &str) {
     let (pages, ..) = engine
         .build_pages(1.0, false, None)
@@ -93,6 +98,28 @@ fn assert_exports_cleanly(engine: &Engine, label: &str) {
                     "{label} {profile:?}: missing %PDF header"
                 );
                 assert!(n > 0, "{label} {profile:?}: zero pages exported");
+                if n == 1 {
+                    let names = format_pdf::test_support::embedded_font_names(&bytes);
+                    assert!(!names.is_empty(), "{label} {profile:?}: no embedded font");
+                    let raw: usize = names
+                        .iter()
+                        .map(|id| {
+                            engine
+                                .fonts
+                                .get(id)
+                                .unwrap_or_else(|| panic!("{label}: embedded `{id}` not loaded"))
+                                .data()
+                                .len()
+                        })
+                        .sum();
+                    assert!(
+                        bytes.len() * 10 < raw,
+                        "{label} {profile:?}: one-page PDF is {} B, not under 10 % of the \
+                         {raw} B of raw font data it embeds ({names:?}) — font subsetting \
+                         (issue #327) regressed",
+                        bytes.len()
+                    );
+                }
             }
             other => panic!("{label} {profile:?}: export failed: {other:?}"),
         }
