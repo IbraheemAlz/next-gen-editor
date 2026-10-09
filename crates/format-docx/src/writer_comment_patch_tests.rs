@@ -766,3 +766,57 @@ fn comment_markers_inside_alternate_content_come_from_the_selected_branch() {
         );
     }
 }
+
+/// Issue #351 × #282 — a row-level `mc:AlternateContent` whose Choice the
+/// reader does not select (`Requires="w99"`): the table walk reads the
+/// Fallback's row only, so a comment added to that cell must be spliced
+/// into the Fallback's paragraph — never into the byte-identical paragraph
+/// of the Choice the search meets first.
+#[test]
+fn a_cell_comment_lands_in_the_selected_alternate_content_branch() {
+    let row = r#"<w:tr><w:tc><w:p><w:r><w:t>same words</w:t></w:r></w:p></w:tc></w:tr>"#;
+    let body = format!(
+        concat!(
+            r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid>"#,
+            r#"<mc:AlternateContent><mc:Choice Requires="w99">{row}</mc:Choice>"#,
+            r#"<mc:Fallback>{row}</mc:Fallback></mc:AlternateContent></w:tbl><w:p/>"#,
+        ),
+        row = row
+    );
+    let (xml, archive) = package(&body, Some(COMMENTS));
+    let doc = &archive.document;
+    let table = doc.blocks[0].as_table().expect("table");
+    assert_eq!(table.rows.len(), 1, "one branch read");
+    assert_eq!(document_xml_of(&save(&archive, doc)), xml, "zero-edit");
+
+    let cell = BlockPath {
+        steps: vec![
+            PathStep::Block(0),
+            PathStep::Cell { row: 0, col: 0 },
+            PathStep::Block(0),
+        ],
+    };
+    let (with_new, id) = doc.insert_comment(
+        LogicalPos::new(cell.clone(), 5),
+        LogicalPos::new(cell.clone(), 10),
+        "n".into(),
+        "Me".into(),
+        String::new(),
+    );
+    let bytes = save(&archive, &with_new);
+    let out = document_xml_of(&bytes);
+    assert!(pure_insertion(&xml, &out), "{out}");
+    let (choice, fallback) = out.split_at(out.find("<mc:Fallback>").expect("fallback kept"));
+    for piece in [
+        format!(r#"<w:commentRangeStart w:id="{id}"/>"#),
+        format!(r#"<w:commentRangeEnd w:id="{id}"/>"#),
+        format!(r#"<w:commentReference w:id="{id}"/>"#),
+    ] {
+        assert!(
+            fallback.contains(&piece) && !choice.contains(&piece),
+            "{piece} sits in the branch the reader selects, once: {out}"
+        );
+    }
+    let back = read_docx(&bytes).expect("re-read");
+    assert_eq!(anchored_text(&back.document, id), "words");
+}

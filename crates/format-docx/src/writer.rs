@@ -27,8 +27,8 @@ use crate::schema::wp_anchor::emit_anchor_open;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
     FontFamily, Hyperlink, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph,
-    Revision, RevisionKind, RowHeight, SourceMarkup, SourcePPr, SourceRun, SpanStyle, Table,
-    TableCell, TableRow, TextDirection, UnderlineStyle, VMergeRole,
+    PathStep, Revision, RevisionKind, RowHeight, SourceMarkup, SourcePPr, SourceRun, SpanStyle,
+    Table, TableCell, TableRow, TextDirection, UnderlineStyle, VMergeRole,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -2391,40 +2391,72 @@ fn splice_is_faithful(src: &str, patched: &str, synth: &[comment_anchors::TreeAn
     ) else {
         return false;
     };
-    let content = |p: &Paragraph| {
-        let mut p = p.clone();
-        p.source_xml = None;
-        p.source_markup = None;
-        p.body_xml = None;
-        /* A split run comes back as two equally styled spans. */
-        let mut spans: Vec<engine::StyleRun> = Vec::with_capacity(p.spans.len());
-        for r in std::mem::take(&mut p.spans) {
-            match spans.last_mut() {
-                Some(last) if last.end == r.start && last.style == r.style => last.end = r.end,
-                _ => spans.push(r),
-            }
-        }
-        p.spans = spans;
-        format!("{p:?}")
-    };
-    if content(&a) != content(&b) {
+    if paragraph_content(&a) != paragraph_content(&b) {
         return false;
     }
+    let top = [PathStep::Block(0)];
+    let synth: Vec<(&[PathStep], comment_anchors::TreeAnchor)> =
+        synth.iter().map(|t| (&top[..], *t)).collect();
+    anchor_pieces_are_faithful(&a_events, &b_events, &synth)
+}
+
+/// Issues #282 / #351 — a re-read paragraph's content for the splice
+/// checks: everything but its source bytes, with equally styled adjacent
+/// spans joined (a split run comes back as two).
+fn paragraph_content(p: &Paragraph) -> String {
+    let mut p = p.clone();
+    p.source_xml = None;
+    p.source_markup = None;
+    p.body_xml = None;
+    let mut spans: Vec<engine::StyleRun> = Vec::with_capacity(p.spans.len());
+    for r in std::mem::take(&mut p.spans) {
+        match spans.last_mut() {
+            Some(last) if last.end == r.start && last.style == r.style => last.end = r.end,
+            _ => spans.push(r),
+        }
+    }
+    p.spans = spans;
+    format!("{p:?}")
+}
+
+/// Issue #282 — the re-read anchor pieces `after` a splice are the ones
+/// `before` it plus exactly the `synth` range markers (each at its path);
+/// reference runs may only be added.
+fn anchor_pieces_are_faithful(
+    before: &[crate::parts::document::CommentEvent],
+    after: &[crate::parts::document::CommentEvent],
+    synth: &[(&[PathStep], comment_anchors::TreeAnchor)],
+) -> bool {
+    /* A sortable spelling of a path. */
+    fn key(steps: &[PathStep]) -> Vec<(u32, u32, u32)> {
+        steps
+            .iter()
+            .map(|s| match *s {
+                PathStep::Block(i) => (0, i, 0),
+                PathStep::Cell { row, col } => (1, row, col),
+            })
+            .collect()
+    }
+    type Piece = (u8, u32, Vec<(u32, u32, u32)>, u32);
     let pieces = |events: &[crate::parts::document::CommentEvent], kind_is_ref: bool| {
-        let mut v: Vec<(u8, u32, u32)> = events
+        let mut v: Vec<Piece> = events
             .iter()
             .filter(|e| (e.kind == engine::CommentAnchorKind::Reference) == kind_is_ref)
-            .map(|e| (e.kind as u8, e.id, e.pos.offset))
+            .map(|e| (e.kind as u8, e.id, key(&e.pos.path.steps), e.pos.offset))
             .collect();
         v.sort_unstable();
         v
     };
-    let mut expected = pieces(&a_events, false);
-    expected.extend(synth.iter().map(|t| (t.kind as u8, t.id, t.at)));
+    let mut expected = pieces(before, false);
+    expected.extend(
+        synth
+            .iter()
+            .map(|(path, t)| (t.kind as u8, t.id, key(path), t.at)),
+    );
     expected.sort_unstable();
-    let refs_before = pieces(&a_events, true);
-    let refs_after = pieces(&b_events, true);
-    expected == pieces(&b_events, false) && refs_before.iter().all(|r| refs_after.contains(r))
+    let refs_before = pieces(before, true);
+    let refs_after = pieces(after, true);
+    expected == pieces(after, false) && refs_before.iter().all(|r| refs_after.contains(r))
 }
 
 /// Issue #120 — emit one block container's block list with the
@@ -2495,40 +2527,23 @@ fn emit_table(t: &Table, out: &mut String, hyperlink_rel_map: &HashMap<String, S
 /// that [`comment_anchors::needs_patch`] replaced by its patched bytes
 /// ([`patch_clean_paragraph`]). A cell paragraph's `source_xml` is the
 /// verbatim slice of the table's bytes, and the paragraphs appear in
-/// those bytes in depth-first order, so each one is the first occurrence
-/// of its bytes after the previous one. `None` (the caller regenerates
-/// the table) when a paragraph is not clean or cannot be located —
-/// decided before any paragraph is patched, so nothing is synthesized
-/// twice.
+/// those bytes in depth-first order, so each one is located as the first
+/// occurrence of its bytes after the previous one — a prediction, checked
+/// by re-reading the result (issue #351: an unselected `mc:Choice` the
+/// reader skips may spell the same bytes first). `None` (the caller
+/// regenerates the table) when a paragraph is not clean or cannot be
+/// located — decided before any paragraph is patched — or when the
+/// re-read disagrees, after rolling back what the attempt synthesized, so
+/// nothing is synthesized twice or lost.
 fn patch_clean_table(
     t: &Table,
     src: &str,
     hyperlink_rel_map: &HashMap<String, String>,
 ) -> Option<String> {
-    fn walk<'a>(t: &'a Table, out: &mut Vec<&'a Paragraph>) -> bool {
-        for row in &t.rows {
-            for cell in &row.cells {
-                for b in &cell.blocks {
-                    match b {
-                        Block::Paragraph(p) => out.push(p),
-                        Block::Table(inner) => {
-                            if !walk(inner, out) {
-                                return false;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        true
-    }
-    let mut paras = Vec::new();
-    if !walk(t, &mut paras) {
-        return None;
-    }
     let mut cursor = 0usize;
     let mut hits: Vec<(usize, usize, &Paragraph)> = Vec::new();
-    for p in paras {
+    let mut synth: Vec<(Vec<PathStep>, comment_anchors::TreeAnchor)> = Vec::new();
+    for (path, p) in table_paragraphs(t) {
         if p.dirty {
             return None;
         }
@@ -2537,8 +2552,15 @@ fn patch_clean_table(
         cursor = at + bytes.len();
         if comment_anchors::needs_patch(p) {
             hits.push((at, bytes.len(), p));
+            synth.extend(
+                comment_anchors::paragraph_anchors(p)
+                    .synthesize
+                    .into_iter()
+                    .map(|a| (path.clone(), a)),
+            );
         }
     }
+    let checkpoint = comment_anchors::checkpoint();
     let mut out = String::with_capacity(src.len() + 256 * hits.len());
     let mut copied = 0usize;
     for (at, len, p) in hits {
@@ -2551,7 +2573,75 @@ fn patch_clean_table(
         copied = at + len;
     }
     out.push_str(&src[copied..]);
-    Some(out)
+    let synth: Vec<(&[PathStep], comment_anchors::TreeAnchor)> =
+        synth.iter().map(|(p, a)| (p.as_slice(), *a)).collect();
+    if table_splice_is_faithful(src, &out, &synth) {
+        Some(out)
+    } else {
+        comment_anchors::rollback(checkpoint);
+        None
+    }
+}
+
+/// Every cell paragraph of `t`, depth first, with its path under a table
+/// at `top(0)` (the path a [`crate::parts::document::reparse_block`] of
+/// the table gives it).
+fn table_paragraphs(t: &Table) -> Vec<(Vec<PathStep>, &Paragraph)> {
+    fn walk<'a>(
+        t: &'a Table,
+        prefix: &mut Vec<PathStep>,
+        out: &mut Vec<(Vec<PathStep>, &'a Paragraph)>,
+    ) {
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, cell) in row.cells.iter().enumerate() {
+                for (i, b) in cell.blocks.iter().enumerate() {
+                    prefix.push(PathStep::Cell {
+                        row: r as u32,
+                        col: c as u32,
+                    });
+                    prefix.push(PathStep::Block(i as u32));
+                    match b {
+                        Block::Paragraph(p) => out.push((prefix.clone(), p)),
+                        Block::Table(inner) => walk(inner, prefix, out),
+                    }
+                    prefix.truncate(prefix.len() - 2);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(t, &mut vec![PathStep::Block(0)], &mut out);
+    out
+}
+
+/// Issue #351 × #282 — re-read `src` and `patched` (one `<w:tbl>` each):
+/// the table splice is faithful when every cell paragraph's content is
+/// unchanged and the anchor pieces are `src`'s plus exactly `synth`.
+/// [`patch_clean_table`] locates a cell paragraph by searching for its
+/// bytes, and a branch the reader skips (an unselected `mc:Choice` of a
+/// row- or cell-level `mc:AlternateContent`, an opaque over-deep nested
+/// table) can spell the same bytes first: the re-read is what tells
+/// whether the splice landed in the paragraph the reader reads.
+fn table_splice_is_faithful(
+    src: &str,
+    patched: &str,
+    synth: &[(&[PathStep], comment_anchors::TreeAnchor)],
+) -> bool {
+    let root = comment_anchors::root_attrs();
+    let patched = revision_ids::detokenize(patched);
+    let (Some((Block::Table(a), a_events)), Some((Block::Table(b), b_events))) = (
+        crate::parts::document::reparse_block(src.as_bytes(), &root),
+        crate::parts::document::reparse_block(patched.as_bytes(), &root),
+    ) else {
+        return false;
+    };
+    let contents = |t: &Table| -> Vec<(Vec<PathStep>, String)> {
+        table_paragraphs(t)
+            .into_iter()
+            .map(|(path, p)| (path, paragraph_content(p)))
+            .collect()
+    };
+    contents(&a) == contents(&b) && anchor_pieces_are_faithful(&a_events, &b_events, synth)
 }
 
 /// Phase 5 PR 3 — full table regeneration. Emits `<w:tbl>` with

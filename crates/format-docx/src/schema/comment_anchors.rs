@@ -424,6 +424,30 @@ pub fn root_attrs() -> Vec<(String, String)> {
     })
 }
 
+/// Issue #351 — the published plan's write-scoped state (the reference
+/// runs synthesized so far), taken before an attempt the caller may
+/// discard ([`rollback`]): a table splice that fails its verification is
+/// regenerated instead, and the regenerated paragraphs must synthesize
+/// the reference runs the discarded attempt claimed.
+pub fn checkpoint() -> Option<HashSet<u32>> {
+    WRITE_COMMENT_PLAN.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|plan| plan.synthesized_refs.clone())
+    })
+}
+
+/// Forget what a discarded attempt synthesized since [`checkpoint`].
+pub fn rollback(checkpoint: Option<HashSet<u32>>) {
+    if let Some(refs) = checkpoint {
+        WRITE_COMMENT_PLAN.with(|c| {
+            if let Some(plan) = c.borrow_mut().as_mut() {
+                plan.synthesized_refs = refs;
+            }
+        });
+    }
+}
+
 /// Clears the published plan when the write ends (early `?` returns
 /// included), restoring any outer one.
 pub struct CommentPlanScope(Option<CommentPlan>);

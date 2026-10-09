@@ -259,7 +259,14 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   XML tokens (a tag never matches part of another tag); the splice is
   verified by re-reading it and falls back to the regenerated paragraph
   (anchors never lost, only respelled). A clean table splices its
-  patched cell paragraphs into its own bytes (`patch_clean_table`).
+  patched cell paragraphs into its own bytes (`patch_clean_table`): each
+  is located by searching for its bytes — a prediction, verified by
+  re-reading the table (issue #351: an unselected `mc:Choice` the reader
+  skips can spell the same paragraph first); a mismatch regenerates the
+  table after `comment_anchors::rollback` forgets the reference runs the
+  discarded attempt synthesized. Comment markers inside an
+  `mc:AlternateContent` are read from the selected branch only (body and
+  cell paragraphs alike); a deleted comment's markers leave every branch.
   `delete_comment` tombstones the thread (`DocumentTree::
   deleted_comments`; new ids are minted above every tombstone) and the
   writer strips exactly those ids from the whole written body

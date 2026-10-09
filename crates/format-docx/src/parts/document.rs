@@ -1270,6 +1270,19 @@ pub(crate) fn reparse_paragraph(
     xml: &[u8],
     root_attrs: &[(String, String)],
 ) -> Option<(engine::Paragraph, Vec<CommentEvent>)> {
+    match reparse_block(xml, root_attrs)? {
+        (Block::Paragraph(p), events) => Some((p, events)),
+        _ => None,
+    }
+}
+
+/// [`reparse_paragraph`] for one block of either kind — a `<w:tbl>`'s
+/// pieces carry their full paths under `top(0)` (issue #284). `None` when
+/// the bytes do not parse as exactly one block.
+pub(crate) fn reparse_block(
+    xml: &[u8],
+    root_attrs: &[(String, String)],
+) -> Option<(Block, Vec<CommentEvent>)> {
     let mut wrapped: Vec<u8> = Vec::with_capacity(xml.len() + 512);
     wrapped.extend_from_slice(b"<w:document");
     if !root_attrs.iter().any(|(k, _)| k == "xmlns:w") {
@@ -1299,7 +1312,7 @@ pub(crate) fn reparse_paragraph(
         parse_document_xml_with_events(&wrapped, &resolver, &mut warnings, PageGeometry::default())
             .ok()?;
     match (tree.blocks.len(), tree.blocks.front()) {
-        (1, Some(Block::Paragraph(p))) => Some((p.clone(), events)),
+        (1, Some(b)) => Some((b.clone(), events)),
         _ => None,
     }
 }
