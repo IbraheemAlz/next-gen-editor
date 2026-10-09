@@ -47,6 +47,14 @@ rmp-serde = "1"
 # 8.7 KB gzip vs blake3's ≈ 32.2 KB / 12.3 KB. Pure Rust, MIT OR Apache-2.0;
 # `default-features = false` drops only `std`.
 sha2 = { version = "0.10", default-features = false }
+# Issue #345 — reading MS-OFFCRYPTO / ECMA-376 Part 2 encrypted packages
+# (agile + standard encryption; decryption only — writing encrypted
+# packages is out of scope). RustCrypto, pure Rust, MIT OR Apache-2.0, soft
+# AES on wasm32. `aes` 0.8 / `sha1` 0.10 share `cipher` 0.4 / `digest` 0.10
+# with `sha2` above; CBC / ECB are a few lines over the block cipher in
+# `format-docx::opc::offcrypto` (no `cbc` crate), base64 likewise.
+aes = { version = "0.8", default-features = false }
+sha1 = { version = "0.10", default-features = false }
 # Dev-only: JSON round-trip tests assert the `#[serde(tag = "type", ...)]`
 # wire shape of bridge enums (Issue #86 telemetry.rs tests).
 serde_json = "1"

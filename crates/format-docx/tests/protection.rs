@@ -48,6 +48,99 @@ fn encrypted_stub_is_refused_as_encrypted() {
     pin_e2e_fixture("encrypted_stub.docx", &bytes);
 }
 
+/// A real agile-encrypted package opens with its password, is
+/// `Encrypted` without one and `WrongPassword` with a wrong one; the e2e
+/// copy is current. The stub (no real descriptor) is unsupported, never a
+/// panic.
+#[test]
+fn encrypted_agile_package_opens_with_its_password() {
+    use format_docx::{PackageLimits, read_docx_with_password};
+    let bytes = fx::encrypted_agile_docx();
+    pin_e2e_fixture("encrypted_agile.docx", &bytes);
+    let open = |pw: Option<&str>| {
+        read_docx_with_password(
+            &bytes,
+            pw,
+            engine::DefaultPageSize::A4,
+            true,
+            &PackageLimits::DEFAULT,
+        )
+    };
+    let a = open(Some("pass")).expect("decrypt + read");
+    assert_eq!(
+        a.document.paragraph_text(0),
+        Some(fx::ENCRYPTED_FIXTURE_TEXT)
+    );
+    assert!(matches!(open(None), Err(DocxError::Encrypted)));
+    assert!(matches!(open(Some("Pass")), Err(DocxError::WrongPassword)));
+    assert!(matches!(read_docx(&bytes), Err(DocxError::Encrypted)));
+    /* A tiny package budget refuses the declared plaintext size. */
+    let tiny = PackageLimits {
+        max_total_bytes: 64,
+        ..PackageLimits::DEFAULT
+    };
+    assert!(matches!(
+        read_docx_with_password(
+            &bytes,
+            Some("pass"),
+            engine::DefaultPageSize::A4,
+            true,
+            &tiny
+        ),
+        Err(DocxError::PackageTooLarge { .. })
+    ));
+    let stub = read_docx_with_password(
+        &fx::encrypted_package_stub(),
+        Some("pass"),
+        engine::DefaultPageSize::A4,
+        true,
+        &PackageLimits::DEFAULT,
+    );
+    assert!(
+        matches!(stub, Err(DocxError::UnsupportedEncryption(_))),
+        "{stub:?}"
+    );
+    /* A password given for a plain package is ignored. */
+    let plain = read_docx_with_password(
+        &fx::forms_protected_docx(),
+        Some("pass"),
+        engine::DefaultPageSize::A4,
+        true,
+        &PackageLimits::DEFAULT,
+    )
+    .expect("plain package");
+    assert_eq!(
+        plain.document.protection_mode(),
+        Some(ProtectionEdit::Forms)
+    );
+}
+
+/// The Apache POI password fixtures (local corpus only — skipped when
+/// absent) open through the reader with their passwords.
+#[test]
+fn corpus_password_fixtures_open() {
+    use format_docx::{PackageLimits, read_docx_with_password};
+    let dir = "/data/corpus/files/apache-poi-test-data-document";
+    for (name, pw) in [
+        ("bug53475-password-is-pass.docx", "pass"),
+        ("bug53475-password-is-solrcell.docx", "solrcell"),
+    ] {
+        let Ok(bytes) = std::fs::read(format!("{dir}/{name}")) else {
+            continue;
+        };
+        let a = read_docx_with_password(
+            &bytes,
+            Some(pw),
+            engine::DefaultPageSize::A4,
+            true,
+            &PackageLimits::DEFAULT,
+        )
+        .expect(name);
+        assert!(a.document.paragraph_count() > 0, "{name}");
+        assert!(!a.document.to_plain_text().trim().is_empty(), "{name}");
+    }
+}
+
 /// The forms fixture reads its restriction and its three kinds of form
 /// content; the e2e copy is current.
 #[test]

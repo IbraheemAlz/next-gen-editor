@@ -52,6 +52,15 @@ pub enum DocxError {
          legacy binary format)"
     )]
     CompoundFile,
+    /// Issue #345 — the password does not open the encrypted package (its
+    /// verifier hash did not match).
+    #[error("the password is incorrect")]
+    WrongPassword,
+    /// Issue #345 — the encrypted package uses a scheme the reader does not
+    /// decrypt (RC4 / CryptoAPI, extensible or certificate encryption, a
+    /// non-AES cipher, a non-SHA hash) or its descriptor is malformed.
+    #[error("the document is encrypted with an unsupported scheme: {0}")]
+    UnsupportedEncryption(String),
 }
 
 /// Non-fatal reader diagnostics. The document opened, but some subtree was

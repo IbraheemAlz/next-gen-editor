@@ -908,3 +908,23 @@ pub fn forms_protected_docx() -> Vec<u8> {
         "<w:documentProtection w:edit=\"forms\" w:enforcement=\"1\"/>",
     )
 }
+
+/// Issue #345 — the text of [`encrypted_agile_docx`]'s one paragraph.
+pub const ENCRYPTED_FIXTURE_TEXT: &str = "Top secret: the password is pass.";
+
+/// Issue #345 — a REAL agile-encrypted package (password `pass`, AES-256,
+/// SHA-512, Office's 100 000 spins) around a one-paragraph document,
+/// produced by the test-only encryptor
+/// (`opc::offcrypto::test_encrypt::encrypt_agile`, fixed salts — the bytes
+/// are deterministic). `ts/e2e/fixtures/encrypted_agile.docx`.
+pub fn encrypted_agile_docx() -> Vec<u8> {
+    let plain = docx_with_body(&format!(
+        "<w:p><w:r><w:t>{ENCRYPTED_FIXTURE_TEXT}</w:t></w:r></w:p>"
+    ));
+    crate::opc::offcrypto::test_encrypt::encrypt_agile(
+        &plain,
+        "pass",
+        crate::opc::offcrypto::HashAlg::Sha512,
+        100_000,
+    )
+}

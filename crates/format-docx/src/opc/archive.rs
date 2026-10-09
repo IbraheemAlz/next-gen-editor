@@ -310,6 +310,38 @@ pub fn read_docx_with_limits(
 ) -> Result<DocxArchive, DocxError> {
     /* Issue #349 — every part's non-fatal diagnostics (styles,
     headers, notes included) land on `DocxArchive::warnings`. */
+    read_docx_with_password(
+        bytes,
+        None,
+        default_page_size,
+        widow_control_default,
+        limits,
+    )
+}
+
+/// Issue #345 — [`read_docx_with_limits`] that also opens an ENCRYPTED
+/// package (MS-OFFCRYPTO agile or standard encryption, see
+/// [`crate::opc::offcrypto`]) when `password` is given: the decrypted ZIP
+/// is read exactly like a plain `.docx` (its declared size bounded by
+/// `limits.max_total_bytes`). Without a password an encrypted package is
+/// [`DocxError::Encrypted`]; a wrong one [`DocxError::WrongPassword`].
+/// A `password` given for a plain package is ignored. The result carries
+/// no trace of the encryption: saving it writes an unencrypted package.
+pub fn read_docx_with_password(
+    bytes: &[u8],
+    password: Option<&str>,
+    default_page_size: engine::DefaultPageSize,
+    widow_control_default: bool,
+    limits: &PackageLimits,
+) -> Result<DocxArchive, DocxError> {
+    let decrypted;
+    let bytes = match (crate::opc::cfb::sniff_compound_file(bytes), password) {
+        (Some(crate::opc::cfb::CompoundFileKind::EncryptedPackage), Some(pw)) => {
+            decrypted = crate::opc::offcrypto::decrypt_package(bytes, pw, limits.max_total_bytes)?;
+            decrypted.as_slice()
+        }
+        _ => bytes,
+    };
     let mut part_warnings = Vec::new();
     let mut archive = crate::error::collect_read_warnings(&mut part_warnings, |_| {
         read_docx_scoped(bytes, default_page_size, widow_control_default, limits)
