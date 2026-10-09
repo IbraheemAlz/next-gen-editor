@@ -547,8 +547,21 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   (`w:eastAsia`, `w:hint`, `w:color`); a source child the model reads as
   nothing (`<w:rFonts w:hint="cs"/>`, `<w:color w:val="auto"/>`) is
   re-emitted. `<w:rStyle>` is never resurrected.
+- `raw_font_family` (a family the registry does not ship) follows the
+  chosen `font_slot` like `font_family` does (issue #424): a
+  complex-script-only edit writes it to `w:cs` and leaves the Latin
+  slot alone, a both-slots edit writes it to every slot, and a new name
+  at any cascade level replaces both fields — never let a raw name
+  rename the other slot or hide behind an inherited family.
+- Read-back (issue #423): `SelectionChanged` carries
+  `resolved_font_latin` / `resolved_font_cs` + `font_source` (Explicit /
+  Theme / Style / Default) and `slot_formats`, so the toolbar and the
+  Font dialog show the family the caret's text actually resolves to;
+  `attrs_at_caret.font_family` keeps its old meaning.
 - Harness: `tools/roundtrip` step 45 (`complex_script_size.docx`, a
-  `<w:bCs/>` + `<w:rStyle>` run, a Word-shaped Arabic run).
+  `<w:bCs/>` + `<w:rStyle>` run, a Word-shaped Arabic run), step 47
+  (raw family per slot, both storage forms) and step 48 (each Font
+  dialog section writes only its own slot).
 
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.
