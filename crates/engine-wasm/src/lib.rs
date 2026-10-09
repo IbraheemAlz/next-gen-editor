@@ -27002,6 +27002,11 @@ mod a11y_object_tests;
 #[cfg(test)]
 mod note_container_tests;
 
+/// Issues #317 / #181 / #141 — the `#[ignore]`d whole-corpus note-band
+/// probe (one `.docx` per process, driven by `NGE_PROBE_FILE`).
+#[cfg(test)]
+mod note_corpus_probe_tests;
+
 #[cfg(test)]
 mod part_media_tests;
 
