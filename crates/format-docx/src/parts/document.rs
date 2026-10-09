@@ -1874,6 +1874,16 @@ fn parse_document_xml_inner(
                     /* Issue #350 — a field character past the nesting cap,
                     or one with no open field: not modeled, its run is kept
                     verbatim. */
+                    /* Issue #358 — a field character outside every
+                    paragraph (between blocks, before `<w:body>`) is not
+                    modeled: #350's `</w:p>` close cannot reach a `begin`
+                    that opened before the paragraph did, so it used to
+                    hide the whole next paragraph. */
+                    b"w:fldChar" if p_start_byte.is_none() => {
+                        crate::error::warn(DocxWarning::StrayFieldChar {
+                            kind: attr_val(&e, b"w:fldCharType").unwrap_or_default(),
+                        });
+                    }
                     b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
                         markup.run_keep_verbatim();
                     }
@@ -2191,7 +2201,15 @@ fn parse_document_xml_inner(
                     represent: verbatim, attached to the following block
                     (or after the last one). Comment range markers are
                     ALSO recorded as ranges in their own arms below. */
-                    n if at_block_level && (is_block_level_marker(n) || ns.ignores_element(n)) => {
+                    /* Issue #358 — a self-closing `<mc:AlternateContent/>`
+                    between blocks has no branch to select: it rides the
+                    following block verbatim like a marker (it used to be
+                    dropped, so a zero-edit save lost its bytes). */
+                    n if at_block_level
+                        && (is_block_level_marker(n)
+                            || ns.ignores_element(n)
+                            || n == b"mc:AlternateContent") =>
+                    {
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
                             envelopes.push_verbatim(frag);
@@ -2209,6 +2227,11 @@ fn parse_document_xml_inner(
                     b"w:ilvl" if in_num_pr => {
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
+                    /* Issue #358 — a `<w:tab/>` / `<w:br/>` inside a
+                    run's `<w:rPr>` is not content (CT_RPr has no such
+                    child): it rides the rPr grab bag only. Counting it
+                    as text too doubled it on every save. */
+                    b"w:tab" | b"w:br" if in_rpr => {}
                     /* Issue #350 — inside field code: not visible. */
                     b"w:tab" | b"w:br" if in_run && field_code_hidden(&field_stack, &field_cap) => {
                     }
@@ -2414,6 +2437,16 @@ fn parse_document_xml_inner(
                         {
                             markup.run_comment_reference(id);
                         }
+                    }
+                    /* Issue #358 — a field character outside every
+                    paragraph (between blocks, before `<w:body>`) is not
+                    modeled: #350's `</w:p>` close cannot reach a `begin`
+                    that opened before the paragraph did, so it used to
+                    hide the whole next paragraph. */
+                    b"w:fldChar" if p_start_byte.is_none() => {
+                        crate::error::warn(DocxWarning::StrayFieldChar {
+                            kind: attr_val(&e, b"w:fldCharType").unwrap_or_default(),
+                        });
                     }
                     b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
                         markup.run_keep_verbatim();

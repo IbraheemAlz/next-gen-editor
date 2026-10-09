@@ -57,7 +57,7 @@ pub fn read_raw_package(data: &[u8]) -> Result<format_docx::DocxArchive, format_
 }
 
 /// `docx_roundtrip` (D5.5, new target) — read -> write -> read must be
-/// stable and never panic. Runs the cycle twice: the writer's own
+/// stable, never panic, and (issue #358) preserve the document's text. Runs the cycle twice: the writer's own
 /// passthrough-vs-resynthesize split (`DocxArchive.other_entries` verbatim,
 /// `word/document.xml` freshly serialized) means a bug that only manifests
 /// on the SECOND save (e.g. a `dirty` flag that doesn't reset) would slip
@@ -77,18 +77,104 @@ pub fn run_docx_roundtrip(data: &[u8]) {
         // contract — nothing further to exercise on this input.
         return;
     };
-    let Ok(archive_b) = format_docx::read_docx(&written_a) else {
-        panic!(
-            "docx_roundtrip: read_docx parsed the ORIGINAL package but \
-             rejected write_docx's own output — the writer produced an \
-             archive its own reader can't parse back"
-        );
+    let archive_b = match format_docx::read_docx(&written_a) {
+        Ok(a) => a,
+        Err(e) => {
+            if trace_enabled() {
+                eprintln!(
+                    "[docx_roundtrip] re-read refused: {e}\n  source document.xml: {}\n  saved document.xml: {}",
+                    String::from_utf8_lossy(&document_xml_of(&bytes)),
+                    String::from_utf8_lossy(&document_xml_of(&written_a)),
+                );
+            }
+            panic!(
+                "docx_roundtrip: read_docx parsed the ORIGINAL package but \
+                 rejected write_docx's own output — the writer produced an \
+                 archive its own reader can't parse back"
+            );
+        }
     };
+    /* Issue #358 — read => write => read preserves the text (every
+    generated and spliced package that parsed at all), with ONE documented
+    exception: a namespace-ill-formed source (an element prefix no
+    `xmlns:` declares — the generator's root omits the drawing / mc
+    bindings one time in eight). The reader skips such elements, while the
+    writer's namespace normalization binds the conventional URI on save, so
+    the second read may see a drawing or `AlternateContent` the first one
+    skipped. Tracked as a gap; everything namespace-well-formed must hold. */
+    let source_xml = document_xml_of(&bytes);
+    let comparable = !has_undeclared_element_prefix(&source_xml);
+    if comparable && trace_enabled() && doc_a.to_plain_text() != archive_b.document.to_plain_text()
+    {
+        eprintln!(
+            "[docx_roundtrip] text drift:\n  before: {:?}\n  after:  {:?}\n  source document.xml: {}\n  saved document.xml: {}",
+            doc_a.to_plain_text(),
+            archive_b.document.to_plain_text(),
+            String::from_utf8_lossy(&source_xml),
+            String::from_utf8_lossy(&document_xml_of(&written_a)),
+        );
+    }
+    assert!(
+        !comparable || doc_a.to_plain_text() == archive_b.document.to_plain_text(),
+        "docx_roundtrip: a zero-edit save changed the document text"
+    );
     let doc_b = archive_b.document.clone();
     let Ok(written_b) = format_docx::write_docx(&archive_b, &doc_b) else {
         panic!("docx_roundtrip: second write_docx failed after a successful first round-trip");
     };
     let _ = format_docx::read_docx(&written_b);
+}
+
+/// `word/document.xml` of a package (empty when unreadable) — trace output.
+fn document_xml_of(docx: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(mut z) = zip::ZipArchive::new(std::io::Cursor::new(docx)) else {
+        return Vec::new();
+    };
+    let Ok(mut f) = z.by_name("word/document.xml") else {
+        return Vec::new();
+    };
+    let mut v = Vec::new();
+    let _ = f.read_to_end(&mut v);
+    v
+}
+
+/// Issue #358 — `true` when some element in `xml` uses a prefix that no
+/// `xmlns:<prefix>=` anywhere in the part declares (namespace-ill-formed
+/// XML; see `run_docx_roundtrip`'s exception). A byte scan, not a parse:
+/// `<p:` / `</p:` element names against every declared prefix.
+fn has_undeclared_element_prefix(xml: &[u8]) -> bool {
+    let mut declared: Vec<&[u8]> = Vec::new();
+    let needle = b"xmlns:";
+    let mut i = 0;
+    while let Some(off) = xml[i..].windows(needle.len()).position(|w| w == needle) {
+        let start = i + off + needle.len();
+        let end = xml[start..]
+            .iter()
+            .position(|b| *b == b'=' || b.is_ascii_whitespace())
+            .map_or(xml.len(), |e| start + e);
+        declared.push(&xml[start..end]);
+        i = end;
+    }
+    let mut j = 0;
+    while let Some(off) = xml[j..].iter().position(|b| *b == b'<') {
+        let mut k = j + off + 1;
+        if xml.get(k) == Some(&b'/') {
+            k += 1;
+        }
+        let name_end = xml[k..]
+            .iter()
+            .position(|b| matches!(b, b' ' | b'/' | b'>' | b'\t' | b'\n' | b'\r'))
+            .map_or(xml.len(), |e| k + e);
+        let name = &xml[k..name_end];
+        if let Some(colon) = name.iter().position(|b| *b == b':')
+            && !declared.contains(&&name[..colon])
+        {
+            return true;
+        }
+        j = name_end.max(k);
+    }
+    false
 }
 
 /// Cap on how many commands one fuzz input drives — bounds wall-clock per
@@ -488,6 +574,88 @@ mod tests {
         run_layout_paginate(&[]);
         run_snapshot_decode(&[]);
         run_format_pdf_image_decode(&[]);
+    }
+
+    #[test]
+    fn undeclared_element_prefixes_are_detected() {
+        let ok =
+            br#"<w:document xmlns:w="u" xmlns:wp="v"><w:body><wp:inline/></w:body></w:document>"#;
+        assert!(!has_undeclared_element_prefix(ok));
+        let bad = br#"<w:document xmlns:w="u"><w:body><wp:inline/></w:body></w:document>"#;
+        assert!(has_undeclared_element_prefix(bad));
+        assert!(!has_undeclared_element_prefix(
+            b"<?xml version=\"1.0\"?><a/>"
+        ));
+    }
+
+    /// Issue #358 — `dictionaries/docx.dict` parses as a libFuzzer
+    /// dictionary (`[name=]"value"` per line, `\\` / `\"` / `\xNN`
+    /// escapes, `#` comments) and every word fits libFuzzer's 64-byte
+    /// limit, so a typo cannot silently weaken the nightly `-dict=` legs.
+    #[test]
+    fn docx_dictionary_is_well_formed() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dictionaries/docx.dict");
+        let dict = std::fs::read_to_string(&path).expect("fuzz/dictionaries/docx.dict");
+        let mut words = std::collections::HashSet::new();
+        for (n, line) in dict.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let q = line
+                .find('"')
+                .unwrap_or_else(|| panic!("line {}: no quoted value", n + 1));
+            let name = &line[..q];
+            assert!(
+                name.is_empty()
+                    || name.strip_suffix('=').is_some_and(|k| !k.is_empty()
+                        && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')),
+                "line {}: bad keyword {name:?}",
+                n + 1
+            );
+            let body = &line[q..];
+            assert!(
+                body.len() >= 2 && body.ends_with('"'),
+                "line {}: unterminated",
+                n + 1
+            );
+            let inner = body[1..body.len() - 1].as_bytes();
+            let mut word = Vec::new();
+            let mut i = 0;
+            while i < inner.len() {
+                match inner[i] {
+                    b'\\' => match inner.get(i + 1) {
+                        Some(&c @ (b'\\' | b'"')) => {
+                            word.push(c);
+                            i += 2;
+                        }
+                        Some(b'x') => {
+                            let hex = inner
+                                .get(i + 2..i + 4)
+                                .and_then(|h| std::str::from_utf8(h).ok())
+                                .and_then(|h| u8::from_str_radix(h, 16).ok());
+                            word.push(hex.unwrap_or_else(|| panic!("line {}: bad \\x", n + 1)));
+                            i += 4;
+                        }
+                        _ => panic!("line {}: bad escape", n + 1),
+                    },
+                    b'"' => panic!("line {}: unescaped quote", n + 1),
+                    c => {
+                        word.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            assert!(
+                !word.is_empty() && word.len() <= 64,
+                "line {}: {} bytes",
+                n + 1,
+                word.len()
+            );
+            assert!(words.insert(word), "line {}: duplicate word", n + 1);
+        }
+        assert!(words.len() > 150, "only {} words", words.len());
+        assert!(words.contains(b"<w:fldChar w:fldCharType=\"begin\"/>".as_slice()));
     }
 
     /// Issue #422 — the committed reproducer scenario runs to completion

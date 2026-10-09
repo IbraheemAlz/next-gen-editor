@@ -1,7 +1,8 @@
 name: fuzz-nightly
 
 # D5.5 scaled up (issue #90; the 5th target added by issue #227, the 6th —
-# `snapshot_decode` — by issue #341) — nightly
+# `snapshot_decode` — by issue #341; the `.docx` legs fuzz with the
+# `fuzz/dictionaries/docx.dict` libFuzzer dictionary since issue #358) — nightly
 # `cargo +nightly fuzz run` for each structure-aware target in `fuzz/`.
 # `ci.yml`'s `rust-native` job only compile-checks `fuzz/` on stable
 # (`cargo check --manifest-path fuzz/Cargo.toml`); running the targets for
@@ -66,12 +67,17 @@ jobs:
         # `format_pdf_image_decode` (issue #227), whose seeds live under
         # `fuzz/corpus/image_decode/` (issue #208's naming, predating this
         # target — the directory describes the seeds' SUBJECT, not any
-        # one target's bin name).
+        # one target's bin name). `dict` (issue #358, optional) is a
+        # libFuzzer `-dict=` file relative to `fuzz/`: WML element /
+        # attribute names and values for the targets whose input becomes a
+        # `word/document.xml`.
         include:
           - target: docx_reader
             corpus_dir: docx_reader
+            dict: dictionaries/docx.dict
           - target: docx_roundtrip
             corpus_dir: docx_roundtrip
+            dict: dictionaries/docx.dict
           - target: rpc_command
             corpus_dir: rpc_command
           - target: layout_paginate
@@ -128,6 +134,12 @@ jobs:
           rm -rf "artifacts/${{ matrix.target }}"
           mkdir -p "artifacts/${{ matrix.target }}"
           DURATION="${{ github.event.inputs.duration_secs || '1800' }}"
+          # Issue #358 — the matrix leg's libFuzzer dictionary, if any.
+          DICT_ARGS=()
+          DICT="${{ matrix.dict || '' }}"
+          if [ -n "$DICT" ]; then
+            DICT_ARGS=("-dict=$DICT")
+          fi
           # `-fork=4`: libFuzzer runs testcases in forked worker processes
           # and restarts a worker that crashes instead of ending the whole
           # session — load-bearing here, not just a speed knob. A known,
@@ -147,6 +159,7 @@ jobs:
             -rss_limit_mb=4096 \
             -timeout=30 \
             -artifact_prefix="artifacts/${{ matrix.target }}/" \
+            ${DICT_ARGS[@]+"${DICT_ARGS[@]}"} \
             2>&1 | tee fuzz-run.log
           # libFuzzer's own exit code, not `tee`'s.
           rc="${PIPESTATUS[0]}"

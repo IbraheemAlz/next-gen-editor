@@ -366,10 +366,13 @@ impl EnvelopeStack {
     }
 }
 
+/// Issue #358 — lossy, never skipped: an envelope's captured bytes may
+/// hold character data the reader never decoded (junk inside an
+/// unselected `mc:Fallback`) that is not UTF-8; skipping them dropped the
+/// whole opener / closer and left the part ill-formed (see the writer's
+/// `push_utf8`).
 fn push_bytes(xml: &[u8], out: &mut String) {
-    if let Ok(s) = std::str::from_utf8(xml) {
-        out.push_str(s);
-    }
+    out.push_str(&String::from_utf8_lossy(xml));
 }
 
 #[cfg(test)]

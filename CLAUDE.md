@@ -166,6 +166,15 @@ D5.10 are external/human sign-offs, not code.
     schema-shaped WML (random `pPr`/`rPr`/`tbl`/`sectPr` trees, valid and
     deliberately-invalid attributes) inside a minimal OPC zip, not raw
     bytes, then `read_docx` / `read → write → read`.
+    Issue #358 widened it: complex fields (balanced / not, nested to 40),
+    `fldSimple`, block + inline `w:sdt` (to 5000 deep), paragraph- and
+    run-level `mc:AlternateContent` with random `Requires`, drawings whose
+    `r:embed` resolves to nothing, `NaN` / unit / hex numbers, 60-deep
+    tables, and a splice mode (spec snippets, raw input bytes, flips,
+    truncation) — all chains, linear in depth, `document.xml` capped at
+    2 MB (#422). `docx_roundtrip` also asserts the zero-edit save keeps
+    the text (exception: a namespace-ill-formed source). The nightly
+    passes `-dict=dictionaries/docx.dict` to both legs.
   - `rpc_command` — `fuzz/src/command_gen.rs` derives `arbitrary::Arbitrary`
     for `Command` (bridge's `arbitrary` feature, optional + off by default,
     zero cost to the wasm build) and drives sequences end to end through

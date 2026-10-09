@@ -256,6 +256,12 @@ pub fn no_pgsz_docx(paragraph_text: &str) -> Vec<u8> {
 /// A package holding `document_xml` (a full `word/document.xml`, prolog
 /// and root included) plus every `(name, bytes)` of `extra`, all deflated.
 pub fn package_with_document_xml(document_xml: &str, extra: &[(&str, &[u8])]) -> Vec<u8> {
+    package_with_document_xml_bytes(document_xml.as_bytes(), extra)
+}
+
+/// [`package_with_document_xml`] for raw `word/document.xml` bytes —
+/// issue #358's hostile parts need bytes that are not valid UTF-8.
+pub fn package_with_document_xml_bytes(document_xml: &[u8], extra: &[(&str, &[u8])]) -> Vec<u8> {
     let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
 <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
@@ -271,7 +277,7 @@ pub fn package_with_document_xml(document_xml: &str, extra: &[(&str, &[u8])]) ->
     let mut entries: Vec<(&str, &[u8])> = vec![
         ("[Content_Types].xml", content_types.as_bytes()),
         ("_rels/.rels", dot_rels.as_bytes()),
-        ("word/document.xml", document_xml.as_bytes()),
+        ("word/document.xml", document_xml),
         ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
     ];
     entries.extend_from_slice(extra);
