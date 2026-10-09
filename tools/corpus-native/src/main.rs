@@ -486,6 +486,11 @@ fn main() -> ExitCode {
     let mut ppr_ind_only = 0usize;
     let mut ppr_reread_ok = 0usize;
     let mut ppr_rewritten = 0u64;
+    /* Issue #371 — the ModifyStyle probe. */
+    let mut style_checked = 0usize;
+    let mut style_only_element = 0usize;
+    let mut style_reread_ok = 0usize;
+    let mut style_delta_le_element = 0usize;
     let mut rewrite_causes: std::collections::BTreeMap<String, (usize, String, u64)> =
         std::collections::BTreeMap::new();
     /* Issue #318 — production-layout timings `(ms, label)`, the
@@ -598,6 +603,14 @@ fn main() -> ExitCode {
             ppr_ind_only += usize::from(pc.ind_only);
             ppr_reread_ok += usize::from(pc.reread_ok);
             ppr_rewritten += pc.source_bytes_rewritten;
+        }
+
+        if let Some(sc) = &rec.style_check {
+            style_checked += 1;
+            style_only_element += usize::from(sc.only_element);
+            style_reread_ok += usize::from(sc.reread_ok);
+            style_delta_le_element +=
+                usize::from(sc.styles_xml_delta_bytes <= sc.element_delta_bytes);
         }
 
         if let Some(t) = &rec.theme_fonts {
@@ -722,6 +735,11 @@ fn main() -> ExitCode {
         "[corpus-native] paragraph-property change (#419): only <w:ind> respelled \
          {ppr_ind_only}/{ppr_checked}, re-read with the new indent {ppr_reread_ok}/{ppr_checked} \
          ({ppr_rewritten} source bytes rewritten in all)"
+    );
+    println!(
+        "[corpus-native] ModifyStyle (#371): only the edited <w:style> changed \
+         {style_only_element}/{style_checked}, styles.xml delta <= the element's \
+         {style_delta_le_element}/{style_checked}, re-read {style_reread_ok}/{style_checked}"
     );
     if !rewrite_causes.is_empty() {
         let mut buckets: Vec<(&String, &(usize, String, u64))> = rewrite_causes.iter().collect();

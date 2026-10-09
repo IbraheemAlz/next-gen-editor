@@ -340,6 +340,47 @@ pub(super) fn splice_ppr(
     Some(out)
 }
 
+/// Issue #371 — [`splice_ppr`] for a `<w:rPr>` (`source` non-empty): a
+/// child whose meaning did not change keeps its source bytes, an
+/// unmodeled one (`<w:kern>`, `<w:lang>`) stays, a changed one is
+/// re-emitted adopting its source twin by meaning (unowned attributes
+/// kept — `adopt_source_rpr_children`).
+pub(super) fn splice_rpr(
+    source: &str,
+    rec: &[(u16, String)],
+    live: &[(u16, String)],
+) -> Option<String> {
+    let gens = |items: &[(u16, String)]| -> Vec<Gen> {
+        items
+            .iter()
+            .map(|(rank, xml)| Gen {
+                rank: i64::from(*rank),
+                key: qname_of(xml),
+                xml: xml.clone(),
+            })
+            .collect()
+    };
+    let (rec, live) = (gens(rec), gens(live));
+    let el = parse_element(source, by_name)?;
+    let src_rank = |c: &SrcChild<'_>| i64::from(crate::schema::ct_rpr::rpr_child_rank(&c.qname));
+    let mut children = String::new();
+    splice_children(
+        &mut children,
+        &el.children,
+        &rec,
+        &live,
+        &src_rank,
+        &|c, _, l| {
+            let mut one = vec![(0u16, l.xml.clone())];
+            crate::schema::source_markup::adopt_source_rpr_children(&mut one, c.xml.as_bytes());
+            one.swap_remove(0).1
+        },
+    );
+    let mut out = String::new();
+    rewrap(&el, &children, &mut out);
+    Some(out)
+}
+
 /// A changed `<w:pPr>` child: a container splices its own children, an
 /// empty element keeps its source twin's unowned attributes.
 fn changed_child(c: &SrcChild<'_>, r: Option<&Gen>, l: &Gen) -> String {
@@ -500,4 +541,125 @@ fn carried(elem: &[u8], k: &[u8], src: &Attrs, live: &Attrs) -> bool {
         },
         _ => false,
     }
+}
+
+/// Issue #371 — what one paragraph style says, for [`splice_style`]: the
+/// modeled children as the writer emits them (`ppr` / `rpr` are the whole
+/// regenerated `<w:pPr>` / `<w:rPr>`, empty when there is nothing to say;
+/// `ppr_children` / `rpr_children` their children for the per-child
+/// splice).
+pub(super) struct StyleParts<'a> {
+    pub name: Option<&'a str>,
+    pub based_on: Option<&'a str>,
+    pub next: Option<&'a str>,
+    pub ppr: String,
+    pub ppr_children: Vec<(u16, String)>,
+    pub rpr: String,
+    pub rpr_children: Vec<(u16, String)>,
+}
+
+/// CT_Style child sequence rank.
+fn style_child_rank(c: &SrcChild<'_>) -> i64 {
+    style_rank_of(&c.qname)
+}
+
+fn style_rank_of(qname: &[u8]) -> i64 {
+    const ORDER: [&[u8]; 22] = [
+        b"w:name",
+        b"w:aliases",
+        b"w:basedOn",
+        b"w:next",
+        b"w:link",
+        b"w:autoRedefine",
+        b"w:hidden",
+        b"w:uiPriority",
+        b"w:semiHidden",
+        b"w:unhideWhenUsed",
+        b"w:qFormat",
+        b"w:locked",
+        b"w:personal",
+        b"w:personalCompose",
+        b"w:personalReply",
+        b"w:rsid",
+        b"w:pPr",
+        b"w:rPr",
+        b"w:tblPr",
+        b"w:trPr",
+        b"w:tcPr",
+        b"w:tblStylePr",
+    ];
+    ORDER
+        .iter()
+        .position(|n| *n == qname)
+        .map_or(ORDER.len() as i64, |i| i as i64)
+}
+
+/// The modeled children of a style as [`Gen`]s.
+fn style_gens(p: &StyleParts<'_>) -> Vec<Gen> {
+    let mut out = Vec::new();
+    for (q, v) in [
+        ("w:name", p.name),
+        ("w:basedOn", p.based_on),
+        ("w:next", p.next),
+    ] {
+        if let Some(v) = v.filter(|v| !v.is_empty()) {
+            let mut xml = format!("<{q} w:val=\"");
+            super::push_escaped_attr(v, &mut xml);
+            xml.push_str("\"/>");
+            out.push(Gen {
+                rank: style_rank_of(q.as_bytes()),
+                key: q.as_bytes().to_vec(),
+                xml,
+            });
+        }
+    }
+    for (q, xml) in [("w:pPr", &p.ppr), ("w:rPr", &p.rpr)] {
+        if !xml.is_empty() {
+            out.push(Gen {
+                rank: style_rank_of(q.as_bytes()),
+                key: q.as_bytes().to_vec(),
+                xml: xml.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Issue #371 — one `<w:style>` element of a source `styles.xml`
+/// (`source`) re-written for an edited paragraph style: every child whose
+/// meaning did not change keeps its source bytes (`<w:uiPriority>`,
+/// `<w:qFormat>`, `<w:rsid>`, unmodeled pPr / rPr children, the start
+/// tag's `w:default` / `w:customStyle`); a changed `<w:name>` /
+/// `<w:basedOn>` / `<w:next>` is re-emitted, a changed `<w:pPr>` spliced
+/// child by child ([`splice_ppr`]), a changed `<w:rPr>` the same way
+/// ([`splice_rpr`]). `None` when the element cannot be split.
+pub(super) fn splice_style(
+    source: &str,
+    rec: &StyleParts<'_>,
+    live: &StyleParts<'_>,
+) -> Option<String> {
+    let el = parse_element(source, by_name)?;
+    if el.self_closing {
+        return None;
+    }
+    let (rec_gens, live_gens) = (style_gens(rec), style_gens(live));
+    let mut children = String::new();
+    splice_children(
+        &mut children,
+        &el.children,
+        &rec_gens,
+        &live_gens,
+        &style_child_rank,
+        &|c, _, l| match c.qname.as_slice() {
+            b"w:pPr" => splice_ppr(c.xml.as_bytes(), &rec.ppr_children, &live.ppr_children)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| l.xml.clone()),
+            b"w:rPr" => splice_rpr(c.xml, &rec.rpr_children, &live.rpr_children)
+                .unwrap_or_else(|| l.xml.clone()),
+            _ => l.xml.clone(),
+        },
+    );
+    let mut out = String::new();
+    rewrap(&el, &children, &mut out);
+    Some(out)
 }

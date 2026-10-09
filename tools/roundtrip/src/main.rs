@@ -40,6 +40,7 @@ mod reader_hardening;
 mod regen;
 mod revision_ids;
 mod revisions;
+mod styles_patch;
 mod table_markup;
 mod theme;
 
@@ -357,6 +358,7 @@ fn run_default() -> Result<()> {
     theme::run_theme_fonts_roundtrip()?;
     regen::run_regen_classes_roundtrip()?;
     ppr_splice::run_ppr_splice_roundtrip()?;
+    styles_patch::run_styles_patch_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

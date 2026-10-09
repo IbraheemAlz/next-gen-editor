@@ -373,10 +373,22 @@ fn modify_style_keeps_every_style_name() {
         "{out}"
     );
     assert!(
-        out.contains(r#"<w:style w:type="paragraph" w:styleId="Nameless"><w:rPr>"#),
+        out.contains(
+            r#"<w:style w:type="paragraph" w:customStyle="1" w:styleId="Nameless"><w:rPr><w:i/></w:rPr></w:style>"#
+        ),
         "a nameless style stays nameless: {out}"
     );
     assert!(!out.contains(r#"<w:name w:val="Heading1"/>"#), "{out}");
+    /* Issue #371 — the part is patched, not regenerated: only the edited
+    style's `<w:rPr>` changed. */
+    assert_eq!(
+        out,
+        NAMED_STYLES_XML.replacen(
+            r#"<w:rPr><w:b/></w:rPr>"#,
+            r#"<w:rPr><w:b/><w:sz w:val="40"/></w:rPr>"#,
+            1
+        )
+    );
 
     let back = read_docx(&bytes).expect("re-read");
     assert_eq!(back.document.styles["Heading1"].name, "heading 1");

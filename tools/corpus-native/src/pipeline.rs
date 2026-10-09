@@ -246,6 +246,84 @@ fn ppr_check(archive: &DocxArchive, orig_xml: &[u8]) -> Option<PprCheck> {
     })
 }
 
+/// Issue #371 — the `ModifyStyle` probe: one paragraph style (`Heading1`
+/// when the document has it, else the first by id) gets its bold toggled
+/// and the document is saved. Only that style's `<w:style>` element of
+/// `styles.xml` may change.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct StyleCheck {
+    pub style_id: String,
+    /// `styles.xml` bytes the save added or removed overall.
+    pub styles_xml_delta_bytes: u64,
+    /// The edited element's own size change.
+    pub element_delta_bytes: u64,
+    /// Every byte outside the edited element is unchanged.
+    pub only_element: bool,
+    /// The re-read style carries the new bold.
+    pub reread_ok: bool,
+}
+
+/// Byte range of the top-level `<w:style … w:styleId="id">` element of a
+/// `styles.xml` (a literal scan: the attribute as Word writes it).
+fn style_element_range(xml: &[u8], id: &str) -> Option<(usize, usize)> {
+    let needle = format!("w:styleId=\"{id}\"");
+    let at = xml
+        .windows(needle.len())
+        .position(|w| w == needle.as_bytes())?;
+    let start = xml[..at].windows(8).rposition(|w| w == b"<w:style")?;
+    let close = b"</w:style>";
+    let end = start + xml[start..].windows(close.len()).position(|w| w == close)? + close.len();
+    Some((start, end))
+}
+
+/// Issue #371 — see [`StyleCheck`]. `None` when the document has no
+/// styles part or no paragraph style.
+fn style_check(archive: &DocxArchive) -> Option<StyleCheck> {
+    let doc = &archive.document;
+    let styles_name = archive.part_names.styles.as_str();
+    let orig = archive
+        .other_entries
+        .iter()
+        .find(|(n, _)| n == styles_name)
+        .map(|(_, b)| b.clone())?;
+    let mut ids: Vec<&String> = doc.styles.keys().collect();
+    ids.sort();
+    let id = if doc.styles.contains_key("Heading1") {
+        "Heading1".to_string()
+    } else {
+        (*ids.first()?).clone()
+    };
+    let (el_start, el_end) = style_element_range(&orig, &id)?;
+    let bold = !doc.styles[&id].run.bold.unwrap_or(false);
+    let patch = engine::SpanStyle {
+        bold: Some(bold),
+        ..Default::default()
+    };
+    let edited = doc.modify_style(&id, None, Some(patch), None, None);
+    let bytes = format_docx::write_docx(archive, &edited).ok()?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).ok()?;
+    let mut new = Vec::new();
+    zip.by_name(styles_name).ok()?.read_to_end(&mut new).ok()?;
+    let tail = orig.len() - el_end;
+    let only_element = new.len() >= el_start + tail
+        && orig[..el_start] == new[..el_start]
+        && orig[el_end..] == new[new.len() - tail..];
+    let new_el_len = new.len().saturating_sub(el_start + tail);
+    let reread_ok = format_docx::read_docx(&bytes).is_ok_and(|back| {
+        back.document
+            .styles
+            .get(&id)
+            .is_some_and(|s| s.run.bold == Some(bold))
+    });
+    Some(StyleCheck {
+        style_id: id,
+        styles_xml_delta_bytes: new.len().abs_diff(orig.len()) as u64,
+        element_delta_bytes: new_el_len.abs_diff(el_end - el_start) as u64,
+        only_element,
+        reread_ok,
+    })
+}
+
 /// Issue #282 — `edited` is `orig` plus insertions only (a byte-level
 /// minimal diff with no deletion; prefix and suffix are trimmed first, so
 /// a local edit of a large part stays cheap).
@@ -621,6 +699,9 @@ pub struct DocResult {
     /// Issue #419 — see [`PprCheck`] (with the scripted edit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ppr_check: Option<PprCheck>,
+    /// Issue #371 — see [`StyleCheck`] (with the scripted edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_check: Option<StyleCheck>,
     /// Issue #318 — wall-clock ms of the PRODUCTION layout
     /// (`engine-wasm`'s `Engine::build_pages`: the real table grid +
     /// autofit, header/footer bands, notes, wrap convergence), driven
@@ -801,6 +882,7 @@ impl DocResult {
             ui_save_matches_write_docx: None,
             comment_check: None,
             ppr_check: None,
+            style_check: None,
             engine_layout_ms: None,
             engine_page_count: None,
             engine_fingerprint: None,
@@ -1145,6 +1227,8 @@ pub fn run_one(
                 stage_infallible!("comment_check", comment_check(&archive_a, &doc_xml_orig));
             /* Issue #419 — a paragraph-property change. */
             rec.ppr_check = stage_infallible!("ppr_check", ppr_check(&archive_a, &doc_xml_orig));
+            /* Issue #371 — a style edit. */
+            rec.style_check = stage_infallible!("style_check", style_check(&archive_a));
         }
     }
 

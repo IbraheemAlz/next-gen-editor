@@ -49,6 +49,10 @@ pub mod regen_check;
 #[path = "writer_ppr_splice.rs"]
 mod ppr_splice;
 
+/// Issue #371 — `styles.xml` patched, not regenerated.
+#[path = "writer_styles_patch.rs"]
+mod styles_patch;
+
 /// Standard OOXML document namespace boilerplate (matches what Word emits).
 const DOC_XML_HEADER: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
@@ -317,6 +321,15 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
     if *style == SpanStyle::default() {
         return;
     }
+    let mut ch = rpr_children(style);
+    ch.adopt_rpr(source);
+    ch.finish("w:rPr", out);
+}
+
+/// The children [`emit_rpr_adopting`] writes for `style`, each at its
+/// CT_RPr rank, the grab bag's included (no source adoption). Issue #371
+/// — also what a style element's `<w:rPr>` splice compares.
+fn rpr_children(style: &SpanStyle) -> PrChildren {
     let rank = rpr_child_rank;
     let mut ch = PrChildren::new();
     /* Issue #104 — the character style the run references; its folded
@@ -466,8 +479,7 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
         );
     }
     ch.push_bag(&style.grab_bag, rpr_child_rank);
-    ch.adopt_rpr(source);
-    ch.finish("w:rPr", out);
+    ch
 }
 
 /// Serialize one run: `<w:r>[<w:rPr>…]<w:t xml:space="preserve">…</w:t></w:r>`.
@@ -649,42 +661,51 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
         "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
         doc_family(doc),
     ));
-    out.push_str("<w:docDefaults><w:rPrDefault>");
-    emit_rpr(&doc.style_run_defaults, &mut out);
-    out.push_str("</w:rPrDefault><w:pPrDefault>");
-    emit_ppr(&doc.style_defaults, None, None, None, None, &mut out);
-    out.push_str("</w:pPrDefault></w:docDefaults>");
+    emit_doc_defaults(doc, &mut out);
     let mut ids: Vec<&String> = doc.styles.keys().collect();
     ids.sort();
     for id in ids {
-        let def = &doc.styles[id];
-        out.push_str("<w:style w:type=\"paragraph\" w:styleId=\"");
-        push_escaped_attr(id, &mut out);
-        out.push_str("\">");
-        /* Issue #297 — the display name as read (`heading 1`), not the
-        id; a style read without `<w:name>` (empty name) stays without. */
-        if !def.name.is_empty() {
-            out.push_str("<w:name w:val=\"");
-            push_escaped_attr(&def.name, &mut out);
-            out.push_str("\"/>");
-        }
-        if let Some(parent) = &def.based_on {
-            out.push_str("<w:basedOn w:val=\"");
-            push_escaped_attr(parent, &mut out);
-            out.push_str("\"/>");
-        }
-        /* Issue #277 — CT_Style order: name, aliases, basedOn, next. */
-        if let Some(next) = &def.next {
-            out.push_str("<w:next w:val=\"");
-            push_escaped_attr(next, &mut out);
-            out.push_str("\"/>");
-        }
-        emit_ppr(&def.para, None, None, None, None, &mut out);
-        emit_rpr(&def.run, &mut out);
-        out.push_str("</w:style>");
+        emit_paragraph_style(id, &doc.styles[id], &mut out);
     }
     out.push_str("</w:styles>");
     out.into_bytes()
+}
+
+/// `<w:docDefaults>` from the model's defaults.
+fn emit_doc_defaults(doc: &engine::DocumentTree, out: &mut String) {
+    out.push_str("<w:docDefaults><w:rPrDefault>");
+    emit_rpr(&doc.style_run_defaults, out);
+    out.push_str("</w:rPrDefault><w:pPrDefault>");
+    emit_ppr(&doc.style_defaults, None, None, None, None, out);
+    out.push_str("</w:pPrDefault></w:docDefaults>");
+}
+
+/// One `<w:style w:type="paragraph">` from the model.
+fn emit_paragraph_style(id: &str, def: &engine::ParagraphStyle, out: &mut String) {
+    out.push_str("<w:style w:type=\"paragraph\" w:styleId=\"");
+    push_escaped_attr(id, out);
+    out.push_str("\">");
+    /* Issue #297 — the display name as read (`heading 1`), not the
+    id; a style read without `<w:name>` (empty name) stays without. */
+    if !def.name.is_empty() {
+        out.push_str("<w:name w:val=\"");
+        push_escaped_attr(&def.name, out);
+        out.push_str("\"/>");
+    }
+    if let Some(parent) = &def.based_on {
+        out.push_str("<w:basedOn w:val=\"");
+        push_escaped_attr(parent, out);
+        out.push_str("\"/>");
+    }
+    /* Issue #277 — CT_Style order: name, aliases, basedOn, next. */
+    if let Some(next) = &def.next {
+        out.push_str("<w:next w:val=\"");
+        push_escaped_attr(next, out);
+        out.push_str("\"/>");
+    }
+    emit_ppr(&def.para, None, None, None, None, out);
+    emit_rpr(&def.run, out);
+    out.push_str("</w:style>");
 }
 
 /// Emit a paragraph's `<w:pPr>`, children in the TRUE CT_PPrBase schema
@@ -4127,9 +4148,21 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         };
         /* Issue #21 — `ModifyStyle` flips `styles_dirty`; regenerate
         `word/styles.xml` from the in-memory table. Same discipline as
-        numbering: untouched documents pass the part through verbatim. */
+        numbering: untouched documents pass the part through verbatim.
+        Issue #371 — a source part is PATCHED: only the edited style
+        elements are re-written (`styles_patch`); the model alone builds
+        the part only when there is none (or it cannot be followed). */
         let styles_bytes: Option<Vec<u8>> = if doc.styles_dirty {
-            Some(build_styles_xml(doc))
+            let source = archive
+                .other_entries
+                .iter()
+                .find(|(n, _)| n == names.styles.as_str())
+                .map(|(_, b)| b.as_slice());
+            Some(
+                source
+                    .and_then(|src| styles_patch::patch_styles_xml(src, doc))
+                    .unwrap_or_else(|| build_styles_xml(doc)),
+            )
         } else {
             None
         };
@@ -11438,3 +11471,8 @@ mod regen_tests;
 #[cfg(test)]
 #[path = "writer_ppr_splice_tests.rs"]
 mod ppr_splice_tests;
+
+/// Issue #371 — `styles.xml` patched, not regenerated.
+#[cfg(test)]
+#[path = "writer_styles_patch_tests.rs"]
+mod styles_patch_tests;

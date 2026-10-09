@@ -504,6 +504,36 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
     self-closing when nothing is inside.
   Harness: `tools/roundtrip` step 49 (`regen_classes.docx`).
 
+## `styles.xml` is patched, not regenerated (issue #371)
+
+`ModifyStyle` (`styles_dirty`) no longer rebuilds the part from the
+engine's paragraph-style table (which dropped every character / table /
+numbering style, `<w:latentStyles>`, unmodeled `<w:docDefaults>` children
+and the unmodeled children of the styles it kept). With a source part
+(`write_docx`, the UI save path through `source_package` included),
+`writer::styles_patch` copies it and re-writes only:
+
+- a paragraph style whose model (`<w:name>`, `basedOn`, `next`, pPr, rPr)
+  no longer equals what its source `<w:style>` element produced (the
+  part re-parsed — no recorded model needed): spliced child by child
+  (`ppr_splice::splice_style` — `<w:pPr>` through the #419 pPr splice, the
+  `<w:rPr>` through `splice_rpr`: unchanged children keep their bytes,
+  unmodeled ones such as `<w:kern>` / `<w:lang>` / `<w:link>` /
+  `<w:uiPriority>` / `<w:rsid>` stay, a changed child adopts its source
+  twin by meaning);
+- `<w:docDefaults>`, only when the defaults changed (regenerated whole);
+- a style the source does not have, appended before `</w:styles>`.
+
+Only the LAST source element of an id is compared (the parsed table's).
+`build_styles_xml` remains the path for a package without `styles.xml`
+(`build_minimal_docx`, an engine-authored tree). Character / table /
+numbering styles are not mirrored into the engine model: the part's own
+bytes are the source of truth, and format-docx's `StyleTable` already
+models their id / name / type / `basedOn` for the read-time cascade.
+Harness: `tools/roundtrip` step 51 (`styles_patch.docx`);
+`tools/corpus-native`'s `style_check` (bold toggled on `Heading1` or the
+first paragraph style: only that element of `styles.xml` may change).
+
 ## Table source markup (issue #248)
 
 A *regenerated* (dirty) table stays byte-close to its source through
