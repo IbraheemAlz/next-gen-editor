@@ -1,8 +1,9 @@
 //! Document lifecycle commands: issue #338 (`CloseDocument` resets to the
-//! seeded empty document instead of answering a `phase3_stub` error).
+//! seeded empty document instead of answering a `phase3_stub` error) and
+//! issue #339 (`OpenDocument` with `PlainText` / `Html`).
 
 use super::*;
-use bridge::HeaderFooterArea;
+use bridge::{DefaultPageSize as WirePageSize, HeaderFooterArea};
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, Waker};
@@ -161,4 +162,165 @@ fn close_document_exits_an_active_story() {
     assert!(editing_story.is_none());
     assert!(!e.story_active());
     assert_eq!(e.undo.current().to_plain_text(), "");
+}
+
+fn open(e: &mut Engine, bytes: &[u8], format: DocFormat, name: &str) -> Event {
+    apply(
+        e,
+        Command::OpenDocument {
+            bytes: bytes.to_vec(),
+            format,
+            name: Some(name.into()),
+            defaults: None,
+        },
+    )
+}
+
+fn paragraphs(e: &Engine) -> Vec<(String, Option<engine::TextDirection>)> {
+    e.undo
+        .current()
+        .blocks
+        .iter()
+        .filter_map(|b| b.as_paragraph())
+        .map(|p| (p.text.clone(), p.props.direction))
+        .collect()
+}
+
+/// Issue #339 — a `.txt` opens one paragraph per line (any line-break
+/// convention, BOM dropped, one trailing break absorbed), each with its
+/// auto direction: Arabic lines RTL, Latin lines LTR, neutral lines
+/// following the paragraph before them.
+#[test]
+fn open_plain_text_splits_lines_and_auto_directs_them() {
+    use engine::TextDirection::{Ltr, Rtl};
+    let mut e = engine_with(DocumentTree::from_text("old"));
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice("Hello\r\nمرحبا بالعالم\n\n123\rEnd\n".as_bytes());
+    let loaded = open(&mut e, &bytes, DocFormat::PlainText, "dir/notes.txt");
+    assert!(
+        matches!(loaded, Event::DocumentLoaded { paragraph_count: 5 }),
+        "{loaded:?}"
+    );
+    assert_eq!(
+        paragraphs(&e),
+        vec![
+            ("Hello".to_string(), Some(Ltr)),
+            ("مرحبا بالعالم".to_string(), Some(Rtl)),
+            (String::new(), Some(Rtl)),
+            ("123".to_string(), Some(Rtl)),
+            ("End".to_string(), Some(Ltr)),
+        ]
+    );
+    let doc = e.undo.current();
+    let arabic = doc.blocks[1].as_paragraph().unwrap();
+    assert_eq!(
+        arabic.direct_overrides.direction,
+        Some(Rtl),
+        "direct, so the .docx writer and ApplyStyle keep it"
+    );
+    assert!(doc.source_package.is_none(), "nothing to preserve");
+    assert_eq!(e.document_name.as_deref(), Some("notes.txt"));
+    assert!(!e.undo.can_undo(), "a fresh document");
+    let saved = apply(&mut e, Command::SaveDocx);
+    assert!(matches!(saved, Event::DocumentSaved { .. }), "{saved:?}");
+}
+
+/// Issue #339 — UTF-16 (either BOM) decodes; invalid UTF-8 is replaced,
+/// never rejected; an empty file is one empty paragraph.
+#[test]
+fn open_plain_text_decodes_utf16_and_tolerates_invalid_utf8() {
+    let mut e = engine_with(DocumentTree::from_text(""));
+    let mut le = vec![0xFF, 0xFE];
+    for u in "سلام\nhi".encode_utf16() {
+        le.extend_from_slice(&u.to_le_bytes());
+    }
+    open(&mut e, &le, DocFormat::PlainText, "le.txt");
+    let texts: Vec<String> = paragraphs(&e).into_iter().map(|(t, _)| t).collect();
+    assert_eq!(texts, ["سلام", "hi"]);
+
+    let mut be = vec![0xFE, 0xFF];
+    for u in "ok".encode_utf16() {
+        be.extend_from_slice(&u.to_be_bytes());
+    }
+    open(&mut e, &be, DocFormat::PlainText, "be.txt");
+    assert_eq!(paragraphs(&e)[0].0, "ok");
+
+    open(
+        &mut e,
+        b"caf\xE9 au lait",
+        DocFormat::PlainText,
+        "cp1252.txt",
+    );
+    assert_eq!(paragraphs(&e)[0].0, "caf\u{FFFD} au lait");
+
+    let loaded = open(&mut e, b"", DocFormat::PlainText, "empty.txt");
+    assert!(
+        matches!(loaded, Event::DocumentLoaded { paragraph_count: 1 }),
+        "{loaded:?}"
+    );
+}
+
+/// Issue #339 — a `.html` opens through the paste parser: head metadata
+/// skipped, `dir` honoured, tables kept, undeclared paragraphs auto-directed;
+/// the host's page-size default applies.
+#[test]
+fn open_html_keeps_tables_and_directions() {
+    use engine::TextDirection::{Ltr, Rtl};
+    let mut e = engine_with(DocumentTree::from_text(""));
+    let html = "<!DOCTYPE html><html><head><title>Ignored</title></head><body>\
+                <p dir=\"rtl\">Hello مرحبا</p>\
+                <table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>\
+                <p>بعد الجدول</p><p>After</p></body></html>";
+    let loaded = apply(
+        &mut e,
+        Command::OpenDocument {
+            bytes: html.as_bytes().to_vec(),
+            format: DocFormat::Html,
+            name: Some("page.html".into()),
+            defaults: Some(DocumentDefaults {
+                page_size: Some(WirePageSize::Letter),
+                widow_control: None,
+            }),
+        },
+    );
+    assert!(matches!(loaded, Event::DocumentLoaded { .. }), "{loaded:?}");
+    let doc = e.undo.current();
+    assert_eq!(
+        doc.blocks.len(),
+        4,
+        "paragraph, table, paragraph, paragraph"
+    );
+    let engine::Block::Table(t) = &doc.blocks[1] else {
+        panic!("the table survives");
+    };
+    assert_eq!((t.rows.len(), t.rows[0].cells.len()), (2, 2));
+    assert_eq!(
+        paragraphs(&e),
+        vec![
+            ("Hello مرحبا".to_string(), Some(Rtl)),
+            ("بعد الجدول".to_string(), Some(Rtl)),
+            ("After".to_string(), Some(Ltr)),
+        ],
+        "explicit dir wins over first-strong; the rest auto-direct"
+    );
+    assert!(!doc.to_plain_text().contains("Ignored"));
+    assert_eq!(doc.body_section.geometry, engine::PageGeometry::letter());
+    assert_eq!(
+        doc.settings.default_page_size,
+        engine::DefaultPageSize::Letter
+    );
+    assert!(doc.source_package.is_none());
+}
+
+/// Issue #339 — PDF is an export format: an honest, specific error, and
+/// the current document is untouched.
+#[test]
+fn open_pdf_is_an_honest_error() {
+    let mut e = engine_with(DocumentTree::from_text("keep me"));
+    let evt = open(&mut e, b"%PDF-1.7", DocFormat::Pdf, "x.pdf");
+    let Event::Error { message } = evt else {
+        panic!("PDF import answers Error, got {evt:?}");
+    };
+    assert!(message.contains("export format"), "{message}");
+    assert_eq!(e.undo.current().to_plain_text(), "keep me");
 }

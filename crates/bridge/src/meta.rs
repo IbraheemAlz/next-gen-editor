@@ -278,7 +278,9 @@ command_meta! {
     Snapshot { .. } => M::QUERY,
     Dispose => M::VIEW.body_only().stub(UNFILED),
     Tick { .. } => M::VIEW.body_only().stub(UNFILED),
-    OpenDocument { .. } => M::EDIT.new_document().exits_story().partial(339),
+    // Issue #339 — Docx, PlainText and Html; Pdf is an export-only format
+    // (an honest, specific error).
+    OpenDocument { .. } => M::EDIT.new_document().exits_story(),
     SaveDocument { .. } => M::QUERY,
     ExportPdf { .. } => M::QUERY,
     // Issue #338 — back to the seeded empty document.

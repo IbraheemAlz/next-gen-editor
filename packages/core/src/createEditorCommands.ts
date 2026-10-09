@@ -59,6 +59,24 @@ import type {
 } from './types';
 import type { LiveCommand } from './facadeMap';
 
+/** Issue #339 — the `DocFormat` a file opens as, from its name: `.txt` →
+ *  `plain_text`, `.html` / `.htm` / `.xhtml` → `html`, anything else (and no
+ *  name) → `docx`. PDF is an export-only format and never inferred. */
+export function docFormatForFileName(name: string | undefined): DocFormat {
+    const ext = name?.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+    switch (ext) {
+        case 'txt':
+        case 'text':
+            return 'plain_text';
+        case 'html':
+        case 'htm':
+        case 'xhtml':
+            return 'html';
+        default:
+            return 'docx';
+    }
+}
+
 /** Sprint 12 (#11) — paragraph style id. The engine now models real
  *  `<w:styles>` entries on `DocumentTree.styles`; `cmd.applyStyle`
  *  dispatches `Command::ApplyStyle { style_id }` and the engine
@@ -458,8 +476,14 @@ export interface EditorCommands {
     setPageOrientationAtCaret(orientation: PageOrientation): Promise<Event>;
 
     /* I/O */
-    /** Open a `.docx` byte buffer (passed zero-copy as a Transferable).
-     *  Engine ships only `Docx`; HTML / PlainText return error events.
+    /** Open a document byte buffer (passed zero-copy as a Transferable).
+     *  Issue #339 — `.docx`, plain text and HTML are all engine-real:
+     *  `opts.format` picks the format, else it is inferred from `name`
+     *  (`docFormatForFileName`: `.txt` → plain text, `.html`/`.htm` → HTML,
+     *  otherwise `.docx`). Plain text opens one paragraph per line (UTF-8,
+     *  UTF-16 with a BOM); HTML goes through the rich-paste parser (`dir`
+     *  honoured, tables kept); paragraphs without a declared direction get
+     *  their first-strong one, so Arabic opens RTL.
      *  Issue #239 — `opts.initialZoom`, when given, dispatches `SET_ZOOM`
      *  before `OPEN_DOCUMENT` so a host can request a starting zoom from
      *  this one call; the engine queues it even if no `RenderPage` has
@@ -474,7 +498,7 @@ export interface EditorCommands {
     openDocument(
         bytes: Uint8Array,
         name?: string,
-        opts?: { initialZoom?: number; defaults?: DocumentDefaults },
+        opts?: { initialZoom?: number; defaults?: DocumentDefaults; format?: DocFormat },
     ): Promise<Event>;
     saveDocument(format: DocFormat): Promise<Event>;
     saveDocx(): Promise<Event>;
@@ -931,13 +955,14 @@ function build(
                set to `undefined` (see `getSelectionAsClipboard` above for
                the same pattern with `include_docx`). */
             const defaults = opts?.defaults ?? documentDefaults;
+            const format = opts?.format ?? docFormatForFileName(name);
             return dispatch(
                 defaults === undefined
-                    ? { type: 'OPEN_DOCUMENT', bytes, format: 'docx', name: name ?? undefined }
+                    ? { type: 'OPEN_DOCUMENT', bytes, format, name: name ?? undefined }
                     : {
                           type: 'OPEN_DOCUMENT',
                           bytes,
-                          format: 'docx',
+                          format,
                           name: name ?? undefined,
                           defaults,
                       },

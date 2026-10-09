@@ -6221,6 +6221,96 @@ fn file_base_name(name: &str) -> String {
         .to_string()
 }
 
+/// Issue #339 — decode a `.txt` / `.html` file's bytes: a UTF-8 BOM is
+/// dropped, a UTF-16 LE / BE BOM selects UTF-16, everything else is UTF-8
+/// with invalid sequences replaced by U+FFFD (no `encoding_rs` in the tree,
+/// so legacy code pages — cp1252, cp1256 — are not detected).
+fn decode_text_file(bytes: &[u8]) -> String {
+    fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
+        let units = bytes.chunks_exact(2).map(|c| unit([c[0], c[1]]));
+        char::decode_utf16(units)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, u16::from_be_bytes);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Issue #339 — one paragraph per line (`\r\n`, `\n` or `\r`). A single
+/// trailing line break ends the last line rather than opening an empty
+/// paragraph (the POSIX text-file convention); an empty file is one empty
+/// paragraph.
+fn plain_text_paragraphs(text: &str) -> Vec<String> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let body = normalized.strip_suffix('\n').unwrap_or(&normalized);
+    body.split('\n').map(str::to_owned).collect()
+}
+
+/// Issue #339 — give every paragraph without an explicit direction its
+/// first-strong one, as a direct override (so it reaches the `.docx`
+/// writer's `<w:bidi>` and survives `ApplyStyle`, #218): Arabic text opens
+/// RTL. A paragraph with no strong character (blank lines, numbers)
+/// follows the paragraph before it — or, before the first strong one, that
+/// first strong direction — so an Arabic file's blank lines are RTL too.
+/// Table-cell paragraphs are walked in document order.
+fn stamp_auto_directions(doc: &mut DocumentTree) {
+    fn resolve(p: &engine::Paragraph) -> Option<engine::TextDirection> {
+        p.props.direction.or_else(|| {
+            first_strong_direction(&p.text).map(|d| match d {
+                ShapingDirection::Rtl => engine::TextDirection::Rtl,
+                ShapingDirection::Ltr => engine::TextDirection::Ltr,
+            })
+        })
+    }
+    fn first(block: &engine::Block) -> Option<engine::TextDirection> {
+        match block {
+            engine::Block::Paragraph(p) => resolve(p),
+            engine::Block::Table(t) => t
+                .rows
+                .iter()
+                .flat_map(|r| r.cells.iter())
+                .flat_map(|c| c.blocks.iter())
+                .find_map(first),
+        }
+    }
+    fn stamp(block: &mut engine::Block, last: &mut Option<engine::TextDirection>) {
+        match block {
+            engine::Block::Paragraph(p) => {
+                if p.props.direction.is_none() {
+                    if let Some(d) = resolve(p).or(*last) {
+                        p.props.direction = Some(d);
+                        p.direct_overrides.direction = Some(d);
+                    }
+                }
+                if p.props.direction.is_some() {
+                    *last = p.props.direction;
+                }
+            }
+            engine::Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        for b in &mut cell.blocks {
+                            stamp(b, last);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut last = doc.blocks.iter().find_map(first);
+    for block in doc.blocks.iter_mut() {
+        stamp(block, &mut last);
+    }
+}
+
 /// Clamp a position into `doc` — `path` resolved to a real paragraph
 /// (falling back to the document end), `offset` normalized by the
 /// engine's snap-down policy (`engine::snap_offset`, issue #115): capped
@@ -7119,10 +7209,32 @@ impl Engine {
                         .filter(|n| !n.is_empty());
                     self.load_docx_bytes(&bytes, "OpenDocument", defaults)
                 }
-                other => Event::Error {
-                    message: format!(
-                        "OpenDocument: format {other:?} not supported — only Docx ships today"
-                    ),
+                /* Issue #339 — `.txt` / `.html` open through the engine's
+                own plain-text model and the rich-paste HTML parser; no
+                source package is retained (nothing to preserve), so a
+                later `.docx` save uses the minimal-package writer. */
+                DocFormat::PlainText | DocFormat::Html => {
+                    self.document_name = name
+                        .as_deref()
+                        .map(file_base_name)
+                        .filter(|n| !n.is_empty());
+                    let text = decode_text_file(&bytes);
+                    let doc = if matches!(format, DocFormat::Html) {
+                        let parsed = engine::html::from_html_document(&text);
+                        if parsed.blocks.is_empty() {
+                            DocumentTree::from_text("")
+                        } else {
+                            DocumentTree::from_blocks(parsed.blocks)
+                        }
+                    } else {
+                        DocumentTree::from_paragraphs(plain_text_paragraphs(&text))
+                    };
+                    self.open_synthesized_document(doc, defaults)
+                }
+                DocFormat::Pdf => Event::Error {
+                    message: "OpenDocument: PDF is an export format — open a .docx, .txt \
+                              or .html file (use ExportPdf to write PDF)"
+                        .into(),
                 },
             },
             Command::SaveDocument { format } => match format {
@@ -15601,6 +15713,35 @@ impl Engine {
         self.invalidate_layout_snapshot();
         self.dirty.invalidate(full_page_rect(self.scale()));
         self.maybe_repaint_result()
+    }
+
+    /// Issue #339 — install a document built in memory from a `.txt` /
+    /// `.html` file: the host's `defaults` (page size, widow control —
+    /// what `read_docx_with_settings` applies to a `.docx`) are applied,
+    /// every paragraph gets its auto direction, and the document replaces
+    /// the current one exactly like a `.docx` load. Answers
+    /// `DocumentLoaded`.
+    fn open_synthesized_document(
+        &mut self,
+        mut doc: DocumentTree,
+        defaults: Option<DocumentDefaults>,
+    ) -> Event {
+        let page_size = match defaults.as_ref().and_then(|d| d.page_size) {
+            Some(BridgeDefaultPageSize::A4) => engine::DefaultPageSize::A4,
+            Some(BridgeDefaultPageSize::Letter) => engine::DefaultPageSize::Letter,
+            None => engine::DefaultPageSize::default(),
+        };
+        doc.body_section.geometry = page_size.geometry();
+        doc.settings.default_page_size = page_size;
+        doc.settings.widow_control_default = defaults.and_then(|d| d.widow_control).unwrap_or(true);
+        stamp_auto_directions(&mut doc);
+        let paragraph_count = doc.paragraph_count();
+        self.tracking_changes = false;
+        *self.detached_package.borrow_mut() = None;
+        if let Err(e) = self.install_new_document(doc) {
+            return *e;
+        }
+        Event::DocumentLoaded { paragraph_count }
     }
 
     /// Issue #338 — `Command::CloseDocument`: back to the seeded empty

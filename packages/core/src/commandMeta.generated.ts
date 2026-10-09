@@ -36,7 +36,7 @@ export interface CommandMeta {
 export type StubCommandType = 'INIT' | 'DISPOSE' | 'TICK' | 'MERGE_PARAGRAPH' | 'UNLOAD_FONT';
 
 /** Commands real for only part of their input space. */
-export type PartialCommandType = 'OPEN_DOCUMENT' | 'SET_IMAGE_WRAP';
+export type PartialCommandType = 'SET_IMAGE_WRAP';
 
 export const COMMAND_META: { readonly [K in CommandType]: CommandMeta } = {
     PING: { variant: 'Ping', mutates_doc: false, moves_selection: false, logged: true, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
@@ -54,7 +54,7 @@ export const COMMAND_META: { readonly [K in CommandType]: CommandMeta } = {
     SNAPSHOT: { variant: 'Snapshot', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
     DISPOSE: { variant: 'Dispose', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 0 } },
     TICK: { variant: 'Tick', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 0 } },
-    OPEN_DOCUMENT: { variant: 'OpenDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'partial', issue: 339 } },
+    OPEN_DOCUMENT: { variant: 'OpenDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' } },
     SAVE_DOCUMENT: { variant: 'SaveDocument', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
     EXPORT_PDF: { variant: 'ExportPdf', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
     CLOSE_DOCUMENT: { variant: 'CloseDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' } },

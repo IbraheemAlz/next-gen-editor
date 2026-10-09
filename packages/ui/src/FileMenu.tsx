@@ -4,7 +4,10 @@
  * Open / Save / Export the active document. Live capabilities track
  * the engine surface:
  *
- *   - **Open** → hidden file input → `Command::OpenDocument { format: Docx }`.
+ *   - **Open** → hidden file input → `Command::OpenDocument`. Issue #339 —
+ *     `.docx`, `.txt` and `.html` / `.htm` are all engine-real; the format
+ *     comes from the file name (`docFormatForFileName`), so no entry here
+ *     needs an "Engine pending" badge.
  *   - **Save** → `Command::SaveDocument { format: Docx }`. Bound to
  *     `Ctrl/Cmd+S` globally.
  *   - **Export PDF** → `Command::ExportPdf { conformance }`. All three
@@ -35,6 +38,18 @@ import {
     type PdfConformance,
 } from '@nge/core';
 import './FileMenu.css';
+
+/** Issue #339 — every format `OpenDocument` implements (see
+ *  `docFormatForFileName` in @nge/core for the extension mapping). */
+const OPEN_ACCEPT = [
+    '.docx',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.txt',
+    'text/plain',
+    '.html',
+    '.htm',
+    'text/html',
+].join(',');
 
 const PDF_CONFORMANCES: {
     value: PdfConformance;
@@ -211,7 +226,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                 onClick={() => fileInput?.click()}
                             >
                                 <span>Open…</span>
-                                <span class="nge-fm__shortcut">.docx</span>
+                                <span class="nge-fm__shortcut">.docx · .txt · .html</span>
                             </button>
                         </li>
                         <li role="none">
@@ -302,7 +317,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                 <input
                     ref={(el) => (fileInput = el)}
                     type="file"
-                    accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    accept={OPEN_ACCEPT}
                     style={{ display: 'none' }}
                     onChange={(e) => {
                         const file = e.currentTarget.files?.[0];

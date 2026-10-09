@@ -18,6 +18,7 @@ export type { EngineProviderProps, EngineHandle } from './EngineProvider';
 
 export {
     createEditorCommands,
+    docFormatForFileName,
     DEFAULT_TOC_SWITCHES,
     STYLE_PRESETS,
     emptyPatch,
