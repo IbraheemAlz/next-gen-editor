@@ -79,7 +79,8 @@ jobs:
           cargo run -p corpus-native --release -- \
             --corpus-dir ~/corpus-cache/files \
             --out ~/corpus-cache/results.jsonl \
-            --timeout-secs 90
+            --timeout-secs 90 \
+            --regen-check
 
       # Issue #380 - the previous nightly's artifact feeds the report's
       # page-count diff and its layout-regression flag. Best effort: a first
