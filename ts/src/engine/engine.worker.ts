@@ -18,6 +18,7 @@ import {
 } from './event-log';
 import { nextCleanState } from './clean-state';
 import { nextRetry } from './retry-schedule';
+import { journalSafe } from './journal-safe';
 import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
@@ -1566,15 +1567,6 @@ function noteCleanState(cmd: Command, evt: Event): void {
         console.warn('[worker] clean marker not persisted', e),
     );
     pendingLogWrites = pendingLogWrites.then(() => write);
-}
-
-/** Issue #345 — `cmd` as it may be persisted: secrets stripped. */
-function journalSafe(cmd: Command): Command {
-    if (cmd.type === 'OPEN_DOCUMENT' && cmd.password !== undefined) {
-        const { password: _password, ...rest } = cmd;
-        return rest;
-    }
-    return cmd;
 }
 
 /**
