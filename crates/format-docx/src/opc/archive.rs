@@ -38,6 +38,9 @@ pub const ENDNOTES_XML: &str = "word/endnotes.xml";
 pub const COMMENTS_XML: &str = "word/comments.xml";
 pub const COMMENTS_EXTENDED_XML: &str = "word/commentsExtended.xml";
 pub const SETTINGS_XML: &str = "word/settings.xml";
+/// Issue #355 — where Word puts the theme (`a:theme`); read-only (font +
+/// colour schemes), always passthrough.
+pub const THEME_XML: &str = "word/theme/theme1.xml";
 /// Issue #77 — OPC core properties; `<dc:creator>` feeds the `AUTHOR`
 /// field. Passthrough-only (never regenerated).
 pub const CORE_PROPS_XML: &str = "docProps/core.xml";
@@ -678,9 +681,12 @@ fn read_docx_scoped(
     /* Issue #355 — the theme part rides `other_entries` verbatim; the
     typed read (+ the settings that select into it) feeds theme-font and
     theme-colour resolution at layout time. */
-    document.theme =
-        crate::parts::theme::read_document_theme(&other_entries, settings_part.as_ref())
-            .map(std::sync::Arc::new);
+    document.theme = crate::parts::theme::read_document_theme(
+        &other_entries,
+        &part_names.theme,
+        settings_part.as_ref(),
+    )
+    .map(std::sync::Arc::new);
 
     /* Issue #77 — `docProps/core.xml` rides `other_entries` verbatim;
     the typed read lifts `<dc:creator>` so `AUTHOR` fields resolve. */

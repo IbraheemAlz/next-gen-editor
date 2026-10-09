@@ -9,8 +9,6 @@ use anyhow::{Context, Result, bail};
 use engine::{BlockPath, FontClass, LogicalPos, SpanStyle};
 use format_docx::test_fixtures::{THEME_FIXTURE_TEXTS, theme_word_default_docx};
 
-const THEME_PART: &str = "word/theme/theme1.xml";
-
 fn at(block: u32, offset: usize) -> LogicalPos {
     LogicalPos::new(BlockPath::top(block), offset as u32)
 }
@@ -74,11 +72,17 @@ pub fn run_theme_fonts_roundtrip() -> Result<()> {
             heading.resolve_color(Some(theme))
         );
     }
+    /* The theme part is the one `PartNames` discovered (#353) — here
+    Word's path, related from the document rels. */
+    let theme_part = archive.part_names.theme.as_str();
+    if theme_part != "word/theme/theme1.xml" {
+        bail!("theme part discovered as {theme_part:?}");
+    }
     let saved = write_docx(&archive, doc).context("zero-edit save")?;
     let saved_archive = read_docx(&saved).context("reread zero-edit save")?;
     if extract_doc_xml(&saved)? != extract_doc_xml(&fixture)?
-        || entry_bytes(&saved_archive, THEME_PART) != entry_bytes(&archive, THEME_PART)
-        || entry_bytes(&saved_archive, THEME_PART).is_none()
+        || entry_bytes(&saved_archive, theme_part) != entry_bytes(&archive, theme_part)
+        || entry_bytes(&saved_archive, theme_part).is_none()
     {
         bail!("zero-edit save drifted");
     }
@@ -107,7 +111,7 @@ pub fn run_theme_fonts_roundtrip() -> Result<()> {
         bail!("edited save is not a pure insertion:\n{out}\nexpected:\n{expected}");
     }
     let back = read_docx(&bytes).context("reread edited")?;
-    if entry_bytes(&back, THEME_PART) != entry_bytes(&archive, THEME_PART) {
+    if entry_bytes(&back, theme_part) != entry_bytes(&archive, theme_part) {
         bail!("theme part drifted on an edited save");
     }
     if resolved(&back.document, 0) != some("Calibri Light", "Times New Roman") {

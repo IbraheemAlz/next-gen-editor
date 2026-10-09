@@ -20,7 +20,7 @@
 use crate::error::{DocxError, DocxWarning};
 use crate::opc::archive::{
     COMMENTS_EXTENDED_XML, COMMENTS_XML, CORE_PROPS_XML, DOC_XML, ENDNOTES_XML, FOOTNOTES_XML,
-    NUMBERING_XML, SETTINGS_XML, STYLES_XML,
+    NUMBERING_XML, SETTINGS_XML, STYLES_XML, THEME_XML,
 };
 use crate::opc::relationships::{TargetMode, parse_relationships};
 
@@ -45,6 +45,9 @@ pub struct PartNames {
     pub comments: String,
     pub comments_extended: String,
     pub core_props: String,
+    /// Issue #355 — the theme part (`…/relationships/theme`), read for its
+    /// font and colour schemes.
+    pub theme: String,
 }
 
 impl Default for PartNames {
@@ -90,6 +93,7 @@ impl PartNames {
             comments: next_to_main("comments.xml", COMMENTS_XML),
             comments_extended: next_to_main("commentsExtended.xml", COMMENTS_EXTENDED_XML),
             core_props: CORE_PROPS_XML.to_string(),
+            theme: next_to_main("theme/theme1.xml", THEME_XML),
         }
     }
 
@@ -168,6 +172,7 @@ impl PartNames {
             pick(&format!("{REL_BASE}endnotes"), &mut names.endnotes);
             pick(&format!("{REL_BASE}comments"), &mut names.comments);
             pick(REL_COMMENTS_EXTENDED, &mut names.comments_extended);
+            pick(&format!("{REL_BASE}theme"), &mut names.theme);
         }
         /* 3. Core properties hang off the package root, not the main part. */
         if let Some(rels) = &root_rels {
@@ -330,9 +335,11 @@ mod tests {
                         (&ty("styles"), "../styles/s%201.xml"),
                         (&ty("settings"), "settings.xml"),
                         (REL_COMMENTS_EXTENDED, "cx.xml"),
+                        (&ty("theme"), "theme/th%201.xml"),
                     ]),
                 ),
                 ("styles/s 1.xml".to_string(), b"<s/>".to_vec()),
+                ("office/theme/th 1.xml".to_string(), b"<a:theme/>".to_vec()),
                 ("office/settings.xml".to_string(), b"<s/>".to_vec()),
                 ("office/cx.xml".to_string(), b"<s/>".to_vec()),
             ];
@@ -349,6 +356,7 @@ mod tests {
             assert_eq!(names.styles, "styles/s 1.xml");
             assert_eq!(names.settings, "office/settings.xml");
             assert_eq!(names.comments_extended, "office/cx.xml");
+            assert_eq!(names.theme, "office/theme/th 1.xml");
             /* Unreferenced siblings fall back next to the main part. */
             assert_eq!(names.numbering, "office/numbering.xml");
         }

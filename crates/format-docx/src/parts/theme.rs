@@ -15,9 +15,6 @@ use engine::{DocumentTheme, FontBinding, RunFontBindings, SchemeColor, ThemeColo
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
-/// Where Word puts the theme when no relationship says otherwise.
-pub const DEFAULT_THEME_PART: &str = "word/theme/theme1.xml";
-
 fn local_name(qname: &[u8]) -> &[u8] {
     match qname.iter().rposition(|b| *b == b':') {
         Some(i) => &qname[i + 1..],
@@ -42,32 +39,20 @@ fn parse_rgb(v: &str) -> Option<[u8; 3]> {
     Some([d(0)?, d(2)?, d(4)?])
 }
 
-/// The document's theme part, located through `word/_rels/document.xml.rels`
-/// (the `…/relationships/theme` row — Transitional or Strict) with Word's
-/// conventional path as the fallback, parsed and joined with the
+/// The document's theme part `theme_part` (an archive entry name —
+/// [`crate::opc::part_names::PartNames::theme`]: the main part's
+/// `…/relationships/theme` target in either namespace family, Word's
+/// `word/theme/theme1.xml` as the fallback), parsed and joined with the
 /// `<w:themeFontLang>` / `<w:clrSchemeMapping>` settings. `None` when the
-/// package has no theme part or it does not parse.
+/// package has no such part or it does not parse.
 pub fn read_document_theme(
     entries: &[(String, Vec<u8>)],
+    theme_part: &str,
     settings: Option<&crate::parts::settings::SettingsPart>,
 ) -> Option<DocumentTheme> {
-    let entry = |name: &str| {
-        entries
-            .iter()
-            .find_map(|(n, b)| (n == name).then_some(b.as_slice()))
-    };
-    let from_rels = entry(crate::opc::archive::RELS_XML)
-        .and_then(|b| crate::opc::relationships::parse_relationships(b).ok())
-        .and_then(|rels| {
-            rels.items
-                .iter()
-                .find(|r| r.rel_type.ends_with("/relationships/theme"))
-                .map(|r| crate::parts::rels::resolve_target(&r.target))
-        });
-    let bytes = from_rels
-        .as_deref()
-        .and_then(entry)
-        .or_else(|| entry(DEFAULT_THEME_PART))?;
+    let bytes = entries
+        .iter()
+        .find_map(|(n, b)| (n == theme_part).then_some(b.as_slice()))?;
     let mut theme = parse_theme_xml(bytes).ok()?;
     if let Some(s) = settings {
         theme.font_lang = s.theme_font_lang.clone();
@@ -225,6 +210,7 @@ pub fn parse_theme_xml(xml: &[u8]) -> Result<DocumentTheme, DocxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opc::archive::{DOC_XML, RELS_XML, THEME_XML};
 
     /// The shape Word writes for its stock "Office" theme (2013+): empty
     /// `a:ea` / `a:cs`, the complex-script and East Asian faces per
@@ -319,19 +305,13 @@ mod tests {
         assert_eq!(theme.fonts.major.by_script["Arab"], "Times New Roman");
         assert_eq!(theme.font_lang.bidi.as_deref(), Some("ar-SA"));
         assert_eq!(theme.color_map.entries["t1"], "dark1");
-        let source = archive
-            .part_by_name(DEFAULT_THEME_PART)
-            .expect("part")
-            .to_vec();
+        let source = archive.part_by_name(THEME_XML).expect("part").to_vec();
         for saved in [
             crate::write_docx(&archive, &archive.document).expect("write"),
             crate::save_docx(&archive.document).expect("save"),
         ] {
             let back = crate::read_docx(&saved).expect("reread");
-            assert_eq!(
-                back.part_by_name(DEFAULT_THEME_PART),
-                Some(source.as_slice())
-            );
+            assert_eq!(back.part_by_name(THEME_XML), Some(source.as_slice()));
             assert_eq!(back.document.theme, archive.document.theme);
         }
         /* No settings part → the identity defaults (empty selections). */
@@ -431,31 +411,60 @@ mod tests {
             "word/document.xml",
             "word/styles.xml",
             "word/settings.xml",
-            DEFAULT_THEME_PART,
+            THEME_XML,
         ] {
             assert_eq!(entry(&saved, name), entry(&bytes, name), "{name}");
         }
     }
 
-    /// The relationship wins over the conventional path.
+    /// The part is the one `PartNames` discovers: the main part's theme
+    /// relationship (percent-decoded, `..`-relative, either family) wins
+    /// over the conventional path, which stays the fallback.
     #[test]
     fn the_theme_relationship_locates_the_part() {
-        let mut entries = vec![
-            (
-                crate::opc::archive::RELS_XML.to_string(),
-                format!(
-                    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-                     <Relationship Id=\"rId9\" Type=\"{}\" Target=\"theme/theme7.xml\"/></Relationships>",
-                    crate::test_fixtures::THEME_REL
-                )
-                .into_bytes(),
-            ),
-            ("word/theme/theme7.xml".to_string(), WORD_THEME.as_bytes().to_vec()),
-        ];
-        let t = read_document_theme(&entries, None).expect("theme");
-        assert_eq!(t.fonts.minor.latin, "Calibri");
-        entries[1].0 = "word/theme/elsewhere.xml".into();
-        assert!(read_document_theme(&entries, None).is_none());
+        use crate::opc::part_names::PartNames;
+        let theme_at = |rel_type: &str, target: &str, part: &str| {
+            let rels = format!(
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+                 <Relationship Id=\"rId9\" Type=\"{rel_type}\" Target=\"{target}\"/></Relationships>"
+            );
+            let entries = vec![
+                (DOC_XML.to_string(), b"<w:document/>".to_vec()),
+                (RELS_XML.to_string(), rels.into_bytes()),
+                (part.to_string(), WORD_THEME.as_bytes().to_vec()),
+            ];
+            let mut warnings = Vec::new();
+            let names = PartNames::discover(
+                &entries,
+                &|n| entries.iter().any(|(e, _)| e == n),
+                &mut warnings,
+            )
+            .expect("part names");
+            assert!(warnings.is_empty(), "{warnings:?}");
+            read_document_theme(&entries, &names.theme, None).map(|t| t.fonts.minor.latin)
+        };
+        let calibri = Some("Calibri".to_string());
+        let rel = crate::test_fixtures::THEME_REL;
+        let strict = crate::schema::family::to_family(rel, crate::schema::NsFamily::Strict);
+        assert_eq!(
+            theme_at(rel, "theme/theme7.xml", "word/theme/theme7.xml"),
+            calibri
+        );
+        assert_eq!(
+            theme_at(&strict, "theme/theme7.xml", "word/theme/theme7.xml"),
+            calibri
+        );
+        assert_eq!(
+            theme_at(rel, "../themes/my%20theme.xml", "themes/my theme.xml"),
+            calibri
+        );
+        /* A relationship naming a missing part falls back to Word's path. */
+        assert_eq!(theme_at(rel, "theme/gone.xml", THEME_XML), calibri);
+        /* Neither → no model. */
+        assert_eq!(
+            theme_at(rel, "theme/gone.xml", "word/theme/elsewhere.xml"),
+            None
+        );
     }
 
     #[test]
