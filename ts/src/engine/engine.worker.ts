@@ -18,6 +18,7 @@ import {
     clearJournalGap,
 } from './event-log';
 import { nextCleanState } from './clean-state';
+import { nextRetry } from './retry-schedule';
 import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
@@ -168,7 +169,7 @@ const SNAPSHOT_IDLE_MS = 1500;
    until they typed again. Bounded exponential backoff; the attempt after
    the last delay failing raises the "not being checkpointed" notice. A
    success resets everything. */
-const SNAPSHOT_RETRY_DELAYS_MS = [2000, 4000, 8000];
+/* The schedule itself lives in `retry-schedule.ts` (unit-tested). */
 let snapshotWriteFailures = 0;
 let snapshotRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let checkpointWarned = false;
@@ -1747,8 +1748,9 @@ function noteSnapshotWriteOk(): void {
 function noteSnapshotFailed(reason: unknown): void {
     snapshotWriteFailures += 1;
     lastCheckpointError = failureText(reason);
-    const delay = SNAPSHOT_RETRY_DELAYS_MS[snapshotWriteFailures - 1];
-    if (delay !== undefined) {
+    const decision = nextRetry(snapshotWriteFailures);
+    if (decision.retry) {
+        const delay = decision.delayMs;
         postCheckpointState(snapshotWriteFailures);
         if (snapshotRetryTimer !== undefined) clearTimeout(snapshotRetryTimer);
         snapshotRetryTimer = setTimeout(() => {
@@ -1795,8 +1797,9 @@ function noteJournalWriteFailed(seq: number, cmd: Command, e: unknown): void {
 function failJournalRound(): void {
     if (journalExhausted) return;
     journalFailures += 1;
-    const delay = SNAPSHOT_RETRY_DELAYS_MS[journalFailures - 1];
-    if (delay !== undefined) {
+    const decision = nextRetry(journalFailures);
+    if (decision.retry) {
+        const delay = decision.delayMs;
         postCheckpointState(journalFailures);
         journalRetryTimer = setTimeout(() => {
             journalRetryTimer = undefined;

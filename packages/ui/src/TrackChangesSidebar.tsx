@@ -32,8 +32,14 @@ export interface TrackChangesSidebarProps {
 }
 
 /** Issue #247 — the row label of a revision kind (issue #262: a
- *  paragraph-mark revision reads as a paragraph split / merge). */
+ *  paragraph-mark revision reads as a paragraph split / merge; issue
+ *  #365: a table-row revision as a row insertion / deletion). */
 function kindLabel(rev: RevisionSnapshot): string {
+    if (rev.row !== undefined) {
+        return rev.kind === 'delete' || rev.kind === 'move-from'
+            ? 'Table row deleted'
+            : 'Table row inserted';
+    }
     if (rev.mark) {
         switch (rev.kind) {
             case 'insert':
@@ -173,7 +179,9 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
                                 <div class="nge-tc__meta">
                                     <span>{fmtDate(rev.date)}</span>
                                     <span class="nge-tc__loc">
-                                        block {rev.block} · {rev.start}–{rev.end}
+                                        {rev.row !== undefined
+                                            ? `block ${rev.block} · row ${rev.row + 1}`
+                                            : `block ${rev.block} · ${rev.start}–${rev.end}`}
                                     </span>
                                 </div>
                                 <div class="nge-tc__actions">

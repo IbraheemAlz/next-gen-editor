@@ -1,12 +1,14 @@
 /**
  * ErrorToast - issue #364: the visible half of an engine refusal.
  *
- * A typed `Event::Error` from a keyboard path (a tracked Backspace over a
- * table boundary, a tracked delete across a cell) used to reach telemetry
- * only, so the key press appeared to do nothing - the Honest UX rule needs
- * a visible refusal. `createEditorState().lastError()` moves on every
- * error reply; this component turns the errors it has copy for into a
- * transient, non-modal, screen-reader-announced toast.
+ * A typed `Event::Error` from a keyboard path (a refused tracked deletion)
+ * used to reach telemetry only, so the key press appeared to do nothing -
+ * the Honest UX rule needs a visible refusal. `createEditorState().
+ * lastError()` moves on every error reply; this component turns the
+ * errors it has copy for into a transient, non-modal, screen-reader-
+ * announced toast. (Issue #365 made a tracked deletion across table cells
+ * or over a table a RECORDED one — rows marked deleted — so the engine
+ * now refuses only a range whose end addresses no paragraph.)
  *
  * - `.nge-toast` is a PERSISTENT `role="status"` live region (implicitly
  *   polite - the explicit `aria-live` is left off so the engine's own
@@ -30,7 +32,7 @@ import './ErrorToast.css';
 /** `ErrorKind` -> the user-facing sentence (what happened + what to do). */
 export const ERROR_TOAST_COPY: Partial<Record<ErrorKind, string>> = {
     TrackedDeletionRefused:
-        'Tracked deletion cannot cross a table cell — turn off Track Changes or delete inside the cell.',
+        'This deletion could not be tracked, so nothing was changed — select the text again, or turn off Track Changes.',
 };
 
 export interface ErrorToastProps {

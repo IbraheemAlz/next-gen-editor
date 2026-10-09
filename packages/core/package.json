@@ -16,9 +16,12 @@
       "import": "./src/commandMeta.generated.ts"
     }
   },
-  "files": ["src"],
+  "files": [
+    "src"
+  ],
   "scripts": {
-    "tsc": "tsc --noEmit"
+    "tsc": "tsc --noEmit",
+    "test": "vitest run"
   },
   "peerDependencies": {
     "solid-js": "^1.9.0"

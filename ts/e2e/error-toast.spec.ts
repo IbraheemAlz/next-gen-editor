@@ -9,7 +9,15 @@ import { boot, documentText } from './helpers/editor';
  * like a dead key. `createEditorState().lastError` now moves on every
  * error reply and `@nge/ui`'s `ErrorToast` shows the kind's copy in a
  * transient `role="status"` region (4 s), with the Dev HUD's "Last error"
- * row recording the command + kind + count. */
+ * row recording the command + kind + count.
+ *
+ * Issue #365 then made that very deletion a RECORDED one (the rows are
+ * marked deleted, `<w:trPr><w:del/>`): no keyboard edit reaches the
+ * refusal any more (only a range whose end addresses no paragraph is
+ * refused). So the first spec pins the new behaviour - Backspace across a
+ * table is tracked, with no toast - and the toast / HUD specs feed a typed
+ * refusal through the engine client's event stream, the exact path an
+ * engine reply takes to `createEditorState`. */
 
 const pos = (block: number, offset: number) => ({
     path: { steps: [{ kind: 'BLOCK', idx: block }] },
@@ -44,7 +52,22 @@ async function seedTableAndSelectAcross(page: Page): Promise<void> {
     );
 }
 
-test('Backspace across a table in review mode shows a toast and leaves the document alone (#364)', async ({
+/** Deliver a typed refusal the way an engine reply reaches the shell: to
+ *  every subscriber of the engine client (what `createEditorState` feeds
+ *  `lastError` from). */
+async function deliverRefusal(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        const client = (window as any).__engineClient;
+        const evt = {
+            type: 'ERROR',
+            message: 'DeleteAtCaret: the deletion range does not address a paragraph',
+            kind: 'TrackedDeletionRefused',
+        };
+        for (const s of client.subscribers as Set<(e: unknown) => void>) s(evt);
+    });
+}
+
+test('Backspace across a table in review mode is recorded, not refused - no toast (#364 x #365)', async ({
     page,
 }) => {
     test.setTimeout(60_000);
@@ -73,16 +96,37 @@ test('Backspace across a table in review mode shows a toast and leaves the docum
     await page.locator('textarea[data-nge-hidden-input]').focus();
     await page.keyboard.press('Backspace');
 
-    await expect(toast).toContainText('Tracked deletion cannot cross a table cell');
+    /* Recorded: the text stays (struck), the table's row is a tracked row
+       deletion, and nothing was refused. */
+    await expect
+        .poll(async () =>
+            page.evaluate(async () => {
+                const rows = await (window as any).__engineClient.revisionsSnapshot();
+                return rows.filter((r: any) => r.row !== undefined).map((r: any) => [r.kind, r.row]);
+            }),
+        )
+        .toEqual([['delete', 0]]);
+    expect(await documentText(page)).toBe(before);
+    await page.waitForTimeout(300);
+    await expect(toast).toHaveText('');
+    /* Accepting removes the deleted text, the table and the mark. */
+    await page.evaluate(() => (window as any).__dispatch({ type: 'ACCEPT_ALL_REVISIONS' }));
+    expect(await documentText(page)).toBe('beter');
+});
+
+test('a typed refusal shows the toast, and it auto-dismisses (#364)', async ({ page }) => {
+    test.setTimeout(60_000);
+    await boot(page);
+    const toast = page.locator('.nge-toast');
+    await expect(toast).toHaveAttribute('role', 'status');
+    await expect(toast).toHaveText('');
+
+    await deliverRefusal(page);
+    await expect(toast).toContainText('could not be tracked');
     await expect(toast).toContainText('turn off Track Changes');
     /* The toast lives in a persistent `role="status"` live region
        (implicitly polite, announced when its text changes). */
     await expect(toast).toHaveAttribute('aria-atomic', 'true');
-
-    /* The refusal changed nothing: no revisions, same text. */
-    expect(await documentText(page)).toBe(before);
-    const revisions = await page.evaluate(() => (window as any).__engineClient.revisionsSnapshot());
-    expect(revisions).toEqual([]);
 
     /* Auto-dismisses (4 s). */
     await expect(toast).toHaveText('', { timeout: 8_000 });
@@ -93,20 +137,19 @@ test('the Dev HUD records the last error with its command, kind and count (#364)
 }) => {
     test.setTimeout(60_000);
     await boot(page);
-    await seedTableAndSelectAcross(page);
-    await page.locator('textarea[data-nge-hidden-input]').focus();
-    await page.keyboard.press('Backspace');
-    await expect(page.locator('.nge-toast')).toContainText('Tracked deletion');
+    await deliverRefusal(page);
+    await expect(page.locator('.nge-toast')).toContainText('could not be tracked');
 
+    await page.locator('textarea[data-nge-hidden-input]').focus();
     await page.keyboard.press('Control+Shift+D');
     const row = page.locator('.nge-hud__lasterror');
     await expect(row).toBeVisible();
+    await expect(row).toContainText('DeleteAtCaret');
     await expect(row).toContainText('TrackedDeletionRefused');
     await expect(row).toContainText('#1');
 
     /* A second refusal moves the row and re-arms the toast. */
-    await page.locator('textarea[data-nge-hidden-input]').focus();
-    await page.keyboard.press('Backspace');
+    await deliverRefusal(page);
     await expect(row).toContainText('#2');
 });
 

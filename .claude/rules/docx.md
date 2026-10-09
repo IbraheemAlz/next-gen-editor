@@ -61,6 +61,33 @@ paths:
   `error::warn` into the read's sink (`collect_read_warnings`; a no-op in
   the writer's re-parses). Verified-reuse equality never uses float `==`:
   `writer::same_section_props` compares geometry by bits.
+- **Namespace prefixes (issues #325 / #394).** The parsers match literal
+  qnames (`w:p`), so every WordprocessingML part the reader walks — the
+  main part, `styles.xml`, `numbering.xml`, `settings.xml`, the note
+  parts, `comments.xml` and every header / footer the main part's rels
+  name — has its root classified first (`NamespaceScope::classify_root`).
+  A part binding WordprocessingML to another prefix (or as the default
+  namespace) is rewritten by `schema::ns_normalize::canonicalize_prefixes`
+  and reported as `DocxWarning::NonCanonicalNamespaces { part, .. }`; a
+  sibling's normalised bytes REPLACE its `other_entries` row, so the
+  parsers, the verbatim passthrough, in-place patches (`comments.xml`)
+  and the tree's source package all see one spelling. Such a part is
+  regenerate-only (its zero-edit save is not byte-identical to the
+  source — `tools/corpus-native`'s `normalized_parts`); canonical parts
+  and parts the reader never walks stay verbatim.
+- **Paragraph borders (issues #352 / #395).** `<w:pBdr>` is read by
+  `schema::ct_pbdr` for paragraphs AND styles / docDefaults
+  (`parts::styles`). Borders cascade PER EDGE (`ParaProperties::
+  merged_with`); an explicit `w:val="nil"` / `"none"` is a set
+  `BorderStyle::None` edge (painted by nothing) so it removes an
+  inherited one. A logical `<w:start>` / `<w:end>` edge is stored in the
+  slot its OWN properties' `direction` names (+ `border_spelling`), and
+  every cascade — the reader's `StyleResolver::resolve_paragraph`, the
+  engine's `recompute_paragraph_props` / `resolve_style_cascade` — goes
+  through `ParaProperties::cascade`, which re-orients each level to the
+  paragraph's FINAL direction (`oriented_borders`) before folding, so a
+  style's `<w:start>` lands where the paragraph's (cascaded) `<w:bidi>`
+  says. Never fold paragraph properties with a bare `merged_with` loop.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:
@@ -84,9 +111,10 @@ The `tools/roundtrip/` harness asserts:
   `TableProperties`, `RowProperties`, `CellProperties`) and the writer
   re-emits it, interleaved with the modeled children **in schema order**
   (rank tables in `schema/ct_rpr.rs`, `ct_ppr.rs`, `ct_tbl.rs`).
-- The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole; its
-  modeled children still seed the run baseline (`fold_rpr_fragment`).
-  Issue #293 — they are also modeled as `Paragraph::mark_style`
+- The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole. Issue
+  #369 — Word applies it to the mark (the pilcrow) ONLY: it is never
+  folded into the paragraph's runs (a bold mark over plain runs reads
+  plain runs). Issue #293 — its modeled children are `Paragraph::mark_style`
   (`schema::ct_rpr::mark_rpr_style`; `None` = not modeled, the bag is the
   truth): typing into an empty paragraph inherits it, `split_at` gives an
   EMPTY half the insertion formatting at the split point, `concat` keeps
@@ -338,6 +366,13 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   any one that removes the mark merges; a single Accept/Reject decides
   the addressed one (by range: the first) — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
+  Issue #367 — a removed mark carrying a SECTION BREAK merges too
+  (`merge_paragraph_with_next`), by Word's rule (the #70 `delete_range`
+  one): the text joins the FOLLOWING section and takes its properties
+  (`concat` keeps the tail's `section_end`), and the dropped section's
+  header / footer refs backfill the surviving terminal's EMPTY slots
+  (owned slots win) — so an own inserted break is removed, not marked.
+  Harness: `tools/roundtrip` step 54 (`section_break_revision.docx`).
   Issue #305 — the single `AcceptRevision` / `RejectRevision` is the
   SAME resolver (`DocumentTree::resolve_revisions` with a
   `RevisionPick::Only`, addressed by `engine::RevisionRef`); text leaves
@@ -381,16 +416,40 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   straddling change is cut once, `tracked::split_revisions`; the right
   piece drops its source id, and `concat` re-joins the two pieces). A
   tracked deletion (`try_tracked_delete_range`; `tracked_delete_range`
-  wraps it) works over any range inside ONE container: per paragraph the
-  reviewer's own pending insertions are removed outright (the #265 path,
-  `revisions::remove_text`), already-deleted bytes are left alone, the
-  rest is marked `Delete`; every swallowed mark is marked `Delete` — or,
-  when it is the reviewer's own inserted mark, removed (the paragraphs
-  merge through `merge_paragraph_with_next`). A range across a cell
-  boundary or over a table is refused (`TrackedEditError`, answered as
-  `Event::Error` — never a silent no-op). Tracked Backspace leaves the
-  caret at the START of what it marked (Word: it steps over struck
-  text).
+  wraps it) works over any range between two paragraphs: per paragraph
+  the reviewer's own pending insertions are removed outright (the #265
+  path, `revisions::remove_text`), already-deleted bytes are left alone,
+  the rest is marked `Delete`; every swallowed mark (one whose merge
+  partner on accept — the next paragraph, past any table the range
+  deletes whole — is in the range) is marked `Delete` — or, when it is
+  the reviewer's own inserted mark, removed (the paragraphs merge through
+  `merge_paragraph_with_next`). Issue #365 — tables, Word's way: a range
+  crossing a row boundary or entering a table from outside deletes every
+  row it touches WHOLE (`RowProperties::revisions` += `Delete` — the
+  `<w:trPr><w:del/>` — plus the cells' contents as text; a nested
+  table's rows marked too; the reviewer's own inserted row removed
+  outright), a range across cells of ONE row deletes each cell's
+  sub-range. Only an end that addresses no paragraph is refused
+  (`TrackedEditError::NoParagraph`, answered as `Event::Error` — never a
+  silent no-op). Tracked Backspace leaves the caret at the START of what
+  it marked (Word: it steps over struck text). Issue #366 — a paste with
+  review mode on (`tracked_insert_multiline` / `tracked_insert_rich_blocks`)
+  records its text as `Insert`s and every mark it creates as inserted
+  (a pasted table's rows as inserted rows); replacing a selection marks
+  it deleted first. An IME commit goes through the tracked typing path.
+- **Table-row revisions (issue #365).** `<w:trPr><w:ins/>` / `<w:del/>`
+  (both, in source order) read into `RowProperties::revisions` (modeled
+  `CT_TrPr` children — no longer bagged), so the verified `<w:trPr>`
+  passthrough covers them; a regenerated `<w:trPr>` emits them at their
+  rank (before `<w:trPrChange>`) with #295 id tokens. The resolver
+  (`resolve_revisions`) resolves rows in the mark walk, after a table's
+  cells and before the paragraph in front of it: an accepted deletion /
+  rejected insertion removes the row (`remove_table_rows`, comment anchors
+  via `remap_table_cells`; a table left without rows goes via
+  `remap_block_splice`). `revision_entries` lists row changes of
+  top-level tables as `RevisionSlot::Row { row, index }` (path = the
+  table), `revisions_snapshot` rows carry `row`. `<w:tblPrChange>` /
+  `<w:trPrChange>` stay verbatim grab-bag bytes (not resolved).
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

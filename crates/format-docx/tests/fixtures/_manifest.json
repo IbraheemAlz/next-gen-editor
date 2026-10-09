@@ -206,6 +206,21 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "section_break_revision.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 3,
+        "paragraph_texts": [
+          "The first section ends here",
+          "The second section",
+          "and its last paragraph"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "simple_arabic.docx": {
       "generator": "build_minimal_docx",
       "phase_introduced": 1,
@@ -479,6 +494,20 @@
           "",
           "Alpha",
           "Beta"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "tracked_table_rows.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "Rows under review",
+          "after"
         ]
       },
       "roundtrip": {
