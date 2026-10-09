@@ -6166,6 +6166,13 @@ fn replaced_text_style(
     ((start.offset as usize) < p.text.len()).then(|| p.style_at(start.offset))
 }
 
+/// Issue #293 — `true` when the paragraph `at` addresses holds no text
+/// (typing there formats the paragraph mark too).
+fn paragraph_is_empty(doc: &DocumentTree, at: &BridgeLogicalPos) -> bool {
+    doc.paragraph_at_path(&bridge_to_engine_path(at.path.clone()))
+        .is_some_and(|p| p.text.is_empty())
+}
+
 /// Issue #276 — apply [`replaced_text_style`]'s result to the `len` bytes
 /// just inserted at `start`.
 fn restyle_replacement(
@@ -12678,6 +12685,7 @@ impl Engine {
         } else {
             temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
+        let was_empty = paragraph_is_empty(&base, &start);
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
         let mut new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         let inserted_end = start.offset + text.len() as u32;
@@ -12690,6 +12698,10 @@ impl Engine {
                 },
                 pending,
             );
+        }
+        /* Issue #293 — as in the body. */
+        if was_empty {
+            new_doc = new_doc.mark_follows_text(&bridge_to_engine_path(start.path.clone()));
         }
         let caret = BridgeLogicalPos {
             path: start.path,
@@ -14250,6 +14262,7 @@ impl Engine {
                 .current()
                 .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
+        let was_empty = paragraph_is_empty(&base, &start);
         let mut new_doc = if tracking {
             base.tracked_insert_text(
                 to_engine_pos(start.clone()),
@@ -14275,6 +14288,10 @@ impl Engine {
                 },
                 pending,
             );
+        }
+        /* Issue #293 — text typed into an empty paragraph formats its mark. */
+        if was_empty {
+            new_doc = new_doc.mark_follows_text(&bridge_to_engine_path(start.path.clone()));
         }
         let caret = BridgeLogicalPos {
             path: start.path,
@@ -17601,6 +17618,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -17756,6 +17774,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -17795,6 +17814,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -18970,6 +18990,7 @@ mod tests {
                 body_xml: None,
                 source_markup: None,
                 mark_revision: None,
+                mark_style: None,
             })],
             source_markup: None,
         }

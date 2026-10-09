@@ -62,6 +62,8 @@ mod block_remap;
 pub use block_remap::CellMove;
 pub mod fields;
 #[cfg(test)]
+mod paragraph_mark_tests;
+#[cfg(test)]
 mod paragraph_merge_tests;
 #[cfg(test)]
 mod revision_tests;
@@ -3514,6 +3516,28 @@ pub struct Paragraph {
     /// snapshot encodes unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mark_revision: Option<Revision>,
+    /// Issue #293 — the paragraph MARK's own run properties
+    /// (`<w:pPr><w:rPr>`): the formatting of the pilcrow, which Word
+    /// gives to text typed into the paragraph while it is EMPTY. Modeled
+    /// fields only (no grab bag): the mark's unmodeled children ride the
+    /// pPr grab bag inside the source `<w:rPr>` fragment, and the writer
+    /// re-emits that fragment verbatim while it still spells this style,
+    /// else regenerates it from this style (keeping the unmodeled
+    /// children). `None` = not modeled — no mark rPr was read, the
+    /// paragraph is engine-synthesized, or the tree predates #293 — and
+    /// the bag is the truth.
+    ///
+    /// Travel rules: `split_at` gives an EMPTY half the insertion
+    /// formatting at the split point (Enter at the end of a bold run →
+    /// the new empty paragraph types bold; Enter at a paragraph start →
+    /// the empty paragraph above takes the first character's format), a
+    /// non-empty half keeps the original; `concat` keeps the surviving
+    /// paragraph's (the head's, the tail's when the head is empty);
+    /// typing into an empty paragraph inherits it. Skipped when `None`,
+    /// so a pre-#293 snapshot encodes unchanged. Boxed: `Paragraph`
+    /// clones constantly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark_style: Option<Box<SpanStyle>>,
 }
 
 /// Issue #81 — one paragraph-scoped bookmark. `id` is the source
@@ -3549,8 +3573,33 @@ impl Paragraph {
     /// sticky formatting): the character before `at`, or at the
     /// paragraph start the character after it, never an inline-object anchor.
     pub fn typing_style_at(&self, at: u32) -> SpanStyle {
+        /* Issue #293 — an empty paragraph has no neighbouring character:
+        Word types with the paragraph MARK's run properties. */
+        if self.text.is_empty() {
+            return self
+                .mark_style
+                .as_deref()
+                .map_or_else(SpanStyle::default, SpanStyle::for_typing);
+        }
         self.inheriting_span(self.snap_offset(at))
             .map_or_else(SpanStyle::default, |i| self.spans[i].style.for_typing())
+    }
+
+    /// Issue #293 — the mark a NEW paragraph mark inserted at byte `at`
+    /// gets: the insertion formatting there ([`Self::typing_style_at`],
+    /// modeled fields only — a run's grab bag never moves onto a mark).
+    /// Equal formatting keeps the current mark as is (`None` stays `None`
+    /// for unformatted text), so an unformatted split adds no `<w:rPr>`.
+    fn insertion_mark(&self, at: u32) -> Option<Box<SpanStyle>> {
+        let style = SpanStyle {
+            grab_bag: None,
+            ..self.typing_style_at(at)
+        };
+        if style == self.mark_style.as_deref().cloned().unwrap_or_default() {
+            self.mark_style.clone()
+        } else {
+            Some(Box::new(style))
+        }
     }
 
     /// Issue #276 — index of the style span an insertion at (snapped)
@@ -3664,6 +3713,7 @@ impl Paragraph {
             each run's recorded `<w:rPr>` against the new style. */
             source_markup: self.source_markup.clone(),
             mark_revision: self.mark_revision.clone(),
+            mark_style: self.mark_style.clone(),
         }
     }
 
@@ -3851,6 +3901,7 @@ impl Paragraph {
             source_markup: markup,
             /* Issue #262 — the paragraph mark is untouched. */
             mark_revision: self.mark_revision.clone(),
+            mark_style: self.mark_style.clone(),
         };
         out.remap_range_overlays(TextEdit {
             at: s,
@@ -3941,6 +3992,24 @@ impl Paragraph {
                 });
             }
         }
+        /* Issue #293 — an EMPTY half is where the caret lands to type: its
+        mark takes the insertion formatting at the split point (Word: Enter
+        at the end of a bold run types bold in the new paragraph; Enter at
+        a paragraph start gives the empty paragraph above the first
+        character's format). A non-empty half keeps the original mark. */
+        let len = self.text.len() as u32;
+        let (left_mark, right_mark) = (
+            if at == 0 && len > 0 {
+                self.insertion_mark(at)
+            } else {
+                self.mark_style.clone()
+            },
+            if at == len {
+                self.insertion_mark(at)
+            } else {
+                self.mark_style.clone()
+            },
+        );
         let mut halves = (
             Paragraph {
                 text: self.text[..at as usize].to_owned(),
@@ -3977,6 +4046,7 @@ impl Paragraph {
                 source_markup: markup_left,
                 /* Issue #262 — a fresh mark for the left half. */
                 mark_revision: None,
+                mark_style: left_mark,
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -4001,10 +4071,10 @@ impl Paragraph {
                 source_markup: markup_right,
                 /* Issue #262 — the original mark ends the right half. */
                 mark_revision: self.mark_revision.clone(),
+                mark_style: right_mark,
             },
         );
         /* Issue #292 — each half is the original minus the other one. */
-        let len = self.text.len() as u32;
         halves.0.remap_range_overlays(TextEdit {
             at,
             removed: len - at,
@@ -4169,6 +4239,7 @@ impl Paragraph {
             /* Issue #262 — the head's mark is the one deleted: the
             surviving mark (and its tracked change) is the tail's. */
             mark_revision: other.mark_revision.clone(),
+            mark_style: fmt.mark_style.clone(),
         }
     }
 
@@ -5059,6 +5130,7 @@ impl DocumentTree {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         }));
         Self {
             blocks,
@@ -5112,6 +5184,7 @@ impl DocumentTree {
                 body_xml: None,
                 source_markup: None,
                 mark_revision: None,
+                mark_style: None,
             }));
         }
         Self {
@@ -6576,6 +6649,7 @@ impl DocumentTree {
                 body_xml: None,
                 source_markup: None,
                 mark_revision: None,
+                mark_style: None,
             }));
             return Self {
                 blocks,
@@ -6619,6 +6693,13 @@ impl DocumentTree {
             /* Issue #276 — pick the span to continue on the PRE-edit
             paragraph, at the offset `splice_text` snaps to. */
             let grow = para.inheriting_span(para.snap_offset(off.min(para.text.len() as u32)));
+            /* Issue #293 — an empty paragraph has no character to continue:
+            the typed text takes the paragraph mark's run properties. */
+            let from_mark = para
+                .text
+                .is_empty()
+                .then(|| para.typing_style_at(0))
+                .filter(|s| *s != SpanStyle::default());
             /* Issues #199 / #106 / #252 — ONE splice drives the source
             markup here and the comment anchors below. */
             let e = para.splice_text(off, 0, text);
@@ -6652,6 +6733,9 @@ impl DocumentTree {
                 if typed != donor {
                     *para = para.set_style(off, off + len, typed);
                 }
+            }
+            if let Some(mark) = from_mark {
+                *para = para.set_style(off, off + len, mark);
             }
             /* Issue #43 — FIELD anchors shift too (they render live now;
             a stale range would repaint the wrong bytes). Typing at a
@@ -6734,6 +6818,38 @@ impl DocumentTree {
         if let Some(e) = edit {
             out.remap_text_edit_record(&target, e);
         }
+        out
+    }
+
+    /// Issue #293 — Word applies formatting typed into an EMPTY paragraph to
+    /// its mark as well (sticky formatting armed in an empty paragraph IS
+    /// the mark's formatting). The interactive typing paths call this after
+    /// overlaying pending formatting onto text typed into a paragraph that
+    /// was empty: the mark takes the typed text's modeled style, so the
+    /// paragraph saves with a mark that agrees with its text. A no-op when
+    /// they already agree (plain typing inherits the mark).
+    pub fn mark_follows_text(&self, para: &BlockPath) -> Self {
+        let mut blocks = self.blocks.clone();
+        let mut changed = false;
+        let _ = mutate_paragraph_in_top(&mut blocks, para, |p| {
+            if p.text.is_empty() {
+                return;
+            }
+            let style = SpanStyle {
+                grab_bag: None,
+                ..p.style_at(0)
+            };
+            if style != p.mark_style.as_deref().cloned().unwrap_or_default() {
+                p.mark_style = Some(Box::new(style));
+                p.dirty = true;
+                changed = true;
+            }
+        });
+        if !changed {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        out.blocks = blocks;
         out
     }
 
@@ -13663,6 +13779,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -13694,6 +13811,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -13722,6 +13840,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -13828,6 +13947,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -13870,6 +13990,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -14369,6 +14490,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -14417,6 +14539,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revision: None,
+            mark_style: None,
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -14464,6 +14587,7 @@ mod tests {
                 body_xml: None,
                 source_markup: None,
                 mark_revision: None,
+                mark_style: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -14489,6 +14613,7 @@ mod tests {
                 body_xml: None,
                 source_markup: None,
                 mark_revision: None,
+                mark_style: None,
             },
         ];
         let (out, caret) = doc.insert_rich(

@@ -135,6 +135,63 @@ pub fn fold_rpr_fragment(fragment: &[u8], style: &mut SpanStyle) {
     }
 }
 
+/// Issue #293 — the paragraph mark's modeled run properties
+/// (`engine::Paragraph::mark_style`) a captured `<w:pPr>/<w:rPr>`
+/// fragment spells: its top-level children folded through
+/// [`apply_rpr`] (no grab bag — the unmodeled children stay in the
+/// fragment). The reader models the mark with it and the writer
+/// verifies the fragment against the live mark with it, so the two can
+/// never disagree.
+pub fn mark_rpr_style(fragment: &[u8]) -> SpanStyle {
+    let mut style = SpanStyle::default();
+    fold_rpr_fragment(fragment, &mut style);
+    style.grab_bag = None;
+    style
+}
+
+/// Issue #293 — the top-level children of a captured `<w:rPr>` fragment
+/// that [`mark_rpr_style`] does NOT model (everything outside
+/// [`apply_rpr`]'s arms: `<w:lang>`, `<w:rtl>`, `<w:rStyle>`, foreign
+/// extensions, the `<w:rPrChange>` history), verbatim, in source order —
+/// what a regenerated mark `<w:rPr>` must keep.
+pub fn unmodeled_rpr_children(fragment: &[u8]) -> Vec<Vec<u8>> {
+    /* `<w:rStyle>` is "modeled" for runs (through the character-style
+    cascade) but nothing models it on a mark. */
+    let kept = |name: &[u8]| !rpr_child_is_modeled(name) || name == b"w:rStyle";
+    let mut reader = Reader::from_reader(fragment);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut depth = 0u32;
+    let mut out = Vec::new();
+    loop {
+        let start = reader.buffer_position() as usize;
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if depth == 1 => {
+                let keep = kept(e.name().as_ref());
+                let end = e.to_end().into_owned();
+                let mut skip = Vec::new();
+                if reader.read_to_end_into(end.name(), &mut skip).is_err() {
+                    break;
+                }
+                if keep {
+                    let stop = reader.buffer_position() as usize;
+                    out.push(fragment[start..stop].to_vec());
+                }
+            }
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::Empty(e)) if depth == 1 && kept(e.name().as_ref()) => {
+                let stop = reader.buffer_position() as usize;
+                out.push(fragment[start..stop].to_vec());
+            }
+            Ok(Event::End(_)) => depth = depth.saturating_sub(1),
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
 /// Value of attribute `key` on a start/empty tag, unescaped.
 pub fn attr_val(e: &BytesStart, key: &[u8]) -> Option<String> {
     e.attributes()
@@ -335,5 +392,32 @@ mod tests {
         let mut empty = SpanStyle::default();
         fold_rpr_fragment(b"<w:rPr/>", &mut empty);
         assert_eq!(empty, SpanStyle::default());
+    }
+
+    /// Issue #293 — a mark `<w:rPr>` splits into the modeled style and the
+    /// verbatim unmodeled children (`<w:rStyle>` included: nothing models
+    /// it on a mark; nested `<w:rPrChange>` content never folds).
+    #[test]
+    fn mark_rpr_splits_into_modeled_style_and_unmodeled_children() {
+        let frag = br#"<w:rPr><w:rStyle w:val="Strong"/><w:b/><w:lang w:val="en-GB"/><w:sz w:val="20"/><w:rPrChange w:id="1" w:author="A"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr>"#;
+        let style = mark_rpr_style(frag);
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(style.font_size, Some(10.0));
+        assert_eq!(style.italic, None, "history never folds");
+        assert!(style.grab_bag.is_none());
+        let kept: Vec<String> = unmodeled_rpr_children(frag)
+            .into_iter()
+            .map(|c| String::from_utf8(c).unwrap())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                r#"<w:rStyle w:val="Strong"/>"#.to_string(),
+                r#"<w:lang w:val="en-GB"/>"#.to_string(),
+                r#"<w:rPrChange w:id="1" w:author="A"><w:rPr><w:i/></w:rPr></w:rPrChange>"#
+                    .to_string(),
+            ]
+        );
+        assert!(unmodeled_rpr_children(b"<w:rPr/>").is_empty());
     }
 }

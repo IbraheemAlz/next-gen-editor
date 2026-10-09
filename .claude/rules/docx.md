@@ -63,6 +63,16 @@ The `tools/roundtrip/` harness asserts:
   (rank tables in `schema/ct_rpr.rs`, `ct_ppr.rs`, `ct_tbl.rs`).
 - The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole; its
   modeled children still seed the run baseline (`fold_rpr_fragment`).
+  Issue #293 — they are also modeled as `Paragraph::mark_style`
+  (`schema::ct_rpr::mark_rpr_style`; `None` = not modeled, the bag is the
+  truth): typing into an empty paragraph inherits it, `split_at` gives an
+  EMPTY half the insertion formatting at the split point, `concat` keeps
+  the surviving paragraph's. The writer re-emits the bag fragment while
+  `mark_rpr_style(fragment) == mark_style` (also a condition of the
+  verified pPr passthrough), else regenerates it from `mark_style` keeping
+  the fragment's unmodeled children (`unmodeled_rpr_children`) and the
+  source spelling of unchanged ones; the #262 mark revision is re-injected
+  after.
 - **When you model a new child:** add it to the `*_child_is_modeled`
   predicate *and* emit it through the `PrChildren` sink in `writer.rs`
   at its rank — never both bag it and emit it (duplicate child).

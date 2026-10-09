@@ -1,11 +1,12 @@
 //! Paragraph formatting through edits and saves: issue #292 (a paragraph
 //! merge keeps the head's style and source identity and carries the
-//! tail's hyperlinks / tracked changes into the saved file).
+//! tail's hyperlinks / tracked changes into the saved file) and issue #293
+//! (the paragraph mark's run properties, `<w:pPr><w:rPr>`).
 
 use super::tests::document_xml_of;
 use super::*;
 use crate::opc::archive::read_docx;
-use engine::{BlockPath, LogicalPos};
+use engine::{Block, BlockPath, DocumentTree, LogicalPos};
 
 const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
@@ -98,3 +99,186 @@ fn a_paragraph_merge_saves_the_heading_with_the_tails_overlays() {
     let r = &p.revisions[0];
     assert_eq!(&p.text[r.start as usize..r.end as usize], "new");
 }
+
+/* ---- Issue #293 — the paragraph mark's run properties ---- */
+
+/// A centred paragraph whose mark is bold + themed red + `en-GB` (its
+/// text run is bold), then an EMPTY paragraph whose mark is italic.
+const MARK_BODY: &str = concat!(
+    r#"<w:p w14:paraId="33333333"><w:pPr><w:jc w:val="center"/><w:rPr><w:b/><w:color w:val="FF0000" w:themeColor="accent2"/><w:lang w:val="en-GB"/></w:rPr></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>Bold</w:t></w:r></w:p>"#,
+    r#"<w:p w14:paraId="44444444"><w:pPr><w:rPr><w:i/></w:rPr></w:pPr></w:p>"#,
+);
+
+fn mark_of(doc: &DocumentTree, i: u32) -> Option<SpanStyle> {
+    doc.nth_paragraph(i)
+        .and_then(|p| p.mark_style.as_deref().cloned())
+}
+
+fn with_mark(doc: &DocumentTree, i: u32, mark: SpanStyle) -> DocumentTree {
+    let mut out = doc.clone();
+    let mut blocks = out.blocks.clone();
+    if let Some(Block::Paragraph(p)) = blocks.get_mut(i as usize) {
+        p.mark_style = Some(Box::new(mark));
+        p.dirty = true;
+        p.source_xml = None;
+    }
+    out.blocks = blocks;
+    out
+}
+
+/// The reader models the mark (modeled children only); a zero-edit save
+/// is byte-identical, an edit of the paragraph's text keeps the verified
+/// source `<w:pPr>` (mark included) byte for byte, and typing into the
+/// empty paragraph comes out italic — through a save and a re-read.
+#[test]
+fn the_paragraph_mark_rpr_is_modeled_and_round_trips() {
+    let xml = document(MARK_BODY);
+    let parsed = read_docx(&package(STYLES_XML, &xml)).expect("read");
+    let doc = &parsed.document;
+    let m0 = mark_of(doc, 0).expect("mark read");
+    assert_eq!(m0.bold, Some(true));
+    assert_eq!(m0.color, Some([0xFF, 0, 0, 255]));
+    assert!(m0.grab_bag.is_none(), "<w:lang> stays in the pPr bag");
+    assert_eq!(mark_of(doc, 1).map(|m| m.italic), Some(Some(true)));
+
+    let bytes = write_docx(&parsed, doc).expect("write");
+    assert_eq!(document_xml_of(&bytes), xml, "zero-edit save");
+
+    let edited = doc.insert_text(at(0, 4), "er");
+    let bytes = write_docx(&parsed, &edited).expect("write edit");
+    let out = document_xml_of(&bytes);
+    assert_eq!(out, xml.replacen(">Bold<", ">Bolder<", 1), "pure insertion");
+
+    let typed = doc.insert_text(at(1, 0), "slanted");
+    let p = typed.nth_paragraph(1).unwrap();
+    assert_eq!(p.style_at(0).italic, Some(true), "typing inherits the mark");
+    let bytes = write_docx(&parsed, &typed).expect("write typed");
+    let back = read_docx(&bytes).expect("re-read");
+    let p = back.document.nth_paragraph(1).unwrap();
+    assert_eq!(p.text, "slanted");
+    assert_eq!(p.style_at(0).italic, Some(true));
+    assert_eq!(
+        mark_of(&back.document, 1).and_then(|m| m.italic),
+        Some(true)
+    );
+}
+
+/// A changed mark regenerates ONLY the mark `<w:rPr>`: the new modeled
+/// children, the unmodeled ones (`<w:lang>`) kept, an unchanged child in
+/// its source spelling (`w:themeColor` on `<w:color>`); the re-read mark
+/// is the new one. A mark with nothing left to say keeps only the
+/// unmodeled children.
+#[test]
+fn a_changed_mark_regenerates_the_mark_rpr_keeping_its_unmodeled_children() {
+    let parsed = read_docx(&package(STYLES_XML, &document(MARK_BODY))).expect("read");
+    let mut mark = mark_of(&parsed.document, 0).unwrap();
+    mark.italic = Some(true);
+    let changed = with_mark(&parsed.document, 0, mark);
+    let bytes = write_docx(&parsed, &changed).expect("write");
+    crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+    let out = document_xml_of(&bytes);
+    assert!(
+        out.contains(concat!(
+            r#"<w:pPr><w:jc w:val="center"/><w:rPr><w:b/><w:i/>"#,
+            r#"<w:color w:val="FF0000" w:themeColor="accent2"/><w:lang w:val="en-GB"/></w:rPr></w:pPr>"#
+        )),
+        "{out}"
+    );
+    let back = read_docx(&bytes).expect("re-read");
+    let m = mark_of(&back.document, 0).unwrap();
+    assert_eq!((m.bold, m.italic), (Some(true), Some(true)));
+
+    let plain = with_mark(&parsed.document, 0, SpanStyle::default());
+    let out = document_xml_of(&write_docx(&parsed, &plain).expect("write plain"));
+    assert!(
+        out.contains(
+            r#"<w:pPr><w:jc w:val="center"/><w:rPr><w:lang w:val="en-GB"/></w:rPr></w:pPr>"#
+        ),
+        "{out}"
+    );
+}
+
+/// Issue #293's headline case end to end: Enter at the end of a bold run in
+/// a paragraph WITHOUT a mark rPr gives the new paragraph a bold mark;
+/// the save spells it (`<w:pPr><w:rPr><w:b/></w:rPr></w:pPr>`) while the
+/// original paragraph keeps its bytes; the re-read types bold there.
+#[test]
+fn enter_after_a_bold_run_saves_a_bold_mark_on_the_new_paragraph() {
+    let body = r#"<w:p w14:paraId="55555555"><w:r><w:t xml:space="preserve">Hello </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>world</w:t></w:r></w:p>"#;
+    let parsed = read_docx(&package(STYLES_XML, &document(body))).expect("read");
+    assert_eq!(
+        mark_of(&parsed.document, 0),
+        None,
+        "no mark rPr in the source"
+    );
+    let split = parsed.document.split_paragraph(at(0, 11));
+    let bytes = write_docx(&parsed, &split).expect("write");
+    let out = document_xml_of(&bytes);
+    assert!(
+        out.contains(body),
+        "the original paragraph is untouched: {out}"
+    );
+    assert!(
+        out.contains("<w:p><w:pPr><w:rPr><w:b/></w:rPr></w:pPr>"),
+        "{out}"
+    );
+    let back = read_docx(&bytes).expect("re-read");
+    assert_eq!(mark_of(&back.document, 1).and_then(|m| m.bold), Some(true));
+    let typed = back.document.insert_text(at(1, 0), "next");
+    assert_eq!(typed.nth_paragraph(1).unwrap().style_at(0).bold, Some(true));
+}
+
+/// A tracked paragraph mark (#262) and a changed mark style regenerate
+/// together: the revision stays the rPr's first child.
+#[test]
+fn a_changed_mark_keeps_the_mark_revision_first() {
+    let body = concat!(
+        r#"<w:p><w:pPr><w:rPr><w:ins w:id="9" w:author="A" w:date="2026-01-01T00:00:00Z"/><w:b/></w:rPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>y</w:t></w:r></w:p>"#,
+    );
+    let parsed = read_docx(&package(STYLES_XML, &document(body))).expect("read");
+    let p0 = parsed.document.nth_paragraph(0).unwrap();
+    assert!(p0.mark_revision.is_some());
+    assert_eq!(
+        mark_of(&parsed.document, 0).and_then(|m| m.bold),
+        Some(true)
+    );
+    let italic = SpanStyle {
+        italic: Some(true),
+        ..Default::default()
+    };
+    let changed = with_mark(&parsed.document, 0, italic);
+    let out = document_xml_of(&write_docx(&parsed, &changed).expect("write"));
+    assert!(
+        out.contains(concat!(
+            r#"<w:pPr><w:rPr><w:ins w:id="9" w:author="A" w:date="2026-01-01T00:00:00Z"/>"#,
+            r#"<w:i/></w:rPr></w:pPr>"#
+        )),
+        "{out}"
+    );
+}
+
+/// An engine-authored tree (no source package: `build_minimal_docx`)
+/// writes the mark too, and an empty `<w:rPr/>` mark reads as an empty
+/// (`Some(default)`) mark that keeps its bytes through an edit.
+#[test]
+fn minimal_package_writes_the_mark_and_an_empty_mark_rpr_round_trips() {
+    let bold = SpanStyle {
+        bold: Some(true),
+        ..Default::default()
+    };
+    let d = DocumentTree::from_text("Hello world")
+        .apply_style(at(0, 6), at(0, 11), bold)
+        .split_paragraph(at(0, 11));
+    let bytes = build_minimal_docx(&d).expect("minimal");
+    let back = read_docx(&bytes).expect("re-read");
+    assert_eq!(mark_of(&back.document, 1).and_then(|m| m.bold), Some(true));
+
+    let xml = document(r#"<w:p><w:pPr><w:rPr/></w:pPr><w:r><w:t>z</w:t></w:r></w:p>"#);
+    let parsed = read_docx(&package(STYLES_XML, &xml)).expect("read");
+    assert_eq!(mark_of(&parsed.document, 0), Some(SpanStyle::default()));
+    let edited = parsed.document.insert_text(at(0, 1), "z");
+    let out = document_xml_of(&write_docx(&parsed, &edited).expect("write"));
+    assert_eq!(out, xml.replacen(">z<", ">zz<", 1));
+}
+

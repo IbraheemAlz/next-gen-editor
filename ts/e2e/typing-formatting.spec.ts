@@ -304,3 +304,46 @@ test('Backspace / Delete across the break after a heading keep the heading (#292
     expect(out.afterDelete, 'Delete keeps the heading').toBe('Heading1');
     expect(out.text.startsWith('TitleBody'), JSON.stringify(out.text)).toBe(true);
 });
+
+/* Issue #293 — Enter at the end of a bold run gives a new, empty paragraph
+ * whose MARK is bold (`<w:pPr><w:rPr><w:b/>`); typing there is bold, as in
+ * Word, and the toolbar previews it before the first keystroke. */
+test('Enter at the end of a bold run, then typing, is bold (#293)', async ({ page }) => {
+    await boot(page);
+    const out = await page.evaluate(async () => {
+        const dispatch = (window as any).__dispatch;
+        const pos = (idx: number, offset: number) => ({
+            path: { steps: [{ kind: 'BLOCK', idx }] },
+            offset,
+        });
+        const select = (idx: number, a: number, b: number) =>
+            dispatch({
+                type: 'SET_SELECTION',
+                range: { start: pos(idx, a), end: pos(idx, b) },
+                caret: pos(idx, b),
+            });
+        /* A fresh "Hello world" paragraph with "world" bold. */
+        await select(0, 0, 0);
+        await dispatch({ type: 'SPLIT_PARAGRAPH', at: undefined });
+        await select(0, 0, 0);
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Hello world' });
+        await select(0, 6, 11);
+        await dispatch({ type: 'APPLY_FORMATTING', range: undefined, attrs: { bold: true } });
+        await select(0, 11, 11);
+        await dispatch({ type: 'SPLIT_PARAGRAPH', at: undefined });
+        const preview = await select(1, 0, 0);
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Next' });
+        const typed = await select(1, 0, 4);
+        const first = await select(0, 0, 5);
+        return {
+            preview: preview.attrs_at_caret.bold as boolean,
+            typed: typed.attrs_at_caret.bold as boolean,
+            mixed: typed.attrs_mixed.bold as boolean,
+            hello: first.attrs_at_caret.bold as boolean,
+        };
+    });
+    expect(out.preview, 'the empty paragraph previews bold').toBe(true);
+    expect(out.typed, 'typed text is bold').toBe(true);
+    expect(out.mixed, 'all of it').toBe(false);
+    expect(out.hello, '"Hello" stays plain').toBe(false);
+});

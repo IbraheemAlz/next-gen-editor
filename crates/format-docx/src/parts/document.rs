@@ -16,7 +16,9 @@ use crate::parts::table::parse_table_bytes_with_warnings;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
-use crate::schema::ct_rpr::{apply_rpr, attr_val, fold_rpr_fragment, rpr_child_is_modeled};
+use crate::schema::ct_rpr::{
+    apply_rpr, attr_val, fold_rpr_fragment, mark_rpr_style, rpr_child_is_modeled,
+};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
@@ -1075,6 +1077,9 @@ pub fn parse_document_xml_with_warnings(
     /* Issue #262 — the tracked change on the paragraph mark
     (`<w:pPr><w:rPr><w:ins/>`), lifted out of the mark's rPr grab bag. */
     let mut para_mark_revision: Option<engine::Revision> = None;
+    /* Issue #293 — the paragraph mark's modeled run properties (the
+    `<w:pPr><w:rPr>` fragment the bag carries, folded). */
+    let mut para_mark_style: Option<Box<SpanStyle>> = None;
     /* Phase 4 — `<w:numPr>/<w:numId>` + `<w:ilvl>` accumulators. We don't
     inherit either field from a paragraph style here; that's a separate
     cascade source Phase 4 ships without modelling. */
@@ -1433,6 +1438,7 @@ pub fn parse_document_xml_with_warnings(
                         direct_ppr = ParaProperties::default();
                         pmark_rpr = SpanStyle::default();
                         para_mark_revision = None;
+                        para_mark_style = None;
                     }
                     b"w:r" => {
                         in_run = true;
@@ -1459,6 +1465,12 @@ pub fn parse_document_xml_with_warnings(
                             let (mark, frag) = split_mark_revision(frag);
                             if para_mark_revision.is_none() {
                                 para_mark_revision = mark;
+                            }
+                            /* Issue #293 — modeled only while the bag keeps
+                            the bytes it was folded from (the writer
+                            verifies the one against the other). */
+                            if bound_by_root(&frag, &ns) {
+                                para_mark_style = Some(Box::new(mark_rpr_style(&frag)));
                             }
                             stash(&mut direct_ppr.grab_bag, frag, &ns);
                         }
@@ -2092,6 +2104,9 @@ pub fn parse_document_xml_with_warnings(
                         still rides the bag (byte-stable regeneration). */
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            if bound_by_root(&frag, &ns) {
+                                para_mark_style = Some(Box::default());
+                            }
                             stash(&mut direct_ppr.grab_bag, frag, &ns);
                         }
                     }
@@ -2576,6 +2591,7 @@ pub fn parse_document_xml_with_warnings(
                             body_xml: envelopes.take_before(),
                             source_markup,
                             mark_revision: para_mark_revision.take(),
+                            mark_style: para_mark_style.take(),
                         }));
                         envelopes.note_block_end(p_end_byte);
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this
