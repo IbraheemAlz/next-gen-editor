@@ -15,6 +15,15 @@
  * The rail groups snapshot rows into threads on `parent_id`
  * (top-level = `parent_id` undefined/null) and renders replies
  * indented inside the parent card, ordered by id.
+ *
+ * Issue #254 — threads are listed in DOCUMENT order of their anchors
+ * (full `start_path`s: a comment inside a table cell sorts at its cell,
+ * not under the cell paragraph's index read as a top-level block), and a
+ * card's location button selects the commented text through the same
+ * path (`SET_SELECTION`), then asks the host to reveal it
+ * (`onNavigate`). The rail refetches on every document mutation
+ * (`PAINTED.mutation_seq`), so typing before an anchor keeps the listed
+ * position on the same text.
  */
 import {
     createEffect,
@@ -27,7 +36,11 @@ import {
 import {
     createEditorCommands,
     useEngine,
+    type BlockPath,
     type CommentSnapshot,
+    type LogicalPos,
+    type LogicalRange,
+    type PathStep,
 } from '@nge/core';
 import './CommentsRail.css';
 
@@ -37,6 +50,10 @@ export interface CommentsRailProps {
      *  `ReviewControlsProps.defaultAuthor`; falls back to the
      *  engine's own `"You"` default. */
     defaultAuthor?: string;
+    /** Issue #254 — called once a card's location button has moved the
+     *  editor selection onto the comment's anchored text; the host
+     *  scrolls it into view (the rail does not own the viewport). */
+    onNavigate?: (comment: CommentSnapshot) => void;
 }
 
 /** One top-level comment plus its replies (ordered by id). */
@@ -60,6 +77,45 @@ function authorInitials(author: string): string {
     if (!author) return '?';
     const parts = author.trim().split(/\s+/).slice(0, 2);
     return parts.map((p) => p[0]?.toUpperCase() ?? '').join('') || '?';
+}
+
+/** Issue #254 — the anchored range of a row: its full paths when the
+ *  engine reports them, else the flat index read as a top-level block
+ *  (implementations that pre-date the paths). */
+function anchorOf(c: CommentSnapshot): LogicalRange {
+    const pos = (path: BlockPath | undefined, block: number, offset: number): LogicalPos => ({
+        path: path ?? { steps: [{ kind: 'BLOCK', idx: block }] },
+        offset,
+    });
+    return {
+        start: pos(c.start_path, c.start_block, c.start_offset),
+        end: pos(c.end_path, c.end_block, c.end_offset),
+    };
+}
+
+function stepOrder(s: PathStep): [number, number] {
+    return s.kind === 'CELL' ? [s.row, s.col] : [s.idx, 0];
+}
+
+/** Document order of two positions: the paths depth-first (a block
+ *  index, then a cell's row and column), then the byte offset. */
+function comparePos(a: LogicalPos, b: LogicalPos): number {
+    const n = Math.min(a.path.steps.length, b.path.steps.length);
+    for (let i = 0; i < n; i++) {
+        const [x0, x1] = stepOrder(a.path.steps[i]!);
+        const [y0, y1] = stepOrder(b.path.steps[i]!);
+        if (x0 !== y0) return x0 - y0;
+        if (x1 !== y1) return x1 - y1;
+    }
+    return a.path.steps.length - b.path.steps.length || a.offset - b.offset;
+}
+
+/** Human-readable anchor position: `block 2 › cell 1,0 › block 0:6`. */
+function describePos(p: LogicalPos): string {
+    const steps = p.path.steps.map((s) =>
+        s.kind === 'CELL' ? `cell ${s.row},${s.col}` : `block ${s.idx}`,
+    );
+    return `${steps.join(' › ')}:${p.offset}`;
 }
 
 /** Group flat snapshot rows into threads. Top-level rows key their
@@ -92,7 +148,12 @@ function groupThreads(rows: CommentSnapshot[]): CommentThread[] {
         else threads.set(c.id, { root: c, replies: [] });
     }
     for (const t of threads.values()) t.replies.sort((a, b) => a.id - b.id);
-    return [...threads.values()];
+    /* Issue #254 — document order of the thread anchors. */
+    return [...threads.values()].sort(
+        (a, b) =>
+            comparePos(anchorOf(a.root).start, anchorOf(b.root).start) ||
+            a.root.id - b.root.id,
+    );
 }
 
 export const CommentsRail: Component<CommentsRailProps> = (props) => {
@@ -104,6 +165,8 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
      * top-level comment id it replies to. */
     const [replyFor, setReplyFor] = createSignal<number | null>(null);
     const [replyText, setReplyText] = createSignal('');
+    /* Issue #254 — the thread whose anchor the selection was moved to. */
+    const [activeId, setActiveId] = createSignal<number | null>(null);
 
     const threads = () => groupThreads(comments());
 
@@ -114,6 +177,15 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
     const toggleResolved = async (c: CommentSnapshot) => {
         await cmd.resolveComment(c.id, !c.resolved);
         await refresh();
+    };
+    /* Issue #254 — select the commented text through its full anchor
+     * path (a cell comment lands in its cell), then let the host reveal
+     * it. Focus stays in the rail: typing must not replace the text. */
+    const goTo = async (c: CommentSnapshot) => {
+        const range = anchorOf(c);
+        await cmd.setSelection(range, range.end);
+        setActiveId(c.id);
+        props.onNavigate?.(c);
     };
     const toggleReplyDraft = (id: number) => {
         setReplyText('');
@@ -154,10 +226,24 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
 
     void refresh();
 
+    /* Issue #254 / #266 — refetch on every document mutation, not only on
+       load: a comment added from the toolbar must appear, and typing
+       before an anchor moves its listed offset. `PAINTED.mutation_seq`
+       moves exactly when the document changed (never on caret moves or
+       view commands); a plain closure variable, read only in the
+       callback, so nothing reactive re-subscribes. */
+    let lastMutationSeq: number | null = null;
     createEffect(() => {
         const unsub = engine.subscribe((evt) => {
             if (evt.type === 'DOCUMENT_LOADED' || evt.type === 'RECOVERED') {
+                setActiveId(null);
                 void refresh();
+            } else if (evt.type === 'PAINTED') {
+                const seq = evt.mutation_seq ?? null;
+                if (lastMutationSeq !== null && seq !== lastMutationSeq) {
+                    void refresh();
+                }
+                lastMutationSeq = seq;
             }
         });
         onCleanup(unsub);
@@ -182,8 +268,9 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                     <For each={threads()}>
                         {(t) => (
                             <li
-                                class={`nge-cm__card ${t.root.resolved ? 'nge-cm__card--resolved' : ''}`}
+                                class={`nge-cm__card ${t.root.resolved ? 'nge-cm__card--resolved' : ''} ${activeId() === t.root.id ? 'nge-cm__card--active' : ''}`}
                                 data-comment-id={t.root.id}
+                                data-anchor={describePos(anchorOf(t.root).start)}
                             >
                                 <div class="nge-cm__card-head">
                                     <div
@@ -202,11 +289,17 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                                 </div>
                                 <p class="nge-cm__text">{t.root.text}</p>
                                 <div class="nge-cm__loc">
-                                    <span>
-                                        block {t.root.start_block}:{t.root.start_offset}
+                                    <button
+                                        class="nge-cm__goto"
+                                        type="button"
+                                        aria-label="Go to comment"
+                                        title="Select the commented text"
+                                        onClick={() => void goTo(t.root)}
+                                    >
+                                        {describePos(anchorOf(t.root).start)}
                                         {' → '}
-                                        block {t.root.end_block}:{t.root.end_offset}
-                                    </span>
+                                        {describePos(anchorOf(t.root).end)}
+                                    </button>
                                 </div>
                                 <Show when={t.replies.length > 0}>
                                     <ul class="nge-cm__replies">

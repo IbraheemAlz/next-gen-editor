@@ -7,6 +7,9 @@
  * `crates/bridge/src/command.rs` — the generated TS shapes live in
  * `crates/engine-wasm/pkg/engine_wasm.d.ts`. Add new methods here when
  * the bridge grows; do not let downstream UI assemble raw Command objects.
+ * Issue #338 — and classify the method in `facadeMap.ts`: its tsc-checked
+ * maps refuse a method that dispatches a command the engine only stubs
+ * (`StubCommandType`, generated from `crates/bridge/src/meta.rs`).
  *
  * tsify-next renders `Option<T>` as `T | undefined`. With
  * `exactOptionalPropertyTypes: true` every field must be set explicitly,
@@ -54,6 +57,25 @@ import type {
     ListKind,
     BridgeStyleProperties,
 } from './types';
+import type { LiveCommand } from './facadeMap';
+
+/** Issue #339 — the `DocFormat` a file opens as, from its name: `.txt` →
+ *  `plain_text`, `.html` / `.htm` / `.xhtml` → `html`, anything else (and no
+ *  name) → `docx`. PDF is an export-only format and never inferred. */
+export function docFormatForFileName(name: string | undefined): DocFormat {
+    const ext = name?.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+    switch (ext) {
+        case 'txt':
+        case 'text':
+            return 'plain_text';
+        case 'html':
+        case 'htm':
+        case 'xhtml':
+            return 'html';
+        default:
+            return 'docx';
+    }
+}
 
 /** Sprint 12 (#11) — paragraph style id. The engine now models real
  *  `<w:styles>` entries on `DocumentTree.styles`; `cmd.applyStyle`
@@ -470,8 +492,14 @@ export interface EditorCommands {
     setPageOrientationAtCaret(orientation: PageOrientation): Promise<Event>;
 
     /* I/O */
-    /** Open a `.docx` byte buffer (passed zero-copy as a Transferable).
-     *  Engine ships only `Docx`; HTML / PlainText return error events.
+    /** Open a document byte buffer (passed zero-copy as a Transferable).
+     *  Issue #339 — `.docx`, plain text and HTML are all engine-real:
+     *  `opts.format` picks the format, else it is inferred from `name`
+     *  (`docFormatForFileName`: `.txt` → plain text, `.html`/`.htm` → HTML,
+     *  otherwise `.docx`). Plain text opens one paragraph per line (UTF-8,
+     *  UTF-16 with a BOM); HTML goes through the rich-paste parser (`dir`
+     *  honoured, tables kept); paragraphs without a declared direction get
+     *  their first-strong one, so Arabic opens RTL.
      *  Issue #239 — `opts.initialZoom`, when given, dispatches `SET_ZOOM`
      *  before `OPEN_DOCUMENT` so a host can request a starting zoom from
      *  this one call; the engine queues it even if no `RenderPage` has
@@ -486,7 +514,7 @@ export interface EditorCommands {
     openDocument(
         bytes: Uint8Array,
         name?: string,
-        opts?: { initialZoom?: number; defaults?: DocumentDefaults },
+        opts?: { initialZoom?: number; defaults?: DocumentDefaults; format?: DocFormat },
     ): Promise<Event>;
     saveDocument(format: DocFormat): Promise<Event>;
     saveDocx(): Promise<Event>;
@@ -494,11 +522,16 @@ export interface EditorCommands {
      *  accessible PDF/UA-1 export (on a PDF/A-2u base; `A2u` itself stays
      *  untagged). */
     exportPdf(conformance: PdfConformance): Promise<Event>;
-    /** Engine-pending — dispatches but engine returns
-     *  `Event::Error` until a Core Engine HTML serializer ships. */
+    /** `SaveDocument { format: 'html' }` — `crates/format-html` (Sprint 9). */
     exportHtml(): Promise<Event>;
-    /** Engine-pending — same status as [`exportHtml`]. */
+    /** `SaveDocument { format: 'plain_text' }` — `DocumentTree::to_plain_text`. */
     exportPlainText(): Promise<Event>;
+    /** Issue #338 — back to the seeded empty document: selection, undo
+     *  history, comments, revisions, media, the retained `.docx` source
+     *  package and the document name are cleared (fonts, zoom and the
+     *  review identity survive). Answers `SELECTION_CHANGED`; the worker
+     *  then broadcasts the accessibility delta + `PAINTED` and pins the
+     *  next event-log snapshot as the new document's base. */
     closeDocument(): Promise<Event>;
 
     /* Clipboard */
@@ -509,8 +542,10 @@ export interface EditorCommands {
     pastePlain(text: string): Promise<Event>;
     pasteHtml(html: string): Promise<Event>;
 
-    /* Escape hatch — for commands not yet covered above. */
-    raw(cmd: Command, transfer?: Transferable[]): Promise<Event>;
+    /* Escape hatch — for commands not yet covered above. Issue #338 — typed
+     * over LIVE commands only: a command the engine merely stubs does not
+     * type-check here either. */
+    raw(cmd: LiveCommand, transfer?: Transferable[]): Promise<Event>;
 }
 
 function build(
@@ -953,13 +988,14 @@ function build(
                set to `undefined` (see `getSelectionAsClipboard` above for
                the same pattern with `include_docx`). */
             const defaults = opts?.defaults ?? documentDefaults;
+            const format = opts?.format ?? docFormatForFileName(name);
             return dispatch(
                 defaults === undefined
-                    ? { type: 'OPEN_DOCUMENT', bytes, format: 'docx', name: name ?? undefined }
+                    ? { type: 'OPEN_DOCUMENT', bytes, format, name: name ?? undefined }
                     : {
                           type: 'OPEN_DOCUMENT',
                           bytes,
-                          format: 'docx',
+                          format,
                           name: name ?? undefined,
                           defaults,
                       },

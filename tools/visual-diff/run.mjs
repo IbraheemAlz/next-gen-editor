@@ -64,6 +64,7 @@ const VIEWPORTS = {
     'autofit-long-url-overflow': { width: 595, height: 842 },
     'list-bullet-numbered': { width: 595, height: 842 },
     'rich-text-caps': { width: 595, height: 842 },
+    'theme-fonts': { width: 1190, height: 360 },
 };
 function viewportFor(name) {
     if (process.env.VIEWPORT) {

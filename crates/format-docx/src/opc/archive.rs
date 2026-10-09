@@ -37,7 +37,13 @@ pub const FOOTNOTES_XML: &str = "word/footnotes.xml";
 pub const ENDNOTES_XML: &str = "word/endnotes.xml";
 pub const COMMENTS_XML: &str = "word/comments.xml";
 pub const COMMENTS_EXTENDED_XML: &str = "word/commentsExtended.xml";
+/// Issue #282 — Word 2019+ comment side parts keyed by paraId / durable id.
+pub const COMMENTS_IDS_XML: &str = "word/commentsIds.xml";
+pub const COMMENTS_EXTENSIBLE_XML: &str = "word/commentsExtensible.xml";
 pub const SETTINGS_XML: &str = "word/settings.xml";
+/// Issue #355 — where Word puts the theme (`a:theme`); read-only (font +
+/// colour schemes), always passthrough.
+pub const THEME_XML: &str = "word/theme/theme1.xml";
 /// Issue #77 — OPC core properties; `<dc:creator>` feeds the `AUTHOR`
 /// field. Passthrough-only (never regenerated).
 pub const CORE_PROPS_XML: &str = "docProps/core.xml";
@@ -664,17 +670,26 @@ fn read_docx_scoped(
     /* Phase 2 audit — `word/settings.xml` rides `other_entries`
     verbatim for round-trip; the typed read just lifts the
     `even_and_odd_headers` toggle the paginator needs. */
-    if let Some(bytes) = other_entries
+    let settings_part = other_entries
         .iter()
         .find(|(n, _)| *n == part_names.settings)
-        .map(|(_, b)| b.as_slice())
-        && let Ok(settings) = crate::parts::settings::parse_settings_xml(bytes)
-    {
+        .and_then(|(_, b)| crate::parts::settings::parse_settings_xml(b).ok());
+    if let Some(settings) = &settings_part {
         document.settings.even_and_odd_headers = settings.even_and_odd_headers;
         /* Issue #80 — document-level note properties. */
         document.footnote_props = settings.footnote_props;
         document.endnote_props = settings.endnote_props;
     }
+
+    /* Issue #355 — the theme part rides `other_entries` verbatim; the
+    typed read (+ the settings that select into it) feeds theme-font and
+    theme-colour resolution at layout time. */
+    document.theme = crate::parts::theme::read_document_theme(
+        &other_entries,
+        &part_names.theme,
+        settings_part.as_ref(),
+    )
+    .map(std::sync::Arc::new);
 
     /* Issue #77 — `docProps/core.xml` rides `other_entries` verbatim;
     the typed read lifts `<dc:creator>` so `AUTHOR` fields resolve. */

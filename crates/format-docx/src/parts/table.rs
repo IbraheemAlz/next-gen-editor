@@ -13,7 +13,7 @@
 //! render can paint correctly, never for write-back at PR 2.
 
 use crate::error::{DocxError, DocxWarning};
-use crate::parts::document::is_block_level_marker;
+use crate::parts::document::{CommentEvent, is_block_level_marker};
 use crate::schema::block_envelope::{BlockEnvelopes, PassthroughSlot};
 use crate::schema::ct_ppr::parse_jc;
 use crate::schema::ct_rpr::{attr_val, parse_hex_color, toggle_on};
@@ -78,7 +78,14 @@ pub fn parse_table_bytes(
     ns: &NamespaceScope,
 ) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
     let mut warnings = Vec::new();
-    let t = parse_table_bytes_at(xml, resolver, ns, 0, &mut warnings)?;
+    let t = parse_table_bytes_at(
+        xml,
+        resolver,
+        ns,
+        0,
+        &mut warnings,
+        &mut CommentSink::default(),
+    )?;
     Ok((t.grid, t.props, t.rows))
 }
 
@@ -120,7 +127,97 @@ pub fn parse_table_bytes_with_warnings(
     ns: &NamespaceScope,
     warnings: &mut Vec<DocxWarning>,
 ) -> Result<ParsedTable, DocxError> {
-    parse_table_bytes_at(xml, resolver, ns, 0, warnings)
+    parse_table_bytes_at(xml, resolver, ns, 0, warnings, &mut CommentSink::default())
+}
+
+/// Issue #284 — [`parse_table_bytes_with_warnings`], appending every
+/// comment anchor piece inside the table (cell paragraphs, nested tables,
+/// markers between cell blocks) to `sink`, in document order, with its
+/// full path (`sink`'s prefix — the table's own path — first).
+pub(crate) fn parse_table_bytes_with_events(
+    xml: &[u8],
+    resolver: &crate::style_resolver::StyleResolver<'_>,
+    ns: &NamespaceScope,
+    warnings: &mut Vec<DocxWarning>,
+    sink: &mut CommentSink,
+) -> Result<ParsedTable, DocxError> {
+    parse_table_bytes_at(xml, resolver, ns, 0, warnings, sink)
+}
+
+/// Issue #284 — where a table walk records comment anchor pieces: the
+/// pieces so far plus the path prefix of the table being walked (the
+/// outer table's path, then each nested table's `Cell` + `Block` steps).
+/// Its bookkeeping stays out of line — the walk's frame recurses once
+/// per nesting level.
+#[derive(Debug, Default)]
+pub(crate) struct CommentSink {
+    pub events: Vec<CommentEvent>,
+    prefix: Vec<engine::PathStep>,
+}
+
+impl CommentSink {
+    /// A sink for a table at `path`.
+    pub(crate) fn rooted(path: Vec<engine::PathStep>) -> Self {
+        Self {
+            events: Vec::new(),
+            prefix: path,
+        }
+    }
+
+    /// `local` (a path in the table whose prefix is `base` steps long) as
+    /// a full path.
+    fn path(&mut self, base: usize, local: [engine::PathStep; 2]) -> engine::BlockPath {
+        self.prefix.truncate(base);
+        let mut steps = self.prefix.clone();
+        steps.extend(local);
+        engine::BlockPath { steps }
+    }
+
+    /// The pieces of a re-parsed cell paragraph (paths `top(0)`) at
+    /// `local`, its path in the table being walked.
+    #[inline(never)]
+    fn paragraph(&mut self, found: Vec<CommentEvent>, base: usize, local: [engine::PathStep; 2]) {
+        let path = self.path(base, local);
+        self.events
+            .extend(found.into_iter().map(|e| e.under_block(&path.steps)));
+    }
+
+    /// The sink for a nested table at `local` in the table being walked
+    /// (no matching "leave": every use truncates back to its own base).
+    #[inline(never)]
+    fn enter(&mut self, base: usize, local: [engine::PathStep; 2]) -> &mut Self {
+        self.prefix.truncate(base);
+        self.prefix.extend(local);
+        self
+    }
+
+    /// A `<w:commentRangeStart/>` / `<w:commentRangeEnd/>` between two
+    /// cell blocks, cells or rows marks offset 0 of whatever follows (the
+    /// body parser's block-level rule).
+    #[inline(never)]
+    fn block_level_marker(
+        &mut self,
+        base: usize,
+        e: &BytesStart,
+        rows: &[TableRow],
+        cur_row: &Option<TableRow>,
+        cur_cell: Option<&TableCell>,
+    ) {
+        let kind = match e.name().as_ref() {
+            b"w:commentRangeStart" => engine::CommentAnchorKind::RangeStart,
+            b"w:commentRangeEnd" => engine::CommentAnchorKind::RangeEnd,
+            _ => return,
+        };
+        let Some(id) = attr_val(e, b"w:id").and_then(|v| v.trim().parse().ok()) else {
+            return;
+        };
+        let path = self.path(base, cell_block_at(rows, cur_row, cur_cell));
+        self.events.push(CommentEvent {
+            kind,
+            id,
+            pos: engine::LogicalPos::new(path, 0),
+        });
+    }
 }
 
 /// Issue #248 — a table property element (`<w:tblPr>`, `<w:tblGrid>`,
@@ -186,7 +283,11 @@ fn parse_table_bytes_at(
     ns: &NamespaceScope,
     depth: u32,
     warnings: &mut Vec<DocxWarning>,
+    sink: &mut CommentSink,
 ) -> Result<ParsedTable, DocxError> {
+    /* Issue #284 — this table's path prefix in `sink` (a nested walk
+    extends it; every use here truncates back to it first). */
+    let sink_base = sink.prefix.len();
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -469,7 +570,8 @@ fn parse_table_bytes_at(
                     if let Some(raw) = slice_element(xml, prev_pos, end_pos, b"w:p")
                         && let Some(cell) = cur_cell.as_mut()
                     {
-                        let mut p = parse_cell_paragraph(&raw, resolver, ns);
+                        let at = cell_block_at(&rows, &cur_row, Some(cell));
+                        let mut p = parse_cell_paragraph(&raw, resolver, ns, sink, sink_base, at);
                         p.body_xml = cell_env.take_before();
                         cell.blocks.push(Block::Paragraph(p));
                         cell_env.note_block_end(end_pos);
@@ -518,7 +620,19 @@ fn parse_table_bytes_at(
                     }
                     _ => {}
                 }
-                if (at_cell_level || row_level || table_level) && is_block_level_marker(&name) {
+                /* Issue #284 — a comment range marker between two cell
+                blocks (or cells, or rows): an anchor at offset 0 of what
+                follows, its bytes kept like any other block-level marker. */
+                if at_cell_level || row_level || table_level {
+                    sink.block_level_marker(sink_base, &e, &rows, &cur_row, cur_cell.as_ref());
+                }
+                if (at_cell_level || row_level || table_level)
+                    && (is_block_level_marker(&name)
+                        || matches!(
+                            name.as_slice(),
+                            b"w:commentRangeStart" | b"w:commentRangeEnd"
+                        ))
+                {
                     /* Issue #120 — a marker between two cell blocks; issue
                     #248 — between two cells of a row, or two rows. */
                     if let Some(frag) = slice_fragment(xml, prev_pos, end_pos) {
@@ -578,17 +692,27 @@ fn parse_table_bytes_at(
                                     warnings.push(DocxWarning::TableNestingTooDeep {
                                         limit: MAX_TABLE_NESTING_DEPTH,
                                     });
-                                    cell.blocks.push(Block::Table(
-                                        ParsedTable::default()
-                                            .into_table(Some(raw), cell_env.take_before()),
-                                    ));
+                                    push_nested_table(
+                                        cell,
+                                        ParsedTable::default(),
+                                        raw,
+                                        cell_env.take_before(),
+                                    );
                                     cell_env.note_block_end(end_pos);
-                                } else if let Ok(parsed) =
-                                    parse_table_bytes_at(&raw, resolver, ns, depth + 1, warnings)
-                                {
-                                    cell.blocks.push(Block::Table(
-                                        parsed.into_table(Some(raw), cell_env.take_before()),
-                                    ));
+                                } else if let Ok(parsed) = parse_table_bytes_at(
+                                    &raw,
+                                    resolver,
+                                    ns,
+                                    depth + 1,
+                                    warnings,
+                                    /* Issue #284 — its comment pieces land
+                                    under its path in this table. */
+                                    sink.enter(
+                                        sink_base,
+                                        cell_block_at(&rows, &cur_row, Some(cell)),
+                                    ),
+                                ) {
+                                    push_nested_table(cell, parsed, raw, cell_env.take_before());
                                     cell_env.note_block_end(end_pos);
                                 }
                             }
@@ -717,7 +841,9 @@ fn parse_table_bytes_at(
                                 /* Issue #101 — cell paragraphs parse
                                 through the body run parser (runs, rPr
                                 grab bags, pictures, source bytes). */
-                                let mut p = parse_cell_paragraph(&raw, resolver, ns);
+                                let at = cell_block_at(&rows, &cur_row, Some(cell));
+                                let mut p =
+                                    parse_cell_paragraph(&raw, resolver, ns, sink, sink_base, at);
                                 p.body_xml = cell_env.take_before();
                                 cell.blocks.push(Block::Paragraph(p));
                                 cell_env.note_block_end(end_pos);
@@ -815,12 +941,16 @@ fn record_tbl_pr_ex(
 /// the paragraph to one unstyled run and dropped `<w:drawing>` pictures.
 ///
 /// Body-only state is discarded: a cell paragraph can never end a
-/// document section (`section_end`), and comment ranges stay
-/// body-paragraph-only as before.
+/// document section (`section_end`). Issue #284 — its comment anchor
+/// pieces go to `sink` at `at` (the paragraph's `Cell` step and block
+/// index in the table being walked).
 fn parse_cell_paragraph(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
     ns: &NamespaceScope,
+    sink: &mut CommentSink,
+    sink_base: usize,
+    at: [engine::PathStep; 2],
 ) -> engine::Paragraph {
     let mut wrapped: Vec<u8> = Vec::with_capacity(xml.len() + 256);
     wrapped.extend_from_slice(b"<w:document");
@@ -848,15 +978,22 @@ fn parse_cell_paragraph(
     wrapped.extend_from_slice(xml);
     wrapped.extend_from_slice(b"</w:body></w:document>");
 
-    let parsed = crate::parts::document::parse_document_xml(&wrapped, resolver)
-        .ok()
-        .and_then(|tree| match tree.blocks.front() {
-            Some(Block::Paragraph(p)) => Some(p.clone()),
-            _ => None,
-        });
+    let mut warnings = Vec::new();
+    let parsed = crate::parts::document::parse_document_xml_with_events(
+        &wrapped,
+        resolver,
+        &mut warnings,
+        engine::PageGeometry::default(),
+    )
+    .ok()
+    .and_then(|(tree, events)| match tree.blocks.front() {
+        Some(Block::Paragraph(p)) => Some((p.clone(), events)),
+        _ => None,
+    });
     match parsed {
-        Some(mut p) => {
+        Some((mut p, found)) => {
             p.section_end = None;
+            sink.paragraph(found, sink_base, at);
             p
         }
         /* The slice already parsed once inside the table walk, so this is
@@ -867,6 +1004,38 @@ fn parse_cell_paragraph(
             ..Default::default()
         },
     }
+}
+
+/// Push a nested table onto `cell` (out of line, issue #284: the
+/// `Table` / `Block` temporaries stay off the walk's recursive frame —
+/// one per nesting level, on a debug build's bounded test stack).
+#[inline(never)]
+fn push_nested_table(
+    cell: &mut TableCell,
+    parsed: ParsedTable,
+    raw: Vec<u8>,
+    before: Option<Box<engine::BodyPassthrough>>,
+) {
+    cell.blocks
+        .push(Block::Table(parsed.into_table(Some(raw), before)));
+}
+
+/// Issue #284 — the path (relative to the table being walked) of what the
+/// walk meets next: the `Cell` step of the cell being read (the row /
+/// column index it gets once pushed; between cells / rows, the next one)
+/// and the index of the cell's next block.
+fn cell_block_at(
+    rows: &[TableRow],
+    cur_row: &Option<TableRow>,
+    cell: Option<&TableCell>,
+) -> [engine::PathStep; 2] {
+    [
+        engine::PathStep::Cell {
+            row: rows.len() as u32,
+            col: cur_row.as_ref().map_or(0, |r| r.cells.len() as u32),
+        },
+        engine::PathStep::Block(cell.map_or(0, |c| c.blocks.len() as u32)),
+    ]
 }
 
 fn handle_property_start(

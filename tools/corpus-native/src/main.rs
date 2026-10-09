@@ -453,6 +453,14 @@ fn main() -> ExitCode {
     that still rewrites source bytes (tracked against issues #242-#249). */
     let mut fidelity_ok_count = 0usize;
     let mut secondary_bound_violations = 0usize;
+    /* Issue #282 — a comment added to an untouched paragraph / a source
+    comment deleted. */
+    let mut comment_checked = 0usize;
+    let mut comment_insert_pure = 0usize;
+    let mut comment_insert_anchored = 0usize;
+    let mut comment_delete_checked = 0usize;
+    let mut comment_delete_pure = 0usize;
+    let mut comment_delete_clean = 0usize;
     let mut rewrite_causes: std::collections::BTreeMap<String, (usize, String, u64)> =
         std::collections::BTreeMap::new();
     /* Issue #318 — production-layout timings `(ms, label)`, the
@@ -460,6 +468,15 @@ fn main() -> ExitCode {
     let mut engine_times: Vec<(u128, String)> = Vec::new();
     let mut engine_over_budget: Vec<String> = Vec::new();
     let mut engine_reasons: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    /* Issue #355 — theme-font resolution: documents with a theme part,
+    documents with at least one run whose face now comes from the theme
+    where it previously fell back, and those runs. */
+    let mut themed_docs = 0usize;
+    let mut theme_resolving_docs = 0usize;
+    let mut theme_resolved_runs = 0u64;
+    let mut theme_runs = 0u64;
+    let mut theme_faces: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for (i, path) in files.iter().enumerate() {
         let label = path
@@ -524,6 +541,30 @@ fn main() -> ExitCode {
             pure_tracked += usize::from(ec.tracked_source_bytes_rewritten == Some(0));
             stale_plain += usize::from(ec.markup_in_step == Some(false));
             stale_tracked += usize::from(ec.tracked_markup_in_step == Some(false));
+        }
+
+        if let Some(cc) = &rec.comment_check {
+            if cc.insert_block.is_some() {
+                comment_checked += 1;
+                comment_insert_pure += usize::from(cc.insert_pure_insertion == Some(true));
+                comment_insert_anchored += usize::from(cc.insert_anchored == Some(true));
+            }
+            if cc.delete_id.is_some() {
+                comment_delete_checked += 1;
+                comment_delete_pure += usize::from(cc.delete_pure_deletion == Some(true));
+                comment_delete_clean +=
+                    usize::from(cc.delete_anchors_left == Some(0) && cc.delete_gone == Some(true));
+            }
+        }
+
+        if let Some(t) = &rec.theme_fonts {
+            themed_docs += usize::from(t.has_theme);
+            theme_resolving_docs += usize::from(t.newly_resolved > 0);
+            theme_resolved_runs += t.newly_resolved;
+            theme_runs += t.runs;
+            for face in &t.faces {
+                *theme_faces.entry(face.clone()).or_insert(0) += 1;
+            }
         }
 
         if let Some(identical) = rec.ui_save_siblings_identical {
@@ -613,6 +654,12 @@ fn main() -> ExitCode {
         "[corpus-native] scripted-edit secondary size bound (<=2xN + new-run allowance) \
          violated: {secondary_bound_violations}/{edit_checked}"
     );
+    println!(
+        "[corpus-native] comment added to an untouched paragraph (#282): pure insertion \
+         {comment_insert_pure}/{comment_checked}, re-read anchored {comment_insert_anchored}/{comment_checked}; \
+         source comment deleted: pure deletion {comment_delete_pure}/{comment_delete_checked}, \
+         no anchor or body left {comment_delete_clean}/{comment_delete_checked}"
+    );
     if !rewrite_causes.is_empty() {
         let mut buckets: Vec<(&String, &(usize, String, u64))> = rewrite_causes.iter().collect();
         buckets.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
@@ -625,6 +672,18 @@ fn main() -> ExitCode {
                 "[corpus-native]   {count:5}  {cause:<14} e.g. {example_path} ({example_bytes} B)"
             );
         }
+    }
+    println!(
+        "[corpus-native] theme fonts (#355): {theme_resolving_docs}/{} documents resolve a theme \
+         font where they previously fell back ({theme_resolved_runs}/{theme_runs} runs); \
+         {themed_docs} carry a theme part",
+        files.len()
+    );
+    if !theme_faces.is_empty() {
+        let mut faces: Vec<(&String, &usize)> = theme_faces.iter().collect();
+        faces.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let list: Vec<String> = faces.iter().map(|(f, n)| format!("{f} ({n})")).collect();
+        println!("[corpus-native]   theme faces (docs): {}", list.join(", "));
     }
     /* Issue #318 — the production layout's cost and degradations. */
     if args.engine.enabled {

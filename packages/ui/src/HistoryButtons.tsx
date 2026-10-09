@@ -21,6 +21,7 @@ export const HistoryButtons: Component = () => {
                 aria-label="Undo"
                 title="Undo (Ctrl+Z)"
                 disabled={!state.canUndo()}
+                data-nge-command="UNDO"
                 onClick={() => void cmd.undo()}
             >
                 ↶
@@ -31,6 +32,7 @@ export const HistoryButtons: Component = () => {
                 aria-label="Redo"
                 title="Redo (Ctrl+Y)"
                 disabled={!state.canRedo()}
+                data-nge-command="REDO"
                 onClick={() => void cmd.redo()}
             >
                 ↷

@@ -123,6 +123,7 @@ fn image_page(stack: &FontStack) -> PageBox {
         strike: false,
         bg_color: None,
         font_family: None,
+        font_family_cs: None,
         caps_transform: false,
         baseline_shift_px: 0.0,
     };
@@ -589,6 +590,7 @@ fn image_free_documents_are_byte_identical() {
                 strike: false,
                 bg_color: None,
                 font_family: None,
+                font_family_cs: None,
                 caps_transform: false,
                 baseline_shift_px: 0.0,
             }],

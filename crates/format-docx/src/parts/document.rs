@@ -12,7 +12,7 @@
 //!   optimisation; zero document.xml drift on untouched paragraphs).
 
 use crate::error::{DocxError, DocxWarning};
-use crate::parts::table::parse_table_bytes_with_warnings;
+use crate::parts::table::parse_table_bytes_with_events;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
@@ -1208,6 +1208,129 @@ fn parse_document_xml_inner(
     warnings: &mut Vec<DocxWarning>,
     default_page_geometry: PageGeometry,
 ) -> Result<DocumentTree, DocxError> {
+    parse_document_xml_with_events(xml, resolver, warnings, default_page_geometry)
+        .map(|(tree, _)| tree)
+}
+
+/// Issues #282 / #284 — one comment anchor piece the reader met: a
+/// `<w:commentRangeStart/>` / `<w:commentRangeEnd/>` or a run holding
+/// `<w:commentReference/>`, at the logical position it marks (a range
+/// marker BETWEEN two blocks marks offset 0 of the following block, as
+/// it always did).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommentEvent {
+    pub kind: engine::CommentAnchorKind,
+    pub id: u32,
+    pub pos: engine::LogicalPos,
+}
+
+impl CommentEvent {
+    /// Issue #284 — an event of a lone re-parsed paragraph (path
+    /// `top(0)`) moved to `at`, the paragraph's real path.
+    pub(crate) fn under_block(mut self, at: &[engine::PathStep]) -> Self {
+        self.pos.path.steps = at.to_vec();
+        self
+    }
+}
+
+/// Pair range starts and ends (document order) into
+/// [`engine::CommentRange`]s: an end closes the latest start of its id;
+/// an unpaired piece is no range (its bytes still ride the passthrough).
+pub(crate) fn pair_comment_events(events: &[CommentEvent]) -> Vec<engine::CommentRange> {
+    let mut open: std::collections::HashMap<u32, &engine::LogicalPos> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for e in events {
+        match e.kind {
+            engine::CommentAnchorKind::RangeStart => {
+                open.insert(e.id, &e.pos);
+            }
+            engine::CommentAnchorKind::RangeEnd => {
+                if let Some(start) = open.remove(&e.id) {
+                    out.push(engine::CommentRange {
+                        id: e.id,
+                        start: start.clone(),
+                        end: e.pos.clone(),
+                    });
+                }
+            }
+            engine::CommentAnchorKind::Reference => {}
+        }
+    }
+    out
+}
+
+/// Issue #282 — re-read ONE paragraph's bytes (`<w:p>…</w:p>`, as the
+/// writer would emit them) the way the body parser reads it: re-rooted
+/// under a `<w:document>` declaring `root_attrs` (the source root's
+/// attributes, so root-bound prefixes resolve), with no style table. The
+/// paragraph and its comment anchor pieces (paths `top(0)`); `None` when
+/// the bytes do not parse as exactly one paragraph.
+pub(crate) fn reparse_paragraph(
+    xml: &[u8],
+    root_attrs: &[(String, String)],
+) -> Option<(engine::Paragraph, Vec<CommentEvent>)> {
+    match reparse_block(xml, root_attrs)? {
+        (Block::Paragraph(p), events) => Some((p, events)),
+        _ => None,
+    }
+}
+
+/// [`reparse_paragraph`] for one block of either kind — a `<w:tbl>`'s
+/// pieces carry their full paths under `top(0)` (issue #284). `None` when
+/// the bytes do not parse as exactly one block.
+pub(crate) fn reparse_block(
+    xml: &[u8],
+    root_attrs: &[(String, String)],
+) -> Option<(Block, Vec<CommentEvent>)> {
+    let mut wrapped: Vec<u8> = Vec::with_capacity(xml.len() + 512);
+    wrapped.extend_from_slice(b"<w:document");
+    if !root_attrs.iter().any(|(k, _)| k == "xmlns:w") {
+        wrapped.extend_from_slice(b" xmlns:w=\"");
+        wrapped.extend_from_slice(crate::schema::NS_W.as_bytes());
+        wrapped.push(b'"');
+    }
+    /* The namespace declarations and (issue #351) `mc:Ignorable`, so the
+    re-read selects the same `mc:AlternateContent` branches. */
+    for (k, v) in root_attrs
+        .iter()
+        .filter(|(k, _)| k.starts_with("xmlns") || k.ends_with(":Ignorable"))
+    {
+        wrapped.push(b' ');
+        wrapped.extend_from_slice(k.as_bytes());
+        wrapped.extend_from_slice(b"=\"");
+        wrapped.extend_from_slice(v.as_bytes());
+        wrapped.push(b'"');
+    }
+    wrapped.extend_from_slice(b"><w:body>");
+    wrapped.extend_from_slice(xml);
+    wrapped.extend_from_slice(b"</w:body></w:document>");
+    let table = crate::parts::styles::StyleTable::default();
+    let resolver = StyleResolver::new(&table);
+    let mut warnings = Vec::new();
+    let (tree, events) =
+        parse_document_xml_with_events(&wrapped, &resolver, &mut warnings, PageGeometry::default())
+            .ok()?;
+    match (tree.blocks.len(), tree.blocks.front()) {
+        (1, Some(b)) => Some((b.clone(), events)),
+        _ => None,
+    }
+}
+
+/// [`parse_document_xml_with_warnings`], also returning every comment
+/// anchor piece in document order (issues #282 / #284): a table cell's
+/// pieces carry their full cell path, and an unpaired piece (one end of a
+/// range that crosses the parsed fragment) is still reported — the writer
+/// verifies a patched paragraph against them, and the cell parser lifts a
+/// cell paragraph's pieces into its table's. Like
+/// `parse_document_xml_inner`, it opens no warnings scope (issue #349):
+/// diagnostics go to the enclosing read.
+pub(crate) fn parse_document_xml_with_events(
+    xml: &[u8],
+    resolver: &StyleResolver<'_>,
+    warnings: &mut Vec<DocxWarning>,
+    default_page_geometry: PageGeometry,
+) -> Result<(DocumentTree, Vec<CommentEvent>), DocxError> {
     /* Issue #110 — see `strip_utf8_bom`: `reader.buffer_position()` and
     every `xml[..]` slice below must share one byte space. */
     let xml_raw = xml;
@@ -1284,14 +1407,11 @@ fn parse_document_xml_inner(
 
     /* Phase 8a — comment ranges. `<w:commentRangeStart w:id="N"/>` opens
     a range; `<w:commentRangeEnd w:id="N"/>` closes it. Each may live in
-    a different paragraph, so we capture the `(block_idx_at_open,
-    open_paragraph_byte_offset)` snapshot and consume it on the matching
-    end. `open_ranges` maps comment id → (start_block_idx, start_offset).
-    `out_comment_ranges` is the document-wide table the parser hands the
-    engine. */
-    let mut open_comment_ranges: std::collections::HashMap<u32, (u32, u32)> =
-        std::collections::HashMap::new();
-    let mut out_comment_ranges: Vec<engine::CommentRange> = Vec::new();
+    a different paragraph — or (issue #284) table cell — so every piece is
+    recorded in document order with its logical position, and
+    `pair_comment_events` pairs them into the tree-level table at the
+    end. A table's pieces (cell paths) are spliced in at the table. */
+    let mut comment_events: Vec<CommentEvent> = Vec::new();
 
     /* Table state. `in_tbl` is a depth counter so nested tables (inside
     cells) don't trigger early `Block::Table` emission — only the
@@ -2329,9 +2449,14 @@ fn parse_document_xml_inner(
                     b"w:commentRangeStart" => {
                         let id: Option<u32> = attr_val(&e, b"w:id").and_then(|v| v.parse().ok());
                         if let Some(id) = id {
-                            let block_idx = out_blocks.len() as u32;
-                            let off = (para_text.len() + run_text.len()) as u32;
-                            open_comment_ranges.insert(id, (block_idx, off));
+                            comment_events.push(CommentEvent {
+                                kind: engine::CommentAnchorKind::RangeStart,
+                                id,
+                                pos: engine::LogicalPos {
+                                    path: engine::BlockPath::top(out_blocks.len() as u32),
+                                    offset: (para_text.len() + run_text.len()) as u32,
+                                },
+                            });
                         }
                         /* Issue #120 — between two blocks the marker is
                         body markup the writer never regenerates. */
@@ -2380,20 +2505,13 @@ fn parse_document_xml_inner(
                                 &ns,
                             );
                         }
-                        if let Some(id) = raw_id
-                            && let Some((start_block, start_off)) = open_comment_ranges.remove(&id)
-                        {
-                            let end_block = out_blocks.len() as u32;
-                            let end_off = (para_text.len() + run_text.len()) as u32;
-                            out_comment_ranges.push(engine::CommentRange {
+                        if let Some(id) = raw_id {
+                            comment_events.push(CommentEvent {
+                                kind: engine::CommentAnchorKind::RangeEnd,
                                 id,
-                                start: engine::LogicalPos {
-                                    path: engine::BlockPath::top(start_block),
-                                    offset: start_off,
-                                },
-                                end: engine::LogicalPos {
-                                    path: engine::BlockPath::top(end_block),
-                                    offset: end_off,
+                                pos: engine::LogicalPos {
+                                    path: engine::BlockPath::top(out_blocks.len() as u32),
+                                    offset: (para_text.len() + run_text.len()) as u32,
                                 },
                             });
                         }
@@ -2413,6 +2531,14 @@ fn parse_document_xml_inner(
                             && let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok())
                         {
                             markup.run_comment_reference(id);
+                            comment_events.push(CommentEvent {
+                                kind: engine::CommentAnchorKind::Reference,
+                                id,
+                                pos: engine::LogicalPos {
+                                    path: engine::BlockPath::top(out_blocks.len() as u32),
+                                    offset: (para_text.len() + run_text.len()) as u32,
+                                },
+                            });
                         }
                     }
                     b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
@@ -2654,12 +2780,20 @@ fn parse_document_xml_inner(
                             cells silently drop list bindings + paragraph
                             styles, breaking visual fidelity on numbered
                             tables. */
+                            /* Issue #284 — the cells' comment anchors, with
+                            their full paths, in document order. */
+                            let mut sink = crate::parts::table::CommentSink::rooted(vec![
+                                engine::PathStep::Block(out_blocks.len() as u32),
+                            ]);
                             let parsed = source_xml
                                 .as_deref()
-                                .map(|b| {
-                                    parse_table_bytes_with_warnings(b, resolver, &ns, warnings)
-                                        .unwrap_or_default()
+                                .and_then(|b| {
+                                    parse_table_bytes_with_events(
+                                        b, resolver, &ns, warnings, &mut sink,
+                                    )
+                                    .ok()
                                 })
+                                .inspect(|_| comment_events.append(&mut sink.events))
                                 .unwrap_or_default();
                             out_blocks.push(Block::Table(
                                 parsed.into_table(source_xml, envelopes.take_before()),
@@ -3102,14 +3236,14 @@ fn parse_document_xml_inner(
         tree.body_section =
             engine::SectionProps::from(&acc.into_section(0, 0, default_page_geometry));
     }
-    tree.comment_ranges = out_comment_ranges;
+    tree.comment_ranges = pair_comment_events(&comment_events);
     /* Issue #112 — only a complete envelope (root tag, `<w:body>` tag and
     a validated tail) is worth re-emitting; anything less means the
     writer synthesizes the stock header + footer as before. */
     if envelope.is_captured() && !envelope_invalid {
         tree.document_envelope = envelope;
     }
-    Ok(tree)
+    Ok((tree, comment_events))
 }
 
 #[cfg(test)]

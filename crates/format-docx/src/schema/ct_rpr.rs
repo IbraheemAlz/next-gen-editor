@@ -296,7 +296,11 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             };
             style.underline = Some(variant);
         }
-        b"w:color" => style.color = attr_val(e, b"w:val").and_then(|v| parse_hex_color(&v)),
+        b"w:color" => {
+            style.color = attr_val(e, b"w:val").and_then(|v| parse_hex_color(&v));
+            /* Issue #355 — the theme colour layout resolves through. */
+            style.color_theme = crate::parts::theme::theme_color_ref(e);
+        }
         b"w:highlight" => {
             style.bg_color = attr_val(e, b"w:val").and_then(|v| highlight_color(&v));
         }
@@ -324,6 +328,8 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             if let Some(t) = theme {
                 style.font_theme = Some(t);
             }
+            /* Issue #355 — the per-slot bindings layout resolves through. */
+            style.font_bindings = crate::parts::theme::rfonts_bindings(e);
         }
         /* `<w:sz w:val="N"/>` and `<w:szCs w:val="N"/>` — N is half-points
         (Word's native encoding; `w:val="24"` = 12 pt). `w:sz` targets ASCII

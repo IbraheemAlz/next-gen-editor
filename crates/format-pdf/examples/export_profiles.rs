@@ -37,6 +37,7 @@ fn hello_page(stack: &FontStack) -> PageBox {
         strike: false,
         bg_color: None,
         font_family: None,
+        font_family_cs: None,
         caps_transform: false,
         baseline_shift_px: 0.0,
     }];

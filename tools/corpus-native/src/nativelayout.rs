@@ -127,6 +127,7 @@ fn default_span(start: u32, end: u32) -> StyleSpan {
         strike: false,
         bg_color: None,
         font_family: None,
+        font_family_cs: None,
         caps_transform: false,
         baseline_shift_px: 0.0,
     }
@@ -151,6 +152,7 @@ fn style_span(start: u32, end: u32, style: &engine::SpanStyle) -> StyleSpan {
         (the run shapes against the per-script default face), never a
         crash. */
         font_family: None,
+        font_family_cs: None,
         /* `<w:smallCaps>` is approximated as full `<w:caps>` — the real
         small-caps rendering (uppercase + ~80% size on originally-lowercase
         substrings only) needs the sub-span split `engine-wasm`'s

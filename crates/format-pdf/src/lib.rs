@@ -2953,6 +2953,7 @@ mod tests {
             strike: false,
             bg_color: None,
             font_family: None,
+            font_family_cs: None,
             caps_transform: false,
             baseline_shift_px: 0.0,
         }
@@ -3087,6 +3088,7 @@ mod tests {
             strike: false,
             bg_color: None,
             font_family: None,
+            font_family_cs: None,
             caps_transform: false,
             baseline_shift_px: 0.0,
         }];

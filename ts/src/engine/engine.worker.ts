@@ -6,6 +6,7 @@ import type {
     Event,
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import { commandMeta } from '@nge/core/command-meta';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
 import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
@@ -14,6 +15,9 @@ import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-
 import LATIN_URL from '../../fonts/LiberationSans-Regular.ttf?url';
 import ARABIC_URL from '../../fonts/NotoNaskhArabic-Regular.ttf?url';
 import DUAL_URL from '../../fonts/Amiri-Regular.ttf?url';
+/* Issue #355 — the `theme-fonts` golden opens a committed fixture generated
+   by `tools/roundtrip --gen-seed` (our own builder, no foreign bytes). */
+import THEME_DOCX_URL from '../../../crates/format-docx/tests/fixtures/theme_loaded_faces.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -178,12 +182,10 @@ let pendingPackage: { hash: string; bytes: Uint8Array } | undefined;
    base did not restore. */
 let pinNextSnapshot = false;
 /* Issue #268 — commands that replace the whole document: the snapshot
-   after one is the new document's pinned base. */
-const DOCUMENT_REPLACING: ReadonlySet<Command['type']> = new Set([
-    'OPEN_DOCUMENT',
-    'LOAD_DOCX',
-    'RENDER_PAGE',
-]);
+   after one is the new document's pinned base. Issue #342 — derived from
+   `bridge::meta` (`CommandMeta.new_document`: OPEN_DOCUMENT, LOAD_DOCX,
+   RENDER_PAGE, CLOSE_DOCUMENT), not a hand-kept list. */
+const startsNewDocument = (cmd: Command): boolean => commandMeta(cmd.type).new_document;
 
 /** Issue #268 — how good a recovery base is, best first:
  *  4 — full tail, package present (or none needed);
@@ -396,6 +398,22 @@ async function handleInit(msg: InitMsg): Promise<void> {
             bytes: await fetchBytes(LATIN_URL),
         } as Command);
         self.postMessage({ type: 'FONT_LOADED_RESULT', event: latin });
+    } else if (testCase === 'theme-fonts') {
+        /* Issue #355 — the three shipped faces under their `FontFamily` ids
+           (what a theme typeface resolves to: "Liberation Sans" →
+           `liberation`, "Noto Naskh Arabic" → `noto-naskh`). */
+        for (const [id, url] of [
+            ['liberation', LATIN_URL],
+            ['amiri', DUAL_URL],
+            ['noto-naskh', ARABIC_URL],
+        ] as const) {
+            const e = await dispatch({
+                type: 'LOAD_FONT',
+                id,
+                bytes: await fetchBytes(url),
+            } as Command);
+            self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
+        }
     } else if (
         testCase === 'hello-arabic' ||
         testCase === 'editing-arabic' ||
@@ -859,6 +877,32 @@ async function handleInit(msg: InitMsg): Promise<void> {
             break;
         }
 
+        case 'theme-fonts': {
+            /* Issue #355 — a Word default-template document whose theme
+               names faces the editor ships: body Latin in Liberation Sans,
+               body Arabic (`+Body CS`, the theme's `Arab` row) in Noto
+               Naskh, the heading (`+Headings`, accent1 shaded BF) in Amiri;
+               one run naming Amiri explicitly, one Arabic run rebound to
+               `majorBidi`, two theme-coloured runs. Without theme
+               resolution every run would paint in the stack default.
+               Zoom 2 so the 11 pt body text is legible in the golden. */
+            await dispatch({ type: 'SET_ZOOM', scale: 2 } as Command);
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: 'liberation',
+                base_direction: 'LTR',
+                px_size: 15,
+                line_height: 22,
+                align: 'START',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'LOAD_DOCX',
+                bytes: await fetchBytes(THEME_DOCX_URL),
+            } as Command);
+            break;
+        }
+
         case 'interactive':
             /* Blank A4 page seeded with one empty paragraph. RenderPage
                caches the layout config so subsequent InsertText / Undo /
@@ -1196,32 +1240,22 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
  * Whether a successfully dispatched command belongs in the durable event
  * log. Recovery replays the tail through `dispatch`, so anything that moves
  * engine state a later logged command depends on must be kept — document
- * mutations, selection/caret moves (caret-relative
- * edits like `INSERT_TEXT` at `undefined` replay wrong without them),
- * composition, font loads, and view state. Pure read-back queries are
- * skipped: they replay as no-ops, and the per-pointermove `HIT_TEST` alone
- * would grow the commands store without bound. `PING` stays logged — the
- * D2.6 exit gate (e2e/event-log-replay.spec.ts) drives the sequence with it.
+ * mutations, selection/caret moves (caret-relative edits like `INSERT_TEXT`
+ * at `undefined` replay wrong without them), composition, font loads, and
+ * view state. Pure read-back queries are skipped: they replay as no-ops, and
+ * the per-pointermove `HIT_TEST` alone would grow the commands store without
+ * bound; the recovery primitives (`SNAPSHOT` / `RECOVER`, issue #85) are
+ * never part of the history they persist / restore. `PING` stays logged —
+ * the D2.6 exit gate (e2e/event-log-replay.spec.ts) drives the sequence
+ * with it.
+ *
+ * Issue #342 — the answer is `CommandMeta.logged`, generated from the
+ * single classification list in `crates/bridge/src/meta.rs` (the same list
+ * `EngineClient.writesInFlight` and the engine's `story_gate` read), not a
+ * hand-kept switch that could drift from them.
  */
 function shouldLogCommand(cmd: Command): boolean {
-    switch (cmd.type) {
-        case 'HIT_TEST':
-        case 'HIT_TEST_IN_PAGE':
-        case 'REQUEST_PAINT':
-        case 'REQUEST_ACCESSIBILITY_DELTA':
-        case 'GET_SELECTION_AS_CLIPBOARD':
-        case 'REQUEST_STATS':
-        case 'SAVE_DOCX':
-        case 'SAVE_DOCUMENT':
-        case 'EXPORT_PDF':
-        /* Issue #85 — the recovery primitives are never part of the
-           history they persist / restore. */
-        case 'SNAPSHOT':
-        case 'RECOVER':
-            return false;
-        default:
-            return true;
-    }
+    return commandMeta(cmd.type).logged;
 }
 
 async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
@@ -1241,7 +1275,7 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         if (shouldLogCommand(msg.cmd)) {
             const seq = logCommand(msg.cmd);
             /* Issue #268 — a new document: its first snapshot is pinned. */
-            if (DOCUMENT_REPLACING.has(msg.cmd.type) && evt.type !== 'ERROR') {
+            if (startsNewDocument(msg.cmd) && evt.type !== 'ERROR') {
                 pinNextSnapshot = true;
             }
             /* Issue #85 — cadence snapshot, taken HERE (still inside this
