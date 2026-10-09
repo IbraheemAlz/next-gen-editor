@@ -30,8 +30,8 @@ use crate::Command;
 
 /// The sentinel issue number of a [`CommandStatus::Stub`] / `Partial` gap
 /// that has no GitHub issue yet. `tools/parity` reports every such row as
-/// UNFILED, and its floor test caps how many may exist (the cap may only
-/// shrink) — file the issue, then replace the sentinel with its number.
+/// UNFILED and its floor — like this crate's own test — allows none: file
+/// the issue first, then cite its number.
 pub const UNFILED: u32 = 0;
 
 /// How far a command's engine behaviour is real.
@@ -269,15 +269,15 @@ command_meta! {
     LoadDocx { .. } => M::EDIT.new_document().exits_story(),
     SaveDocx => M::QUERY,
     // ---- Phase 2 §4 ----------------------------------------------------------
-    // Lifecycle slots the worker protocol owns (INIT message, worker
-    // termination); no client dispatches them.
-    Init { .. } => M::VIEW.body_only().stub(UNFILED),
+    // Issue #397 — lifecycle slots the worker protocol owns (INIT message,
+    // worker termination); no client dispatches them.
+    Init { .. } => M::VIEW.body_only().stub(397),
     // Issue #85 — recovery primitives are never part of the history they
     // persist / restore.
     Recover { .. } => M::EDIT.unlogged(),
     Snapshot { .. } => M::QUERY,
-    Dispose => M::VIEW.body_only().stub(UNFILED),
-    Tick { .. } => M::VIEW.body_only().stub(UNFILED),
+    Dispose => M::VIEW.body_only().stub(397),
+    Tick { .. } => M::VIEW.body_only().stub(397),
     // Issue #339 — Docx, PlainText and Html; Pdf is an export-only format
     // (an honest, specific error).
     OpenDocument { .. } => M::EDIT.new_document().exits_story(),
@@ -290,9 +290,9 @@ command_meta! {
     ApplyFormatting { .. } => M::FORMAT,
     ToggleFormatting { .. } => M::FORMAT,
     SplitParagraph { .. } => M::EDIT,
-    // Stable paragraph ids do not exist yet; Backspace/Delete across a
-    // boundary (`DeleteAtCaret`) is the interactive merge.
-    MergeParagraph { .. } => M::EDIT.body_only().stub(UNFILED),
+    // Issue #396 — stable paragraph ids do not exist yet; Backspace/Delete
+    // across a boundary (`DeleteAtCaret`) is the interactive merge.
+    MergeParagraph { .. } => M::EDIT.body_only().stub(396),
     InsertImage { .. } => M::EDIT.body_only(),
     ResizeImage { .. } => M::FORMAT.text_box_only(),
     MoveImage { .. } => M::FORMAT.text_box_only(),
@@ -648,11 +648,10 @@ mod tests {
         }
     }
 
-    /// Floor (issue #342): every gap names its tracking issue, or the
-    /// UNFILED sentinel — and the number of UNFILED gaps may only shrink.
+    /// Floor (issue #342): every gap names its tracking issue — the
+    /// UNFILED sentinel is not allowed (#396 / #397 filed the last ones).
     #[test]
     fn every_gap_cites_an_issue() {
-        const MAX_UNFILED: usize = 4;
         let mut unfiled = Vec::new();
         for kind in CommandKind::ALL {
             if let Some(issue) = kind.meta().status.issue()
@@ -662,8 +661,8 @@ mod tests {
             }
         }
         assert!(
-            unfiled.len() <= MAX_UNFILED,
-            "new UNFILED gaps {unfiled:?} — file a GitHub issue and cite its number"
+            unfiled.is_empty(),
+            "UNFILED gaps {unfiled:?} — file a GitHub issue and cite its number"
         );
     }
 

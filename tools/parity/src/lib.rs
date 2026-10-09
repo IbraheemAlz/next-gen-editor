@@ -36,9 +36,10 @@ pub const FUZZ_GEN: &str = "fuzz/src/command_gen.rs";
 /// Ratchet: `Implemented` commands the e2e suite dispatches by wire name.
 /// Raise it as coverage grows; never lower it.
 pub const E2E_IMPLEMENTED_FLOOR: usize = 45;
-/// Ratchet: gaps citing `bridge::UNFILED` instead of an issue number
-/// (mirrors `bridge::meta`'s own cap). File the issue, then shrink this.
-pub const MAX_UNFILED: usize = 4;
+/// Gaps allowed to cite `bridge::UNFILED` instead of an issue number —
+/// none (mirrors `bridge::meta`'s own test; #396 / #397 filed the last
+/// four). File the issue before classifying a gap.
+pub const MAX_UNFILED: usize = 0;
 
 /// The repository root this crate lives in (`tools/parity/../..`).
 pub fn default_root() -> PathBuf {
