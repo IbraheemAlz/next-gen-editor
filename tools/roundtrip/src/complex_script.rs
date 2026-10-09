@@ -17,6 +17,88 @@ use format_docx::test_fixtures::{
 /// only, with a character style reference.
 const BCS_RUN: &str = r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rStyle w:val="Emph"/><w:bCs/><w:rtl/></w:rPr><w:t>مملكة إسبانيا</w:t></w:r><w:r><w:t xml:space="preserve"> (</w:t></w:r></w:p>"#;
 
+/// Issue #249 — a Word-shaped Arabic run: a Latin face, an Arabic face and
+/// `w:hint` in one `<w:rFonts>`, an explicit OFF bold, both sizes, `rtl`
+/// and a language tag.
+const WORD_ARABIC_RPR: &str = r#"<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Simplified Arabic" w:hint="cs"/><w:b w:val="false"/><w:sz w:val="22"/><w:szCs w:val="28"/><w:rtl/><w:lang w:bidi="ar-SA"/>"#;
+const WORD_ARABIC_TEXT: &str = "الإصدار الأول";
+
+/// Step 41e — regeneration fidelity (#249): changing bold rewrites only
+/// `<w:b>`; changing the font rewrites only the font names, keeping
+/// `w:hint`, the explicit OFF bold and both sizes.
+fn run_regeneration_fidelity_step() -> Result<()> {
+    let body = format!(
+        r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr>{WORD_ARABIC_RPR}</w:rPr><w:t>{WORD_ARABIC_TEXT}</w:t></w:r></w:p>"#
+    );
+    let src = docx_with_body(&body);
+    let archive = read_docx(&src).context("read Word-shaped Arabic run")?;
+    let doc_a = doc_xml_string(&src)?;
+    let s = archive
+        .document
+        .nth_paragraph(0)
+        .context("paragraph")?
+        .style_at(0);
+    let names = (
+        s.font_family.as_ref().map(|f| f.display_name().to_string()),
+        s.font_family_cs
+            .as_ref()
+            .map(|f| f.display_name().to_string()),
+    );
+    if names
+        != (
+            Some("Times New Roman".into()),
+            Some("Simplified Arabic".into()),
+        )
+    {
+        bail!("w:ascii / w:cs not read into their own slots: {names:?}");
+    }
+    let untouched = write_docx(&archive, &archive.document).context("untouched save")?;
+    if doc_xml_string(&untouched)? != doc_a {
+        bail!("untouched Word-shaped Arabic run drifted");
+    }
+    let len = WORD_ARABIC_TEXT.len();
+    let write = |patch: SpanStyle| -> Result<String> {
+        let edited = archive.document.apply_style(pos(0, 0), pos(0, len), patch);
+        let bytes = write_docx(&archive, &edited).context("write edited")?;
+        assert_document_xml_well_formed(&bytes).context("edited Arabic run")?;
+        doc_xml_string(&bytes)
+    };
+    let bolded = write(
+        SpanStyle {
+            bold: Some(true),
+            ..SpanStyle::default()
+        }
+        .with_cs_twins(),
+    )?;
+    let expected = doc_a.replacen(r#"<w:b w:val="false"/>"#, "<w:b/><w:bCs/>", 1);
+    if bolded != expected {
+        bail!(
+            "bold change rewrote more than <w:b>\n--- expected ---\n{expected}\n--- got ---\n{bolded}"
+        );
+    }
+    let refonted = write(
+        SpanStyle {
+            font_family: Some(engine::FontFamily::Amiri),
+            ..SpanStyle::default()
+        }
+        .with_cs_twins(),
+    )?;
+    let expected = doc_a.replacen(
+        r#"<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Simplified Arabic" w:hint="cs"/>"#,
+        r#"<w:rFonts w:ascii="Amiri" w:hAnsi="Amiri" w:cs="Amiri" w:hint="cs"/>"#,
+        1,
+    );
+    if refonted != expected {
+        bail!(
+            "font change dropped unmodeled values\n--- expected ---\n{expected}\n--- got ---\n{refonted}"
+        );
+    }
+    println!(
+        "[roundtrip] step 41e OK — changing bold rewrites only <w:b>; a font change keeps w:hint, the OFF bold and both sizes (#249)"
+    );
+    Ok(())
+}
+
 /// Step 41d — Ctrl+B on an Arabic `<w:bCs/>` run writes `<w:b/>` next to
 /// the existing `<w:bCs/>` and keeps its `<w:rStyle>`: a pure insertion.
 fn run_bcs_rstyle_step() -> Result<()> {
@@ -196,5 +278,6 @@ pub(crate) fn run_complex_script_roundtrip() -> Result<()> {
     println!(
         "[roundtrip] step 41c OK — a set size writes w:sz + w:szCs, untouched text keeps its pair, no synthesized w:szCs"
     );
-    run_bcs_rstyle_step()
+    run_bcs_rstyle_step()?;
+    run_regeneration_fidelity_step()
 }

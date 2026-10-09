@@ -130,3 +130,164 @@ fn a_stale_bag_twin_never_duplicates_the_modeled_child() {
         r#"<w:rPr><w:b/><w:bCs/><w:lang w:bidi="ar-SA"/></w:rPr>"#
     );
 }
+
+/* ================================================================
+Issue #249 — the complex-script font slot and regeneration fidelity.
+================================================================ */
+
+/// One run with `rpr` around `text`; returns the source document.xml and
+/// the archive.
+fn open_run(rpr: &str, text: &str) -> (String, DocxArchive) {
+    open(&format!(
+        r#"<w:p><w:r><w:rPr>{rpr}</w:rPr><w:t>{text}</w:t></w:r></w:p>"#
+    ))
+}
+
+/// Restyle all of paragraph 0's `len` bytes with `patch` and return the
+/// written document.xml.
+fn restyle(archive: &DocxArchive, len: usize, patch: SpanStyle) -> String {
+    let edited = archive.document.apply_style(at(0, 0), at(0, len), patch);
+    let bytes = write_docx(archive, &edited).expect("write");
+    crate::opc::archive::check_document_xml_well_formed(&bytes).expect("well-formed");
+    document_xml_of(&bytes)
+}
+
+/// `w:cs` / `w:cstheme` read into the complex-script slot; `w:cs` alone
+/// no longer becomes the Latin face; each slot writes back only what it
+/// holds.
+#[test]
+fn rfonts_cs_slot_reads_apart_from_ascii() {
+    let (_, both) = open_run(
+        r#"<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Simplified Arabic" w:cstheme="minorBidi"/>"#,
+        ARABIC,
+    );
+    let s = both.document.nth_paragraph(0).unwrap().style_at(0);
+    assert_eq!(
+        s.font_family.as_ref().map(|f| f.display_name()),
+        Some("Times New Roman")
+    );
+    assert_eq!(
+        s.font_family_cs.as_ref().map(|f| f.display_name()),
+        Some("Simplified Arabic")
+    );
+    assert_eq!(s.font_theme, None);
+    assert_eq!(s.font_theme_cs.as_deref(), Some("minorBidi"));
+
+    let (_, cs_only) = open_run(r#"<w:rFonts w:cs="Arial"/>"#, ARABIC);
+    let s = cs_only.document.nth_paragraph(0).unwrap().style_at(0);
+    assert_eq!(s.font_family, None, "w:cs alone is not the Latin face");
+    assert_eq!(
+        s.font_family_cs.as_ref().map(|f| f.display_name()),
+        Some("Arial")
+    );
+
+    /* Engine-authored (no source): each slot writes its own attributes. */
+    let mut out = String::new();
+    emit_rpr(
+        &SpanStyle {
+            font_family: Some(engine::FontFamily::LiberationSans),
+            font_family_cs: Some(engine::FontFamily::Amiri),
+            ..SpanStyle::default()
+        },
+        &mut out,
+    );
+    assert_eq!(
+        out,
+        r#"<w:rPr><w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:cs="Amiri"/></w:rPr>"#
+    );
+    let mut out = String::new();
+    emit_rpr(
+        &SpanStyle {
+            font_family: Some(engine::FontFamily::LiberationSans),
+            ..SpanStyle::default()
+        },
+        &mut out,
+    );
+    assert!(!out.contains("w:cs="), "no synthesized w:cs: {out}");
+}
+
+/// Issue #249 acceptance (`55733.docx`'s run): changing bold rewrites only
+/// `<w:b>` — the source `<w:rFonts w:ascii="Cambria" />` gains no
+/// `w:hAnsi` / `w:cs`, `<w:sz>` gains no `<w:szCs>`, and the spelling
+/// (spaces before `/>`) is kept.
+#[test]
+fn changing_bold_rewrites_only_the_b_element() {
+    let rpr = r#"<w:rFonts w:ascii="Cambria" /><w:b w:val="false" /><w:sz w:val="22" /><w:u w:val="none" />"#;
+    let (src, archive) = open_run(rpr, "TEST");
+    let xml = restyle(&archive, 4, bold(true));
+    assert_eq!(
+        xml,
+        src.replace(r#"<w:b w:val="false" />"#, "<w:b/>"),
+        "only <w:b> changes"
+    );
+    /* The UI toggle sets both slots: `<w:bCs/>` is an insertion. */
+    let xml = restyle(&archive, 4, bold(true).with_cs_twins());
+    assert_eq!(
+        xml,
+        src.replace(r#"<w:b w:val="false" />"#, "<w:b/><w:bCs/>")
+    );
+    /* A change elsewhere keeps `<w:b w:val="false" />` as written (it
+    used to be dropped: the regenerated run turned bold in Word). */
+    let xml = restyle(
+        &archive,
+        4,
+        SpanStyle {
+            color: Some([0xC0, 0, 0, 255]),
+            ..SpanStyle::default()
+        },
+    );
+    assert_eq!(
+        xml,
+        src.replace(
+            r#"<w:sz w:val="22" />"#,
+            r#"<w:color w:val="C00000"/><w:sz w:val="22" />"#
+        )
+    );
+}
+
+/// What the model reads as nothing still survives a regeneration:
+/// `<w:rFonts w:hint="cs"/>` (ubiquitous in Arabic documents), `<w:color
+/// w:val="auto"/>`, and a `<w:highlight>` the writer would otherwise
+/// respell as `<w:shd>`.
+#[test]
+fn regeneration_keeps_children_the_model_reads_as_nothing() {
+    let rpr =
+        r#"<w:rFonts w:hint="cs"/><w:color w:val="auto"/><w:highlight w:val="yellow"/><w:rtl/>"#;
+    let (src, archive) = open_run(rpr, ARABIC);
+    let xml = restyle(&archive, ARABIC.len(), bold(true).with_cs_twins());
+    assert_eq!(
+        xml,
+        src.replace(
+            r#"<w:rFonts w:hint="cs"/>"#,
+            r#"<w:rFonts w:hint="cs"/><w:b/><w:bCs/>"#
+        )
+    );
+}
+
+/// A CHANGED font keeps the `<w:rFonts>` attributes the model does not own
+/// (`w:eastAsia`, `w:hint`); an engine-authored OFF is written explicitly.
+#[test]
+fn changed_value_keeps_unowned_attributes_and_off_is_explicit() {
+    let rpr = r#"<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:eastAsia="SimSun" w:cs="Simplified Arabic" w:hint="eastAsia"/><w:b/><w:bCs/>"#;
+    let (_, archive) = open_run(rpr, ARABIC);
+    let xml = restyle(
+        &archive,
+        ARABIC.len(),
+        SpanStyle {
+            font_family: Some(engine::FontFamily::Amiri),
+            bold: Some(false),
+            ..SpanStyle::default()
+        }
+        .with_cs_twins(),
+    );
+    assert!(
+        xml.contains(
+            r#"<w:rPr><w:rFonts w:ascii="Amiri" w:hAnsi="Amiri" w:cs="Amiri" w:eastAsia="SimSun" w:hint="eastAsia"/><w:b w:val="0"/><w:bCs w:val="0"/></w:rPr>"#
+        ),
+        "{xml}"
+    );
+    let back = read_docx(&build_docx_with_styles(STYLES_XML, &xml)).unwrap();
+    let s = back.document.nth_paragraph(0).unwrap().style_at(0);
+    assert_eq!((s.bold, s.bold_cs), (Some(false), Some(false)));
+    assert_eq!(s.font_family_cs, Some(engine::FontFamily::Amiri));
+}

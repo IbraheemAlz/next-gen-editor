@@ -195,7 +195,7 @@ fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
         baseline_shift_px: 0.0,
         bold: style.bold_cs.unwrap_or(false),
         italic: style.italic_cs.unwrap_or(false),
-        font_family: span.font_family.clone(),
+        font_family: style.font_family_cs.as_ref().map(|f| f.id().to_string()),
         whole_span: style.forces_complex_script(),
     };
     span.with_cs(cs)

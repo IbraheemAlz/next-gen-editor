@@ -409,3 +409,118 @@ fn mixed_detection_reads_each_script_class_with_its_twin() {
         "mixed turns ON for both classes"
     );
 }
+
+/* ================================================================
+Issue #249 — the `<w:rFonts w:cs>` slot.
+================================================================ */
+
+/// An engine with the three seed faces loaded under their `FontFamily`
+/// ids (`liberation`, `amiri`, `noto-naskh`), so a document naming them in
+/// `<w:rFonts>` resolves to real faces.
+fn seed_font_engine(rpr: &str) -> Engine {
+    let mut e = engine_for_run(rpr);
+    e.fonts.clear();
+    for (id, bytes) in [
+        (
+            "liberation",
+            &include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf")[..],
+        ),
+        (
+            "amiri",
+            &include_bytes!("../../../ts/fonts/Amiri-Regular.ttf")[..],
+        ),
+        (
+            "noto-naskh",
+            &include_bytes!("../../../ts/fonts/NotoNaskhArabic-Regular.ttf")[..],
+        ),
+    ] {
+        let font = LoadedFont::parse(id.to_string(), bytes.to_vec()).expect("font");
+        e.fonts.insert(id.to_string(), Arc::new(font));
+    }
+    if let Some(cfg) = e.layout_cfg.as_mut() {
+        cfg.font_id = "liberation".into();
+    }
+    e
+}
+
+/// Every shaped run of paragraph 0 as (is complex script, font id, any
+/// `.notdef` glyph).
+fn run_fonts(e: &Engine) -> Vec<(bool, String, bool)> {
+    let doc = e.undo.current().clone();
+    let text = doc.nth_paragraph(0).unwrap().text.clone();
+    let (pages, _, _, _) = e.build_pages(1.0, false, None).expect("layout");
+    pages[0].blocks[0]
+        .as_paragraph()
+        .unwrap()
+        .lines
+        .iter()
+        .flat_map(|l| l.runs.iter())
+        .map(|r| {
+            let piece = &text[r.source_range.start as usize..r.source_range.end as usize];
+            let notdef = r.glyphs.iter().any(|g| g.id == 0 && !g.synthetic);
+            (is_arabic(piece), r.font.clone(), notdef)
+        })
+        .collect()
+}
+
+/// Acceptance (#249): a run naming a Latin face in `w:ascii` / `w:hAnsi`
+/// and an Arabic face in `w:cs` shapes each script with its own face —
+/// the old single slot shaped the Arabic with Liberation Sans (no Arabic
+/// glyphs: `.notdef` boxes).
+#[test]
+fn rfonts_cs_slot_picks_the_arabic_face() {
+    for (cs, want) in [("Amiri", "amiri"), ("Noto Naskh Arabic", "noto-naskh")] {
+        let e = seed_font_engine(&format!(
+            r#"<w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:cs="{cs}"/>"#
+        ));
+        let runs = run_fonts(&e);
+        assert!(runs.iter().any(|r| r.0) && runs.iter().any(|r| !r.0));
+        for (arabic, font, notdef) in runs {
+            assert_eq!(font, if arabic { want } else { "liberation" }, "{cs}");
+            assert!(!notdef, "{cs}: every glyph has a face");
+        }
+        let arabic_at = BCS_TEXT.find('\u{0646}').unwrap() as u32 + 2;
+        assert_eq!(e.attrs_at(bpos_top(0, arabic_at), true).font_family, want);
+        assert_eq!(e.attrs_at(bpos_top(0, 2), true).font_family, "liberation");
+    }
+}
+
+/// `ApplyFormatting { font_family }` sets both slots unless `font_slot`
+/// says otherwise; the complex-script-only change relayouts (the layout
+/// key hashes the slot).
+#[test]
+fn apply_formatting_routes_the_family_by_font_slot() {
+    let mut e = seed_font_engine(
+        r#"<w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:cs="Amiri"/>"#,
+    );
+    let len = BCS_TEXT.len() as u32;
+    select(&mut e, 0, 0, len);
+    let family = |id: &str, slot: Option<FontSlot>| TextAttrsPatch {
+        font_family: Some(id.into()),
+        font_size: None,
+        ..patch(0.0, slot)
+    };
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: family("noto-naskh", Some(FontSlot::ComplexScript)),
+        },
+    );
+    for (arabic, font, _) in run_fonts(&e) {
+        assert_eq!(font, if arabic { "noto-naskh" } else { "liberation" });
+    }
+    let s = e.undo.current().nth_paragraph(0).unwrap().style_at(0);
+    assert_eq!(s.font_family, Some(engine::FontFamily::LiberationSans));
+    assert_eq!(s.font_family_cs, Some(engine::FontFamily::NotoNaskhArabic));
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: family("amiri", None),
+        },
+    );
+    let s = e.undo.current().nth_paragraph(0).unwrap().style_at(0);
+    assert_eq!(s.font_family, Some(engine::FontFamily::Amiri));
+    assert_eq!(s.font_family_cs, Some(engine::FontFamily::Amiri));
+}

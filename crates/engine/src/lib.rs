@@ -2153,6 +2153,16 @@ pub struct SpanStyle {
     pub strike: Option<bool>,
     pub bg_color: Option<[u8; 4]>,
     pub font_family: Option<FontFamily>,
+    /// Issue #249 — `<w:rFonts w:cs>`: the complex-script twin of
+    /// [`Self::font_family`] (which holds `w:ascii` / `w:hAnsi`). Arabic
+    /// documents name a Latin face and an Arabic face on the same run;
+    /// folding them into one slot shaped the Arabic with the Latin face.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_family_cs: Option<FontFamily>,
+    /// Issue #249 — `<w:rFonts w:cstheme>`: the complex-script twin of
+    /// [`Self::font_theme`] (`w:asciiTheme` / `w:hAnsiTheme`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_theme_cs: Option<String>,
     /// Issue #104 — the run's `<w:rStyle>` character-style id. The reader
     /// still folds the style's properties into the span (the layout and
     /// toolbar read one flat style); the id rides along so a regenerated
@@ -2233,6 +2243,9 @@ impl SpanStyle {
         if self.italic_cs.is_none() {
             self.italic_cs = self.italic;
         }
+        if self.font_family_cs.is_none() {
+            self.font_family_cs = self.font_family.clone();
+        }
         self
     }
 
@@ -2249,6 +2262,9 @@ impl SpanStyle {
         if let Some(italic) = self.italic.take() {
             self.italic_cs = Some(italic);
         }
+        if let Some(family) = self.font_family.take() {
+            self.font_family_cs = Some(family);
+        }
         self
     }
 
@@ -2262,6 +2278,9 @@ impl SpanStyle {
             font_size: self.font_size_cs,
             bold: self.bold_cs,
             italic: self.italic_cs,
+            font_family: self.font_family_cs.clone(),
+            raw_font_family: None,
+            font_theme: self.font_theme_cs.clone(),
             ..self.clone()
         }
     }
@@ -2290,6 +2309,8 @@ impl SpanStyle {
             strike: patch.strike.or(self.strike),
             bg_color: patch.bg_color.or(self.bg_color),
             font_family: patch.font_family.or(self.font_family),
+            font_family_cs: patch.font_family_cs.or(self.font_family_cs),
+            font_theme_cs: patch.font_theme_cs.or(self.font_theme_cs),
             char_style: patch.char_style.or(self.char_style),
             caps: patch.caps.or(self.caps),
             small_caps: patch.small_caps.or(self.small_caps),
@@ -11737,6 +11758,23 @@ mod tests {
         }
         .complex_script_view();
         assert_eq!((view.bold, view.italic), (Some(false), None));
+        /* Issue #249 — the family slot too. */
+        let fam = SpanStyle {
+            font_family: Some(FontFamily::LiberationSans),
+            font_theme: Some("minorHAnsi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fam.clone().with_cs_twins().font_family_cs,
+            Some(FontFamily::LiberationSans)
+        );
+        let cs_only = fam.clone().into_cs_only();
+        assert_eq!(
+            (cs_only.font_family, cs_only.font_family_cs),
+            (None, Some(FontFamily::LiberationSans))
+        );
+        let view = fam.complex_script_view();
+        assert_eq!((view.font_family, view.font_theme), (None, None));
     }
 
     /* ---- issue #23: dynamic, string-backed FontFamily ------------- */

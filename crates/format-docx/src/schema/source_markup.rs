@@ -950,6 +950,169 @@ pub fn adopt_source_children(children: &mut [(u16, String)], source: &[u8]) {
     }
 }
 
+/// Issue #249 — what one `<w:rPr>` child element says to the model: the
+/// [`SpanStyle`] folding it alone into the default produces
+/// ([`crate::schema::ct_rpr::apply_rpr`], plus `<w:rStyle>` as
+/// [`SpanStyle::char_style`]). `None` for anything but one empty element.
+fn fold_rpr_child(xml: &[u8]) -> Option<SpanStyle> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut style = SpanStyle::default();
+    match reader.read_event_into(&mut buf).ok()? {
+        Event::Empty(e) => {
+            let name = e.name().as_ref().to_vec();
+            if name == b"w:rStyle" {
+                style.char_style = crate::schema::ct_rpr::attr_val(&e, b"w:val");
+            } else {
+                crate::schema::ct_rpr::apply_rpr(&name, &e, &mut style);
+            }
+        }
+        _ => return None,
+    }
+    buf.clear();
+    matches!(reader.read_event_into(&mut buf).ok()?, Event::Eof).then_some(style)
+}
+
+/// Issue #249 — attributes of a modeled `<w:rPr>` child the model does not
+/// own: a CHANGED value keeps them (`w:eastAsia` / `w:hint` survive a font
+/// change, `w:color` an underline-style change). Everything else is owned
+/// — a stale `w:themeColor` must never override a new explicit colour.
+fn rpr_attr_is_unowned(elem: &[u8], attr: &[u8]) -> bool {
+    match elem {
+        b"w:rFonts" => matches!(attr, b"w:eastAsia" | b"w:eastAsiaTheme" | b"w:hint"),
+        b"w:u" => matches!(
+            attr,
+            b"w:color" | b"w:themeColor" | b"w:themeShade" | b"w:themeTint"
+        ),
+        _ => false,
+    }
+}
+
+/// `regenerated` (one empty element) with `extra` attributes appended
+/// before its `/>`; values are the source's escaped bytes. An attribute the
+/// regenerated element already carries, or whose value would need a
+/// different quote, is skipped.
+fn with_extra_attrs(regenerated: &str, extra: &[(Vec<u8>, Vec<u8>)]) -> String {
+    let Some(head) = regenerated.strip_suffix("/>") else {
+        return regenerated.to_owned();
+    };
+    let mut out = head.trim_end().to_owned();
+    for (k, v) in extra {
+        let (Ok(k), Ok(v)) = (std::str::from_utf8(k), std::str::from_utf8(v)) else {
+            continue;
+        };
+        if v.contains('"') || out.contains(&format!(" {k}=")) {
+            continue;
+        }
+        out.push(' ');
+        out.push_str(k);
+        out.push_str("=\"");
+        out.push_str(v);
+        out.push('"');
+    }
+    out.push_str("/>");
+    out
+}
+
+/// Issue #249 — the `<w:rPr>` form of [`adopt_source_children`]: a
+/// regenerated run keeps every byte of its source `<w:rPr>` the edit did
+/// not change, judged by what the model READS rather than by spelling.
+///
+/// 1. A regenerated modeled child adopts its unused source twin of the
+///    same name when the twin folds to the same model value
+///    ([`fold_rpr_child`]): `<w:b w:val="false" />` survives as written
+///    (it equals the regenerated `<w:b w:val="0"/>`), `<w:rFonts
+///    w:ascii="Cambria" />` survives without the `w:hAnsi` regeneration
+///    adds, `<w:u w:val="words"/>` and a patterned `<w:shd>` keep their
+///    spelling. A twin of ANOTHER modeled name folding to the same
+///    non-default value is adopted too (`<w:highlight>` for the
+///    regenerated `<w:shd>` fill), at its own schema rank.
+/// 2. A same-name twin with a CHANGED value is not adopted; the
+///    regenerated element gains the twin's attributes the model does not
+///    own ([`rpr_attr_is_unowned`]).
+/// 3. A source child of a modeled name the model reads as nothing
+///    (`<w:rFonts w:hint="cs"/>`, `<w:color w:val="auto"/>`, a
+///    `<w:highlight w:val="none"/>`) and that no regenerated child
+///    replaces is re-emitted verbatim at its rank — regeneration never
+///    drops what the source said. `<w:rStyle>` is never resurrected: its
+///    absence is the model's (`char_style`) to decide.
+///
+/// Grab-bag children (unmodeled names) are verbatim already and left alone.
+pub fn adopt_source_rpr_children(children: &mut Vec<(u16, String)>, source: &[u8]) {
+    use crate::schema::ct_rpr::{rpr_child_is_modeled, rpr_child_rank};
+    let twins = top_level_children(source);
+    if twins.is_empty() {
+        return;
+    }
+    let folds: Vec<Option<SpanStyle>> = twins
+        .iter()
+        .map(|t| if t.3 { fold_rpr_child(&t.2) } else { None })
+        .collect();
+    let mut used = vec![false; twins.len()];
+    for (rank, xml) in children.iter_mut() {
+        let Some((name, _)) = parse_empty_element(xml) else {
+            continue;
+        };
+        if !rpr_child_is_modeled(&name) {
+            continue;
+        }
+        let Some(regen) = fold_rpr_child(xml.as_bytes()) else {
+            continue;
+        };
+        if let Some(i) = (0..twins.len()).find(|&i| !used[i] && twins[i].3 && twins[i].0 == name) {
+            used[i] = true;
+            if folds[i].as_ref() == Some(&regen) {
+                if let Ok(s) = std::str::from_utf8(&twins[i].2) {
+                    *xml = s.to_owned();
+                }
+            } else {
+                let extra: Vec<(Vec<u8>, Vec<u8>)> = twins[i]
+                    .1
+                    .iter()
+                    .filter(|(k, _)| rpr_attr_is_unowned(&name, k))
+                    .cloned()
+                    .collect();
+                if !extra.is_empty() {
+                    *xml = with_extra_attrs(xml, &extra);
+                }
+            }
+            continue;
+        }
+        if regen == SpanStyle::default() {
+            continue;
+        }
+        if let Some(i) = (0..twins.len()).find(|&i| {
+            !used[i]
+                && twins[i].0 != name
+                && rpr_child_is_modeled(&twins[i].0)
+                && folds[i].as_ref() == Some(&regen)
+        }) && let Ok(s) = std::str::from_utf8(&twins[i].2)
+        {
+            used[i] = true;
+            *xml = s.to_owned();
+            *rank = rpr_child_rank(&twins[i].0);
+        }
+    }
+    let present: Vec<Vec<u8>> = children
+        .iter()
+        .map(|(_, x)| crate::schema::grab_bag::fragment_qname(x.as_bytes()).to_vec())
+        .collect();
+    for (i, t) in twins.iter().enumerate() {
+        if used[i]
+            || !t.3
+            || t.0 == b"w:rStyle"
+            || !rpr_child_is_modeled(&t.0)
+            || present.contains(&t.0)
+            || folds[i].as_ref() != Some(&SpanStyle::default())
+        {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(&t.2) {
+            children.push((rpr_child_rank(&t.0), s.to_owned()));
+        }
+    }
+}
+
 /// `true` when a `<w:t>` holding `text` needs `xml:space="preserve"`:
 /// leading / trailing whitespace would otherwise be dropped by a
 /// consumer applying default whitespace handling.
@@ -990,6 +1153,35 @@ mod tests {
         let mut ch = children(&[r#"<w:tabs><w:tab w:val="left" w:pos="1440"/></w:tabs>"#]);
         adopt_source_children(&mut ch, src);
         assert!(ch[0].1.contains("1440"));
+    }
+
+    /// Issue #249 — rPr adoption is semantic: equal values keep the source
+    /// spelling (even across element names for the background), a changed
+    /// character style is never reverted, a dropped `<w:rStyle>` is never
+    /// resurrected, and children the model reads as nothing survive.
+    #[test]
+    fn rpr_adoption_compares_what_the_model_reads() {
+        let src = br#"<w:rPr><w:rStyle w:val="A"/><w:b w:val="1"/><w:highlight w:val="yellow"/><w:color w:val="auto"/></w:rPr>"#;
+        let mut ch = children(&[
+            r#"<w:rStyle w:val="B"/>"#,
+            "<w:b/>",
+            r#"<w:shd w:val="clear" w:color="auto" w:fill="FFFF00"/>"#,
+        ]);
+        adopt_source_rpr_children(&mut ch, src);
+        let xml: Vec<&str> = ch.iter().map(|(_, x)| x.as_str()).collect();
+        assert_eq!(
+            xml,
+            [
+                r#"<w:rStyle w:val="B"/>"#,
+                r#"<w:b w:val="1"/>"#,
+                r#"<w:highlight w:val="yellow"/>"#,
+                r#"<w:color w:val="auto"/>"#,
+            ]
+        );
+        /* No regenerated rStyle: the source's is not brought back. */
+        let mut ch = children(&["<w:b/>"]);
+        adopt_source_rpr_children(&mut ch, src);
+        assert!(ch.iter().all(|(_, x)| !x.contains("rStyle")), "{ch:?}");
     }
 
     #[test]

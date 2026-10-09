@@ -2824,7 +2824,11 @@ fn build_style_spans(
             baseline_shift_px: raw_cs_px * shift_factor,
             bold: style.bold_cs.unwrap_or(false),
             italic: style.italic_cs.unwrap_or(false),
-            font_family: template.font_family.clone(),
+            font_family: style
+                .font_family_cs
+                .as_ref()
+                .map(font_family_id)
+                .map(str::to_string),
             whole_span: style.forces_complex_script(),
         };
         let template = template.with_cs(cs);
@@ -3036,7 +3040,11 @@ fn composition_layout_spans(
         baseline_shift_px: 0.0,
         bold: st.bold_cs.unwrap_or(false),
         italic: st.italic_cs.unwrap_or(false),
-        font_family: comp.font_family.clone(),
+        font_family: st
+            .font_family_cs
+            .as_ref()
+            .map(font_family_id)
+            .map(str::to_string),
         whole_span: st.forces_complex_script(),
     };
     out.push(comp.with_cs(cs));
@@ -3053,6 +3061,7 @@ fn hash_complex_script_slots(style: &SpanStyle, h: &mut impl std::hash::Hasher) 
     style.font_size_cs.map(f32::to_bits).hash(h);
     style.bold_cs.hash(h);
     style.italic_cs.hash(h);
+    style.font_family_cs.hash(h);
     style.forces_complex_script().hash(h);
 }
 

@@ -606,6 +606,8 @@ mod tests {
             b"bold_cs",
             b"italic_cs",
             b"char_style",
+            b"font_family_cs",
+            b"font_theme_cs",
         ] {
             assert!(
                 !has_key(&plain, key),
@@ -617,6 +619,8 @@ mod tests {
             bold_cs: Some(true),
             italic_cs: Some(false),
             char_style: Some("Emph".into()),
+            font_family_cs: Some(crate::FontFamily::Amiri),
+            font_theme_cs: Some("minorBidi".into()),
             ..latin
         };
         let bytes = encode(&twins).unwrap();

@@ -22,7 +22,9 @@ use crate::schema::ct_rpr::rpr_child_rank;
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::fragment_qname;
-use crate::schema::source_markup::{adopt_source_children, attrs_xml, text_needs_preserve};
+use crate::schema::source_markup::{
+    adopt_source_children, adopt_source_rpr_children, attrs_xml, text_needs_preserve,
+};
 use crate::schema::wp_anchor::emit_anchor_open;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
@@ -240,6 +242,16 @@ impl PrChildren {
         }
     }
 
+    /// Issue #249 — the `<w:rPr>` adoption: semantic (what the model
+    /// reads), keeps unowned attributes across a changed value and never
+    /// drops a source child the model reads as nothing
+    /// ([`adopt_source_rpr_children`]).
+    fn adopt_rpr(&mut self, source: Option<&[u8]>) {
+        if let Some(src) = source {
+            adopt_source_rpr_children(&mut self.items, src);
+        }
+    }
+
     /// `<elem>` + children in schema order + `</elem>`. Always emits the
     /// wrapper — every caller has already returned early for the
     /// nothing-to-say case, and an empty `<w:pPr></w:pPr>` is what the
@@ -296,54 +308,62 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
         .as_ref()
         .map(|f| family_docx_name(f).to_string())
         .or_else(|| style.raw_font_family.clone());
-    if rfonts_name.is_some() || style.font_theme.is_some() {
+    /* Issue #249 — the complex-script slot writes `w:cs` / `w:cstheme`
+    from its own field: a run whose source named only a Latin face gains
+    no synthesized `w:cs`, and an engine-authored font change (which sets
+    both slots) still writes all three name attributes. */
+    let cs_name = style.font_family_cs.as_ref().map(family_docx_name);
+    if rfonts_name.is_some()
+        || cs_name.is_some()
+        || style.font_theme.is_some()
+        || style.font_theme_cs.is_some()
+    {
         let mut s = String::from("<w:rFonts");
-        if let Some(n) = rfonts_name.as_deref() {
-            s.push_str(" w:ascii=\"");
-            push_escaped_attr(n, &mut s);
-            s.push_str("\" w:hAnsi=\"");
-            push_escaped_attr(n, &mut s);
-            s.push_str("\" w:cs=\"");
-            push_escaped_attr(n, &mut s);
+        let mut attr = |k: &str, v: &str| {
+            s.push(' ');
+            s.push_str(k);
+            s.push_str("=\"");
+            push_escaped_attr(v, &mut s);
             s.push('"');
+        };
+        if let Some(n) = rfonts_name.as_deref() {
+            attr("w:ascii", n);
+            attr("w:hAnsi", n);
+        }
+        if let Some(n) = cs_name {
+            attr("w:cs", n);
         }
         if let Some(t) = style.font_theme.as_deref() {
-            s.push_str(" w:asciiTheme=\"");
-            push_escaped_attr(t, &mut s);
-            s.push_str("\" w:hAnsiTheme=\"");
-            push_escaped_attr(t, &mut s);
-            s.push_str("\" w:cstheme=\"");
-            push_escaped_attr(t, &mut s);
-            s.push('"');
+            attr("w:asciiTheme", t);
+            attr("w:hAnsiTheme", t);
+        }
+        if let Some(t) = style.font_theme_cs.as_deref() {
+            attr("w:cstheme", t);
         }
         s.push_str("/>");
         ch.push(rank(b"w:rFonts"), s);
     }
-    if style.bold == Some(true) {
-        ch.push(rank(b"w:b"), "<w:b/>".into());
-    }
-    /* Issue #104 — the complex-script twins, each from its own slot. */
-    if style.bold_cs == Some(true) {
-        ch.push(rank(b"w:bCs"), "<w:bCs/>".into());
-    }
-    if style.italic == Some(true) {
-        ch.push(rank(b"w:i"), "<w:i/>".into());
-    }
-    if style.italic_cs == Some(true) {
-        ch.push(rank(b"w:iCs"), "<w:iCs/>".into());
-    }
-    /* CT_RPr ordering — caps/smallCaps sit between `<w:iCs/>` and
-    `<w:strike/>` (OOXML §17.3.2). When both are on, Word's writer
-    emits both; the reader's `apply_rpr` flips both flags and the
-    shape-time transform prefers `caps` (full-height) over `smallCaps`. */
-    if style.caps == Some(true) {
-        ch.push(rank(b"w:caps"), "<w:caps/>".into());
-    }
-    if style.small_caps == Some(true) {
-        ch.push(rank(b"w:smallCaps"), "<w:smallCaps/>".into());
-    }
-    if style.strike == Some(true) {
-        ch.push(rank(b"w:strike"), "<w:strike/>".into());
+    /* On/off properties. Issue #249 — an explicit OFF is written too
+    (`<w:b w:val="0"/>`): it overrides a bold paragraph / character style,
+    and dropping it on regeneration turned the run bold in Word. Issue
+    #104 — the complex-script twins (`bCs` / `iCs`) each from their own
+    slot. CT_RPr ordering — caps/smallCaps sit between `<w:iCs/>` and
+    `<w:strike/>` (OOXML §17.3.2); when both are on, Word's writer emits
+    both and the shape-time transform prefers `caps`. */
+    for (name, value) in [
+        ("w:b", style.bold),
+        ("w:bCs", style.bold_cs),
+        ("w:i", style.italic),
+        ("w:iCs", style.italic_cs),
+        ("w:caps", style.caps),
+        ("w:smallCaps", style.small_caps),
+        ("w:strike", style.strike),
+    ] {
+        match value {
+            Some(true) => ch.push(rank(name.as_bytes()), format!("<{name}/>")),
+            Some(false) => ch.push(rank(name.as_bytes()), format!("<{name} w:val=\"0\"/>")),
+            None => {}
+        }
     }
     if let Some([r, g, b, _]) = style.color {
         ch.push(
@@ -402,7 +422,7 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
         );
     }
     ch.push_bag(&style.grab_bag, rpr_child_rank);
-    ch.adopt(source);
+    ch.adopt_rpr(source);
     ch.finish("w:rPr", out);
 }
 

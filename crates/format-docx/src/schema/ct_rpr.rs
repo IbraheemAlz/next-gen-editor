@@ -265,20 +265,28 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             the original face the author chose). Theme attributes
             (`asciiTheme` / `hAnsiTheme` / `cstheme`) park in
             `font_theme` — Word's "Update Style" depends on them. */
-            let name = attr_val(e, b"w:ascii")
-                .or_else(|| attr_val(e, b"w:hAnsi"))
-                .or_else(|| attr_val(e, b"w:cs"));
+            let name = attr_val(e, b"w:ascii").or_else(|| attr_val(e, b"w:hAnsi"));
             if let Some(n) = name {
                 match family_from_docx(&n) {
                     Some(fam) => style.font_family = Some(fam),
                     None => style.raw_font_family = Some(n),
                 }
             }
-            let theme = attr_val(e, b"w:asciiTheme")
-                .or_else(|| attr_val(e, b"w:hAnsiTheme"))
-                .or_else(|| attr_val(e, b"w:cstheme"));
+            let theme = attr_val(e, b"w:asciiTheme").or_else(|| attr_val(e, b"w:hAnsiTheme"));
             if let Some(t) = theme {
                 style.font_theme = Some(t);
+            }
+            /* Issue #249 — the complex-script slot stays apart: an
+            Arabic run naming `w:ascii="Times New Roman"
+            w:cs="Simplified Arabic"` shapes its Latin with the first and
+            its Arabic with the second (`w:cs` alone no longer becomes the
+            Latin face either). `w:eastAsia` / `w:hint` stay unmodeled —
+            the writer carries them over from the source element. */
+            if let Some(fam) = attr_val(e, b"w:cs").and_then(|n| family_from_docx(&n)) {
+                style.font_family_cs = Some(fam);
+            }
+            if let Some(t) = attr_val(e, b"w:cstheme") {
+                style.font_theme_cs = Some(t);
             }
         }
         /* `<w:sz w:val="N"/>` and `<w:szCs w:val="N"/>` — N is half-points
