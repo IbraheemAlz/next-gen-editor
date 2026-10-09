@@ -122,6 +122,14 @@ export interface EngineClientLike {
     onRendererDowngrade?(fn: (d: RendererDowngrade | undefined) => void): () => void;
     retryGpuRenderer?(): Promise<void>;
     /**
+     * Issue #428 - switch the render backend IN PLACE (the Settings menu):
+     * the #270 retire-respawn path with the renderer pinned
+     * (`'canvas2d'`) or re-probed (`'vello'`). The document survives; a
+     * page reload is never involved. Implementations without it omit the
+     * method and the Settings menu shows the active renderer only.
+     */
+    setRenderer?(kind: 'vello' | 'canvas2d'): Promise<void>;
+    /**
      * Issue #330 - optional in-place engine restart for the crash overlay:
      * `restartInPlace` re-spawns the engine from the event log (joining a
      * recovery already under way), `prepareCarryOver` makes the next page
@@ -149,8 +157,19 @@ export interface EngineClientLike {
      */
     readonly previousSession?: PreviousSessionInfo | undefined;
     onPreviousSession?(fn: (p: PreviousSessionInfo | undefined) => void): () => void;
-    recoverPreviousSession?(): Promise<void>;
-    discardPreviousSession?(): Promise<void>;
+    recoverPreviousSession?(id?: string): Promise<void>;
+    discardPreviousSession?(id?: string): Promise<void>;
+    /**
+     * Issue #426 - the previous sessions form a ring (newest 3), not one
+     * slot: every entry still waiting for a decision, newest first (the
+     * `previousSession` above is the first). `id` on recover / discard
+     * picks an entry; `dismissPreviousSessions` records that the offer was
+     * seen and left undecided (they stay offered, and a full ring evicts
+     * them first).
+     */
+    readonly previousSessions?: PreviousSessionInfo[];
+    onPreviousSessions?(fn: (p: PreviousSessionInfo[]) => void): () => void;
+    dismissPreviousSessions?(): Promise<void>;
     readonly hasUnsavedChanges?: boolean;
     restartInPlace?(): Promise<void>;
     prepareCarryOver?(): Promise<void>;
@@ -167,6 +186,10 @@ export interface EngineClientLike {
 
 /** Issue #388 - see `EngineClientLike.previousSession`. */
 export interface PreviousSessionInfo {
+    /** Issue #426 - the ring entry's id (`recoverPreviousSession(id)`). */
+    id: string;
+    /** Issue #426 - `seen` once the offer was dismissed undecided. */
+    decision?: 'undecided' | 'seen';
     /** When the session was set aside (ms since the epoch). */
     archivedAt: number;
     /** When its last edit was journaled, when known. */

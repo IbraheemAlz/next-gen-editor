@@ -21,10 +21,21 @@
  *     drifted `document.xml` on a no-op save — that's a real bug even
  *     though `corpus-native` doesn't hard-fail on it),
  *   - lists layout-time outliers (the "layout-time outliers" bucket the
- *     issue calls for).
+ *     issue calls for),
+ *   - issue #380: a production-layout section - p50/p95/max
+ *     `engine_layout_ms` and CPU ms (#418), documents over the layout budget,
+ *     a histogram of `engine_degradations`, and a page-count diff against the
+ *     previous nightly artifact (`--prev`). A document that laid out in the
+ *     previous artifact and now has a CONFIRMED timeout (the #418 retry also
+ *     failed) is a layout REGRESSION: it is printed, emitted as a GitHub
+ *     `::warning::` annotation and listed in the JSON summary. A first-attempt
+ *     timeout the retry cleared is never flagged. `n/a` is reserved for files
+ *     that `read_docx` itself rejects (the engine-layout stage runs for every
+ *     document that reads, whatever the round-trip outcome).
  *
  * Usage:
  *   node report.mjs [--in /data/corpus/results.jsonl] [--json out.json] [--top 20]
+ *                   [--prev previous/results.jsonl] [--layout-budget-ms 10000]
  *
  * Exit code is always 0 — this is a reporting tool, not a gate (the issue's
  * nightly workflow is explicitly non-blocking, matching `qa-harness` in
@@ -40,6 +51,55 @@ const argValue = (flag, fallback) => {
 const IN_PATH = argValue('--in', '/data/corpus/results.jsonl');
 const JSON_OUT = argValue('--json', null);
 const TOP_N = Number(argValue('--top', '20'));
+const PREV_PATH = argValue('--prev', null);
+/* Mirrors corpus-native's DEFAULT_LAYOUT_BUDGET_MS. */
+const LAYOUT_BUDGET_MS = Number(argValue('--layout-budget-ms', '10000'));
+
+function percentile(sortedAsc, p) {
+    if (sortedAsc.length === 0) return null;
+    const rank = Math.ceil((p / 100) * sortedAsc.length) - 1;
+    return sortedAsc[Math.min(sortedAsc.length - 1, Math.max(0, rank))];
+}
+
+/** Compute the production-layout summary (issue #380) - exported shape is the JSON `layout` block. */
+function layoutSummary(records, prevRecords) {
+    const laidOut = records.filter((r) => typeof r.engine_layout_ms === 'number');
+    const ms = laidOut.map((r) => r.engine_layout_ms).sort((a, b) => a - b);
+    const cpu = records
+        .filter((r) => typeof r.engine_layout_cpu_ms === 'number')
+        .map((r) => r.engine_layout_cpu_ms)
+        .sort((a, b) => a - b);
+    const isEngineTimeout = (r) => r.outcome === 'timeout' && r.stage === 'engine_layout';
+    const overBudget = records.filter(
+        (r) => isEngineTimeout(r) || (typeof r.engine_layout_ms === 'number' && r.engine_layout_ms > LAYOUT_BUDGET_MS),
+    );
+    const degradations = new Map();
+    for (const r of records) {
+        for (const d of new Set(r.engine_degradations || [])) degradations.set(d, (degradations.get(d) || 0) + 1);
+    }
+    /* Documents the stage never reached = the file did not read. */
+    const notAvailable = records.filter(
+        (r) => typeof r.engine_layout_ms !== 'number' && typeof r.engine_layout_wall_ms !== 'number',
+    );
+    const pageDiffs = [];
+    const regressions = [];
+    if (prevRecords) {
+        const prev = new Map(prevRecords.map((r) => [r.path, r]));
+        for (const r of records) {
+            const p = prev.get(r.path);
+            if (!p) continue;
+            const prevLaidOut = typeof p.engine_layout_ms === 'number';
+            if (prevLaidOut && typeof r.engine_page_count === 'number' && p.engine_page_count !== r.engine_page_count) {
+                pageDiffs.push({ path: r.path, before: p.engine_page_count, after: r.engine_page_count });
+            }
+            const confirmed = r.outcome === 'timeout' && r.timeout_retry && r.timeout_retry.recovered === false;
+            if (prevLaidOut && confirmed && r.stage === 'engine_layout') {
+                regressions.push({ path: r.path, previous_ms: p.engine_layout_ms });
+            }
+        }
+    }
+    return { laidOut, ms, cpu, overBudget, degradations, notAvailable, pageDiffs, regressions };
+}
 
 function normalizeSignature(outcome, stage, message) {
     const normalized = (message || '')
@@ -68,6 +128,8 @@ function loadRecords(path) {
 
 function main() {
     const records = loadRecords(IN_PATH);
+    const prevRecords = PREV_PATH && existsSync(PREV_PATH) ? loadRecords(PREV_PATH) : null;
+    if (PREV_PATH && !prevRecords) console.warn(`[report] --prev ${PREV_PATH} not found; no page-count diff`);
     console.log(`[report] ${records.length} documents from ${IN_PATH}`);
 
     /* --- Outcome counts. --- */
@@ -248,6 +310,37 @@ function main() {
         );
     }
 
+    /* --- Production layout (issues #318 / #380 / #418). --- */
+    const L = layoutSummary(records, prevRecords);
+    const fmt = (v) => (v === null ? 'n/a' : `${v} ms`);
+    console.log(`\n=== Production layout (engine-wasm; budget ${LAYOUT_BUDGET_MS} ms CPU) ===`);
+    console.log(`  laid out: ${L.laidOut.length}/${records.length} (n/a - file does not read: ${L.notAvailable.length})`);
+    console.log(
+        `  engine_layout_ms     p50 ${fmt(percentile(L.ms, 50))} - p95 ${fmt(percentile(L.ms, 95))} - max ${fmt(L.ms.at(-1) ?? null)}`,
+    );
+    console.log(
+        `  engine_layout_cpu_ms p50 ${fmt(percentile(L.cpu, 50))} - p95 ${fmt(percentile(L.cpu, 95))} - max ${fmt(L.cpu.at(-1) ?? null)}`,
+    );
+    console.log(`  documents over budget: ${L.overBudget.length}`);
+    for (const r of L.overBudget.slice(0, TOP_N)) {
+        console.log(`    ${r.path} (cpu ${r.engine_layout_cpu_ms ?? '?'} ms, wall ${r.engine_layout_wall_ms ?? '?'} ms)`);
+    }
+    const sortedDeg = [...L.degradations.entries()].sort((a, b) => b[1] - a[1]);
+    console.log(`  degradation reasons (documents): ${sortedDeg.length === 0 ? 'none' : ''}`);
+    for (const [reason, count] of sortedDeg) console.log(`    ${String(count).padStart(4)}  ${reason}`);
+    if (prevRecords) {
+        console.log(`  page-count changes vs previous artifact: ${L.pageDiffs.length}`);
+        for (const d of L.pageDiffs.slice(0, TOP_N)) console.log(`    ${d.path} (${d.before} -> ${d.after})`);
+        console.log(`  LAYOUT REGRESSIONS (laid out before, confirmed timeout now): ${L.regressions.length}`);
+        for (const d of L.regressions) {
+            console.log(`    ${d.path} (previously ${d.previous_ms} ms)`);
+            /* GitHub Actions annotation - flags the run without failing it. */
+            console.log(`::warning title=corpus layout regression::${d.path} laid out in ${d.previous_ms} ms last night, now times out (confirmed by the lone retry)`);
+        }
+    } else {
+        console.log('  (no --prev artifact: page-count diff and regression flag skipped)');
+    }
+
     const summary = {
         total_documents: records.length,
         outcome_counts: outcomeCounts,
@@ -279,6 +372,17 @@ function main() {
             paragraphs: regenParagraphs,
             mismatched: regenMismatched,
             classes: Object.fromEntries(sortedRegenClasses),
+        },
+        layout: {
+            budget_ms: LAYOUT_BUDGET_MS,
+            laid_out: L.laidOut.length,
+            not_available: L.notAvailable.map((r) => r.path),
+            engine_layout_ms: { p50: percentile(L.ms, 50), p95: percentile(L.ms, 95), max: L.ms.at(-1) ?? null },
+            engine_layout_cpu_ms: { p50: percentile(L.cpu, 50), p95: percentile(L.cpu, 95), max: L.cpu.at(-1) ?? null },
+            over_budget: L.overBudget.map((r) => r.path),
+            degradations: Object.fromEntries(L.degradations),
+            page_count_changes: L.pageDiffs,
+            regressions: L.regressions,
         },
         layout_time_outliers: withLayoutTime.slice(0, 10).map((r) => ({
             path: r.path,

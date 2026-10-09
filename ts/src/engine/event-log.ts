@@ -46,11 +46,30 @@
  * COMMITTED, see `engine.worker.ts` `takeSnapshot`). */
 import type { Command } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
-const DB_NAME = 'engine-log';
+/** The primary database: the first tab's active log, the `archive` ring,
+ *  the origin-wide renderer streak. */
+export const PRIMARY_DB = 'engine-log';
+/** Issue #426 - a tab that does not own the primary log keeps its own
+ *  (`engine-log-<tab token>`, same schema); see `tab-session.ts`. */
+export const SECONDARY_DB_PREFIX = 'engine-log-';
 /* v2 (issue #212): the `packages` store + the snapshots `packageHash` index.
    v3 (issue #388): the `archive` store (the previous session's log, set
-   aside at boot until the user recovers or discards it). */
+   aside at boot until the user recovers or discards it). Issue #426 keeps
+   v3: the store is keyed by entry id, so the single `previous` row of #388
+   is simply the oldest legacy entry of the new ring. */
 const DB_VERSION = 3;
+/** The database `getDb()` returns by default - THIS context's active log.
+ *  Both the page and the worker call `setActiveLogDb` with the name the
+ *  page chose (`tab-session.ts`) before touching the log. */
+let activeDbName = PRIMARY_DB;
+
+export function setActiveLogDb(name: string): void {
+    activeDbName = name;
+}
+
+export function activeLogDb(): string {
+    return activeDbName;
+}
 /** Snapshots retained by `persistSnapshot`; older ones are pruned (§10.2). */
 const SNAPSHOTS_KEPT = 3;
 
@@ -192,9 +211,9 @@ function txDone(tx: IDBTransaction): Promise<void> {
     });
 }
 
-function openDb(): Promise<IDBDatabase> {
+function openDb(name: string): Promise<IDBDatabase> {
     return new Promise<IDBDatabase>((resolve, reject) => {
-        const open = indexedDB.open(DB_NAME, DB_VERSION);
+        const open = indexedDB.open(name, DB_VERSION);
         open.onupgradeneeded = () => {
             const db = open.result;
             if (!db.objectStoreNames.contains('commands')) {
@@ -222,7 +241,7 @@ function openDb(): Promise<IDBDatabase> {
                connection: let go, the next call re-opens. */
             db.onversionchange = () => {
                 db.close();
-                dbPromise = null;
+                dbPromises.delete(name);
             };
             resolve(db);
         };
@@ -231,14 +250,16 @@ function openDb(): Promise<IDBDatabase> {
     });
 }
 
-/** Lazily opened, cached connection — shared by every export below. */
-let dbPromise: Promise<IDBDatabase> | null = null;
+/** Lazily opened, cached connections - shared by every export below. */
+const dbPromises = new Map<string, Promise<IDBDatabase>>();
 
-function getDb(): Promise<IDBDatabase> {
-    const existing = dbPromise;
+function getDb(name: string = activeDbName): Promise<IDBDatabase> {
+    const existing = dbPromises.get(name);
     if (existing) return existing;
-    const fresh = openDb();
-    dbPromise = fresh;
+    const fresh = openDb(name);
+    dbPromises.set(name, fresh);
+    /* A failed open must not poison later calls. */
+    fresh.catch(() => dbPromises.delete(name));
     return fresh;
 }
 
@@ -275,8 +296,11 @@ export async function openEventLog(documentId: string): Promise<void> {
    `false` on the first document edit and back to `true` on a
    successful `SaveDocx`, an opened / closed / seeded document and an
    empty log. At boot, a log whose marker says "not clean" is not simply
-   cleared: it is copied into ONE `archive` row first (`archiveActiveLog`)
+   cleared: it is copied into the `archive` ring first (`archiveLog`)
    and offered back to the user (`restoreArchive` / `discardArchive`).
+   Issue #426: the ring keeps the newest 3 entries, each with a decision
+   state, and lives in the primary database; every tab's ACTIVE log is its
+   own database (`tab-session.ts`).
    Rows from before this marker have none, which reads as "unknown" =
    nothing to offer.
    =================================================================== */
@@ -288,17 +312,26 @@ interface CleanRow {
 }
 const CLEAN_ID = 'clean';
 const ARCHIVE_STORE = 'archive';
-const ARCHIVE_ID = 'previous';
+/** Issue #426 - sessions kept aside, newest N. */
+export const ARCHIVE_RING_SIZE = 3;
 
 /** The `meta` rows an archived session carries back with it. */
 const ARCHIVED_META_IDS = ['document', PRUNED_ID, PINNED_ID, CLEAN_ID, 'journal-gap'];
 
+/** Issue #426 - whether the user has seen the offer and moved on:
+ *  `undecided` = never offered, or offered and still open; `seen` = the
+ *  banner was dismissed without a decision. A full ring evicts `seen`
+ *  entries (oldest first) before it touches an `undecided` one. */
+export type ArchiveDecision = 'undecided' | 'seen';
+
 interface ArchiveRow {
-    id: typeof ARCHIVE_ID;
+    id: string;
     /** When the session was set aside (ms since the epoch). */
     archivedAt: number;
     /** When the archived log's last document edit was logged. */
     lastEditAt: number | undefined;
+    /** Issue #426 - per-entry decision state. Absent on a #388 row. */
+    decision?: ArchiveDecision;
     commands: CommandRow[];
     snapshots: SnapshotRow[];
     packages: PackageRow[];
@@ -317,11 +350,14 @@ export interface ActiveLogStatus {
     at: number | undefined;
 }
 
-/** The previous session held back for the user's decision. */
+/** A previous session held back for the user's decision. */
 export interface ArchiveInfo {
+    /** Issue #426 - the ring entry's id (`recoverPreviousSession(id)`). */
+    id: string;
     archivedAt: number;
     lastEditAt: number | undefined;
     commandCount: number;
+    decision: ArchiveDecision;
 }
 
 /** Persist the clean marker (the worker's off-critical-path write). */
@@ -343,8 +379,8 @@ export async function loadCleanMarker(): Promise<boolean | undefined> {
 }
 
 /** Look at the active log WITHOUT touching it (boot, before `INIT`). */
-export async function inspectActiveLog(): Promise<ActiveLogStatus> {
-    const db = await getDb();
+export async function inspectActiveLog(name: string = activeDbName): Promise<ActiveLogStatus> {
+    const db = await getDb(name);
     const tx = db.transaction(['commands', 'snapshots', 'meta'], 'readonly');
     const cmds = tx.objectStore('commands').count();
     const snaps = tx.objectStore('snapshots').count();
@@ -358,11 +394,13 @@ export async function inspectActiveLog(): Promise<ActiveLogStatus> {
     };
 }
 
-/** Copy the active log into the single `archive` row (replacing an older
- *  one - the newest unsaved session wins). Resolves once committed, so
- *  the caller may then let `INIT` clear the active stores. */
-export async function archiveActiveLog(): Promise<void> {
-    const db = await getDb();
+/** Issue #426 - copy the log of database `source` (default: this
+ *  context's active one) into a NEW entry of the `archive` ring, which
+ *  lives in the primary database whichever tab it came from. Resolves
+ *  once committed, so the caller may then let `INIT` clear the source (or
+ *  delete it). A full ring evicts per `ARCHIVE_RING_SIZE`. */
+export async function archiveLog(source: string = activeDbName): Promise<void> {
+    const db = await getDb(source);
     const read = db.transaction(['commands', 'snapshots', 'packages', 'meta'], 'readonly');
     const cmdReq = read.objectStore('commands').getAll();
     const snapReq = read.objectStore('snapshots').getAll();
@@ -370,10 +408,12 @@ export async function archiveActiveLog(): Promise<void> {
     const metaReqs = ARCHIVED_META_IDS.map((id) => read.objectStore('meta').get(id));
     await txDone(read);
     const commands = cmdReq.result as CommandRow[];
+    const now = Date.now();
     const row: ArchiveRow = {
-        id: ARCHIVE_ID,
-        archivedAt: Date.now(),
+        id: `a-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        archivedAt: now,
         lastEditAt: commands.at(-1)?.at,
+        decision: 'undecided',
         commands,
         snapshots: snapReq.result as SnapshotRow[],
         packages: pkgReq.result as PackageRow[],
@@ -381,66 +421,131 @@ export async function archiveActiveLog(): Promise<void> {
             .map((r) => r.result as Record<string, unknown> | undefined)
             .filter((r): r is Record<string, unknown> => r !== undefined),
     };
-    const write = db.transaction(ARCHIVE_STORE, 'readwrite');
-    write.objectStore(ARCHIVE_STORE).put(row);
+    const primary = await getDb(PRIMARY_DB);
+    const write = primary.transaction(ARCHIVE_STORE, 'readwrite');
+    const store = write.objectStore(ARCHIVE_STORE);
+    store.put(row);
+    /* Ring eviction, in the same transaction as the new entry. */
+    const all = store.getAll();
+    all.onsuccess = () => {
+        const rows = all.result as ArchiveRow[];
+        let over = rows.length - ARCHIVE_RING_SIZE;
+        const order = (r: ArchiveRow): number => (r.decision === 'seen' ? 0 : 1);
+        const victims = [...rows]
+            .filter((r) => r.id !== row.id)
+            .sort((x, y) => order(x) - order(y) || x.archivedAt - y.archivedAt);
+        while (over-- > 0 && victims.length > 0) {
+            const v = victims.shift()!;
+            console.warn(
+                `[event-log] archive ring full: dropping the ${v.decision ?? 'undecided'} ` +
+                    `session set aside at ${new Date(v.archivedAt).toISOString()}`,
+            );
+            store.delete(v.id);
+        }
+    };
     await txDone(write);
 }
 
-/** The archived previous session, if one is waiting for a decision. */
-export async function loadArchiveInfo(): Promise<ArchiveInfo | undefined> {
-    const db = await getDb();
+/** The archived previous sessions waiting for a decision, newest first. */
+export async function listArchive(): Promise<ArchiveInfo[]> {
+    const db = await getDb(PRIMARY_DB);
     const tx = db.transaction(ARCHIVE_STORE, 'readonly');
-    const req = tx.objectStore(ARCHIVE_STORE).get(ARCHIVE_ID);
+    const req = tx.objectStore(ARCHIVE_STORE).getAll();
     await txDone(tx);
-    const row = req.result as ArchiveRow | undefined;
-    if (!row) return undefined;
-    return {
-        archivedAt: row.archivedAt,
-        lastEditAt: row.lastEditAt,
-        commandCount: row.commands.length,
-    };
+    return (req.result as ArchiveRow[])
+        .map((row) => ({
+            id: row.id,
+            archivedAt: row.archivedAt,
+            lastEditAt: row.lastEditAt,
+            commandCount: row.commands.length,
+            decision: row.decision ?? 'undecided',
+        }))
+        .sort((a, b) => b.archivedAt - a.archivedAt);
 }
 
-/** Make the archived session the active log (one transaction: the active
- *  stores are replaced and the archive is removed together). Resolves
- *  `false` when there is no archive. */
-export async function restoreArchive(): Promise<boolean> {
-    const db = await getDb();
-    const tx = db.transaction(
-        ['commands', 'snapshots', 'meta', 'packages', ARCHIVE_STORE],
-        'readwrite',
-    );
-    const archive = tx.objectStore(ARCHIVE_STORE);
-    const req = archive.get(ARCHIVE_ID);
-    let restored = false;
-    req.onsuccess = () => {
-        const row = req.result as ArchiveRow | undefined;
-        if (!row) return;
-        restored = true;
-        tx.objectStore('commands').clear();
-        tx.objectStore('snapshots').clear();
-        tx.objectStore('packages').clear();
-        const meta = tx.objectStore('meta');
-        for (const id of ARCHIVED_META_IDS) meta.delete(id);
-        for (const c of row.commands) tx.objectStore('commands').put(c);
-        for (const s of row.snapshots) tx.objectStore('snapshots').put(s);
-        for (const p of row.packages) tx.objectStore('packages').put(p);
-        for (const m of row.meta) meta.put(m);
-        /* A session restored from the archive is, by construction, one
-           that had unsaved edits. */
-        meta.put({ id: CLEAN_ID, clean: false, at: Date.now() } satisfies CleanRow);
-        archive.delete(ARCHIVE_ID);
-    };
-    await txDone(tx);
-    return restored;
-}
-
-/** Throw the archived session away (the user chose Discard). */
-export async function discardArchive(): Promise<void> {
-    const db = await getDb();
+/** Issue #426 - mark entries as seen-and-dismissed (the banner's
+ *  Dismiss): they stay offered at the next boot but are evicted first. */
+export async function markArchiveSeen(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    const db = await getDb(PRIMARY_DB);
     const tx = db.transaction(ARCHIVE_STORE, 'readwrite');
-    tx.objectStore(ARCHIVE_STORE).delete(ARCHIVE_ID);
+    const store = tx.objectStore(ARCHIVE_STORE);
+    for (const id of ids) {
+        const req = store.get(id);
+        req.onsuccess = () => {
+            const row = req.result as ArchiveRow | undefined;
+            if (row) store.put({ ...row, decision: 'seen' } satisfies ArchiveRow);
+        };
+    }
     await txDone(tx);
+}
+
+/** Make archive entry `id` (default: the newest) the ACTIVE log of this
+ *  context. The active stores are replaced in one transaction; the entry is
+ *  removed afterwards - a crash in between leaves a duplicate offer, never a
+ *  lost session. Resolves `false` when there is no such entry. */
+export async function restoreArchive(id?: string): Promise<boolean> {
+    const entries = await listArchive();
+    const target = id === undefined ? entries[0]?.id : id;
+    if (target === undefined) return false;
+    const primary = await getDb(PRIMARY_DB);
+    const read = primary.transaction(ARCHIVE_STORE, 'readonly');
+    const req = read.objectStore(ARCHIVE_STORE).get(target);
+    await txDone(read);
+    const row = req.result as ArchiveRow | undefined;
+    if (!row) return false;
+    const db = await getDb();
+    const tx = db.transaction(['commands', 'snapshots', 'meta', 'packages'], 'readwrite');
+    tx.objectStore('commands').clear();
+    tx.objectStore('snapshots').clear();
+    tx.objectStore('packages').clear();
+    const meta = tx.objectStore('meta');
+    for (const mid of ARCHIVED_META_IDS) meta.delete(mid);
+    for (const c of row.commands) tx.objectStore('commands').put(c);
+    for (const sn of row.snapshots) tx.objectStore('snapshots').put(sn);
+    for (const p of row.packages) tx.objectStore('packages').put(p);
+    for (const m of row.meta) meta.put(m);
+    /* A session restored from the archive is, by construction, one that
+       had unsaved edits. */
+    meta.put({ id: CLEAN_ID, clean: false, at: Date.now() } satisfies CleanRow);
+    await txDone(tx);
+    await discardArchive(target);
+    return true;
+}
+
+/** Throw archive entry `id` away (the user chose Discard); without an id,
+ *  the newest entry. */
+export async function discardArchive(id?: string): Promise<void> {
+    const target = id ?? (await listArchive())[0]?.id;
+    if (target === undefined) return;
+    const db = await getDb(PRIMARY_DB);
+    const tx = db.transaction(ARCHIVE_STORE, 'readwrite');
+    tx.objectStore(ARCHIVE_STORE).delete(target);
+    await txDone(tx);
+}
+
+/** Issue #426 - delete a (secondary) tab database whose tab is gone. */
+export async function deleteLogDb(name: string): Promise<void> {
+    if (name === PRIMARY_DB) return;
+    const pending = dbPromises.get(name);
+    dbPromises.delete(name);
+    if (pending) (await pending.catch(() => undefined))?.close();
+    await new Promise<void>((resolve) => {
+        const req = indexedDB.deleteDatabase(name);
+        req.onsuccess = req.onerror = req.onblocked = () => resolve();
+    });
+}
+
+/** Issue #426 - names of the secondary tab databases that exist. */
+export async function listSecondaryDbs(): Promise<string[]> {
+    try {
+        const dbs = await indexedDB.databases();
+        return dbs
+            .map((d) => d.name ?? '')
+            .filter((n) => n.startsWith(SECONDARY_DB_PREFIX));
+    } catch {
+        return [];
+    }
 }
 
 /** Append one dispatched command to the durable log. */
@@ -664,7 +769,7 @@ export interface RendererStreak {
 const STREAK_ID = 'renderer-streak';
 
 export async function loadRendererStreak(): Promise<RendererStreak | undefined> {
-    const db = await getDb();
+    const db = await getDb(PRIMARY_DB);
     const tx = db.transaction('meta', 'readonly');
     const req = tx.objectStore('meta').get(STREAK_ID);
     await txDone(tx);
@@ -688,14 +793,14 @@ export async function loadRendererStreak(): Promise<RendererStreak | undefined> 
 }
 
 export async function saveRendererStreak(streak: RendererStreak): Promise<void> {
-    const db = await getDb();
+    const db = await getDb(PRIMARY_DB);
     const tx = db.transaction('meta', 'readwrite');
     tx.objectStore('meta').put({ id: STREAK_ID, ...streak });
     await txDone(tx);
 }
 
 export async function clearRendererStreak(): Promise<void> {
-    const db = await getDb();
+    const db = await getDb(PRIMARY_DB);
     const tx = db.transaction('meta', 'readwrite');
     tx.objectStore('meta').delete(STREAK_ID);
     await txDone(tx);
