@@ -633,7 +633,7 @@ fn one_warning() -> u32 {
 }
 
 /// Issue #406 — the class of a [`ReadWarning`]: one variant per
-/// `format_docx::DocxWarning` variant, PascalCase on the wire like
+/// `format_docx::DocxWarning` class, PascalCase on the wire like
 /// [`ErrorKind`]. The spelling is a stable telemetry code — never rename a
 /// variant, only add.
 #[derive(
@@ -648,8 +648,9 @@ pub enum ReadWarningKind {
     /// a number, `NaN`, infinite, a unit its type does not allow, negative
     /// where only non-negative values are legal); the default applies.
     InvalidMeasure,
-    /// Issue #349 / #407 — a measure attribute held a finite value outside
-    /// its range; it is used clamped.
+    /// Issue #349 / #407 — a measure attribute (twips, or a DrawingML /
+    /// VML EMU coordinate) held a finite value outside its range; it is
+    /// used clamped.
     MeasureClamped,
     /// Issue #350 — complex fields still open in their instruction part
     /// when their paragraph ended were closed there.

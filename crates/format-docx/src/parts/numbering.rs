@@ -378,24 +378,12 @@ pub fn parse_numbering_xml(xml: &[u8]) -> Result<NumberingDefinitions, DocxError
 }
 
 /// Parse `<w:ind w:start|left|end|right|firstLine|hanging>` exactly the same
-/// way `schema::ct_ppr` does. Inlined here so this module is free of the
-/// `apply_ppr` ParaProperties dependence — numbering only cares about
-/// indentation.
+/// way `schema::ct_ppr` does — issue #407: literally its `apply_ind`, so a
+/// level's indent goes through the measure reader too (unit suffixes, NaN /
+/// infinite rejected and reported, ±22 in clamp; `firstLine` / `hanging`
+/// are `ST_TwipsMeasure`, never negative).
 fn apply_lvl_ind(e: &BytesStart, ind: &mut Indent) {
-    let twips = |k: &[u8]| -> Option<i32> { attr_val(e, k).and_then(|v| v.trim().parse().ok()) };
-    if let Some(v) = twips(b"w:start").or_else(|| twips(b"w:left")) {
-        ind.start_twips = v;
-    }
-    if let Some(v) = twips(b"w:end").or_else(|| twips(b"w:right")) {
-        ind.end_twips = v;
-    }
-    if let Some(v) = twips(b"w:hanging") {
-        ind.hanging_twips = v;
-        ind.first_line_twips = 0;
-    } else if let Some(v) = twips(b"w:firstLine") {
-        ind.first_line_twips = v;
-        ind.hanging_twips = 0;
-    }
+    crate::schema::ct_ppr::apply_ind(e, ind);
 }
 
 /// Sprint 13 (#12) — serialize an engine `NumberingDefinitions` into

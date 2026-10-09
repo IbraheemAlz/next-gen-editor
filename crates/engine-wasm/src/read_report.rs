@@ -7,7 +7,7 @@
 //! document that opened with a clamped page margin or a regenerate-only
 //! part looked exactly like a clean open. [`bridge_read_warnings`] lowers
 //! them onto `Event::DocumentLoaded::warnings`: one bridge
-//! [`ReadWarningKind`] per reader variant (exhaustive — a new
+//! [`ReadWarningKind`] per reader warning class (exhaustive — a new
 //! `DocxWarning` variant does not compile until it is classified here),
 //! identical warnings coalesced into one entry with a `count`, first
 //! occurrence order kept.
@@ -20,7 +20,11 @@ fn kind_of(w: &DocxWarning) -> ReadWarningKind {
     match w {
         DocxWarning::TableNestingTooDeep { .. } => ReadWarningKind::TableNestingTooDeep,
         DocxWarning::InvalidMeasure { .. } => ReadWarningKind::InvalidMeasure,
-        DocxWarning::MeasureClamped { .. } => ReadWarningKind::MeasureClamped,
+        /* Issue #407 — an EMU coordinate clamped is the same class as a
+        twips measure clamped; the detail names the unit. */
+        DocxWarning::MeasureClamped { .. } | DocxWarning::EmuClamped { .. } => {
+            ReadWarningKind::MeasureClamped
+        }
         DocxWarning::UnclosedField { .. } => ReadWarningKind::UnclosedField,
         DocxWarning::StrayFieldChar { .. } => ReadWarningKind::StrayFieldChar,
         DocxWarning::FieldNestingTooDeep { .. } => ReadWarningKind::FieldNestingTooDeep,

@@ -23,7 +23,9 @@ use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
 use crate::schema::mce;
-use crate::schema::measure::{PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt};
+use crate::schema::measure::{
+    PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt, attr_measure_twips,
+};
 use crate::schema::source_markup::{
     MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_textless_run_child,
 };
@@ -774,12 +776,14 @@ fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
 }
 
 /// Audit gap A.M3 — parse one `<w:tab w:val w:pos/>` child.
-/// `w:val` defaults to `left`; `w:pos` is twips (signed integer per
-/// spec). Returns `None` for malformed entries (missing pos) so they
-/// don't pollute the stop list with NaNs.
+/// `w:val` defaults to `left`; `w:pos` is `ST_SignedTwipsMeasure`.
+/// Returns `None` for malformed entries (missing or unusable pos) so they
+/// don't pollute the stop list with NaNs. Issue #407 — through the
+/// measure reader: unit suffixes honoured, NaN / infinite rejected and
+/// reported, clamped to ±22 in.
 pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine::TabStop> {
     use crate::schema::ct_rpr::attr_val;
-    let pos_twips: i32 = attr_val(e, b"w:pos")?.trim().parse().ok()?;
+    let position_pt = attr_measure_pt(e, b"w:pos", SIGNED_TWIPS)?;
     let kind = match attr_val(e, b"w:val").as_deref().map(str::trim) {
         Some("center") => engine::TabKind::Center,
         Some("right") | Some("end") => engine::TabKind::Right,
@@ -788,7 +792,7 @@ pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine
         _ => engine::TabKind::Left,
     };
     Some(engine::TabStop {
-        position_pt: (pos_twips as f32) / 20.0,
+        position_pt,
         kind,
         /* Issue #81 — `w:leader` (TOC dot leaders). */
         leader: attr_val(e, b"w:leader")
@@ -878,9 +882,10 @@ impl SectPrAccum {
                 let num = attr_val(e, b"w:num")
                     .and_then(|v| v.trim().parse::<u8>().ok())
                     .unwrap_or(1);
-                let space = attr_val(e, b"w:space")
-                    .and_then(|v| v.trim().parse::<i32>().ok())
-                    .unwrap_or(720);
+                /* Issue #407 — `ST_TwipsMeasure` through the measure
+                reader (an unusable gutter keeps the 720 default and is
+                reported). */
+                let space = attr_measure_twips(e, b"w:space", TWIPS).unwrap_or(720);
                 if num > 1 {
                     self.columns = Some(engine::ColumnSpec::from_twips(num, space));
                 }

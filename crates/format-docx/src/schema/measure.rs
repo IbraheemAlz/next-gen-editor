@@ -22,6 +22,16 @@
 //! - finite but outside the range → clamped, with
 //!   [`DocxWarning::MeasureClamped`].
 //!
+//! Issue #407 extends the same reader to the attributes #349 left on ad
+//! hoc parses: tab stops (`<w:tab w:pos>`), `<w:cols w:space>`, cell
+//! margins (`<w:tcMar>` / `<w:tblCellMar>`), row heights
+//! (`<w:trHeight>`), numbering-level indents, `<w:defaultTabStop>` — and,
+//! through [`emu`] / [`attr_emu`] / [`text_emu`], to the DrawingML EMU
+//! coordinates (`<wp:extent>`, `<wp:simplePos>`, `<wp:posOffset>`, the
+//! anchor's wrap distances, text-box insets, `<a:ln w>`) and the CSS-ish
+//! VML `style` lengths ([`css_length_emu`]), which used to turn `NaN` into
+//! 0 and `inf` into `i64::MAX` through an `as i64` cast.
+//!
 //! The model never sees a non-finite value, so every verified passthrough
 //! (the `sectPr` bytes, a paragraph's `pPr`) re-derives the same model
 //! from the same bytes and a zero-edit save stays byte-identical — the
@@ -70,6 +80,30 @@ pub(crate) const PAGE_SIZE: MeasureSpec = MeasureSpec {
     max: MAX_TWIPS,
 };
 
+/// EMU per twip (914 400 EMU per inch / 1 440 twips per inch).
+pub(crate) const EMU_PER_TWIP: f64 = 635.0;
+
+/// Word's largest shape extent / offset, 22 in, in EMU (20 116 800) — the
+/// same bound as [`MAX_TWIPS`], and exactly DrawingML's `ST_LineWidth`
+/// maximum.
+pub(crate) const MAX_EMU: f64 = MAX_TWIPS * EMU_PER_TWIP;
+
+/// `ST_PositiveCoordinate` / `ST_WrapDistance` / `ST_LineWidth` (EMU) —
+/// drawing extents, wrap distances, line widths: non-negative, ≤ 22 in.
+pub(crate) const EMU_EXTENT: MeasureSpec = MeasureSpec {
+    signed: false,
+    min: 0.0,
+    max: MAX_EMU,
+};
+
+/// `ST_Coordinate` / `ST_Coordinate32` (EMU) — positions and offsets:
+/// signed, within ±22 in.
+pub(crate) const EMU_COORD: MeasureSpec = MeasureSpec {
+    signed: true,
+    min: -MAX_EMU,
+    max: MAX_EMU,
+};
+
 /// Twips per unit of a universal measure (ECMA-376 §22.9.2.15).
 fn unit_twips(unit: &str) -> Option<f64> {
     Some(match unit {
@@ -94,14 +128,40 @@ pub(crate) enum Measure {
     Invalid,
 }
 
+/// EMU per unit of a DrawingML coordinate: a bare integer is EMU; ISO
+/// 29500 also lets `ST_Coordinate` carry a universal measure.
+fn unit_emu(unit: &str) -> Option<f64> {
+    Some(match unit {
+        "" => 1.0,
+        "pt" => 12_700.0,
+        "in" => 914_400.0,
+        "cm" => 360_000.0,
+        "mm" => 36_000.0,
+        "pc" | "pi" => 152_400.0,
+        _ => return None,
+    })
+}
+
 /// Read `raw` under `spec` (see the module docs).
 pub(crate) fn measure(raw: &str, spec: MeasureSpec) -> Measure {
+    read_number(raw, spec, unit_twips)
+}
+
+/// [`measure`] for a DrawingML EMU coordinate (`spec` in EMU — see
+/// [`EMU_EXTENT`] / [`EMU_COORD`]).
+pub(crate) fn emu(raw: &str, spec: MeasureSpec) -> Measure {
+    read_number(raw, spec, unit_emu)
+}
+
+/// The shared number + unit reader: `per_unit` maps the (trimmed) unit
+/// suffix to the spec's unit, `None` for a unit the type does not allow.
+fn read_number(raw: &str, spec: MeasureSpec, per_unit: fn(&str) -> Option<f64>) -> Measure {
     let v = raw.trim();
     let split = v
         .find(|c: char| c.is_ascii_alphabetic() && c != 'e' && c != 'E')
         .unwrap_or(v.len());
     let (num, unit) = v.split_at(split);
-    let Some(per) = unit_twips(unit.trim()) else {
+    let Some(per) = per_unit(unit.trim()) else {
         return Measure::Invalid;
     };
     let num = num.trim();
@@ -117,17 +177,108 @@ pub(crate) fn measure(raw: &str, spec: MeasureSpec) -> Measure {
     let Ok(n) = num.parse::<f64>() else {
         return Measure::Invalid;
     };
-    let twips = n * per;
-    if !twips.is_finite() || (!spec.signed && twips < 0.0) {
+    in_range(n * per, spec)
+}
+
+/// Range-check a converted value under `spec`.
+fn in_range(v: f64, spec: MeasureSpec) -> Measure {
+    if !v.is_finite() || (!spec.signed && v < 0.0) {
         return Measure::Invalid;
     }
-    if twips < spec.min {
+    if v < spec.min {
         Measure::Clamped(spec.min)
-    } else if twips > spec.max {
+    } else if v > spec.max {
         Measure::Clamped(spec.max)
     } else {
-        Measure::Ok(twips)
+        Measure::Ok(v)
     }
+}
+
+/// Issue #407 — a CSS-ish VML length (`72pt`, `1in`, `2.54cm`, `10mm`,
+/// `96px`, `914400emu`, a bare number in `bare_emu` units) → EMU under
+/// `spec`, reporting to the reader report as `attr`.
+///
+/// VML `style` attributes legitimately hold spellings the model cannot
+/// place (`100%`, `auto`, `em` units): those stay a silent `None`, as
+/// before. A number that is not finite (`NaN`, `inf` — the old `as i64`
+/// cast turned them into 0 and `i64::MAX`) is reported as
+/// [`DocxWarning::InvalidMeasure`]; an out-of-range one is clamped and
+/// reported as [`DocxWarning::EmuClamped`].
+pub(crate) fn css_length_emu(
+    raw: &str,
+    bare_emu: f64,
+    spec: MeasureSpec,
+    attr: impl FnOnce() -> String,
+) -> Option<i64> {
+    let v = raw.trim();
+    let split = v
+        .find(|c: char| (c.is_ascii_alphabetic() && c != 'e' && c != 'E') || c == '%')
+        .unwrap_or(v.len());
+    let (num, unit) = v.split_at(split);
+    let num = num.trim();
+    let unit = unit.trim().to_ascii_lowercase();
+    let lower = v.to_ascii_lowercase();
+    let unsigned = lower.trim_start_matches(['+', '-']);
+    let spelled_non_finite = unsigned.starts_with("nan") || unsigned.starts_with("inf");
+    let per = match unit.as_str() {
+        "" => Some(bare_emu),
+        "pt" => Some(12_700.0),
+        "in" => Some(914_400.0),
+        "cm" => Some(360_000.0),
+        "mm" => Some(36_000.0),
+        "px" => Some(9_525.0),
+        "emu" => Some(1.0),
+        _ => None,
+    };
+    let lexically_numeric = !num.is_empty()
+        && num
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"+-.eE".contains(&b));
+    let parsed = match (per, lexically_numeric) {
+        (Some(per), true) => num.parse::<f64>().ok().map(|n| n * per),
+        _ => None,
+    };
+    let outcome = match parsed {
+        Some(v) => in_range(v, spec),
+        None if spelled_non_finite => Measure::Invalid,
+        None => return None,
+    };
+    report(outcome, raw, attr).map(|v| v.round() as i64)
+}
+
+/// Report a non-`Ok` outcome of an EMU read and return the usable value.
+fn report(outcome: Measure, raw: &str, attr: impl FnOnce() -> String) -> Option<f64> {
+    match outcome {
+        Measure::Ok(v) => Some(v),
+        Measure::Clamped(v) => {
+            warn(DocxWarning::EmuClamped {
+                attr: attr(),
+                value: raw.to_string(),
+                emu: v.round() as i64,
+            });
+            Some(v)
+        }
+        Measure::Invalid => {
+            warn(DocxWarning::InvalidMeasure {
+                attr: attr(),
+                value: raw.to_string(),
+            });
+            None
+        }
+    }
+}
+
+/// Issue #407 — [`emu`] of attribute `key` of `e`, as whole EMU, reporting
+/// an unusable or clamped value. `None` when absent or unusable.
+pub(crate) fn attr_emu(e: &BytesStart, key: &[u8], spec: MeasureSpec) -> Option<i64> {
+    let raw = attr_val(e, key)?;
+    report(emu(&raw, spec), &raw, || describe(e, key)).map(|v| v.round() as i64)
+}
+
+/// Issue #407 — [`emu`] of an element's TEXT content (`<wp:posOffset>`),
+/// reported as `element`. `None` when unusable.
+pub(crate) fn text_emu(text: &str, spec: MeasureSpec, element: &str) -> Option<i64> {
+    report(emu(text, spec), text.trim(), || element.to_string()).map(|v| v.round() as i64)
 }
 
 /// [`measure`] of attribute `key` of `e`, reporting an unusable or
@@ -167,7 +318,7 @@ pub(crate) fn attr_measure_twips(e: &BytesStart, key: &[u8], spec: MeasureSpec) 
 }
 
 /// `w:pgSz/@w:w`-style name of the attribute, for the reader report.
-fn describe(e: &BytesStart, key: &[u8]) -> String {
+pub(crate) fn describe(e: &BytesStart, key: &[u8]) -> String {
     format!(
         "{}/@{}",
         String::from_utf8_lossy(e.name().as_ref()),

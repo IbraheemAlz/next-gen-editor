@@ -74,12 +74,14 @@ pub fn parse_settings_xml(xml: &[u8]) -> Result<SettingsPart, DocxError> {
                 crate::parts::footnotes::apply_note_pr_child(name.as_ref(), &e, props);
             }
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:defaultTabStop" => {
-                out.default_tab_stop_twips = e
-                    .attributes()
-                    .flatten()
-                    .find(|a| a.key.as_ref() == b"w:val")
-                    .and_then(|a| a.unescape_value().ok())
-                    .and_then(|v| v.parse().ok());
+                /* Issue #407 — `ST_TwipsMeasure` through the measure
+                reader (NaN / negative rejected and reported, clamped). */
+                out.default_tab_stop_twips = crate::schema::measure::attr_measure_twips(
+                    &e,
+                    b"w:val",
+                    crate::schema::measure::TWIPS,
+                )
+                .and_then(|t| u32::try_from(t).ok());
             }
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:evenAndOddHeaders" => {
                 out.even_and_odd_headers = toggle_attr(e.attributes());

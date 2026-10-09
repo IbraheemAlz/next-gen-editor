@@ -1158,9 +1158,7 @@ fn handle_property_inner(
     if let Some(cell) = cur_cell.as_mut()
         && parent == b"w:tcMar"
     {
-        let twips: i32 = attr_val(e, b"w:w")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let twips = cell_margin_twips(e);
         let m = cell
             .props
             .cell_margins
@@ -1178,9 +1176,7 @@ fn handle_property_inner(
     Children are `<w:top>` / `<w:left|start>` / `<w:bottom>` /
     `<w:right|end>` with `w:w` twips. */
     if parent == b"w:tblCellMar" {
-        let twips: i32 = attr_val(e, b"w:w")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let twips = cell_margin_twips(e);
         let m = &mut props.cell_margins;
         match name {
             b"w:top" => m.top_twips = Some(twips),
@@ -1214,7 +1210,9 @@ fn handle_property_inner(
     {
         match name {
             b"w:trHeight" => {
-                let twips = attr_val(e, b"w:val").and_then(|v| v.parse().ok());
+                /* Issue #407 — `ST_TwipsMeasure` through the measure
+                reader: an unusable height leaves the row auto-sized. */
+                let twips = attr_measure_twips(e, b"w:val", TWIPS);
                 let rule = attr_val(e, b"w:hRule");
                 if let Some(t) = twips {
                     row.props.height = Some(match rule.as_deref() {
@@ -1282,6 +1280,14 @@ fn handle_property_inner(
             *slot = Some(parse_border_stroke(e));
         }
     }
+}
+
+/// One `<w:tcMar>` / `<w:tblCellMar>` edge's `w:w` in twips. Issue #407 —
+/// through the measure reader (`ST_TwipsMeasure`: a negative or non-finite
+/// padding is unusable and reported, a huge one clamped); an absent or
+/// unusable value reads as `CT_TblWidth`'s default 0, as before.
+fn cell_margin_twips(e: &BytesStart) -> i32 {
+    attr_measure_twips(e, b"w:w", TWIPS).unwrap_or(0)
 }
 
 /// `<w:tblW>` / `<w:tcW>` (`CT_TblWidth`). Issue #349 — a `dxa` value goes

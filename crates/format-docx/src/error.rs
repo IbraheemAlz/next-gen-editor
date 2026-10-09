@@ -63,6 +63,15 @@ pub enum DocxWarning {
         value: String,
         twips: i64,
     },
+    /// Issue #407 — a DrawingML / VML EMU coordinate (`wp:extent/@cx`,
+    /// `wp:posOffset`, a VML `style` length) held a finite `value` outside
+    /// its range (±22 in); the model uses it clamped to `emu`. The source
+    /// bytes are kept.
+    EmuClamped {
+        attr: String,
+        value: String,
+        emu: i64,
+    },
     /// Issue #350 — complex fields still open in their instruction part
     /// when their paragraph ended (`count` of them): closed there, so their
     /// hidden instruction never swallows the following paragraphs.
@@ -110,6 +119,7 @@ impl DocxWarning {
             DocxWarning::TableNestingTooDeep { .. }
             | DocxWarning::InvalidMeasure { .. }
             | DocxWarning::MeasureClamped { .. }
+            | DocxWarning::EmuClamped { .. }
             | DocxWarning::UnclosedField { .. }
             | DocxWarning::StrayFieldChar { .. }
             | DocxWarning::FieldNestingTooDeep { .. }
@@ -129,6 +139,9 @@ impl DocxWarning {
             DocxWarning::InvalidMeasure { attr, value } => format!("{attr} = \"{value}\""),
             DocxWarning::MeasureClamped { attr, value, twips } => {
                 format!("{attr} = \"{value}\" → {twips} twips")
+            }
+            DocxWarning::EmuClamped { attr, value, emu } => {
+                format!("{attr} = \"{value}\" → {emu} EMU")
             }
             DocxWarning::UnclosedField { count } => {
                 format!("{count} field(s) closed at the end of their paragraph")
