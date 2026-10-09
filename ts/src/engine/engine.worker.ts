@@ -140,6 +140,16 @@ const SNAPSHOT_EVERY = 200;
    SNAPSHOT_EVERY this bounds the replay tail to ≤ 200 commands during a
    typing burst and to ~0 once the user pauses. */
 const SNAPSHOT_IDLE_MS = 1500;
+/* Issue #333 - a failed snapshot WRITE (quota, aborted transaction) is
+   retried on its own clock, independent of new commands: an idle user
+   whose last checkpoint failed would otherwise keep a growing replay tail
+   until they typed again. Bounded exponential backoff; the attempt after
+   the last delay failing raises the "not being checkpointed" notice. A
+   success resets everything. */
+const SNAPSHOT_RETRY_DELAYS_MS = [2000, 4000, 8000];
+let snapshotWriteFailures = 0;
+let snapshotRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let checkpointWarned = false;
 let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
 /* Issue #85 — every in-flight event-log write, chained so the fault-
    injection hook can flush before trapping. A REAL trap loses whatever
@@ -1183,6 +1193,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             ok: true,
             evt,
             renderer,
+            /* Issue #330 - a boot that recovers (carry-over) never saw INIT's reply. */
+            crossOriginIsolated: self.crossOriginIsolated,
             restored,
             appliedCommands: recovered?.applied_commands ?? 0,
             snapshotFallbacks,
@@ -1520,6 +1532,7 @@ async function takeSnapshot(seq: number): Promise<void> {
             console.warn('[worker] engine snapshot failed', evt);
             return;
         }
+        const previousSnapshotAt = lastSnapshotAt;
         lastSnapshotAt = seq;
         const hash = evt.package_hash;
         let pkg: SnapshotPackage | undefined;
@@ -1544,6 +1557,7 @@ async function takeSnapshot(seq: number): Promise<void> {
         pinNextSnapshot = false;
         const write = persistSnapshot(seq, evt.bytes, pkg, { pin }).then(
             () => {
+                noteSnapshotWriteOk();
                 if (hash === undefined) return;
                 /* Issue #314 — only now is the package known stored. */
                 committedPackageHash = hash;
@@ -1551,6 +1565,11 @@ async function takeSnapshot(seq: number): Promise<void> {
             },
             (e: unknown) => {
                 console.warn('[worker] event-log snapshot failed', e);
+                /* Issue #333 - nothing was checkpointed at `seq`: let a
+                   retry (or the next command) snapshot this position
+                   again instead of skipping it as "already taken". */
+                if (lastSnapshotAt === seq) lastSnapshotAt = previousSnapshotAt;
+                noteSnapshotWriteFailed();
                 /* Issue #314 — the package may not be stored (this write
                    carried it, or the store lost it: `PackageMissingError`):
                    forget it, so the next snapshot re-ships the bytes. */
@@ -1565,6 +1584,45 @@ async function takeSnapshot(seq: number): Promise<void> {
         pendingLogWrites = pendingLogWrites.then(() => write);
     } catch (e: unknown) {
         console.warn('[worker] snapshot dispatch failed', e);
+    }
+}
+
+/** Issue #333 — a snapshot write landed: the failure run is over. */
+function noteSnapshotWriteOk(): void {
+    snapshotWriteFailures = 0;
+    if (snapshotRetryTimer !== undefined) {
+        clearTimeout(snapshotRetryTimer);
+        snapshotRetryTimer = undefined;
+    }
+    if (checkpointWarned) {
+        checkpointWarned = false;
+        self.postMessage({ notice: 'CHECKPOINT', state: 'ok', failures: 0 });
+    }
+}
+
+/** Issue #333 — a snapshot write failed: schedule the next bounded retry,
+ *  or, once the last one failed too, tell the shell. Every failure is
+ *  reported (`state: 'failed'`) so the shell can count it. */
+function noteSnapshotWriteFailed(): void {
+    snapshotWriteFailures += 1;
+    const delay = SNAPSHOT_RETRY_DELAYS_MS[snapshotWriteFailures - 1];
+    if (delay !== undefined) {
+        self.postMessage({ notice: 'CHECKPOINT', state: 'failed', failures: snapshotWriteFailures });
+        if (snapshotRetryTimer !== undefined) clearTimeout(snapshotRetryTimer);
+        snapshotRetryTimer = setTimeout(() => {
+            snapshotRetryTimer = undefined;
+            /* Like the idle timer: read the head INSIDE the queued task. */
+            void enqueue(() => takeSnapshot(logSequence));
+        }, delay);
+        return;
+    }
+    /* Retries exhausted. A later command-driven snapshot may still land
+       (and reset); until then the user must know the log is not
+       checkpointing. Warn once per failure run. */
+    self.postMessage({ notice: 'CHECKPOINT', state: 'failed', failures: snapshotWriteFailures });
+    if (!checkpointWarned) {
+        checkpointWarned = true;
+        self.postMessage({ notice: 'CHECKPOINT', state: 'exhausted', failures: snapshotWriteFailures });
     }
 }
 
@@ -1720,6 +1778,10 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
                 idleSnapshotTimer = undefined;
             }
             trapAfterCommands = null;
+            if (snapshotRetryTimer !== undefined) {
+                clearTimeout(snapshotRetryTimer);
+                snapshotRetryTimer = undefined;
+            }
             /* The respawned generation replays from here: snapshot the
                log head so its tail is empty (the commands are logged
                regardless — recovery would replay them without it). */

@@ -198,6 +198,15 @@ pub enum Command {
         #[serde(default)]
         #[tsify(optional)]
         defaults: Option<DocumentDefaults>,
+        /// Issue #348 — overrides for the reader's resource limits
+        /// (`format_docx::PackageLimits`: part / package byte budgets,
+        /// entry count, XML depth / element count). `None` (and every
+        /// field left unset) keeps the defaults sized to the worker budget.
+        /// A package past a limit is refused with `Event::Error { kind:
+        /// PackageTooLarge }`.
+        #[serde(default)]
+        #[tsify(optional)]
+        limits: Option<PackageLimitsOverride>,
     },
     SaveDocument {
         format: DocFormat,
@@ -860,17 +869,34 @@ pub enum Command {
     /// Sprint 7 (UI Edition) — accept a tracked-change revision
     /// addressed by top-level `block` index + byte `start` + byte
     /// `end`. Insert+Accept keeps text; Delete+Accept removes it.
+    /// Issue #304 — accepting either half of a tracked move resolves the
+    /// whole move (every move revision sharing its `move_name`).
     AcceptRevision {
         block: u32,
         start: u32,
         end: u32,
+        /// Issue #304 — the stable id `revisions_snapshot()` lists the
+        /// revision under (`revision_id`). When present it alone
+        /// addresses the revision — so the outer of two wrappers over one
+        /// range is reachable — and `block` / `start` / `end` are
+        /// ignored; an id that names no revision any more (already
+        /// resolved, its text edited) is a no-op. Absent: the range
+        /// addresses it, as before.
+        #[serde(default)]
+        #[tsify(optional)]
+        revision_id: Option<u32>,
     },
     /// Sprint 7 (UI Edition) — reject a tracked-change revision.
-    /// Insert+Reject removes text; Delete+Reject keeps it.
+    /// Insert+Reject removes text; Delete+Reject keeps it. Issue #304 —
+    /// rejecting either half of a tracked move rejects the whole move.
     RejectRevision {
         block: u32,
         start: u32,
         end: u32,
+        /// Issue #304 — see `AcceptRevision.revision_id`.
+        #[serde(default)]
+        #[tsify(optional)]
+        revision_id: Option<u32>,
     },
     /// Issue #262 — accept EVERY tracked change of the body (table cells
     /// included) in document order, as one undo step: deletions and move
@@ -1241,6 +1267,31 @@ pub struct DocumentDefaults {
     pub widow_control: Option<bool>,
 }
 
+/// Issue #348 — host overrides for the `.docx` reader's resource limits
+/// ([`Command::OpenDocument`]'s `limits`). `None` keeps the reader's
+/// default for that bound (`format_docx::PackageLimits::DEFAULT`: 64 MiB
+/// per part, 128 MiB per package, 10 000 entries, XML depth 256,
+/// 4 000 000 elements per part).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct PackageLimitsOverride {
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_part_bytes: Option<u64>,
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_total_bytes: Option<u64>,
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_entries: Option<u32>,
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_xml_depth: Option<u32>,
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_xml_elements: Option<u64>,
+}
+
 /// A sparse patch of inline text attributes — `None` fields are left
 /// Issue #21 — patch for a style's `<w:pPr>` half. A pragmatic subset
 /// of the paragraph surface (alignment / direction / line spacing /
@@ -1465,6 +1516,7 @@ mod tests {
                 format: DocFormat::Docx,
                 name: None,
                 defaults: None,
+                limits: None,
             } if bytes == vec![1, 2, 3]
         ));
 

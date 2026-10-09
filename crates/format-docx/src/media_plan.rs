@@ -25,7 +25,7 @@
 //!
 //! Unreferenced media (a picture inserted then deleted) is not written.
 
-use crate::opc::archive::RELS_XML;
+use crate::opc::part_names::PartNames;
 use crate::opc::relationships::parse_relationships;
 use engine::{Block, DocumentTree, InlineKind};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -166,18 +166,28 @@ fn rid_number(id: &str) -> Option<u32> {
 }
 
 /// Numeric suffix of a `word/media/imageK.<ext>` entry name.
-fn media_index(entry: &str) -> Option<u32> {
-    let base = entry.strip_prefix("word/media/image")?;
+fn media_index(entry: &str, media_dir: &str) -> Option<u32> {
+    let base = entry.strip_prefix(media_dir)?.strip_prefix("image")?;
     let (digits, _) = base.split_once('.')?;
     digits.parse().ok()
 }
 
 /// Plan the OPC additions for every image in `doc` the package `entries`
 /// (the source archive's non-`document.xml` entries) does not carry.
-pub(crate) fn plan_new_media(entries: &[(String, Vec<u8>)], doc: &DocumentTree) -> MediaPlan {
+pub(crate) fn plan_new_media(
+    entries: &[(String, Vec<u8>)],
+    doc: &DocumentTree,
+    names: &PartNames,
+) -> MediaPlan {
+    let part_dir = names.main.rsplit_once('/').map_or("", |(d, _)| d);
+    let media_dir = if part_dir.is_empty() {
+        "media/".to_string()
+    } else {
+        format!("{part_dir}/media/")
+    };
     let doc_rel_ids: HashSet<String> = entries
         .iter()
-        .find(|(n, _)| n == RELS_XML)
+        .find(|(n, _)| *n == names.main_rels)
         .and_then(|(_, b)| parse_relationships(b).ok())
         .map(|r| r.items.into_iter().map(|i| i.id).collect())
         .unwrap_or_default();
@@ -213,7 +223,7 @@ pub(crate) fn plan_new_media(entries: &[(String, Vec<u8>)], doc: &DocumentTree) 
         .collect();
     let mut next_media = entries
         .iter()
-        .filter_map(|(n, _)| media_index(n))
+        .filter_map(|(n, _)| media_index(n, &media_dir))
         .max()
         .unwrap_or(0)
         .saturating_add(1);
@@ -232,14 +242,14 @@ pub(crate) fn plan_new_media(entries: &[(String, Vec<u8>)], doc: &DocumentTree) 
         };
         let (extension, default_content_type) = media_extension_and_type(&blob.content_type);
         let entry_name = loop {
-            let candidate = format!("word/media/image{next_media}.{extension}");
+            let candidate = format!("{media_dir}image{next_media}.{extension}");
             next_media = next_media.saturating_add(1);
             if !entry_names.contains(&candidate.to_ascii_lowercase()) {
                 break candidate;
             }
         };
         let target = entry_name
-            .strip_prefix("word/")
+            .strip_prefix(&format!("{part_dir}/"))
             .unwrap_or(&entry_name)
             .to_string();
         if rel_id != model_id {
@@ -403,7 +413,7 @@ mod tests {
     fn plans_ids_above_every_rels_part_and_media_names_above_existing() {
         let entries = vec![
             (
-                RELS_XML.to_string(),
+                PartNames::default().main_rels,
                 rels(&[("rId3", "media/image1.png"), ("rId7", "media/image2.png")]),
             ),
             (
@@ -416,7 +426,7 @@ mod tests {
         ];
         /* `rId3` is imported (a document rel) — never planned. */
         let doc = doc_with_images(&["rId3", "nge_img_1"]);
-        let plan = plan_new_media(&entries, &doc);
+        let plan = plan_new_media(&entries, &doc, &PartNames::default());
         assert_eq!(plan.new_media.len(), 1);
         let m = &plan.new_media[0];
         assert_eq!(m.rel_id, "rId13");
@@ -450,7 +460,10 @@ mod tests {
     #[test]
     fn reader_resolved_pictures_are_not_planned() {
         let entries = vec![
-            (RELS_XML.to_string(), rels(&[("rId3", "media/image1.png")])),
+            (
+                PartNames::default().main_rels,
+                rels(&[("rId3", "media/image1.png")]),
+            ),
             (
                 "word/_rels/header1.xml.rels".to_string(),
                 rels(&[("rId12", "media/image2.png")]),
@@ -480,7 +493,7 @@ mod tests {
             });
         }
         doc.blocks = blocks.into_iter().collect();
-        assert!(plan_new_media(&entries, &doc).is_empty());
+        assert!(plan_new_media(&entries, &doc, &PartNames::default()).is_empty());
     }
 
     #[test]
@@ -493,7 +506,7 @@ mod tests {
                 data: vec![0],
             },
         );
-        assert!(plan_new_media(&[], &doc).is_empty());
+        assert!(plan_new_media(&[], &doc, &PartNames::default()).is_empty());
     }
 
     #[test]

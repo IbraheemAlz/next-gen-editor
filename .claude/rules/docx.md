@@ -38,6 +38,29 @@ paths:
   `DocxWarning::TableNestingTooDeep` on `DocxArchive::warnings`. Never add
   an unbounded recursion over attacker-shaped input (POI ships a 5000-deep
   17 KB file).
+- **Package limits (issue #348).** Every ZIP entry is read through
+  `opc::limits::read_entry_bounded` (`take(limit + 1)`) — never
+  `Vec::with_capacity(file.size())`: the central directory's declared size
+  is attacker-controlled (a 4 GiB claim trapped the wasm worker).
+  `PackageLimits` (64 MiB part / 128 MiB package / 10k entries / XML depth
+  256 / 4M elements per part; `read_docx_with_limits`, overridable from
+  `Command::OpenDocument.limits`) is checked before any typed walk — the
+  XML shape caps run over every part the reader may walk (every `.xml` /
+  `.rels` entry but custom XML data and `docProps/*` other than
+  `core.xml` — the #353 main part can live anywhere), and depth inside a
+  table nested past the #111 cap is not counted (it is opaque bytes). Overflow is
+  `DocxError::PackageTooLarge` → `Event::Error { kind: PackageTooLarge }`
+  (the shell's File-menu banner), never a trap.
+- **Measures (issue #349).** Page geometry, `<w:ind>`, `<w:spacing>` and
+  table widths go through `schema::measure` (`attr_measure*`): integer or
+  decimal twips, ECMA universal-measure units (`in` / `cm` / `mm` / `pt` /
+  `pc` / `pi`), never `NaN` / infinite (unusable → the default +
+  `DocxWarning::InvalidMeasure`), clamped to ±31 680 twips (Word's 22 in;
+  pages ≥ 144) with `DocxWarning::MeasureClamped`. Never parse a measure
+  with `f32::from_str` (it accepts `NaN`). Deep helpers report through
+  `error::warn` into the read's sink (`collect_read_warnings`; a no-op in
+  the writer's re-parses). Verified-reuse equality never uses float `==`:
+  `writer::same_section_props` compares geometry by bits.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:
@@ -63,6 +86,17 @@ The `tools/roundtrip/` harness asserts:
   (rank tables in `schema/ct_rpr.rs`, `ct_ppr.rs`, `ct_tbl.rs`).
 - The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole; its
   modeled children still seed the run baseline (`fold_rpr_fragment`).
+  Issue #293 — they are also modeled as `Paragraph::mark_style`
+  (`schema::ct_rpr::mark_rpr_style`; `None` = not modeled, the bag is the
+  truth): typing into an empty paragraph inherits it, `split_at` gives an
+  EMPTY half the insertion formatting at the split point, `concat` keeps
+  the surviving paragraph's. The writer re-emits the bag fragment while
+  `mark_rpr_style(fragment) == mark_style` (also a condition of the
+  verified pPr passthrough), else regenerates it from `mark_style` keeping
+  the fragment's unmodeled children (`unmodeled_rpr_children`) and the
+  source spelling of unchanged ones; the #262 mark revision is re-injected
+  after. Harness: `tools/roundtrip` step 40 (`paragraph_format.rs` — with
+  the #292 merge and the #297 style names).
 - **When you model a new child:** add it to the `*_child_is_modeled`
   predicate *and* emit it through the `PrChildren` sink in `writer.rs`
   at its rank — never both bag it and emit it (duplicate child).
@@ -139,6 +173,24 @@ the writer replays:
   object with no picture (shape, chart, OLE) has no regeneration and is
   ALWAYS written from its bytes — never dropped. Text boxes are stories
   (`InlineKind::TextBox`, issue #83) and splice through `parts::textbox`.
+- **Markup compatibility (issue #351).** `mc:AlternateContent` reads ONE
+  branch at every level — the first `mc:Choice` whose `Requires` prefixes
+  the reader understands (`schema::mce`: by URI when declared on the AC /
+  choice, else by conventional name — `wps`, `wpg`, `wpc`, `w14`, `w15`,
+  `w16*`, `wp14`, `a14`, VML, …), else the `mc:Fallback` — and keeps the
+  others as bytes: run level, `scan_drawing` / the text-box lowering scan
+  the selected branch of the whole-element capture (the writer's verified
+  re-scan decides identically from the same bytes); paragraph level, the
+  wrapper is an opener / closer marker pair (`MarkupCapture::
+  wrapper_start` — the run-level `<w:sdt>` mechanism, #245); block level
+  and between cells / rows, an envelope (`BlockEnvelopes`, like a
+  block-level `<w:sdt>`). Inside a cell paragraph the table walker skips
+  drawings / AC / text-box stories whole (`parse_cell_paragraph` owns
+  them), so a box's own `<w:p>` is never a cell block. An element whose
+  prefix the root's `mc:Ignorable` lists and whose namespace the reader
+  does not understand (`NamespaceScope::ignores_element`) is never walked
+  for content — kept verbatim between blocks / between runs; re-rooted
+  parses (cells, text-box stories) re-declare `mc:Ignorable`.
 - Known exception: a part with two `<w:body>` elements (POI's
   `MultipleBodyBug.docx`) gets the synthesized header.
 
@@ -245,14 +297,50 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   resolves text revisions per paragraph, then merges paragraphs for
   resolved marks per container from the end — a mark's changes in order,
   any one that removes the mark merges; a single Accept/Reject decides
-  the first — through `splice_text` + `remap_text_edit_record` /
+  the addressed one (by range: the first) — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
+  Issue #305 — the single `AcceptRevision` / `RejectRevision` is the
+  SAME resolver (`DocumentTree::resolve_revisions` with a
+  `RevisionPick::Only`, addressed by `engine::RevisionRef`); text leaves
+  a paragraph only through `revisions::remove_text` (one overlay-shift
+  rule: an inline object whose sentinel was removed goes with it), and
+  `markup-assert` checks every inline object still anchors on a U+FFFC.
+  Issue #304 — a `revisions_snapshot` row carries a stable
+  `revision_id` (`DocumentTree::revision_entries`: a content hash —
+  kind, author, date, `w:id`, move name, covered text — probed to be
+  unique in document order; nothing stored on the model), which
+  `AcceptRevision` / `RejectRevision` take instead of the range, so two
+  wrappers over one range — and each change of a mark carrying several
+  (`RevisionSlot::Mark(i)`, one row each) — are all reachable; resolving
+  either half of a tracked move resolves every move revision sharing its
+  `move_name`.
+- **Annotation ids (issue #295).** Regenerated content never prints a
+  tracked-change annotation `w:id` (`ins` / `del` / `moveFrom` /
+  `moveTo` / `rPrChange` / `pPrChange` / …) directly: `writer::
+  revision_ids` writes a KEEP-`n` token for an id the model carries
+  (`serialize_paragraph` tokenizes its whole output, verbatim run /
+  paragraph properties included) and a FRESH token for an engine-made
+  revision; `write_docx_inner` resolves them over every regenerated part
+  together (body first, then headers / footers, notes) — a KEEP keeps
+  its id the first time unless passthrough bytes of its own part spell
+  it, the rest get ids above every id in the package (fidelity first: an
+  id two source parts already shared is left alone). A run split in two (sub-
+  range formatting, a paragraph split, a writer cut) writes its
+  `<w:rPrChange>` once with the source id; range markers are never
+  rewritten; a save that regenerates nothing is untouched. The reader
+  also models a run's `<w:rPrChange>` as a `FormatChange` revision over
+  the run (`parts::format_change`: `prev_attrs` = the recorded rPr) —
+  the element still rides the grab bag; accepting drops it
+  (`SpanStyle::for_typing`), rejecting restores `prev_attrs`.
 - **Recording structural tracked changes (issues #301 / #298).** Enter
   with review mode on (`DocumentTree::tracked_split_paragraph`, engine
   `crates/engine/src/tracked.rs`) records the NEW mark — the one ending
   the left half, Word's `<w:ins/>` on the first paragraph — as inserted;
-  `split_paragraph` now carries the text revisions onto both halves
-  (a straddling change is cut; the right piece drops its source id). A
+  `split_at` carries the text revisions — and, issue #292, the
+  hyperlinks — onto both halves, so `split_paragraph`, tracked Enter, a
+  cross-paragraph delete's halves and clipboard slices all do (a
+  straddling change is cut once, `tracked::split_revisions`; the right
+  piece drops its source id, and `concat` re-joins the two pieces). A
   tracked deletion (`try_tracked_delete_range`; `tracked_delete_range`
   wraps it) works over any range inside ONE container: per paragraph the
   reviewer's own pending insertions are removed outright (the #265 path,
@@ -278,6 +366,20 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   equals `FieldSource::instruction` and outside a `<w:del>`; a
   `<w:fldSimple>` only while its element nests with every regenerated
   wrapper (`simple_field_nests`), else the complex form.
+- **Field phases (issue #350).** Text (`<w:t>`, `<w:delText>`, tabs,
+  breaks) never enters the visible paragraph while any open field is in
+  its instruction part (`field_code_hidden`) — a nested field's RESULT
+  there is code too: `IF { MERGEFIELD x } = …` shows only the IF's
+  result, the inner field gets no overlay and joins the outer
+  `Field::instruction` as `{ MERGEFIELD x }` (Word's code-view spelling);
+  its bytes ride the outer field's source prologue. Nesting is capped at
+  32 (`FieldCap`; deeper fields are hidden code), a `separate` / `end`
+  with no open field is ignored (its run kept verbatim), and a field
+  still in its instruction part at `</w:p>` is closed there
+  (`close_open_field_code`) — a stray `begin` can no longer hide every
+  later paragraph — with the broken code kept as one content marker
+  (`MarkupCapture::close_field_spans`). Result-part fields still span
+  paragraphs (TOC). Each case is a `DocxWarning`.
 - Offsets are remapped by `delete_text`, `split_at`, `concat` and — for
   every in-place text change — `Paragraph::splice_text` (`engine::
   text_remap`, issues #250 / #252), which returns the `TextEdit` the

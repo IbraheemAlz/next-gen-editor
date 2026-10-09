@@ -5,20 +5,20 @@
 
 use crate::error::DocxError;
 use crate::error::WriteNote;
-use crate::opc::archive::{
-    COMMENTS_EXTENDED_XML, COMMENTS_XML, DOC_XML, DocxArchive, ENDNOTES_XML, FOOTNOTES_XML,
-    NUMBERING_XML, RELS_XML, STYLES_XML, root_attributes,
-};
+#[cfg(test)]
+use crate::opc::archive::{DOC_XML, RELS_XML};
+use crate::opc::archive::{DocxArchive, root_attributes};
 use crate::parts::comments::{
     build_comments_extended_xml, build_comments_extended_xml_with_overrides, build_comments_xml,
 };
 use crate::parts::document::parse_sect_pr_fragment;
 use crate::parts::footnotes::emit_note_pr;
 use crate::parts::numbering::build_numbering_xml;
+use crate::schema::NsFamily;
 use crate::schema::block_envelope::EnvelopeStack;
 use crate::schema::comment_anchors;
 use crate::schema::ct_ppr::ppr_child_rank;
-use crate::schema::ct_rpr::rpr_child_rank;
+use crate::schema::ct_rpr::{mark_rpr_style, rpr_child_rank, unmodeled_rpr_children};
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::fragment_qname;
@@ -34,6 +34,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
+
+/// Issue #295 — package-unique tracked-change annotation ids.
+#[path = "writer_revision_ids.rs"]
+mod revision_ids;
 
 /// Standard OOXML document namespace boilerplate (matches what Word emits).
 const DOC_XML_HEADER: &str = concat!(
@@ -512,13 +516,14 @@ fn push_escaped_attr(text: &str, out: &mut String) {
     }
 }
 
-/// Emit the opening tag of a `<w:ins>` / `<w:del>` wrapper. `id` defaults
-/// to the writer-assigned fallback when the engine model carries none —
-/// Word requires `w:id` on every wrapper, the value must be unique within
-/// the document, but is otherwise opaque.
-fn emit_revision_open(rev: &Revision, fallback_id: u32, out: &mut String) {
+/// Emit the opening tag of a `<w:ins>` / `<w:del>` wrapper. Word requires
+/// `w:id` on every wrapper and the value must be unique within the
+/// document: issue #295 — the id is a [`revision_ids::token`] (the model's
+/// id, or a fresh one when the engine model carries none — an
+/// engine-made revision), resolved package-wide when the save finishes.
+fn emit_revision_open(rev: &Revision, out: &mut String) {
     let tag = revision_tag(rev.kind);
-    let id = rev.id.unwrap_or(fallback_id);
+    let id = revision_ids::token(rev.id);
     out.push_str(&format!("<{tag} w:id=\"{id}\""));
     if !rev.author.is_empty() {
         out.push_str(" w:author=\"");
@@ -582,9 +587,10 @@ fn jc_val(a: Alignment) -> &'static str {
 pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
     let mut out = String::with_capacity(1024);
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
-    out.push_str(
+    out.push_str(&crate::schema::family::to_family(
         "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
-    );
+        doc_family(doc),
+    ));
     out.push_str("<w:docDefaults><w:rPrDefault>");
     emit_rpr(&doc.style_run_defaults, &mut out);
     out.push_str("</w:rPrDefault><w:pPrDefault>");
@@ -596,9 +602,14 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
         let def = &doc.styles[id];
         out.push_str("<w:style w:type=\"paragraph\" w:styleId=\"");
         push_escaped_attr(id, &mut out);
-        out.push_str("\"><w:name w:val=\"");
-        push_escaped_attr(&def.name, &mut out);
-        out.push_str("\"/>");
+        out.push_str("\">");
+        /* Issue #297 — the display name as read (`heading 1`), not the
+        id; a style read without `<w:name>` (empty name) stays without. */
+        if !def.name.is_empty() {
+            out.push_str("<w:name w:val=\"");
+            push_escaped_attr(&def.name, &mut out);
+            out.push_str("\"/>");
+        }
         if let Some(parent) = &def.based_on {
             out.push_str("<w:basedOn w:val=\"");
             push_escaped_attr(parent, &mut out);
@@ -696,10 +707,39 @@ fn emit_ppr(
     populated stroke emits as a child; absent edges silently omit. */
     if let Some(b) = props.borders.as_ref() {
         let mut s = String::from("<w:pBdr>");
-        emit_border_edge("w:top", &b.top, &mut s);
-        emit_border_edge("w:left", &b.left, &mut s);
-        emit_border_edge("w:bottom", &b.bottom, &mut s);
-        emit_border_edge("w:right", &b.right, &mut s);
+        /* Issue #352 — an edge the source spelled `<w:start>` / `<w:end>`
+        keeps that spelling: the leading edge (left in LTR, right in RTL)
+        is `start`, the trailing one `end`. */
+        let rtl = props.direction == Some(engine::TextDirection::Rtl);
+        let sp = props.border_spelling;
+        let (left_name, right_name) = match (rtl, sp.start, sp.end) {
+            (false, start, end) => (
+                if start { "w:start" } else { "w:left" },
+                if end { "w:end" } else { "w:right" },
+            ),
+            (true, start, end) => (
+                if end { "w:end" } else { "w:left" },
+                if start { "w:start" } else { "w:right" },
+            ),
+        };
+        /* CT_PBdr is a sequence: top, start|left, bottom, end|right — rank
+        by the NAME written, not the physical slot (an RTL `start` edge
+        sits in the right slot but must precede `bottom`). */
+        let name_rank = |n: &str| match n {
+            "w:start" | "w:left" => 1,
+            "w:end" | "w:right" => 3,
+            _ => 0,
+        };
+        let mut edges = [
+            (0, "w:top", &b.top),
+            (name_rank(left_name), left_name, &b.left),
+            (2, "w:bottom", &b.bottom),
+            (name_rank(right_name), right_name, &b.right),
+        ];
+        edges.sort_by_key(|(rank, _, _)| *rank);
+        for (_, name, stroke) in edges {
+            emit_border_edge(name, stroke, &mut s);
+        }
         emit_border_edge("w:between", &b.inside_h, &mut s);
         s.push_str("</w:pBdr>");
         ch.push(rank(b"w:pBdr"), s);
@@ -850,6 +890,19 @@ fn serialize_paragraph(
     out: &mut String,
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
+    /* Issue #295 — every annotation id this paragraph writes (its verbatim
+    or regenerated run / paragraph properties included) becomes a token
+    the save resolves package-wide (`revision_ids`). */
+    let from = out.len();
+    serialize_paragraph_body(para, out, hyperlink_rel_map);
+    revision_ids::tokenize_annotations(out, from);
+}
+
+fn serialize_paragraph_body(
+    para: &Paragraph,
+    out: &mut String,
+    hyperlink_rel_map: &HashMap<String, String>,
+) {
     /* Issues #199 / #106 — the source paragraph's attributes (rsids,
     `w14:paraId` / `w14:textId`) and markup survive regeneration. */
     let markup = para.source_markup.as_deref();
@@ -873,6 +926,11 @@ fn serialize_paragraph(
         std::borrow::Cow::Owned(p)
     } else {
         std::borrow::Cow::Borrowed(&para.props)
+    };
+    /* Issue #293 — the mark's rPr spells the modeled mark style. */
+    let props = match with_mark_style(&props, para.mark_style.as_deref()) {
+        Some(p) => std::borrow::Cow::Owned(p),
+        None => props,
     };
     /* Issues #262 / #303 — the paragraph-mark revisions re-enter the
     mark's rPr, all of them, in order. */
@@ -1062,6 +1120,74 @@ fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
         /* Issues #262 / #303 — the bytes spell the paragraph-mark
         revisions. */
         && sp.mark_revisions == para.mark_revisions
+        /* Issue #293 — and the mark's run properties. */
+        && mark_rpr_is_current(&para.props, para.mark_style.as_deref())
+}
+
+/// Issue #293 — the paragraph-mark `<w:rPr>` fragment riding the pPr
+/// grab bag, if any.
+fn mark_rpr_fragment(props: &ParaProperties) -> Option<&[u8]> {
+    engine::GrabBag::fragments_of(&props.grab_bag)
+        .iter()
+        .find(|f| fragment_qname(f) == b"w:rPr")
+        .map(Vec::as_slice)
+}
+
+/// Issue #293 — `true` while the mark `<w:rPr>` in `props`' bag (or its
+/// absence) still spells `mark` (`Paragraph::mark_style`, modeled fields
+/// only); a `None` mark is not modeled — the bag is the truth.
+fn mark_rpr_is_current(props: &ParaProperties, mark: Option<&SpanStyle>) -> bool {
+    let Some(mark) = mark else {
+        return true;
+    };
+    let spelled = mark_rpr_fragment(props)
+        .map(mark_rpr_style)
+        .unwrap_or_default();
+    spelled
+        == SpanStyle {
+            grab_bag: None,
+            ..mark.clone()
+        }
+}
+
+/// Issue #293 — `props` with the mark `<w:rPr>` fragment regenerated from
+/// `mark` when the recorded one no longer spells it (`None` when it
+/// still does): the modeled children from `mark`, the recorded
+/// fragment's unmodeled ones (`<w:lang>`, `<w:rStyle>`, the
+/// `<w:rPrChange>` history …) kept, each unchanged child in its source
+/// spelling ([`emit_rpr_adopting`]). A mark with nothing to say drops
+/// the fragment.
+fn with_mark_style(props: &ParaProperties, mark: Option<&SpanStyle>) -> Option<ParaProperties> {
+    if mark_rpr_is_current(props, mark) {
+        return None;
+    }
+    let mark = mark?;
+    let old = mark_rpr_fragment(props);
+    let kept = old.map(unmodeled_rpr_children).unwrap_or_default();
+    let style = SpanStyle {
+        grab_bag: (!kept.is_empty()).then(|| Box::new(engine::GrabBag { fragments: kept })),
+        ..mark.clone()
+    };
+    let mut rpr = String::new();
+    emit_rpr_adopting(&style, old, &mut rpr);
+    let mut p = props.clone();
+    let bag = p.grab_bag.get_or_insert_with(Default::default);
+    let at = bag
+        .fragments
+        .iter()
+        .position(|f| fragment_qname(f) == b"w:rPr");
+    match (at, rpr.is_empty()) {
+        (Some(i), true) => {
+            bag.fragments.remove(i);
+        }
+        (Some(i), false) => bag.fragments[i] = rpr.into_bytes(),
+        (None, false) => bag.fragments.push(rpr.into_bytes()),
+        (None, true) => {}
+    }
+    if bag.fragments.is_empty() {
+        p.grab_bag = None;
+    }
+    Some(p)
 }
 
 /// Issues #262 / #303 — `props` with the paragraph-mark revisions `revs`
@@ -1083,7 +1209,9 @@ fn with_mark_revisions(props: &ParaProperties, revs: &[Revision]) -> ParaPropert
     let mut el = String::new();
     for rev in ordered {
         let mut one = String::new();
-        emit_revision_open(rev, 0, &mut one);
+        /* Issue #295 — a mark revision without a source id gets a fresh,
+        package-unique id (it used to be written as `w:id="0"`). */
+        emit_revision_open(rev, &mut one);
         /* `<w:ins …>` → `<w:ins …/>`: the mark element is empty. */
         one.pop();
         one.push_str("/>");
@@ -1368,7 +1496,6 @@ fn emit_styled_runs_with_objects(
     it opened (`None`: the standard end run). */
     let mut field_close: Vec<Option<&[u8]>> = Vec::new();
     let mut hyperlink_stack: Vec<&Hyperlink> = Vec::new();
-    let mut next_fallback_id: u32 = 1;
     /* Issues #199 / #106 — the `<w:r>` still open in `sink`: consecutive
     text / tab / break segments of ONE source run (same style, same
     deletion state, no markup emitted between them) share it, the way the
@@ -1483,9 +1610,7 @@ fn emit_styled_runs_with_objects(
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *r as *const _))
             {
-                let fallback = next_fallback_id;
-                next_fallback_id += 1;
-                emit_revision_open(r, fallback, out);
+                emit_revision_open(r, out);
                 rev_stack.push(r);
             }
         }
@@ -2178,10 +2303,11 @@ fn emit_anchored_image_drawing(
 /// the inline and anchored emitters. Byte-identical to the Phase 7 inline
 /// output (the visual-diff / round-trip fixtures pin it).
 fn emit_pic_graphic(rel_id: &str, cx: i64, cy: i64, out: &mut String) {
+    let graphic_data_uri = fam("http://schemas.openxmlformats.org/drawingml/2006/picture");
     out.push_str(&format!(
         "<wp:cNvGraphicFramePr/>\
          <a:graphic>\
-         <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+         <a:graphicData uri=\"{graphic_data_uri}\">\
          <pic:pic>\
          <pic:nvPicPr><pic:cNvPr id=\"0\" name=\"Image\"/><pic:cNvPicPr/></pic:nvPicPr>\
          <pic:blipFill>\
@@ -2705,7 +2831,9 @@ fn extra_root_attrs(declared: &str, extra: &[(String, String)]) -> String {
 /// goes through `write_docx`, which always has the archive in hand.
 #[cfg(test)]
 fn build_document_xml(doc: &DocumentTree, hyperlink_rel_map: &HashMap<String, String>) -> String {
-    build_document_xml_with_root(doc, hyperlink_rel_map, &[])
+    /* Issue #295 — standalone (no package save around it): resolve the
+    annotation-id tokens over this one part. */
+    revision_ids::finalize_one(build_document_xml_with_root(doc, hyperlink_rel_map, &[]))
 }
 
 /// `build_document_xml` re-declaring `root_attrs` (the source
@@ -2719,6 +2847,8 @@ fn build_document_xml_with_root(
     root_attrs: &[(String, String)],
 ) -> String {
     let mut out = String::with_capacity(2048);
+    /* Issue #325 — mint in the document's own namespace family. */
+    let _family = FamilyScope::enter(doc_family(doc));
     /* Issue #112 — the read-time page-size fallback (issue #109) the
     verified sectPr passthrough re-parses against; see
     `sect_pr_source_is_current`. */
@@ -2777,9 +2907,10 @@ fn build_document_xml_with_root(
         } else {
             DOC_XML_HEADER
         };
-        let extra = extra_root_attrs(header, root_attrs);
+        let header = fam(header);
+        let extra = extra_root_attrs(&header, root_attrs);
         if extra.is_empty() {
-            out.push_str(header);
+            out.push_str(&header);
         } else {
             /* Every header constant closes the root tag right before
             `<w:body>`; splice the carried declarations in there. */
@@ -2839,10 +2970,65 @@ fn sect_pr_source_is_current(props: &engine::SectionProps) -> bool {
     for this write), so an untouched section compares equal and an edited
     one does not. */
     let default_geometry = WRITE_DEFAULT_GEOMETRY.with(|g| g.get());
-    props
-        .source_xml
-        .as_deref()
-        .is_some_and(|src| parse_sect_pr_fragment(src, default_geometry) == props.without_source())
+    props.source_xml.as_deref().is_some_and(|src| {
+        same_section_props(&parse_sect_pr_fragment(src, default_geometry), props)
+    })
+}
+
+/// Issue #349 — verified-reuse equality of two sections' properties
+/// (`source_xml` ignored). Floats compare by their bits, never with `==`:
+/// a re-parse of the same bytes yields the same bits, and a `NaN` (which
+/// `==` never equals — it regenerated the section on every save) or a
+/// `-0.0` can neither defeat nor fool the check. Destructured so a new
+/// field cannot be silently left out.
+fn same_section_props(a: &engine::SectionProps, b: &engine::SectionProps) -> bool {
+    let engine::SectionProps {
+        geometry: ga,
+        header_refs,
+        footer_refs,
+        title_pg,
+        columns,
+        page_num,
+        section_type,
+        footnote_props,
+        endnote_props,
+        source_xml: _,
+    } = a;
+    let same = |x: f32, y: f32| x.to_bits() == y.to_bits();
+    let geometry_bits = |g: &engine::PageGeometry| {
+        let engine::PageGeometry {
+            width,
+            height,
+            margin_top,
+            margin_right,
+            margin_bottom,
+            margin_left,
+            header_offset,
+            footer_offset,
+        } = *g;
+        [
+            width,
+            height,
+            margin_top,
+            margin_right,
+            margin_bottom,
+            margin_left,
+            header_offset,
+            footer_offset,
+        ]
+        .map(f32::to_bits)
+    };
+    let engine::ColumnSpec { count, gutter_pt } = *columns;
+    geometry_bits(ga) == geometry_bits(&b.geometry)
+        && *header_refs == b.header_refs
+        && *footer_refs == b.footer_refs
+        && *title_pg == b.title_pg
+        && count == b.columns.count
+        && same(gutter_pt, b.columns.gutter_pt)
+        && *page_num == b.page_num
+        && *section_type == b.section_type
+        && *footnote_props == b.footnote_props
+        && *endnote_props == b.endnote_props
 }
 
 thread_local! {
@@ -2851,6 +3037,52 @@ thread_local! {
     /// document in hand.
     static WRITE_DEFAULT_GEOMETRY: std::cell::Cell<engine::PageGeometry> =
         const { std::cell::Cell::new(engine::PageGeometry::a4()) };
+    /// Issue #325 — the ISO 29500 namespace family of the document being
+    /// written (its `w` URI): every namespace URI / relationship type the
+    /// writer MINTS goes through [`fam`] / [`mint_root`], so a saved Strict
+    /// package never becomes a Transitional / Strict hybrid.
+    static WRITE_FAMILY: std::cell::Cell<NsFamily> =
+        const { std::cell::Cell::new(NsFamily::Transitional) };
+}
+
+/// RAII guard: sets [`WRITE_FAMILY`] for the duration of one write.
+struct FamilyScope(NsFamily);
+
+impl FamilyScope {
+    fn enter(family: NsFamily) -> Self {
+        Self(WRITE_FAMILY.with(|f| f.replace(family)))
+    }
+}
+
+impl Drop for FamilyScope {
+    fn drop(&mut self) {
+        WRITE_FAMILY.with(|f| f.set(self.0));
+    }
+}
+
+/// The family a tree was read in: the `w` URI of its captured root tag,
+/// else of its recorded root attributes; Transitional for an
+/// engine-authored tree.
+fn doc_family(doc: &DocumentTree) -> NsFamily {
+    if doc.document_envelope.is_captured() {
+        return crate::schema::family::family_of_root_tag(&doc.document_envelope.root_tag);
+    }
+    doc.document_root_attrs
+        .iter()
+        .find(|(k, _)| k == "xmlns:w")
+        .and_then(|(_, v)| crate::schema::family::family_of_w_uri(v))
+        .unwrap_or_default()
+}
+
+/// A minted string (Transitional spelling in source) in the current
+/// write's namespace family.
+fn fam(s: &str) -> Cow<'_, str> {
+    crate::schema::family::to_family(s, WRITE_FAMILY.with(|f| f.get()))
+}
+
+/// A minted part's root start tag in the current write's family.
+fn mint_root(part: Vec<u8>) -> Vec<u8> {
+    crate::schema::family::root_tag_to_family(part, WRITE_FAMILY.with(|f| f.get()))
 }
 
 /// Issue #112 — the namespace bindings the rendered `body` needs from the
@@ -2884,11 +3116,13 @@ fn bindings_used_by(body: &str, needs_wps: bool) -> Vec<(&'static str, &'static 
         ),
         ("wps", crate::parts::textbox::NS_WPS),
     ];
+    let family = WRITE_FAMILY.with(|f| f.get());
     CANDIDATES
         .into_iter()
         .filter(|(prefix, _)| {
             *prefix == "w" || (*prefix == "wps" && needs_wps) || unbound.contains(*prefix)
         })
+        .map(|(prefix, uri)| (prefix, crate::schema::family::uri_in(uri, family)))
         .collect()
 }
 
@@ -3099,6 +3333,8 @@ pub fn write_docx_with_notes(
     doc: &DocumentTree,
 ) -> Result<(Vec<u8>, Vec<WriteNote>), DocxError> {
     let _source_scope = AgainstSourceScope::enter(true);
+    /* Issue #325 — every URI / rel type minted below follows the source's family. */
+    let _family = FamilyScope::enter(doc_family(doc));
     let outer = WRITE_NOTES.with(|c| c.borrow_mut().replace(Vec::new()));
     let res = write_docx_inner(archive, doc);
     let notes = WRITE_NOTES.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
@@ -3108,10 +3344,15 @@ pub fn write_docx_with_notes(
 /// [`write_docx`] without choosing whether recorded source markup is
 /// trusted — the caller has set [`WRITE_AGAINST_SOURCE`].
 fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    let names = &archive.part_names;
+    let main_dir_prefix = match names.main.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/"),
+        None => String::new(),
+    };
     /* Issue #135 — images inserted after open: plan their media parts,
     package relationship ids and content-type defaults, and write from a
     copy of the tree whose image references carry the package ids. */
-    let media_plan = crate::media_plan::plan_new_media(&archive.other_entries, doc);
+    let media_plan = crate::media_plan::plan_new_media(&archive.other_entries, doc, names);
     let renamed_doc;
     let doc: &DocumentTree = if media_plan.renames.is_empty() {
         doc
@@ -3126,11 +3367,14 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o644);
 
-        let comments_already_present = archive.other_entries.iter().any(|(n, _)| n == COMMENTS_XML);
+        let comments_already_present = archive
+            .other_entries
+            .iter()
+            .any(|(n, _)| n == names.comments.as_str());
         let extended_already_present = archive
             .other_entries
             .iter()
-            .any(|(n, _)| n == COMMENTS_EXTENDED_XML);
+            .any(|(n, _)| n == names.comments_extended.as_str());
 
         /* L1.2 (#18) — synthesize `word/comments.xml` only when the
         archive carries no `comments.xml` AND the engine holds at least
@@ -3149,7 +3393,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         let (comments_bytes, minted_paraids): (Option<Vec<u8>>, HashMap<u32, String>) =
             if any_unminted_resolved && !comments_already_present {
                 let (bytes, map) = build_comments_xml(&doc.comment_defs);
-                (Some(bytes), map)
+                (Some(mint_root(bytes)), map)
             } else {
                 (None, HashMap::new())
             };
@@ -3180,7 +3424,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         verbatim — round-trip remains byte-identical for documents
         that never touched a list. */
         let numbering_bytes: Option<Vec<u8>> = if doc.numbering.dirty {
-            Some(build_numbering_xml(&doc.numbering))
+            Some(mint_root(build_numbering_xml(&doc.numbering)))
         } else {
             None
         };
@@ -3192,7 +3436,10 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         } else {
             None
         };
-        let styles_already_present = archive.other_entries.iter().any(|(n, _)| n == STYLES_XML);
+        let styles_already_present = archive
+            .other_entries
+            .iter()
+            .any(|(n, _)| n == names.styles.as_str());
         /* Issue #202 — paragraphs only inheriting their direction keep it
         on styles.xml, not as a direct `<w:bidi/>`. */
         let _inherited_directions =
@@ -3204,23 +3451,23 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         let settings_already_present = archive
             .other_entries
             .iter()
-            .any(|(n, _)| n == crate::opc::archive::SETTINGS_XML);
+            .any(|(n, _)| n == names.settings.as_str());
         let settings_bytes: Option<Vec<u8>> = if doc.settings_dirty {
             let existing = archive
                 .other_entries
                 .iter()
-                .find(|(n, _)| n == crate::opc::archive::SETTINGS_XML)
+                .find(|(n, _)| n == names.settings.as_str())
                 .and_then(|(_, b)| std::str::from_utf8(b).ok());
             match existing {
                 Some(xml) => Some(
                     patch_settings_even_odd(xml, doc.settings.even_and_odd_headers).into_bytes(),
                 ),
                 None if doc.settings.even_and_odd_headers => Some(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                    fam("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
                      <w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
-                     <w:evenAndOddHeaders/></w:settings>"
-                        .to_string()
-                        .into_bytes(),
+                     <w:evenAndOddHeaders/></w:settings>")
+                    .into_owned()
+                    .into_bytes(),
                 ),
                 None => None,
             }
@@ -3258,14 +3505,14 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 };
                 (present, Some(build_notes_xml(kind, doc, &root_attrs)))
             };
-        let (footnotes_present, footnotes_bytes) = notes_plan(
+        let (footnotes_present, mut footnotes_bytes) = notes_plan(
             engine::NoteKind::Footnote,
-            FOOTNOTES_XML,
+            names.footnotes.as_str(),
             doc.notes_dirty.footnotes,
         );
-        let (endnotes_present, endnotes_bytes) = notes_plan(
+        let (endnotes_present, mut endnotes_bytes) = notes_plan(
             engine::NoteKind::Endnote,
-            ENDNOTES_XML,
+            names.endnotes.as_str(),
             doc.notes_dirty.endnotes,
         );
         let synth_footnotes = !footnotes_present && footnotes_bytes.is_some();
@@ -3273,7 +3520,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         let numbering_already_present = archive
             .other_entries
             .iter()
-            .any(|(n, _)| n == NUMBERING_XML);
+            .any(|(n, _)| n == names.numbering.as_str());
 
         /* L1.2 (#18) — when comments.xml or commentsExtended.xml is
         being synthesized on a fresh document, splice the matching
@@ -3287,7 +3534,10 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         `r:id`, reserving the id range `synth_comments`/`synth_extended`
         are about to consume from the SAME rels part so neither minting
         pass can collide with the other. */
-        let rels_entry = archive.other_entries.iter().find(|(n, _)| n == RELS_XML);
+        let rels_entry = archive
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == names.main_rels.as_str());
         let rels_already_present = rels_entry.is_some();
         let existing_rels_str: Option<&str> =
             rels_entry.and_then(|(_, b)| std::str::from_utf8(b).ok());
@@ -3367,17 +3617,23 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 file name derives from it. */
                 let (part_name, exists) = match existing_rels.items.iter().find(|r| &r.id == rid) {
                     Some(rel) => {
-                        /* Rels targets are `word/`-relative. */
-                        let target = if rel.target.starts_with("word/") {
-                            rel.target.clone()
-                        } else {
-                            format!("word/{}", rel.target)
-                        };
+                        /* Rels targets are relative to the main part
+                        (issue #353: `word/` for the usual layout). */
+                        let target = crate::opc::archive::resolve_in_package(
+                            &archive.other_entries,
+                            names.main.as_str(),
+                            &rel.target,
+                        );
                         (target, true)
                     }
                     None => {
                         let prefix = if header { "header" } else { "footer" };
-                        let name = next_hf_part_name(prefix, &archive.other_entries, planned);
+                        let name = next_hf_part_name(
+                            prefix,
+                            &archive.other_entries,
+                            planned,
+                            &main_dir_prefix,
+                        );
                         planned.push(name.clone());
                         (name, false)
                     }
@@ -3494,19 +3750,23 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
             for part in &m.parts {
                 use crate::media_plan::StoryPart;
                 let rels_name = match part {
-                    StoryPart::Body => Some(RELS_XML.to_string()),
+                    StoryPart::Body => Some(names.main_rels.to_string()),
                     StoryPart::Header(rid) | StoryPart::Footer(rid) => hf_new_parts
                         .iter()
                         .find(|(r, ..)| r == rid)
                         .map(|(_, part_name, ..)| part_name.clone())
                         .or_else(|| {
-                            existing_rels
-                                .by_id(rid)
-                                .map(|rel| crate::parts::rels::resolve_target(&rel.target))
+                            existing_rels.by_id(rid).map(|rel| {
+                                crate::opc::archive::resolve_in_package(
+                                    &archive.other_entries,
+                                    names.main.as_str(),
+                                    &rel.target,
+                                )
+                            })
                         })
                         .map(|part_name| hf_part_rels_name(&part_name)),
-                    StoryPart::Footnotes => Some(hf_part_rels_name(FOOTNOTES_XML)),
-                    StoryPart::Endnotes => Some(hf_part_rels_name(ENDNOTES_XML)),
+                    StoryPart::Footnotes => Some(hf_part_rels_name(names.footnotes.as_str())),
+                    StoryPart::Endnotes => Some(hf_part_rels_name(names.endnotes.as_str())),
                 };
                 if let Some(rels_name) = rels_name {
                     media_rels_rows
@@ -3522,8 +3782,54 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 media_ct_defaults.push((m.extension, m.default_content_type));
             }
         }
-        let body_media_rows = media_rels_rows.get(RELS_XML).cloned().unwrap_or_default();
+        let body_media_rows = media_rels_rows
+            .get(names.main_rels.as_str())
+            .cloned()
+            .unwrap_or_default();
         let mut media_rels_written: Vec<String> = Vec::new();
+
+        /* Issue #295 — build the body now (it is still written last) and
+        resolve the tracked-change annotation-id tokens of every part this
+        save regenerates together, in document order (body, headers /
+        footers, notes), so no `w:id` repeats across the package; the parts
+        written through untouched reserve the ids they spell. */
+        let mut doc_xml = build_document_xml_with_root(
+            doc,
+            &hyperlink_rid_by_target,
+            &archive.document_root_attrs,
+        )
+        .into_bytes();
+        {
+            let mut reserved = std::collections::HashSet::new();
+            for (name, bytes) in &archive.other_entries {
+                let regenerated = hf_replacements.contains_key(name.as_str())
+                    || (name == names.footnotes.as_str() && footnotes_bytes.is_some())
+                    || (name == names.endnotes.as_str() && endnotes_bytes.is_some())
+                    || (name == names.styles.as_str() && styles_bytes.is_some())
+                    || (name == names.numbering.as_str() && numbering_bytes.is_some())
+                    || (name == names.comments.as_str() && comments_bytes.is_some());
+                if !regenerated
+                    && name.starts_with(main_dir_prefix.as_str())
+                    && name.ends_with(".xml")
+                {
+                    revision_ids::literal_ids(bytes, &mut reserved);
+                }
+            }
+            let mut hf: Vec<(&String, &mut Vec<u8>)> = hf_replacements
+                .iter_mut()
+                .chain(
+                    hf_new_parts
+                        .iter_mut()
+                        .map(|(_, name, bytes, ..)| (&*name, bytes)),
+                )
+                .collect();
+            hf.sort_by(|a, b| a.0.cmp(b.0));
+            let mut parts: Vec<&mut Vec<u8>> = vec![&mut doc_xml];
+            parts.extend(hf.into_iter().map(|(_, bytes)| bytes));
+            parts.extend(footnotes_bytes.as_mut());
+            parts.extend(endnotes_bytes.as_mut());
+            revision_ids::finalize(&mut parts, &reserved);
+        }
 
         /* Write sibling entries verbatim, in original order — except
         for parts we have a regenerated copy for (replace in-place).
@@ -3532,11 +3838,11 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         part on a fresh document. */
         for (name, bytes) in &archive.other_entries {
             zip.start_file(name, opts)?;
-            if name == COMMENTS_EXTENDED_XML
+            if name == names.comments_extended.as_str()
                 && let Some(new_bytes) = extended_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
-            } else if name == COMMENTS_XML
+            } else if name == names.comments.as_str()
                 && let Some(new_bytes) = comments_bytes.as_deref()
             {
                 /* Synthesis path is guarded behind `!comments_already_present`;
@@ -3544,27 +3850,27 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 `None` and this branch is unreachable. Kept defensive for
                 the case where the gate evolves. */
                 zip.write_all(new_bytes)?;
-            } else if name == NUMBERING_XML
+            } else if name == names.numbering.as_str()
                 && let Some(new_bytes) = numbering_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
-            } else if name == STYLES_XML
+            } else if name == names.styles.as_str()
                 && let Some(new_bytes) = styles_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
-            } else if name == FOOTNOTES_XML
+            } else if name == names.footnotes.as_str()
                 && let Some(new_bytes) = footnotes_bytes.as_deref()
             {
                 /* Issue #80 — an edited note part. */
                 zip.write_all(new_bytes)?;
-            } else if name == ENDNOTES_XML
+            } else if name == names.endnotes.as_str()
                 && let Some(new_bytes) = endnotes_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
             } else if let Some(new_bytes) = hf_replacements.get(name.as_str()) {
                 /* Phase 3 (#39) — an edited imported header/footer part. */
                 zip.write_all(new_bytes)?;
-            } else if name != RELS_XML
+            } else if name != names.main_rels.as_str()
                 && let Some(rows) = media_rels_rows.get(name.as_str())
             {
                 /* Issue #135 — a header / footer / note part's rels gains
@@ -3580,7 +3886,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 /* Issue #72 — a regenerated part's rels file (additive
                 splice; foreign rows survive). */
                 zip.write_all(new_bytes)?;
-            } else if name == crate::opc::archive::SETTINGS_XML
+            } else if name == names.settings.as_str()
                 && let Some(new_bytes) = settings_bytes.as_deref()
             {
                 /* Issue #74 — patched-in-place settings.xml. */
@@ -3607,7 +3913,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 if synth_comments {
                     patched = match inject_content_type_override(
                         &patched,
-                        COMMENTS_PART_NAME,
+                        format!("/{}", names.comments.as_str()).as_str(),
                         COMMENTS_CONTENT_TYPE,
                     ) {
                         Cow::Borrowed(_) => patched,
@@ -3617,7 +3923,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 if synth_extended {
                     patched = match inject_content_type_override(
                         &patched,
-                        COMMENTS_EXT_PART_NAME,
+                        format!("/{}", names.comments_extended.as_str()).as_str(),
                         COMMENTS_EXT_CONTENT_TYPE,
                     ) {
                         Cow::Borrowed(_) => patched,
@@ -3627,7 +3933,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 if synth_settings {
                     patched = match inject_content_type_override(
                         &patched,
-                        SETTINGS_PART_NAME,
+                        format!("/{}", names.settings.as_str()).as_str(),
                         SETTINGS_CONTENT_TYPE,
                     ) {
                         Cow::Borrowed(_) => patched,
@@ -3648,10 +3954,14 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 for (on, part_name, content_type) in [
                     (
                         synth_footnotes,
-                        "/word/footnotes.xml",
+                        format!("/{}", names.footnotes.as_str()).as_str(),
                         FOOTNOTES_CONTENT_TYPE,
                     ),
-                    (synth_endnotes, "/word/endnotes.xml", ENDNOTES_CONTENT_TYPE),
+                    (
+                        synth_endnotes,
+                        format!("/{}", names.endnotes.as_str()).as_str(),
+                        ENDNOTES_CONTENT_TYPE,
+                    ),
                 ] {
                     if !on {
                         continue;
@@ -3663,7 +3973,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                     };
                 }
                 zip.write_all(patched.as_bytes())?;
-            } else if name == RELS_XML
+            } else if name == names.main_rels.as_str()
                 && (synth_comments
                     || synth_extended
                     || needs_hyperlink_rels_splice
@@ -3753,7 +4063,9 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 collision-proof against Word's `rIdN` sequence by
                 prefix). Targets are `word/`-relative. */
                 for (rid, part_name, _, rel_type, _) in &hf_new_parts {
-                    let target = part_name.strip_prefix("word/").unwrap_or(part_name);
+                    let target = part_name
+                        .strip_prefix(main_dir_prefix.as_str())
+                        .unwrap_or(part_name);
                     let new = inject_doc_rel(&patched, rid, rel_type, target, None);
                     if let Cow::Owned(s) = new {
                         patched = Cow::Owned(s);
@@ -3772,33 +4084,33 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         never had one, append it (same Sprint-13-v1 no-OPC-synth
         stance as numbering: Word tolerates the missing Override). */
         if !styles_already_present && let Some(new_bytes) = styles_bytes.as_deref() {
-            zip.start_file(STYLES_XML, opts)?;
+            zip.start_file(names.styles.as_str(), opts)?;
             zip.write_all(new_bytes)?;
         }
         if !numbering_already_present && let Some(new_bytes) = numbering_bytes.as_deref() {
-            zip.start_file(NUMBERING_XML, opts)?;
+            zip.start_file(names.numbering.as_str(), opts)?;
             zip.write_all(new_bytes)?;
         }
         /* L1.2 (#18) — append comments.xml when synthesized fresh.
         Content_Types + rels were patched in the write loop above. */
         if let Some(new_bytes) = comments_bytes.as_deref() {
-            zip.start_file(COMMENTS_XML, opts)?;
+            zip.start_file(names.comments.as_str(), opts)?;
             zip.write_all(new_bytes)?;
         }
         /* Append `commentsExtended.xml` when synthesized fresh.
         Content_Types + rels were patched in the write loop above. */
         if !extended_already_present && let Some(new_bytes) = extended_bytes.as_deref() {
-            zip.start_file(COMMENTS_EXTENDED_XML, opts)?;
+            zip.start_file(names.comments_extended.as_str(), opts)?;
             zip.write_all(new_bytes)?;
         }
         /* Issue #80 — append fresh note parts. Content_Types + rels were
         patched in the write loop above. */
         if synth_footnotes && let Some(new_bytes) = footnotes_bytes.as_deref() {
-            zip.start_file(FOOTNOTES_XML, opts)?;
+            zip.start_file(names.footnotes.as_str(), opts)?;
             zip.write_all(new_bytes)?;
         }
         if synth_endnotes && let Some(new_bytes) = endnotes_bytes.as_deref() {
-            zip.start_file(ENDNOTES_XML, opts)?;
+            zip.start_file(names.endnotes.as_str(), opts)?;
             zip.write_all(new_bytes)?;
         }
         /* Issue #60 — a document with zero prior relationships (no
@@ -3824,29 +4136,34 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
             for (rid, target) in &body_media_rows {
                 fresh.push_str(&format!(
                     "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{target}\"/>\n",
-                    crate::media_plan::IMAGE_REL_TYPE
+                    fam(crate::media_plan::IMAGE_REL_TYPE)
                 ));
             }
             for (rid, target) in &new_hyperlink_rel_entries {
                 fresh.push_str(&format!(
-                    "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL_TYPE}\" Target=\"{target}\" TargetMode=\"External\"/>\n"
+                    "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{target}\" TargetMode=\"External\"/>\n",
+                    fam(HYPERLINK_REL_TYPE)
                 ));
             }
             /* Phase 3 (#39) — fresh header/footer rels on a document
             that never had a rels part. */
             for (rid, part_name, _, rel_type, _) in &hf_new_parts {
-                let target = part_name.strip_prefix("word/").unwrap_or(part_name);
+                let target = part_name
+                    .strip_prefix(main_dir_prefix.as_str())
+                    .unwrap_or(part_name);
                 fresh.push_str(&format!(
-                    "<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>\n"
+                    "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{target}\"/>\n",
+                    fam(rel_type)
                 ));
             }
             if synth_settings {
                 fresh.push_str(&format!(
-                    "<Relationship Id=\"ngeSettings1\" Type=\"{SETTINGS_REL_TYPE}\" Target=\"settings.xml\"/>\n"
+                    "<Relationship Id=\"ngeSettings1\" Type=\"{}\" Target=\"settings.xml\"/>\n",
+                    fam(SETTINGS_REL_TYPE)
                 ));
             }
             fresh.push_str("</Relationships>");
-            zip.start_file(RELS_XML, opts)?;
+            zip.start_file(names.main_rels.as_str(), opts)?;
             zip.write_all(fresh.as_bytes())?;
         }
 
@@ -3872,7 +4189,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         /* Issue #135 — a part referencing a new picture that had no rels
         file at all gets a fresh one. */
         for (name, rows) in &media_rels_rows {
-            if name == RELS_XML || media_rels_written.contains(name) {
+            if name == names.main_rels.as_str() || media_rels_written.contains(name) {
                 continue;
             }
             zip.start_file(name, opts)?;
@@ -3886,18 +4203,14 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         /* Issue #74 — synthesized settings.xml on a document that never
         had one. */
         if synth_settings && let Some(new_bytes) = settings_bytes.as_deref() {
-            zip.start_file(crate::opc::archive::SETTINGS_XML, opts)?;
+            zip.start_file(names.settings.as_str(), opts)?;
             zip.write_all(new_bytes)?;
         }
 
-        /* Write the regenerated document.xml. */
-        zip.start_file(DOC_XML, opts)?;
-        let xml = build_document_xml_with_root(
-            doc,
-            &hyperlink_rid_by_target,
-            &archive.document_root_attrs,
-        );
-        zip.write_all(xml.as_bytes())?;
+        /* Write the regenerated document.xml (built and finalized above,
+        issue #295). */
+        zip.start_file(names.main.as_str(), opts)?;
+        zip.write_all(&doc_xml)?;
 
         zip.finish()?;
     }
@@ -3917,16 +4230,24 @@ pub fn save_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
     let Some(package) = doc.source_package.as_deref() else {
         return build_minimal_docx(doc);
     };
+    let other_entries: Vec<(String, Vec<u8>)> = package
+        .entries
+        .iter()
+        .map(|e| (e.name.clone(), e.data.clone()))
+        .collect();
+    /* Issue #353 — the package carries every entry but the main part, so
+    its name is re-derived from `_rels/.rels` (the main part is trusted to
+    exist; the fixed name is the fallback). */
+    let part_names =
+        crate::opc::part_names::PartNames::discover(&other_entries, &|_| true, &mut Vec::new())
+            .unwrap_or_default();
     let archive = DocxArchive {
-        other_entries: package
-            .entries
-            .iter()
-            .map(|e| (e.name.clone(), e.data.clone()))
-            .collect(),
+        other_entries,
         /* `write_docx` writes `doc`, never `archive.document`. */
         document: DocumentTree::default(),
         document_root_attrs: doc.document_root_attrs.clone(),
         warnings: Vec::new(),
+        part_names,
     };
     write_docx(&archive, doc)
 }
@@ -3974,6 +4295,7 @@ pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
         for an engine-authored document (minimal root unchanged). */
         document_root_attrs: doc.document_root_attrs.clone(),
         warnings: Vec::new(),
+        part_names: Default::default(),
     };
     /* Issues #199 / #106 — no source `styles.xml` travels in a minimal
     package, so recorded source `<w:pPr>` / `<w:rPr>` bytes (a bare
@@ -4189,8 +4511,6 @@ const COMMENTS_EXT_REL_TYPE: &str =
 /// Issue #60 — rel-type IRI for an external `<w:hyperlink r:id>` target.
 const HYPERLINK_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
-const COMMENTS_PART_NAME: &str = "/word/comments.xml";
-const COMMENTS_EXT_PART_NAME: &str = "/word/commentsExtended.xml";
 const COMMENTS_REL_TARGET: &str = "comments.xml";
 const COMMENTS_EXT_REL_TARGET: &str = "commentsExtended.xml";
 
@@ -4217,7 +4537,6 @@ const ENDNOTES_REL_TYPE: &str =
 
 /* Issue #74 — settings.xml OPC identity (synthesized only when the
 archive never carried one). */
-const SETTINGS_PART_NAME: &str = "/word/settings.xml";
 const SETTINGS_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml";
 const SETTINGS_REL_TYPE: &str =
@@ -4327,20 +4646,22 @@ fn build_hf_xml(
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     out.push('<');
     out.push_str(tag);
-    out.push_str(" xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"");
+    out.push_str(&fam(
+        " xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"",
+    ));
     if has_image {
         /* Issue #69 — `wp14` for a floating picture's percentage offsets. */
-        out.push_str(
+        out.push_str(&fam(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\
              \u{20}xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"\
              \u{20}xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"\
              \u{20}xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"\
              \u{20}xmlns:wp14=\"http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing\"",
-        );
+        ));
     } else if has_link {
-        out.push_str(
+        out.push_str(&fam(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
-        );
+        ));
     }
     /* Issue #84 — Word binds the same prefix set on every part root; a
     header story's passthrough paragraphs and grab-bag fragments need
@@ -4406,18 +4727,20 @@ fn build_notes_xml(
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     out.push('<');
     out.push_str(root);
-    out.push_str(" xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"");
+    out.push_str(&fam(
+        " xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"",
+    ));
     if has_image {
-        out.push_str(
+        out.push_str(&fam(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\
              \u{20}xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"\
              \u{20}xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"\
              \u{20}xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"",
-        );
+        ));
     } else if has_link {
-        out.push_str(
+        out.push_str(&fam(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
-        );
+        ));
     }
     let extra = extra_root_attrs(&out, root_attrs);
     out.push_str(&extra);
@@ -4504,10 +4827,15 @@ fn for_each_hf_paragraph<'a>(blocks: &'a [Block], f: &mut impl FnMut(&'a Paragra
 /// Phase 3 (#39) — smallest positive N such that `word/{prefix}N.xml`
 /// collides with neither an existing archive entry nor an
 /// already-planned fresh part.
-fn next_hf_part_name(prefix: &str, existing: &[(String, Vec<u8>)], planned: &[String]) -> String {
+fn next_hf_part_name(
+    prefix: &str,
+    existing: &[(String, Vec<u8>)],
+    planned: &[String],
+    dir_prefix: &str,
+) -> String {
     let mut n = 1u32;
     loop {
-        let candidate = format!("word/{prefix}{n}.xml");
+        let candidate = format!("{dir_prefix}{prefix}{n}.xml");
         let taken = existing.iter().any(|(name, _)| name == &candidate)
             || planned.iter().any(|name| name == &candidate);
         if !taken {
@@ -4603,6 +4931,7 @@ fn inject_doc_rel<'a>(
     if rels_xml.contains(&target_needle) {
         return Cow::Borrowed(rels_xml);
     }
+    let rel_type = fam(rel_type);
     let Some(close_idx) = rels_xml.find("</Relationships>") else {
         return Cow::Borrowed(rels_xml);
     };
@@ -4870,6 +5199,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4913,6 +5243,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4960,6 +5291,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5021,6 +5353,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5068,6 +5401,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5175,6 +5509,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -5897,6 +6232,7 @@ mod tests {
             document: doc.clone(),
             document_root_attrs: Vec::new(),
             warnings: Vec::new(),
+            part_names: Default::default(),
         };
 
         let saved = write_docx(&archive, &doc).expect("write");
@@ -5949,6 +6285,7 @@ mod tests {
             document: doc.clone(),
             document_root_attrs: Vec::new(),
             warnings: Vec::new(),
+            part_names: Default::default(),
         };
 
         let saved = write_docx(&archive, &doc).expect("write");
@@ -6075,6 +6412,7 @@ mod tests {
             document: doc.clone(),
             document_root_attrs: Vec::new(),
             warnings: Vec::new(),
+            part_names: Default::default(),
         };
         let saved = write_docx(&archive, &doc).expect("write");
         let reopened = read_docx(&saved).expect("reread");
@@ -7040,6 +7378,7 @@ mod tests {
                 body_xml: None,
                 source_markup: None,
                 mark_revisions: Vec::new(),
+                mark_style: None,
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -7101,6 +7440,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7202,6 +7542,7 @@ mod tests {
             keep_lines: Some(false),
             page_break_before: false,
             borders: None,
+            border_spelling: Default::default(),
             tab_stops: Vec::new(),
             list_item: None,
             shading: Some([0x33, 0x66, 0x99, 0xFF]),
@@ -7229,6 +7570,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -7261,6 +7603,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7321,6 +7664,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -8002,6 +8346,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -8227,6 +8572,7 @@ mod tests {
             document: doc.clone(),
             document_root_attrs: Vec::new(),
             warnings: Vec::new(),
+            part_names: Default::default(),
         };
         let bytes = write_docx(&archive, &doc).expect("initial write");
 
@@ -8472,6 +8818,7 @@ mod tests {
             document: doc.clone(),
             document_root_attrs: Vec::new(),
             warnings: Vec::new(),
+            part_names: Default::default(),
         };
 
         let bytes = write_docx(&archive, &doc).expect("resave");
@@ -8524,7 +8871,7 @@ mod tests {
             <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
             <Override PartName=\"/word/comments.xml\" ContentType=\"foo\"/>\
             </Types>";
-        let after = inject_content_type_override(ct, COMMENTS_PART_NAME, COMMENTS_CONTENT_TYPE);
+        let after = inject_content_type_override(ct, "/word/comments.xml", COMMENTS_CONTENT_TYPE);
         assert!(matches!(after, Cow::Borrowed(_)), "no-op when present");
 
         let rels = "<?xml version=\"1.0\"?>\n\
@@ -8644,6 +8991,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -10317,6 +10665,17 @@ mod inline_span_tests;
 #[cfg(test)]
 #[path = "writer_table_markup_tests.rs"]
 mod table_markup_tests;
+
+/// Issues #292 / #293 / #297 — paragraph formatting through edits and
+/// saves (merges, the paragraph mark's run properties, style names).
+#[cfg(test)]
+#[path = "writer_paragraph_format_tests.rs"]
+mod paragraph_format_tests;
+
+/// Issue #295 — package-unique tracked-change annotation ids.
+#[cfg(test)]
+#[path = "writer_revision_id_tests.rs"]
+mod revision_id_tests;
 
 /// Issue #355 — `<w:rFonts>` theme bindings.
 #[cfg(test)]

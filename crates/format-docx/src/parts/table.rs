@@ -21,6 +21,8 @@ use crate::schema::ct_tbl;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::mce;
+use crate::schema::measure::{SIGNED_TWIPS, TWIPS, attr_measure_twips};
 use crate::schema::source_markup::raw_attrs;
 use engine::{
     Block, BorderStroke, BorderStyle, CellBorders, CellMargins, CellSourceMarkup, CellWidth,
@@ -169,6 +171,15 @@ impl OpenElement {
 /// cells of the current row, blocks of the current cell) — everything
 /// between rows and between cells: whitespace, range markers and the
 /// `<w:sdt>` / `<w:customXml>` wrappers around rows or cells.
+/// Issue #351 — the table walker level a tracked `mc:AlternateContent`
+/// sits at (whose `BlockEnvelopes` tracker keeps it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltTableLevel {
+    Cell,
+    Row,
+    Table,
+}
+
 fn parse_table_bytes_at(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
@@ -225,6 +236,9 @@ fn parse_table_bytes_at(
     let mut open_grid: Option<OpenElement> = None;
     let mut open_tr_pr: Option<OpenElement> = None;
     let mut open_tc_pr: Option<OpenElement> = None;
+    /* Issue #351 — tracked `mc:AlternateContent` elements: `(level, start
+    tag, a branch was taken, element-stack depth at its start)`. */
+    let mut alt_stack: Vec<(AltTableLevel, BytesStart<'static>, bool, usize)> = Vec::new();
 
     loop {
         let event = reader.read_event_into(&mut buf)?;
@@ -238,6 +252,24 @@ fn parse_table_bytes_at(
             Event::Start(e) => {
                 let name = e.name().as_ref().to_owned();
                 match name.as_slice() {
+                    /* Issue #351 — inside a cell paragraph a drawing, an
+                    `mc:AlternateContent` or a text-box story is the
+                    paragraph parser's business (`parse_cell_paragraph`):
+                    skip it whole, so neither branch of an AlternateContent
+                    nor a text box's own `<w:p>` / `<w:tbl>` is taken for a
+                    cell block. */
+                    b"w:drawing"
+                    | b"mc:AlternateContent"
+                    | b"w:pict"
+                    | b"w:object"
+                    | b"w:txbxContent"
+                        if nested_tbl_depth == 0 && p_start_byte.is_some() =>
+                    {
+                        let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
                     b"w:tbl" if !in_table => {
                         in_table = true;
                         markup.attrs = raw_attrs(&e, ns);
@@ -325,6 +357,49 @@ fn parse_table_bytes_at(
                         cell_env.open_container(prev_pos);
                         if let Some(cell) = cur_cell.as_ref() {
                             cell_env.set_blocks_at_open(cell.blocks.len());
+                        }
+                    }
+                    /* Issue #351 — `mc:AlternateContent` between cell
+                    blocks, between cells or between rows: an envelope
+                    around the branch a consumer selects (its other branches
+                    ride the opener / closer bytes), so a cell's text is no
+                    longer read once per branch. */
+                    b"mc:AlternateContent" if at_cell_level || row_level || table_level => {
+                        let level = if at_cell_level {
+                            cell_env.open_container(prev_pos);
+                            if let Some(cell) = cur_cell.as_ref() {
+                                cell_env.set_blocks_at_open(cell.blocks.len());
+                            }
+                            AltTableLevel::Cell
+                        } else if row_level {
+                            tc_env.open_container(prev_pos);
+                            if let Some(row) = cur_row.as_ref() {
+                                tc_env.set_blocks_at_open(row.cells.len());
+                            }
+                            AltTableLevel::Row
+                        } else {
+                            row_env.open_container(prev_pos);
+                            row_env.set_blocks_at_open(rows.len());
+                            AltTableLevel::Table
+                        };
+                        alt_stack.push((level, e.clone().into_owned(), false, stack.len()));
+                    }
+                    b"mc:Choice" | b"mc:Fallback"
+                        if nested_tbl_depth == 0
+                            && p_start_byte.is_none()
+                            && alt_stack.last().is_some_and(|f| f.3 + 1 == stack.len()) =>
+                    {
+                        let frame = alt_stack.last_mut().expect("guarded");
+                        let take = !frame.2
+                            && (name.as_slice() == b"mc:Fallback"
+                                || mce::choice_selectable(Some(&frame.1), &e));
+                        if take {
+                            frame.2 = true;
+                        } else {
+                            let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                            prev_pos = reader.buffer_position() as usize;
+                            buf.clear();
+                            continue;
                         }
                     }
                     /* Issue #248 — a content control / custom-XML element
@@ -579,6 +654,28 @@ fn parse_table_bytes_at(
                             row_env.note_block_end(end_pos);
                         }
                     }
+                    /* Issue #351 — a tracked `mc:AlternateContent` closes
+                    (`stack` still holds its own name here). */
+                    b"mc:AlternateContent"
+                        if alt_stack.last().is_some_and(|f| f.3 + 1 == stack.len()) =>
+                    {
+                        match alt_stack.pop().map(|f| f.0) {
+                            Some(AltTableLevel::Cell) => {
+                                if let Some(cell) = cur_cell.as_mut() {
+                                    cell_env.close_container(xml, end_pos, &mut cell.blocks);
+                                }
+                            }
+                            Some(AltTableLevel::Row) => {
+                                if let Some(row) = cur_row.as_mut() {
+                                    tc_env.close_container(xml, end_pos, &mut row.cells);
+                                }
+                            }
+                            Some(AltTableLevel::Table) => {
+                                row_env.close_container(xml, end_pos, &mut rows);
+                            }
+                            None => {}
+                        }
+                    }
                     /* Issue #120 — a cell-level container closes. */
                     b"w:sdt" | b"w:customXml" if at_cell_level && cell_env.in_container() => {
                         if let Some(cell) = cur_cell.as_mut() {
@@ -637,7 +734,14 @@ fn parse_table_bytes_at(
                 /* Issue #120 — whitespace between two cell blocks (a
                 pretty-printed part) rides the following block; issue
                 #248 — the same between cells and between rows. */
-                let container = matches!(parent, b"w:sdtContent" | b"w:customXml");
+                let container = matches!(
+                    parent,
+                    b"w:sdtContent"
+                        | b"w:customXml"
+                        | b"mc:AlternateContent"
+                        | b"mc:Choice"
+                        | b"mc:Fallback"
+                );
                 if let Some(frag) = slice_fragment(xml, prev_pos, end_pos) {
                     if at_cell_level && (container || parent == b"w:tc") {
                         cell_env.push_verbatim(frag);
@@ -732,6 +836,14 @@ fn parse_cell_paragraph(
         wrapped.extend_from_slice(uri.as_bytes());
         wrapped.push(b'"');
     }
+    /* Issue #351 — the nested parse honours the same `mc:Ignorable`. */
+    if let Some((name, value)) = ns.ignorable_attr() {
+        wrapped.push(b' ');
+        wrapped.extend_from_slice(name.as_bytes());
+        wrapped.extend_from_slice(b"=\"");
+        wrapped.extend_from_slice(value.as_bytes());
+        wrapped.push(b'"');
+    }
     wrapped.extend_from_slice(b"><w:body>");
     wrapped.extend_from_slice(xml);
     wrapped.extend_from_slice(b"</w:body></w:document>");
@@ -769,7 +881,8 @@ fn handle_property_start(
     let parent = stack.last().map(|n| n.as_slice()).unwrap_or(b"");
     match name {
         b"w:gridCol" => {
-            if let Some(w) = attr_val(e, b"w:w").and_then(|v| v.parse().ok()) {
+            /* Issue #349 — `ST_TwipsMeasure` through the measure reader. */
+            if let Some(w) = attr_measure_twips(e, b"w:w", TWIPS) {
                 grid.push(w);
             }
         }
@@ -811,7 +924,8 @@ fn handle_property_empty(
     let parent = stack.last().map(|n| n.as_slice()).unwrap_or(b"");
     match name {
         b"w:gridCol" => {
-            if let Some(w) = attr_val(e, b"w:w").and_then(|v| v.parse().ok()) {
+            /* Issue #349 — `ST_TwipsMeasure` through the measure reader. */
+            if let Some(w) = attr_measure_twips(e, b"w:w", TWIPS) {
                 grid.push(w);
             }
         }
@@ -952,7 +1066,8 @@ fn handle_property_inner(
         match name {
             b"w:tblW" => props.width = parse_cell_width(e),
             b"w:tblInd" => {
-                if let Some(v) = attr_val(e, b"w:w").and_then(|v| v.parse().ok()) {
+                /* Issue #349 — signed (a table may hang into the margin). */
+                if let Some(v) = attr_measure_twips(e, b"w:w", SIGNED_TWIPS) {
                     props.indent_twips = v;
                 }
             }
@@ -1000,15 +1115,41 @@ fn handle_property_inner(
     }
 }
 
+/// `<w:tblW>` / `<w:tcW>` (`CT_TblWidth`). Issue #349 — a `dxa` value goes
+/// through the measure reader (`ST_TwipsMeasure`: unit suffixes honoured,
+/// NaN / infinite rejected, clamped); a `pct` value (issue #353) through
+/// [`parse_pct_width`].
 fn parse_cell_width(e: &BytesStart) -> Option<CellWidth> {
     let typ = attr_val(e, b"w:type").unwrap_or_else(|| "dxa".into());
-    let val: Option<i32> = attr_val(e, b"w:w").and_then(|v| v.parse().ok());
+    let raw = attr_val(e, b"w:w");
     match typ.as_str() {
         "auto" => Some(CellWidth::Auto),
         "nil" => Some(CellWidth::Nil),
-        "pct" => val.map(|v| CellWidth::Pct(v as u16)),
-        _ => val.map(CellWidth::Dxa),
+        "pct" => raw.as_deref().and_then(parse_pct_width).map(CellWidth::Pct),
+        /* Issue #353 — a literal percentage on a dxa-typed width (ISO
+        29500 ST_MeasurementOrPercent) is still a percentage. */
+        _ => match raw.as_deref().map(str::trim) {
+            Some(v) if v.ends_with('%') => parse_pct_width(v).map(CellWidth::Pct),
+            _ => attr_measure_twips(e, b"w:w", TWIPS).map(CellWidth::Dxa),
+        },
     }
+}
+
+/// Issue #353 — a `w:type="pct"` width in fiftieths of a percent
+/// (`5000` = 100 %). ISO 29500 (and Strict producers) also write the
+/// universal form `50%` / `33.5%`, which is converted (×50). The result
+/// is clamped to `0..=u16::MAX` instead of the old `as u16` truncation
+/// (which turned `70000` into `4464` and `-1` into `65535`).
+fn parse_pct_width(raw: &str) -> Option<u16> {
+    let raw = raw.trim();
+    let fifties = match raw.strip_suffix('%') {
+        Some(num) => num.trim().parse::<f64>().ok()? * 50.0,
+        None => raw.parse::<f64>().ok()?,
+    };
+    if !fifties.is_finite() {
+        return None;
+    }
+    Some(fifties.round().clamp(0.0, f64::from(u16::MAX)) as u16)
 }
 
 fn parse_border_stroke(e: &BytesStart) -> BorderStroke {
@@ -1067,6 +1208,32 @@ mod tests {
         assert_eq!(cell_text(&rows[0].cells[0]), "A1");
         assert_eq!(cell_text(&rows[0].cells[1]), "B1");
         assert_eq!(cell_text(&rows[1].cells[1]), "B2");
+    }
+
+    #[test]
+    fn pct_widths_accept_percent_literals_and_clamp() {
+        assert_eq!(parse_pct_width("5000"), Some(5000));
+        assert_eq!(parse_pct_width("50%"), Some(2500));
+        assert_eq!(parse_pct_width(" 33.5% "), Some(1675));
+        assert_eq!(parse_pct_width("100%"), Some(5000));
+        /* Out of range clamps instead of wrapping (`70000 as u16` = 4464). */
+        assert_eq!(parse_pct_width("70000"), Some(u16::MAX));
+        assert_eq!(parse_pct_width("-1"), Some(0));
+        assert_eq!(parse_pct_width("5000000%"), Some(u16::MAX));
+        assert_eq!(parse_pct_width("abc"), None);
+        assert_eq!(parse_pct_width("inf%"), None);
+
+        let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="50%" w:type="pct"/></w:tcPr><w:p/></w:tc><w:tc><w:tcPr><w:tcW w:w="70000" w:type="pct"/></w:tcPr><w:p/></w:tc><w:tc><w:tcPr><w:tcW w:w="25%" w:type="dxa"/></w:tcPr><w:p/></w:tc></w:tr></w:tbl>"#;
+        let (_, _, rows) = parse_table_bytes(
+            xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+        )
+        .expect("parse");
+        let w = |i: usize| rows[0].cells[i].props.width;
+        assert_eq!(w(0), Some(CellWidth::Pct(2500)));
+        assert_eq!(w(1), Some(CellWidth::Pct(u16::MAX)));
+        assert_eq!(w(2), Some(CellWidth::Pct(1250)));
     }
 
     #[test]

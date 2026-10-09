@@ -9,11 +9,24 @@
  *
  * Downstream UI never imports from `crates/engine-wasm/pkg` directly.
  * @nge/core is the entire engine surface.
+ *
+ * Issue #340 - the SDK exposes NO globals: nothing here (or in @nge/ui)
+ * assigns to `window`, reads debug URL parameters, or picks a telemetry
+ * sink from the page URL. The engine handle comes from the host via
+ * `<EngineProvider client={...}>` and the telemetry endpoint via its
+ * `telemetryEndpoint` prop. The `window.__dispatch` / `__engineClient`
+ * test hooks belong to the reference shell (`ts/src/dev-hooks.ts`) and
+ * are installed only in dev / `?test=` / `VITE_NGE_DEV_HOOKS=1` builds.
  */
 export { EditorSurface } from './EditorSurface';
 export type { EditorSurfaceProps, EditorSurfaceHandle } from './EditorSurface';
 
-export { EngineProvider, useEngine, useDocumentDefaults } from './EngineProvider';
+export {
+    EngineProvider,
+    useEngine,
+    useDocumentDefaults,
+    useTelemetryEndpoint,
+} from './EngineProvider';
 export type { EngineProviderProps, EngineHandle } from './EngineProvider';
 
 export {
@@ -53,9 +66,10 @@ export type {
     RevisionSnapshot,
     CommentSnapshot,
     RecoveryReport,
+    CheckpointStatus,
 } from './types';
 
-export { recoveryNotices, recoveryDegraded } from './recovery';
+export { recoveryNotices, recoveryDegraded, checkpointNotices } from './recovery';
 export type { RecoveryNotice, RecoveryNoticeKind, RecoveryNoticeOptions } from './recovery';
 
 export type {
@@ -64,6 +78,8 @@ export type {
     DocFormat,
     DocumentDefaults,
     DefaultPageSize,
+    ErrorKind,
+    PackageLimitsOverride,
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,

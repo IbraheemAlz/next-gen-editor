@@ -383,3 +383,216 @@ fn typing_over_a_selection_takes_the_first_replaced_characters_style() {
     assert_eq!(style_at(&e, 10), SpanStyle::default(), "find/replace");
     assert_eq!(style_at(&e, 9).bold, Some(true));
 }
+
+/* ---- Issue #292 — paragraph merges keep the head's paragraph style ---- */
+
+fn backspace(e: &mut Engine) {
+    apply(
+        e,
+        Command::DeleteAtCaret {
+            forward: false,
+            by_word: false,
+        },
+    );
+}
+
+fn delete_forward(e: &mut Engine) {
+    apply(
+        e,
+        Command::DeleteAtCaret {
+            forward: true,
+            by_word: false,
+        },
+    );
+}
+
+/// `heading_doc()` with a hyperlink on "Body" and a tracked insertion on
+/// "dy" in the paragraph after the heading.
+fn heading_doc_with_overlays() -> DocumentTree {
+    let mut d = heading_doc();
+    let mut blocks = d.blocks.clone();
+    if let engine::Block::Paragraph(p) = &mut blocks[1] {
+        p.hyperlinks.push(engine::Hyperlink {
+            start: 0,
+            end: 4,
+            target: "https://example.com".into(),
+            ..Default::default()
+        });
+        p.revisions.push(engine::Revision {
+            start: 2,
+            end: 4,
+            kind: engine::RevisionKind::Insert,
+            author: "Reviewer".into(),
+            date: "2026-01-01T00:00:00Z".into(),
+            id: Some(4),
+            prev_attrs: None,
+            move_name: None,
+        });
+    }
+    d.blocks = blocks;
+    d
+}
+
+/// #292 — Backspace at the start of the paragraph after a heading joins
+/// it onto the heading, which stays Heading1 (it used to be demoted to an
+/// unstyled paragraph); the second paragraph's hyperlink and tracked
+/// insertion ride the merge onto their text.
+#[test]
+fn backspace_after_a_heading_keeps_the_heading_and_the_overlays() {
+    let mut e = engine_with(heading_doc_with_overlays());
+    caret(&mut e, 1, 0);
+    backspace(&mut e);
+    let doc = e.undo.current();
+    assert_eq!(doc.blocks.len(), 1);
+    let p = doc.nth_paragraph(0).unwrap();
+    assert_eq!(p.text, "Chapter OneBody");
+    assert_eq!(style_of(&e, 0).as_deref(), Some("Heading1"));
+    assert_eq!(p.props.keep_next, Some(true));
+    assert!(toolbar_bold(&e), "the merged text paints as a heading");
+    let h = &p.hyperlinks[0];
+    assert_eq!(&p.text[h.start as usize..h.end as usize], "Body");
+    let r = &p.revisions[0];
+    assert_eq!(&p.text[r.start as usize..r.end as usize], "dy");
+    assert_eq!(r.author, "Reviewer");
+}
+
+/// #292 — Delete at the very end of the heading: the same merge.
+#[test]
+fn delete_at_the_heading_end_keeps_the_heading() {
+    let mut e = engine_with(heading_doc_with_overlays());
+    caret(&mut e, 0, 11);
+    delete_forward(&mut e);
+    let p = e.undo.current().nth_paragraph(0).unwrap().clone();
+    assert_eq!(p.text, "Chapter OneBody");
+    assert_eq!(style_of(&e, 0).as_deref(), Some("Heading1"));
+    assert_eq!(p.hyperlinks.len(), 1);
+    assert_eq!(p.revisions.len(), 1);
+    /* Undo restores both paragraphs with their own styles. */
+    apply(&mut e, Command::Undo);
+    assert_eq!(e.undo.current().blocks.len(), 2);
+    assert_eq!(style_of(&e, 0).as_deref(), Some("Heading1"));
+    assert_eq!(style_of(&e, 1), None);
+}
+
+/// #292 — a selection from inside the heading into the next paragraph,
+/// deleted: the heading (the head) keeps its style; the clipped tracked
+/// insertion keeps its surviving byte.
+#[test]
+fn a_cross_paragraph_selection_delete_keeps_the_heading() {
+    let mut e = engine_with(heading_doc_with_overlays());
+    apply(
+        &mut e,
+        Command::SetSelection {
+            range: BridgeLogicalRange {
+                start: bpos_top(0, 7),
+                end: bpos_top(1, 3),
+            },
+            caret: bpos_top(1, 3),
+        },
+    );
+    backspace(&mut e);
+    let p = e.undo.current().nth_paragraph(0).unwrap().clone();
+    assert_eq!(p.text, "Chaptery");
+    assert_eq!(style_of(&e, 0).as_deref(), Some("Heading1"));
+    let r = &p.revisions[0];
+    assert_eq!(&p.text[r.start as usize..r.end as usize], "y");
+}
+
+/* ---- Issue #293 — the paragraph mark's run properties ---- */
+
+fn para_style_at(e: &Engine, para: u32, offset: u32) -> SpanStyle {
+    e.undo
+        .current()
+        .nth_paragraph(para)
+        .unwrap()
+        .style_at(offset)
+}
+
+fn mark_bold(e: &Engine, para: u32) -> Option<bool> {
+    e.undo
+        .current()
+        .nth_paragraph(para)
+        .and_then(|p| p.mark_style.as_deref())
+        .and_then(|m| m.bold)
+}
+
+/// #293 — Enter at the end of a bold run, then type: the new paragraph's
+/// text is bold, as in Word (it used to come out plain — an empty
+/// paragraph had no character to inherit from). The toolbar previews it
+/// in the still-empty paragraph.
+#[test]
+fn enter_at_the_end_of_a_bold_run_then_typing_is_bold() {
+    let mut e = engine_with(formatted_doc());
+    /* "plain BOLD" — drop " italic" so the bold run ends the paragraph. */
+    apply(
+        &mut e,
+        Command::SetSelection {
+            range: BridgeLogicalRange {
+                start: bpos_top(0, 10),
+                end: bpos_top(0, 17),
+            },
+            caret: bpos_top(0, 17),
+        },
+    );
+    backspace(&mut e);
+    assert_eq!(
+        e.undo.current().nth_paragraph(0).unwrap().text,
+        "plain BOLD"
+    );
+    caret(&mut e, 0, 10);
+    apply(&mut e, Command::SplitParagraph { at: None });
+    assert_eq!(e.undo.current().nth_paragraph(1).unwrap().text, "");
+    assert_eq!(mark_bold(&e, 1), Some(true));
+    assert!(toolbar(&e).bold, "the empty paragraph previews bold");
+    type_text(&mut e, "Next");
+    assert_eq!(e.undo.current().nth_paragraph(1).unwrap().text, "Next");
+    assert_eq!(para_style_at(&e, 1, 0).bold, Some(true));
+    assert_eq!(para_style_at(&e, 1, 3).bold, Some(true));
+    assert!(toolbar(&e).bold);
+}
+
+/// #293 — sticky bold-off armed in that empty bold-marked paragraph wins
+/// for the typed text, and the mark follows it (Word: formatting applied
+/// in an empty paragraph is its mark's), so the saved pair agrees.
+#[test]
+fn pending_bold_off_in_an_empty_bold_marked_paragraph_formats_the_mark() {
+    let d = DocumentTree::from_text("plain BOLD").apply_style(
+        pos0(6),
+        pos0(10),
+        SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        },
+    );
+    let mut e = engine_with(d);
+    caret(&mut e, 0, 10);
+    apply(&mut e, Command::SplitParagraph { at: None });
+    assert_eq!(mark_bold(&e, 1), Some(true));
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: TextAttrsPatch {
+                bold: Some(false),
+                italic: None,
+                underline: None,
+                strike: None,
+                font_family: None,
+                font_size: None,
+                color: None,
+                bg_color: None,
+                script: None,
+                language: None,
+                caps: None,
+                small_caps: None,
+            },
+        },
+    );
+    type_text(&mut e, "plain");
+    assert_ne!(para_style_at(&e, 1, 0).bold, Some(true), "pending wins");
+    assert_ne!(
+        mark_bold(&e, 1),
+        Some(true),
+        "the mark follows the typed text"
+    );
+}
