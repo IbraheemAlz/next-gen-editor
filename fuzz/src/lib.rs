@@ -94,6 +94,20 @@ pub fn run_docx_roundtrip(data: &[u8]) {
             );
         }
     };
+    /* Issue #434 — the writer's output is well-formed: the reader repairs
+    a malformed source up front (`MalformedPart { repaired: true }`), so
+    the re-read must need no repair. Only a part the FIRST read already
+    found beyond repair (and kept as it was) may be reported again. */
+    if let Some(part) = needless_repair(&archive_a.warnings, &archive_b.warnings) {
+        if trace_enabled() {
+            eprintln!(
+                "[docx_roundtrip] the save needed a repair ({part}):\n  warnings: {:?}\n  saved document.xml: {}",
+                archive_b.warnings,
+                String::from_utf8_lossy(&document_xml_of(&written_a)),
+            );
+        }
+        panic!("docx_roundtrip: write_docx produced a part that is not well-formed");
+    }
     /* Issue #358 — read => write => read preserves the text (every
     generated and spliced package that parsed at all), with ONE documented
     exception: a namespace-ill-formed source (an element prefix no
@@ -123,6 +137,26 @@ pub fn run_docx_roundtrip(data: &[u8]) {
         panic!("docx_roundtrip: second write_docx failed after a successful first round-trip");
     };
     let _ = format_docx::read_docx(&written_b);
+}
+
+/// Issue #434 — the first part the re-read of a save reports as malformed
+/// (`DocxWarning::MalformedPart`) that the first read did not already find
+/// beyond repair: a part the writer produced not well-formed.
+fn needless_repair(
+    first: &[format_docx::DocxWarning],
+    second: &[format_docx::DocxWarning],
+) -> Option<String> {
+    use format_docx::DocxWarning::MalformedPart;
+    second.iter().find_map(|w| match w {
+        MalformedPart { part, .. }
+            if !first.iter().any(
+                |f| matches!(f, MalformedPart { part: p, repaired: false, .. } if p == part),
+            ) =>
+        {
+            Some(part.clone())
+        }
+        _ => None,
+    })
 }
 
 /// `word/document.xml` of a package (empty when unreadable) — trace output.

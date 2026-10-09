@@ -152,3 +152,197 @@ fn a_non_utf8_sibling_part_is_repaired_in_place() {
         Some("A\u{FFFD}")
     );
 }
+
+/* ------------------------------------------------------------------ */
+/* Issue #434 — the lexical repairs and the structural refusals         */
+/* ------------------------------------------------------------------ */
+
+/// The repaired source's `word/document.xml`, as the zero-edit save writes
+/// it (the part is regenerate-only).
+fn saved_document_xml(xml: &[u8]) -> String {
+    use std::io::Read;
+    let a = read_docx(&package_with_document_xml_bytes(xml, &[])).expect("read");
+    let saved = write_docx(&a, &a.document).expect("write");
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(saved)).expect("zip");
+    let mut s = String::new();
+    z.by_name("word/document.xml")
+        .expect("main part")
+        .read_to_string(&mut s)
+        .expect("utf-8");
+    s
+}
+
+/// `ROOT` split around its newline: the XML declaration, then the root
+/// start tag.
+fn prolog_and_root() -> (&'static [u8], &'static [u8]) {
+    let nl = ROOT.iter().position(|&b| b == b'\n').expect("declaration");
+    (&ROOT[..nl], &ROOT[nl + 1..])
+}
+
+/// Issue #434 (sweep index 37398) — a raw `&` in a field's hidden code
+/// inside a paragraph-level `mc:Fallback`: quick-xml never decodes it, so
+/// the part opened, but an edit regenerates the paragraph and the writer
+/// copied the bytes into a `<w:t>` — a save its own reader refused
+/// ("Cannot find ';' after '&'"). Escaped up front, every save re-reads.
+#[test]
+fn a_raw_ampersand_in_hidden_field_code_no_longer_breaks_an_edited_save() {
+    let body = [
+        br#"<w:p><mc:AlternateContent><mc:Fallback>"#.as_slice(),
+        br#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+        BEGIN,
+        br#"<w:r><w:instrText> MERGEFIELD Name </w:instrText></w:r>"#,
+        br#"<w:r><w:fldChar w:fldCharType="bogus"/></w:r><w:r><w:t>a & b</w:t></w:r>"#,
+        BEGIN,
+        br#"</mc:Fallback></mc:AlternateContent></w:p>"#,
+    ]
+    .concat();
+    let xml = document(&body);
+    assert_repaired_round_trip(&xml);
+    let a = read_docx(&package_with_document_xml_bytes(&xml, &[])).expect("read");
+    let edited = a.document.insert_text(a.document.end_of_document(), "Z");
+    let saved = write_docx(&a, &edited).expect("write");
+    crate::check_document_xml_well_formed(&saved).expect("the edited save is well-formed");
+    let b = read_docx(&saved).expect("the edited save re-reads");
+    assert!(malformed_parts(&b.warnings).is_empty(), "{:?}", b.warnings);
+}
+
+/// Issue #434 — raw `&` / undefined entities / `<` in the verbatim spans
+/// the reader never decodes (paragraph-property junk, an unmodeled run
+/// property's text and attribute, an unselected `mc:Choice`) are escaped
+/// up front: the text is unchanged and the zero-edit save is well-formed.
+#[test]
+fn raw_ampersands_in_verbatim_spans_are_escaped() {
+    let body = concat!(
+        r#"<w:p><w:pPr>x & y</w:pPr><w:r><w:rPr><w:foo w:val="1 & 2 < 3">a & b</w:foo></w:rPr><w:t>t</w:t></w:r>"#,
+        r#"<w:r><mc:AlternateContent><mc:Choice Requires="w14"><w:t>&bogus; & more</w:t></mc:Choice>"#,
+        r#"<mc:Fallback><w:t>fb</w:t></mc:Fallback></mc:AlternateContent></w:r></w:p>"#,
+    );
+    let xml = document(body.as_bytes());
+    assert_eq!(assert_repaired_round_trip(&xml), "t[image]");
+    let saved = saved_document_xml(&xml);
+    for spelled in [
+        "<w:pPr>x &amp; y</w:pPr>",
+        r#"w:val="1 &amp; 2 &lt; 3">a &amp; b</w:foo>"#,
+        "<w:t>&amp;bogus; &amp; more</w:t>",
+    ] {
+        assert!(saved.contains(spelled), "{spelled} not in {saved}");
+    }
+}
+
+/// Issue #434 — characters XML 1.0 excludes, raw or referenced (`&#0;`
+/// used to refuse the part, a raw control character used to be written
+/// back raw), read as U+FFFD.
+#[test]
+fn excluded_characters_read_as_replacement_characters() {
+    let body = b"<w:p><w:r><w:t>a&#0;b\x01c&#xFFFE;d</w:t></w:r></w:p>";
+    assert_eq!(
+        assert_repaired_round_trip(&document(body)),
+        "a\u{FFFD}b\u{FFFD}c\u{FFFD}d"
+    );
+}
+
+/// Issue #434 (sweep index 39869) — a byte-flipped `w:fldCharType` value
+/// that is not UTF-8 ends a field that never began, beside a content
+/// control whose only content is an unclosed `begin`, inside a
+/// paragraph-level `mc:Choice`: the same capture fallback as #439.
+#[test]
+fn a_non_utf8_field_character_type_keeps_the_text() {
+    let body = [
+        br#"<w:p><mc:AlternateContent><mc:Choice Requires="w14"><w:sdt><w:sdtContent>"#.as_slice(),
+        br#"<w:r><w:t>x</w:t></w:r><w:r><w:fldChar w:fldCharType="e"#,
+        b"\xC3",
+        br#"d"/></w:r></w:sdtContent></w:sdt><w:sdt><w:sdtContent>"#,
+        BEGIN,
+        br#"</w:sdtContent></w:sdt></mc:Choice><mc:Fallback><w:r><w:t>fb</w:t></w:r></mc:Fallback>"#,
+        br#"</mc:AlternateContent><w:r><w:t>tail</w:t></w:r></w:p><w:p><w:r><w:t>next</w:t></w:r></w:p>"#,
+    ]
+    .concat();
+    assert_repaired_round_trip(&document(&body));
+}
+
+/// Issue #434 — a main part that simply stops (truncated between two
+/// tags) is closed: the text up to the cut survives and the save is
+/// well-formed. Cut inside a tag there is no faithful repair: the open is
+/// refused with a typed error, as before.
+#[test]
+fn a_truncated_main_part_is_closed_and_a_cut_tag_refuses() {
+    let full = document(br#"<w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>sec"#);
+    let cut = &full[..full.len() - "<w:sectPr/></w:body></w:document>".len()];
+    assert_eq!(assert_repaired_round_trip(cut), "first\nsec");
+    let docx = package_with_document_xml_bytes(&cut[..cut.len() - 9], &[]);
+    let err = read_docx(&docx).expect_err("cut inside `<w:t>`");
+    assert!(matches!(err, crate::DocxError::Xml(_)), "{err:?}");
+}
+
+/// Issue #434 (the #439 package's prolog) — junk text between the XML
+/// declaration and the root, and after the root, is dropped.
+#[test]
+fn junk_outside_the_root_is_dropped() {
+    let (decl, root) = prolog_and_root();
+    let xml = [
+        decl,
+        b"PK\x03\x04 junk\n",
+        root,
+        b"<w:body><w:p><w:r><w:t>a</w:t></w:r></w:p><w:sectPr/></w:body></w:document>&#0;tail",
+    ]
+    .concat();
+    assert_eq!(assert_repaired_round_trip(&xml), "a");
+    let saved = saved_document_xml(&xml);
+    assert!(
+        saved.starts_with(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document"#),
+        "{saved}"
+    );
+    assert!(saved.ends_with("</w:document>"), "{saved}");
+}
+
+/// Issue #434 — entities a DOCTYPE declares are never expanded (an OPC part
+/// may not carry a DTD; expanding one is the XXE attack): the reference
+/// reads as its literal text, where the part used to be refused outright
+/// ("unrecognized entity").
+#[test]
+fn entities_a_dtd_declares_are_never_expanded() {
+    let (decl, root) = prolog_and_root();
+    let xml = [
+        decl,
+        b"\n",
+        br#"<!DOCTYPE w:document [<!ENTITY e "EXPANDED">]>"#,
+        root,
+        b"<w:body><w:p><w:r><w:t>&e;</w:t></w:r></w:p><w:sectPr/></w:body></w:document>",
+    ]
+    .concat();
+    assert_eq!(assert_repaired_round_trip(&xml), "&e;");
+}
+
+/// Issue #434 — an end tag that does not close the open element has no
+/// faithful repair (an unclosed tag inside a preserved span: where did the
+/// producer mean it to end?): the main part is refused with a typed error
+/// — never a panic, never a guess.
+#[test]
+fn an_unclosed_tag_inside_a_preserved_span_refuses_typed() {
+    for body in [
+        &br#"<w:p><w:pPr><w:foo></w:pPr><w:r><w:t>a</w:t></w:r></w:p>"#[..],
+        br#"<w:p><w:r><mc:AlternateContent><mc:Choice Requires="w14"><w:t>a</mc:Choice></mc:AlternateContent></w:r></w:p>"#,
+        br#"<w:p><w:r><w:t>a</w:t></w:r></w:p></w:p>"#,
+    ] {
+        let docx = package_with_document_xml_bytes(&document(body), &[]);
+        let err = read_docx(&docx).expect_err("structurally broken");
+        assert!(matches!(err, crate::DocxError::Xml(_)), "{err:?}");
+    }
+}
+
+/// Issue #434 — a structurally broken sibling is reported and left exactly
+/// as it is: the document still opens (default styles), and the part
+/// passes through byte-identical, as before.
+#[test]
+fn a_structurally_broken_sibling_is_reported_and_kept() {
+    let styles: &[u8] = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style></w:styles>"#;
+    let xml = document(b"<w:p><w:r><w:t>a</w:t></w:r></w:p>");
+    let docx = package_with_document_xml_bytes(&xml, &[("word/styles.xml", styles)]);
+    let a = read_docx(&docx).expect("the document opens");
+    assert_eq!(
+        malformed_parts(&a.warnings),
+        vec![("word/styles.xml", false)]
+    );
+    assert_eq!(a.part_by_name("word/styles.xml"), Some(styles));
+    assert_eq!(a.document.to_plain_text(), "a");
+}

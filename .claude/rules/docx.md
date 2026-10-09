@@ -51,6 +51,33 @@ paths:
   table nested past the #111 cap is not counted (it is opaque bytes). Overflow is
   `DocxError::PackageTooLarge` → `Event::Error { kind: PackageTooLarge }`
   (the shell's File-menu banner), never a trap.
+- **Well-formedness (issues #439 / #434).** quick-xml tolerates what it
+  never decodes (bytes that are not UTF-8, a raw `&`, control
+  characters, junk outside the root, a truncated part), and the writer
+  used to replay such bytes from skipped / verbatim regions — text drift
+  on a zero-edit save, saves its own reader refused. Every
+  WordprocessingML part the reader walks (the main part, the #394
+  sibling list, the comment side parts) now goes through
+  `opc::well_formed::repair_part` after the #348 shape caps and BEFORE
+  the #325 normalisation and any capture. Well-formed → untouched (the
+  byte-identical fast path). LEXICAL defects are repaired in place
+  (invalid UTF-8 → U+FFFD; an `&` starting no predefined entity /
+  character reference → `&amp;` — DTD entities are never expanded; `<`
+  in a value → `&lt;`; `]]>` → `]]&gt;`; excluded characters, raw or
+  referenced → U+FFFD; malformed / repeated attributes dropped; text
+  outside the root and a misplaced declaration dropped; `--` in a comment
+  split; elements open at EOF closed) and reported as
+  `DocxWarning::MalformedPart { repaired: true }`: the part is
+  regenerate-only like a #325 normalised one (a sibling's repaired bytes
+  replace its `other_entries` row). STRUCTURAL defects (an end tag that
+  closes the wrong element or nothing, markup cut inside a tag, a second
+  root, no root) have no faithful repair: the part is left as it is with
+  `repaired: false` — the main part's typed parse refuses it (typed
+  error), a sibling reads as before. `check_part_xml_well_formed` (the
+  save-side gate) runs the same scan (`well_formed::defects`), and the
+  `docx_roundtrip` fuzz target asserts a save's re-read needs no repair.
+  Harness: `tools/roundtrip` step 60 (`malformed.rs`); seeds
+  `fuzz/corpus/docx_roundtrip/repro_*`.
 - **Measures (issue #349).** Page geometry, `<w:ind>`, `<w:spacing>` and
   table widths go through `schema::measure` (`attr_measure*`): integer or
   decimal twips, ECMA universal-measure units (`in` / `cm` / `mm` / `pt` /

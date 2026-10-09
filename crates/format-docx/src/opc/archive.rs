@@ -91,6 +91,12 @@ pub struct DocxArchive {
 /// passthrough `<w:p w14:paraId=…>` spliced under a synthesized root
 /// that forgot to re-declare `xmlns:w14` is well-formed XML 1.0 but NOT
 /// namespace-well-formed, and Word refuses (or "repairs") the file.
+///
+/// Issue #434 — and lexically strict, by the same scan the reader runs on
+/// every part it opens (`opc::well_formed`): bytes that are not UTF-8, an
+/// `&` starting no reference, a character XML 1.0 excludes, a malformed or
+/// repeated attribute, junk outside the root and a truncated part all fail
+/// it — a save the reader would have to repair is not well-formed.
 pub fn check_document_xml_well_formed(docx: &[u8]) -> Result<(), DocxError> {
     /* Issue #353 — the main part is whatever `_rels/.rels` says. */
     let main = main_part_name(docx).unwrap_or_else(|| DOC_XML.to_string());
@@ -132,6 +138,13 @@ pub fn check_part_xml_well_formed(docx: &[u8], part_name: &str) -> Result<(), Do
         .map_err(|_| DocxError::MissingEntry(part_name.into()))?;
     /* Issue #348 — never allocate from the declared size. */
     let xml = read_entry_bounded(part, part_name, &PackageLimits::DEFAULT, &mut 0)?;
+    /* Issue #434 — the reader's strict scan, so the save side and the read
+    side agree: anything the reader would have to repair (bytes that are
+    not UTF-8, a raw `&`, an excluded character, a malformed attribute,
+    junk outside the root, a truncated part) fails the gate too. */
+    if let Some(defects) = crate::opc::well_formed::defects(&xml) {
+        return Err(DocxError::MalformedXml(format!("{part_name}: {defects}")));
+    }
 
     let mut reader = NsReader::from_reader(xml.as_slice());
     let config = reader.config_mut();

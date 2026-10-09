@@ -32,6 +32,7 @@
 mod comments;
 mod complex_script;
 mod inline_spans;
+mod malformed;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
@@ -365,6 +366,7 @@ fn run_default() -> Result<()> {
     tracked_coverage::run_tracked_table_rows_roundtrip()?;
     tracked_coverage::run_section_break_revision_roundtrip()?;
     protection::run_document_protection_roundtrip()?;
+    malformed::run_malformed_parts_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

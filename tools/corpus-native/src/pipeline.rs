@@ -568,12 +568,19 @@ pub struct DocResult {
     pub theme_fonts: Option<ThemeFontCensus>,
     /// Issues #325 / #394 — the parts the reader re-prefixed into the
     /// canonical namespace spelling (`DocxWarning::NonCanonicalNamespaces`
-    /// with `normalized`): each is regenerate-only, so its zero-edit save
+    /// with `normalized`) and, issue #434, the malformed parts it repaired
+    /// up front (`DocxWarning::MalformedPart` with `repaired`): each is
+    /// regenerate-only, so its zero-edit save
     /// re-emits the normalised bytes, not the source's — a fidelity cost
     /// the sibling / `document.xml` identity columns (which compare the
     /// archive as read) do not show. Empty for canonical packages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub normalized_parts: Vec<String>,
+    /// Issue #434 — the MAIN part is among `normalized_parts`: its zero-edit
+    /// save re-emits the normalised / repaired bytes by design, so the
+    /// `document.xml` identity column does not count it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub main_part_regenerate_only: bool,
 }
 
 /// Issue #355 — theme-font resolution over every paragraph (body, table
@@ -735,6 +742,7 @@ impl DocResult {
             theme_fonts: None,
             engine_degradations: Vec::new(),
             normalized_parts: Vec::new(),
+            main_part_regenerate_only: false,
         }
     }
 
@@ -908,10 +916,16 @@ pub fn run_one(
                 part,
                 normalized: true,
                 ..
+            }
+            | format_docx::DocxWarning::MalformedPart {
+                part,
+                repaired: true,
+                ..
             } => Some(part.clone()),
             _ => None,
         })
         .collect();
+    rec.main_part_regenerate_only = rec.normalized_parts.contains(&archive_a.part_names.main);
 
     /* 2. Full layout (native — `crates/layout`, no browser). */
     let layout_t0 = Instant::now();
