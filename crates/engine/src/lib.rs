@@ -2301,6 +2301,13 @@ impl SpanStyle {
     /// complex-script twin: the "both slots" rule of engine-authored
     /// formatting (Word's ribbon size / bold / italic / font apply to both
     /// script classes). A twin the caller already set is kept.
+    ///
+    /// Issue #424 — the Latin family slot is `font_family` OR an
+    /// unresolved `raw_font_family` ([`Self::names_latin_family`]): a raw
+    /// name the engine could not model is still the family the caller
+    /// picked, so the complex-script slot takes it too (written `w:cs`,
+    /// laid out — substituted — per slot) instead of silently keeping
+    /// its inherited theme face.
     pub fn with_cs_twins(mut self) -> SpanStyle {
         if self.font_size_cs.is_none() {
             self.font_size_cs = self.font_size;
@@ -2312,7 +2319,7 @@ impl SpanStyle {
             self.italic_cs = self.italic;
         }
         if self.font_family_cs.is_none() {
-            self.font_family_cs = self.font_family.clone();
+            self.font_family_cs = self.font_family.clone().or_else(|| self.raw_family());
         }
         self
     }
@@ -2320,6 +2327,12 @@ impl SpanStyle {
     /// Issue #359 — the `cs_only` form of a formatting patch: every Latin
     /// slot moves onto its complex-script twin and the Latin slot is left
     /// unset, so applying the patch touches only complex-script text.
+    ///
+    /// Issue #424 — an unresolved `raw_font_family` is a Latin-slot name
+    /// (`w:ascii` / `w:hAnsi`) like `font_family`: it moves to `w:cs`
+    /// (as the verbatim-display [`FontFamily::Custom`] the reader would
+    /// have built from `w:cs`), never stays behind to rename the Latin
+    /// text.
     pub fn into_cs_only(mut self) -> SpanStyle {
         if let Some(size) = self.font_size.take() {
             self.font_size_cs = Some(size);
@@ -2330,10 +2343,28 @@ impl SpanStyle {
         if let Some(italic) = self.italic.take() {
             self.italic_cs = Some(italic);
         }
-        if let Some(family) = self.font_family.take() {
+        let raw = self.raw_family();
+        self.raw_font_family = None;
+        if let Some(family) = self.font_family.take().or(raw) {
             self.font_family_cs = Some(family);
         }
         self
+    }
+
+    /// Issue #424 — `true` when this level names the Latin family slot
+    /// (`w:ascii` / `w:hAnsi`): a modeled `font_family` or a non-blank
+    /// unresolved `raw_font_family`. The two fields are ONE slot — see
+    /// [`Self::merged_with`].
+    pub fn names_latin_family(&self) -> bool {
+        self.font_family.is_some() || self.raw_family().is_some()
+    }
+
+    /// Issue #424 — `raw_font_family` as a family (verbatim display name);
+    /// `None` when unset or blank.
+    fn raw_family(&self) -> Option<FontFamily> {
+        self.raw_font_family
+            .as_deref()
+            .and_then(FontFamily::from_display_name)
     }
 
     /// Issue #359 — `self` as complex-script text sees it: every Latin
@@ -2384,10 +2415,23 @@ impl SpanStyle {
         `w:hAnsi`) claims those two, a complex-script one (`w:cs`) the
         `cs` slot, so a Latin-only font pick leaves the Arabic text on
         its theme face. */
+        let names_latin = patch.names_latin_family();
         let claims = theme::SlotClaims {
-            latin: patch.font_bindings.is_none()
-                && (patch.font_family.is_some() || patch.raw_font_family.is_some()),
+            latin: patch.font_bindings.is_none() && names_latin,
             complex_script: patch.font_bindings.is_none() && patch.font_family_cs.is_some(),
+        };
+        /* Issue #424 — `font_family` and `raw_font_family` are one slot (the
+        Latin name): a level naming it either way replaces both, so a raw
+        pick is never shadowed by an inherited modeled family (layout and
+        the writer both prefer `font_family`), nor a modeled pick trailed
+        by a stale raw name. A blank raw name names nothing. */
+        let (font_family, raw_font_family) = if names_latin {
+            (patch.font_family, patch.raw_font_family)
+        } else {
+            (
+                patch.font_family.or(self.font_family),
+                patch.raw_font_family.or(self.raw_font_family),
+            )
         };
         let font_theme = if claims.latin && patch.font_theme.is_none() {
             None
@@ -2412,13 +2456,13 @@ impl SpanStyle {
             underline: patch.underline.or(self.underline),
             strike: patch.strike.or(self.strike),
             bg_color: patch.bg_color.or(self.bg_color),
-            font_family: patch.font_family.or(self.font_family),
+            font_family,
             font_family_cs: patch.font_family_cs.or(self.font_family_cs),
             char_style: patch.char_style.or(self.char_style),
             caps: patch.caps.or(self.caps),
             small_caps: patch.small_caps.or(self.small_caps),
             vert_align: patch.vert_align.or(self.vert_align),
-            raw_font_family: patch.raw_font_family.or(self.raw_font_family),
+            raw_font_family,
             font_theme,
             /* Issue #84 — same "set field wins" rule as every slot above:
             a formatting patch (no bag) keeps the run's bag; a direct
@@ -12052,6 +12096,92 @@ mod tests {
         );
         let view = fam.complex_script_view();
         assert_eq!((view.font_family, view.font_theme), (None, None));
+    }
+
+    /// Issue #424 — an unresolved (raw) family name is a real Latin-slot
+    /// claim: the slot routing moves / mirrors it like `font_family`, and
+    /// the cascade treats the two fields as one slot.
+    #[test]
+    fn raw_font_family_is_a_latin_slot_claim() {
+        let raw = SpanStyle {
+            raw_font_family: Some("Sakkal Majalla".into()),
+            ..Default::default()
+        };
+        let sakkal = FontFamily::from_display_name("Sakkal Majalla");
+        assert!(raw.names_latin_family());
+        assert!(
+            !SpanStyle {
+                raw_font_family: Some("  ".into()),
+                ..Default::default()
+            }
+            .names_latin_family(),
+            "a blank raw name names nothing"
+        );
+        /* Both slots: the complex-script slot takes the raw name. */
+        let both = raw.clone().with_cs_twins();
+        assert_eq!(both.raw_font_family.as_deref(), Some("Sakkal Majalla"));
+        assert_eq!(both.font_family_cs, sakkal);
+        /* Complex script only: the name leaves the Latin slot. */
+        let cs_only = raw.clone().into_cs_only();
+        assert_eq!((cs_only.font_family, cs_only.raw_font_family), (None, None));
+        assert_eq!(cs_only.font_family_cs, sakkal);
+        assert_eq!(
+            cs_only
+                .font_family_cs
+                .as_ref()
+                .map(FontFamily::display_name),
+            Some("Sakkal Majalla"),
+            "written verbatim as w:cs"
+        );
+        /* A raw pick over a modeled family replaces it (layout and the
+        writer prefer `font_family`, which used to shadow the pick)… */
+        let amiri = SpanStyle {
+            font_family: Some(FontFamily::Amiri),
+            font_family_cs: Some(FontFamily::Amiri),
+            ..Default::default()
+        };
+        let picked = amiri.clone().merged_with(raw.clone());
+        assert_eq!(picked.font_family, None);
+        assert_eq!(picked.raw_font_family.as_deref(), Some("Sakkal Majalla"));
+        assert_eq!(
+            picked.font_family_cs,
+            Some(FontFamily::Amiri),
+            "a Latin-only raw pick leaves the complex-script slot"
+        );
+        /* …a modeled pick drops a stale raw name… */
+        let back = picked.merged_with(SpanStyle {
+            font_family: Some(FontFamily::LiberationSans),
+            ..Default::default()
+        });
+        assert_eq!(
+            (back.font_family, back.raw_font_family),
+            (Some(FontFamily::LiberationSans), None)
+        );
+        /* …and a level naming neither keeps both. */
+        let kept = raw.clone().merged_with(SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(kept.raw_font_family.as_deref(), Some("Sakkal Majalla"));
+        /* A cs-only raw pick claims the `cs` theme binding, not the Latin
+        ones (issue #355's claim rule). */
+        let themed = SpanStyle {
+            font_bindings: Some(Box::new(theme::RunFontBindings {
+                ascii: Some(theme::FontBinding::Theme("minorHAnsi".into())),
+                h_ansi: Some(theme::FontBinding::Theme("minorHAnsi".into())),
+                east_asia: None,
+                cs: Some(theme::FontBinding::Theme("minorBidi".into())),
+            })),
+            ..Default::default()
+        };
+        let merged = themed.merged_with(raw.into_cs_only());
+        let b = merged.font_bindings.as_deref().expect("bindings");
+        assert_eq!(b.cs, Some(theme::FontBinding::Name));
+        assert_eq!(
+            b.ascii,
+            Some(theme::FontBinding::Theme("minorHAnsi".into())),
+            "the Latin slot stays on the theme"
+        );
     }
 
     /* ---- issue #23: dynamic, string-backed FontFamily ------------- */

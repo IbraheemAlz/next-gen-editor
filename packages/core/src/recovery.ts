@@ -13,14 +13,17 @@
  * Headless and pure: `@nge/ui`'s `RecoveryBanner` renders the list, and a
  * host with its own chrome can render it however it likes.
  */
-import type { RecoveryReport } from './types';
+import type { PreviousSessionInfo, RecoveryReport } from './types';
 
 export type RecoveryNoticeKind =
     | 'log-truncated'
     | 'tail-dropped'
     | 'package-lost'
     | 'renderer-downgrade'
-    | 'checkpoint-failing';
+    | 'checkpoint-failing'
+    | 'journal-failing'
+    | 'journal-gap'
+    | 'previous-session';
 
 export interface RecoveryNotice {
     kind: RecoveryNoticeKind;
@@ -90,6 +93,18 @@ export function recoveryNotices(
                 'original, which still has them.',
         });
     }
+    if (report.journalGap !== undefined && report.journalGap > 0) {
+        const n = report.journalGap;
+        notices.push({
+            kind: 'journal-gap',
+            title: 'Some of your latest edits could not be restored',
+            detail:
+                `The editor could not record ${n} recent ${n === 1 ? 'change' : 'changes'} ` +
+                'before it crashed (browser storage was failing), so the recovered document ' +
+                'is missing them.',
+            action: 'Review the document and redo your most recent edits before saving.',
+        });
+    }
     if (report.rendererDowngraded && report.rendererDowngrade) {
         const d = report.rendererDowngrade;
         notices.push({
@@ -118,8 +133,24 @@ export function recoveryDegraded(report: RecoveryReport | undefined): boolean {
  * nothing is lost yet, but a crash now would replay a long tail or lose
  * work, so the user is told to save. `[]` while checkpoints are fine.
  */
-export function checkpointNotices(failing: boolean): RecoveryNotice[] {
-    if (!failing) return [];
+export function checkpointNotices(failing: boolean, journalFailing = false): RecoveryNotice[] {
+    if (!failing && !journalFailing) return [];
+    if (journalFailing) {
+        /* Issue #390 - the worse case: even the per-command journal is not
+           being written, so a crash now loses the edits since the last
+           checkpoint rather than replaying them. */
+        return [
+            {
+                kind: 'journal-failing',
+                title: 'Your edits are not being recorded',
+                detail:
+                    'The editor could not write its recovery journal (the browser storage ' +
+                    'may be full or blocked). If the editor crashes now, recovery will miss ' +
+                    'your recent edits.',
+                action: 'Save your work now.',
+            },
+        ];
+    }
     return [
         {
             kind: 'checkpoint-failing',
@@ -129,6 +160,32 @@ export function checkpointNotices(failing: boolean): RecoveryNotice[] {
                 'storage may be full or blocked). If the editor crashes now, recent edits ' +
                 'may be lost.',
             action: 'Save your work now.',
+        },
+    ];
+}
+
+/**
+ * Issue #388 - the offer to bring back a previous page generation's
+ * unsaved session (a plain reload starts a new session, which would
+ * otherwise have dropped it). Non-destructive until the user decides:
+ * Recover swaps it in, Discard throws it away; ignoring the banner keeps
+ * it for the next boot.
+ */
+export function previousSessionNotice(
+    info: PreviousSessionInfo | undefined,
+    options: RecoveryNoticeOptions = {},
+): RecoveryNotice[] {
+    if (!info) return [];
+    const formatTime = options.formatTime ?? defaultTime;
+    const when = formatTime(info.lastEditAt ?? info.archivedAt);
+    return [
+        {
+            kind: 'previous-session',
+            title: 'Recover previous document?',
+            detail:
+                `The page was closed or reloaded with unsaved changes (last edit around ${when}). ` +
+                'They have been kept aside; this new session starts from a blank document.',
+            action: 'Recover them to carry on where you left off, or discard them.',
         },
     ];
 }

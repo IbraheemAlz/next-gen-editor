@@ -257,6 +257,7 @@ dependencies = [
  "format-docx",
  "format-pdf",
  "layout",
+ "libc",
  "quick-xml",
  "serde",
  "serde_json",

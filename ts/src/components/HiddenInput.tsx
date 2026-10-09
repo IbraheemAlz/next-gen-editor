@@ -16,7 +16,7 @@ import {
 } from '../state/engine-store';
 import { ClipboardWriteError, copy, cut, paste, writeSync } from '../input/clipboard';
 import { createClipboardPrefetch } from '../input/clipboard-cache';
-import { installDevHook } from '../dev-hooks';
+import { devHooksEnabled, installDevHook } from '../dev-hooks';
 
 /** Map a non-composition `InputEvent` to an engine command. */
 function mapInputEventToCommand(e: InputEvent): Command | null {
@@ -354,11 +354,16 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     /* Issue #57 — warm payload for the live selection, so copy/cut can
        write synchronously inside the trusted event. `?clipboardPrefetch=0`
        disables the prefetch (every copy then takes the async path). */
-    const prefetch = createClipboardPrefetch(
-        props.client,
-        props.store,
-        new URLSearchParams(window.location.search).get('clipboardPrefetch') !== '0',
-    );
+    /* Issue #389 - the kill switch is a build constant
+       (`VITE_NGE_CLIPBOARD_PREFETCH=0`); the `?clipboardPrefetch=0` URL
+       parameter is honoured only under the dev-hooks flag. */
+    const prefetchEnabled =
+        import.meta.env.VITE_NGE_CLIPBOARD_PREFETCH !== '0' &&
+        !(
+            devHooksEnabled() &&
+            new URLSearchParams(window.location.search).get('clipboardPrefetch') === '0'
+        );
+    const prefetch = createClipboardPrefetch(props.client, props.store, prefetchEnabled);
     installDevHook('__clipboardPrefetch', prefetch);
 
     const onCopy = (e: ClipboardEvent): void => {
@@ -433,6 +438,8 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
                the document. The SDK's EditorSurface exposes the same hook
                as `#nge-hidden-input`. */
             data-nge-hidden-input=""
+            /* Issue #389 - passive, observable state (not a capability). */
+            data-clipboard-prefetch={prefetchEnabled ? 'on' : 'off'}
             tabindex="-1"
             autocomplete="off"
             autocapitalize="off"

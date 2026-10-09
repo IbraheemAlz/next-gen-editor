@@ -111,6 +111,9 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **Recovery = base snapshot + replayed tail (issue #85).** `Command::Snapshot` → `Event::Snapshot { bytes }` is the versioned `engine::snapshot` envelope (`NGES` magic + format-version byte + named-field MessagePack; every model struct is `#[serde(default)]`, maps serialize sorted so equal states are byte-identical). It carries the document tree (styles, numbering, header/footer stories, media, comments), a size-bounded undo window, the selection, the active story, sticky formatting, review flags and the layout config. The worker snapshots every `SNAPSHOT_EVERY` logged commands *inside* the command task after the reply (so the seq is exact) and on a 1.5 s idle timer; the IndexedDB write stays off the critical path. `Command::Recover { snapshot, log_tail }` restores, then replays the tail through `apply` with the layout config stashed (no fonts yet → nothing may paint), and answers `Recovered { applied_commands, snapshot_restored, renderer }` — the renderer is re-probed on the fresh canvas and reported by the engine itself (#66). `setupEngine(restored = true)` re-loads fonts and re-asserts the device scale instead of re-seeding. `ARM_TRAP` (`EngineClient.armTrap`) is the fault-injection hook: a real `Engine.debug_force_trap` after K logged commands, log flushed first. The #99 Vello crash-loop streak is **persisted** (issue #240, `meta` row `renderer-streak`: count + timestamp + renderer + a `live` token; a clean `pagehide` leaves the token in `localStorage`, so only a generation that died with its tab counts): a boot within 24 h of reaching `VELLO_TRAP_LIMIT` starts on Canvas2D without probing (`INIT.forceRenderer`), and the Dev HUD shows the sticky fallback with a "Retry vello" action (`EngineClient.retryGpuRenderer`) — since issue #270 the retry is **in place**: the worker is retired (everything already sent is applied and logged, a snapshot is taken, writes flushed, then `self.close()`), and the shell respawns it through the normal recovery path without a trap, so the document, zoom and the page survive — never `window.location.reload()`, which starts a new session.
 - **Crash overlay never loses the document (issue #330).** `TrapOverlay` (shown between `TRAP` and `RECOVERED`) has no `window.location.reload()` fallback any more: "Reload engine" = `EngineClient.restartInPlace()` (joins a recovery already under way, otherwise retires the worker like #270 — bounded by `RETIRE_TIMEOUT_MS` — and respawns through the normal recovery path, `RecoveryInfo.cause = 'engine-reload'`); "Reload page (keeps document)" = `prepareCarryOver()` (retire + a one-shot `sessionStorage` token) then reload, and the next boot's `init()` honours the token **once** by recovering from the log instead of `INIT` (`cause = 'page-reload'`; `RECOVER`'s reply now also carries `crossOriginIsolated`); "Discard document" (two-step confirm) is the only action that starts a new session. **A new session — `INIT` → `openEventLog` — is the only thing that clears the event log**; a plain F5 still does, with or without unsaved edits (no `beforeunload` guard yet). Buttons whose `EngineClientLike` method (`restartInPlace` / `prepareCarryOver`) is absent are hidden, not left as reloads. e2e: `crash-recovery.spec.ts` holds the recovery open with a gate on `client.recover` so the overlay can be clicked.
 - **A failed snapshot write is retried on its own clock (issue #333).** `takeSnapshot`'s write failure rewinds `lastSnapshotAt` (so the position is snapshotted again, not skipped as "taken") and schedules a bounded retry — `SNAPSHOT_RETRY_DELAYS_MS` = 2 s, 4 s, 8 s, independent of new commands; a success resets the run. After the last retry also fails the worker posts `{ notice: 'CHECKPOINT', state: 'exhausted' }` (unsolicited, id-less like the a11y delta) → `EngineClient.checkpointStatus` / `onCheckpointStatus` → `createEditorState().checkpointFailing` → `RecoveryBanner` ("Changes are not being checkpointed … Save your work now", `data-kinds="checkpoint-failing"`, cleared by the next landed write). Every failed write also fires `onCheckpointFailure` → telemetry `ERROR / CHECKPOINT_FAILED` sample (`bridge::ErrorCode::CheckpointFailed`). e2e: `event-log-replay.spec.ts` mocks `IDBObjectStore.put` in the worker to abort the first N `snapshots` puts.
+- **A plain reload with unsaved edits no longer loses them (issue #388).** The worker keeps a `clean` marker in the event-log `meta` store, folded from every command by the ONE shared rule `ts/src/engine/clean-state.ts` (`nextCleanState`: `new_document` commands → clean, other `mutates_doc` → dirty, a `SAVE_DOCX` that answered `DOCUMENT_SAVED` → clean, refused commands change nothing; `EngineClient` folds the same rule on the main thread for the synchronous answer, `hasUnsavedChanges`). `attachUnloadGuard` (`ts/src/state/unload-guard.ts`) raises the browser's `beforeunload` prompt while the document is not clean (`attachUnloadGuard(client, { enabled })` / `VITE_NGE_UNLOAD_GUARD=0` for hosts that autosave; a prepared carry-over, #330, is not guarded). At boot — no carry-over token — `EngineClient.init` calls `inspectActiveLog`: a log whose marker is `false` is copied into ONE `archive` row (`archiveActiveLog`, DB v3; a newer unsaved session replaces an older undecided one) BEFORE `INIT` clears the active stores, and `previousSession` / `onPreviousSession` publish it (an undecided offer survives further reloads). `@nge/ui` `RecoveryBanner` shows "Recover previous document?" with **Recover** (`recoverPreviousSession`: retire the fresh worker, `restoreArchive` swaps the archive in as the active log in one transaction, respawn through the normal recovery path, `cause = 'session-restore'`) and **Discard** (`discardPreviousSession`); the archive is cleared only by Discard or by Recover. A log with no marker (written before #388) reads as "unknown" and is never offered. e2e: `unsaved-session.spec.ts`.
+- **The event log's health is a typed bridge event, and the command journal is retried too (issue #390).** The ad-hoc `{ notice: 'CHECKPOINT' }` worker message is gone: the worker broadcasts an additive `Event::CheckpointState { ok, failures, last_error, journal_failing }` (id-less, unsolicited like the a11y delta — no `Command`, `EXPECTED_VARIANT_COUNT` unchanged) on `subscribe()`; every event with `failures > 0` is exactly one failed attempt (the exhausting failure is a single `ok: false` event), `failures: 0` ends a run. Three failure sources share the 2/4/8 s clock: an engine-side `SNAPSHOT` dispatch that answers anything but `SNAPSHOT` (or throws) → `noteSnapshotFailed`, the snapshot's IndexedDB write (#333), and an `appendCommand` row write → `journalBacklog` + `drainJournal` (rounds, not rows: a keystroke burst failing together is ONE round; a later successful append drains an exhausted backlog). The failed seqs are also recorded best-effort in the `meta` row `journal-gap`; `RECOVER` counts the ones still missing after the restored base (plus holes in the retained tail) as `RecoveryInfo.journalGap` (reply field `journalGap`, `recoveryNotices` kind `journal-gap`). `@nge/core` `createEditorState().checkpointState()` (`CheckpointHealth`) mirrors the event (seeded from `engine.checkpointStatus`; `checkpointFailing()` is `!ok`); `RecoveryBanner` shows `journal-failing` ("Your edits are not being recorded", `checkpointNotices(failing, journalFailing)`) beside the #333 `checkpoint-failing` notice; telemetry gets `ERROR / CHECKPOINT_FAILED` per attempt and `ERROR / JOURNAL_FAILED` (`bridge::ErrorCode::JournalFailed`) once per exhausted run. e2e: `journal-failure.spec.ts` (mocked failing `commands` store).
+- **A refused keyboard edit is visible (issue #364).** `Engine::tracked_delete` answers `Event::Error { kind: Some(ErrorKind::TrackedDeletionRefused) }` (additive `bridge::ErrorKind` variant) for a tracked deletion across a table-cell boundary / over a table. `@nge/core` `createEditorState().lastError()` (`EditorError`: `kind`, `command` parsed from the `<Command>: ` message prefix, `message`, running `count`, `at`) moves on EVERY `Event::Error` reply; `@nge/ui` `ErrorToast` (mounted in `SdkShelf`) renders the kinds that have copy in `ERROR_TOAST_COPY` in a persistent `.nge-toast` `role="status"` live region for 4 s (a newer error restarts the timer; `PackageTooLarge` keeps the File menu's presentation, untyped errors are HUD-only), and the Dev HUD has a "Last error" row. A new typed `ErrorKind` that the user must see needs a copy entry there. e2e: `error-toast.spec.ts` (review mode, selection across a table, real Backspace; fails without the toast).
 - **e2e suite**: `ts/e2e/*.spec.ts` + `ts/playwright.config.ts` — `@playwright/test` with `channel: 'chrome'` (system Chrome, no download); `webServer` auto-boots Vite. Run: `pnpm exec playwright test` from `ts/`.
 - **Race-class e2e specs use the synchronous `burst` helper (issue #310).** `page.keyboard` / `page.mouse` round-trip through CDP per event — slow enough that the worker answers between two simulated inputs and the shell's mirrored state is already fresh, so a spec passes against the very race it targets (the #286 real-keyboard spec did). `ts/e2e/helpers/editor.ts` exports `burst(page, steps)`, which fires the whole sequence (`'B'` Ctrl+B, `'BTN'` Bold button, `'ENTER'`, `{ pointerdown: { x, y, shift? } }` / `{ pointerup }` on a page canvas through the real `pointer.ts`, or any other string as `insertText`) from ONE synchronous `page.evaluate`, so no engine reply can interleave; read results via `documentText` / `settle` (worker round-trips, FIFO behind the burst). Calling `__dispatch` directly is NOT a race test — it bypasses `pointer.ts` / `HiddenInput`. **A new race spec must be shown to fail** against a deliberately re-introduced deferral in the shell (e.g. `setTimeout(…, 0)` around `placeCaret`/`extendTo`/the Enter dispatch/`toggleFormat`/`cmd.toggleFormatting`); a bare delay needs a trailing keystroke queued behind it in the burst (the readback arrives too late to notice a delay on its own). Keep one slow real-input smoke per scenario, but never as the only guard. The engine ignores a stale `at` on `SPLIT_PARAGRAPH` when a selection exists, so "stale mirror" regressions of Enter surface only as shell-side deferral.
 
@@ -210,10 +213,11 @@ D5.10 are external/human sign-offs, not code.
   (their heavier fixtures blew the runner's time cap — run them locally or
   on a nightly schedule). Issue #258 added `tools/pdf-validate --corpus
   tier-a --profile 1b` to the same job (~9 s locally for all 6 documents,
-  reusing the wasm build the visual-diff step already needs) — veraPDF
-  itself is not installed on the runner, so only the structural PDF/A
-  marker check runs there; the full veraPDF conformance gate is local-only
-  (`node tools/pdf-validate/run.mjs`). The Playwright e2e suite (`ts/e2e/`)
+  reusing the wasm build the visual-diff step already needs). Issue #393
+  installs veraPDF 1.30.2 on the runner (pinned official installer zip +
+  SHA-256, headless IzPack install into `~/verapdf`, `actions/cache`d), so
+  both pdf-validate steps run the real conformance checks under `--strict`
+  (a missing veraPDF fails instead of skipping). The Playwright e2e suite (`ts/e2e/`)
   became a **blocking** `e2e` job later, issue #230 — see the Validation
   section.
 
@@ -305,6 +309,8 @@ Engine backlog" references a real issue.
 ## Validation (CI gates, all -D warnings)
 
 - `cargo fmt --all -- --check` clean.
+- `cargo fmt --manifest-path fuzz/Cargo.toml -- --check` clean (issue #412 —
+  `fuzz/` is its own workspace, so `--all` does not reach it).
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo test --workspace` (native unit tests), **plus** `cargo test -p
   engine-wasm --features fuzz-native` (issue #321): the bridge-level tests
@@ -350,9 +356,12 @@ Engine backlog" references a real issue.
   budget + `wasm-pack test` + the `engine-wasm-pkg` artifact upload),
   `e2e` (this suite, issue #230). Non-blocking (`continue-on-error: true`):
   `qa-harness` runs `tools/visual-diff --tier A` (capped at 3 min) then
-  `tools/pdf-validate --corpus tier-a --profile 1b` (issue #258, capped at
-  1 min; structural-only on this runner — no veraPDF installed) — the whole
-  job stays non-blocking because golden pixel-reproducibility on the GitHub
+  `tools/pdf-validate --corpus tier-a --profile 1b --strict` (issue #258,
+  capped at 1 min; real veraPDF 1.30.2 since issue #393) then
+  `tools/pdf-validate --native --strict` (issue #393, browserless Rust
+  export of the Latin + Arabic CFF / TrueType fixtures, capped at 2 min;
+  its `cargo test -p format-pdf --lib --no-run` pre-build is a separate
+  uncapped step) — the whole job stays non-blocking because golden pixel-reproducibility on the GitHub
   runner's Chrome is still unproven across machines. `tools/memory-profile`
   and `tools/perf` are **not** wired into `ci.yml` at all — the heavier
   fixtures (100p/250p/500p) blew the runner's time cap; run them locally
@@ -389,17 +398,25 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 ### Live validation hooks (issue #340)
 
 `window.__dispatch`, `__engineClient`, `__fontRegistry`,
-`__setTelemetryEnabled`, `__telemetryFlush` and `__clipboardPrefetch` — and
-the `?telemetryEndpoint=` URL parameter — are installed/honoured **only**
+`__setTelemetryEnabled`, `__telemetryFlush`, `__clipboardPrefetch` and
+`__lastStats` — and the `?telemetryEndpoint=` and `?clipboardPrefetch=0`
+URL parameters, and the `@nge/ui` `SettingsMenu`'s URL-driven renderer
+switch (`<EngineProvider debugSurfaces>`, issue #389) — are
+installed/honoured **only**
 when `devHooksEnabled()` (`ts/src/dev-hooks.ts`): the Vite dev server
 (`import.meta.env.DEV`), a `?test=` page, or a build made with
 **`VITE_NGE_DEV_HOOKS=1`**. Live validation against a **built** bundle
 (`vite build` + `vite preview`, or any non-dev deploy) therefore needs
 `VITE_NGE_DEV_HOOKS=1 pnpm exec vite build`; a plain release build exposes no
 engine handle on `window` (`ts/e2e/prod-build.spec.ts` builds both ways and
-asserts it). The passive status flags (`__paintIdle`, `__engineReady`,
-`__renderer`, `__recovered`, `__bootMs`, `__lastStats`) stay unconditional —
-they are not capabilities and a production smoke test waits on them.
+asserts it, plus no `#stats` box, `?clipboardPrefetch=0` ignored, no renderer
+switch). The passive status flags — exactly `__paintIdle`, `__engineReady`,
+`__renderer`, `__recovered` and `__bootMs` — are the ONLY unconditional
+`window.__*` values: they are not capabilities and a production smoke test
+waits on them. The visible stats readout is the Dev HUD (Ctrl+Shift+D), not a
+fixed `#stats` box; production kill switches are build constants
+(`VITE_NGE_CLIPBOARD_PREFETCH=0`, `VITE_NGE_UNLOAD_GUARD=0`) or provider
+props, never URL parameters.
 `playwright.config.ts` sets the flag on its dev server. The telemetry
 collector endpoint is the build constant `VITE_NGE_TELEMETRY_ENDPOINT` (or
 `<EngineProvider telemetryEndpoint>`); the URL parameter works only under the

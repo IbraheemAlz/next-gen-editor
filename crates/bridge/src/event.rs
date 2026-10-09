@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
-use crate::command::{BridgeCellBorders, BridgeTabStop, HeaderFooterArea, PageOrientation};
+use crate::command::{
+    BridgeCellBorders, BridgeTabStop, FontSlot, HeaderFooterArea, PageOrientation,
+};
 use crate::common::{
     Alignment, Color, Direction, DocFormat, ImageRect, LogicalPos, LogicalRange, Rect,
     RendererDowngrade, Script, SelectionKind, TextAttrs,
@@ -13,6 +15,12 @@ use crate::common::{
 /// engine's cold default (100 %), never `0.0`.
 fn default_zoom() -> f32 {
     1.0
+}
+
+/// `serde(default)` for `SelectionChanged.caret_font_slot`: a producer that
+/// predates issue #423 reported the Latin read-back.
+fn default_caret_font_slot() -> FontSlot {
+    FontSlot::Latin
 }
 
 /// An event emitted by the engine. Serialized internally-tagged
@@ -407,6 +415,37 @@ pub enum Event {
         /// that predate it.
         #[serde(default)]
         document_revision: u64,
+        /// Issue #423 — the family the caret run's LATIN slot (`w:ascii`,
+        /// else `w:hAnsi`) resolves to after the full cascade: the run's
+        /// own name → its theme binding (through `theme1.xml`) → the
+        /// style chain → docDefaults → the layout's default face. A
+        /// display name (`"Calibri"`), never the raw theme token
+        /// (`minorHAnsi`). `attrs_at_caret.font_family` keeps reporting
+        /// the run's own id (or the layout default) for older consumers.
+        /// Additive — empty from producers that predate it.
+        #[serde(default)]
+        resolved_font_latin: String,
+        /// Issue #423 — `resolved_font_latin`
+        /// for the COMPLEX-SCRIPT slot (`w:cs` / `w:cstheme`, the theme's
+        /// per-script entry for the caret's script): what Arabic / Hebrew
+        /// text at the caret is shaped with.
+        #[serde(default)]
+        resolved_font_cs: String,
+        /// Issue #423 — where each slot's resolved family came from, so a
+        /// picker can mark a theme font ("Calibri (theme)").
+        #[serde(default)]
+        font_source: BridgeFontSources,
+        /// Issue #420 — the caret run's resolved size / weight / slant /
+        /// family id PER SCRIPT SLOT (Word's Font dialog: "Latin text" and
+        /// "Complex scripts"). `attrs_at_caret` reports only the slot the
+        /// caret's own text reads (`caret_font_slot`).
+        #[serde(default)]
+        slot_formats: BridgeSlotFormats,
+        /// Issue #423 — the slot `attrs_at_caret` reports: `ComplexScript`
+        /// when the caret's text is Arabic / Hebrew / … (or the run is
+        /// `<w:rtl/>` / `<w:cs/>`), else `Latin`. Never `Both`.
+        #[serde(default = "default_caret_font_slot")]
+        caret_font_slot: FontSlot,
         /// Issue #345 — the editing restriction the document enforces
         /// (`<w:documentProtection w:enforcement="1">` with a restricting
         /// `w:edit`), so the shell can badge it; `None` for an
@@ -512,6 +551,33 @@ pub enum Event {
         priority: AnnouncementPriority,
         message: String,
     },
+
+    /// Issue #390 - health of the worker's durable event log, broadcast
+    /// unsolicited on `subscribe()` (like the accessibility deltas; never
+    /// a reply, never produced by `Engine::apply`) whenever it changes.
+    /// It replaces the ad-hoc untyped `CHECKPOINT` worker message: a
+    /// failed engine-side `SNAPSHOT`, a failed snapshot write and a
+    /// failed command-row append each count, are retried on a bounded
+    /// 2/4/8 s clock, and flip `ok` to `false` once the retries are
+    /// exhausted (the shell then tells the user their changes are not
+    /// being protected). Additive: no `Command` carries it.
+    CheckpointState {
+        /// `true` while checkpoints (snapshots) and the command journal
+        /// are landing; `false` once a failure's bounded retries ran out.
+        ok: bool,
+        /// Consecutive failed attempts in the current failure run
+        /// (snapshot dispatch + snapshot write + journal append);
+        /// `0` when healthy.
+        failures: u32,
+        /// The most recent failure's message, when one occurred.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        last_error: Option<String>,
+        /// The command journal specifically is not being written: a
+        /// recovery now would silently miss the commands in the gap.
+        #[serde(default)]
+        journal_failing: bool,
+    },
 }
 
 /// Issue #348 — the class of an [`Event::Error`] the shell can present
@@ -524,6 +590,11 @@ pub enum ErrorKind {
     /// open was refused before anything was allocated from the package's
     /// own size claims. The previous document stays open.
     PackageTooLarge,
+    /// Issue #364 - a tracked (review-mode) deletion the engine refuses
+    /// because it would cross a table-cell boundary or run over a table:
+    /// nothing changed. The shell shows a visible, non-modal refusal
+    /// instead of letting the key press appear to do nothing.
+    TrackedDeletionRefused,
     /// Issue #345 — the file is an encrypted (password-protected) Office
     /// document: an OLE compound file (`D0 CF 11 E0 A1 B1 1A E1`) carrying
     /// an MS-OFFCRYPTO / ECMA-376 Part 2 `EncryptedPackage`, not a ZIP. The
@@ -734,6 +805,58 @@ pub struct AttrsMixed {
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
+}
+
+/// Issue #423 — where a script slot's resolved family came from (the
+/// cascade level that named it).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FontSource {
+    /// The run's own formatting names the family: its direct
+    /// `<w:rFonts>` name, a toolbar / Font-dialog pick, an armed pending
+    /// (sticky) style.
+    Explicit,
+    /// A theme binding (`w:asciiTheme` / `w:hAnsiTheme` / `w:cstheme`, at
+    /// any cascade level) resolved through the document theme, including
+    /// its per-script entries (`<a:font script="Arab">`).
+    Theme,
+    /// The style cascade names it: the character / paragraph style chain
+    /// or docDefaults (`<w:rPrDefault>`).
+    Style,
+    /// Nothing in the document names the slot; the family is the layout's
+    /// default face for the script (the font stack's fallback).
+    #[default]
+    Default,
+}
+
+/// Issue #423 — [`FontSource`] per script slot.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BridgeFontSources {
+    pub latin: FontSource,
+    pub complex_script: FontSource,
+}
+
+/// Issue #420 — one script slot of the formatting at the caret, fully
+/// resolved (cascade + theme + pending style), as the Font dialog seeds
+/// its "Latin text" / "Complex scripts" sections. Fonts are keyed by the
+/// toolbar / font-registry id (`TextAttrs.font_family`'s spelling);
+/// the display name is `SelectionChanged.resolved_font_*`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq)]
+pub struct BridgeSlotFormat {
+    /// Resolution id of the slot's family (`"amiri"`, `"calibri"`, …).
+    pub font_family: String,
+    /// Points.
+    pub font_size: f32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// Issue #420 — [`BridgeSlotFormat`] per script slot.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq)]
+pub struct BridgeSlotFormats {
+    /// `<w:sz>`, `<w:b>`, `<w:i>`, `w:ascii` / `w:hAnsi`.
+    pub latin: BridgeSlotFormat,
+    /// `<w:szCs>`, `<w:bCs>`, `<w:iCs>`, `w:cs`.
+    pub complex_script: BridgeSlotFormat,
 }
 
 /// Font vertical metrics, scaled to a requested pixel size.
@@ -1144,6 +1267,76 @@ mod a11y_note_wire_tests {
         })
         .unwrap();
         assert_eq!(refused["kind"], "Protected");
+    }
+
+    /// Issue #364 - the tracked-deletion refusal is a typed error kind.
+    #[test]
+    fn tracked_deletion_refused_kind_is_on_the_wire() {
+        let typed = serde_json::to_value(Event::Error {
+            message: "DeleteRange: table".into(),
+            kind: Some(ErrorKind::TrackedDeletionRefused),
+        })
+        .unwrap();
+        assert_eq!(
+            typed,
+            serde_json::json!({
+                "type": "ERROR",
+                "message": "DeleteRange: table",
+                "kind": "TrackedDeletionRefused"
+            })
+        );
+    }
+
+    /// Issue #390 - `CheckpointState` is an unsolicited, additive event:
+    /// a healthy state carries no `last_error` key, a failing one does.
+    #[test]
+    fn checkpoint_state_wire_shape() {
+        let ok = serde_json::to_value(Event::CheckpointState {
+            ok: true,
+            failures: 0,
+            last_error: None,
+            journal_failing: false,
+        })
+        .unwrap();
+        assert_eq!(
+            ok,
+            serde_json::json!({
+                "type": "CHECKPOINT_STATE",
+                "ok": true,
+                "failures": 0,
+                "journal_failing": false
+            })
+        );
+        let failing = serde_json::to_value(Event::CheckpointState {
+            ok: false,
+            failures: 4,
+            last_error: Some("QuotaExceededError".into()),
+            journal_failing: true,
+        })
+        .unwrap();
+        assert_eq!(
+            failing,
+            serde_json::json!({
+                "type": "CHECKPOINT_STATE",
+                "ok": false,
+                "failures": 4,
+                "last_error": "QuotaExceededError",
+                "journal_failing": true
+            })
+        );
+        // An older payload without `journal_failing` still decodes.
+        let back: Event = serde_json::from_value(
+            serde_json::json!({ "type": "CHECKPOINT_STATE", "ok": true, "failures": 0 }),
+        )
+        .unwrap();
+        assert!(matches!(
+            back,
+            Event::CheckpointState {
+                ok: true,
+                journal_failing: false,
+                ..
+            }
+        ));
     }
 
     fn run(text: &str, note_ref: Option<A11yNoteRef>) -> A11yRun {

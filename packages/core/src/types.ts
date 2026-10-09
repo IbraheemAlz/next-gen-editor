@@ -59,6 +59,10 @@ export type {
     Script,
     TextAttrs,
     AttrsMixed,
+    FontSource,
+    BridgeFontSources,
+    BridgeSlotFormat,
+    BridgeSlotFormats,
     EngineStats,
     LayoutDegraded,
     LayoutDegradeReason,
@@ -135,6 +139,20 @@ export interface EngineClientLike {
      */
     readonly checkpointStatus?: CheckpointStatus;
     onCheckpointStatus?(fn: (s: CheckpointStatus) => void): () => void;
+    /**
+     * Issue #388 - optional previous-session recovery. A page reload
+     * starts a new session; when the previous generation ended with
+     * unsaved edits, the client sets that session aside instead of
+     * dropping it and reports it here until the user decides:
+     * `recoverPreviousSession` swaps it in (the engine restarts from it),
+     * `discardPreviousSession` throws it away. `hasUnsavedChanges` is the
+     * synchronous answer a `beforeunload` guard needs.
+     */
+    readonly previousSession?: PreviousSessionInfo | undefined;
+    onPreviousSession?(fn: (p: PreviousSessionInfo | undefined) => void): () => void;
+    recoverPreviousSession?(): Promise<void>;
+    discardPreviousSession?(): Promise<void>;
+    readonly hasUnsavedChanges?: boolean;
     restartInPlace?(): Promise<void>;
     prepareCarryOver?(): Promise<void>;
     /**
@@ -148,11 +166,26 @@ export interface EngineClientLike {
     onRecovery?(fn: (report: RecoveryReport) => void): () => void;
 }
 
+/** Issue #388 - see `EngineClientLike.previousSession`. */
+export interface PreviousSessionInfo {
+    /** When the session was set aside (ms since the epoch). */
+    archivedAt: number;
+    /** When its last edit was journaled, when known. */
+    lastEditAt: number | undefined;
+    /** Journaled commands it holds. */
+    commandCount: number;
+}
+
 /** Issue #333 - see `EngineClientLike.checkpointStatus`. */
 export interface CheckpointStatus {
     failing: boolean;
-    /** Consecutive failed snapshot writes in the current run. */
+    /** Consecutive failed attempts in the current run. */
     failures: number;
+    /** Issue #390 - the command journal specifically is not being
+     *  written: a recovery now would miss the commands in the gap. */
+    journalFailing?: boolean | undefined;
+    /** Issue #390 - the most recent failure's message. */
+    lastError?: string | undefined;
 }
 
 /**
@@ -188,9 +221,13 @@ export interface RecoveryReport {
     tailDropped: boolean;
     /** When the restored base snapshot was taken (ms since the epoch). */
     baseSnapshotAt: number | undefined;
+    /** Issue #390 - logged commands after the restored base whose row was
+     *  never written (the journal failed): the recovery could not replay
+     *  them. Absent / `0` = none. */
+    journalGap?: number;
     /** Issue #270 — why the recovery ran: a worker `trap`, or an in-place
      *  `renderer-retry` (a planned respawn, no crash). Absent = `trap`. */
-    cause?: 'trap' | 'renderer-retry' | 'engine-reload' | 'page-reload';
+    cause?: 'trap' | 'renderer-retry' | 'engine-reload' | 'page-reload' | 'session-restore';
 }
 
 /** Read-only revision row consumed by the Track Changes sidebar. */

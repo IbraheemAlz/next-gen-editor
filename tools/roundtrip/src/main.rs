@@ -354,6 +354,8 @@ fn run_default() -> Result<()> {
     comments::run_comment_patch_roundtrip()?;
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
+    theme::run_unregistered_family_roundtrip()?;
+    complex_script::run_font_dialog_slots_roundtrip()?;
     protection::run_document_protection_roundtrip()?;
 
     println!("\nPASS");
