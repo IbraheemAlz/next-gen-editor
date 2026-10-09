@@ -177,6 +177,79 @@ pub fn is_inline_marker(qname: &[u8]) -> bool {
     )
 }
 
+/// Issue #419 — the modeled attributes of a border edge beyond its style,
+/// size and colour: `w:space` (points), `w:shadow`, `w:frame` (on/off,
+/// `true` / `1` / `on`). Every other field default — the caller fills
+/// those.
+pub fn border_extras(e: &BytesStart) -> engine::BorderStroke {
+    let attr = |name: &[u8]| crate::schema::ct_rpr::attr_val(e, name);
+    let on = |name: &[u8]| attr(name).is_some_and(|v| matches!(v.trim(), "1" | "true" | "on"));
+    engine::BorderStroke {
+        space_pt: attr(b"w:space").and_then(|v| v.trim().parse().ok()),
+        shadow: on(b"w:shadow"),
+        frame: on(b"w:frame"),
+        ..engine::BorderStroke::default()
+    }
+}
+
+/// Issue #384 — [`is_modeled_textless_run_child`] for an EMPTY element
+/// (`<w:pict/>`): an object container with no content models nothing,
+/// so a run holding only such elements is kept verbatim like any other
+/// text-less run instead of vanishing.
+pub fn is_modeled_empty_run_child(qname: &[u8]) -> bool {
+    is_modeled_textless_run_child(qname)
+        && !matches!(
+            qname,
+            b"w:drawing" | b"w:pict" | b"w:object" | b"mc:AlternateContent"
+        )
+}
+
+/// Issues #272 / #384 — an in-paragraph `<w:smartTag>` / `<w:customXml>`
+/// wrapper whose start tag the reader just read (`reader` is right after
+/// it, at byte `end` of `xml`): consume the whitespace and the property
+/// child (`<w:smartTagPr>` / `<w:customXmlPr>`) that follow it, when there
+/// is one, and return the byte where the wrapped content begins — the
+/// opener ([`MarkupCapture::wrapper_content_start`]) is everything from
+/// the start tag to there; the closer is the end tag. `None`: not a
+/// wrapper of this kind. Without a property child nothing is consumed.
+pub fn inline_wrapper_opener_end(
+    qname: &[u8],
+    xml: &[u8],
+    reader: &mut Reader<&[u8]>,
+    end: usize,
+) -> Result<Option<(usize, &'static [u8])>, crate::error::DocxError> {
+    let (pr, close): (&[u8], &'static [u8]) = match qname {
+        b"w:smartTag" => (b"<w:smartTagPr", b"</w:smartTag>"),
+        b"w:customXml" => (b"<w:customXmlPr", b"</w:customXml>"),
+        _ => return Ok(None),
+    };
+    let rest = xml.get(end..).unwrap_or(&[]);
+    let ws = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    let follows = rest[ws..].starts_with(pr)
+        && matches!(
+            rest.get(ws + pr.len()),
+            Some(b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')
+        );
+    if !follows {
+        return Ok(Some((end, close)));
+    }
+    let mut buf = Vec::new();
+    loop {
+        let at = reader.buffer_position() as usize;
+        match reader.read_event_into(&mut buf)? {
+            Event::Text(_) => {}
+            Event::Start(e) => {
+                let e = e.into_owned();
+                crate::schema::grab_bag::capture_subtree(xml, at, reader, &e)?;
+                break;
+            }
+            _ => break,
+        }
+        buf.clear();
+    }
+    Ok(Some((reader.buffer_position() as usize, close)))
+}
+
 /// Run children that carry modeled content even though they add no text
 /// to the run (field machinery, note references). A text-less run holding
 /// one of these regenerates from the model; any OTHER text-less run is
@@ -220,6 +293,34 @@ struct RunCapture {
     /// (a field character past the nesting cap, a stray `separate` /
     /// `end`): a text-less run is kept verbatim despite `has_modeled`.
     keep_verbatim: bool,
+    /// Issue #384 — the run holds a `begin` / `separate` / `end` field
+    /// character: it is a wrapper boundary, not content, so it does not
+    /// end the boundary stretch ([`Boundaries`]).
+    field_char: bool,
+    /// Issue #384 — the last child read was leading content (`lead`):
+    /// whitespace after it belongs to the lead bytes.
+    lead_last: bool,
+}
+
+/// Issue #384 — the wrapper boundaries (starts and ends of hyperlinks,
+/// tracked changes, `<w:fldSimple>`, complex fields) the paragraph read
+/// since the last content (a text or object run): each marker captured in
+/// between records its slot among them ([`SourceMarker::closes_after`] /
+/// [`SourceMarker::opens_before`]), so a regenerated paragraph re-emits
+/// a `<w:proofErr/>` that sat inside a link before its `</w:hyperlink>`
+/// rather than after it.
+#[derive(Default)]
+struct Boundaries {
+    /// `markers.len()` at every wrapper start read since the last
+    /// content, in order (a marker after `k` of them has
+    /// `opens_before = k`).
+    opens: Vec<usize>,
+    /// First marker that still counts the wrapper ends that follow it
+    /// (captured since the last content, before any start).
+    close_from: usize,
+    /// Complex fields whose `separate` counted as a start: `(nesting
+    /// depth, index in opens while still in this stretch)`.
+    fields: Vec<(usize, Option<usize>)>,
 }
 
 /// Issue #245 — where run-level whitespace lands in [`RunPad`].
@@ -259,6 +360,8 @@ pub struct MarkupCapture {
     /// Issue #245 — run-level `<w:sdt>` elements open in this paragraph,
     /// innermost last.
     sdts: Vec<SdtCapture>,
+    /// Issue #384 — wrapper boundaries since the last content.
+    bounds: Boundaries,
 }
 
 /// Issue #245 — one run-level `<w:sdt>` being read.
@@ -368,17 +471,100 @@ impl MarkupCapture {
     }
 
     /// A `<w:sectPr>` inside the paragraph's `<w:pPr>`: the section
-    /// marker moves on edits, so the pPr bytes are never reused.
-    pub fn note_sect_in_ppr(&mut self) {
-        self.ppr_unusable = true;
-    }
+    /// marker moves on edits, so the pPr bytes are never reused whole
+    /// (`section_end` blocks the writer's verified passthrough). Issue
+    /// #419 — they are still recorded: a regenerated pPr splices its
+    /// changed children into them, the `<w:sectPr>` always the live one.
+    pub fn note_sect_in_ppr(&mut self) {}
 
     fn content(&mut self, at: u32) {
         if !self.content_seen {
             self.content_seen = true;
             for ws in std::mem::take(&mut self.pending_ws) {
-                self.markers.push(SourceMarker::verbatim(at, ws));
+                self.push_marker(SourceMarker::verbatim(at, ws));
             }
+        }
+    }
+
+    /// Issue #384 — record `m` with its slot among the wrapper boundaries
+    /// read since the last content (unpaired markers only: a content
+    /// control's opener / closer always sits between the ends and the
+    /// starts, so the two can never cross a regenerated wrapper).
+    fn push_marker(&mut self, mut m: SourceMarker) {
+        if matches!(m.role, MarkerRole::Verbatim | MarkerRole::Content) {
+            m.opens_before = u8::try_from(self.bounds.opens.len()).unwrap_or(u8::MAX);
+        }
+        self.markers.push(m);
+    }
+
+    /// Issue #384 — content (a text or object run) ends the boundary
+    /// stretch.
+    fn boundary_barrier(&mut self) {
+        self.bounds.opens.clear();
+        self.bounds.close_from = self.markers.len();
+        for f in &mut self.bounds.fields {
+            f.1 = None;
+        }
+    }
+
+    /// Issue #384 — a wrapper the writer regenerates around runs starts
+    /// here (`<w:hyperlink>`, `<w:ins>` / `<w:del>` / `<w:moveFrom>` /
+    /// `<w:moveTo>`, `<w:fldSimple>`), at text offset `at`.
+    pub fn wrapper_open(&mut self, at: u32) {
+        if !self.open || self.run.is_some() {
+            return;
+        }
+        self.content(at);
+        self.bounds.opens.push(self.markers.len());
+    }
+
+    /// Issue #384 — the innermost open wrapper ends here. `produced`: it
+    /// became a model overlay the writer regenerates (a non-empty range),
+    /// else it is forgotten (its start no longer counts).
+    pub fn wrapper_close(&mut self, produced: bool) {
+        if !self.open || self.run.is_some() {
+            return;
+        }
+        self.close_boundary(produced);
+    }
+
+    fn close_boundary(&mut self, produced: bool) {
+        if !produced || !self.bounds.opens.is_empty() {
+            /* A start read in this stretch: the wrapper is empty (or not
+            modeled) — forget its start. */
+            if let Some(at) = self.bounds.opens.pop() {
+                let from = at.min(self.markers.len());
+                for m in &mut self.markers[from..] {
+                    m.opens_before = m.opens_before.saturating_sub(1);
+                }
+            }
+            return;
+        }
+        let from = self.bounds.close_from.min(self.markers.len());
+        for m in &mut self.markers[from..] {
+            if matches!(m.role, MarkerRole::Verbatim | MarkerRole::Content) && m.opens_before == 0 {
+                m.closes_after = m.closes_after.saturating_add(1);
+            }
+        }
+    }
+
+    /// Issue #384 — the `separate` field character of the field at
+    /// nesting `depth` (in the open run). `counted`: every enclosing field
+    /// is in its result part, so the writer emits this one as a wrapper —
+    /// its prologue is a start.
+    pub fn field_separate(&mut self, depth: usize, counted: bool) {
+        if !self.open {
+            return;
+        }
+        if let Some(r) = self.run.as_mut() {
+            r.field_char = true;
+        }
+        self.bounds.fields.retain(|f| f.0 < depth);
+        if counted {
+            self.bounds.opens.push(self.markers.len());
+            self.bounds
+                .fields
+                .push((depth, Some(self.bounds.opens.len() - 1)));
         }
     }
 
@@ -391,7 +577,7 @@ impl MarkupCapture {
             return;
         }
         if self.content_seen {
-            self.markers.push(SourceMarker::verbatim(at, frag));
+            self.push_marker(SourceMarker::verbatim(at, frag));
         } else {
             self.pending_ws.push(frag);
         }
@@ -404,7 +590,29 @@ impl MarkupCapture {
         }
         self.content(at);
         if bound_by_root(&frag, ns) {
-            self.markers.push(SourceMarker::verbatim(at, frag));
+            self.push_marker(SourceMarker::verbatim(at, frag));
+        }
+    }
+
+    /// Issue #384 — the `<w:bookmarkStart/>` / `<w:bookmarkEnd/>` of the
+    /// model-owned `_Toc*` bookmark `name`: a verified marker
+    /// ([`SourceMarker::toc_bookmark`]).
+    pub fn toc_bookmark_marker(
+        &mut self,
+        at: u32,
+        frag: Vec<u8>,
+        name: String,
+        ns: &NamespaceScope,
+    ) {
+        if !self.open || self.run.is_some() {
+            return;
+        }
+        self.content(at);
+        if bound_by_root(&frag, ns) {
+            self.push_marker(SourceMarker {
+                toc_bookmark: Some(name),
+                ..SourceMarker::verbatim(at, frag)
+            });
         }
     }
 
@@ -433,6 +641,18 @@ impl MarkupCapture {
                 if f.marker_mark > from {
                     f.marker_mark = f.marker_mark.saturating_sub(to - from).max(from);
                 }
+            }
+            /* Issue #384 — and the boundary bookkeeping. */
+            let shift = |i: &mut usize| {
+                if *i >= to {
+                    *i -= to - from;
+                } else if *i > from {
+                    *i = from;
+                }
+            };
+            shift(&mut self.bounds.close_from);
+            for o in &mut self.bounds.opens {
+                shift(o);
             }
         }
     }
@@ -504,7 +724,7 @@ impl MarkupCapture {
         match bytes {
             Some(bytes) if bound_by_root(&bytes, ns) && !empty => {
                 top.opener = Some(self.markers.len());
-                self.markers.push(SourceMarker {
+                self.push_marker(SourceMarker {
                     at,
                     xml: bytes,
                     role: MarkerRole::Open {
@@ -512,6 +732,7 @@ impl MarkupCapture {
                         close_xml: default_close.to_vec(),
                     },
                     comment: None,
+                    ..SourceMarker::default()
                 });
             }
             /* `<w:sdtContent/>`: nothing to wrap, the element is whole at
@@ -555,24 +776,26 @@ impl MarkupCapture {
             {
                 close_xml.clone_from(&close);
             }
-            self.markers.push(SourceMarker {
+            self.push_marker(SourceMarker {
                 at,
                 xml: close,
                 role: MarkerRole::Close {
                     id: top.start as u32,
                 },
                 comment: None,
+                ..SourceMarker::default()
             });
         } else if let Some(frag) = xml.get(top.start..end)
             && bound_by_root(frag, ns)
             && is_balanced_fragment(frag)
         {
             self.content(at);
-            self.markers.push(SourceMarker {
+            self.push_marker(SourceMarker {
                 at,
                 xml: frag.to_vec(),
                 role: MarkerRole::Content,
                 comment: None,
+                ..SourceMarker::default()
             });
         }
     }
@@ -593,6 +816,17 @@ impl MarkupCapture {
     /// starts: whitespace before it is not trailing.
     pub fn run_child_start(&mut self) {
         if let Some(r) = self.run.as_mut() {
+            /* Issue #384 — whitespace between two content children: after
+            leading content it is part of the lead bytes, else the run's
+            inner padding (the first one stands for all). */
+            if !r.trail.is_empty() && r.pad_state == PadState::Content {
+                if r.lead_last {
+                    r.lead.extend_from_slice(&r.trail);
+                } else if r.pad.inner.is_empty() {
+                    r.pad.inner = r.trail.clone();
+                }
+            }
+            r.lead_last = false;
             r.pad_state = PadState::Content;
             r.trail.clear();
         }
@@ -675,6 +909,7 @@ impl MarkupCapture {
             && run_text_empty
         {
             r.lead.extend_from_slice(frag);
+            r.lead_last = true;
         }
     }
 
@@ -719,6 +954,7 @@ impl MarkupCapture {
                 bare_edge_ws,
             });
         }
+        self.boundary_barrier();
     }
 
     /// `</w:r>` of a run that produced no text, ending at byte `end`
@@ -740,11 +976,12 @@ impl MarkupCapture {
             && bound_by_root(frag, ns)
         {
             self.markers.truncate(span.marker_mark);
-            self.markers.push(SourceMarker {
+            self.push_marker(SourceMarker {
                 at,
                 xml: frag.to_vec(),
                 role: MarkerRole::Content,
                 comment: None,
+                ..SourceMarker::default()
             });
             return;
         }
@@ -755,13 +992,18 @@ impl MarkupCapture {
         {
             /* Issue #243 — a `<w:commentReference>` run is a comment-anchor
             marker the writer verifies against the tree. */
-            self.markers.push(SourceMarker {
+            self.push_marker(SourceMarker {
                 comment: r.comment_ref.map(|id| CommentAnchor {
                     kind: CommentAnchorKind::Reference,
                     id,
                 }),
                 ..SourceMarker::verbatim(at, frag.to_vec())
             });
+        } else if !r.field_char {
+            /* Issue #384 — modeled content (a note reference, a drawing):
+            the boundary stretch ends. A field-character run is a
+            boundary itself. */
+            self.boundary_barrier();
         }
     }
 
@@ -779,6 +1021,9 @@ impl MarkupCapture {
             Some(r) if eligible => Some(r.xml_start),
             _ => None,
         };
+        if let Some(r) = self.run.as_mut() {
+            r.field_char = true;
+        }
         self.field_spans.push(FieldSpanCapture {
             depth,
             at,
@@ -794,6 +1039,30 @@ impl MarkupCapture {
     /// run holding its `end`.
     pub fn field_end(&mut self, depth: usize, at: u32, modeled: bool) {
         self.field_due = None;
+        /* Issue #384 — a modeled field's end is a wrapper end (the writer
+        writes its end run there); an unmodeled one forgets the start its
+        `separate` counted. */
+        if self.open {
+            if let Some(r) = self.run.as_mut() {
+                r.field_char = true;
+            }
+            let mut entry = None;
+            while let Some(&f) = self.bounds.fields.last() {
+                if f.0 < depth {
+                    break;
+                }
+                self.bounds.fields.pop();
+                if f.0 == depth {
+                    entry = Some(f);
+                    break;
+                }
+            }
+            if modeled {
+                self.close_boundary(true);
+            } else if let Some((_, Some(_))) = entry {
+                self.close_boundary(false);
+            }
+        }
         while self.field_spans.last().is_some_and(|f| f.depth > depth) {
             self.field_spans.pop();
         }
@@ -835,11 +1104,12 @@ impl MarkupCapture {
             && bound_by_root(frag, ns)
         {
             self.markers.truncate(span.marker_mark);
-            self.markers.push(SourceMarker {
+            self.push_marker(SourceMarker {
                 at: span.at,
                 xml: frag.to_vec(),
                 role: MarkerRole::Content,
                 comment: None,
+                ..SourceMarker::default()
             });
         }
     }
@@ -859,7 +1129,7 @@ impl MarkupCapture {
         }
         self.content(at);
         if bound_by_root(&frag, ns) {
-            self.markers.push(SourceMarker {
+            self.push_marker(SourceMarker {
                 comment: Some(anchor),
                 ..SourceMarker::verbatim(at, frag)
             });

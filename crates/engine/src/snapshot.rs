@@ -50,6 +50,23 @@
 //!   raises [`MIN_SUPPORTED_VERSION`] to 2 and deletes the FNV path
 //!   (`package::legacy_*`, `MediaRef::hash`).
 //!
+//! ## Untrusted input — declared lengths are checked first (issue #422)
+//!
+//! A snapshot comes back from IndexedDB, so its bytes are untrusted.
+//! MessagePack prefixes every array / map / string / binary with a declared
+//! length, and some visitors preallocate from it uncapped (`im`'s `Vector`
+//! and `HashMap` call `Vec::with_capacity(size_hint)`; serde's own
+//! collections cap at 1 MiB): one flipped bit in a `blocks` header would
+//! ask a 2 GiB wasm heap for `4 G × size_of::<Block>()` and trap the
+//! worker instead of returning an error. [`decode`] therefore runs
+//! [`validate_payload`] first — an allocation-free walk of the whole value
+//! that refuses any declared length the remaining bytes cannot hold
+//! ([`SnapshotError::DeclaredLength`]), nesting past
+//! [`MAX_PAYLOAD_DEPTH`] ([`SnapshotError::TooDeep`]) and any malformation
+//! ([`SnapshotError::Malformed`]). After it passes, every declared count is
+//! backed by real values, so a preallocation can never exceed what the
+//! decoded payload itself occupies.
+//!
 //! Map-typed model fields serialize **sorted by key** ([`ser_sorted_map`]) so
 //! two snapshots of the same state are byte-identical regardless of
 //! `HashMap` iteration order — the recovery e2e gate compares the pre-trap
@@ -71,6 +88,11 @@ pub const FORMAT_VERSION: u8 = 2;
 pub const MIN_SUPPORTED_VERSION: u8 = 1;
 /// Bytes preceding the payload: `MAGIC` + the version byte.
 pub const HEADER_LEN: usize = MAGIC.len() + 1;
+/// Issue #422 — the deepest container nesting a payload may declare
+/// (rmp-serde's own default limit, so [`validate_payload`] never accepts a
+/// shape the decoder would refuse for depth). The deepest real document —
+/// tables nested to the reader's 256-level XML cap — stays well under it.
+pub const MAX_PAYLOAD_DEPTH: usize = 1024;
 
 /// Why a snapshot could not be encoded or decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +109,22 @@ pub enum SnapshotError {
     Encode(String),
     /// The payload failed to deserialize.
     Decode(String),
+    /// Issue #422 — a container / string / binary at payload byte `offset`
+    /// declares a length (`declared` values or bytes) larger than the
+    /// `remaining` bytes after its header could hold. Refused before the
+    /// decoder could preallocate from it.
+    DeclaredLength {
+        offset: usize,
+        declared: u64,
+        remaining: u64,
+    },
+    /// Issue #422 — containers nest deeper than [`MAX_PAYLOAD_DEPTH`] at
+    /// payload byte `offset`.
+    TooDeep { offset: usize },
+    /// Issue #422 — the payload is not a well-formed MessagePack value
+    /// (truncated header or value, reserved marker) at payload byte
+    /// `offset`.
+    Malformed { offset: usize, what: &'static str },
 }
 
 impl fmt::Display for SnapshotError {
@@ -107,6 +145,22 @@ impl fmt::Display for SnapshotError {
             ),
             SnapshotError::Encode(e) => write!(f, "snapshot: encode failed: {e}"),
             SnapshotError::Decode(e) => write!(f, "snapshot: decode failed: {e}"),
+            SnapshotError::DeclaredLength {
+                offset,
+                declared,
+                remaining,
+            } => write!(
+                f,
+                "snapshot: payload byte {offset} declares a length of {declared} but only \
+                 {remaining} bytes follow"
+            ),
+            SnapshotError::TooDeep { offset } => write!(
+                f,
+                "snapshot: payload nests deeper than {MAX_PAYLOAD_DEPTH} levels at byte {offset}"
+            ),
+            SnapshotError::Malformed { offset, what } => {
+                write!(f, "snapshot: malformed payload at byte {offset}: {what}")
+            }
         }
     }
 }
@@ -154,12 +208,126 @@ pub fn peek_version(bytes: &[u8]) -> Result<u8, SnapshotError> {
     Ok(version)
 }
 
-/// Validate the header and decode the payload as `T`.
+/// Validate the header and decode the payload as `T`. The payload is
+/// structurally validated first ([`validate_payload`], issue #422), so no
+/// declared length reaches the decoder unbacked.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<Decoded<T>, SnapshotError> {
     let version = peek_version(bytes)?;
-    let payload = rmp_serde::from_slice::<T>(&bytes[HEADER_LEN..])
-        .map_err(|e| SnapshotError::Decode(e.to_string()))?;
+    let payload = &bytes[HEADER_LEN..];
+    validate_payload(payload)?;
+    let payload =
+        rmp_serde::from_slice::<T>(payload).map_err(|e| SnapshotError::Decode(e.to_string()))?;
     Ok(Decoded { version, payload })
+}
+
+/// Issue #422 — walk the MessagePack value at the start of `payload`
+/// without decoding (or allocating per value) and refuse it unless every
+/// declared length fits the bytes that follow its header: a string /
+/// binary / extension needs its bytes, an array its `n` values and a map
+/// its `2n` (each value is at least one byte). Containers may nest at most
+/// [`MAX_PAYLOAD_DEPTH`] deep. Returns the length of the value; bytes after
+/// it are ignored, exactly as `rmp_serde::from_slice` ignores them.
+///
+/// Iterative (one `u64` per open container), so a hostile nesting depth
+/// costs neither stack nor more than `8 × MAX_PAYLOAD_DEPTH` bytes of heap.
+pub fn validate_payload(payload: &[u8]) -> Result<usize, SnapshotError> {
+    fn be(payload: &[u8], pos: &mut usize, n: usize, at: usize) -> Result<u64, SnapshotError> {
+        let end = pos.checked_add(n).filter(|&e| e <= payload.len());
+        let Some(end) = end else {
+            return Err(SnapshotError::Malformed {
+                offset: at,
+                what: "truncated length / scalar header",
+            });
+        };
+        let v = payload[*pos..end]
+            .iter()
+            .fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+        *pos = end;
+        Ok(v)
+    }
+    let mut pos = 0usize;
+    // Values still owed by each open container, innermost last.
+    let mut open: Vec<u64> = Vec::new();
+    loop {
+        let at = pos;
+        let Some(&marker) = payload.get(pos) else {
+            return Err(SnapshotError::Malformed {
+                offset: at,
+                what: "truncated: a declared value is missing",
+            });
+        };
+        pos += 1;
+        /* `(nested values, bytes to skip)` this header declares. */
+        let (children, skip): (u64, u64) = match marker {
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (0, 0),
+            0x80..=0x8f => (2 * u64::from(marker & 0x0f), 0),
+            0x90..=0x9f => (u64::from(marker & 0x0f), 0),
+            0xa0..=0xbf => (0, u64::from(marker & 0x1f)),
+            0xc1 => {
+                return Err(SnapshotError::Malformed {
+                    offset: at,
+                    what: "reserved marker 0xc1",
+                });
+            }
+            // bin / str 8, 16, 32: a length, then that many bytes.
+            0xc4 | 0xd9 => (0, be(payload, &mut pos, 1, at)?),
+            0xc5 | 0xda => (0, be(payload, &mut pos, 2, at)?),
+            0xc6 | 0xdb => (0, be(payload, &mut pos, 4, at)?),
+            // ext 8, 16, 32: a length, a type byte, the data.
+            0xc7 => (0, be(payload, &mut pos, 1, at)? + 1),
+            0xc8 => (0, be(payload, &mut pos, 2, at)? + 1),
+            0xc9 => (0, be(payload, &mut pos, 4, at)? + 1),
+            // float 32 / 64, (u)int 8..64: fixed widths.
+            0xca => (0, 4),
+            0xcb => (0, 8),
+            0xcc | 0xd0 => (0, 1),
+            0xcd | 0xd1 => (0, 2),
+            0xce | 0xd2 => (0, 4),
+            0xcf | 0xd3 => (0, 8),
+            // fixext 1, 2, 4, 8, 16: a type byte plus the data.
+            0xd4 => (0, 2),
+            0xd5 => (0, 3),
+            0xd6 => (0, 5),
+            0xd7 => (0, 9),
+            0xd8 => (0, 17),
+            // array / map 16, 32.
+            0xdc => (be(payload, &mut pos, 2, at)?, 0),
+            0xdd => (be(payload, &mut pos, 4, at)?, 0),
+            0xde => (2 * be(payload, &mut pos, 2, at)?, 0),
+            0xdf => (2 * be(payload, &mut pos, 4, at)?, 0),
+        };
+        let remaining = (payload.len() - pos) as u64;
+        let declared = skip.max(children);
+        if declared > remaining {
+            return Err(SnapshotError::DeclaredLength {
+                offset: at,
+                declared,
+                remaining,
+            });
+        }
+        pos += skip as usize;
+        if children > 0 {
+            if open.len() >= MAX_PAYLOAD_DEPTH {
+                return Err(SnapshotError::TooDeep { offset: at });
+            }
+            open.push(children);
+            continue;
+        }
+        /* A complete value: it may complete its container, and that one
+        its own, and so on up. */
+        loop {
+            match open.last_mut() {
+                None => return Ok(pos),
+                Some(owed) => {
+                    *owed -= 1;
+                    if *owed > 0 {
+                        break;
+                    }
+                    open.pop();
+                }
+            }
+        }
+    }
 }
 
 /// `#[serde(serialize_with)]` helper: emit a `HashMap` sorted by key so the
@@ -174,6 +342,47 @@ where
 {
     let sorted: BTreeMap<&K, &V> = map.iter().collect();
     sorted.serialize(serializer)
+}
+
+/// Issue #422 — the most bytes [`de_bounded_vector`] reserves up front
+/// (serde's own collections use the same 1 MiB "cautious" bound).
+pub const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
+
+/// Issue #422 — `#[serde(deserialize_with)]` helper for an `im::Vector`.
+/// `im`'s own visitor calls `Vec::with_capacity(size_hint)` uncapped, so
+/// even after [`validate_payload`] (which only guarantees one payload byte
+/// per declared element) a crafted `blocks` array of N one-byte values
+/// would reserve `N × size_of::<Block>()` before the first element failed
+/// to decode. This visitor reserves at most [`MAX_PREALLOC_BYTES`] and
+/// grows from there, exactly like serde's `Vec` impl. Output is unchanged:
+/// the same elements in the same order.
+pub fn de_bounded_vector<'de, D, T>(deserializer: D) -> Result<im::Vector<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Clone,
+{
+    struct BoundedVector<T>(std::marker::PhantomData<T>);
+    impl<'de, T: serde::Deserialize<'de> + Clone> serde::de::Visitor<'de> for BoundedVector<T> {
+        type Value = im::Vector<T>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a sequence")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let cap = seq
+                .size_hint()
+                .unwrap_or(0)
+                .min(MAX_PREALLOC_BYTES / std::mem::size_of::<T>().max(1));
+            let mut out = Vec::with_capacity(cap);
+            while let Some(v) = seq.next_element()? {
+                out.push(v);
+            }
+            Ok(out.into_iter().collect())
+        }
+    }
+    deserializer.deserialize_seq(BoundedVector(std::marker::PhantomData))
 }
 
 #[cfg(test)]
@@ -279,6 +488,162 @@ mod tests {
                 name: "x".into()
             }
         );
+    }
+
+    /// A payload struct with an `im::Vector` — the collection whose serde
+    /// visitor preallocates the DECLARED length uncapped.
+    #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+    #[serde(default)]
+    struct VecHolder {
+        v: im::Vector<u64>,
+        name: String,
+    }
+
+    fn envelope(payload: &[u8]) -> Vec<u8> {
+        let mut out = MAGIC.to_vec();
+        out.push(FORMAT_VERSION);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Issue #422 — a container that declares more values than the bytes
+    /// after it can hold is refused BEFORE rmp-serde runs: an `array32`
+    /// of 4 G `u64`s in a 20-byte buffer must not become a 32 GiB
+    /// `Vec::with_capacity` (it would abort a wasm worker).
+    #[test]
+    fn a_lying_container_length_is_refused_before_decoding() {
+        // {"v": array32(0xFFFF_FFFF)} and nothing after it.
+        let mut p = vec![0x81, 0xa1, b'v', 0xdd];
+        p.extend_from_slice(&u32::MAX.to_be_bytes());
+        p.extend_from_slice(&[0x01, 0x02]);
+        assert_eq!(
+            decode::<VecHolder>(&envelope(&p)).unwrap_err(),
+            SnapshotError::DeclaredLength {
+                offset: 3,
+                declared: u64::from(u32::MAX),
+                remaining: 2
+            }
+        );
+        // The same for a map32 (2n values), a str32 and a bin32.
+        for (marker, children_per_entry) in [(0xdfu8, 2u64), (0xdb, 1), (0xc6, 1)] {
+            let mut p = vec![marker];
+            p.extend_from_slice(&0x7fff_ffffu32.to_be_bytes());
+            p.push(0xc0);
+            let err = validate_payload(&p).unwrap_err();
+            assert_eq!(
+                err,
+                SnapshotError::DeclaredLength {
+                    offset: 0,
+                    declared: 0x7fff_ffff * children_per_entry,
+                    remaining: 1
+                },
+                "{marker:#x}"
+            );
+        }
+        // An honest count of the same shape decodes.
+        let ok = VecHolder {
+            v: (0..300u64).collect(),
+            name: "n".into(),
+        };
+        let back: Decoded<VecHolder> = decode(&encode(&ok).unwrap()).unwrap();
+        assert_eq!(back.payload, ok);
+    }
+
+    #[test]
+    fn nesting_and_malformations_are_typed_errors() {
+        // MAX_PAYLOAD_DEPTH nested one-element arrays around a nil: fine.
+        let mut deep = vec![0x91; MAX_PAYLOAD_DEPTH];
+        deep.push(0xc0);
+        assert_eq!(validate_payload(&deep), Ok(deep.len()));
+        // One more level is refused, without recursion.
+        let mut deeper = vec![0x91; MAX_PAYLOAD_DEPTH + 1];
+        deeper.push(0xc0);
+        assert_eq!(
+            validate_payload(&deeper).unwrap_err(),
+            SnapshotError::TooDeep {
+                offset: MAX_PAYLOAD_DEPTH
+            }
+        );
+        assert!(matches!(
+            validate_payload(&[0xc1]).unwrap_err(),
+            SnapshotError::Malformed { offset: 0, .. }
+        ));
+        assert!(matches!(
+            validate_payload(&[0xdd, 0x00]).unwrap_err(),
+            SnapshotError::Malformed { offset: 0, .. }
+        ));
+        // Two values declared, one byte left: refused at the header.
+        assert_eq!(
+            validate_payload(&[0x92, 0xc0]).unwrap_err(),
+            SnapshotError::DeclaredLength {
+                offset: 0,
+                declared: 2,
+                remaining: 1
+            }
+        );
+        // Plausible counts, but the second value never comes.
+        assert!(matches!(
+            validate_payload(&[0x92, 0x91, 0xc0]).unwrap_err(),
+            SnapshotError::Malformed { offset: 3, .. }
+        ));
+        assert!(matches!(
+            validate_payload(&[]).unwrap_err(),
+            SnapshotError::Malformed { offset: 0, .. }
+        ));
+        // Every scalar width, and bytes after the value are ignored (as
+        // `rmp_serde::from_slice` ignores them).
+        let scalars: &[&[u8]] = &[
+            &[0xca, 0, 0, 0, 0],
+            &[0xcb, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0xcf, 0, 0, 0, 0, 0, 0, 0, 1],
+            &[0xd3, 0, 0, 0, 0, 0, 0, 0, 1],
+            &[0xd4, 1, 2],
+            &[0xd8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0xc7, 2, 9, 1, 2],
+            &[0xa3, b'a', b'b', b'c'],
+        ];
+        for s in scalars {
+            assert_eq!(validate_payload(s), Ok(s.len()), "{s:x?}");
+            let mut trailing = s.to_vec();
+            trailing.push(0xc1);
+            assert_eq!(validate_payload(&trailing), Ok(s.len()), "{s:x?}");
+        }
+    }
+
+    /// Issue #422 — the walk agrees with the encoder: every snapshot this
+    /// module writes validates to its full length.
+    #[test]
+    fn every_encoded_payload_validates_to_its_full_length() {
+        let doc = rich_document();
+        let bytes = encode(&doc).unwrap();
+        assert_eq!(
+            validate_payload(&bytes[HEADER_LEN..]),
+            Ok(bytes.len() - HEADER_LEN)
+        );
+        let small = encode(&V2::default()).unwrap();
+        assert_eq!(
+            validate_payload(&small[HEADER_LEN..]),
+            Ok(small.len() - HEADER_LEN)
+        );
+    }
+
+    /// Issue #422 — the second line of defence: even straight through
+    /// `rmp_serde` (no [`validate_payload`]), a `blocks` array declaring
+    /// 2^31 entries reserves at most [`MAX_PREALLOC_BYTES`] and fails on
+    /// the missing elements. `im`'s own visitor would have asked for
+    /// `2^31 × size_of::<Block>()` and aborted the process.
+    #[test]
+    fn a_lying_blocks_count_reserves_a_bounded_prefix() {
+        let mut p = vec![0x81, 0xa6];
+        p.extend_from_slice(b"blocks");
+        p.push(0xdd);
+        p.extend_from_slice(&0x7fff_ffffu32.to_be_bytes());
+        p.push(0xc0);
+        assert!(rmp_serde::from_slice::<DocumentTree>(&p).is_err());
+        // An honest array decodes to the same document as before.
+        let doc = rich_document();
+        let back: Decoded<DocumentTree> = decode(&encode(&doc).unwrap()).unwrap();
+        assert_eq!(encode(&back.payload).unwrap(), encode(&doc).unwrap());
     }
 
     #[derive(Serialize, Deserialize, Default)]
@@ -506,6 +871,7 @@ mod tests {
                     open: b"\n  ".to_vec(),
                     after_rpr: b"\n  ".to_vec(),
                     close: b"\n".to_vec(),
+                    inner: b"\n  ".to_vec(),
                 })),
                 bare_edge_ws: true,
             }],
@@ -521,6 +887,7 @@ mod tests {
                     xml: br#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#.to_vec(),
                     role: crate::MarkerRole::Content,
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     /* Issue #245 — a content control's two ends. */
@@ -531,12 +898,14 @@ mod tests {
                         close_xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     },
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     at: 5,
                     xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     role: crate::MarkerRole::Close { id: 7 },
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     /* Issue #243 — a comment anchor keeps its identity. */
@@ -546,6 +915,16 @@ mod tests {
                         kind: crate::CommentAnchorKind::RangeEnd,
                         id: 3,
                     }),
+                    ..SourceMarker::default()
+                },
+                SourceMarker {
+                    /* Issue #384 — a marker's slot among the wrapper
+                    boundaries, and a `_Toc*` bookmark's name. */
+                    at: 11,
+                    xml: br#"<w:bookmarkEnd w:id="4"/>"#.to_vec(),
+                    closes_after: 2,
+                    opens_before: 1,
+                    toc_bookmark: Some("_Toc4".into()),
                     ..SourceMarker::default()
                 },
             ],
@@ -627,6 +1006,36 @@ mod tests {
         assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
         let old: Decoded<SpanStyle> = decode(&plain).unwrap();
         assert_eq!(old.payload.font_size_cs, None);
+    }
+
+    /// Issue #345 — a protected document's restriction survives crash
+    /// recovery byte-stably; an unprotected one encodes exactly as before
+    /// the field existed (no `protection` key).
+    #[test]
+    fn document_protection_round_trips_and_stays_absent_when_unset() {
+        let has_key = |bytes: &[u8], key: &[u8]| bytes.windows(key.len()).any(|w| w == key);
+        let plain = DocumentTree::from_text("x");
+        let plain_bytes = encode(&plain).unwrap();
+        assert!(!has_key(&plain_bytes, b"protection"));
+        let mut protected = plain.clone();
+        protected.settings.protection = Some(crate::DocumentProtection {
+            edit: Some(crate::ProtectionEdit::Forms),
+            enforcement: true,
+            hash: Some("aGFzaA==".into()),
+            salt: Some("c2FsdA==".into()),
+            spin_count: Some(100_000),
+            algorithm: Some("SHA-512".into()),
+        });
+        let bytes = encode(&protected).unwrap();
+        let back: Decoded<DocumentTree> = decode(&bytes).unwrap();
+        assert_eq!(back.payload.settings, protected.settings);
+        assert_eq!(
+            back.payload.protection_mode(),
+            Some(crate::ProtectionEdit::Forms)
+        );
+        assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
+        let old: Decoded<DocumentTree> = decode(&plain_bytes).unwrap();
+        assert_eq!(old.payload.settings.protection, None);
     }
 
     /// Issue #79 — the `<w:bidiVisual>` flag survives crash recovery.

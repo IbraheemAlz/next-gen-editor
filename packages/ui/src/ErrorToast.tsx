@@ -1,12 +1,14 @@
 /**
  * ErrorToast - issue #364: the visible half of an engine refusal.
  *
- * A typed `Event::Error` from a keyboard path (a tracked Backspace over a
- * table boundary, a tracked delete across a cell) used to reach telemetry
- * only, so the key press appeared to do nothing - the Honest UX rule needs
- * a visible refusal. `createEditorState().lastError()` moves on every
- * error reply; this component turns the errors it has copy for into a
- * transient, non-modal, screen-reader-announced toast.
+ * A typed `Event::Error` from a keyboard path (a refused tracked deletion)
+ * used to reach telemetry only, so the key press appeared to do nothing -
+ * the Honest UX rule needs a visible refusal. `createEditorState().
+ * lastError()` moves on every error reply; this component turns the
+ * errors it has copy for into a transient, non-modal, screen-reader-
+ * announced toast. (Issue #365 made a tracked deletion across table cells
+ * or over a table a RECORDED one — rows marked deleted — so the engine
+ * now refuses only a range whose end addresses no paragraph.)
  *
  * - `.nge-toast` is a PERSISTENT `role="status"` live region (implicitly
  *   polite - the explicit `aria-live` is left off so the engine's own
@@ -30,7 +32,7 @@ import './ErrorToast.css';
 /** `ErrorKind` -> the user-facing sentence (what happened + what to do). */
 export const ERROR_TOAST_COPY: Partial<Record<ErrorKind, string>> = {
     TrackedDeletionRefused:
-        'Tracked deletion cannot cross a table cell — turn off Track Changes or delete inside the cell.',
+        'This deletion could not be tracked, so nothing was changed — select the text again, or turn off Track Changes.',
 };
 
 export interface ErrorToastProps {
@@ -40,13 +42,21 @@ export interface ErrorToastProps {
     copy?: Partial<Record<ErrorKind, string>>;
 }
 
-/** The toast text for an error, or `undefined` when it is not toasted. */
+/** The toast text for an error, or `undefined` when it is not toasted.
+ *  Issue #345 — a `Protected` refusal (the open document's enforced
+ *  `w:documentProtection`) without host copy shows the engine's own,
+ *  mode-specific explanation ("This document is protected (filling in
+ *  forms): only form fields …"), its `<Command>: ` prefix dropped. */
 export function toastMessageFor(
     error: EditorError | undefined,
     copy: Partial<Record<ErrorKind, string>> = ERROR_TOAST_COPY,
 ): string | undefined {
     if (!error || error.kind === undefined) return undefined;
-    return copy[error.kind];
+    const text = copy[error.kind];
+    if (text === undefined && error.kind === 'Protected') {
+        return error.message.replace(/^[A-Za-z][A-Za-z0-9]*: /, '');
+    }
+    return text;
 }
 
 export const ErrorToast: Component<ErrorToastProps> = (props) => {

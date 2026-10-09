@@ -21,20 +21,22 @@ use std::collections::HashSet;
 use crate::revision_refs::RevisionPick;
 use crate::text_remap::TextEdit;
 use crate::{
-    Block, BlockPath, DocumentTree, Paragraph, PathStep, Revision, RevisionKind, SpanStyle,
-    StyleRun, delete_block_at_path, mutate_paragraph_in_top, parent_container_snapshot,
+    Block, BlockPath, CellMove, DocumentTree, Paragraph, PathStep, Revision, RevisionKind,
+    SpanStyle, StyleRun, delete_block_at_path, mutate_paragraph_in_top, parent_container_snapshot,
     replace_block_in_top,
 };
 
 impl DocumentTree {
     /// `true` when any body paragraph (table cells included) carries a
-    /// tracked change — text overlay or paragraph mark.
+    /// tracked change — text overlay or paragraph mark — or, issue #365,
+    /// any table row (nested tables included) a tracked row insertion /
+    /// deletion.
     pub fn has_revisions(&self) -> bool {
         let mut any = false;
         crate::fields::for_each_paragraph_deep(&self.blocks, &mut |_, p| {
             any |= !p.revisions.is_empty() || !p.mark_revisions.is_empty();
         });
-        any
+        any || self.blocks.iter().any(block_has_row_revisions)
     }
 
     /// Issue #262 — accept (`accept == true`) or reject every tracked
@@ -49,10 +51,19 @@ impl DocumentTree {
     ///    chain of merges resolves in one pass): an accepted deleted /
     ///    moved-away mark, or a rejected inserted / moved-in one, merges
     ///    the paragraph with the next one; otherwise the mark just loses
-    ///    its revision. A mark in front of a table, at the end of its
-    ///    container, or carrying a section break cannot merge and only
-    ///    loses its revision. A mark carrying several changes (issue #303)
+    ///    its revision. A mark in front of a table or at the end of its
+    ///    container cannot merge and only loses its revision; a mark
+    ///    carrying a section break merges by Word's rule (issue #367 —
+    ///    [`Self::merge_paragraph_with_next`]: the text joins the
+    ///    following section). A mark carrying several changes (issue #303)
     ///    resolves them in order: any one that removes the mark merges.
+    ///    Issue #365 — a table's rows resolve in the same walk, after the
+    ///    marks inside its cells and before the paragraph in front of it:
+    ///    an accepted row deletion or a rejected row insertion removes
+    ///    the row (a table left without rows goes), any other decision
+    ///    just drops the row's revision — so a paragraph whose deleted
+    ///    mark stood in front of a fully deleted table merges with the
+    ///    paragraph after it.
     /// 3. With every move resolved, the orphaned in-paragraph move-range
     ///    markers (`<w:moveFromRangeStart/>` …) are dropped.
     pub fn resolve_all_revisions(&self, accept: bool) -> Self {
@@ -186,6 +197,8 @@ impl DocumentTree {
                         inner.push(PathStep::Cell { row, col });
                         self.resolve_marks_in(&inner, accept, pick);
                     }
+                    /* Issue #365 — then the rows themselves. */
+                    self.resolve_rows(&path, accept, pick);
                 }
                 Some(Block::Paragraph(p))
                     if (0..p.mark_revisions.len()).any(|j| pick.mark(&path, j)) =>
@@ -238,13 +251,154 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #365 — resolve the row revisions `pick` selects of the table
+    /// at `table`: per row, in order, a decided change that removes the
+    /// row (an accepted deletion, a rejected insertion) removes it — and
+    /// every other change with it — otherwise the decided changes are
+    /// dropped and the rest stay pending ([`Self::remove_table_rows`]).
+    fn resolve_rows(&mut self, table: &BlockPath, accept: bool, pick: &RevisionPick) {
+        let Some(t) = self.table_at_path(table) else {
+            return;
+        };
+        let mut gone = Vec::new();
+        let mut kept: Vec<(usize, Vec<Revision>)> = Vec::new();
+        for (r, row) in t.rows.iter().enumerate() {
+            let revs = &row.props.revisions;
+            let decided: Vec<bool> = (0..revs.len()).map(|j| pick.row(table, r, j)).collect();
+            if !decided.contains(&true) {
+                continue;
+            }
+            if revs
+                .iter()
+                .zip(&decided)
+                .any(|(rv, &d)| d && rv.kind.removes_text(accept))
+            {
+                gone.push(r as u32);
+            } else {
+                let rest = revs
+                    .iter()
+                    .zip(&decided)
+                    .filter(|&(_, &d)| !d)
+                    .map(|(rv, _)| rv.clone())
+                    .collect();
+                kept.push((r, rest));
+            }
+        }
+        if !kept.is_empty() {
+            let mut t = t.clone();
+            for (r, rest) in kept {
+                t.rows[r].props.revisions = rest;
+            }
+            t.dirty = true;
+            t.source_xml = None;
+            let mut top = self.blocks.clone();
+            let _ = replace_block_in_top(&mut top, table, Block::Table(t));
+            self.blocks = top;
+        }
+        self.remove_table_rows(table, &gone);
+    }
+
+    /// Issue #365 — remove rows `rows` (indices into the table as it is
+    /// now, any order) of the table at `table`, comment anchors following
+    /// ([`Self::remap_table_cells`]: an anchor in a removed row collapses
+    /// onto the start of the next surviving row, else the end of the
+    /// previous one). A table left without rows goes too
+    /// ([`Self::remap_block_splice`]) — replaced by an empty paragraph
+    /// when it was its container's only block, so a cell or the body is
+    /// never left empty. Returns `true` when the table left its container
+    /// (the blocks after it moved up one).
+    pub(crate) fn remove_table_rows(&mut self, table: &BlockPath, rows: &[u32]) -> bool {
+        let Some(t) = self.table_at_path(table) else {
+            return false;
+        };
+        let before = t.rows.len() as u32;
+        let mut gone: Vec<u32> = rows.iter().copied().filter(|&r| r < before).collect();
+        gone.sort_unstable();
+        gone.dedup();
+        if gone.is_empty() {
+            return false;
+        }
+        let Some((PathStep::Block(idx), container)) = table.steps.split_last() else {
+            return false;
+        };
+        let mut t = t.clone();
+        for &r in gone.iter().rev() {
+            t.rows.remove(r as usize);
+        }
+        t.dirty = true;
+        t.source_xml = None;
+        let mut top = self.blocks.clone();
+        if t.rows.is_empty() {
+            let alone = container_blocks(self, container).is_some_and(|b| b.len() == 1);
+            if alone {
+                let _ =
+                    replace_block_in_top(&mut top, table, Block::Paragraph(Paragraph::default()));
+                self.blocks = top;
+                self.remap_block_splice(container, *idx, 1, 1);
+            } else {
+                let _ = delete_block_at_path(&mut top, table);
+                self.blocks = top;
+                self.remap_block_splice(container, *idx, 1, 0);
+            }
+            return !alone;
+        }
+        let last_cols: Vec<u32> = t
+            .rows
+            .iter()
+            .map(|r| r.cells.len().saturating_sub(1) as u32)
+            .collect();
+        let _ = replace_block_in_top(&mut top, table, Block::Table(t));
+        self.blocks = top;
+        let new_index = |r: u32| r - gone.iter().filter(|&&g| g < r).count() as u32;
+        self.remap_table_cells(table, |r, col| {
+            if gone.binary_search(&r).is_err() {
+                let to = new_index(r);
+                return if to == r {
+                    CellMove::Keep
+                } else {
+                    CellMove::To { row: to, col }
+                };
+            }
+            if let Some(next) = (r + 1..before).find(|x| gone.binary_search(x).is_err()) {
+                return CellMove::Collapse {
+                    row: new_index(next),
+                    col: 0,
+                    at_end: false,
+                };
+            }
+            let prev = (0..r)
+                .rev()
+                .find(|x| gone.binary_search(x).is_err())
+                .unwrap_or(0);
+            let row = new_index(prev);
+            CellMove::Collapse {
+                row,
+                col: last_cols.get(row as usize).copied().unwrap_or(0),
+                at_end: true,
+            }
+        });
+        false
+    }
+
     /// Remove the MARK of paragraph `i` of `container`: merge it with the
     /// paragraph after it (the merged paragraph ends with the tail's mark
     /// and its revisions), remapping the comment anchors. `false` — and
     /// nothing done — when that mark cannot go: the next block is not a
-    /// paragraph (a table, or the container's end) or the mark carries a
-    /// section break. Shared by the mark resolution above and the tracked
-    /// deletion of a reviewer's own inserted mark (issue #298).
+    /// paragraph (a table, or the container's end). Shared by the mark
+    /// resolution above and the tracked deletion of a reviewer's own
+    /// inserted mark (issue #298).
+    ///
+    /// Issue #367 — a mark carrying a SECTION BREAK goes too, by Word's
+    /// rule for deleting a section break (the one `delete_range` applies,
+    /// issue #70): the text before the break joins the FOLLOWING section
+    /// and takes its properties — the merged paragraph ends with the
+    /// tail's mark, so the tail's `section_end` (or, with none, the next
+    /// terminal's / the body's) is what survives — and the dropped
+    /// section's header / footer references are backfilled into the
+    /// surviving terminal's EMPTY slots ([`Self::backfill_dropped_refs`]):
+    /// a slot the following section owns keeps its own part, a slot it
+    /// inherited (absence = link-to-previous) keeps resolving to the part
+    /// it inherited, now that the section it inherited from is gone.
     pub(crate) fn merge_paragraph_with_next(&mut self, container: &[PathStep], i: u32) -> bool {
         let Some(blocks) = container_blocks(self, container) else {
             return false;
@@ -254,9 +408,10 @@ impl DocumentTree {
         else {
             return false;
         };
-        if head.section_end.is_some() {
-            return false;
-        }
+        let dropped = head
+            .section_end
+            .as_deref()
+            .map(|s| (s.header_refs.clone(), s.footer_refs.clone()));
         let path = child(container, i);
         let head_len = head.text.len() as u32;
         let mut top = self.blocks.clone();
@@ -274,7 +429,86 @@ impl DocumentTree {
             self.blocks = top;
             self.remap_paragraph_merge(&path, head_len, i + 1, 0);
         }
+        if let Some((headers, footers)) = dropped
+            && container.is_empty()
+        {
+            self.backfill_dropped_refs(i, &headers, &footers);
+        }
         true
+    }
+
+    /// Issue #367 — a section break at body block `from` (or before it)
+    /// was removed: fold the dropped section's header / footer refs into
+    /// the empty slots of the section that now covers that text — the
+    /// first terminal (`section_end`) at or after `from`, else the body's
+    /// final section. The `delete_range` backfill (issue #70), for one
+    /// dropped terminal.
+    fn backfill_dropped_refs(
+        &mut self,
+        from: u32,
+        headers: &crate::HeaderFooterRefs,
+        footers: &crate::HeaderFooterRefs,
+    ) {
+        if headers.is_empty() && footers.is_empty() {
+            return;
+        }
+        let fill = |h: &mut crate::HeaderFooterRefs, f: &mut crate::HeaderFooterRefs| {
+            let before = (h.clone(), f.clone());
+            h.inherit_missing_from(headers);
+            f.inherit_missing_from(footers);
+            before != (h.clone(), f.clone())
+        };
+        let terminal =
+            self.blocks
+                .iter()
+                .enumerate()
+                .skip(from as usize)
+                .find_map(|(k, b)| match b {
+                    Block::Paragraph(p) if p.section_end.is_some() => Some(k as u32),
+                    _ => None,
+                });
+        match terminal {
+            Some(k) => {
+                let Some(mut props) = self
+                    .blocks
+                    .get(k as usize)
+                    .and_then(Block::as_paragraph)
+                    .and_then(|p| p.section_end.clone())
+                else {
+                    return;
+                };
+                let (mut h, mut f) = (props.header_refs.clone(), props.footer_refs.clone());
+                if fill(&mut h, &mut f) {
+                    props.header_refs = h;
+                    props.footer_refs = f;
+                    let mut top = self.blocks.clone();
+                    let _ = mutate_paragraph_in_top(&mut top, &BlockPath::top(k), |p| {
+                        p.section_end = Some(props);
+                    });
+                    self.blocks = top;
+                }
+            }
+            None => {
+                let mut body = self.body_section.clone();
+                if fill(&mut body.header_refs, &mut body.footer_refs) {
+                    self.body_section = body;
+                }
+            }
+        }
+    }
+}
+
+/// Issue #365 — `block` is (or holds, at any depth) a table row carrying
+/// a tracked change.
+fn block_has_row_revisions(block: &Block) -> bool {
+    match block {
+        Block::Paragraph(_) => false,
+        Block::Table(t) => t.rows.iter().any(|r| {
+            !r.props.revisions.is_empty()
+                || r.cells
+                    .iter()
+                    .any(|c| c.blocks.iter().any(block_has_row_revisions))
+        }),
     }
 }
 

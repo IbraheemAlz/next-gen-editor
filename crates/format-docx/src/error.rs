@@ -37,6 +37,30 @@ pub enum DocxError {
     /// of being clamped into some other part's name.
     #[error("unsafe part name: {0}")]
     UnsafePartName(String),
+    /// Issue #345 — the bytes are an OLE compound file carrying an
+    /// MS-OFFCRYPTO / ECMA-376 Part 2 encrypted package (`EncryptionInfo` +
+    /// `EncryptedPackage` streams): the document is password protected.
+    /// Refused before the ZIP reader sees it (it used to fail as "invalid
+    /// Zip archive").
+    #[error("the document is encrypted (password protected)")]
+    Encrypted,
+    /// Issue #345 — the bytes are an OLE compound file that is NOT an
+    /// encrypted OOXML package: a legacy binary Office document (Word
+    /// 97–2003 `.doc`, …) or a damaged container.
+    #[error(
+        "not a .docx package: the file is an OLE compound file (a Word 97-2003 .doc or another \
+         legacy binary format)"
+    )]
+    CompoundFile,
+    /// Issue #345 — the password does not open the encrypted package (its
+    /// verifier hash did not match).
+    #[error("the password is incorrect")]
+    WrongPassword,
+    /// Issue #345 — the encrypted package uses a scheme the reader does not
+    /// decrypt (RC4 / CryptoAPI, extensible or certificate encryption, a
+    /// non-AES cipher, a non-SHA hash) or its descriptor is malformed.
+    #[error("the document is encrypted with an unsupported scheme: {0}")]
+    UnsupportedEncryption(String),
 }
 
 /// Non-fatal reader diagnostics. The document opened, but some subtree was
@@ -73,13 +97,21 @@ pub enum DocxWarning {
     /// Issue #350 — complex fields nested deeper than `limit`: the extra
     /// levels are not modeled (their text stays hidden code).
     FieldNestingTooDeep { limit: u32 },
-    /// Issue #325 — the main part binds WordprocessingML under a prefix
-    /// (or as the default namespace) the literal-qname reader does not
-    /// match. `normalized` = the part was re-prefixed into the canonical
-    /// spelling and read; it is then **regenerate-only** (a zero-edit
-    /// save re-emits the normalised bytes, not the source's). `false` =
+    /// Issue #325 — a WordprocessingML part binds WordprocessingML under a
+    /// prefix (or as the default namespace) the literal-qname reader does
+    /// not match. `part` is the archive entry (issue #394: the main part
+    /// and every sibling the reader walks — headers, footers, footnotes,
+    /// endnotes, comments, styles, numbering, settings). `normalized` =
+    /// the part was re-prefixed into the canonical spelling and read; it
+    /// is then **regenerate-only** (its source bytes are not reused: a
+    /// zero-edit save re-emits the normalised bytes, and every passthrough
+    /// / in-place patch of the part starts from them). `false` =
     /// normalisation itself failed and the part read as-is (likely empty).
-    NonCanonicalNamespaces { detail: String, normalized: bool },
+    NonCanonicalNamespaces {
+        part: String,
+        detail: String,
+        normalized: bool,
+    },
     /// Issue #325 — the main part's root is not a WordprocessingML element
     /// in either namespace family; it reads as an empty document.
     NotWordprocessingMl,

@@ -446,6 +446,14 @@ pub enum Event {
         /// `<w:rtl/>` / `<w:cs/>`), else `Latin`. Never `Both`.
         #[serde(default = "default_caret_font_slot")]
         caret_font_slot: FontSlot,
+        /// Issue #345 — the editing restriction the document enforces
+        /// (`<w:documentProtection w:enforcement="1">` with a restricting
+        /// `w:edit`), so the shell can badge it; `None` for an
+        /// unrestricted document. Additive: skipped on the wire when
+        /// `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        protection: Option<ProtectionMode>,
     },
     /// Issue #239 — reply to `SetZoom` / `SetDeviceScale` when no
     /// `RenderPage` has run yet: there is no layout config to fold the
@@ -582,11 +590,60 @@ pub enum ErrorKind {
     /// open was refused before anything was allocated from the package's
     /// own size claims. The previous document stays open.
     PackageTooLarge,
-    /// Issue #364 - a tracked (review-mode) deletion the engine refuses
-    /// because it would cross a table-cell boundary or run over a table:
+    /// Issue #364 - a tracked (review-mode) deletion the engine refuses:
     /// nothing changed. The shell shows a visible, non-modal refusal
-    /// instead of letting the key press appear to do nothing.
+    /// instead of letting the key press appear to do nothing. Since issue
+    /// #365 a range across table cells or over a table is RECORDED (rows
+    /// marked deleted, `<w:trPr><w:del/>`), so only a range whose end
+    /// addresses no paragraph is refused.
     TrackedDeletionRefused,
+    /// Issue #345 — the file is an encrypted (password-protected) Office
+    /// document: an OLE compound file (`D0 CF 11 E0 A1 B1 1A E1`) carrying
+    /// an MS-OFFCRYPTO / ECMA-376 Part 2 `EncryptedPackage`, not a ZIP. The
+    /// open was refused; the previous document stays open.
+    EncryptedDocument,
+    /// Issue #345 — the document's enforced `w:documentProtection` refused
+    /// the command (a read-only document, comments-only, tracked-changes
+    /// only, or an edit outside form-field content). Nothing changed.
+    Protected,
+    /// Issue #345 — `OpenDocument.password` does not open the encrypted
+    /// package. The previous document stays open.
+    WrongPassword,
+}
+
+/// Issue #345 — an enforced editing restriction (`w:documentProtection`
+/// `w:edit`, spelled as in OOXML on the wire).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProtectionMode {
+    /// No edits at all.
+    ReadOnly,
+    /// Comments only.
+    Comments,
+    /// Every edit is tracked; review mode is forced on.
+    TrackedChanges,
+    /// Only form-field content (content controls, text form fields).
+    Forms,
+}
+
+impl ProtectionMode {
+    /// Every mode, in declaration order.
+    pub const ALL: &'static [ProtectionMode] = &[
+        ProtectionMode::ReadOnly,
+        ProtectionMode::Comments,
+        ProtectionMode::TrackedChanges,
+        ProtectionMode::Forms,
+    ];
+
+    /// The serde wire spelling (`w:edit`), e.g. `"trackedChanges"`.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            ProtectionMode::ReadOnly => "readOnly",
+            ProtectionMode::Comments => "comments",
+            ProtectionMode::TrackedChanges => "trackedChanges",
+            ProtectionMode::Forms => "forms",
+        }
+    }
 }
 
 impl Event {
@@ -1192,6 +1249,34 @@ mod a11y_note_wire_tests {
             typed,
             serde_json::json!({ "type": "ERROR", "message": "too big", "kind": "PackageTooLarge" })
         );
+        /* Issue #345 — the encrypted-package refusal. */
+        let encrypted = serde_json::to_value(Event::Error {
+            message: "locked".into(),
+            kind: Some(ErrorKind::EncryptedDocument),
+        })
+        .unwrap();
+        assert_eq!(encrypted["kind"], "EncryptedDocument");
+    }
+
+    /// Issue #345 — protection modes spell `w:edit`; the typed refusal.
+    #[test]
+    fn protection_wire_shapes() {
+        for (mode, wire) in [
+            (ProtectionMode::ReadOnly, "readOnly"),
+            (ProtectionMode::Comments, "comments"),
+            (ProtectionMode::TrackedChanges, "trackedChanges"),
+            (ProtectionMode::Forms, "forms"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), wire);
+            assert_eq!(mode.wire_name(), wire);
+        }
+        assert_eq!(ProtectionMode::ALL.len(), 4);
+        let refused = serde_json::to_value(Event::Error {
+            message: "protected".into(),
+            kind: Some(ErrorKind::Protected),
+        })
+        .unwrap();
+        assert_eq!(refused["kind"], "Protected");
     }
 
     /// Issue #364 - the tracked-deletion refusal is a typed error kind.

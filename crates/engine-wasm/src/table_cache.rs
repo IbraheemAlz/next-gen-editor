@@ -294,11 +294,16 @@ pub(crate) fn table_content_key(
                     cant_split,
                     header,
                     grab_bag: _,
+                    revisions,
                 },
             cells,
             source_markup: _,
         } = row;
         hash_debug(height, &mut h);
+        /* Tracked row insertions / deletions (#365) draw nothing today;
+        hashed anyway (almost always empty) so a future tracked-row
+        rendering cannot be served a stale box. */
+        hash_debug(revisions, &mut h);
         header.hash(&mut h);
         cant_split.hash(&mut h);
         cells.len().hash(&mut h);

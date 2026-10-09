@@ -64,14 +64,22 @@ pub mod fields;
 mod revision_refs;
 pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};
 #[cfg(test)]
+mod para_border_cascade_tests;
+#[cfg(test)]
 mod paragraph_mark_tests;
 #[cfg(test)]
 mod paragraph_merge_tests;
 #[cfg(test)]
 mod revision_tests;
 mod revisions;
+#[cfg(test)]
+mod section_mark_tests;
 mod text_remap;
 mod tracked;
+#[cfg(test)]
+mod tracked_paste_tests;
+#[cfg(test)]
+mod tracked_table_tests;
 #[cfg(test)]
 mod tracked_tests;
 pub use text_remap::TextEdit;
@@ -80,6 +88,8 @@ pub use tracked::{TrackedDeletion, TrackedEditError};
 pub mod html;
 pub mod numbering;
 pub mod package;
+/// Issue #345 — `w:documentProtection` model + form-region predicates.
+pub mod protection;
 pub mod snapshot;
 pub mod theme;
 
@@ -89,6 +99,7 @@ pub use fields::{
     TypedField, render_date_time_picture,
 };
 pub use package::{MediaRef, PackageEntry, SourcePackage};
+pub use protection::{DocumentProtection, FormEdit, FormRegion, ProtectionEdit};
 pub use theme::{
     ColorScheme, ColorSchemeMapping, DocumentTheme, FontBinding, FontClass, FontScheme,
     ResolvedFont, RunFontBindings, SchemeColor, ThemeColorRef, ThemeFontLang, ThemeFontRef,
@@ -180,6 +191,9 @@ pub struct DocumentTree {
     /// Phase 5 PR 1 widened it to `Vector<Block>` so tables can appear at
     /// any document position. Still `im::Vector` so undo snapshots clone
     /// in O(1) — table cells use plain `Vec<Block>` instead.
+    /// Issue #422 — decoded through [`snapshot::de_bounded_vector`], so a
+    /// hostile declared count cannot drive `im`'s uncapped preallocation.
+    #[serde(deserialize_with = "crate::snapshot::de_bounded_vector")]
     pub blocks: Vector<Block>,
     /// Phase 3 (#40) — the body-level trailing `<w:sectPr>` governing the
     /// FINAL section. Interior section boundaries live on their closing
@@ -1022,6 +1036,13 @@ pub struct DocumentSettings {
     /// and only a host calling `format_docx::read_docx_with_settings`
     /// with the strict ECMA-376 reading sets it `false`.
     pub widow_control_default: bool,
+    /// Issue #345 — `<w:documentProtection>` as read (`None` when the
+    /// part has none). Read-only ingest: `settings.xml` passes through
+    /// byte-identical, hash and salt included. The engine enforces
+    /// [`DocumentProtection::enforced_mode`]. Skipped when `None`, so an
+    /// unprotected document's snapshot encodes exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protection: Option<DocumentProtection>,
 }
 
 impl Default for DocumentSettings {
@@ -1031,6 +1052,7 @@ impl Default for DocumentSettings {
             author: None,
             default_page_size: DefaultPageSize::default(),
             widow_control_default: true,
+            protection: None,
         }
     }
 }
@@ -1666,6 +1688,12 @@ pub struct RunPad {
     pub after_rpr: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub close: Vec<u8>,
+    /// Issue #384 — the whitespace between two content children of the
+    /// run (`<w:br/>`, the text that follows it), re-emitted between the
+    /// regenerated pieces that share the run. Skipped when empty, so a
+    /// pre-#384 snapshot encodes unchanged.
+    #[serde(with = "serde_bytes", skip_serializing_if = "Vec::is_empty")]
+    pub inner: Vec<u8>,
 }
 
 /// Issues #199 / #106 — unmodeled in-paragraph markup at text offset `at`:
@@ -1692,6 +1720,40 @@ pub struct SourceMarker {
     /// where the tree says).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<CommentAnchor>,
+    /// Issue #384 — where the marker sat among the wrapper boundaries the
+    /// source wrote at its offset (the ends and starts of hyperlinks,
+    /// tracked changes, `<w:fldSimple>` and complex fields — everything
+    /// the writer regenerates around runs). `closes_after` = how many
+    /// wrapper ENDS followed it there (a `<w:proofErr/>` right before a
+    /// `</w:hyperlink>` is inside the link: it belongs to the run before
+    /// it); `opens_before` = how many wrapper STARTS preceded it there
+    /// (a bookmark right after `<w:hyperlink>` belongs to the run after
+    /// it). Both 0 (the pre-#384 default) = between the ends and the
+    /// starts. The writer re-emits the marker at the same slot among the
+    /// boundaries it writes at that offset, clamped to what is there —
+    /// so an edit that moved the marker or a wrapper can never make it
+    /// cross one. Only meaningful on unpaired markers (a content
+    /// control's opener / closer pair always sits between). Skipped when
+    /// 0, so a pre-#384 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub closes_after: u8,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub opens_before: u8,
+    /// Issue #384 — `Some(name)` when the marker is the
+    /// `<w:bookmarkStart/>` / `<w:bookmarkEnd/>` of a paragraph-scoped
+    /// `_Toc*` bookmark the model owns ([`Paragraph::bookmarks`]). Like a
+    /// comment anchor it is *verified*: replayed at its source position
+    /// only while the paragraph still holds a bookmark of that name (the
+    /// writer then does not wrap the content with it); otherwise dropped
+    /// (a split's right half), and a bookmark with no carried end is
+    /// closed at the paragraph end as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toc_bookmark: Option<String>,
+}
+
+/// Issue #384 — serde skip helper for [`SourceMarker`]'s slot counters.
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl SourceMarker {
@@ -1702,6 +1764,9 @@ impl SourceMarker {
             xml,
             role: MarkerRole::Verbatim,
             comment: None,
+            closes_after: 0,
+            opens_before: 0,
+            toc_bookmark: None,
         }
     }
 }
@@ -3576,6 +3641,13 @@ pub struct ParaProperties {
     /// rect at the paragraph's bounding rectangle before drawing the
     /// `<w:pBdr>` strokes.
     pub shading: Option<[u8; 4]>,
+    /// Issue #419 — the pattern half of the paragraph's `<w:shd>`
+    /// (`w:val` + `w:color`), when it is not the plain `clear` / `auto`
+    /// fill [`Self::shading`] describes alone. Travels with `shading`
+    /// through the cascade. Skipped when `None`, so a pre-#419 snapshot
+    /// encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shading_pattern: Option<ShadingPattern>,
     /// Issue #84 — unmodeled direct `<w:pPr>` children (and the whole
     /// paragraph-mark `<w:pPr>/<w:rPr>`, which the writer never
     /// regenerates) captured verbatim by the `.docx` reader. See
@@ -3636,7 +3708,23 @@ impl ParaProperties {
     /// stylesheets virtually never set 0 explicitly, so the trade-off is
     /// acceptable for Phase 3; Phase 4+ may widen to `Option`.
     pub fn merged_with(self, patch: ParaProperties) -> ParaProperties {
+        /* Issue #395 — borders cascade PER EDGE (evaluated first: the
+        struct literal below moves both sides' borders). */
+        let rtl = patch.direction.or(self.direction) == Some(TextDirection::Rtl);
+        let border_spelling = merged_border_spelling(
+            (&self.borders, self.border_spelling),
+            (&patch.borders, patch.border_spelling),
+            rtl,
+        );
         ParaProperties {
+            /* Issue #419 — the pattern travels with the `<w:shd>` that
+            set it (evaluated first: `or` below moves nothing, but the
+            pattern is not `Copy`). */
+            shading_pattern: if patch.shading.is_some() || patch.shading_pattern.is_some() {
+                patch.shading_pattern
+            } else {
+                self.shading_pattern
+            },
             shading: patch.shading.or(self.shading),
             alignment: patch.alignment.or(self.alignment),
             indent: if patch.indent == Indent::default() {
@@ -3657,16 +3745,13 @@ impl ParaProperties {
             keep_next: patch.keep_next.or(self.keep_next),
             keep_lines: patch.keep_lines.or(self.keep_lines),
             page_break_before: patch.page_break_before || self.page_break_before,
-            /* Audit gap A.M4 — `<w:pBdr>` overlay: patch's borders win
-            when set; otherwise inherit. */
-            /* Issue #352 — the spelling travels with the borders it
-            describes (evaluated first: `or` below moves `patch.borders`). */
-            border_spelling: if patch.borders.is_some() {
-                patch.border_spelling
-            } else {
-                self.border_spelling
-            },
-            borders: patch.borders.or(self.borders),
+            /* Audit gap A.M4 / issue #395 — `<w:pBdr>` overlay, per edge:
+            each edge the patch sets wins (an explicit `w:val="nil"` /
+            `"none"` is a set edge — a `BorderStyle::None` stroke — so it
+            REMOVES the inherited one); the others inherit. Issue #352 —
+            the logical spelling travels with the edge it describes. */
+            border_spelling,
+            borders: merged_borders(self.borders, patch.borders),
             /* Audit gap A.M3 — `<w:tabs>` overlay: patch's stops
             REPLACE the parent's (Word's documented behaviour — child
             `<w:tabs>` is not additive, it shadows the cascade).
@@ -3687,6 +3772,148 @@ impl ParaProperties {
             widow_control: patch.widow_control.or(self.widow_control),
         }
     }
+
+    /// Issue #395 — `self` with its logically spelled border edges
+    /// (`border_spelling`, issue #352) re-oriented from its OWN direction
+    /// to a paragraph whose resolved direction is `rtl`.
+    ///
+    /// Convention: a `ParaProperties` stores a `<w:start>` / `<w:end>`
+    /// edge in the physical slot its own `direction` names (start = left
+    /// unless it is right-to-left). That holds for a paragraph's resolved
+    /// `props` (own = resolved direction), its `direct_overrides` (own =
+    /// the direct `<w:bidi>`, if any), a style definition and the
+    /// docDefaults (own = their `<w:bidi>`). A cascade re-orients every
+    /// level to the paragraph's final direction before folding it
+    /// ([`Self::cascade`]): a style's `<w:start>` is the start of the
+    /// paragraph it formats, not of the style. Physical edges never move;
+    /// on a collision (`<w:start>` and `<w:right>` naming one side) the
+    /// logical edge wins, as in the reader.
+    pub fn oriented_borders(mut self, rtl: bool) -> ParaProperties {
+        let own_rtl = self.direction == Some(TextDirection::Rtl);
+        let sp = self.border_spelling;
+        if own_rtl == rtl || !(sp.start || sp.end) {
+            return self;
+        }
+        let Some(b) = self.borders.as_mut() else {
+            return self;
+        };
+        /* Under the own orientation the start edge sits in `lead`, the
+        end edge in `trail`; the target orientation mirrors both sides.
+        A logical edge follows its name to the mirrored slot. A physical
+        edge stays on its side — which is the slot the OTHER logical edge
+        moves into, so it yields to it; the side the logical edge left
+        held nothing else. */
+        let (lead, trail) = if own_rtl {
+            (b.right.take(), b.left.take())
+        } else {
+            (b.left.take(), b.right.take())
+        };
+        let (to_lead, to_trail) = match (sp.start, sp.end) {
+            (true, true) => (lead, trail),
+            (true, false) => (lead, None),
+            _ => (None, trail),
+        };
+        if rtl {
+            (b.right, b.left) = (to_lead, to_trail);
+        } else {
+            (b.left, b.right) = (to_lead, to_trail);
+        }
+        self
+    }
+
+    /// Issue #395 — fold a paragraph's property cascade, `levels` root
+    /// first (docDefaults, the `<w:basedOn>` chain root → leaf, then the
+    /// direct `<w:pPr>`): [`Self::merged_with`] level by level, except
+    /// that the borders are folded per edge AFTER every level's logical
+    /// edges were re-oriented to the FINAL direction
+    /// ([`Self::oriented_borders`]), which is only known once every level
+    /// has been seen (a direct `<w:bidi>` turns a style's `<w:start>`
+    /// edge around).
+    pub fn cascade<'a>(levels: impl IntoIterator<Item = &'a ParaProperties>) -> ParaProperties {
+        let levels: Vec<&ParaProperties> = levels.into_iter().collect();
+        let mut out = ParaProperties::default();
+        for level in &levels {
+            out = out.merged_with((*level).clone());
+        }
+        let rtl = out.direction == Some(TextDirection::Rtl);
+        let mut borders: Option<CellBorders> = None;
+        let mut spelling = BorderSpelling::default();
+        for level in &levels {
+            if level.borders.is_none() {
+                continue;
+            }
+            let oriented = (*level).clone().oriented_borders(rtl);
+            spelling = merged_border_spelling(
+                (&borders, spelling),
+                (&oriented.borders, oriented.border_spelling),
+                rtl,
+            );
+            borders = merged_borders(borders, oriented.borders);
+        }
+        out.borders = borders;
+        out.border_spelling = spelling;
+        out
+    }
+}
+
+/// Issue #395 — per-edge overlay of `patch` onto `base` (see
+/// [`ParaProperties::merged_with`]).
+fn merged_borders(base: Option<CellBorders>, patch: Option<CellBorders>) -> Option<CellBorders> {
+    match (base, patch) {
+        (Some(b), Some(p)) => Some(CellBorders {
+            top: p.top.or(b.top),
+            left: p.left.or(b.left),
+            bottom: p.bottom.or(b.bottom),
+            right: p.right.or(b.right),
+            inside_h: p.inside_h.or(b.inside_h),
+            inside_v: p.inside_v.or(b.inside_v),
+        }),
+        (b, None) => b,
+        (None, p) => p,
+    }
+}
+
+/// Issues #352 / #395 — the logical spelling of [`merged_borders`]: each
+/// flag comes from whichever side supplied the edge it describes (start =
+/// the leading slot: left, or right when `rtl`).
+fn merged_border_spelling(
+    base: (&Option<CellBorders>, BorderSpelling),
+    patch: (&Option<CellBorders>, BorderSpelling),
+    rtl: bool,
+) -> BorderSpelling {
+    match (base.0, patch.0) {
+        (_, None) => base.1,
+        (None, Some(_)) => patch.1,
+        (Some(_), Some(p)) => {
+            let (lead, trail) = if rtl {
+                (&p.right, &p.left)
+            } else {
+                (&p.left, &p.right)
+            };
+            BorderSpelling {
+                start: if lead.is_some() {
+                    patch.1.start
+                } else {
+                    base.1.start
+                },
+                end: if trail.is_some() {
+                    patch.1.end
+                } else {
+                    base.1.end
+                },
+            }
+        }
+    }
+}
+
+/// Issue #419 — `<w:shd w:val w:color>`: the ST_Shd pattern (`pct25`,
+/// `solid`, `horzStripe`, …) and its colour (`None` = `auto`), drawn over
+/// the `w:fill` background ([`ParaProperties::shading`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ShadingPattern {
+    pub val: String,
+    pub color: Option<[u8; 4]>,
 }
 
 /// `<w:numPr>` reference — a paragraph's binding to a numbering definition.
@@ -4780,6 +5007,17 @@ pub struct BorderStroke {
     pub style: BorderStyle,
     pub size_eighth_pt: u16,
     pub color: Option<[u8; 4]>,
+    /// Issue #419 — `w:space`: the gap between the border and the text,
+    /// in points. `None` = not written. Skipped when `None` (and the two
+    /// flags below when off), so a pre-#419 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_pt: Option<u16>,
+    /// Issue #419 — `w:shadow`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub shadow: bool,
+    /// Issue #419 — `w:frame`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub frame: bool,
 }
 
 /// Issue #352 — which paragraph-border edges the source spelled with the
@@ -4952,6 +5190,26 @@ pub struct RowProperties {
     /// Issue #84 — unmodeled `<w:trPr>` children, verbatim. See
     /// [`GrabBag`].
     pub grab_bag: Option<Box<GrabBag>>,
+    /// Issue #365 — the row's tracked changes: `<w:trPr><w:ins/>` (a
+    /// tracked row insertion) / `<w:del/>` (a tracked row deletion), in
+    /// source order — a row one reviewer inserted and another deleted
+    /// carries both (the #303 rule for paragraph marks). `start` / `end`
+    /// are unused. They are `CT_TrPr` children, so they live with the
+    /// row properties: the verified `<w:trPr>` passthrough (issue #248)
+    /// re-emits the source bytes only while they are unchanged. Accepting
+    /// a deletion / rejecting an insertion removes the row
+    /// ([`DocumentTree::resolve_revisions`]). Skipped when empty, so a
+    /// pre-#365 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<Revision>,
+}
+
+impl TableRow {
+    /// Issue #365 — the row's first tracked change (see
+    /// [`RowProperties::revisions`] for a row carrying several).
+    pub fn revision(&self) -> Option<&Revision> {
+        self.props.revisions.first()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -7164,7 +7422,7 @@ impl DocumentTree {
         };
         let mut blocks = self.blocks.clone();
         let parent = start.path.parent();
-        for idx in start_idx..=end_idx {
+        for idx in self.sibling_range(&start.path, start_idx, end_idx) {
             let Some(Block::Paragraph(p)) = container.get(idx as usize) else {
                 continue;
             };
@@ -7278,7 +7536,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.alignment = Some(align);
@@ -7347,7 +7605,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.direction = Some(direction);
@@ -8054,7 +8312,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8108,9 +8366,8 @@ impl DocumentTree {
     /// [`Self::recompute_paragraph_props`] (on every style mutation)
     /// and by the reader's first-pass cascade.
     pub fn resolve_style_cascade(&self, style_id: Option<&str>) -> ParaProperties {
-        let mut out = self.style_defaults.clone();
         let Some(leaf) = style_id else {
-            return out;
+            return ParaProperties::cascade([&self.style_defaults]);
         };
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut chain: Vec<&ParagraphStyle> = Vec::new();
@@ -8125,10 +8382,11 @@ impl DocumentTree {
             chain.push(def);
             current = def.based_on.as_deref();
         }
-        for def in chain.iter().rev() {
-            out = out.clone().merged_with(def.para.clone());
-        }
-        out
+        /* Issue #395 — through the direction-aware cascade, so a
+        style's logical border edges land by the chain's direction. */
+        ParaProperties::cascade(
+            std::iter::once(&self.style_defaults).chain(chain.iter().rev().map(|d| &d.para)),
+        )
     }
 
     /// Issue #29 — the RUN half of the cascade: fold
@@ -8167,7 +8425,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8365,7 +8623,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8428,7 +8686,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8479,6 +8737,12 @@ impl DocumentTree {
             para.props.shading = color;
             /* Sprint 12 (#11) — shadow into direct_overrides. */
             para.direct_overrides.shading = color;
+            /* Issue #419 — a new fill keeps the source pattern drawn over
+            it (`pct25` + its colour); clearing the shading clears both. */
+            if color.is_none() {
+                para.props.shading_pattern = None;
+                para.direct_overrides.shading_pattern = None;
+            }
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -8488,7 +8752,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8609,7 +8873,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8686,7 +8950,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8741,7 +9005,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.list_item = None;
@@ -9263,7 +9527,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.borders = borders.clone();
@@ -11085,7 +11349,6 @@ pub fn recompute_paragraph_props(
     styles: &std::collections::HashMap<String, ParagraphStyle>,
     style_defaults: &ParaProperties,
 ) {
-    let mut resolved = style_defaults.clone();
     /* Walk the style chain leaf → root with the same cycle / depth
     guard as `DocumentTree::resolve_style_cascade` (kept here as a
     free fn so callers without a borrowed `DocumentTree` can still
@@ -11104,11 +11367,17 @@ pub fn recompute_paragraph_props(
             chain.push(def);
             current = def.based_on.as_deref();
         }
-        for def in chain.iter().rev() {
-            resolved = resolved.merged_with(def.para.clone());
-        }
+        /* Issue #395 — defaults → chain → direct in ONE direction-
+        aware cascade: the logical border edges of every level land on
+        the side the paragraph's final direction names. */
+        para.props = ParaProperties::cascade(
+            std::iter::once(style_defaults)
+                .chain(chain.iter().rev().map(|d| &d.para))
+                .chain(std::iter::once(&para.direct_overrides)),
+        );
+        return;
     }
-    para.props = resolved.merged_with(para.direct_overrides.clone());
+    para.props = ParaProperties::cascade([style_defaults, &para.direct_overrides]);
 }
 
 /// Sprint 11 — UAX-#29 word count for one paragraph's text. Shares
@@ -11136,6 +11405,7 @@ pub fn default_word_stroke() -> BorderStroke {
         style: BorderStyle::Single,
         size_eighth_pt: DEFAULT_BORDER_SIZE_EIGHTH_PT,
         color: Some([0, 0, 0, 255]),
+        ..Default::default()
     }
 }
 
@@ -11759,6 +12029,58 @@ pub fn parent_container_snapshot(doc: &DocumentTree, path: &BlockPath) -> Option
     };
     let cell = t.rows.get(row as usize)?.cells.get(col as usize)?;
     Some(cell.blocks.clone())
+}
+
+/// Issue #422 — [`parent_container_snapshot`]'s length, without the clone:
+/// how many blocks the container `path`'s last step indexes into holds
+/// (the top-level sequence, or a table cell's blocks). `None` when the
+/// path does not resolve to a container.
+pub fn parent_container_len(doc: &DocumentTree, path: &BlockPath) -> Option<usize> {
+    if path.steps.len() == 1 {
+        return Some(doc.blocks.len());
+    }
+    if path.steps.len() < 3 {
+        return None;
+    }
+    let n = path.steps.len();
+    let grandparent = BlockPath {
+        steps: path.steps[..n - 2].to_vec(),
+    };
+    let Block::Table(t) = doc.block_at(&grandparent)? else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = path.steps[n - 2] else {
+        return None;
+    };
+    Some(
+        t.rows
+            .get(row as usize)?
+            .cells
+            .get(col as usize)?
+            .blocks
+            .len(),
+    )
+}
+
+impl DocumentTree {
+    /// Issue #422 — the sibling indices `start_idx..=end_idx` of a
+    /// same-parent range, clipped to the blocks that exist in `path`'s
+    /// container. The indices come off the wire: an end index of ~4
+    /// billion used to drive the range loops of `set_line_spacing` & co.
+    /// through 4 billion iterations (88 s for one fuzz-generated
+    /// `SetLineSpacing`), each building a path to a block that is not
+    /// there. A missing index addresses nothing, so the clipped loop
+    /// mutates exactly the paragraphs the unclipped one did.
+    fn sibling_range(
+        &self,
+        path: &BlockPath,
+        start_idx: u32,
+        end_idx: u32,
+    ) -> std::ops::Range<u32> {
+        let len = parent_container_len(self, path).unwrap_or(0) as u64;
+        let stop = (u64::from(end_idx) + 1).min(len) as u32;
+        start_idx..stop
+    }
 }
 
 /// Same parent container? Two paragraph paths share a container
@@ -15171,6 +15493,51 @@ mod tests {
         assert_eq!(d.blocks[0].as_paragraph().unwrap().props.line_height, None);
     }
 
+    /// Issue #422 — a wire end index of `u32::MAX` used to walk ~4 billion
+    /// missing siblings (88 s for one fuzz `SetLineSpacing`). The range is
+    /// clipped to the blocks that exist; the same paragraphs change.
+    #[test]
+    fn range_edits_clip_a_hostile_end_index_to_existing_siblings() {
+        let mut d = DocumentTree::from_text("a");
+        let p = d.blocks[0].clone();
+        d.blocks.push_back(p.clone());
+        d.blocks.push_back(p);
+        let start = LogicalPos::new(BlockPath::top(1), 0);
+        let end = LogicalPos::new(BlockPath::top(u32::MAX), 0);
+        let started = std::time::Instant::now();
+        let spaced = d.set_line_spacing(start.clone(), end.clone(), 2.0);
+        let aligned = d.set_alignment(start.clone(), end.clone(), Alignment::Center);
+        let styled = d.apply_style(
+            start.clone(),
+            end,
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let lh =
+            |doc: &DocumentTree, i: usize| doc.blocks[i].as_paragraph().unwrap().props.line_height;
+        assert_eq!(lh(&spaced, 0), None);
+        assert_eq!(lh(&spaced, 1), Some(LineHeight::Auto { twips: 480 }));
+        assert_eq!(lh(&spaced, 2), Some(LineHeight::Auto { twips: 480 }));
+        let al = |i: usize| aligned.blocks[i].as_paragraph().unwrap().props.alignment;
+        assert_eq!(
+            (al(0), al(1), al(2)),
+            (None, Some(Alignment::Center), Some(Alignment::Center))
+        );
+        assert!(styled.blocks[0].as_paragraph().unwrap().spans.is_empty());
+        assert!(!styled.blocks[2].as_paragraph().unwrap().spans.is_empty());
+        // A start index past the end addresses nothing.
+        let far = LogicalPos::new(BlockPath::top(u32::MAX - 1), 0);
+        let none = d.set_line_spacing(
+            far.clone(),
+            LogicalPos::new(BlockPath::top(u32::MAX), 0),
+            2.0,
+        );
+        assert!((0..3).all(|i| lh(&none, i).is_none()));
+    }
+
     /// Issue #145 — `SetTabStops` must not clobber an existing leader
     /// when the wire omits it (a caller that only edits position, like
     /// the Ruler drag path, and therefore sends `leader: None`). `None`
@@ -15637,6 +16004,7 @@ mod tests {
                     style: BorderStyle::Single,
                     size_eighth_pt: 8,
                     color: Some([0, 0, 0xFF, 0xFF]),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

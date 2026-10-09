@@ -245,6 +245,7 @@ fn table_borders_fixture_doc() -> DocumentTree {
         style: engine::BorderStyle::Double,
         size_eighth_pt: 12,
         color: Some([0xB0, 0x00, 0x00, 0xFF]),
+        ..Default::default()
     };
     doc = doc.set_cell_borders(
         table_path,

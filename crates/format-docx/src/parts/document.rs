@@ -15,10 +15,9 @@ use crate::error::{DocxError, DocxWarning};
 use crate::parts::table::parse_table_bytes_with_events;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
+use crate::schema::ct_pbdr::{PbdrLogical, apply_pbdr_edge};
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
-use crate::schema::ct_rpr::{
-    apply_rpr, attr_val, fold_rpr_fragment, mark_rpr_style, rpr_child_is_modeled,
-};
+use crate::schema::ct_rpr::{apply_rpr, attr_val, mark_rpr_style, rpr_child_is_modeled};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
@@ -26,7 +25,8 @@ use crate::schema::grab_bag::{
 use crate::schema::mce;
 use crate::schema::measure::{PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt};
 use crate::schema::source_markup::{
-    MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_textless_run_child,
+    MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_empty_run_child,
+    is_modeled_textless_run_child,
 };
 use crate::style_resolver::StyleResolver;
 use engine::{
@@ -182,6 +182,90 @@ impl FieldSourceTracker {
         bookmark, text-less runs) ride its bytes now. */
         markup.drain_markers(b.marker_mark, mend);
         self.end_pending = run_start.map(|r| (idx, r));
+    }
+
+    /// Issue #384 — the `end` of `ending` produced a multi-paragraph
+    /// field's Tail (`fields` gained it past `fields_before`): the Tail
+    /// keeps its end run as source form ([`engine::FieldSource::close`],
+    /// filled when the run closes) and the Head — in this paragraph (a
+    /// one-paragraph TOC) or the earlier one in `out_blocks` the
+    /// `separate` fired in — its verbatim prologue, so a regenerated TOC
+    /// paragraph keeps `begin … separate` (the untrimmed instruction, the
+    /// run properties, the whitespace) instead of the stock prologue.
+    #[allow(clippy::too_many_arguments)]
+    fn span_end(
+        &mut self,
+        ending: Option<&FieldBuilder>,
+        fields: &mut [engine::Field],
+        fields_before: usize,
+        out_blocks: &mut [Block],
+        xml: &[u8],
+        ns: &NamespaceScope,
+        markup: &mut MarkupCapture,
+        run_start: Option<usize>,
+    ) {
+        let n = fields.len();
+        let is_span = |f: &engine::Field, s: engine::FieldSpan| f.span == Some(s);
+        let Some(b) = ending else {
+            return;
+        };
+        if n <= fields_before || !is_span(&fields[n - 1], engine::FieldSpan::Tail) {
+            return;
+        }
+        let tail = n - 1;
+        fields[tail].source = Some(Box::new(engine::FieldSource::default()));
+        self.end_pending = run_start.map(|r| (tail, r));
+        let Some((ps, pe, mend)) = b.prologue else {
+            return;
+        };
+        let Some(open) = xml
+            .get(ps..pe)
+            .filter(|o| is_balanced_fragment(o) && bound_by_root(o, ns))
+        else {
+            return;
+        };
+        let source = |f: &engine::Field| {
+            Some(Box::new(engine::FieldSource {
+                instruction: f.instruction.clone(),
+                open: open.to_vec(),
+                close: Vec::new(),
+            }))
+        };
+        if n >= fields_before + 2 && is_span(&fields[n - 2], engine::FieldSpan::Head) {
+            /* A one-paragraph TOC: the prologue's markers ride its bytes. */
+            let head = &mut fields[n - 2];
+            head.source = source(head);
+            markup.drain_markers(b.marker_mark, mend);
+            return;
+        }
+        /* The Head sits on the paragraph the `separate` fired in, already
+        read: its prologue markers leave that paragraph's markup — only
+        when they are exactly the ones captured at the `begin` offset. */
+        let Some((block, false)) = b.cached_block else {
+            return;
+        };
+        let Some(Block::Paragraph(p)) = out_blocks.get_mut(block) else {
+            return;
+        };
+        let at = b.begin_at;
+        let Some(head) = p
+            .fields
+            .iter_mut()
+            .rev()
+            .find(|f| is_span(f, engine::FieldSpan::Head) && f.start == at)
+        else {
+            return;
+        };
+        let Some(m) = p.source_markup.as_deref_mut() else {
+            head.source = source(head);
+            return;
+        };
+        let range = b.marker_mark..mend;
+        if mend > m.markers.len() || m.markers[range.clone()].iter().any(|mk| mk.at != at) {
+            return;
+        }
+        m.markers.drain(range);
+        head.source = source(head);
     }
 
     /// A `</w:r>` ended at byte `end`; `run_text_len` is the run's text
@@ -487,6 +571,15 @@ fn track_field_span(e: &BytesStart<'_>, markup: &mut MarkupCapture, cx: FieldSpa
             markup.field_begin(cx.here, cx.stack.len(), eligible);
         }
         "end" if cx.depth_before > 0 => markup.field_end(cx.depth_before, cx.here, cx.modeled),
+        /* Issue #384 — the prologue of a field the writer regenerates as a
+        wrapper (every enclosing field in its result) ends here. */
+        "separate" if !cx.stack.is_empty() => {
+            let enclosing = &cx.stack[..cx.stack.len() - 1];
+            markup.field_separate(
+                cx.stack.len(),
+                enclosing.iter().all(|f| f.cached_start.is_some()),
+            );
+        }
         _ => {}
     }
 }
@@ -577,7 +670,10 @@ fn mark_revision_kind(qname: &[u8]) -> Option<engine::RevisionKind> {
     }
 }
 
-fn mark_revision(kind: engine::RevisionKind, e: &BytesStart<'_>) -> engine::Revision {
+/// A `CT_TrackChange` element (`w:id` / `w:author` / `w:date`) as a
+/// range-less revision of `kind`: a paragraph mark's (issue #262) or a
+/// table row's (`<w:trPr><w:ins/>`, issue #365).
+pub(crate) fn mark_revision(kind: engine::RevisionKind, e: &BytesStart<'_>) -> engine::Revision {
     engine::Revision {
         start: 0,
         end: 0,
@@ -774,115 +870,6 @@ fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
     }
 }
 
-/// Audit gap A.M4 — parse one `<w:pBdr>` per-edge child into the
-/// matching `CellBorders` slot. Reuses the table-border parser via
-/// `parse_border_stroke` on `<w:top w:val w:sz w:color>`. Unknown
-/// edge names are silently ignored — defensive against future spec
-/// extensions.
-pub(crate) fn apply_pbdr_edge(
-    name: &[u8],
-    e: &quick_xml::events::BytesStart,
-    props: &mut engine::ParaProperties,
-) {
-    let stroke = parse_border_stroke(e);
-    if stroke.is_none() {
-        return;
-    }
-    let borders = props
-        .borders
-        .get_or_insert_with(engine::CellBorders::default);
-    match name {
-        b"w:top" => borders.top = stroke,
-        b"w:left" => borders.left = stroke,
-        b"w:bottom" => borders.bottom = stroke,
-        b"w:right" => borders.right = stroke,
-        b"w:between" => {
-            /* `<w:between>` is the "inside-horizontal" border between
-            consecutive same-pBdr paragraphs. The engine has no
-            multi-paragraph border collapse yet — store on `inside_h`
-            for round-trip; renderer ignores it. */
-            borders.inside_h = stroke;
-        }
-        _ => {}
-    }
-}
-
-/// Issue #352 — the logical `<w:start>` / `<w:end>` edges of a `<w:pBdr>`
-/// (ISO 29500; ECMA-376 2nd ed. and later accept them in Transitional
-/// too), collected during the parse and mapped to a physical side only
-/// once the paragraph's direction is final.
-#[derive(Default)]
-pub(crate) struct PbdrLogical {
-    start: Option<engine::BorderStroke>,
-    end: Option<engine::BorderStroke>,
-    /// The element was present (even with `w:val="none"`): the source
-    /// spelled that edge logically.
-    start_seen: bool,
-    end_seen: bool,
-}
-
-impl PbdrLogical {
-    /// Take `<w:start>` / `<w:end>`; `false` for every other edge name
-    /// (the caller then applies the physical-edge path).
-    pub(crate) fn accept(&mut self, name: &[u8], e: &quick_xml::events::BytesStart) -> bool {
-        match name {
-            b"w:start" => {
-                self.start = parse_border_stroke(e);
-                self.start_seen = true;
-                true
-            }
-            b"w:end" => {
-                self.end = parse_border_stroke(e);
-                self.end_seen = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Land the collected edges on `props` (the resolved paragraph
-    /// properties) and `overrides` (the direct pPr kept for a later
-    /// re-cascade): start = left in a left-to-right paragraph and right
-    /// in a right-to-left one, end the opposite. The spelling flags record
-    /// which edges the source wrote logically, for the writer.
-    pub(crate) fn fold_into(
-        self,
-        props: &mut engine::ParaProperties,
-        overrides: &mut engine::ParaProperties,
-    ) {
-        if !self.start_seen && !self.end_seen {
-            return;
-        }
-        let rtl = props.direction == Some(engine::TextDirection::Rtl);
-        for target in [props, overrides] {
-            if self.start.is_some() {
-                let borders = target
-                    .borders
-                    .get_or_insert_with(engine::CellBorders::default);
-                let slot = if rtl {
-                    &mut borders.right
-                } else {
-                    &mut borders.left
-                };
-                *slot = self.start.clone();
-            }
-            if self.end.is_some() {
-                let borders = target
-                    .borders
-                    .get_or_insert_with(engine::CellBorders::default);
-                let slot = if rtl {
-                    &mut borders.left
-                } else {
-                    &mut borders.right
-                };
-                *slot = self.end.clone();
-            }
-            target.border_spelling.start |= self.start_seen;
-            target.border_spelling.end |= self.end_seen;
-        }
-    }
-}
-
 /// Audit gap A.M3 — parse one `<w:tab w:val w:pos/>` child.
 /// `w:val` defaults to `left`; `w:pos` is twips (signed integer per
 /// spec). Returns `None` for malformed entries (missing pos) so they
@@ -904,40 +891,6 @@ pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine
         leader: attr_val(e, b"w:leader")
             .map(|v| engine::TabLeader::from_ooxml(&v))
             .unwrap_or_default(),
-    })
-}
-
-/// Audit gap A.M4 — parse `<w:top|left|bottom|right|between
-/// w:val w:sz w:color w:space/>` into a `BorderStroke`. Mirrors the
-/// table-cell border parser semantics; `w:val="none"` returns `None`
-/// so the edge stays absent in the engine model.
-fn parse_border_stroke(e: &quick_xml::events::BytesStart) -> Option<engine::BorderStroke> {
-    use crate::schema::ct_rpr::{attr_val, parse_hex_color};
-    let val = attr_val(e, b"w:val")?.trim().to_ascii_lowercase();
-    if val == "none" || val == "nil" {
-        return None;
-    }
-    let style = match val.as_str() {
-        "single" => engine::BorderStyle::Single,
-        "double" => engine::BorderStyle::Double,
-        "dotted" => engine::BorderStyle::Dotted,
-        "dashed" => engine::BorderStyle::Dashed,
-        other => engine::BorderStyle::Other(other.to_string()),
-    };
-    let size_eighth_pt: u16 = attr_val(e, b"w:sz")
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(4);
-    let color = attr_val(e, b"w:color").and_then(|v| {
-        if v.trim().eq_ignore_ascii_case("auto") {
-            None
-        } else {
-            parse_hex_color(&v)
-        }
-    });
-    Some(engine::BorderStroke {
-        style,
-        size_eighth_pt,
-        color,
     })
 }
 
@@ -1427,13 +1380,13 @@ pub(crate) fn parse_document_xml_with_events(
     /* Per-paragraph parser state. */
     let mut p_style_id: Option<String> = None;
     let mut direct_ppr = ParaProperties::default();
-    let mut pmark_rpr = SpanStyle::default();
     /* Issues #262 / #303 — the tracked changes on the paragraph mark
     (`<w:pPr><w:rPr><w:ins/><w:del/>`), lifted out of the mark's rPr grab
     bag. */
     let mut para_mark_revisions: Vec<engine::Revision> = Vec::new();
     /* Issue #293 — the paragraph mark's modeled run properties (the
-    `<w:pPr><w:rPr>` fragment the bag carries, folded). */
+    `<w:pPr><w:rPr>` fragment the bag carries, folded). Issue #369 — they
+    format the pilcrow only: they never seed the paragraph's runs. */
     let mut para_mark_style: Option<Box<SpanStyle>> = None;
     /* Phase 4 — `<w:numPr>/<w:numId>` + `<w:ilvl>` accumulators. We don't
     inherit either field from a paragraph style here; that's a separate
@@ -1537,7 +1490,7 @@ pub(crate) fn parse_document_xml_with_events(
     holds the `w:id` of every `_Toc*` bookmark the model owns, so its
     `<w:bookmarkEnd>` is not ALSO kept as a verbatim marker. */
     let mut markup = MarkupCapture::new();
-    let mut toc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut toc_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     /* Issue #84 — namespace prefixes the part's root element binds. Grab-bag
     fragments in a foreign namespace (`w14:`, `mc:`, …) re-bind their
@@ -1633,6 +1586,36 @@ pub(crate) fn parse_document_xml_with_events(
                     b"w:sdt" if in_para => {
                         markup.sdt_start(prev_pos);
                         prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    /* Issues #272 / #384 — an in-paragraph `<w:smartTag>` /
+                    `<w:customXml>`: the runs stay paragraph content, the
+                    wrapper (start tag + property child / end tag) rides the
+                    source markup as an opener / closer pair, exactly like a
+                    run-level `<w:sdt>`. */
+                    n @ (b"w:smartTag" | b"w:customXml") if in_para && !in_ppr => {
+                        let qname = n.to_vec();
+                        markup.wrapper_start(prev_pos);
+                        let end = reader.buffer_position() as usize;
+                        if let Some((content, close)) =
+                            crate::schema::source_markup::inline_wrapper_opener_end(
+                                &qname,
+                                xml,
+                                &mut reader,
+                                end,
+                            )?
+                        {
+                            markup.wrapper_content_start(
+                                xml,
+                                content,
+                                para_text.len() as u32,
+                                &ns,
+                                false,
+                                close,
+                            );
+                            prev_pos = content;
+                        }
                         buf.clear();
                         continue;
                     }
@@ -1889,7 +1872,6 @@ pub(crate) fn parse_document_xml_with_events(
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pbdr_logical = PbdrLogical::default();
-                        pmark_rpr = SpanStyle::default();
                         para_mark_revisions.clear();
                         para_mark_style = None;
                     }
@@ -1904,15 +1886,14 @@ pub(crate) fn parse_document_xml_with_events(
                     }
                     b"w:rPr" if in_ppr && !in_run => {
                         /* Issue #84 — paragraph-mark run properties
-                        (`<w:pPr>/<w:rPr>`). The writer never regenerates
-                        this element, so the WHOLE subtree rides the
-                        paragraph's grab bag verbatim; its modeled children
-                        still seed the run baseline (`pmark_rpr`) exactly
-                        as before via `fold_rpr_fragment`, which also
-                        stops a nested `<w:rPrChange>/<w:rPr>` history from
-                        overriding the live formatting. */
+                        (`<w:pPr>/<w:rPr>`). The WHOLE subtree rides the
+                        paragraph's grab bag verbatim. Issue #369 — Word
+                        applies them to the paragraph mark (the pilcrow)
+                        only, never to the paragraph's runs, so they are
+                        modeled as `Paragraph::mark_style` alone (#293:
+                        typing into an EMPTY paragraph inherits them) and
+                        no longer folded into every run's span style. */
                         if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
-                            fold_rpr_fragment(&frag, &mut pmark_rpr);
                             /* Issues #262 / #303 — the mark's tracked
                             changes are modeled (`Paragraph::mark_revisions`,
                             all of them); the bag keeps the rest and the
@@ -1981,6 +1962,8 @@ pub(crate) fn parse_document_xml_with_events(
                         `w:tooltip`, …) ride the link for regeneration. */
                         let attrs = crate::schema::source_markup::raw_attrs(&e, &ns);
                         hyperlink_stack.push((target, start, attrs));
+                        /* Issue #384 — a wrapper start for marker slots. */
+                        markup.wrapper_open(start);
                     }
                     b"w:t" => {
                         in_text_elt = true;
@@ -1990,10 +1973,22 @@ pub(crate) fn parse_document_xml_with_events(
                         in_del_text_elt = true;
                         markup.run_text_elt(&e, &ns);
                     }
-                    b"w:instrText" => in_instr_text = true,
+                    /* Issue #384 — a field inside a tracked deletion spells
+                    its code `<w:delInstrText>`: the same instruction. */
+                    b"w:instrText" | b"w:delInstrText" => in_instr_text = true,
                     /* Issue #350 — a field character past the nesting cap,
                     or one with no open field: not modeled, its run is kept
                     verbatim. */
+                    /* Issue #358 — a field character outside every
+                    paragraph (between blocks, before `<w:body>`) is not
+                    modeled: #350's `</w:p>` close cannot reach a `begin`
+                    that opened before the paragraph did, so it used to
+                    hide the whole next paragraph. */
+                    b"w:fldChar" if p_start_byte.is_none() => {
+                        crate::error::warn(DocxWarning::StrayFieldChar {
+                            kind: attr_val(&e, b"w:fldCharType").unwrap_or_default(),
+                        });
+                    }
                     b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
                         markup.run_keep_verbatim();
                     }
@@ -2052,6 +2047,17 @@ pub(crate) fn parse_document_xml_with_events(
                                 let local = (para_fields.len() == fields_before + 1
                                     && para_fields.last().is_some_and(|f| f.is_local()))
                                 .then(|| para_fields.len() - 1);
+                                /* Issue #384 — a TOC's source form. */
+                                field_sources.span_end(
+                                    ending.as_ref(),
+                                    &mut para_fields,
+                                    fields_before,
+                                    &mut out_blocks,
+                                    xml,
+                                    &ns,
+                                    &mut markup,
+                                    clean_run,
+                                );
                                 field_sources.end(
                                     ending,
                                     &mut para_fields,
@@ -2074,6 +2080,7 @@ pub(crate) fn parse_document_xml_with_events(
                             .filter(|t| bound_by_root(t, &ns))
                             .map(<[u8]>::to_vec);
                         fld_simple_stack.push((instr, start, tag));
+                        markup.wrapper_open(start);
                     }
                     b"w:ins" | b"w:del" | b"w:moveFrom" | b"w:moveTo" => {
                         let kind = match name.as_ref() {
@@ -2103,6 +2110,7 @@ pub(crate) fn parse_document_xml_with_events(
                             start: (para_text.len() + run_text.len()) as u32,
                             move_name,
                         });
+                        markup.wrapper_open((para_text.len() + run_text.len()) as u32);
                     }
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
@@ -2129,7 +2137,7 @@ pub(crate) fn parse_document_xml_with_events(
                             if n == b"w:rPrChange" {
                                 run_format_change =
                                     Some(crate::parts::format_change::format_change_revision(
-                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                        &e, &frag, &ns, resolver,
                                     ));
                             }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
@@ -2164,7 +2172,7 @@ pub(crate) fn parse_document_xml_with_events(
                 }
                 let at_block_level =
                     in_block_container && p_start_byte.is_none() && in_tbl == 0 && !in_sect_pr;
-                if in_run && is_modeled_textless_run_child(name.as_ref()) {
+                if in_run && is_modeled_empty_run_child(name.as_ref()) {
                     markup.run_modeled();
                 }
                 if in_run && !in_rpr && name.as_ref() != b"w:rPr" {
@@ -2225,9 +2233,19 @@ pub(crate) fn parse_document_xml_with_events(
                         }
                     }
                     b"w:bookmarkEnd" if in_para && !in_run && !in_ppr => {
-                        let modeled = attr_val(&e, b"w:id").is_some_and(|id| toc_ids.contains(&id));
-                        if !modeled && let Some(frag) = slice_fragment(xml, prev_pos, here) {
-                            markup.marker(para_text.len() as u32, frag, &ns);
+                        let toc = attr_val(&e, b"w:id").and_then(|id| toc_ids.get(&id).cloned());
+                        if let Some(frag) = slice_fragment(xml, prev_pos, here) {
+                            /* Issue #384 — a model-owned `_Toc*` bookmark's
+                            end rides as a verified marker. */
+                            match toc {
+                                Some(name) => markup.toc_bookmark_marker(
+                                    para_text.len() as u32,
+                                    frag,
+                                    name,
+                                    &ns,
+                                ),
+                                None => markup.marker(para_text.len() as u32, frag, &ns),
+                            }
                         }
                     }
                     n if in_para
@@ -2257,11 +2275,8 @@ pub(crate) fn parse_document_xml_with_events(
                         let end = reader.buffer_position() as usize;
                         envelopes.note_block_start(prev_pos);
                         let source_xml = slice_element(xml, prev_pos, end, b"w:p");
-                        let (props, _) = resolver.resolve_paragraph(
-                            None,
-                            ParaProperties::default(),
-                            SpanStyle::default(),
-                        );
+                        let (props, _) =
+                            resolver.resolve_paragraph(None, ParaProperties::default());
                         let list_item = props.list_item;
                         markup.open_paragraph(&e, &ns, end);
                         let source_markup = markup.finish(0, &props, &None, list_item);
@@ -2311,7 +2326,15 @@ pub(crate) fn parse_document_xml_with_events(
                     represent: verbatim, attached to the following block
                     (or after the last one). Comment range markers are
                     ALSO recorded as ranges in their own arms below. */
-                    n if at_block_level && (is_block_level_marker(n) || ns.ignores_element(n)) => {
+                    /* Issue #358 — a self-closing `<mc:AlternateContent/>`
+                    between blocks has no branch to select: it rides the
+                    following block verbatim like a marker (it used to be
+                    dropped, so a zero-edit save lost its bytes). */
+                    n if at_block_level
+                        && (is_block_level_marker(n)
+                            || ns.ignores_element(n)
+                            || n == b"mc:AlternateContent") =>
+                    {
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
                             envelopes.push_verbatim(frag);
@@ -2329,6 +2352,11 @@ pub(crate) fn parse_document_xml_with_events(
                     b"w:ilvl" if in_num_pr => {
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
+                    /* Issue #358 — a `<w:tab/>` / `<w:br/>` inside a
+                    run's `<w:rPr>` is not content (CT_RPr has no such
+                    child): it rides the rPr grab bag only. Counting it
+                    as text too doubled it on every save. */
+                    b"w:tab" | b"w:br" if in_rpr => {}
                     /* Issue #350 — inside field code: not visible. */
                     b"w:tab" | b"w:br" if in_run && field_code_hidden(&field_stack, &field_cap) => {
                     }
@@ -2428,7 +2456,21 @@ pub(crate) fn parse_document_xml_with_events(
                             /* Modeled (issue #81): the writer re-emits the
                             start AND its end from `Paragraph::bookmarks`. */
                             if let Some(id) = &raw_id {
-                                toc_ids.insert(id.clone());
+                                toc_ids.insert(id.clone(), name.clone());
+                            }
+                            /* Issue #384 — and its start keeps its source
+                            position as a verified marker. */
+                            if !in_run
+                                && !in_ppr
+                                && let Some(frag) =
+                                    slice_fragment(xml, prev_pos, reader.buffer_position() as usize)
+                            {
+                                markup.toc_bookmark_marker(
+                                    para_text.len() as u32,
+                                    frag,
+                                    name.clone(),
+                                    &ns,
+                                );
                             }
                             if !para_bookmarks.iter().any(|b| b.name == name) {
                                 para_bookmarks.push(engine::Bookmark {
@@ -2541,6 +2583,16 @@ pub(crate) fn parse_document_xml_with_events(
                             });
                         }
                     }
+                    /* Issue #358 — a field character outside every
+                    paragraph (between blocks, before `<w:body>`) is not
+                    modeled: #350's `</w:p>` close cannot reach a `begin`
+                    that opened before the paragraph did, so it used to
+                    hide the whole next paragraph. */
+                    b"w:fldChar" if p_start_byte.is_none() => {
+                        crate::error::warn(DocxWarning::StrayFieldChar {
+                            kind: attr_val(&e, b"w:fldCharType").unwrap_or_default(),
+                        });
+                    }
                     b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
                         markup.run_keep_verbatim();
                     }
@@ -2595,6 +2647,17 @@ pub(crate) fn parse_document_xml_with_events(
                                 let local = (para_fields.len() == fields_before + 1
                                     && para_fields.last().is_some_and(|f| f.is_local()))
                                 .then(|| para_fields.len() - 1);
+                                /* Issue #384 — a TOC's source form. */
+                                field_sources.span_end(
+                                    ending.as_ref(),
+                                    &mut para_fields,
+                                    fields_before,
+                                    &mut out_blocks,
+                                    xml,
+                                    &ns,
+                                    &mut markup,
+                                    clean_run,
+                                );
                                 field_sources.end(
                                     ending,
                                     &mut para_fields,
@@ -2631,7 +2694,7 @@ pub(crate) fn parse_document_xml_with_events(
                             if n == b"w:rPrChange" {
                                 run_format_change =
                                     Some(crate::parts::format_change::format_change_revision(
-                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                        &e, &frag, &ns, resolver,
                                     ));
                             }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
@@ -2853,12 +2916,25 @@ pub(crate) fn parse_document_xml_with_events(
                             &ns,
                         );
                     }
+                    /* Issues #272 / #384 — the in-paragraph wrapper's close. */
+                    b"w:smartTag" | b"w:customXml"
+                        if p_start_byte.is_some() && !in_run && !in_ppr =>
+                    {
+                        markup.sdt_content_end(prev_pos);
+                        markup.sdt_end(
+                            xml,
+                            reader.buffer_position() as usize,
+                            para_text.len() as u32,
+                            &ns,
+                        );
+                    }
                     b"w:t" => in_text_elt = false,
                     b"w:delText" => in_del_text_elt = false,
-                    b"w:instrText" => in_instr_text = false,
+                    b"w:instrText" | b"w:delInstrText" => in_instr_text = false,
                     b"w:ins" | b"w:del" | b"w:moveFrom" | b"w:moveTo" => {
                         if let Some(open) = revision_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
+                            markup.wrapper_close(end > open.start);
                             if end > open.start {
                                 para_revisions.push(engine::Revision {
                                     start: open.start,
@@ -2927,6 +3003,7 @@ pub(crate) fn parse_document_xml_with_events(
                         if let Some((instr, start, tag)) = fld_simple_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
                             let instr = instr.trim().to_string();
+                            markup.wrapper_close(end > start && !instr.is_empty());
                             if end > start && !instr.is_empty() {
                                 /* Issue #246 — remember the simple form. */
                                 let close = xml
@@ -2952,6 +3029,7 @@ pub(crate) fn parse_document_xml_with_events(
                     b"w:hyperlink" => {
                         if let Some((target, start, attrs)) = hyperlink_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
+                            markup.wrapper_close(end > start && !target.is_empty());
                             if end > start && !target.is_empty() {
                                 para_hyperlinks.push(engine::Hyperlink {
                                     start,
@@ -3042,17 +3120,20 @@ pub(crate) fn parse_document_xml_with_events(
                             continue;
                         }
                         /* Issue #29 — spans carry only what the STYLE TABLE
-                        cannot re-derive: paragraph-mark rPr + character-style
-                        chain + direct rPr. The docDefaults <w:rPr> and the
-                        pStyle-chain <w:rPr> are deliberately NOT baked here —
-                        the engine folds them at span-materialize time
+                        cannot re-derive: character-style chain + direct
+                        rPr. The docDefaults <w:rPr> and the pStyle-chain
+                        <w:rPr> are deliberately NOT baked here — the engine
+                        folds them at span-materialize time
                         (`build_style_spans`), which is what lets ModifyStyle
                         re-cascade loaded documents and stops dirty-paragraph
                         saves from writing style-derived props as direct
-                        formatting. Final precedence is unchanged:
-                        defaults → pStyle chain → pmark → rStyle → direct. */
+                        formatting. Final precedence:
+                        defaults → pStyle chain → rStyle → direct. Issue
+                        #369 — the paragraph mark's `<w:pPr><w:rPr>` is NOT
+                        in this cascade: Word formats only the pilcrow with
+                        it (`Paragraph::mark_style`). */
                         let mut style = resolver.resolve_run(
-                            pmark_rpr.clone(),
+                            SpanStyle::default(),
                             r_style_id.as_deref(),
                             direct_rpr.clone(),
                         );
@@ -3111,20 +3192,18 @@ pub(crate) fn parse_document_xml_with_events(
                         the originals to produce the up-front resolved
                         view; we clone before consumption. */
                         let style_id_for_paragraph = p_style_id.clone();
-                        let mut direct_overrides_for_paragraph = direct_ppr.clone();
+                        /* Issues #352 / #395 — logical `<w:start>` /
+                        `<w:end>` border edges join the direct pPr by its
+                        OWN direction; the cascade turns them to the side
+                        the RESOLVED direction names. */
+                        std::mem::take(&mut pbdr_logical).fold_into(&mut direct_ppr);
+                        let direct_overrides_for_paragraph = direct_ppr.clone();
                         /* Paragraph cascade: bake direct_ppr on top of doc
-                        defaults + pStyle chain. The baseline rPr we computed
-                        per-run is informational here. */
-                        let (mut props, _) = resolver.resolve_paragraph(
+                        defaults + pStyle chain. */
+                        let (props, _) = resolver.resolve_paragraph(
                             p_style_id.take().as_deref(),
                             std::mem::take(&mut direct_ppr),
-                            std::mem::take(&mut pmark_rpr),
                         );
-                        /* Issue #352 — logical `<w:start>` / `<w:end>`
-                        border edges land on the physical side the
-                        RESOLVED direction names. */
-                        std::mem::take(&mut pbdr_logical)
-                            .fold_into(&mut props, &mut direct_overrides_for_paragraph);
                         /* Compose `ListItem` from the per-paragraph numPr
                         accumulators; partial refs (numId without ilvl, or
                         vice versa) default the missing field to 0 — Word

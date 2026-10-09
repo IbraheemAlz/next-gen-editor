@@ -40,6 +40,7 @@ import type {
     LayoutDegraded,
     PreviousSessionInfo,
     LogicalRange,
+    ProtectionMode,
     RecoveryReport,
     Rect,
     RendererDowngrade,
@@ -157,6 +158,13 @@ export interface EditorState {
      */
     paragraphIndent: Accessor<BridgeIndent>;
     /**
+     * Issue #345 — the editing restriction the open document enforces
+     * (`readOnly` / `comments` / `trackedChanges` / `forms`), or
+     * `undefined` for an unrestricted document. Drives the protection
+     * badge; the engine refuses whatever the mode does not allow.
+     */
+    protection: Accessor<ProtectionMode | undefined>;
+    /**
      * Sprint 14 (#14) — engine track-changes recording state.
      * `ReviewControls`'s Track toggle binds its active state to
      * this accessor instead of carrying local Solid state, so a
@@ -260,6 +268,11 @@ export interface EditorState {
      * `undefined` when there is none. Shared like `zoom`.
      */
     previousSession: Accessor<PreviousSessionInfo | undefined>;
+    /**
+     * Issue #426 - every previous session still waiting for a decision
+     * (the archive ring, newest first); `previousSession` is the first.
+     */
+    previousSessions: Accessor<PreviousSessionInfo[]>;
 }
 
 /**
@@ -303,6 +316,7 @@ interface ViewState {
     checkpointState: Accessor<CheckpointHealth>;
     lastError: Accessor<EditorError | undefined>;
     previousSession: Accessor<PreviousSessionInfo | undefined>;
+    previousSessions: Accessor<PreviousSessionInfo[]>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -351,6 +365,10 @@ function viewStateFor(engine: EngineHandle): ViewState {
             PreviousSessionInfo | undefined
         >(engine.previousSession);
         engine.onPreviousSession?.((p) => setPreviousSession(p));
+        const [previousSessions, setPreviousSessions] = createSignal<PreviousSessionInfo[]>(
+            engine.previousSessions ?? (engine.previousSession ? [engine.previousSession] : []),
+        );
+        engine.onPreviousSessions?.((p) => setPreviousSessions(p));
         /* Issue #364 - every `Event::Error` reply, with its command. */
         const [lastError, setLastError] = createSignal<EditorError | undefined>(undefined);
         let errorCount = 0;
@@ -407,6 +425,7 @@ function viewStateFor(engine: EngineHandle): ViewState {
             checkpointState,
             lastError,
             previousSession,
+            previousSessions,
         };
     });
     viewStates.set(engine, state);
@@ -452,6 +471,7 @@ export function createEditorState(): EditorState {
     const ZERO_INDENT: BridgeIndent = { start_pt: 0, end_pt: 0, first_line_pt: 0 };
     const [paragraphIndent, setParagraphIndent] = createSignal<BridgeIndent>(ZERO_INDENT);
     const [isTrackingChanges, setIsTrackingChanges] = createSignal(false);
+    const [protection, setProtection] = createSignal<ProtectionMode | undefined>(undefined);
     const [paragraphBorders, setParagraphBorders] =
         createSignal<BridgeCellBorders | undefined>(undefined);
     const [editingStory, setEditingStory] =
@@ -487,6 +507,7 @@ export function createEditorState(): EditorState {
                 setTabStops(evt.tab_stops);
                 setParagraphIndent(evt.paragraph_indent ?? ZERO_INDENT);
                 setIsTrackingChanges(evt.is_tracking_changes);
+                setProtection(evt.protection);
                 setParagraphBorders(evt.paragraph_borders);
                 setEditingStory(evt.editing_story);
                 setFieldCodeView(evt.field_code_view);
@@ -566,6 +587,7 @@ export function createEditorState(): EditorState {
         tabStops,
         paragraphIndent,
         isTrackingChanges,
+        protection,
         paragraphBorders,
         editingStory,
         fieldCodeView,
@@ -578,5 +600,6 @@ export function createEditorState(): EditorState {
         checkpointState: view.checkpointState,
         lastError: view.lastError,
         previousSession: view.previousSession,
+        previousSessions: view.previousSessions,
     };
 }

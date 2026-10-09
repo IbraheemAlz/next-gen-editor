@@ -492,7 +492,9 @@ pub fn compute_markers(
                 .and_modify(|m| *m = (*m).max(ilvl))
                 .or_insert(ilvl);
             match counters.get_mut(&(num_id, ilvl)) {
-                Some(c) => *c += 1,
+                /* Issue #422 — `<w:start w:val="2147483647"/>` is untrusted:
+                saturate instead of overflowing on the next item. */
+                Some(c) => *c = c.saturating_add(1),
                 None => {
                     let start = defs.start_for(num_id, ilvl).unwrap_or(1);
                     counters.insert((num_id, ilvl), start);

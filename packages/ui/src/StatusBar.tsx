@@ -10,6 +10,8 @@
  *     current selection.
  *   - Zoom controls relocated from Sprint 1's toolbar to where they
  *     conventionally live in a word processor.
+ *   - Issue #345 — the document's enforced editing restriction
+ *     (`ProtectionBadge`), when it has one.
  *   - Active renderer indicator (`Canvas2D` / `Vello`) — read-only
  *     status; the `SettingsMenu` below offers the reload-to-switch
  *     affordance.
@@ -21,6 +23,7 @@ import { createEffect, createSignal, onCleanup, type Component } from 'solid-js'
 import { createEditorCommands, createEditorState } from '@nge/core';
 import { ZoomControls } from './ZoomControls';
 import { SettingsMenu } from './SettingsMenu';
+import { ProtectionBadge } from './ProtectionBadge';
 import './StatusBar.css';
 
 const LANGUAGES: { value: string; label: string }[] = [
@@ -94,6 +97,8 @@ export const StatusBar: Component<StatusBarProps> = (props) => {
                 <span class="nge-statusbar__stat" title="Characters (with spaces)">
                     {state.stats()?.character_count ?? '–'} chars
                 </span>
+                {/* Issue #345 — the enforced editing restriction, if any. */}
+                <ProtectionBadge />
             </div>
 
             <div class="nge-statusbar__spacer" />

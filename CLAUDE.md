@@ -112,8 +112,9 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **Crash overlay never loses the document (issue #330).** `TrapOverlay` (shown between `TRAP` and `RECOVERED`) has no `window.location.reload()` fallback any more: "Reload engine" = `EngineClient.restartInPlace()` (joins a recovery already under way, otherwise retires the worker like #270 — bounded by `RETIRE_TIMEOUT_MS` — and respawns through the normal recovery path, `RecoveryInfo.cause = 'engine-reload'`); "Reload page (keeps document)" = `prepareCarryOver()` (retire + a one-shot `sessionStorage` token) then reload, and the next boot's `init()` honours the token **once** by recovering from the log instead of `INIT` (`cause = 'page-reload'`; `RECOVER`'s reply now also carries `crossOriginIsolated`); "Discard document" (two-step confirm) is the only action that starts a new session. **A new session — `INIT` → `openEventLog` — is the only thing that clears the event log**; a plain F5 still does, with or without unsaved edits (no `beforeunload` guard yet). Buttons whose `EngineClientLike` method (`restartInPlace` / `prepareCarryOver`) is absent are hidden, not left as reloads. e2e: `crash-recovery.spec.ts` holds the recovery open with a gate on `client.recover` so the overlay can be clicked.
 - **A failed snapshot write is retried on its own clock (issue #333).** `takeSnapshot`'s write failure rewinds `lastSnapshotAt` (so the position is snapshotted again, not skipped as "taken") and schedules a bounded retry — `SNAPSHOT_RETRY_DELAYS_MS` = 2 s, 4 s, 8 s, independent of new commands; a success resets the run. After the last retry also fails the worker posts `{ notice: 'CHECKPOINT', state: 'exhausted' }` (unsolicited, id-less like the a11y delta) → `EngineClient.checkpointStatus` / `onCheckpointStatus` → `createEditorState().checkpointFailing` → `RecoveryBanner` ("Changes are not being checkpointed … Save your work now", `data-kinds="checkpoint-failing"`, cleared by the next landed write). Every failed write also fires `onCheckpointFailure` → telemetry `ERROR / CHECKPOINT_FAILED` sample (`bridge::ErrorCode::CheckpointFailed`). e2e: `event-log-replay.spec.ts` mocks `IDBObjectStore.put` in the worker to abort the first N `snapshots` puts.
 - **A plain reload with unsaved edits no longer loses them (issue #388).** The worker keeps a `clean` marker in the event-log `meta` store, folded from every command by the ONE shared rule `ts/src/engine/clean-state.ts` (`nextCleanState`: `new_document` commands → clean, other `mutates_doc` → dirty, a `SAVE_DOCX` that answered `DOCUMENT_SAVED` → clean, refused commands change nothing; `EngineClient` folds the same rule on the main thread for the synchronous answer, `hasUnsavedChanges`). `attachUnloadGuard` (`ts/src/state/unload-guard.ts`) raises the browser's `beforeunload` prompt while the document is not clean (`attachUnloadGuard(client, { enabled })` / `VITE_NGE_UNLOAD_GUARD=0` for hosts that autosave; a prepared carry-over, #330, is not guarded). At boot — no carry-over token — `EngineClient.init` calls `inspectActiveLog`: a log whose marker is `false` is copied into ONE `archive` row (`archiveActiveLog`, DB v3; a newer unsaved session replaces an older undecided one) BEFORE `INIT` clears the active stores, and `previousSession` / `onPreviousSession` publish it (an undecided offer survives further reloads). `@nge/ui` `RecoveryBanner` shows "Recover previous document?" with **Recover** (`recoverPreviousSession`: retire the fresh worker, `restoreArchive` swaps the archive in as the active log in one transaction, respawn through the normal recovery path, `cause = 'session-restore'`) and **Discard** (`discardPreviousSession`); the archive is cleared only by Discard or by Recover. A log with no marker (written before #388) reads as "unknown" and is never offered. e2e: `unsaved-session.spec.ts`.
+- **Per-tab event logs + an archive ring (issue #426, supersedes the single shared log of #388).** Every tab used to open the same `engine-log` DB, so a second tab archived and then cleared the first tab's LIVE session. `ts/src/engine/tab-session.ts` (`claimTabSession`, run first thing in `EngineClient.init` under a Web Lock) gives each page generation an identity: a tab token in `sessionStorage` (survives reloads; a duplicated tab's copy is detected by its live heartbeat `instance` and re-issued), a heartbeat per token in `localStorage` (`nge.tab-hb.<token>`, 2 s beats, `left` on `pagehide`; `isTabGone` = no beat / stale > 6 s / `left` past a 4 s reload grace, the #240 `live`-token idea), and ownership of the PRIMARY DB `engine-log` (`nge.log-owner`). A page whose primary is owned by another live tab logs into its own `engine-log-<token>` DB; `EngineClient` hands the name to the worker as `INIT.logDb` / `RECOVER.logDb` (`event-log.ts` `setActiveLogDb`; the renderer streak and the archive always live in the primary). A boot therefore archives only logs whose tab is gone (its own previous page, a primary whose owner died, or — swept at boot — a closed tab's secondary DB, which is then deleted). The archive is a RING (`ARCHIVE_RING_SIZE` = 3 entries keyed by id, each with a decision state `undecided` / `seen`; `RecoveryBanner` Dismiss marks `seen`; a full ring evicts the oldest `seen` entry before an `undecided` one); `previousSessions` / `onPreviousSessions` publish it and Recover / Discard take an entry id (`restoreArchive(id)` writes the active log first, then drops the entry — a crash between leaves a duplicate offer, never a lost session). e2e: `unsaved-session.spec.ts` (two pages in one context).
 - **The event log's health is a typed bridge event, and the command journal is retried too (issue #390).** The ad-hoc `{ notice: 'CHECKPOINT' }` worker message is gone: the worker broadcasts an additive `Event::CheckpointState { ok, failures, last_error, journal_failing }` (id-less, unsolicited like the a11y delta — no `Command`, `EXPECTED_VARIANT_COUNT` unchanged) on `subscribe()`; every event with `failures > 0` is exactly one failed attempt (the exhausting failure is a single `ok: false` event), `failures: 0` ends a run. Three failure sources share the 2/4/8 s clock: an engine-side `SNAPSHOT` dispatch that answers anything but `SNAPSHOT` (or throws) → `noteSnapshotFailed`, the snapshot's IndexedDB write (#333), and an `appendCommand` row write → `journalBacklog` + `drainJournal` (rounds, not rows: a keystroke burst failing together is ONE round; a later successful append drains an exhausted backlog). The failed seqs are also recorded best-effort in the `meta` row `journal-gap`; `RECOVER` counts the ones still missing after the restored base (plus holes in the retained tail) as `RecoveryInfo.journalGap` (reply field `journalGap`, `recoveryNotices` kind `journal-gap`). `@nge/core` `createEditorState().checkpointState()` (`CheckpointHealth`) mirrors the event (seeded from `engine.checkpointStatus`; `checkpointFailing()` is `!ok`); `RecoveryBanner` shows `journal-failing` ("Your edits are not being recorded", `checkpointNotices(failing, journalFailing)`) beside the #333 `checkpoint-failing` notice; telemetry gets `ERROR / CHECKPOINT_FAILED` per attempt and `ERROR / JOURNAL_FAILED` (`bridge::ErrorCode::JournalFailed`) once per exhausted run. e2e: `journal-failure.spec.ts` (mocked failing `commands` store).
-- **A refused keyboard edit is visible (issue #364).** `Engine::tracked_delete` answers `Event::Error { kind: Some(ErrorKind::TrackedDeletionRefused) }` (additive `bridge::ErrorKind` variant) for a tracked deletion across a table-cell boundary / over a table. `@nge/core` `createEditorState().lastError()` (`EditorError`: `kind`, `command` parsed from the `<Command>: ` message prefix, `message`, running `count`, `at`) moves on EVERY `Event::Error` reply; `@nge/ui` `ErrorToast` (mounted in `SdkShelf`) renders the kinds that have copy in `ERROR_TOAST_COPY` in a persistent `.nge-toast` `role="status"` live region for 4 s (a newer error restarts the timer; `PackageTooLarge` keeps the File menu's presentation, untyped errors are HUD-only), and the Dev HUD has a "Last error" row. A new typed `ErrorKind` that the user must see needs a copy entry there. e2e: `error-toast.spec.ts` (review mode, selection across a table, real Backspace; fails without the toast).
+- **A refused keyboard edit is visible (issue #364).** `Engine::tracked_delete` answers `Event::Error { kind: Some(ErrorKind::TrackedDeletionRefused) }` (additive `bridge::ErrorKind` variant) for a tracked deletion the engine refuses — since issue #365 only a range whose end addresses no paragraph (a range across cells / over a table is recorded: rows marked deleted). `@nge/core` `createEditorState().lastError()` (`EditorError`: `kind`, `command` parsed from the `<Command>: ` message prefix, `message`, running `count`, `at`) moves on EVERY `Event::Error` reply; `@nge/ui` `ErrorToast` (mounted in `SdkShelf`) renders the kinds that have copy in `ERROR_TOAST_COPY` in a persistent `.nge-toast` `role="status"` live region for 4 s (a newer error restarts the timer; `PackageTooLarge` keeps the File menu's presentation, untyped errors are HUD-only), and the Dev HUD has a "Last error" row. A new typed `ErrorKind` that the user must see needs a copy entry there. e2e: `error-toast.spec.ts` (a typed refusal fed through the client's event stream — no keyboard edit reaches one since #365 — shows the toast and the HUD row; fails without the toast; review mode + real Backspace across a table records the deletion with no toast).
 - **e2e suite**: `ts/e2e/*.spec.ts` + `ts/playwright.config.ts` — `@playwright/test` with `channel: 'chrome'` (system Chrome, no download); `webServer` auto-boots Vite. Run: `pnpm exec playwright test` from `ts/`.
 - **Race-class e2e specs use the synchronous `burst` helper (issue #310).** `page.keyboard` / `page.mouse` round-trip through CDP per event — slow enough that the worker answers between two simulated inputs and the shell's mirrored state is already fresh, so a spec passes against the very race it targets (the #286 real-keyboard spec did). `ts/e2e/helpers/editor.ts` exports `burst(page, steps)`, which fires the whole sequence (`'B'` Ctrl+B, `'BTN'` Bold button, `'ENTER'`, `{ pointerdown: { x, y, shift? } }` / `{ pointerup }` on a page canvas through the real `pointer.ts`, or any other string as `insertText`) from ONE synchronous `page.evaluate`, so no engine reply can interleave; read results via `documentText` / `settle` (worker round-trips, FIFO behind the burst). Calling `__dispatch` directly is NOT a race test — it bypasses `pointer.ts` / `HiddenInput`. **A new race spec must be shown to fail** against a deliberately re-introduced deferral in the shell (e.g. `setTimeout(…, 0)` around `placeCaret`/`extendTo`/the Enter dispatch/`toggleFormat`/`cmd.toggleFormatting`); a bare delay needs a trailing keystroke queued behind it in the burst (the readback arrives too late to notice a delay on its own). Keep one slow real-input smoke per scenario, but never as the only guard. The engine ignores a stale `at` on `SPLIT_PARAGRAPH` when a selection exists, so "stale mirror" regressions of Enter surface only as shell-side deferral.
 
@@ -160,7 +161,7 @@ D5.10 are external/human sign-offs, not code.
   `crates/format-pdf/build.rs` synthesizes the sRGB ICC profile — no binary
   blob in the tree. `tools/pdf-validate` is the veraPDF harness.
 - **Fuzzing (D5.5, scaled up by issue #90).** `fuzz/` is a cargo-fuzz crate
-  in its **own workspace** with four structure-aware targets, all
+  in its **own workspace** with six structure-aware targets, all
   compile-checked on stable via `cargo check --manifest-path fuzz/Cargo.toml`
   (`cargo +nightly fuzz run` is the nightly flow, `.github/workflows/
   fuzz-nightly.yml`, ≥ 30 min/target with `-fork=4` so one already-known
@@ -170,6 +171,15 @@ D5.10 are external/human sign-offs, not code.
     schema-shaped WML (random `pPr`/`rPr`/`tbl`/`sectPr` trees, valid and
     deliberately-invalid attributes) inside a minimal OPC zip, not raw
     bytes, then `read_docx` / `read → write → read`.
+    Issue #358 widened it: complex fields (balanced / not, nested to 40),
+    `fldSimple`, block + inline `w:sdt` (to 5000 deep), paragraph- and
+    run-level `mc:AlternateContent` with random `Requires`, drawings whose
+    `r:embed` resolves to nothing, `NaN` / unit / hex numbers, 60-deep
+    tables, and a splice mode (spec snippets, raw input bytes, flips,
+    truncation) — all chains, linear in depth, `document.xml` capped at
+    2 MB (#422). `docx_roundtrip` also asserts the zero-edit save keeps
+    the text (exception: a namespace-ill-formed source). The nightly
+    passes `-dict=dictionaries/docx.dict` to both legs.
   - `rpc_command` — `fuzz/src/command_gen.rs` derives `arbitrary::Arbitrary`
     for `Command` (bridge's `arbitrary` feature, optional + off by default,
     zero cost to the wasm build) and drives sequences end to end through
@@ -178,14 +188,33 @@ D5.10 are external/human sign-offs, not code.
     needed: `Engine::new_headless` skips the `OffscreenCanvas` requirement,
     and `apply`'s auto-repaint still runs the full layout pipeline (only
     the final canvas blit is unreachable, and already skipped whenever no
-    canvas is registered).
+    canvas is registered). Issue #341: a command answered with
+    `Event::Error` must leave the document, selection, active story,
+    document name and undo depth unchanged
+    (`Engine::state_fingerprint_for_fuzzing`; the only exception is a
+    reply-stage error after a committed edit on a never-painted headless
+    engine, `is_post_commit_report_error`).
+  - `snapshot_decode` (issue #341) — `fuzz/src/snapshot_gen.rs` takes the
+    engine's own snapshot of a generated session, parses the MessagePack
+    into a tree and mutates it (hostile ints / floats, truncated or lying
+    containers, dangling stories, v1 / v2 / forged package keys, a wrong
+    magic / version byte), ≤ 4 MB; `Engine::restore` must answer `Ok` or a
+    typed error, then one `apply` round keeps
+    `Engine::check_invariants_for_fuzzing`, and `Command::Recover` must
+    answer `Recovered`. Seeds (`corpus/snapshot_decode/`, v1 FNV + v2
+    `sha256-` detached packages, hostile envelopes) come from
+    `examples/regen-seeds`.
   - `layout_paginate` (new) — `fuzz/src/layout_gen.rs` builds random
     paragraph/table/section trees straight into the paginator; a page-count
     bound stands in for a termination watchdog (`Engine::
     layout_page_count_for_fuzzing`).
   - `fuzz/examples/smoke.rs` is a stable-only driver (no nightly needed)
-    proving all four work: `cargo run --manifest-path fuzz/Cargo.toml
-    --example smoke --release`.
+    proving all six work: `systemd-run --user --scope -p MemoryMax=16G
+    --quiet -- cargo run --manifest-path fuzz/Cargo.toml --example smoke
+    --release` — always under the cap (issue #422, see "Bash / agent
+    ergonomics"); it prints `smoke: peak RSS …` (keep it < 4 GB) and
+    aborts on its own on a runaway input (live-heap ceiling, `RLIMIT_AS`,
+    per-input timeout), naming the input.
   - Issue #229 — the `rpc_command` corpus's #186/#187 regression seeds are
     derived from `command_gen::Scenario`'s explicit builder (a fixed-prefix
     fast path in `gen_targeted_command`, immune to unrelated arms' byte-
@@ -329,6 +358,26 @@ Engine backlog" references a real issue.
   `roundtrip-dump` artifact on failure (the harness has no separate
   diff-file dump — its `FAIL:` line carries the inline diff).
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
+- **Timing budgets live in `tools/perf`, never in the blocking e2e suite**
+  (issue #425). A wall-clock assertion in Playwright fails under machine load
+  with the code unchanged (`boot.spec.ts` once read 717 ms at load 43-58).
+  `ts/e2e/boot.spec.ts` is a smoke (`__bootMs` / `__engineReady` reported);
+  the D2.1 worker-boot < 500 ms gate is `workerBootMs` in
+  `node tools/perf/run.mjs --strict`, alongside cold start and insert p95.
+- `pnpm -r test` (issue #332) — the TypeScript **unit** tests: `vitest`
+  (pinned, workspace root dev dep; shared node-environment config in
+  `vitest.shared.ts`, **no jsdom** — a module under test must not touch
+  the DOM), `fake-indexeddb` for `ts/src/engine/event-log.ts`, a scripted
+  fake `Worker` for `EngineClient`. Tests sit beside the code
+  (`*.test.ts`, `src/**` of `ts/`, `packages/core`, `packages/ui`) and run in
+  about a second. Pure TS logic (event-log scoring / pruning / package GC /
+  the #314 write-confirm, the #333 retry schedule, `recoveryNotices()`,
+  `nextCleanState`, `devHooksEnabled` / `resolveTelemetryEndpoint`) is
+  tested here, **not** through Playwright; the e2e suite keeps what needs a
+  real browser + the wasm engine. `engine.worker.ts` imports the wasm
+  engine and cannot be loaded by vitest: extract a pure decision into its
+  own module (as `retry-schedule.ts`) to unit-test it. CI runs it as the
+  `unit` step of the `e2e` job, before Playwright.
 - `pnpm exec playwright test` (from `ts/`) — the full e2e suite in `ts/e2e/`
   (`workers: 1`, well under a minute locally) all green.
   **Blocking since issue #230**: `ci.yml`'s `e2e` job reuses the `wasm`
@@ -466,6 +515,17 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
 
 - **Working dir drifts** between Bash tool calls. Use absolute paths or `cd /home/ibrahim/Desktop/code/next-gen-editor &&` at the top of every multi-step command.
 - Long-running processes (vite dev, wasm-pack build) run in `run_in_background: true`.
+- **Heavy local runs go through a memory-capped scope (issue #422).** The
+  fuzz smoke driver / sweeps, `tools/corpus-native`, Playwright and `cargo
+  test --workspace` run as `systemd-run --user --scope -p MemoryMax=16G
+  --quiet -- <command>` (inherits env + cwd). On 2026-10-09 one uncapped
+  smoke input reached 46.5 GB and the OOM killer took the whole terminal
+  scope — session, agents, merge queues, Chrome. `fuzz/examples/smoke.rs`
+  also self-limits (`RLIMIT_AS` 8 GiB, a 2 GiB live-heap ceiling, a 300 s
+  per-input timeout — `SMOKE_AS_LIMIT_MB` / `SMOKE_RSS_LIMIT_MB` /
+  `SMOKE_TIMEOUT_SECS`; the offending input is printed and, with
+  `SMOKE_ARTIFACT_DIR`, saved) and prints its peak RSS at exit; bisect a
+  heavy input with `--from/--to/--log-inputs`.
 - Don't `git add .` blindly. Stage by explicit path.
 - Commit messages: heredoc + a `Co-Authored-By:` trailer naming the model that wrote the change (e.g. `Claude Fable 5.1`, `Claude Opus 5.5`, `Claude Sonnet 5`, each `<noreply@anthropic.com>`); the session that merges adds its `Claude-Session:` link.
 - **Parallel agents in git worktrees.** A shared `CARGO_TARGET_DIR` across

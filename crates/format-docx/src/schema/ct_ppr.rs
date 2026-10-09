@@ -18,9 +18,9 @@ use quick_xml::events::BytesStart;
 /// arms of [`apply_ppr`] plus the container / reference children the
 /// part parsers handle in their own loops (`pStyle`, `numPr`, `pBdr`,
 /// `tabs`, `sectPr`). The paragraph-mark `<w:rPr>` is deliberately NOT
-/// here — the writer never regenerates it, so the whole element rides
-/// the paragraph's grab bag (its modeled children still seed the run
-/// baseline via `ct_rpr::fold_rpr_fragment`).
+/// here — the whole element rides the paragraph's grab bag (its modeled
+/// children are `Paragraph::mark_style`, issue #293, and format the mark
+/// only — never the runs, issue #369).
 pub fn ppr_child_is_modeled(name: &[u8]) -> bool {
     matches!(
         name,
@@ -174,6 +174,20 @@ pub fn apply_ppr(name: &[u8], e: &BytesStart, props: &mut ParaProperties) {
             /* `w:fill="auto"` / malformed hex → `None` (shading cleared),
             matching the cell `<w:tcPr><w:shd>` path. */
             props.shading = attr_val(e, b"w:fill").and_then(|v| parse_hex_color(&v));
+            /* Issue #419 — a pattern (`w:val` other than `clear`, or a
+            pattern colour) is modeled next to the fill. */
+            let val = attr_val(e, b"w:val").map(|v| v.trim().to_string());
+            let color = attr_val(e, b"w:color").and_then(|v| parse_hex_color(&v));
+            props.shading_pattern = match val {
+                Some(val) if val != "clear" || color.is_some() => {
+                    Some(engine::ShadingPattern { val, color })
+                }
+                None if color.is_some() => Some(engine::ShadingPattern {
+                    val: "clear".into(),
+                    color,
+                }),
+                _ => None,
+            };
         }
         /* Issue #178 — tri-state: an explicit `w:val="0"` must be able
         to override an inherited style's ON (see `ParaProperties::

@@ -310,6 +310,38 @@ pub fn read_docx_with_limits(
 ) -> Result<DocxArchive, DocxError> {
     /* Issue #349 — every part's non-fatal diagnostics (styles,
     headers, notes included) land on `DocxArchive::warnings`. */
+    read_docx_with_password(
+        bytes,
+        None,
+        default_page_size,
+        widow_control_default,
+        limits,
+    )
+}
+
+/// Issue #345 — [`read_docx_with_limits`] that also opens an ENCRYPTED
+/// package (MS-OFFCRYPTO agile or standard encryption, see
+/// [`crate::opc::offcrypto`]) when `password` is given: the decrypted ZIP
+/// is read exactly like a plain `.docx` (its declared size bounded by
+/// `limits.max_total_bytes`). Without a password an encrypted package is
+/// [`DocxError::Encrypted`]; a wrong one [`DocxError::WrongPassword`].
+/// A `password` given for a plain package is ignored. The result carries
+/// no trace of the encryption: saving it writes an unencrypted package.
+pub fn read_docx_with_password(
+    bytes: &[u8],
+    password: Option<&str>,
+    default_page_size: engine::DefaultPageSize,
+    widow_control_default: bool,
+    limits: &PackageLimits,
+) -> Result<DocxArchive, DocxError> {
+    let decrypted;
+    let bytes = match (crate::opc::cfb::sniff_compound_file(bytes), password) {
+        (Some(crate::opc::cfb::CompoundFileKind::EncryptedPackage), Some(pw)) => {
+            decrypted = crate::opc::offcrypto::decrypt_package(bytes, pw, limits.max_total_bytes)?;
+            decrypted.as_slice()
+        }
+        _ => bytes,
+    };
     let mut part_warnings = Vec::new();
     let mut archive = crate::error::collect_read_warnings(&mut part_warnings, |_| {
         read_docx_scoped(bytes, default_page_size, widow_control_default, limits)
@@ -325,6 +357,15 @@ fn read_docx_scoped(
     widow_control_default: bool,
     limits: &PackageLimits,
 ) -> Result<DocxArchive, DocxError> {
+    /* Issue #345 — an OLE compound file is never a ZIP: an encrypted
+    package (or a legacy binary document) gets its own typed refusal
+    instead of "invalid Zip archive". */
+    if let Some(kind) = crate::opc::cfb::sniff_compound_file(bytes) {
+        return Err(match kind {
+            crate::opc::cfb::CompoundFileKind::EncryptedPackage => DocxError::Encrypted,
+            crate::opc::cfb::CompoundFileKind::Other => DocxError::CompoundFile,
+        });
+    }
     /* Issue #348 — every entry through the bounded reader (never an
     allocation from the declared size), then the XML shape bounds of every
     part the reader walks, before any typed walk. */
@@ -352,7 +393,10 @@ fn read_docx_scoped(
     other_entries.shrink_to_fit();
     /* Issue #325 — validate the root's namespace bindings; a non-canonical
     spelling is normalised (regenerate-only) instead of reading empty. */
-    let xml = canonical_main_part(xml, &mut warnings);
+    let xml = canonical_main_part(&part_names.main, xml, &mut warnings);
+    /* Issue #394 — the same for every WordprocessingML sibling the reader
+    walks, before any of them is parsed. */
+    canonical_sibling_parts(&mut other_entries, &part_names, &mut warnings);
 
     /* Phase 3 — `word/styles.xml` rides the pass-through but feeds the
     cascade resolver. Absent or malformed → empty table (all paragraphs
@@ -676,6 +720,9 @@ fn read_docx_scoped(
         .and_then(|(_, b)| crate::parts::settings::parse_settings_xml(b).ok());
     if let Some(settings) = &settings_part {
         document.settings.even_and_odd_headers = settings.even_and_odd_headers;
+        /* Issue #345 — the editing restriction the engine enforces (the
+        part's bytes still pass through verbatim). */
+        document.settings.protection = settings.protection.clone();
         /* Issue #80 — document-level note properties. */
         document.footnote_props = settings.footnote_props;
         document.endnote_props = settings.endnote_props;
@@ -733,31 +780,116 @@ fn read_docx_scoped(
 /// when even that fails, or the root is no WordprocessingML at all, the
 /// part is returned as-is with a typed warning — never a silent empty
 /// document.
-fn canonical_main_part(xml: Vec<u8>, warnings: &mut Vec<DocxWarning>) -> Vec<u8> {
+fn canonical_main_part(name: &str, xml: Vec<u8>, warnings: &mut Vec<DocxWarning>) -> Vec<u8> {
     use crate::schema::family::RootBinding;
-    use crate::schema::ns_normalize::{canonicalize_prefixes, inspect_root};
+    use crate::schema::ns_normalize::inspect_root;
     match inspect_root(&xml) {
         RootBinding::Canonical(_) => xml,
         RootBinding::NotWordprocessingMl => {
             warnings.push(DocxWarning::NotWordprocessingMl);
             xml
         }
-        RootBinding::NonCanonical { detail } => match canonicalize_prefixes(&xml) {
-            Ok(normalised) => {
-                warnings.push(DocxWarning::NonCanonicalNamespaces {
-                    detail,
-                    normalized: true,
-                });
-                normalised
-            }
-            Err(e) => {
-                warnings.push(DocxWarning::NonCanonicalNamespaces {
-                    detail: format!("{detail}; normalisation failed: {e}"),
-                    normalized: false,
-                });
-                xml
-            }
-        },
+        RootBinding::NonCanonical { detail } => normalise_part(name, xml, detail, warnings),
+    }
+}
+
+/// Issue #394 — [`canonical_main_part`] for the WordprocessingML siblings
+/// the reader walks: `styles.xml`, `numbering.xml`, `settings.xml`,
+/// `footnotes.xml`, `endnotes.xml`, `comments.xml` and every header /
+/// footer part the main part's relationships name. A non-canonical part
+/// is replaced IN `entries` by its normalised bytes, so every consumer —
+/// the typed parsers, the writer's verbatim passthrough, the in-place
+/// patches (`comments.xml`), a regenerated header's root bindings, the
+/// tree's retained source package — sees one consistent canonical
+/// spelling: the part is regenerate-only (its source bytes are never
+/// spliced into), reported as [`DocxWarning::NonCanonicalNamespaces`].
+/// Canonical parts stay byte-identical, as do parts the reader never
+/// walks (custom XML, `fontTable.xml`, the theme) and a sibling whose
+/// root is no WordprocessingML at all (it reads as before; only the main
+/// part reports [`DocxWarning::NotWordprocessingMl`]).
+fn canonical_sibling_parts(
+    entries: &mut [(String, Vec<u8>)],
+    names: &PartNames,
+    warnings: &mut Vec<DocxWarning>,
+) {
+    use crate::schema::family::RootBinding;
+    use crate::schema::ns_normalize::inspect_root;
+    let mut parts: Vec<String> = [
+        &names.styles,
+        &names.numbering,
+        &names.settings,
+        &names.footnotes,
+        &names.endnotes,
+        &names.comments,
+    ]
+    .into_iter()
+    .cloned()
+    .collect();
+    parts.extend(header_footer_parts(entries, names));
+    let mut seen = std::collections::HashSet::new();
+    for part in parts {
+        if !seen.insert(part.clone()) {
+            continue;
+        }
+        let Some(slot) = entries.iter_mut().find(|(n, _)| *n == part) else {
+            continue;
+        };
+        if let RootBinding::NonCanonical { detail } = inspect_root(&slot.1) {
+            let xml = std::mem::take(&mut slot.1);
+            slot.1 = normalise_part(&part, xml, detail, warnings);
+        }
+    }
+}
+
+/// Issue #394 — the archive entries of every header / footer part the
+/// main part's relationships target (both namespace families' rel types),
+/// in relationship order.
+fn header_footer_parts(entries: &[(String, Vec<u8>)], names: &PartNames) -> Vec<String> {
+    const REL_BASE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
+    let Some(rels) = entries
+        .iter()
+        .find(|(n, _)| *n == names.main_rels)
+        .and_then(|(_, b)| crate::opc::relationships::parse_relationships(b).ok())
+    else {
+        return Vec::new();
+    };
+    let header = format!("{REL_BASE}header");
+    let footer = format!("{REL_BASE}footer");
+    rels.by_type(&header)
+        .chain(rels.by_type(&footer))
+        .filter(|r| r.target_mode == crate::opc::relationships::TargetMode::Internal)
+        .map(|r| resolve_in_package(entries, &names.main, &r.target))
+        .collect()
+}
+
+/// Issues #325 / #394 — re-prefix one non-canonical part (`detail` names
+/// the first offending binding) and report it. A part the normaliser
+/// cannot rewrite is returned as-is (it will likely read empty), still
+/// reported.
+fn normalise_part(
+    name: &str,
+    xml: Vec<u8>,
+    detail: String,
+    warnings: &mut Vec<DocxWarning>,
+) -> Vec<u8> {
+    use crate::schema::ns_normalize::canonicalize_prefixes;
+    match canonicalize_prefixes(&xml) {
+        Ok(normalised) => {
+            warnings.push(DocxWarning::NonCanonicalNamespaces {
+                part: name.to_string(),
+                detail,
+                normalized: true,
+            });
+            normalised
+        }
+        Err(e) => {
+            warnings.push(DocxWarning::NonCanonicalNamespaces {
+                part: name.to_string(),
+                detail: format!("{detail}; normalisation failed: {e}"),
+                normalized: false,
+            });
+            xml
+        }
     }
 }
 

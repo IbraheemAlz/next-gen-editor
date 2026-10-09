@@ -49,9 +49,14 @@ pub fn tbl_pr_child_rank(name: &[u8]) -> u16 {
     schema_rank(ORDER, name, b"w:tblPrChange")
 }
 
-/// `true` for the `<w:trPr>` children `parts::table` consumes.
+/// `true` for the `<w:trPr>` children `parts::table` consumes. Issue
+/// #365 — the tracked row insertion / deletion (`<w:ins/>` / `<w:del/>`)
+/// is modeled as `RowProperties::revisions`.
 pub fn tr_pr_child_is_modeled(name: &[u8]) -> bool {
-    matches!(name, b"w:trHeight" | b"w:cantSplit" | b"w:tblHeader")
+    matches!(
+        name,
+        b"w:trHeight" | b"w:cantSplit" | b"w:tblHeader" | b"w:ins" | b"w:del"
+    )
 }
 
 /// Rank in the `EG_TrPrBase` listing (ECMA-376 §17.4.82; an unbounded

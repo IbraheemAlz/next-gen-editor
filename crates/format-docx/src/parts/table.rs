@@ -1226,6 +1226,17 @@ fn handle_property_inner(
             }
             b"w:cantSplit" => row.props.cant_split = true,
             b"w:tblHeader" => row.props.header = true,
+            /* Issue #365 — a tracked row insertion / deletion. */
+            b"w:ins" | b"w:del" => {
+                let kind = if name == b"w:ins" {
+                    engine::RevisionKind::Insert
+                } else {
+                    engine::RevisionKind::Delete
+                };
+                row.props
+                    .revisions
+                    .push(crate::parts::document::mark_revision(kind, e));
+            }
             _ => {}
         }
         return;
@@ -1338,6 +1349,8 @@ fn parse_border_stroke(e: &BytesStart) -> BorderStroke {
         style,
         size_eighth_pt,
         color,
+        /* Issue #419 — `w:space` / `w:shadow` / `w:frame`. */
+        ..crate::schema::source_markup::border_extras(e)
     }
 }
 
