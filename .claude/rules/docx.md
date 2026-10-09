@@ -366,6 +366,13 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   any one that removes the mark merges; a single Accept/Reject decides
   the addressed one (by range: the first) — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
+  Issue #367 — a removed mark carrying a SECTION BREAK merges too
+  (`merge_paragraph_with_next`), by Word's rule (the #70 `delete_range`
+  one): the text joins the FOLLOWING section and takes its properties
+  (`concat` keeps the tail's `section_end`), and the dropped section's
+  header / footer refs backfill the surviving terminal's EMPTY slots
+  (owned slots win) — so an own inserted break is removed, not marked.
+  Harness: `tools/roundtrip` step 54 (`section_break_revision.docx`).
   Issue #305 — the single `AcceptRevision` / `RejectRevision` is the
   SAME resolver (`DocumentTree::resolve_revisions` with a
   `RevisionPick::Only`, addressed by `engine::RevisionRef`); text leaves
@@ -409,16 +416,40 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   straddling change is cut once, `tracked::split_revisions`; the right
   piece drops its source id, and `concat` re-joins the two pieces). A
   tracked deletion (`try_tracked_delete_range`; `tracked_delete_range`
-  wraps it) works over any range inside ONE container: per paragraph the
-  reviewer's own pending insertions are removed outright (the #265 path,
-  `revisions::remove_text`), already-deleted bytes are left alone, the
-  rest is marked `Delete`; every swallowed mark is marked `Delete` — or,
-  when it is the reviewer's own inserted mark, removed (the paragraphs
-  merge through `merge_paragraph_with_next`). A range across a cell
-  boundary or over a table is refused (`TrackedEditError`, answered as
-  `Event::Error` — never a silent no-op). Tracked Backspace leaves the
-  caret at the START of what it marked (Word: it steps over struck
-  text).
+  wraps it) works over any range between two paragraphs: per paragraph
+  the reviewer's own pending insertions are removed outright (the #265
+  path, `revisions::remove_text`), already-deleted bytes are left alone,
+  the rest is marked `Delete`; every swallowed mark (one whose merge
+  partner on accept — the next paragraph, past any table the range
+  deletes whole — is in the range) is marked `Delete` — or, when it is
+  the reviewer's own inserted mark, removed (the paragraphs merge through
+  `merge_paragraph_with_next`). Issue #365 — tables, Word's way: a range
+  crossing a row boundary or entering a table from outside deletes every
+  row it touches WHOLE (`RowProperties::revisions` += `Delete` — the
+  `<w:trPr><w:del/>` — plus the cells' contents as text; a nested
+  table's rows marked too; the reviewer's own inserted row removed
+  outright), a range across cells of ONE row deletes each cell's
+  sub-range. Only an end that addresses no paragraph is refused
+  (`TrackedEditError::NoParagraph`, answered as `Event::Error` — never a
+  silent no-op). Tracked Backspace leaves the caret at the START of what
+  it marked (Word: it steps over struck text). Issue #366 — a paste with
+  review mode on (`tracked_insert_multiline` / `tracked_insert_rich_blocks`)
+  records its text as `Insert`s and every mark it creates as inserted
+  (a pasted table's rows as inserted rows); replacing a selection marks
+  it deleted first. An IME commit goes through the tracked typing path.
+- **Table-row revisions (issue #365).** `<w:trPr><w:ins/>` / `<w:del/>`
+  (both, in source order) read into `RowProperties::revisions` (modeled
+  `CT_TrPr` children — no longer bagged), so the verified `<w:trPr>`
+  passthrough covers them; a regenerated `<w:trPr>` emits them at their
+  rank (before `<w:trPrChange>`) with #295 id tokens. The resolver
+  (`resolve_revisions`) resolves rows in the mark walk, after a table's
+  cells and before the paragraph in front of it: an accepted deletion /
+  rejected insertion removes the row (`remove_table_rows`, comment anchors
+  via `remap_table_cells`; a table left without rows goes via
+  `remap_block_splice`). `revision_entries` lists row changes of
+  top-level tables as `RevisionSlot::Row { row, index }` (path = the
+  table), `revisions_snapshot` rows carry `row`. `<w:tblPrChange>` /
+  `<w:trPrChange>` stay verbatim grab-bag bytes (not resolved).
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

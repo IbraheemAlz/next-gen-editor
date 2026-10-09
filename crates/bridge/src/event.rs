@@ -582,10 +582,12 @@ pub enum ErrorKind {
     /// open was refused before anything was allocated from the package's
     /// own size claims. The previous document stays open.
     PackageTooLarge,
-    /// Issue #364 - a tracked (review-mode) deletion the engine refuses
-    /// because it would cross a table-cell boundary or run over a table:
+    /// Issue #364 - a tracked (review-mode) deletion the engine refuses:
     /// nothing changed. The shell shows a visible, non-modal refusal
-    /// instead of letting the key press appear to do nothing.
+    /// instead of letting the key press appear to do nothing. Since issue
+    /// #365 a range across table cells or over a table is RECORDED (rows
+    /// marked deleted, `<w:trPr><w:del/>`), so only a range whose end
+    /// addresses no paragraph is refused.
     TrackedDeletionRefused,
 }
 

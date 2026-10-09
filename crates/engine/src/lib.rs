@@ -72,8 +72,14 @@ mod paragraph_merge_tests;
 #[cfg(test)]
 mod revision_tests;
 mod revisions;
+#[cfg(test)]
+mod section_mark_tests;
 mod text_remap;
 mod tracked;
+#[cfg(test)]
+mod tracked_paste_tests;
+#[cfg(test)]
+mod tracked_table_tests;
 #[cfg(test)]
 mod tracked_tests;
 pub use text_remap::TextEdit;
@@ -5094,6 +5100,26 @@ pub struct RowProperties {
     /// Issue #84 — unmodeled `<w:trPr>` children, verbatim. See
     /// [`GrabBag`].
     pub grab_bag: Option<Box<GrabBag>>,
+    /// Issue #365 — the row's tracked changes: `<w:trPr><w:ins/>` (a
+    /// tracked row insertion) / `<w:del/>` (a tracked row deletion), in
+    /// source order — a row one reviewer inserted and another deleted
+    /// carries both (the #303 rule for paragraph marks). `start` / `end`
+    /// are unused. They are `CT_TrPr` children, so they live with the
+    /// row properties: the verified `<w:trPr>` passthrough (issue #248)
+    /// re-emits the source bytes only while they are unchanged. Accepting
+    /// a deletion / rejecting an insertion removes the row
+    /// ([`DocumentTree::resolve_revisions`]). Skipped when empty, so a
+    /// pre-#365 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<Revision>,
+}
+
+impl TableRow {
+    /// Issue #365 — the row's first tracked change (see
+    /// [`RowProperties::revisions`] for a row carrying several).
+    pub fn revision(&self) -> Option<&Revision> {
+        self.props.revisions.first()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
