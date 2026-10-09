@@ -1391,3 +1391,8 @@ pub fn styles_patch_docx() -> Vec<u8> {
         ("word/styles.xml", STYLES_PATCH_XML.as_bytes()),
     ])
 }
+
+/* Issues #335 / #357 / #326 — run-content elements and hyphenation. */
+#[path = "test_fixtures_run_content.rs"]
+mod run_content;
+pub use run_content::*;

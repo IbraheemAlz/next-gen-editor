@@ -8,6 +8,7 @@
 
 pub mod bidi;
 pub mod fonts;
+pub mod hyphenate;
 pub mod justify;
 pub mod justify_kashida;
 pub mod line_break;
@@ -19,6 +20,7 @@ pub use fonts::{
     FontError, FontId, FontMetrics, FontStack, GlyphMetrics, LoadedFont, MAX_OUTLINE_PX,
     MAX_RASTER_PX, OutlineCmd, RasterizedGlyph, Synthesis,
 };
+pub use hyphenate::Hyphenator;
 pub use justify::{Alignment, JustifyMode};
 pub use line_break::break_opportunities;
 pub use script::{

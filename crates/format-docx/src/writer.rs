@@ -318,7 +318,17 @@ fn rfonts_theme_attrs(style: &SpanStyle) -> Vec<(&'static str, &str)> {
 /// regenerated children keep the source spelling of an unchanged element
 /// (issue #106, [`PrChildren::adopt`]).
 fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String) {
-    if *style == SpanStyle::default() {
+    /* Issue #326 — `lang` is read-only (the `<w:lang>` bytes ride the
+    grab bag): a style that differs from the default only there has
+    nothing to write (text typed into an empty paragraph inherits the
+    mark's language). */
+    if *style == SpanStyle::default()
+        || (style.lang.is_some()
+            && SpanStyle {
+                lang: None,
+                ..style.clone()
+            } == SpanStyle::default())
+    {
         return;
     }
     let mut ch = rpr_children(style);
@@ -976,6 +986,22 @@ fn ppr_children(
             },
         );
     }
+    /* Issue #326 — a style's `<w:suppressAutoHyphens>`; same contract as
+    `widowControl` above. */
+    if let Some(on) = props.suppress_auto_hyphens
+        && !engine::GrabBag::fragments_of(&props.grab_bag)
+            .iter()
+            .any(|f| f.starts_with(b"<w:suppressAutoHyphens"))
+    {
+        ch.push(
+            rank(b"w:suppressAutoHyphens"),
+            if on {
+                "<w:suppressAutoHyphens/>".into()
+            } else {
+                "<w:suppressAutoHyphens w:val=\"0\"/>".into()
+            },
+        );
+    }
     /* Phase 3 (#40) — a marker paragraph's interior `<w:sectPr>`: the
     genuinely-last CT_PPr content child (only the never-emitted
     pPrChange follows it in the schema). */
@@ -1024,11 +1050,15 @@ fn serialize_paragraph_body(
     let inherited_bidi = direction_is_inherited(para);
     let props = if para.props.outline_level.is_some()
         || para.props.widow_control.is_some()
+        || para.props.suppress_auto_hyphens.is_some()
         || inherited_bidi
     {
         let mut p = para.props.clone();
         p.outline_level = None;
         p.widow_control = None;
+        /* Issue #326 — read-only like the two above (the direct element
+        rides the grab bag; a style-inherited value is not baked in). */
+        p.suppress_auto_hyphens = None;
         if inherited_bidi {
             p.direction = None;
         }
@@ -1087,10 +1117,17 @@ fn serialize_paragraph_body(
     `para.text`; the structural `<w:r><w:br/></w:r>` emission needs
     the cut-point walk. The fast path stays open for plain
     paragraphs that carry no overlays AND no break characters. */
-    let has_break = para
-        .text
-        .chars()
-        .any(|c| c == '\u{2028}' || c == '\u{000C}');
+    let has_break = para.text.chars().any(|c| {
+        c == '\u{2028}'
+            || c == '\u{000C}'
+            /* Issue #357 — `<w:cr/>`; issue #335 — a hyphen element is a
+            leaf of its own; the `<w:dir>` / `<w:bdo>` controls become
+            wrappers. */
+            || c == engine::run_content::CARRIAGE_RETURN
+            || engine::run_content::is_bidi_wrapper_control(c)
+            || c == engine::run_content::SOFT_HYPHEN
+            || c == engine::run_content::NON_BREAKING_HYPHEN
+    });
     let has_source_runs = markup.is_some_and(|m| {
         if m.offsets_valid(para.text.len()) {
             !(m.runs.is_empty() && m.markers.is_empty())
@@ -1302,6 +1339,8 @@ fn splice_source_ppr(sp: &SourcePPr, para: &Paragraph, live: &ParaProperties) ->
     let mut rec = sp.props.clone();
     rec.outline_level = None;
     rec.widow_control = None;
+    /* Issue #326 — cleared on the live side too (read-only). */
+    rec.suppress_auto_hyphens = None;
     /* The live direction was dropped as inherited from the style
     (issue #202): the same value recorded is inherited too. */
     if live.direction.is_none()
@@ -1591,11 +1630,19 @@ fn emit_styled_runs_with_objects(
     U+0009 byte at every tab anchor; the writer reinjects the structural
     `<w:r><w:tab/></w:r>` run at the same offset. Tabs sit alongside
     `<w:br>` in the cut set because the same boundary mechanic applies. */
-    let mut tab_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    /* Issue #335 — the soft / non-breaking hyphen characters ride the same
+    mechanic: each is its own leaf (`<w:softHyphen/>` /
+    `<w:noBreakHyphen/>`), never the raw character inside a `<w:t>` —
+    except inside a source run that spelled them literally
+    ([`SourceRun::literal_hyphens`]), which keeps its spelling. */
+    let mut leaf_at: std::collections::HashMap<usize, &'static str> =
+        std::collections::HashMap::new();
+    let mut bidi_ctrl_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (idx, ch) in para.text.char_indices() {
         let kind = match ch {
             '\u{2028}' => Some(BreakKind::Line),
             '\u{000C}' => Some(BreakKind::Page),
+            engine::run_content::CARRIAGE_RETURN => Some(BreakKind::CarriageReturn),
             _ => None,
         };
         if let Some(k) = kind {
@@ -1603,8 +1650,18 @@ fn emit_styled_runs_with_objects(
             cuts.insert(idx);
             cuts.insert(idx + ch.len_utf8());
         }
-        if ch == '\u{0009}' {
-            tab_at.insert(idx);
+        if let Some(leaf) = run_leaf_element(ch)
+            && !(engine::run_content::is_hyphen_character(ch)
+                && run_source(idx).is_some_and(|s| s.run.literal_hyphens))
+        {
+            leaf_at.insert(idx, leaf);
+            cuts.insert(idx);
+            cuts.insert(idx + ch.len_utf8());
+        }
+        /* Issue #357 — a `<w:dir>` / `<w:bdo>` control writes no text:
+        the wrapper markers (`bidi_wrapper_markers`) carry it. */
+        if engine::run_content::is_bidi_wrapper_control(ch) {
+            bidi_ctrl_at.insert(idx);
             cuts.insert(idx);
             cuts.insert(idx + ch.len_utf8());
         }
@@ -1838,12 +1895,21 @@ fn emit_styled_runs_with_objects(
         );
 
         let src = run_source(lo);
-        if let Some(obj) = obj_at.get(&lo) {
+        /* Issue #357 — a `<w:sym>` / `<w:ptab>` object is a leaf of its
+        run, written like a tab: inside its source run when it sits in
+        one. */
+        let object_leaf = obj_at.get(&lo).and_then(|o| object_leaf_xml(o));
+        if let Some(obj) = obj_at.get(&lo)
+            && object_leaf.is_none()
+        {
             emit_inline_object(obj, &style_at(lo), src, out, hyperlink_rel_map);
             /* Skip to the byte after the anchor's UTF-8 length — the
             object consumes the full anchor character. The cut set
             already placed a boundary at `lo + OBJECT_REPLACE_UTF8.len()`,
             so the next window picks up from there naturally. */
+        } else if bidi_ctrl_at.contains(&lo) {
+            /* Issue #357 — nothing: the wrapper ends were emitted as
+            markers at this offset. */
         } else if let Some(src) = src {
             /* Issues #199 / #106 — a leaf inside a source run: continue the
             open `<w:r>` when nothing was emitted since and it is the same
@@ -1866,12 +1932,11 @@ fn emit_styled_runs_with_objects(
                 open_run_pad = src.run.pad.as_ref().map_or(&[], |p| p.close.as_slice());
             }
             if let Some(&kind) = break_at.get(&lo) {
-                sink.push_str(match kind {
-                    BreakKind::Line => "<w:br/>",
-                    BreakKind::Page => "<w:br w:type=\"page\"/>",
-                });
-            } else if tab_at.contains(&lo) {
-                sink.push_str("<w:tab/>");
+                sink.push_str(kind.element());
+            } else if let Some(leaf) = leaf_at.get(&lo) {
+                sink.push_str(leaf);
+            } else if let Some(leaf) = &object_leaf {
+                sink.push_str(leaf);
             } else {
                 push_text_element(&para.text[lo..hi], in_del, Some(src.run), sink);
             }
@@ -1881,11 +1946,15 @@ fn emit_styled_runs_with_objects(
             U+2028 / U+000C character — emit the structural element so
             Word doesn't render the bare Unicode char as a tofu box. */
             emit_br_run(kind, out);
-        } else if tab_at.contains(&lo) {
+        } else if let Some(leaf) = leaf_at.get(&lo) {
             /* Audit gap A.M5 — emit the structural `<w:tab/>` element
             instead of a literal HT byte; the rPr applies to the tab
-            run so an inherited bold/italic style still survives. */
-            emit_tab_run(&style_at(lo), out);
+            run so an inherited bold/italic style still survives. Issue
+            #335 — the hyphen elements likewise. */
+            emit_leaf_run(&style_at(lo), leaf, out);
+        } else if let Some(leaf) = &object_leaf {
+            /* Issue #357 — `<w:sym>` / `<w:ptab>` outside a source run. */
+            emit_leaf_run(&style_at(lo), leaf, out);
         } else {
             serialize_run_kind(&para.text[lo..hi], &style_at(lo), in_del, out);
         }
@@ -2080,6 +2149,82 @@ enum PlacedKind {
     Close(usize),
 }
 
+/// One marker on its way into [`positioned_markers`]' pairing: a source
+/// marker borrowed from the paragraph's markup, or (issue #357) a
+/// `<w:dir>` / `<w:bdo>` wrapper end synthesized from a bidi control.
+struct MarkIn<'a> {
+    at: usize,
+    xml: &'a [u8],
+    role: MarkInRole<'a>,
+    comment: Option<engine::CommentAnchor>,
+}
+
+enum MarkInRole<'a> {
+    /// Issue #384 — `slot` = `(closes_after, opens_before)` among the
+    /// wrapper boundaries at the marker's offset (`(0, 0)` when stale).
+    Plain {
+        slot: (u8, u8),
+    },
+    Open {
+        id: u32,
+        close_xml: &'a [u8],
+    },
+    Close {
+        id: u32,
+    },
+}
+
+/// Issue #357 — the wrapper markers the bidi controls of `text` stand for
+/// (`engine::run_content`): each LRE / RLE / LRO / RLO opens a
+/// `<w:dir>` / `<w:bdo>` at its offset, each U+202C closes the innermost
+/// open one. Ids count down from `u32::MAX` (source content-control ids
+/// are byte offsets of a part, far below). An unmatched pop is dropped and
+/// an unclosed opener closes at the paragraph end (the pairing does it).
+fn bidi_wrapper_markers(text: &str) -> Vec<MarkIn<'static>> {
+    use engine::run_content::{BidiWrapper, POP_DIRECTIONAL};
+    let mut out = Vec::new();
+    let mut open: Vec<u32> = Vec::new();
+    let mut next_id = u32::MAX;
+    for (at, ch) in text.char_indices() {
+        if let Some(w) = BidiWrapper::of_opener(ch) {
+            let (xml, close_xml): (&'static [u8], &'static [u8]) = match w {
+                BidiWrapper::Dir { rtl: true } => (b"<w:dir w:val=\"rtl\">", b"</w:dir>"),
+                BidiWrapper::Dir { rtl: false } => (b"<w:dir w:val=\"ltr\">", b"</w:dir>"),
+                BidiWrapper::Bdo { rtl: true } => (b"<w:bdo w:val=\"rtl\">", b"</w:bdo>"),
+                BidiWrapper::Bdo { rtl: false } => (b"<w:bdo w:val=\"ltr\">", b"</w:bdo>"),
+            };
+            out.push(MarkIn {
+                at,
+                xml,
+                role: MarkInRole::Open {
+                    id: next_id,
+                    close_xml,
+                },
+                comment: None,
+            });
+            open.push(next_id);
+            next_id -= 1;
+        } else if ch == POP_DIRECTIONAL
+            && let Some(id) = open.pop()
+        {
+            let close_xml: &'static [u8] = match out.iter().find_map(|m| match m.role {
+                MarkInRole::Open { id: oid, close_xml } if oid == id => Some(close_xml),
+                _ => None,
+            }) {
+                Some(c) => c,
+                None => continue,
+            };
+            out.push(MarkIn {
+                at,
+                xml: close_xml,
+                role: MarkInRole::Close { id },
+                comment: None,
+            });
+        }
+    }
+    out
+}
+
 /// `true` when the wrapper range `w` and the content control `[s, e)`
 /// nest as the writer emits them at shared offsets (markers between the
 /// closes and the opens of the regenerated wrappers): disjoint, the
@@ -2109,10 +2254,6 @@ fn nests_with(s: usize, e: usize, (ws, we): (usize, usize)) -> bool {
 ///   range, noted as [`WriteNote::InlineWrapperWidened`].
 fn positioned_markers<'a>(para: &'a Paragraph, wrappers: &[(usize, usize)]) -> Vec<OutMarker<'a>> {
     let len = para.text.len();
-    let Some(m) = para.source_markup.as_deref() else {
-        return Vec::new();
-    };
-    let valid = m.offsets_valid(len);
     let floor = |at: u32| {
         let mut at = (at as usize).min(len);
         while !para.text.is_char_boundary(at) {
@@ -2120,24 +2261,59 @@ fn positioned_markers<'a>(para: &'a Paragraph, wrappers: &[(usize, usize)]) -> V
         }
         at
     };
-    let kept: Vec<&engine::SourceMarker> = m
-        .markers
-        .iter()
-        .filter(|mk| valid || mk.role.must_survive())
-        /* Issue #243 — a comment anchor only while the tree agrees. */
-        .filter(|mk| comment_anchors::keep_marker(para, mk))
-        /* Issue #384 — a `_Toc*` bookmark end only while the paragraph
-        still owns the bookmark. */
-        .filter(|mk| {
-            mk.toc_bookmark
-                .as_deref()
-                .is_none_or(|n| para.bookmarks.iter().any(|b| b.name == n))
-        })
-        .collect();
-    if !valid && !kept.is_empty() {
-        note(WriteNote::StaleMarkupClamped {
-            markers: kept.len() as u32,
-        });
+    let mut kept: Vec<MarkIn<'a>> = Vec::new();
+    if let Some(m) = para.source_markup.as_deref() {
+        let valid = m.offsets_valid(len);
+        kept.extend(
+            m.markers
+                .iter()
+                .filter(|mk| valid || mk.role.must_survive())
+                /* Issue #243 — a comment anchor only while the tree agrees. */
+                .filter(|mk| comment_anchors::keep_marker(para, mk))
+                /* Issue #384 — a `_Toc*` bookmark end only while the
+                paragraph still owns the bookmark. */
+                .filter(|mk| {
+                    mk.toc_bookmark
+                        .as_deref()
+                        .is_none_or(|n| para.bookmarks.iter().any(|b| b.name == n))
+                })
+                .map(|mk| MarkIn {
+                    at: floor(mk.at),
+                    xml: &mk.xml,
+                    role: match &mk.role {
+                        engine::MarkerRole::Open { id, close_xml } => {
+                            MarkInRole::Open { id: *id, close_xml }
+                        }
+                        engine::MarkerRole::Close { id } => MarkInRole::Close { id: *id },
+                        /* Issue #384 — a stale marker's slot no longer
+                        means anything: between the ends and the starts. */
+                        _ => MarkInRole::Plain {
+                            slot: if valid {
+                                (mk.closes_after, mk.opens_before)
+                            } else {
+                                (0, 0)
+                            },
+                        },
+                    },
+                    comment: mk.comment,
+                }),
+        );
+        if !valid && !kept.is_empty() {
+            note(WriteNote::StaleMarkupClamped {
+                markers: kept.len() as u32,
+            });
+        }
+    }
+    /* Issue #357 — the `<w:dir>` / `<w:bdo>` wrappers the paragraph's
+    bidi controls stand for, merged in offset order (stable: at one
+    offset the source markers go first). */
+    let bidi = bidi_wrapper_markers(&para.text);
+    if !bidi.is_empty() {
+        kept.extend(bidi);
+        kept.sort_by_key(|mk| mk.at);
+    }
+    if kept.is_empty() {
+        return Vec::new();
     }
     /* Pair openers and closers in source order. */
     let mut placed: Vec<PlacedMarker<'a>> = Vec::with_capacity(kept.len());
@@ -2146,29 +2322,29 @@ fn positioned_markers<'a>(para: &'a Paragraph, wrappers: &[(usize, usize)]) -> V
     /* Per pair: (id, [start, end)). */
     let mut pairs: Vec<(u32, usize, usize)> = Vec::new();
     for mk in kept {
-        let at = floor(mk.at);
-        match &mk.role {
-            engine::MarkerRole::Open { id, close_xml } => {
-                stack.push((*id, close_xml.as_slice(), pairs.len()));
-                pairs.push((*id, at, len));
+        let at = mk.at;
+        match mk.role {
+            MarkInRole::Open { id, close_xml } => {
+                stack.push((id, close_xml, pairs.len()));
+                pairs.push((id, at, len));
                 placed.push(PlacedMarker {
                     at,
-                    xml: &mk.xml,
+                    xml: mk.xml,
                     kind: PlacedKind::Open(pairs.len() - 1),
                     comment: None,
                     slot: (0, 0),
                 });
             }
-            engine::MarkerRole::Close { id } => {
-                if !stack.iter().any(|(sid, _, _)| sid == id) {
+            MarkInRole::Close { id } => {
+                if !stack.iter().any(|(sid, _, _)| *sid == id) {
                     continue;
                 }
                 while let Some((sid, close_xml, pi)) = stack.pop() {
                     pairs[pi].2 = at;
-                    let own = sid == *id;
+                    let own = sid == id;
                     placed.push(PlacedMarker {
                         at,
-                        xml: if own { &mk.xml } else { close_xml },
+                        xml: if own { mk.xml } else { close_xml },
                         kind: PlacedKind::Close(pi),
                         comment: None,
                         slot: (0, 0),
@@ -2178,18 +2354,12 @@ fn positioned_markers<'a>(para: &'a Paragraph, wrappers: &[(usize, usize)]) -> V
                     }
                 }
             }
-            /* Issue #384 — a stale marker's slot no longer means anything:
-            between the ends and the starts. */
-            _ => placed.push(PlacedMarker {
+            MarkInRole::Plain { slot } => placed.push(PlacedMarker {
                 at,
-                xml: &mk.xml,
+                xml: mk.xml,
                 kind: PlacedKind::Plain,
                 comment: mk.comment,
-                slot: if valid {
-                    (mk.closes_after, mk.opens_before)
-                } else {
-                    (0, 0)
-                },
+                slot,
             }),
         }
     }
@@ -2431,13 +2601,25 @@ fn emit_field_epilogue(out: &mut String) {
 enum BreakKind {
     Line,
     Page,
+    /// Issue #357 — `<w:cr/>` (U+000D): a line break written as the
+    /// element it was read from.
+    CarriageReturn,
+}
+
+impl BreakKind {
+    fn element(self) -> &'static str {
+        match self {
+            BreakKind::Line => "<w:br/>",
+            BreakKind::Page => "<w:br w:type=\"page\"/>",
+            BreakKind::CarriageReturn => "<w:cr/>",
+        }
+    }
 }
 
 fn emit_br_run(kind: BreakKind, out: &mut String) {
-    match kind {
-        BreakKind::Line => out.push_str("<w:r><w:br/></w:r>"),
-        BreakKind::Page => out.push_str("<w:r><w:br w:type=\"page\"/></w:r>"),
-    }
+    out.push_str("<w:r>");
+    out.push_str(kind.element());
+    out.push_str("</w:r>");
 }
 
 /// Audit gap A.M5 — `<w:tab/>` round-trip. Emitted as its own `<w:r>`
@@ -2446,10 +2628,23 @@ fn emit_br_run(kind: BreakKind, out: &mut String) {
 /// when the tab sits inside a `<w:del>` block — the tab element itself
 /// has no body so it does not switch tag names, only the enclosing
 /// run picks up `<w:delText>` semantics for any neighbouring text.
-fn emit_tab_run(style: &SpanStyle, out: &mut String) {
+fn emit_leaf_run(style: &SpanStyle, leaf: &str, out: &mut String) {
     out.push_str("<w:r>");
     emit_rpr(style, out);
-    out.push_str("<w:tab/></w:r>");
+    out.push_str(leaf);
+    out.push_str("</w:r>");
+}
+
+/// The empty run-content element a text character stands for (audit gap
+/// A.M5 — `<w:tab/>`; issue #335 — `<w:softHyphen/>` /
+/// `<w:noBreakHyphen/>`, see [`engine::run_content`]). `None` for text.
+fn run_leaf_element(ch: char) -> Option<&'static str> {
+    match ch {
+        '\u{0009}' => Some("<w:tab/>"),
+        engine::run_content::SOFT_HYPHEN => Some("<w:softHyphen/>"),
+        engine::run_content::NON_BREAKING_HYPHEN => Some("<w:noBreakHyphen/>"),
+        _ => None,
+    }
 }
 
 /// UTF-8 encoding of U+FFFC OBJECT REPLACEMENT CHARACTER (the byte
@@ -2576,7 +2771,48 @@ fn emit_inline_object(
             out.push_str(elem);
             out.push_str("/></w:r>");
         }
+        /* Issue #357 — run-content leaves (the window walk normally
+        writes them inside their source run, see `object_leaf_xml`). */
+        InlineKind::Symbol { .. } | InlineKind::PositionalTab { .. } => {
+            if let Some(leaf) = object_leaf_xml(obj) {
+                open_source_run(style, src, out);
+                out.push_str(&leaf);
+                out.push_str("</w:r>");
+            }
+        }
     }
+}
+
+/// Issue #357 — the run-content element an inline object that is a mere
+/// leaf of its run stands for: `<w:sym w:font w:char/>` (the source
+/// attribute values verbatim) or `<w:ptab w:relativeTo w:alignment
+/// w:leader/>` (Word's attribute order). `None` for every object that
+/// owns a run of its own (pictures, text boxes, note marks).
+fn object_leaf_xml(obj: &InlineObject) -> Option<String> {
+    let mut out = String::new();
+    match &obj.kind {
+        InlineKind::Symbol { font, char } => {
+            out.push_str("<w:sym w:font=\"");
+            push_escaped_attr(font, &mut out);
+            out.push_str("\" w:char=\"");
+            push_escaped_attr(char, &mut out);
+            out.push_str("\"/>");
+        }
+        InlineKind::PositionalTab {
+            alignment,
+            relative_to,
+            leader,
+        } => {
+            out.push_str(&format!(
+                "<w:ptab w:relativeTo=\"{}\" w:alignment=\"{}\" w:leader=\"{}\"/>",
+                relative_to.as_str(),
+                alignment.as_str(),
+                leader.as_str()
+            ));
+        }
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// `<w:r …>` + `<w:rPr>` of a note reference / self-mark run: the source
@@ -8367,6 +8603,7 @@ mod tests {
             grab_bag: None,
             outline_level: None,
             widow_control: None,
+            suppress_auto_hyphens: None,
         };
         let para = Paragraph {
             text: "hello world".into(),
@@ -11529,3 +11766,8 @@ mod ppr_splice_tests;
 #[cfg(test)]
 #[path = "writer_styles_patch_tests.rs"]
 mod styles_patch_tests;
+
+/// Issues #335 / #357 — run-content elements with no text of their own.
+#[cfg(test)]
+#[path = "writer_run_content_tests.rs"]
+mod run_content_tests;

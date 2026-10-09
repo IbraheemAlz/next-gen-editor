@@ -502,6 +502,15 @@ fn emit_inline_object(obj: &InlineObject, media: &Media<'_>, out: &mut String) {
             emit_blocks(&story.body, media, out);
             out.push_str("</aside>");
         }
+        /* Issue #357 — a symbol exports as its Unicode equivalent. */
+        InlineKind::Symbol { font, char } => {
+            escape_text_into(
+                &engine::run_content::symbol_char(font, char).to_string(),
+                out,
+            );
+        }
+        /* Issue #357 — a positional tab exports as a tab character. */
+        InlineKind::PositionalTab { .. } => out.push('\t'),
     }
 }
 
