@@ -17,3 +17,4 @@ pub mod offcrypto;
 pub mod part_names;
 pub mod relationships;
 pub mod splice;
+pub(crate) mod well_formed;

@@ -660,6 +660,29 @@ mod tests {
         assert!(words.contains(b"<w:fldChar w:fldCharType=\"begin\"/>".as_slice()));
     }
 
+    /// Issues #439 / #434 — every committed `docx_roundtrip` reproducer
+    /// (`corpus/docx_roundtrip/repro_*`, raw fuzz inputs the generator
+    /// turns into malformed packages) holds the read => write => read
+    /// invariant. The generator-independent spellings of the same shapes
+    /// are `format_docx`'s `reader_well_formed_tests`.
+    #[test]
+    fn committed_docx_roundtrip_reproducers_hold() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_roundtrip");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).expect("corpus/docx_roundtrip") {
+            let path = entry.expect("entry").path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("repro_"))
+            {
+                run_docx_roundtrip(&std::fs::read(&path).expect("seed"));
+                seen += 1;
+            }
+        }
+        assert!(seen >= 1, "the #439 reproducer is committed");
+    }
+
     /// Issue #422 — the committed reproducer scenario runs to completion
     /// (one solid stroke per patterned underline, not millions of fills).
     #[test]

@@ -14,6 +14,7 @@ use crate::opc::limits::{
     PackageLimits, check_xml_part, is_walked_xml_part, read_entry_bounded, read_package_entries,
 };
 use crate::opc::part_names::{PartNames, rels_entry_name, target_candidates};
+use crate::opc::well_formed::repair_part;
 use crate::parts::comments::{parse_comments_extended_xml, parse_comments_xml};
 use crate::parts::document::parse_document_xml_with_warnings;
 use crate::parts::endnotes::parse_endnotes_xml;
@@ -391,11 +392,15 @@ fn read_docx_scoped(
     let (_, xml) = all_entries.remove(main_at);
     let mut other_entries = all_entries;
     other_entries.shrink_to_fit();
+    /* Issues #439 / #434 — a part that is not well-formed XML is repaired
+    up front (regenerate-only) before anything captures its bytes. */
+    let xml = repair_part(&part_names.main, xml, limits, &mut warnings)?;
     /* Issue #325 — validate the root's namespace bindings; a non-canonical
     spelling is normalised (regenerate-only) instead of reading empty. */
     let xml = canonical_main_part(&part_names.main, xml, &mut warnings);
-    /* Issue #394 — the same for every WordprocessingML sibling the reader
-    walks, before any of them is parsed. */
+    /* Issues #394 / #434 — the same for every WordprocessingML sibling the
+    reader walks, before any of them is parsed. */
+    repair_sibling_parts(&mut other_entries, &part_names, limits, &mut warnings)?;
     canonical_sibling_parts(&mut other_entries, &part_names, &mut warnings);
 
     /* Phase 3 — `word/styles.xml` rides the pass-through but feeds the
@@ -814,6 +819,22 @@ fn canonical_sibling_parts(
 ) {
     use crate::schema::family::RootBinding;
     use crate::schema::ns_normalize::inspect_root;
+    for part in wordprocessing_siblings(entries, names) {
+        let Some(slot) = entries.iter_mut().find(|(n, _)| *n == part) else {
+            continue;
+        };
+        if let RootBinding::NonCanonical { detail } = inspect_root(&slot.1) {
+            let xml = std::mem::take(&mut slot.1);
+            slot.1 = normalise_part(&part, xml, detail, warnings);
+        }
+    }
+}
+
+/// Issue #394 — the WordprocessingML siblings the reader walks (and
+/// normalises): `styles.xml`, `numbering.xml`, `settings.xml`, the note
+/// parts, `comments.xml` and every header / footer the main part's
+/// relationships name, deduplicated, in that order.
+fn wordprocessing_siblings(entries: &[(String, Vec<u8>)], names: &PartNames) -> Vec<String> {
     let mut parts: Vec<String> = [
         &names.styles,
         &names.numbering,
@@ -827,18 +848,41 @@ fn canonical_sibling_parts(
     .collect();
     parts.extend(header_footer_parts(entries, names));
     let mut seen = std::collections::HashSet::new();
-    for part in parts {
-        if !seen.insert(part.clone()) {
-            continue;
+    parts.retain(|p| seen.insert(p.clone()));
+    parts
+}
+
+/// Issues #439 / #434 — [`repair_part`] for every WordprocessingML sibling
+/// the reader walks ([`wordprocessing_siblings`], plus the comment side
+/// parts `parts::comments` parses and patches in place). A repaired part
+/// REPLACES its `entries` row — like a #394 normalised part, every
+/// consumer (the typed parsers, the verbatim passthrough, in-place
+/// patches, the tree's source package) then sees the one well-formed
+/// spelling, and the part is regenerate-only.
+fn repair_sibling_parts(
+    entries: &mut [(String, Vec<u8>)],
+    names: &PartNames,
+    limits: &PackageLimits,
+    warnings: &mut Vec<DocxWarning>,
+) -> Result<(), DocxError> {
+    let mut parts = wordprocessing_siblings(entries, names);
+    for side in [
+        &names.comments_extended,
+        &names.comments_ids,
+        &names.comments_extensible,
+    ] {
+        if !parts.contains(side) {
+            parts.push(side.clone());
         }
+    }
+    for part in parts {
         let Some(slot) = entries.iter_mut().find(|(n, _)| *n == part) else {
             continue;
         };
-        if let RootBinding::NonCanonical { detail } = inspect_root(&slot.1) {
-            let xml = std::mem::take(&mut slot.1);
-            slot.1 = normalise_part(&part, xml, detail, warnings);
-        }
+        let xml = std::mem::take(&mut slot.1);
+        slot.1 = repair_part(&part, xml, limits, warnings)?;
     }
+    Ok(())
 }
 
 /// Issue #394 — the archive entries of every header / footer part the

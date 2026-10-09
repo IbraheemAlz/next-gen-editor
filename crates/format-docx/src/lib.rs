@@ -24,6 +24,8 @@ pub mod parts;
 pub mod reader;
 #[cfg(test)]
 mod reader_hardening_tests;
+#[cfg(test)]
+mod reader_well_formed_tests;
 pub mod schema;
 pub mod style_resolver;
 #[doc(hidden)]
