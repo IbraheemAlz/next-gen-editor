@@ -461,7 +461,12 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   `TextAttrsPatch.font_slot` = `Latin` / `ComplexScript` (the `cs_only`
   flag) narrows it.
 - `SpanStyle::char_style` keeps the run's `<w:rStyle>` id next to the
-  folded style properties; the writer emits it first.
+  folded style properties; the writer emits it first. A source
+  `<w:rPrChange>`'s recorded `<w:rStyle>` rides `Revision::prev_attrs`
+  the same way, so rejecting the change writes it back (#295 × #104).
+- The paragraph mark (`Paragraph::mark_style`, #293) goes through the
+  same `apply_rpr`, so its twins (`<w:bCs>`, `<w:szCs>`, `w:cs`) are
+  modeled there too; `<w:rStyle>` stays verbatim on a mark.
 - On/off properties write an explicit OFF (`<w:b w:val="0"/>`).
 - A regenerated `<w:rPr>` adopts its source by MEANING
   (`schema::source_markup::adopt_source_rpr_children`): a child whose
