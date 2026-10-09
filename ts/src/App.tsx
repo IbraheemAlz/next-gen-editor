@@ -20,6 +20,7 @@ import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
 import { createEngineStore, SCREEN_DPI_SCALE, type EngineStore } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
+import { attachUnloadGuard } from './state/unload-guard';
 import { installDevHook, resolveTelemetryEndpoint } from './dev-hooks';
 import { attachDragDrop } from './input/dnd';
 import { createFontRegistry, createTelemetryConfig, type FontRegistry } from '@nge/core';
@@ -234,6 +235,11 @@ export function App() {
 
     /* §10 D4.10 — drop a .docx anywhere on the page to load it. */
     onMount(() => onCleanup(attachDragDrop(client)));
+
+    /* Issue #388 - a reload / tab close with unsaved edits raises the
+       browser's prompt (off via VITE_NGE_UNLOAD_GUARD=0 for hosts that
+       autosave); the next boot offers the session back regardless. */
+    onMount(() => onCleanup(attachUnloadGuard(client)));
 
     /* Engine scale follows monitor / browser-zoom DPR changes. A
        `matchMedia('(resolution: …dppx)')` query fires exactly once when

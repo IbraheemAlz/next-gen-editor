@@ -31,6 +31,7 @@ import type {
     EngineStats,
     Event,
     LayoutDegraded,
+    PreviousSessionInfo,
     LogicalRange,
     RecoveryReport,
     Rect,
@@ -200,6 +201,13 @@ export interface EditorState {
      * `zoom`.
      */
     checkpointFailing: Accessor<boolean>;
+    /**
+     * Issue #388 - the previous page generation's unsaved session, set
+     * aside at boot and waiting for Recover / Discard
+     * (`engine.recoverPreviousSession` / `discardPreviousSession`);
+     * `undefined` when there is none. Shared like `zoom`.
+     */
+    previousSession: Accessor<PreviousSessionInfo | undefined>;
 }
 
 /**
@@ -217,6 +225,7 @@ interface ViewState {
     rendererDowngrade: Accessor<RendererDowngrade | undefined>;
     lastRecovery: Accessor<RecoveryReport | undefined>;
     checkpointFailing: Accessor<boolean>;
+    previousSession: Accessor<PreviousSessionInfo | undefined>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -251,6 +260,11 @@ function viewStateFor(engine: EngineHandle): ViewState {
             engine.checkpointStatus?.failing === true,
         );
         engine.onCheckpointStatus?.((s) => setCheckpointFailing(s.failing));
+        /* Issue #388 - the unsaved previous session, seeded then fed. */
+        const [previousSession, setPreviousSession] = createSignal<
+            PreviousSessionInfo | undefined
+        >(engine.previousSession);
+        engine.onPreviousSession?.((p) => setPreviousSession(p));
         engine.subscribe((evt: Event) => {
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
@@ -277,7 +291,14 @@ function viewStateFor(engine: EngineHandle): ViewState {
                 setRendererDowngrade(evt.renderer_downgrade);
             }
         });
-        return { zoom, deviceScale, rendererDowngrade, lastRecovery, checkpointFailing };
+        return {
+            zoom,
+            deviceScale,
+            rendererDowngrade,
+            lastRecovery,
+            checkpointFailing,
+            previousSession,
+        };
     });
     viewStates.set(engine, state);
     return state;
@@ -427,5 +448,6 @@ export function createEditorState(): EditorState {
         rendererDowngrade: view.rendererDowngrade,
         lastRecovery: view.lastRecovery,
         checkpointFailing: view.checkpointFailing,
+        previousSession: view.previousSession,
     };
 }

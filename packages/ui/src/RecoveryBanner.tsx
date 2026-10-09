@@ -20,7 +20,9 @@ import { createEffect, createMemo, createSignal, For, Show, type Component } fro
 import {
     checkpointNotices,
     createEditorState,
+    previousSessionNotice,
     recoveryNotices,
+    useEngine,
     type RecoveryNoticeOptions,
     type RecoveryReport,
 } from '@nge/core';
@@ -34,6 +36,26 @@ export interface RecoveryBannerProps {
 
 export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
     const state = createEditorState();
+    const engine = useEngine();
+    /* Issue #388 - "Recover previous document?" is dismissed per offer
+       (the session stays archived: the next boot offers it again). */
+    const [previousDismissed, setPreviousDismissed] = createSignal(false);
+    const [busy, setBusy] = createSignal(false);
+    createEffect(() => {
+        if (state.previousSession() === undefined) setPreviousDismissed(false);
+    });
+    const decide = async (action: 'recover' | 'discard'): Promise<void> => {
+        if (busy()) return;
+        setBusy(true);
+        try {
+            if (action === 'recover') await engine.recoverPreviousSession?.();
+            else await engine.discardPreviousSession?.();
+        } catch (e: unknown) {
+            console.error(`[recovery] previous session ${action} failed`, e);
+        } finally {
+            setBusy(false);
+        }
+    };
     /* The report the user dismissed; a newer report shows again. */
     const [dismissed, setDismissed] = createSignal<RecoveryReport | undefined>(undefined);
     /* Issue #333 - the checkpoint warning is dismissed per failure run:
@@ -50,7 +72,10 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
                 ? []
                 : recoveryNotices(state.lastRecovery(), options);
         const checkpoint = checkpointDismissed() ? [] : checkpointNotices(state.checkpointFailing());
-        return [...recovery, ...checkpoint];
+        const previous = previousDismissed()
+            ? []
+            : previousSessionNotice(state.previousSession(), options);
+        return [...previous, ...recovery, ...checkpoint];
     });
     const visible = createMemo(() => notices().length > 0);
 
@@ -78,6 +103,26 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
                                 </strong>
                                 <p class="nge-recovery-banner__detail">{notice.detail}</p>
                                 <p class="nge-recovery-banner__action">{notice.action}</p>
+                                <Show when={notice.kind === 'previous-session'}>
+                                    <div class="nge-recovery-banner__choices">
+                                        <button
+                                            class="nge-btn nge-recovery-banner__recover"
+                                            type="button"
+                                            disabled={busy()}
+                                            onClick={() => void decide('recover')}
+                                        >
+                                            Recover
+                                        </button>
+                                        <button
+                                            class="nge-btn nge-recovery-banner__discard"
+                                            type="button"
+                                            disabled={busy()}
+                                            onClick={() => void decide('discard')}
+                                        >
+                                            Discard
+                                        </button>
+                                    </div>
+                                </Show>
                             </section>
                         )}
                     </For>
@@ -89,6 +134,7 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
                     onClick={() => {
                         setDismissed(() => state.lastRecovery());
                         setCheckpointDismissed(true);
+                        setPreviousDismissed(true);
                     }}
                 >
                     Dismiss

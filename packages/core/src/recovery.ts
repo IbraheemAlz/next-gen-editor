@@ -13,14 +13,15 @@
  * Headless and pure: `@nge/ui`'s `RecoveryBanner` renders the list, and a
  * host with its own chrome can render it however it likes.
  */
-import type { RecoveryReport } from './types';
+import type { PreviousSessionInfo, RecoveryReport } from './types';
 
 export type RecoveryNoticeKind =
     | 'log-truncated'
     | 'tail-dropped'
     | 'package-lost'
     | 'renderer-downgrade'
-    | 'checkpoint-failing';
+    | 'checkpoint-failing'
+    | 'previous-session';
 
 export interface RecoveryNotice {
     kind: RecoveryNoticeKind;
@@ -129,6 +130,32 @@ export function checkpointNotices(failing: boolean): RecoveryNotice[] {
                 'storage may be full or blocked). If the editor crashes now, recent edits ' +
                 'may be lost.',
             action: 'Save your work now.',
+        },
+    ];
+}
+
+/**
+ * Issue #388 - the offer to bring back a previous page generation's
+ * unsaved session (a plain reload starts a new session, which would
+ * otherwise have dropped it). Non-destructive until the user decides:
+ * Recover swaps it in, Discard throws it away; ignoring the banner keeps
+ * it for the next boot.
+ */
+export function previousSessionNotice(
+    info: PreviousSessionInfo | undefined,
+    options: RecoveryNoticeOptions = {},
+): RecoveryNotice[] {
+    if (!info) return [];
+    const formatTime = options.formatTime ?? defaultTime;
+    const when = formatTime(info.lastEditAt ?? info.archivedAt);
+    return [
+        {
+            kind: 'previous-session',
+            title: 'Recover previous document?',
+            detail:
+                `The page was closed or reloaded with unsaved changes (last edit around ${when}). ` +
+                'They have been kept aside; this new session starts from a blank document.',
+            action: 'Recover them to carry on where you left off, or discard them.',
         },
     ];
 }

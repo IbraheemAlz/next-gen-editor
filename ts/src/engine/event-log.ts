@@ -47,8 +47,10 @@
 import type { Command } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 const DB_NAME = 'engine-log';
-/* v2 (issue #212): the `packages` store + the snapshots `packageHash` index. */
-const DB_VERSION = 2;
+/* v2 (issue #212): the `packages` store + the snapshots `packageHash` index.
+   v3 (issue #388): the `archive` store (the previous session's log, set
+   aside at boot until the user recovers or discards it). */
+const DB_VERSION = 3;
 /** Snapshots retained by `persistSnapshot`; older ones are pruned (§10.2). */
 const SNAPSHOTS_KEPT = 3;
 
@@ -200,6 +202,9 @@ function openDb(): Promise<IDBDatabase> {
             if (!db.objectStoreNames.contains('packages')) {
                 db.createObjectStore('packages', { keyPath: 'hash' });
             }
+            if (!db.objectStoreNames.contains(ARCHIVE_STORE)) {
+                db.createObjectStore(ARCHIVE_STORE, { keyPath: 'id' });
+            }
         };
         open.onsuccess = () => {
             const db = open.result;
@@ -243,6 +248,187 @@ export async function openEventLog(documentId: string): Promise<void> {
     tx.objectStore('meta').put({ id: 'document', documentId, openedAt: Date.now() });
     tx.objectStore('meta').put({ id: PRUNED_ID, through: 0 } satisfies PrunedRow);
     tx.objectStore('meta').delete(PINNED_ID);
+    /* Issue #388 - a freshly opened log describes a document that equals
+       what is on screen (nothing to lose yet). */
+    tx.objectStore('meta').put({ id: CLEAN_ID, clean: true, at: Date.now() } satisfies CleanRow);
+    await txDone(tx);
+}
+
+/* ===================================================================
+   Issue #388 - the `clean` marker and the archived previous session.
+
+   A plain reload starts a new session, and `openEventLog` clears the log
+   - so a user who edited, never saved and reloaded lost the edits. The
+   `meta` row `clean` records whether the document in the log equals
+   what the user last saved (or opened / seeded): the worker flips it to
+   `false` on the first document edit and back to `true` on a
+   successful `SaveDocx`, an opened / closed / seeded document and an
+   empty log. At boot, a log whose marker says "not clean" is not simply
+   cleared: it is copied into ONE `archive` row first (`archiveActiveLog`)
+   and offered back to the user (`restoreArchive` / `discardArchive`).
+   Rows from before this marker have none, which reads as "unknown" =
+   nothing to offer.
+   =================================================================== */
+
+interface CleanRow {
+    id: 'clean';
+    clean: boolean;
+    at: number;
+}
+const CLEAN_ID = 'clean';
+const ARCHIVE_STORE = 'archive';
+const ARCHIVE_ID = 'previous';
+
+/** The `meta` rows an archived session carries back with it. */
+const ARCHIVED_META_IDS = ['document', PRUNED_ID, PINNED_ID, CLEAN_ID];
+
+interface ArchiveRow {
+    id: typeof ARCHIVE_ID;
+    /** When the session was set aside (ms since the epoch). */
+    archivedAt: number;
+    /** When the archived log's last document edit was logged. */
+    lastEditAt: number | undefined;
+    commands: CommandRow[];
+    snapshots: SnapshotRow[];
+    packages: PackageRow[];
+    meta: Array<Record<string, unknown>>;
+}
+
+/** What `inspectActiveLog` reports about the log a previous page
+ *  generation left behind. */
+export interface ActiveLogStatus {
+    /** `false` = the marker says the log holds unsaved edits; `undefined`
+     *  = no marker (a log from before #388, or no log at all). */
+    clean: boolean | undefined;
+    /** The log holds at least one command row or snapshot. */
+    hasContent: boolean;
+    /** When the marker last changed. */
+    at: number | undefined;
+}
+
+/** The previous session held back for the user's decision. */
+export interface ArchiveInfo {
+    archivedAt: number;
+    lastEditAt: number | undefined;
+    commandCount: number;
+}
+
+/** Persist the clean marker (the worker's off-critical-path write). */
+export async function writeCleanMarker(clean: boolean): Promise<void> {
+    const db = await getDb();
+    const tx = db.transaction('meta', 'readwrite');
+    tx.objectStore('meta').put({ id: CLEAN_ID, clean, at: Date.now() } satisfies CleanRow);
+    await txDone(tx);
+}
+
+/** The persisted clean marker (`undefined` = none). */
+export async function loadCleanMarker(): Promise<boolean | undefined> {
+    const db = await getDb();
+    const tx = db.transaction('meta', 'readonly');
+    const req = tx.objectStore('meta').get(CLEAN_ID);
+    await txDone(tx);
+    const row = req.result as Partial<CleanRow> | undefined;
+    return typeof row?.clean === 'boolean' ? row.clean : undefined;
+}
+
+/** Look at the active log WITHOUT touching it (boot, before `INIT`). */
+export async function inspectActiveLog(): Promise<ActiveLogStatus> {
+    const db = await getDb();
+    const tx = db.transaction(['commands', 'snapshots', 'meta'], 'readonly');
+    const cmds = tx.objectStore('commands').count();
+    const snaps = tx.objectStore('snapshots').count();
+    const marker = tx.objectStore('meta').get(CLEAN_ID);
+    await txDone(tx);
+    const row = marker.result as Partial<CleanRow> | undefined;
+    return {
+        clean: typeof row?.clean === 'boolean' ? row.clean : undefined,
+        hasContent: (cmds.result as number) > 0 || (snaps.result as number) > 0,
+        at: typeof row?.at === 'number' ? row.at : undefined,
+    };
+}
+
+/** Copy the active log into the single `archive` row (replacing an older
+ *  one - the newest unsaved session wins). Resolves once committed, so
+ *  the caller may then let `INIT` clear the active stores. */
+export async function archiveActiveLog(): Promise<void> {
+    const db = await getDb();
+    const read = db.transaction(['commands', 'snapshots', 'packages', 'meta'], 'readonly');
+    const cmdReq = read.objectStore('commands').getAll();
+    const snapReq = read.objectStore('snapshots').getAll();
+    const pkgReq = read.objectStore('packages').getAll();
+    const metaReqs = ARCHIVED_META_IDS.map((id) => read.objectStore('meta').get(id));
+    await txDone(read);
+    const commands = cmdReq.result as CommandRow[];
+    const row: ArchiveRow = {
+        id: ARCHIVE_ID,
+        archivedAt: Date.now(),
+        lastEditAt: commands.at(-1)?.at,
+        commands,
+        snapshots: snapReq.result as SnapshotRow[],
+        packages: pkgReq.result as PackageRow[],
+        meta: metaReqs
+            .map((r) => r.result as Record<string, unknown> | undefined)
+            .filter((r): r is Record<string, unknown> => r !== undefined),
+    };
+    const write = db.transaction(ARCHIVE_STORE, 'readwrite');
+    write.objectStore(ARCHIVE_STORE).put(row);
+    await txDone(write);
+}
+
+/** The archived previous session, if one is waiting for a decision. */
+export async function loadArchiveInfo(): Promise<ArchiveInfo | undefined> {
+    const db = await getDb();
+    const tx = db.transaction(ARCHIVE_STORE, 'readonly');
+    const req = tx.objectStore(ARCHIVE_STORE).get(ARCHIVE_ID);
+    await txDone(tx);
+    const row = req.result as ArchiveRow | undefined;
+    if (!row) return undefined;
+    return {
+        archivedAt: row.archivedAt,
+        lastEditAt: row.lastEditAt,
+        commandCount: row.commands.length,
+    };
+}
+
+/** Make the archived session the active log (one transaction: the active
+ *  stores are replaced and the archive is removed together). Resolves
+ *  `false` when there is no archive. */
+export async function restoreArchive(): Promise<boolean> {
+    const db = await getDb();
+    const tx = db.transaction(
+        ['commands', 'snapshots', 'meta', 'packages', ARCHIVE_STORE],
+        'readwrite',
+    );
+    const archive = tx.objectStore(ARCHIVE_STORE);
+    const req = archive.get(ARCHIVE_ID);
+    let restored = false;
+    req.onsuccess = () => {
+        const row = req.result as ArchiveRow | undefined;
+        if (!row) return;
+        restored = true;
+        tx.objectStore('commands').clear();
+        tx.objectStore('snapshots').clear();
+        tx.objectStore('packages').clear();
+        const meta = tx.objectStore('meta');
+        for (const id of ARCHIVED_META_IDS) meta.delete(id);
+        for (const c of row.commands) tx.objectStore('commands').put(c);
+        for (const s of row.snapshots) tx.objectStore('snapshots').put(s);
+        for (const p of row.packages) tx.objectStore('packages').put(p);
+        for (const m of row.meta) meta.put(m);
+        /* A session restored from the archive is, by construction, one
+           that had unsaved edits. */
+        meta.put({ id: CLEAN_ID, clean: false, at: Date.now() } satisfies CleanRow);
+        archive.delete(ARCHIVE_ID);
+    };
+    await txDone(tx);
+    return restored;
+}
+
+/** Throw the archived session away (the user chose Discard). */
+export async function discardArchive(): Promise<void> {
+    const db = await getDb();
+    const tx = db.transaction(ARCHIVE_STORE, 'readwrite');
+    tx.objectStore(ARCHIVE_STORE).delete(ARCHIVE_ID);
     await txDone(tx);
 }
 

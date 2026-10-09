@@ -20,13 +20,21 @@ import type {
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { commandMeta } from '@nge/core/command-meta';
 import {
+    archiveActiveLog,
     clearRendererStreak,
+    discardArchive,
+    inspectActiveLog,
+    loadArchiveInfo,
+    loadCleanMarker,
     loadRendererStreak,
     loadRecoveryLog,
+    restoreArchive,
     saveRendererStreak,
+    type ArchiveInfo,
     type RecoveryLog,
     type RendererStreak,
 } from './event-log';
+import { nextCleanState } from './clean-state';
 
 type WorkerReply = {
     ok: boolean;
@@ -190,7 +198,17 @@ export interface RecoveryInfo {
 /** Issue #270 — see `RecoveryInfo.cause`. Issue #330 — `engine-reload`
  *  is the crash overlay's "Reload engine" (an in-place restart from the
  *  log) and `page-reload` a boot that honoured a carry-over. */
-export type RecoveryCause = 'trap' | 'renderer-retry' | 'engine-reload' | 'page-reload';
+export type RecoveryCause =
+    | 'trap'
+    | 'renderer-retry'
+    | 'engine-reload'
+    | 'page-reload'
+    | 'session-restore';
+
+/** Issue #388 - a previous page generation's session that ended with
+ *  unsaved edits, set aside at boot and waiting for the user to recover
+ *  or discard it. */
+export type PreviousSession = ArchiveInfo;
 
 /** Issue #330 — `sessionStorage` key of the one-shot "carry the document
  *  across this reload" token (see `EngineClient.prepareCarryOver`). */
@@ -362,6 +380,16 @@ export class EngineClient {
     private checkpointListeners = new Set<(s: CheckpointStatus) => void>();
     private checkpointFailureListeners = new Set<(failures: number) => void>();
     private checkpointFailureTotal = 0;
+    /** Issue #388 - whether the document in the engine equals what the
+     *  user last saved (or opened / seeded); folded from every dispatched
+     *  command and its reply (`nextCleanState`). */
+    private clean = true;
+    /** Issue #388 - a reload that carries the document was prepared: the
+     *  document is not at risk, so the unload guard stays quiet. */
+    private carryOverPrepared = false;
+    /** Issue #388 - the previous session waiting for a decision. */
+    private previous: PreviousSession | undefined;
+    private previousListeners = new Set<(p: PreviousSession | undefined) => void>();
     /** Issue #330 — set from the moment the shell is asked to remount a
      *  canvas and call `recover()` until that recovery settles. Lets
      *  "Reload engine" join a recovery already under way instead of
@@ -493,12 +521,18 @@ export class EngineClient {
                 log &&
                 (log.commands.length > 0 || log.candidates.some((c) => c.snapshot.length > 0))
             ) {
+                /* Issue #388 - the carried log keeps its own marker. */
+                this.clean = (await loadCleanMarker().catch(() => undefined)) !== false;
                 this.worker.terminate();
                 this.pendingCause = 'page-reload';
                 await this.recover(canvas);
                 return;
             }
         }
+        /* Issue #388 - a plain reload: `INIT` clears the event log, so a
+           previous generation's UNSAVED session is set aside first and
+           offered back instead of being silently lost. */
+        await this.stashPreviousSession();
         const r = await this.send(
             {
                 type: 'INIT',
@@ -515,6 +549,91 @@ export class EngineClient {
         this.bootProbed = r.probed !== false;
         this.noteGenerationStart();
         this.armStableTimer();
+    }
+
+    /** Issue #388 - copy the previous generation's log into the archive
+     *  when it holds unsaved edits (clean marker `false`), then publish
+     *  whatever the archive holds (it may predate this boot: an undecided
+     *  session survives further reloads). A storage failure must not
+     *  block the boot - it degrades to the pre-#388 behaviour. */
+    private async stashPreviousSession(): Promise<void> {
+        try {
+            const status = await inspectActiveLog();
+            if (status.clean === false && status.hasContent) await archiveActiveLog();
+            this.setPrevious(await loadArchiveInfo());
+        } catch (e: unknown) {
+            console.warn('[recovery] previous session could not be set aside', e);
+        }
+    }
+
+    private setPrevious(next: PreviousSession | undefined): void {
+        this.previous = next;
+        for (const fn of this.previousListeners) fn(next);
+    }
+
+    /** Issue #388 - the previous session awaiting Recover / Discard. */
+    get previousSession(): PreviousSession | undefined {
+        return this.previous;
+    }
+
+    /** Issue #388 - observe `previousSession` changes. */
+    onPreviousSession(fn: (p: PreviousSession | undefined) => void): () => void {
+        this.previousListeners.add(fn);
+        return () => {
+            this.previousListeners.delete(fn);
+        };
+    }
+
+    /** Issue #388 - whether closing the page now would lose edits: the
+     *  document differs from the last save and no carry-over is prepared. */
+    get hasUnsavedChanges(): boolean {
+        return !this.clean && !this.carryOverPrepared;
+    }
+
+    /**
+     * Issue #388 - the banner's "Recover": replace the live (fresh)
+     * session with the archived one. The live worker is retired (its
+     * log head flushed), the archive becomes the active event log in one
+     * transaction, and the engine respawns through the normal recovery
+     * path (`cause = 'session-restore'`). Resolves once the recovery
+     * settles. A failed restore leaves the archive in place.
+     */
+    async recoverPreviousSession(): Promise<void> {
+        if (!this.previous) return;
+        if (this.recoveryPending) return this.recoveryPending.promise;
+        if (this.recovering || this.retiring) return;
+        this.retiring = true;
+        const generation = this.generations;
+        let retired: WorkerReply;
+        try {
+            retired = await this.retireWorker();
+        } finally {
+            this.retiring = false;
+        }
+        if (this.generations !== generation || retired.trap || this.recovering) return;
+        const restored = await restoreArchive().catch((e: unknown) => {
+            console.error('[recovery] the previous session could not be restored', e);
+            return false;
+        });
+        if (!restored) {
+            /* Nothing was swapped: bring the live session back as it was. */
+            this.markRecoveryPending();
+            const back = this.recoveryPending!.promise;
+            this.respawnAfterRetire('engine-reload');
+            return back;
+        }
+        this.setPrevious(undefined);
+        this.clean = false;
+        this.markRecoveryPending();
+        const done = this.recoveryPending!.promise;
+        this.respawnAfterRetire('session-restore');
+        return done;
+    }
+
+    /** Issue #388 - the banner's "Discard": drop the archived session. */
+    async discardPreviousSession(): Promise<void> {
+        await discardArchive();
+        this.setPrevious(undefined);
     }
 
     /** Issue #240 — whether the current worker generation probed the GPU
@@ -668,6 +787,7 @@ export class EngineClient {
             }
         }
         writeCarryOver(this.documentId);
+        this.carryOverPrepared = true;
     }
 
     /** Issue #333 — current checkpoint health (`failing` once the retries
@@ -969,6 +1089,7 @@ export class EngineClient {
             if (write) this.pendingWrites -= 1;
         }
         if (!r.ok) throw new Error(r.error);
+        this.clean = nextCleanState(this.clean, cmd, r.evt!);
         return r.evt!;
     }
 

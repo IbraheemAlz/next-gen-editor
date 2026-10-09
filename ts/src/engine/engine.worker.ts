@@ -7,7 +7,14 @@ import type {
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { commandMeta } from '@nge/core/command-meta';
-import { openEventLog, appendCommand, persistSnapshot } from './event-log';
+import {
+    openEventLog,
+    appendCommand,
+    persistSnapshot,
+    writeCleanMarker,
+    loadCleanMarker,
+} from './event-log';
+import { nextCleanState } from './clean-state';
 import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
@@ -134,6 +141,10 @@ let engine: Engine | null = null;
 /* Phase 2 §6 — event-log sequencing for the EngineClient command path. */
 let logSequence = 0;
 let lastSnapshotAt = 0;
+/* Issue #388 - whether the document equals what the user last saved (or
+   opened / seeded); mirrored into the event log's `clean` marker so a
+   later boot can offer an unsaved session back. */
+let cleanState = true;
 const SNAPSHOT_EVERY = 200;
 /* Issue #85 — idle snapshot cadence: this long after the last logged
    command, with commands outstanding since the last snapshot, a snapshot
@@ -1032,6 +1043,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
         await openEventLog(msg.documentId);
+        cleanState = true;
         committedPackageHash = undefined;
         pendingPackage = undefined;
         /* Issue #268 — the session's first snapshot is its pinned base. */
@@ -1092,6 +1104,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            post-recovery appends don't collide with or shadow prior rows. */
         logSequence = msg.lastSeq;
         trapAfterCommands = null;
+        /* Issue #388 - the recovered log keeps its own marker. */
+        cleanState = (await loadCleanMarker().catch(() => undefined)) !== false;
         /* Issue #85 — base snapshot + replayed tail, inside the engine.
            Issue #241 — the candidates are tried newest first: a snapshot
            that does not restore (unreadable row) falls back to the next
@@ -1309,6 +1323,9 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         const elapsed = performance.now() - t0;
         notePaintVersion(evt);
         self.postMessage({ id: msg.id, ok: true, evt, elapsed });
+        /* Issue #388 - fold the command into the clean marker (off the
+           critical path, queued ahead of this command's log row). */
+        noteCleanState(msg.cmd, evt);
         /* D2.8 backpressure (PHASE_2_BRIDGE_MEMORY.md §12 risk 5): persist to
            the event log OFF the critical path. The RPC response is already
            sent, so event-log latency never throttles command throughput. */
@@ -1514,6 +1531,17 @@ async function decodeAndRegisterMedia(): Promise<void> {
             console.warn(`[worker] image decode failed (${entry.rel_id}):`, e);
         }
     }
+}
+
+/** Issue #388 - persist a change of the document's clean state. */
+function noteCleanState(cmd: Command, evt: Event): void {
+    const next = nextCleanState(cleanState, cmd, evt);
+    if (next === cleanState) return;
+    cleanState = next;
+    const write = writeCleanMarker(next).catch((e: unknown) =>
+        console.warn('[worker] clean marker not persisted', e),
+    );
+    pendingLogWrites = pendingLogWrites.then(() => write);
 }
 
 /**

@@ -68,9 +68,15 @@ export type {
     CommentSnapshot,
     RecoveryReport,
     CheckpointStatus,
+    PreviousSessionInfo,
 } from './types';
 
-export { recoveryNotices, recoveryDegraded, checkpointNotices } from './recovery';
+export {
+    recoveryNotices,
+    recoveryDegraded,
+    checkpointNotices,
+    previousSessionNotice,
+} from './recovery';
 
 /* Issue #342 — per-command metadata generated from `bridge::meta` (also
  * importable on its own as `@nge/core/command-meta`, which the worker and
