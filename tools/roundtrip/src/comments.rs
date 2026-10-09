@@ -1,5 +1,5 @@
-//! Issue #282 — step 38: comments on paragraphs the writer replays from
-//! their source bytes.
+//! Issues #282 / #284 — step 38: comments on paragraphs the writer
+//! replays from their source bytes, and comments inside table cells.
 
 use super::{
     BARE_SECT_PR, assert_document_xml_well_formed, entry_bytes, extract_doc_xml,
@@ -88,6 +88,9 @@ fn save_both(archive: &format_docx::DocxArchive, doc: &DocumentTree) -> Result<V
 /// b. Deleting the source comment of an untouched paragraph removes its
 ///    anchors (reference run included) and its `comments.xml` entry as a
 ///    pure deletion; the re-read document has no trace of it.
+/// c. Issue #284 — a comment inside a table cell re-reads with its full
+///    cell path, and typing before / inside / after it in the cell keeps
+///    its anchors (each save a pure insertion, the range on the same text).
 pub fn run_comment_patch_roundtrip() -> Result<()> {
     let fixture = build();
     let archive = read_docx(&fixture).context("read comment patch fixture")?;
@@ -97,13 +100,7 @@ pub fn run_comment_patch_roundtrip() -> Result<()> {
     }
 
     let top = |block: u32, offset: u32| LogicalPos::new(BlockPath::top(block), offset);
-    let cell = BlockPath {
-        steps: vec![
-            PathStep::Block(2),
-            PathStep::Cell { row: 1, col: 0 },
-            PathStep::Block(0),
-        ],
-    };
+    let cell = cell_path();
     let (doc, para_id) = archive.document.insert_comment(
         top(1, 6),
         top(1, 10),
@@ -169,5 +166,63 @@ pub fn run_comment_patch_roundtrip() -> Result<()> {
     println!(
         "[roundtrip] step 38b OK — a deleted comment leaves the untouched paragraph and comments.xml (pure deletion)"
     );
+
+    /* c. Issue #284 — a comment anchored inside a table cell. */
+    let (doc, cell_id) = archive.document.insert_comment(
+        LogicalPos::new(cell_path(), 6),
+        LogicalPos::new(cell_path(), 10),
+        "on four".into(),
+        "Reviewer".into(),
+        "2026-10-09T00:00:00Z".into(),
+    );
+    let commented = read_docx(&save_both(&archive, &doc)?).context("re-read cell comment")?;
+    let r = commented
+        .document
+        .comment_ranges
+        .iter()
+        .find(|r| r.id == cell_id)
+        .context("the cell comment has no range")?;
+    if r.start.path != cell_path() || r.end.path != cell_path() {
+        bail!(
+            "step 38c: cell comment read at {:?} .. {:?}",
+            r.start,
+            r.end
+        );
+    }
+    let source = extract_doc_xml(&write_docx(&commented, &commented.document)?)?;
+    for (offset, want) in [(2u32, "four"), (8, "foXur"), (10, "four")] {
+        let edited = commented
+            .document
+            .insert_text(LogicalPos::new(cell_path(), offset), "X");
+        let bytes = save_both(&commented, &edited)?;
+        let xml = extract_doc_xml(&bytes)?;
+        if !pure_insertion(&source, &xml) {
+            bail!(
+                "step 38c: edit at {offset} in the commented cell rewrote source bytes:\n{}",
+                String::from_utf8_lossy(&xml)
+            );
+        }
+        let back = read_docx(&bytes).context("re-read edited cell")?;
+        if covered(&back.document, cell_id).as_deref() != Some(want) {
+            bail!(
+                "step 38c: edit at {offset}: cell comment covers {:?}",
+                covered(&back.document, cell_id)
+            );
+        }
+    }
+    println!(
+        "[roundtrip] step 38c OK — a cell comment re-reads with its full path and survives edits inside the cell (pure insertions)"
+    );
     Ok(())
+}
+
+/// Row 1 / column 0 of the table (block 2), its paragraph.
+fn cell_path() -> BlockPath {
+    BlockPath {
+        steps: vec![
+            PathStep::Block(2),
+            PathStep::Cell { row: 1, col: 0 },
+            PathStep::Block(0),
+        ],
+    }
 }

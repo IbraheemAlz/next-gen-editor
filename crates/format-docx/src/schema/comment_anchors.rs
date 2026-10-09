@@ -16,8 +16,8 @@
 //!
 //! - replays a comment-anchor marker verbatim only when it is *verified*:
 //!   a range end must sit exactly where the tree puts that end of that
-//!   comment (or, for a comment the tree has no range for — a table-cell
-//!   anchor, an unpaired end — the comment must still exist); a reference
+//!   comment (or, for a comment the tree has no range for — an unpaired
+//!   end, a story anchor — the comment must still exist); a reference
 //!   only while the comment exists. A deleted comment's markers are
 //!   dropped, never resurrected.
 //! - synthesizes every tree endpoint that no verbatim byte carries (an

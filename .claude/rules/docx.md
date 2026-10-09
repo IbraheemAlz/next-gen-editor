@@ -95,7 +95,16 @@ The `tools/roundtrip/` harness asserts:
   (`parts::table::parse_cell_paragraph` re-roots the `<w:p>` under the
   part's namespace scope and calls `parse_document_xml`), so cells carry
   the same spans / grab bags / pictures / fields as body paragraphs. Never
-  grow a second, cell-only run parser.
+  grow a second, cell-only run parser. Issue #284 — the same parse reports
+  the paragraph's comment anchor pieces (`parse_document_xml_with_events`),
+  and the table walk roots them at the cell (`CommentSink`: a nested
+  table's pieces under its `Cell` + `Block` steps, a range marker between
+  cell blocks / cells / rows at offset 0 of what follows), so
+  `comment_ranges` carries full cell paths; the body parser pairs every
+  piece in document order (`pair_comment_events`). The walk recurses once
+  per nesting level: keep new per-level work out of line (`#[inline(never)]`
+  helpers) — a debug test thread's 2 MiB stack bounds
+  `MAX_TABLE_NESTING_DEPTH`.
 - Harness: `tools/roundtrip` default mode step 9 edits
   `grab_bag_exotic.docx` and asserts the regenerated `document.xml` is
   byte-identical to the source plus the inserted text.
@@ -177,7 +186,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   (`SourceMarker::comment`, `schema::comment_anchors`): a
   `<w:commentRangeStart/End/>` replays verbatim only where the tree-level
   `comment_ranges` puts that end of that comment (a comment with no tree
-  range — cell anchors, unpaired ends — only while it exists), the
+  range — unpaired ends, story anchors — only while it exists), the
   `<w:commentReference>` run only while the comment exists; a deleted
   comment is never resurrected. Every tree endpoint no verbatim byte
   carries (engine-minted comment, stale markup) is synthesized at its

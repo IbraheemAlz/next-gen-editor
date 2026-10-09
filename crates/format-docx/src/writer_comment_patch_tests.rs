@@ -4,6 +4,9 @@
 //! is appended to `comments.xml`; a deleted comment's anchors leave every
 //! replayed byte (clean paragraphs, always-kept spans) and its body leaves
 //! the comment parts, as a pure deletion.
+//!
+//! Issue #284 — comments anchored inside table cells are read with their
+//! full cell paths and kept through edits inside the cell.
 
 use super::tests::document_xml_of;
 use super::*;
@@ -364,6 +367,198 @@ fn new_comment_in_an_untouched_table_cell_is_spliced_into_the_table_bytes() {
         )),
         "{out}"
     );
+    /* Issue #284 — the re-read comment carries its cell path. */
+    let back = read_docx(&bytes).expect("re-read");
+    let r = back
+        .document
+        .comment_ranges
+        .iter()
+        .find(|r| r.id == id)
+        .expect("range");
+    assert_eq!(r.start.path.steps[1], PathStep::Cell { row: 1, col: 0 });
+    assert_eq!(anchored_text(&back.document, id), "four");
+}
+
+fn cell_path(table: u32, row: u32, col: u32, block: u32) -> BlockPath {
+    BlockPath {
+        steps: vec![
+            PathStep::Block(table),
+            PathStep::Cell { row, col },
+            PathStep::Block(block),
+        ],
+    }
+}
+
+/// A table whose cell (1, 1) holds comment 0 on "beta", cell (0, 0) a
+/// comment 1 spanning from body text into it, and cell (1, 0) a nested
+/// table with comment 2 — plus a block-level range end between two cell
+/// paragraphs.
+fn cell_comment_body() -> String {
+    let tc = |inner: &str| format!("<w:tc>{inner}</w:tc>");
+    let p = |inner: &str| format!("<w:p>{inner}</w:p>");
+    let run = |t: &str| format!(r#"<w:r><w:t xml:space="preserve">{t}</w:t></w:r>"#);
+    let reference = |id: u32| {
+        format!(
+            r#"<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="{id}"/></w:r>"#
+        )
+    };
+    let nested = format!(
+        "<w:tbl><w:tblGrid><w:gridCol w:w=\"1000\"/></w:tblGrid><w:tr>{}</w:tr></w:tbl>{}",
+        tc(&p(&format!(
+            r#"{}<w:commentRangeStart w:id="2"/>{}<w:commentRangeEnd w:id="2"/>{}"#,
+            run("in "),
+            run("deep"),
+            reference(2)
+        ))),
+        p("")
+    );
+    format!(
+        "{}<w:tbl><w:tblGrid><w:gridCol w:w=\"2000\"/><w:gridCol w:w=\"2000\"/></w:tblGrid>\
+         <w:tr>{}{}</w:tr><w:tr>{}{}</w:tr></w:tbl>{}",
+        p(&format!(
+            r#"{}<w:commentRangeStart w:id="1"/>{}"#,
+            run("lead "),
+            run("in")
+        )),
+        tc(&format!(
+            r#"{}<w:commentRangeEnd w:id="1"/>{}"#,
+            p(&run("to cell")),
+            p(&reference(1))
+        )),
+        tc(&p(&run("b"))),
+        tc(&nested),
+        tc(&p(&format!(
+            r#"{}<w:commentRangeStart w:id="0"/>{}<w:commentRangeEnd w:id="0"/>{}{}"#,
+            run("alpha "),
+            run("beta"),
+            reference(0),
+            run(" gamma")
+        ))),
+        p(&run("tail")),
+    )
+}
+
+const CELL_COMMENTS: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    r#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+    r#"<w:comment w:id="0" w:author="A"><w:p><w:r><w:t>zero</w:t></w:r></w:p></w:comment>"#,
+    r#"<w:comment w:id="1" w:author="A"><w:p><w:r><w:t>one</w:t></w:r></w:p></w:comment>"#,
+    r#"<w:comment w:id="2" w:author="A"><w:p><w:r><w:t>two</w:t></w:r></w:p></w:comment>"#,
+    r#"</w:comments>"#,
+);
+
+/// Issue #284 — the reader records cell comment ranges with their full
+/// paths: inside a cell paragraph, across body → cell (a block-level end
+/// between two cell paragraphs marks the next one's start), and inside a
+/// nested table.
+#[test]
+fn cell_comment_ranges_are_read_with_full_paths() {
+    let (xml, archive) = package(&cell_comment_body(), Some(CELL_COMMENTS));
+    let doc = &archive.document;
+    let range = |id: u32| {
+        doc.comment_ranges
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+            .unwrap()
+    };
+    let r0 = range(0);
+    assert_eq!(r0.start, LogicalPos::new(cell_path(1, 1, 1, 0), 6));
+    assert_eq!(r0.end, LogicalPos::new(cell_path(1, 1, 1, 0), 10));
+    assert_eq!(anchored_text(doc, 0), "beta");
+    let r1 = range(1);
+    assert_eq!(r1.start, LogicalPos::new(BlockPath::top(0), 5));
+    assert_eq!(r1.end, LogicalPos::new(cell_path(1, 0, 0, 1), 0));
+    let r2 = range(2);
+    let deep = BlockPath {
+        steps: vec![
+            PathStep::Block(1),
+            PathStep::Cell { row: 1, col: 0 },
+            PathStep::Block(0),
+            PathStep::Cell { row: 0, col: 0 },
+            PathStep::Block(0),
+        ],
+    };
+    assert_eq!(r2.start, LogicalPos::new(deep.clone(), 3));
+    assert_eq!(r2.end, LogicalPos::new(deep, 7));
+    assert_eq!(anchored_text(doc, 2), "deep");
+    /* Zero-edit save stays byte-identical. */
+    assert_eq!(document_xml_of(&save(&archive, doc)), xml);
+}
+
+/// Issue #284 — typing inside a commented cell (the table regenerates)
+/// keeps every anchor: the save is the source plus the typed bytes, and
+/// the re-read range covers the same, grown text.
+#[test]
+fn edits_inside_a_commented_cell_keep_its_anchors() {
+    let (xml, archive) = package(&cell_comment_body(), Some(CELL_COMMENTS));
+    for (offset, covered, exact) in [
+        (2, "beta", Some((">alpha <", ">alXpha <"))),
+        (8, "beXta", Some((">beta<", ">beXta<"))),
+        /* Right after the comment: outside it (its own run between the
+        range end and the reference run). */
+        (10, "beta", None),
+    ] {
+        let doc = archive
+            .document
+            .insert_text(LogicalPos::new(cell_path(1, 1, 1, 0), offset), "X");
+        let bytes = save(&archive, &doc);
+        let out = document_xml_of(&bytes);
+        assert!(pure_insertion(&xml, &out), "insert at {offset}: {out}");
+        if let Some((from, to)) = exact {
+            assert_eq!(out, xml.replacen(from, to, 1), "insert at {offset}");
+        }
+        let back = read_docx(&bytes).expect("re-read");
+        assert_eq!(
+            anchored_text(&back.document, 0),
+            covered,
+            "insert at {offset}"
+        );
+        assert_eq!(anchored_text(&back.document, 2), "deep");
+        assert_eq!(back.document.comment_ranges.len(), 3);
+    }
+    /* Typing in the nested table's commented paragraph. */
+    let deep = BlockPath {
+        steps: vec![
+            PathStep::Block(1),
+            PathStep::Cell { row: 1, col: 0 },
+            PathStep::Block(0),
+            PathStep::Cell { row: 0, col: 0 },
+            PathStep::Block(0),
+        ],
+    };
+    let doc = archive.document.insert_text(LogicalPos::new(deep, 5), "X");
+    let bytes = save(&archive, &doc);
+    assert_eq!(
+        document_xml_of(&bytes),
+        xml.replacen(">deep<", ">deXep<", 1)
+    );
+    let back = read_docx(&bytes).expect("re-read");
+    assert_eq!(anchored_text(&back.document, 2), "deXep");
+}
+
+/// Issue #284 — deleting a cell comment strips its anchors from the
+/// untouched table's bytes (and from a regenerated one).
+#[test]
+fn deleting_a_cell_comment_strips_its_anchors() {
+    let (xml, archive) = package(&cell_comment_body(), Some(CELL_COMMENTS));
+    let deleted = archive.document.delete_comment(0);
+    for (what, doc) in [
+        ("untouched", deleted.clone()),
+        (
+            "edited",
+            deleted.insert_text(LogicalPos::new(cell_path(1, 1, 1, 0), 0), "X"),
+        ),
+    ] {
+        let out = document_xml_of(&save(&archive, &doc));
+        assert!(!out.contains(r#"w:id="0""#), "{what}: {out}");
+        assert!(
+            out.contains(r#"<w:commentRangeStart w:id="2"/>"#),
+            "{what}: {out}"
+        );
+    }
+    let out = document_xml_of(&save(&archive, &deleted));
+    assert!(pure_insertion(&out, &xml), "untouched: a pure deletion");
 }
 
 /// Pretty-printed / drifted source: the regenerated paragraph is not

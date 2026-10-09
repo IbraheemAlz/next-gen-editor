@@ -12,7 +12,7 @@
 //!   optimisation; zero document.xml drift on untouched paragraphs).
 
 use crate::error::{DocxError, DocxWarning};
-use crate::parts::table::parse_table_bytes_with_warnings;
+use crate::parts::table::parse_table_bytes_with_events;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
@@ -988,6 +988,15 @@ pub(crate) struct CommentEvent {
     pub kind: engine::CommentAnchorKind,
     pub id: u32,
     pub pos: engine::LogicalPos,
+}
+
+impl CommentEvent {
+    /// Issue #284 — an event of a lone re-parsed paragraph (path
+    /// `top(0)`) moved to `at`, the paragraph's real path.
+    pub(crate) fn under_block(mut self, at: &[engine::PathStep]) -> Self {
+        self.pos.path.steps = at.to_vec();
+        self
+    }
 }
 
 /// Pair range starts and ends (document order) into
@@ -2333,12 +2342,20 @@ pub(crate) fn parse_document_xml_with_events(
                             cells silently drop list bindings + paragraph
                             styles, breaking visual fidelity on numbered
                             tables. */
+                            /* Issue #284 — the cells' comment anchors, with
+                            their full paths, in document order. */
+                            let mut sink = crate::parts::table::CommentSink::rooted(vec![
+                                engine::PathStep::Block(out_blocks.len() as u32),
+                            ]);
                             let parsed = source_xml
                                 .as_deref()
-                                .map(|b| {
-                                    parse_table_bytes_with_warnings(b, resolver, &ns, warnings)
-                                        .unwrap_or_default()
+                                .and_then(|b| {
+                                    parse_table_bytes_with_events(
+                                        b, resolver, &ns, warnings, &mut sink,
+                                    )
+                                    .ok()
                                 })
+                                .inspect(|_| comment_events.append(&mut sink.events))
                                 .unwrap_or_default();
                             out_blocks.push(Block::Table(
                                 parsed.into_table(source_xml, envelopes.take_before()),
