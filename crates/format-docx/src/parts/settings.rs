@@ -39,6 +39,49 @@ pub struct SettingsPart {
     pub consecutive_hyphen_limit: Option<u32>,
     /// Issue #326 — `<w:doNotHyphenateCaps/>`.
     pub do_not_hyphenate_caps: bool,
+    /// Issue #345 — `<w:documentProtection>`, `None` when absent.
+    pub protection: Option<engine::DocumentProtection>,
+}
+
+/// Issue #345 — lift `<w:documentProtection>`'s attributes (both the
+/// transitional `w:hash` / `w:salt` / `w:cryptSpinCount` /
+/// `w:cryptAlgorithmSid` family and the strict `w:hashValue` /
+/// `w:saltValue` / `w:spinCount` / `w:algorithmName` one; the strict
+/// spelling wins when a writer emits both).
+fn document_protection(
+    attrs: quick_xml::events::attributes::Attributes<'_>,
+) -> engine::DocumentProtection {
+    let mut p = engine::DocumentProtection::default();
+    let mut sid: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut strict_hash: Option<String> = None;
+    let mut strict_salt: Option<String> = None;
+    let mut strict_spin: Option<u32> = None;
+    for a in attrs.flatten() {
+        let Ok(v) = a.unescape_value() else { continue };
+        let v = v.into_owned();
+        match a.key.as_ref() {
+            b"w:edit" => p.edit = engine::ProtectionEdit::from_ooxml(v.trim()),
+            b"w:enforcement" => {
+                p.enforcement =
+                    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on")
+            }
+            b"w:hash" => p.hash = Some(v),
+            b"w:salt" => p.salt = Some(v),
+            b"w:cryptSpinCount" => p.spin_count = v.trim().parse().ok(),
+            b"w:cryptAlgorithmSid" => sid = Some(v),
+            b"w:hashValue" => strict_hash = Some(v),
+            b"w:saltValue" => strict_salt = Some(v),
+            b"w:spinCount" => strict_spin = v.trim().parse().ok(),
+            b"w:algorithmName" => name = Some(v),
+            _ => {}
+        }
+    }
+    p.hash = strict_hash.or(p.hash);
+    p.salt = strict_salt.or(p.salt);
+    p.spin_count = strict_spin.or(p.spin_count);
+    p.algorithm = name.or_else(|| sid.map(|s| engine::protection::crypt_algorithm_sid_name(&s)));
+    p
 }
 
 /// Decode an OOXML toggle attribute (`w:val` "false" / "0" / "off"
@@ -88,6 +131,9 @@ pub fn parse_settings_xml(xml: &[u8]) -> Result<SettingsPart, DocxError> {
                     .find(|a| a.key.as_ref() == b"w:val")
                     .and_then(|a| a.unescape_value().ok())
                     .and_then(|v| v.parse().ok());
+            }
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:documentProtection" => {
+                out.protection = Some(document_protection(e.attributes()));
             }
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:evenAndOddHeaders" => {
                 out.even_and_odd_headers = toggle_attr(e.attributes());
@@ -152,6 +198,68 @@ pub fn parse_settings_xml(xml: &[u8]) -> Result<SettingsPart, DocxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #345 — both attribute families, `w:enforcement` spellings,
+    /// an unknown `w:edit`.
+    #[test]
+    fn reads_document_protection() {
+        let wrap = |el: &str| {
+            format!(
+                r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{el}</w:settings>"#
+            )
+        };
+        let word = wrap(
+            r#"<w:documentProtection w:edit="readOnly" w:enforcement="1" w:cryptProviderType="rsaFull" w:cryptAlgorithmClass="hash" w:cryptAlgorithmType="typeAny" w:cryptAlgorithmSid="4" w:cryptSpinCount="50000" w:hash="4X8p6kGAJoqQumimmzU4VbNkKjY=" w:salt="GgJHVEzkGgBKZq4k8fEPbA=="/>"#,
+        );
+        let p = parse_settings_xml(word.as_bytes())
+            .unwrap()
+            .protection
+            .unwrap();
+        assert_eq!(p.edit, Some(engine::ProtectionEdit::ReadOnly));
+        assert!(p.enforcement);
+        assert_eq!(p.hash.as_deref(), Some("4X8p6kGAJoqQumimmzU4VbNkKjY="));
+        assert_eq!(p.salt.as_deref(), Some("GgJHVEzkGgBKZq4k8fEPbA=="));
+        assert_eq!(p.spin_count, Some(50000));
+        assert_eq!(p.algorithm.as_deref(), Some("SHA-1"));
+        assert_eq!(p.enforced_mode(), Some(engine::ProtectionEdit::ReadOnly));
+        assert!(p.has_password());
+
+        let strict = wrap(
+            r#"<w:documentProtection w:edit="forms" w:enforcement="true" w:algorithmName="SHA-512" w:hashValue="aGFzaA==" w:saltValue="c2FsdA==" w:spinCount="100000"/>"#,
+        );
+        let p = parse_settings_xml(strict.as_bytes())
+            .unwrap()
+            .protection
+            .unwrap();
+        assert_eq!(p.enforced_mode(), Some(engine::ProtectionEdit::Forms));
+        assert_eq!(p.algorithm.as_deref(), Some("SHA-512"));
+        assert_eq!(p.spin_count, Some(100000));
+        assert_eq!(p.hash.as_deref(), Some("aGFzaA=="));
+
+        let off = wrap(r#"<w:documentProtection w:edit="comments" w:enforcement="0"/>"#);
+        let p = parse_settings_xml(off.as_bytes())
+            .unwrap()
+            .protection
+            .unwrap();
+        assert_eq!(p.edit, Some(engine::ProtectionEdit::Comments));
+        assert_eq!(p.enforced_mode(), None);
+        assert!(!p.has_password());
+
+        let unknown = wrap(r#"<w:documentProtection w:edit="sometimes" w:enforcement="1"/>"#);
+        let p = parse_settings_xml(unknown.as_bytes())
+            .unwrap()
+            .protection
+            .unwrap();
+        assert_eq!(p.edit, None);
+        assert_eq!(p.enforced_mode(), None);
+
+        assert!(
+            parse_settings_xml(wrap("").as_bytes())
+                .unwrap()
+                .protection
+                .is_none()
+        );
+    }
 
     /// Issue #355 — the two theme-selection settings Word writes.
     #[test]

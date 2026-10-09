@@ -11,3 +11,7 @@ engine = { path = "../engine" }
 quick-xml = { workspace = true }
 zip = { workspace = true }
 thiserror = { workspace = true }
+# Issue #345 — encrypted-package decryption (`opc::offcrypto`).
+aes = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }

@@ -859,6 +859,7 @@ mod tests {
                 style: BorderStyle::Single,
                 size_eighth_pt: 8, // 1 pt
                 color: Some([0, 0, 0, 0xff]),
+                ..Default::default()
             }),
             ..Default::default()
         });

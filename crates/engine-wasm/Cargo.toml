@@ -36,6 +36,8 @@ wasm-bindgen-test = "0.3"
 # `UndoStack::push` this crate's tests commit (dev-only; never in the
 # wasm artifact).
 engine = { path = "../engine", features = ["markup-assert"] }
+# Issue #345 — the protection tests read parts of a saved package.
+zip = { workspace = true }
 
 [features]
 # Native testing/fuzzing entry points (D5.5, issue #90) — off by default,

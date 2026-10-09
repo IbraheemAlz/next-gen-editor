@@ -9,6 +9,7 @@ fn stroke(color: u8) -> Option<BorderStroke> {
         style: BorderStyle::Single,
         size_eighth_pt: 8,
         color: Some([color, 0, 0, 255]),
+        ..Default::default()
     })
 }
 
@@ -17,6 +18,7 @@ fn nil() -> Option<BorderStroke> {
         style: BorderStyle::None,
         size_eighth_pt: 0,
         color: None,
+        ..Default::default()
     })
 }
 

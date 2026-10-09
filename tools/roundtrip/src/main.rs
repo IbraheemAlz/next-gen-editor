@@ -35,11 +35,15 @@ mod inline_spans;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod ppr_splice;
+mod protection;
 mod reader_cascade;
 mod reader_hardening;
+mod regen;
 mod revision_ids;
 mod revisions;
 mod run_content;
+mod styles_patch;
 mod table_markup;
 mod theme;
 mod tracked_coverage;
@@ -364,6 +368,12 @@ fn run_default() -> Result<()> {
     tracked_coverage::run_tracked_paste_roundtrip()?;
     tracked_coverage::run_tracked_table_rows_roundtrip()?;
     tracked_coverage::run_section_break_revision_roundtrip()?;
+    protection::run_document_protection_roundtrip()?;
+    regen::run_regen_classes_roundtrip()?;
+    ppr_splice::run_ppr_splice_roundtrip()?;
+    styles_patch::run_styles_patch_roundtrip()?;
+    /* Step 59 — issues #335 / #357 / #326: run-content elements and
+    automatic hyphenation. */
     run_content::run_soft_hyphen_roundtrip()?;
     run_content::run_run_content_roundtrip()?;
     run_content::run_hyphenation_roundtrip()?;
@@ -5043,7 +5053,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #335 — `<w:softHyphen/>` / `<w:noBreakHyphen/>` (the
         visual-diff `soft-hyphen` golden loads it). Zero-edit drift 0;
-        the default harness's step 55 edits it. */
+        the default harness's step 59a–d edits it. */
         PrebuiltFixture {
             name: "soft_hyphen.docx",
             bytes: format_docx::test_fixtures::soft_hyphen_docx(),
@@ -5064,7 +5074,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #357 — `<w:sym>`, `<w:cr/>`, `<w:ptab>`, `<w:bdo>` /
         `<w:dir>` (the visual-diff `run-content` golden loads it).
-        Zero-edit drift 0; the default harness's step 56 edits it. */
+        Zero-edit drift 0; the default harness's step 59e–h edits it. */
         PrebuiltFixture {
             name: "run_content.docx",
             bytes: format_docx::test_fixtures::run_content_docx(),
@@ -5085,7 +5095,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #326 — automatic hyphenation on / off (the visual-diff
         `hyphenation` / `hyphenation-off` goldens load them). Zero-edit
-        drift 0; the default harness's step 57 edits both. */
+        drift 0; the default harness's step 59i–k edits both. */
         PrebuiltFixture {
             name: "hyphenation_on.docx",
             bytes: format_docx::test_fixtures::hyphenation_docx(true),
