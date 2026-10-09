@@ -15,7 +15,7 @@ import {
     Show,
     type Component,
 } from 'solid-js';
-import { createEditorCommands, createEditorState } from '@nge/core';
+import { createEditorCommands, createEditorState, type RecoveryReport } from '@nge/core';
 import './DevHud.css';
 
 export interface DevHudProps {
@@ -32,6 +32,26 @@ function fmtBytes(n: number | undefined): string {
     if (n < 1024) return `${n} B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
     return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
+/** Issue #315 — the base the last recovery came back from. */
+function recoveryBase(r: RecoveryReport): string {
+    const base = r.restored ? (r.pinnedBase ? 'pinned snapshot' : 'snapshot') : 'command log';
+    const at =
+        r.baseSnapshotAt !== undefined
+            ? ` @ ${new Date(r.baseSnapshotAt).toLocaleTimeString()}`
+            : '';
+    return `${base}${at} +${r.appliedCommands} cmds`;
+}
+
+/** Issue #315 — every way the last recovery degraded (`[]` = none). */
+function recoveryLosses(r: RecoveryReport): string[] {
+    const losses: string[] = [];
+    if (r.logTruncated) losses.push('log truncated');
+    if (r.tailDropped) losses.push('tail dropped');
+    if (r.packageLost) losses.push('package lost');
+    if (r.rendererDowngraded) losses.push('renderer downgraded');
+    return losses;
 }
 
 export const DevHud: Component<DevHudProps> = (props) => {
@@ -127,6 +147,33 @@ export const DevHud: Component<DevHudProps> = (props) => {
                                         </button>
                                     </dd>
                                 </Show>
+                            </>
+                        )}
+                    </Show>
+
+                    {/* Issue #315 — the most recent crash recovery: the base
+                        it restored, the fallbacks it took, and every loss
+                        (the same flags the recovery banner and the
+                        telemetry CRASH sample carry). */}
+                    <Show when={state.lastRecovery()}>
+                        {(r) => (
+                            <>
+                                <dt>Recovery</dt>
+                                <dd class="nge-hud__recovery-base">{recoveryBase(r())}</dd>
+                                <dt>Fallbacks</dt>
+                                <dd class="nge-hud__recovery-fallbacks">
+                                    {r().snapshotFallbacks} snapshot · {r().packageFallbacks} package
+                                </dd>
+                                <dt>Losses</dt>
+                                <dd
+                                    class="nge-hud__recovery-losses"
+                                    classList={{
+                                        'nge-hud__recovery-losses--warn':
+                                            recoveryLosses(r()).length > 0,
+                                    }}
+                                >
+                                    {recoveryLosses(r()).join(', ') || 'none'}
+                                </dd>
                             </>
                         )}
                     </Show>

@@ -62,6 +62,9 @@ interface SnapshotRow {
     bytes: Uint8Array;
     /** Issue #212 — the detached source package this snapshot names. */
     packageHash?: string;
+    /** Issue #315 — wall-clock time (ms since the epoch) the row was
+     *  persisted; absent on rows written before it existed. */
+    at?: number;
 }
 interface PackageRow {
     hash: string;
@@ -139,6 +142,9 @@ export interface RecoveryCandidate {
     tailComplete?: boolean;
     /** Issue #268 — this is the document's pinned base snapshot. */
     pinned?: boolean;
+    /** Issue #315 — when the snapshot was persisted (ms since the epoch),
+     *  so a recovery that loses the edits after it can say since when. */
+    takenAt?: number;
 }
 
 /** Everything `EngineClient.recover()` hands the respawned worker. */
@@ -269,7 +275,8 @@ export async function persistSnapshot(
     const store = tx.objectStore('snapshots');
     const packages = tx.objectStore('packages');
     const meta = tx.objectStore('meta');
-    const row: SnapshotRow = pkg ? { seq, bytes, packageHash: pkg.hash } : { seq, bytes };
+    const at = Date.now();
+    const row: SnapshotRow = pkg ? { seq, bytes, packageHash: pkg.hash, at } : { seq, bytes, at };
     /* Issue #314 — the package the row names, resolved INSIDE this
        transaction. Requests run in issue order, so this lookup (and the
        put its callback may issue) completes before the package GC below
@@ -391,6 +398,7 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
                     tailComplete: row.seq >= prunedThrough,
                 };
                 if (row.seq === pinnedSeq) candidate.pinned = true;
+                if (typeof row.at === 'number') candidate.takenAt = row.at;
                 if (row.packageHash !== undefined) {
                     candidate.packageHash = row.packageHash;
                     const pkg = packages.get(row.packageHash);

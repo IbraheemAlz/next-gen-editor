@@ -60,6 +60,8 @@ type WorkerReply = {
     pinnedBase?: boolean;
     /** Issue #268 — RECOVER reply: see `RecoveryInfo.tailDropped`. */
     tailDropped?: boolean;
+    /** Issue #315 — RECOVER reply: see `RecoveryInfo.baseSnapshotAt`. */
+    baseTakenAt?: number;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -160,6 +162,17 @@ export interface RecoveryInfo {
      * snapshot is unreadable; better than `logTruncated`'s total loss.
      */
     tailDropped: boolean;
+    /**
+     * Issue #315 — this recovery is the one that tripped the #99 crash-loop
+     * downgrade (`rendererDowngrade` is re-sent on every later forced
+     * recovery of the session; only the first one is news to the user).
+     */
+    rendererDowngraded: boolean;
+    /** Issue #315 — when the restored base snapshot was persisted (ms
+     *  since the epoch); `undefined` when none was restored or the row
+     *  predates the timestamp. Lets the shell say since when edits were
+     *  lost (`tailDropped`). */
+    baseSnapshotAt: number | undefined;
 }
 
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
@@ -267,6 +280,9 @@ export class EngineClient {
     private downgrade: RendererDowngrade | undefined;
     /** Issue #240 — listeners for `downgrade` changes (the Dev HUD). */
     private downgradeListeners = new Set<(d: RendererDowngrade | undefined) => void>();
+    /** Issue #315 — listeners for completed recoveries (the recovery
+     *  banner, the Dev HUD, the telemetry `CRASH` sample). */
+    private recoveryListeners = new Set<(info: RecoveryInfo) => void>();
     /** Issue #240 — whether the boot worker probed the GPU backend. */
     private bootProbed = true;
     /** Issue #240 — the persisted streak currently marks a live Vello
@@ -481,6 +497,20 @@ export class EngineClient {
     }
 
     /**
+     * Issue #315 — observe completed recoveries. Fires once per
+     * `recover()`, AFTER `lastRecovery` holds its outcome (unlike the
+     * `RECOVERED` event, which subscribers see before the client has
+     * folded the worker's reply into `RecoveryInfo`). Returns the
+     * unsubscribe.
+     */
+    onRecovery(fn: (info: RecoveryInfo) => void): () => void {
+        this.recoveryListeners.add(fn);
+        return () => {
+            this.recoveryListeners.delete(fn);
+        };
+    }
+
+    /**
      * Recover after a trap: load the persisted snapshots + command log,
      * spawn a fresh worker, and replay via `Command::Recover` (newest
      * snapshot first, falling back to older ones — issue #241). `canvas` must be a
@@ -501,7 +531,11 @@ export class EngineClient {
         /* Issue #99 — N traps in a row on Vello: stop re-probing the GPU
            (it would pick Vello again and crash-loop) and force Canvas2D for
            this and every later generation of the session. */
+        /* Issue #315 — whether THIS recovery trips the downgrade (the
+           banner announces it once, not on every later recovery). */
+        let downgradedNow = false;
         if (this.downgrade === undefined && this.velloTrapStreak >= VELLO_TRAP_LIMIT) {
+            downgradedNow = true;
             this.setDowngrade({
                 from: 'vello',
                 to: 'canvas2d',
@@ -562,6 +596,8 @@ export class EngineClient {
             packageLost: r.packageLost === true,
             pinnedBase: r.pinnedBase === true,
             tailDropped: r.tailDropped === true,
+            rendererDowngraded: downgradedNow && recovered?.renderer_downgrade !== undefined,
+            baseSnapshotAt: r.restored === true ? r.baseTakenAt : undefined,
         };
         this.noteGenerationStart();
         if (this.lastRecoveryInfo.logTruncated) {
@@ -583,6 +619,9 @@ export class EngineClient {
             );
         }
         this.armStableTimer();
+        /* Issue #315 — after `lastRecovery` is final. */
+        const info = this.lastRecoveryInfo;
+        for (const fn of this.recoveryListeners) fn(info);
     }
 
     /**

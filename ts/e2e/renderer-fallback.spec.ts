@@ -48,6 +48,8 @@ test('two traps on Vello force the third generation onto Canvas2D, which stays u
     let evts = await page.evaluate(() => (window as any).__recoveredEvents);
     expect(evts[0].renderer).toBe('vello');
     expect(evts[0].renderer_downgrade).toBeUndefined();
+    /* Issue #315 — nothing lost, nothing changed: no banner. */
+    await expect(page.locator('.nge-recovery-banner')).toHaveCount(0);
 
     /* Trap 2 on Vello: the crash loop trips — generation 3 is forced. */
     await trapAndAwaitRecovery(page);
@@ -76,6 +78,13 @@ test('two traps on Vello force the third generation onto Canvas2D, which stays u
     expect(status.windowRenderer).toBe('canvas2d');
     expect(status.downgrade?.consecutive_traps).toBe(2);
     expect(status.lastRecovery?.rendererDowngrade?.reason).toBe('CRASH_LOOP');
+    /* Issue #315 — the recovery that tripped the crash loop says so. */
+    expect(status.lastRecovery?.rendererDowngraded).toBe(true);
+    const banner = page.locator('.nge-recovery-banner');
+    await expect(banner).toBeVisible();
+    await expect(banner).toHaveAttribute('data-kinds', 'renderer-downgrade');
+    await expect(banner).toContainText('The vello renderer crashed 2 times in a row');
+    await expect(banner).toContainText('Your document is intact');
 
     /* Generation 3 stays up: it answers, edits land, and no further
        recovery happens. */

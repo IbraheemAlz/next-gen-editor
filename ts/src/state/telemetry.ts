@@ -28,6 +28,42 @@ interface RendererDowngrade {
     reason: 'CRASH_LOOP';
     consecutive_traps: number;
 }
+/** Mirror of `bridge::RecoveryFlags` (issue #315): what the recovery a
+ *  trap triggered had to give up — booleans + counts, no content. */
+interface RecoveryFlags {
+    snapshot_restored: boolean;
+    pinned_base: boolean;
+    tail_dropped: boolean;
+    package_lost: boolean;
+    log_truncated: boolean;
+    snapshot_fallbacks: number;
+    package_fallbacks: number;
+}
+/** Issue #315 — the recovery-report fields the CRASH sample reads (a
+ *  structural subset of `EngineClient`'s `RecoveryInfo` and of
+ *  `@nge/core`'s `RecoveryReport`). */
+export interface TelemetryRecoveryReport {
+    restored: boolean;
+    pinnedBase: boolean;
+    tailDropped: boolean;
+    packageLost: boolean;
+    logTruncated: boolean;
+    snapshotFallbacks: number;
+    packageFallbacks: number;
+    rendererDowngrade: RendererDowngrade | undefined;
+}
+
+function recoveryFlags(r: TelemetryRecoveryReport): RecoveryFlags {
+    return {
+        snapshot_restored: r.restored,
+        pinned_base: r.pinnedBase,
+        tail_dropped: r.tailDropped,
+        package_lost: r.packageLost,
+        log_truncated: r.logTruncated,
+        snapshot_fallbacks: r.snapshotFallbacks,
+        package_fallbacks: r.packageFallbacks,
+    };
+}
 
 type TelemetryKind =
     | { type: 'PAINT_TIMING'; p50: number; p95: number; p99: number }
@@ -55,6 +91,10 @@ type TelemetryKind =
            *  forced off Vello after a crash loop (omitted otherwise, like
            *  the Rust `skip_serializing_if`). */
           renderer_downgrade?: RendererDowngrade;
+          /** Issue #315 — present on a `RECOVERED` sample when the client
+           *  reports its recovery outcome (omitted otherwise, like the
+           *  Rust `skip_serializing_if`). */
+          recovery?: RecoveryFlags;
       }
     | { type: 'DOC_OPEN'; size_bytes: number; page_count: number; open_ms: number; backend: string };
 
@@ -76,6 +116,10 @@ export interface TelemetryClient {
     dispatch(cmd: Command, transfer?: Transferable[]): Promise<Event>;
     subscribe(fn: (e: Event) => void): () => void;
     readonly renderer: string;
+    /** Issue #315 — optional: completed-recovery feed (fires after the
+     *  client folded the worker reply into its report). Without it the
+     *  CRASH sample settles on the bare `RECOVERED` event, flag-less. */
+    onRecovery?(fn: (report: TelemetryRecoveryReport) => void): () => void;
 }
 
 const FLUSH_INTERVAL_MS = 60_000;
@@ -207,27 +251,43 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
      *  timeout to emit a corrected follow-up. */
     const armCrashSample = (trapMessage: string): void => {
         const recentCommandsSnapshot = [...recentCommands];
-        const emit = (outcome: RecoveryOutcome, downgrade?: RendererDowngrade): void => {
+        const emit = (
+            outcome: RecoveryOutcome,
+            downgrade?: RendererDowngrade,
+            recovery?: RecoveryFlags,
+        ): void => {
             queueAndFlush({
                 type: 'CRASH',
                 trap_message: trapMessage,
                 recent_commands: recentCommandsSnapshot,
                 recovery_outcome: outcome,
                 ...(downgrade ? { renderer_downgrade: downgrade } : {}),
+                ...(recovery ? { recovery } : {}),
             });
         };
         emit('PENDING');
         if (!isEnabled()) return;
         let settled = false;
-        const offRecovered = client.subscribe((e2: Event) => {
-            if (settled || e2.type !== 'RECOVERED') return;
-            settled = true;
-            window.clearTimeout(timer);
-            offRecovered();
-            /* Issue #99 — the recovered engine echoes the crash-loop
-               downgrade the shell forced on this generation. */
-            emit('RECOVERED', e2.renderer_downgrade);
-        });
+        /* Issue #315 — prefer the client's completed-recovery feed: it
+           carries the degradation flags (pinned base, dropped tail, lost
+           package, truncated log…) the bare event does not. */
+        const offRecovered = client.onRecovery
+            ? client.onRecovery((report) => {
+                  if (settled) return;
+                  settled = true;
+                  window.clearTimeout(timer);
+                  offRecovered();
+                  emit('RECOVERED', report.rendererDowngrade, recoveryFlags(report));
+              })
+            : client.subscribe((e2: Event) => {
+                  if (settled || e2.type !== 'RECOVERED') return;
+                  settled = true;
+                  window.clearTimeout(timer);
+                  offRecovered();
+                  /* Issue #99 — the recovered engine echoes the crash-loop
+                     downgrade the shell forced on this generation. */
+                  emit('RECOVERED', e2.renderer_downgrade);
+              });
         const timer = window.setTimeout(() => {
             if (settled) return;
             settled = true;

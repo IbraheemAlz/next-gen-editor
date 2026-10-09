@@ -110,6 +110,50 @@ export interface EngineClientLike {
     readonly rendererDowngrade?: RendererDowngrade | undefined;
     onRendererDowngrade?(fn: (d: RendererDowngrade | undefined) => void): () => void;
     retryGpuRenderer?(): Promise<void>;
+    /**
+     * Issue #315 — optional crash-recovery report. The outcome of the most
+     * recent recovery (`undefined` before any), and a feed that fires once
+     * per completed recovery with its final report. Implementations
+     * without crash recovery omit both; the recovery banner and the Dev
+     * HUD's recovery rows then never show.
+     */
+    readonly lastRecovery?: RecoveryReport | undefined;
+    onRecovery?(fn: (report: RecoveryReport) => void): () => void;
+}
+
+/**
+ * Issue #315 — what a crash recovery achieved and what it had to give up
+ * (#85 / #241 / #268 / #99). The concrete `EngineClient`'s `RecoveryInfo`
+ * satisfies it structurally. Turn it into user-facing notices with
+ * `recoveryNotices()`; an empty list means a normal recovery, which stays
+ * silent.
+ */
+export interface RecoveryReport {
+    /** A persisted base snapshot was restored before the tail replay. */
+    restored: boolean;
+    /** Replay-tail commands applied on top of the base. */
+    appliedCommands: number;
+    /** The renderer the recovered engine paints with. */
+    renderer: string;
+    /** The crash-loop downgrade in force for the recovered generation. */
+    rendererDowngrade: RendererDowngrade | undefined;
+    /** THIS recovery tripped the downgrade (later recoveries re-send it). */
+    rendererDowngraded: boolean;
+    /** Newer snapshots skipped because they would not restore. */
+    snapshotFallbacks: number;
+    /** Nothing restored and the log was pruned: the document is lost. */
+    logTruncated: boolean;
+    /** Readable snapshots passed over for an older base with its package. */
+    packageFallbacks: number;
+    /** The source package could not be re-attached: saving writes a
+     *  minimal document without the original file's sibling parts. */
+    packageLost: boolean;
+    /** The restored base is the document's pinned snapshot. */
+    pinnedBase: boolean;
+    /** That pinned base came back WITHOUT its tail: later edits are lost. */
+    tailDropped: boolean;
+    /** When the restored base snapshot was taken (ms since the epoch). */
+    baseSnapshotAt: number | undefined;
 }
 
 /** Read-only revision row consumed by the Track Changes sidebar. */

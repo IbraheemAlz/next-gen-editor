@@ -1140,6 +1140,9 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             packageLost,
             pinnedBase: restored && base.pinned === true,
             tailDropped,
+            /* Issue #315 — when the restored snapshot was persisted, so
+               the shell can say since when edits were lost. */
+            ...(restored && base.takenAt !== undefined ? { baseTakenAt: base.takenAt } : {}),
         });
         /* §10 — the recovered engine has no a11y cache, so this delta is a
            full `Replace`: the mirror DOM rebuilds from the restored tree

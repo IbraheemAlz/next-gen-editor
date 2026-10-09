@@ -148,6 +148,11 @@ test('document, caret and undo survive a real wasm trap; renderer reported truth
     expect(r.windowRenderer).toBe(r.recoveredEvt.renderer);
     expect(r.clientRenderer).toBe(r.recoveredEvt.renderer);
     expect(r.lastRecovery?.renderer).toBe(r.recoveredEvt.renderer);
+    /* Issue #315 — a recovery that lost nothing stays silent. */
+    expect(r.lastRecovery?.tailDropped).toBe(false);
+    expect(r.lastRecovery?.packageLost).toBe(false);
+    expect(r.lastRecovery?.logTruncated).toBe(false);
+    await expect(page.locator('.nge-recovery-banner')).toHaveCount(0);
 });
 
 /* Issue #96 — every page paints after a real trap, not just page 0.

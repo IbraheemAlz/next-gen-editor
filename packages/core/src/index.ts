@@ -52,7 +52,11 @@ export type {
     EngineClientSnapshots,
     RevisionSnapshot,
     CommentSnapshot,
+    RecoveryReport,
 } from './types';
+
+export { recoveryNotices, recoveryDegraded } from './recovery';
+export type { RecoveryNotice, RecoveryNoticeKind, RecoveryNoticeOptions } from './recovery';
 
 export type {
     Command,
