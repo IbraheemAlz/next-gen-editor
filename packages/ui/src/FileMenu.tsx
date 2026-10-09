@@ -154,7 +154,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                        no password prompt yet, the message says what the
                        file is and what to do. */
                     /* Issue #345 — a protection refusal is toasted by
-                       the status bar's ProtectionBadge, not here. */
+                       the ErrorToast (engine copy), not here. */
                     if (evt.kind === 'Protected') break;
                     setError(errorMessage(evt.kind, evt.message));
                     setPendingExportFormat(null);

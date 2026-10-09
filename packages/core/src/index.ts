@@ -45,7 +45,6 @@ export type {
     EditorState,
     CheckpointHealth,
     EditorError,
-    ProtectionRefusal,
 } from './createEditorState';
 
 export { createFontRegistry } from './createFontRegistry';

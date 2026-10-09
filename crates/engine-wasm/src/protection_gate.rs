@@ -85,7 +85,7 @@ impl Engine {
             let _ = self.render_document(None);
         }
         Event::Error {
-            message: format!("{message} [{}]", cmd.kind().name()),
+            message: format!("{}: {message}", cmd.kind().name()),
             kind: Some(bridge::ErrorKind::Protected),
         }
     }

@@ -94,8 +94,8 @@ test('forms protection: typing outside a field is refused, inside it lands', asy
     await select(page, [0, 6], [0, 6]);
     await burst(page, ['!']);
     await settle(page);
-    await expect(page.locator('.nge-protection__toast')).toContainText(
-        'only form fields and content controls can be edited',
+    await expect(page.locator('.nge-toast__message')).toContainText(
+        'This document is protected (filling in forms): only form fields and content controls can be edited',
     );
     await expect(page.locator('.nge-fm__error')).toHaveCount(0);
     expect(await documentText(page)).toBe(before);

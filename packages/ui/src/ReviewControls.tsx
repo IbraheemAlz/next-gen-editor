@@ -132,7 +132,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
             if (
                 evt.type === 'ERROR' &&
                 /* Issue #345 — protection refusals are toasted by the
-                   status bar's ProtectionBadge. */
+                   ErrorToast. */
                 evt.kind !== 'Protected' &&
                 (evt.message.includes('ToggleTrackChanges') ||
                     evt.message.includes('AcceptRevision') ||
