@@ -10,6 +10,7 @@ pub mod document;
 pub mod endnotes;
 pub mod footer;
 pub mod footnotes;
+pub(crate) mod format_change;
 pub mod header;
 pub mod numbering;
 pub mod rels;

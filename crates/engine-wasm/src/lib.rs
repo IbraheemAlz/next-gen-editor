@@ -1269,41 +1269,7 @@ impl Engine {
     /// `Delete`), author, and date. The TS shell uses this to render
     /// hover tooltips over revision-marked text in the canvas.
     pub fn revisions_snapshot(&self) -> Result<JsValue, JsValue> {
-        let doc = self.undo.current();
-        let mut rows: Vec<RevisionOut> = Vec::new();
-        for (block_idx, block) in doc.blocks.iter().enumerate() {
-            if let engine::Block::Paragraph(p) = block {
-                for r in &p.revisions {
-                    rows.push(RevisionOut {
-                        block: block_idx as u32,
-                        start: r.start,
-                        end: r.end,
-                        kind: revision_kind_label(r.kind),
-                        author: r.author.clone(),
-                        date: r.date.clone(),
-                        move_name: r.move_name.clone(),
-                        mark: false,
-                    });
-                }
-                /* Issue #262 — the paragraph-mark revisions, addressed as
-                the empty range at the paragraph end (what
-                `AcceptRevision` / `RejectRevision` resolve it by — the
-                FIRST of several, issue #303: one row each, in order). */
-                for r in &p.mark_revisions {
-                    let end = p.text.len() as u32;
-                    rows.push(RevisionOut {
-                        block: block_idx as u32,
-                        start: end,
-                        end,
-                        kind: revision_kind_label(r.kind),
-                        author: r.author.clone(),
-                        date: r.date.clone(),
-                        move_name: r.move_name.clone(),
-                        mark: true,
-                    });
-                }
-            }
-        }
+        let rows = revision_rows(self.undo.current());
         serde_wasm_bindgen::to_value(&rows)
             .map_err(|e| JsValue::from_str(&format!("encode revisions: {e}")))
     }
@@ -1379,7 +1345,7 @@ struct PaintDimsOut {
     paint_geometry_seq: u64,
 }
 
-#[derive(::serde::Serialize)]
+#[derive(::serde::Serialize, Debug, Clone, PartialEq)]
 struct RevisionOut {
     block: u32,
     start: u32,
@@ -1395,6 +1361,48 @@ struct RevisionOut {
     /// addressed by the empty range `start == end == text length`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mark: bool,
+    /// Issue #304 — the revision's stable id
+    /// (`DocumentTree::revision_entries`): what `AcceptRevision` /
+    /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
+    /// by edits elsewhere — two wrappers over one range are two ids.
+    revision_id: u32,
+}
+
+/// The `revisions_snapshot()` rows: every tracked change of the
+/// top-level paragraphs, in document order — per paragraph its text
+/// revisions, then its mark's changes (issue #262: the empty range at
+/// the paragraph end; issue #303: one row per change, in order) — each
+/// with its issue #304 `revision_id` (the range alone addresses only a
+/// mark's FIRST change; the id addresses each).
+fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
+    doc.revision_entries()
+        .into_iter()
+        .filter_map(|e| {
+            let block = match e.at.path.steps.as_slice() {
+                [EnginePathStep::Block(b)] => *b,
+                _ => return None,
+            };
+            let r = e.revision;
+            let mark = matches!(e.at.slot, engine::RevisionSlot::Mark(_));
+            let (start, end) = if mark {
+                let end = e.paragraph.text.len() as u32;
+                (end, end)
+            } else {
+                (r.start, r.end)
+            };
+            Some(RevisionOut {
+                block,
+                start,
+                end,
+                kind: revision_kind_label(r.kind),
+                author: r.author.clone(),
+                date: r.date.clone(),
+                move_name: r.move_name.clone(),
+                mark,
+                revision_id: e.id,
+            })
+        })
+        .collect()
 }
 
 /// The `revisions_snapshot()` wire label of a revision kind.
@@ -7871,12 +7879,18 @@ impl Engine {
             Command::SetReviewIdentity { author, date } => {
                 self.do_set_review_identity(author, date)
             }
-            Command::AcceptRevision { block, start, end } => {
-                self.do_accept_revision(block, start, end)
-            }
-            Command::RejectRevision { block, start, end } => {
-                self.do_reject_revision(block, start, end)
-            }
+            Command::AcceptRevision {
+                block,
+                start,
+                end,
+                revision_id,
+            } => self.do_resolve_revision(block, start, end, revision_id, true),
+            Command::RejectRevision {
+                block,
+                start,
+                end,
+                revision_id,
+            } => self.do_resolve_revision(block, start, end, revision_id, false),
             Command::AcceptAllRevisions => self.do_resolve_all_revisions(true),
             Command::RejectAllRevisions => self.do_resolve_all_revisions(false),
             Command::InsertComment {
@@ -15477,7 +15491,6 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::AcceptRevision` (Sprint 7 UI Edition).
     /// Sprint 14 (#14) — best-effort current review date stamp.
     /// Prefers the explicit value `Command::SetReviewIdentity` set;
     /// otherwise falls back to the engine clock (`now_iso8601`, issue
@@ -15524,17 +15537,40 @@ impl Engine {
         self.selection_changed()
     }
 
-    fn do_accept_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
-        let new_doc = self.undo.current().accept_revision_at(block, start, end);
-        self.undo.push(new_doc);
-        self.clamp_selection_to_document();
-        self.layout_cache.get_mut().clear();
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
-        }
-        self.announce(AnnouncementPriority::Polite, "Revision accepted");
-        self.selection_changed()
+    /// `Command::AcceptRevision` / `RejectRevision` (Sprint 7 UI
+    /// Edition). Issue #305 — the single revision resolves through the
+    /// accept-all resolver (`DocumentTree::resolve_revision`), as one
+    /// undo step with the selection clamped like accept-all's; an
+    /// address that names no revision pushes nothing. Issue #304 — a
+    /// `revision_id` (the stable id `revisions_snapshot` lists) is the
+    /// address when present, the range otherwise; either half of a
+    /// tracked move resolves the whole move.
+    fn do_resolve_revision(
+        &mut self,
+        block: u32,
+        start: u32,
+        end: u32,
+        revision_id: Option<u32>,
+        accept: bool,
+    ) -> Event {
+        let doc = self.undo.current();
+        let at = match revision_id {
+            Some(id) => doc.revision_by_id(id),
+            None => doc.revision_at_range(block, start, end),
+        };
+        let resolved = at.and_then(|at| doc.resolve_revision(&at, accept));
+        let Some(new_doc) = resolved else {
+            self.announce(AnnouncementPriority::Polite, "No such tracked change");
+            return self.selection_changed();
+        };
+        self.commit_resolved_revisions(
+            new_doc,
+            if accept {
+                "Revision accepted"
+            } else {
+                "Revision rejected"
+            },
+        )
     }
 
     /// A review decision merged or shortened paragraphs (issue #262 / #301 —
@@ -15551,25 +15587,10 @@ impl Engine {
         }
     }
 
-    /// `Command::RejectRevision` (Sprint 7 UI Edition).
-    fn do_reject_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
-        let new_doc = self.undo.current().reject_revision_at(block, start, end);
-        self.undo.push(new_doc);
-        self.clamp_selection_to_document();
-        self.layout_cache.get_mut().clear();
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
-        }
-        self.announce(AnnouncementPriority::Polite, "Revision rejected");
-        self.selection_changed()
-    }
-
     /// Issue #262 — `Command::AcceptAllRevisions` /
     /// `RejectAllRevisions`: every tracked change of the body resolved in
     /// one tree edit, pushed as ONE undo step. Nothing to resolve → no
-    /// undo step. The selection is clamped back into the (possibly
-    /// merged / shortened) paragraphs.
+    /// undo step.
     fn do_resolve_all_revisions(&mut self, accept: bool) -> Event {
         let doc = self.undo.current();
         if !doc.has_revisions() {
@@ -15577,6 +15598,20 @@ impl Engine {
             return self.selection_changed();
         }
         let new_doc = doc.resolve_all_revisions(accept);
+        self.commit_resolved_revisions(
+            new_doc,
+            if accept {
+                "All tracked changes accepted"
+            } else {
+                "All tracked changes rejected"
+            },
+        )
+    }
+
+    /// Push a revision resolution (single or all) as ONE undo step and
+    /// repaint. The selection is clamped back into the (possibly merged /
+    /// shortened) paragraphs.
+    fn commit_resolved_revisions(&mut self, new_doc: DocumentTree, announcement: &str) -> Event {
         self.undo.push(new_doc);
         self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
@@ -15584,14 +15619,7 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
-        self.announce(
-            AnnouncementPriority::Polite,
-            if accept {
-                "All tracked changes accepted"
-            } else {
-                "All tracked changes rejected"
-            },
-        );
+        self.announce(AnnouncementPriority::Polite, announcement);
         self.selection_changed()
     }
 
@@ -27564,6 +27592,9 @@ mod revision_command_tests;
 
 #[cfg(test)]
 mod tracked_command_tests;
+
+#[cfg(test)]
+mod revision_address_tests;
 
 #[cfg(test)]
 mod story_tab_tests;

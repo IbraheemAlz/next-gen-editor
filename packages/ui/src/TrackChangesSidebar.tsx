@@ -73,12 +73,18 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
     const [revisions, setRevisions] = createSignal<RevisionSnapshot[]>([]);
     const [error, setError] = createSignal<string | null>(null);
 
+    /* Issue #304 — address the row by its stable `revision_id`, not by
+       its range: two wrappers over the same bytes (`<w:moveTo><w:del>`)
+       are two rows with one range, and only the id reaches the outer
+       one. Accepting / rejecting either half of a tracked move resolves
+       the whole move (the engine pairs them by `move_name`). An engine
+       that pre-dates the id falls back to the range. */
     const accept = async (rev: RevisionSnapshot) => {
-        await cmd.acceptRevision(rev.block, rev.start, rev.end);
+        await cmd.acceptRevision(rev.block, rev.start, rev.end, rev.revision_id);
         await refresh();
     };
     const reject = async (rev: RevisionSnapshot) => {
-        await cmd.rejectRevision(rev.block, rev.start, rev.end);
+        await cmd.rejectRevision(rev.block, rev.start, rev.end, rev.revision_id);
         await refresh();
     };
 
@@ -156,6 +162,7 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
                             <li
                                 class={`nge-tc__row nge-tc__row--${rev.kind}`}
                                 data-block={rev.block}
+                                data-revision-id={rev.revision_id}
                             >
                                 <div class="nge-tc__row-head">
                                     <span class={`nge-tc__kind nge-tc__kind--${rev.kind}`}>

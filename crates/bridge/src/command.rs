@@ -860,17 +860,34 @@ pub enum Command {
     /// Sprint 7 (UI Edition) — accept a tracked-change revision
     /// addressed by top-level `block` index + byte `start` + byte
     /// `end`. Insert+Accept keeps text; Delete+Accept removes it.
+    /// Issue #304 — accepting either half of a tracked move resolves the
+    /// whole move (every move revision sharing its `move_name`).
     AcceptRevision {
         block: u32,
         start: u32,
         end: u32,
+        /// Issue #304 — the stable id `revisions_snapshot()` lists the
+        /// revision under (`revision_id`). When present it alone
+        /// addresses the revision — so the outer of two wrappers over one
+        /// range is reachable — and `block` / `start` / `end` are
+        /// ignored; an id that names no revision any more (already
+        /// resolved, its text edited) is a no-op. Absent: the range
+        /// addresses it, as before.
+        #[serde(default)]
+        #[tsify(optional)]
+        revision_id: Option<u32>,
     },
     /// Sprint 7 (UI Edition) — reject a tracked-change revision.
-    /// Insert+Reject removes text; Delete+Reject keeps it.
+    /// Insert+Reject removes text; Delete+Reject keeps it. Issue #304 —
+    /// rejecting either half of a tracked move rejects the whole move.
     RejectRevision {
         block: u32,
         start: u32,
         end: u32,
+        /// Issue #304 — see `AcceptRevision.revision_id`.
+        #[serde(default)]
+        #[tsify(optional)]
+        revision_id: Option<u32>,
     },
     /// Issue #262 — accept EVERY tracked change of the body (table cells
     /// included) in document order, as one undo step: deletions and move

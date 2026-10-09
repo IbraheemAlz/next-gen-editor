@@ -245,8 +245,41 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   resolves text revisions per paragraph, then merges paragraphs for
   resolved marks per container from the end — a mark's changes in order,
   any one that removes the mark merges; a single Accept/Reject decides
-  the first — through `splice_text` + `remap_text_edit_record` /
+  the addressed one (by range: the first) — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
+  Issue #305 — the single `AcceptRevision` / `RejectRevision` is the
+  SAME resolver (`DocumentTree::resolve_revisions` with a
+  `RevisionPick::Only`, addressed by `engine::RevisionRef`); text leaves
+  a paragraph only through `revisions::remove_text` (one overlay-shift
+  rule: an inline object whose sentinel was removed goes with it), and
+  `markup-assert` checks every inline object still anchors on a U+FFFC.
+  Issue #304 — a `revisions_snapshot` row carries a stable
+  `revision_id` (`DocumentTree::revision_entries`: a content hash —
+  kind, author, date, `w:id`, move name, covered text — probed to be
+  unique in document order; nothing stored on the model), which
+  `AcceptRevision` / `RejectRevision` take instead of the range, so two
+  wrappers over one range — and each change of a mark carrying several
+  (`RevisionSlot::Mark(i)`, one row each) — are all reachable; resolving
+  either half of a tracked move resolves every move revision sharing its
+  `move_name`.
+- **Annotation ids (issue #295).** Regenerated content never prints a
+  tracked-change annotation `w:id` (`ins` / `del` / `moveFrom` /
+  `moveTo` / `rPrChange` / `pPrChange` / …) directly: `writer::
+  revision_ids` writes a KEEP-`n` token for an id the model carries
+  (`serialize_paragraph` tokenizes its whole output, verbatim run /
+  paragraph properties included) and a FRESH token for an engine-made
+  revision; `write_docx_inner` resolves them over every regenerated part
+  together (body first, then headers / footers, notes) — a KEEP keeps
+  its id the first time unless passthrough bytes of its own part spell
+  it, the rest get ids above every id in the package (fidelity first: an
+  id two source parts already shared is left alone). A run split in two (sub-
+  range formatting, a paragraph split, a writer cut) writes its
+  `<w:rPrChange>` once with the source id; range markers are never
+  rewritten; a save that regenerates nothing is untouched. The reader
+  also models a run's `<w:rPrChange>` as a `FormatChange` revision over
+  the run (`parts::format_change`: `prev_attrs` = the recorded rPr) —
+  the element still rides the grab bag; accepting drops it
+  (`SpanStyle::for_typing`), rejecting restores `prev_attrs`.
 - **Recording structural tracked changes (issues #301 / #298).** Enter
   with review mode on (`DocumentTree::tracked_split_paragraph`, engine
   `crates/engine/src/tracked.rs`) records the NEW mark — the one ending
