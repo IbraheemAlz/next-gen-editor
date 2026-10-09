@@ -23,6 +23,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 echo "=== 3. native tests ==="
 cargo test --workspace --lib
 
+echo "=== 3b. native tests behind fuzz-native (issue #321) ==="
+# Off by default => `--workspace` above collects 0 of these.
+cargo test -p engine-wasm --features fuzz-native 2>&1 | tail -5
+
 echo "=== 4. wasm build ==="
 wasm-pack build --target web --release crates/engine-wasm 2>&1 | tail -5
 
