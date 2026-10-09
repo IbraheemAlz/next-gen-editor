@@ -416,6 +416,7 @@ impl Scenario {
                         language: None,
                         caps: None,
                         small_caps: None,
+                        font_slot: None,
                     },
                 },
             ],
@@ -626,6 +627,7 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
                 language: None,
                 caps: None,
                 small_caps: None,
+                font_slot: None,
             },
         },
         6 => Command::SetParagraphAlign {

@@ -52,10 +52,13 @@ fn the_reader_records_each_slot_binding() {
     );
 }
 
-/// The canonical engine shape (names on ascii / hAnsi / cs, an eastAsia
-/// name or not, no theme) carries no bindings, so an engine-authored
-/// family round-trips equal; any other shape records the slots it
-/// mentions (a missing hAnsi name leaves that slot to the cascade).
+/// The canonical engine shapes (no theme; a Latin name on ascii + hAnsi,
+/// a complex-script name on cs, or both — an eastAsia name or not beside
+/// the Latin pair) carry no bindings, so an engine-authored family
+/// round-trips equal whichever script slots it set (issue #249); any
+/// other shape records the slots it mentions (a missing hAnsi name leaves
+/// that slot to the cascade; an empty `w:cs` the model cannot hold keeps
+/// its claim explicit).
 #[test]
 fn the_canonical_name_shape_records_no_bindings() {
     for (rfonts, expect) in [
@@ -77,9 +80,24 @@ fn the_canonical_name_shape_records_no_bindings() {
             ]),
         ),
         (r#"<w:rFonts w:hint="cs"/>"#, None),
+        (r#"<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/>"#, None),
+        (r#"<w:rFonts w:cs="Arial"/>"#, None),
         (
-            r#"<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/>"#,
-            Some([Some(FontBinding::Name), Some(FontBinding::Name), None, None]),
+            r#"<w:rFonts w:ascii="Arial"/>"#,
+            Some([Some(FontBinding::Name), None, None, None]),
+        ),
+        (
+            r#"<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs=""/>"#,
+            Some([
+                Some(FontBinding::Name),
+                Some(FontBinding::Name),
+                None,
+                Some(FontBinding::Name),
+            ]),
+        ),
+        (
+            r#"<w:rFonts w:eastAsia="SimSun" w:cs="Arial"/>"#,
+            Some([None, None, Some(FontBinding::Name), Some(FontBinding::Name)]),
         ),
         (
             r#"<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial" w:asciiTheme="minorHAnsi"/>"#,
@@ -151,7 +169,9 @@ fn a_regenerated_run_keeps_its_slot_bindings() {
 
 /// The user picks a family: the slots it claims lose their theme binding
 /// in the written run (Word would otherwise keep showing the theme face —
-/// a theme attribute beats a name on the same element).
+/// a theme attribute beats a name on the same element). Issue #249 — the
+/// toolbar names both script slots (`with_cs_twins`); a Latin-only pick
+/// (`FontSlot::Latin`) claims `ascii` / `hAnsi` and keeps `w:cstheme`.
 #[test]
 fn a_new_family_drops_the_bindings_it_claims() {
     let (_, archive) = open();
@@ -159,7 +179,9 @@ fn a_new_family_drops_the_bindings_it_claims() {
         font_family: Some(engine::FontFamily::Amiri),
         ..Default::default()
     };
-    let edited = archive.document.apply_style(at(0), at(7), amiri);
+    let edited = archive
+        .document
+        .apply_style(at(0), at(7), amiri.clone().with_cs_twins());
     let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
     assert!(
         out.contains(r#"<w:rFonts w:ascii="Amiri" w:hAnsi="Amiri" w:cs="Amiri"/>"#),
@@ -167,6 +189,13 @@ fn a_new_family_drops_the_bindings_it_claims() {
     );
     assert!(!out.contains("Theme="), "no stale theme binding:\n{out}");
     assert!(!out.contains("w:cstheme"), "no stale theme binding:\n{out}");
+
+    let edited = archive.document.apply_style(at(0), at(7), amiri);
+    let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+    assert!(
+        out.contains(r#"<w:rFonts w:ascii="Amiri" w:hAnsi="Amiri" w:cstheme="majorBidi"/>"#),
+        "{out}"
+    );
 }
 
 /// A `styles.xml` regenerated from the tree (`ModifyStyle`) keeps the

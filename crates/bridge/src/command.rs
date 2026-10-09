@@ -1367,6 +1367,26 @@ pub enum FormattingToggle {
     SmallCaps,
 }
 
+/// Issues #359 / #104 / #249 — the script slot a [`TextAttrsPatch`]'s
+/// `font_size` / `bold` / `italic` / `font_family` write. OOXML keeps a
+/// Latin set (`<w:sz>`, `<w:b>`, `<w:i>`, `<w:rFonts w:ascii/w:hAnsi>`)
+/// and a complex-script set (`<w:szCs>`, `<w:bCs>`, `<w:iCs>`,
+/// `<w:rFonts w:cs>`) per run; Arabic / Hebrew / Thai text formats with
+/// the latter.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum FontSlot {
+    /// Both sets — Word's ribbon (and the default when the patch names
+    /// no slot).
+    #[default]
+    Both,
+    /// The Latin set only (Word's Font dialog, "Latin text").
+    Latin,
+    /// The complex-script set only — the `cs_only` flag (Word's Font
+    /// dialog, "Complex scripts").
+    ComplexScript,
+}
+
 /// unchanged. The resolved counterpart is [`crate::TextAttrs`].
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -1388,6 +1408,12 @@ pub struct TextAttrsPatch {
     pub caps: Option<bool>,
     /// `<w:smallCaps/>` — same provenance as [`Self::caps`].
     pub small_caps: Option<bool>,
+    /// Issue #359 — which script slot `font_size` / `bold` / `italic` /
+    /// `font_family` write; absent = [`FontSlot::Both`]. Additive: older
+    /// callers omit it and keep setting both, as Word's ribbon does.
+    #[serde(default)]
+    #[tsify(optional)]
+    pub font_slot: Option<FontSlot>,
 }
 
 /// Stable identifier for a paragraph in the document model.

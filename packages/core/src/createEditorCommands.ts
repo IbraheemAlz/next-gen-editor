@@ -32,6 +32,7 @@ import type {
     UnderlineStyle,
     VerticalScript,
     FormattingToggle,
+    FontSlot,
     Alignment,
     Direction,
     PdfConformance,
@@ -185,7 +186,11 @@ export interface EditorCommands {
     setUnderline(style: UnderlineStyle, range?: LogicalRange): Promise<Event>;
     setVerticalScript(script: VerticalScript, range?: LogicalRange): Promise<Event>;
     setFontFamily(family: string, range?: LogicalRange): Promise<Event>;
-    setFontSize(pt: number, range?: LogicalRange): Promise<Event>;
+    /** Issue #359 — `slot` picks the script slot the size writes: omitted
+     *  (or `'Both'`) sets Latin AND complex-script text, as Word's ribbon
+     *  does; `'Latin'` = `<w:sz>` only; `'ComplexScript'` = `<w:szCs>`
+     *  only (Arabic / Hebrew / Thai text). */
+    setFontSize(pt: number, range?: LogicalRange, slot?: FontSlot): Promise<Event>;
     setColor(r: number, g: number, b: number, a?: number, range?: LogicalRange): Promise<Event>;
     setHighlight(r: number, g: number, b: number, a?: number, range?: LogicalRange): Promise<Event>;
     /** `<w:caps/>` — render every glyph uppercase. */
@@ -636,7 +641,8 @@ function build(
          * bridge change required. */
         setVerticalScript: (script, range) => fmt({ script }, range),
         setFontFamily: (font_family, range) => fmt({ font_family }, range),
-        setFontSize: (font_size, range) => fmt({ font_size }, range),
+        setFontSize: (font_size, range, slot) =>
+            fmt(slot === undefined ? { font_size } : { font_size, font_slot: slot }, range),
         setColor: (r, g, b, a = 255, range) => fmt({ color: { r, g, b, a } }, range),
         setHighlight: (r, g, b, a = 255, range) =>
             fmt({ bg_color: { r, g, b, a } }, range),

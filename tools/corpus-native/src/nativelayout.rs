@@ -127,9 +127,9 @@ fn default_span(start: u32, end: u32) -> StyleSpan {
         strike: false,
         bg_color: None,
         font_family: None,
-        font_family_cs: None,
         caps_transform: false,
         baseline_shift_px: 0.0,
+        cs: None,
     }
 }
 
@@ -152,7 +152,6 @@ fn style_span(start: u32, end: u32, style: &engine::SpanStyle) -> StyleSpan {
         (the run shapes against the per-script default face), never a
         crash. */
         font_family: None,
-        font_family_cs: None,
         /* `<w:smallCaps>` is approximated as full `<w:caps>` — the real
         small-caps rendering (uppercase + ~80% size on originally-lowercase
         substrings only) needs the sub-span split `engine-wasm`'s
@@ -161,7 +160,18 @@ fn style_span(start: u32, end: u32, style: &engine::SpanStyle) -> StyleSpan {
         not whether the visual result matches Word. */
         caps_transform: style.caps.unwrap_or(false) || style.small_caps.unwrap_or(false),
         baseline_shift_px: 0.0,
+        cs: None,
     }
+    /* Issues #359 / #104 / #249 — complex-script text takes the run's
+    complex-script twins (the corpus page counts must move with them). */
+    .with_cs(layout::ComplexScriptAttrs {
+        px_size: style.font_size_cs.unwrap_or(DEFAULT_PX_SIZE).max(1.0),
+        baseline_shift_px: 0.0,
+        bold: style.bold_cs.unwrap_or(false),
+        italic: style.italic_cs.unwrap_or(false),
+        font_family: None,
+        whole_span: style.forces_complex_script(),
+    })
 }
 
 /// Resolved style spans covering `[0, text_len)` with no gaps — the

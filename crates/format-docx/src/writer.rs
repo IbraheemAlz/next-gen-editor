@@ -22,7 +22,9 @@ use crate::schema::ct_rpr::{mark_rpr_style, rpr_child_rank, unmodeled_rpr_childr
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::fragment_qname;
-use crate::schema::source_markup::{adopt_source_children, attrs_xml, text_needs_preserve};
+use crate::schema::source_markup::{
+    adopt_source_children, adopt_source_rpr_children, attrs_xml, text_needs_preserve,
+};
 use crate::schema::wp_anchor::emit_anchor_open;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
@@ -213,7 +215,19 @@ impl PrChildren {
 
     /// Append every grab-bag fragment at its element's schema rank.
     fn push_bag(&mut self, bag: &Option<Box<engine::GrabBag>>, rank_of: fn(&[u8]) -> u16) {
+        /* Issue #104 — a bag captured before its element was modeled (a
+        crash-recovery snapshot written by an older build still carries
+        `<w:bCs/>` verbatim) never duplicates the child the model now
+        emits itself: the modeled value wins. */
+        let modeled: Vec<Vec<u8>> = self
+            .items
+            .iter()
+            .map(|(_, xml)| fragment_qname(xml.as_bytes()).to_vec())
+            .collect();
         for frag in engine::GrabBag::fragments_of(bag) {
+            if modeled.iter().any(|m| m.as_slice() == fragment_qname(frag)) {
+                continue;
+            }
             /* Fragments are byte slices of a part quick-xml already
             decoded as UTF-8; a lossy decode can only differ on bytes the
             reader would have rejected. */
@@ -229,6 +243,16 @@ impl PrChildren {
     fn adopt(&mut self, source: Option<&[u8]>) {
         if let Some(src) = source {
             adopt_source_children(&mut self.items, src);
+        }
+    }
+
+    /// Issue #249 — the `<w:rPr>` adoption: semantic (what the model
+    /// reads), keeps unowned attributes across a changed value and never
+    /// drops a source child the model reads as nothing
+    /// ([`adopt_source_rpr_children`]).
+    fn adopt_rpr(&mut self, source: Option<&[u8]>) {
+        if let Some(src) = source {
+            adopt_source_rpr_children(&mut self.items, src);
         }
     }
 
@@ -287,56 +311,76 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
     }
     let rank = rpr_child_rank;
     let mut ch = PrChildren::new();
+    /* Issue #104 — the character style the run references; its folded
+    properties follow as direct formatting, exactly as before. */
+    if let Some(id) = style.char_style.as_deref() {
+        let mut s = String::from("<w:rStyle w:val=\"");
+        push_escaped_attr(id, &mut s);
+        s.push_str("\"/>");
+        ch.push(rank(b"w:rStyle"), s);
+    }
     /* Audit gap A.M2 — `<w:rFonts>` round-trips a known FontFamily,
     a verbatim raw name, and/or a theme binding. The reader splits
     the source's `w:ascii` either into `font_family` (recognised) or
-    `raw_font_family` (verbatim string); the theme attrs park in
-    `font_theme`. Emit whichever slots are populated. */
+    `raw_font_family` (verbatim string); the theme attrs ride the slot
+    bindings (`font_bindings`, issue #355). Emit whichever slots are
+    populated. */
     let rfonts_name: Option<String> = style
         .font_family
         .as_ref()
         .map(|f| family_docx_name(f).to_string())
         .or_else(|| style.raw_font_family.clone());
+    /* Issue #249 — the complex-script slot writes `w:cs` from its own
+    field: a run whose source named only a Latin face gains no
+    synthesized `w:cs`, and an engine-authored font change (which sets
+    both slots) still writes all three name attributes. Issue #355 —
+    the theme attributes come from the slot bindings
+    ([`rfonts_theme_attrs`]; `w:cstheme` is the `cs` slot's). */
+    let cs_name = style.font_family_cs.as_ref().map(family_docx_name);
     let theme_attrs = rfonts_theme_attrs(style);
-    if rfonts_name.is_some() || !theme_attrs.is_empty() {
+    if rfonts_name.is_some() || cs_name.is_some() || !theme_attrs.is_empty() {
         let mut s = String::from("<w:rFonts");
-        if let Some(n) = rfonts_name.as_deref() {
-            s.push_str(" w:ascii=\"");
-            push_escaped_attr(n, &mut s);
-            s.push_str("\" w:hAnsi=\"");
-            push_escaped_attr(n, &mut s);
-            s.push_str("\" w:cs=\"");
-            push_escaped_attr(n, &mut s);
-            s.push('"');
-        }
-        for (attr, value) in theme_attrs {
+        let mut attr = |k: &str, v: &str| {
             s.push(' ');
-            s.push_str(attr);
+            s.push_str(k);
             s.push_str("=\"");
-            push_escaped_attr(value, &mut s);
+            push_escaped_attr(v, &mut s);
             s.push('"');
+        };
+        if let Some(n) = rfonts_name.as_deref() {
+            attr("w:ascii", n);
+            attr("w:hAnsi", n);
+        }
+        if let Some(n) = cs_name {
+            attr("w:cs", n);
+        }
+        for (k, v) in theme_attrs {
+            attr(k, v);
         }
         s.push_str("/>");
         ch.push(rank(b"w:rFonts"), s);
     }
-    if style.bold == Some(true) {
-        ch.push(rank(b"w:b"), "<w:b/>".into());
-    }
-    if style.italic == Some(true) {
-        ch.push(rank(b"w:i"), "<w:i/>".into());
-    }
-    /* CT_RPr ordering — caps/smallCaps sit between `<w:iCs/>` and
-    `<w:strike/>` (OOXML §17.3.2). When both are on, Word's writer
-    emits both; the reader's `apply_rpr` flips both flags and the
-    shape-time transform prefers `caps` (full-height) over `smallCaps`. */
-    if style.caps == Some(true) {
-        ch.push(rank(b"w:caps"), "<w:caps/>".into());
-    }
-    if style.small_caps == Some(true) {
-        ch.push(rank(b"w:smallCaps"), "<w:smallCaps/>".into());
-    }
-    if style.strike == Some(true) {
-        ch.push(rank(b"w:strike"), "<w:strike/>".into());
+    /* On/off properties. Issue #249 — an explicit OFF is written too
+    (`<w:b w:val="0"/>`): it overrides a bold paragraph / character style,
+    and dropping it on regeneration turned the run bold in Word. Issue
+    #104 — the complex-script twins (`bCs` / `iCs`) each from their own
+    slot. CT_RPr ordering — caps/smallCaps sit between `<w:iCs/>` and
+    `<w:strike/>` (OOXML §17.3.2); when both are on, Word's writer emits
+    both and the shape-time transform prefers `caps`. */
+    for (name, value) in [
+        ("w:b", style.bold),
+        ("w:bCs", style.bold_cs),
+        ("w:i", style.italic),
+        ("w:iCs", style.italic_cs),
+        ("w:caps", style.caps),
+        ("w:smallCaps", style.small_caps),
+        ("w:strike", style.strike),
+    ] {
+        match value {
+            Some(true) => ch.push(rank(name.as_bytes()), format!("<{name}/>")),
+            Some(false) => ch.push(rank(name.as_bytes()), format!("<{name} w:val=\"0\"/>")),
+            None => {}
+        }
     }
     if style.color.is_some() || style.color_theme.is_some() {
         /* Issue #355 — `w:val` stays the cached RGB (`auto` when only the
@@ -364,11 +408,17 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
         ch.push(rank(b"w:color"), s);
     }
     /* `<w:sz>` / `<w:szCs>` — Word's half-point encoding; round to nearest.
-    Emit both elements so ASCII + complex-script runs (Arabic, Hebrew,
-    Thai) both pick up the size. Word's own writer always pairs them. */
+    Issue #359 — each slot writes its own element: a source run with only
+    `<w:sz>` never gains a synthesized `<w:szCs>` (#249), and an
+    engine-authored size change sets both slots (`SpanStyle::
+    with_cs_twins`), so it still writes the pair Word writes. */
+    let half_points = |pt: f32| (pt * 2.0).round().max(2.0) as u32;
     if let Some(pt) = style.font_size {
-        let half_pts = (pt * 2.0).round().max(2.0) as u32;
+        let half_pts = half_points(pt);
         ch.push(rank(b"w:sz"), format!("<w:sz w:val=\"{half_pts}\"/>"));
+    }
+    if let Some(pt) = style.font_size_cs {
+        let half_pts = half_points(pt);
         ch.push(rank(b"w:szCs"), format!("<w:szCs w:val=\"{half_pts}\"/>"));
     }
     /* `<w:u w:val="…"/>` — emit only when the variant is visible. The
@@ -408,7 +458,7 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
         );
     }
     ch.push_bag(&style.grab_bag, rpr_child_rank);
-    ch.adopt(source);
+    ch.adopt_rpr(source);
     ch.finish("w:rPr", out);
 }
 
@@ -5715,13 +5765,16 @@ mod tests {
 
     #[test]
     fn round_trip_font_size_sz_szcs() {
-        /* Reader must lift `<w:sz>` / `<w:szCs>` into `SpanStyle.font_size`;
-        writer must emit both elements so ASCII + complex-script runs
-        agree on the size. Half-point math: 13.5 pt = w:val="27". */
+        /* Issue #359 — the reader lifts `<w:sz>` into `font_size` and
+        `<w:szCs>` into `font_size_cs`; the writer emits each slot it
+        holds (an engine-authored size sets both — `with_cs_twins`), so
+        Latin and complex-script text agree on the size. Half-point math:
+        13.5 pt = w:val="27". */
         let sized = SpanStyle {
             font_size: Some(13.5),
             ..Default::default()
-        };
+        }
+        .with_cs_twins();
         let para = Paragraph {
             text: "abc".into(),
             spans: vec![StyleRun {
@@ -5767,24 +5820,42 @@ mod tests {
             saved_doc_xml.contains("<w:szCs w:val=\"27\"/>"),
             "complex-script font-size element missing: {saved_doc_xml}"
         );
-        /* Reader round-trip — value must come back as 13.5 pt. */
+        /* Reader round-trip — both slots come back as 13.5 pt. */
         let parsed = read_docx(&bytes).expect("read");
-        assert_eq!(
-            parsed
-                .document
-                .nth_paragraph(0)
-                .unwrap()
-                .style_at(1)
-                .font_size,
-            Some(13.5)
-        );
+        let back = parsed.document.nth_paragraph(0).unwrap().style_at(1);
+        assert_eq!(back.font_size, Some(13.5));
+        assert_eq!(back.font_size_cs, Some(13.5));
+        /* A Latin-only size never synthesizes `<w:szCs>` (#249). */
+        let latin_only = DocumentTree::from_rich_paragraphs([Paragraph {
+            text: "abc".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 3,
+                style: SpanStyle {
+                    font_size: Some(11.0),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        }]);
+        let bytes = build_minimal_docx(&latin_only).expect("build");
+        let xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(xml.contains("<w:sz w:val=\"22\"/>"), "{xml}");
+        assert!(!xml.contains("<w:szCs"), "{xml}");
     }
 
     #[test]
-    fn reader_szcs_overrides_sz_when_both_present() {
-        /* OOXML lists `<w:szCs>` after `<w:sz>` in CT_RPr; complex-script
-        docs depend on it winning. `apply_rpr` folds both into the same
-        slot in document order, so the last one written wins. */
+    fn reader_keeps_sz_and_szcs_apart() {
+        /* Issue #359 — OOXML sizes Latin text by `<w:sz>` and
+        complex-script text by `<w:szCs>`; Arabic documents routinely
+        carry `w:sz="22" w:szCs="28"` on one run. The old single slot let
+        `szCs` win and laid the Latin text out at 14 pt. */
         use crate::schema::ct_rpr::apply_rpr;
         use quick_xml::events::Event;
         use quick_xml::reader::Reader;
@@ -5803,7 +5874,8 @@ mod tests {
             }
             buf.clear();
         }
-        assert_eq!(style.font_size, Some(14.0));
+        assert_eq!(style.font_size, Some(10.0));
+        assert_eq!(style.font_size_cs, Some(14.0));
     }
 
     #[test]
@@ -11026,6 +11098,11 @@ mod revision_id_tests;
 #[cfg(test)]
 #[path = "writer_comment_patch_tests.rs"]
 mod comment_patch_tests;
+
+/// Issues #359 / #104 / #249 — complex-script run properties.
+#[cfg(test)]
+#[path = "writer_complex_script_tests.rs"]
+mod complex_script_tests;
 
 /// Issue #355 — `<w:rFonts>` theme bindings.
 #[cfg(test)]

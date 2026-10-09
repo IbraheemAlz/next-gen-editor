@@ -385,7 +385,11 @@ async function handleInit(msg: InitMsg): Promise<void> {
             bytes: await fetchBytes(DUAL_URL),
         } as Command);
         self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
-    } else if (testCase === 'a4-justified-mixed' || testCase === 'rich-text') {
+    } else if (
+        testCase === 'a4-justified-mixed' ||
+        testCase === 'rich-text' ||
+        testCase === 'rich-text-cs-size'
+    ) {
         const arabic = await dispatch({
             type: 'LOAD_FONT',
             id: ARABIC_ID,
@@ -761,6 +765,42 @@ async function handleInit(msg: InitMsg): Promise<void> {
                     end: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 23 },
                 },
                 attrs: { small_caps: true },
+            } as Command);
+            break;
+        }
+
+        case 'rich-text-cs-size': {
+            /* Issue #359 — one run, two sizes: the Latin slot is set to 22
+               px and the complex-script slot (`font_slot: 'ComplexScript'`,
+               OOXML's `<w:szCs>`) to 40 px, so the Arabic words of the SAME
+               run render nearly twice as large as the Latin ones and the
+               line breaks follow both. */
+            const p0 = { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 };
+            const text =
+                'Latin text at the Latin size مع نص عربي بالحجم المعقد in one run, ' +
+                'wrapping across lines حيث يتبع كل سطر الحجمين معا.';
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text,
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 22,
+                line_height: 56,
+                align: 'START',
+            } as Command);
+            const whole = {
+                start: p0,
+                end: { ...p0, offset: new TextEncoder().encode(text).length },
+            };
+            await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: whole,
+                attrs: { font_size: 22, font_slot: 'Latin' },
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: whole,
+                attrs: { font_size: 40, font_slot: 'ComplexScript' },
             } as Command);
             break;
         }

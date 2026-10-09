@@ -483,6 +483,42 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   re-verify at every write. Never add an index-keyed side table.
 - Harness: `tools/roundtrip` step 30 (`table_source_markup.docx`).
 
+## Complex-script run properties (issues #359 / #104 / #249)
+
+- Every Latin run slot has a complex-script twin on `SpanStyle`:
+  `font_size` / `font_size_cs` (`<w:sz>` / `<w:szCs>`), `bold` /
+  `bold_cs` (`<w:b>` / `<w:bCs>`), `italic` / `italic_cs`, `font_family`
+  (`w:ascii`, else `w:hAnsi`) / `font_family_cs` (`w:cs`), `font_theme` /
+  `font_theme_cs` (`w:cstheme`). Read apart, cascaded independently (an
+  unset twin takes the cascade's twin, never the Latin value — Word's
+  rule), written from their own slot. Never fold one into the other.
+- Layout picks the set per piece by script class
+  (`text_pipeline::is_complex_script`; a grab-bag `<w:rtl/>` / `<w:cs/>`
+  forces the twins for the whole run — `SpanStyle::forces_complex_script`).
+- Engine-authored formatting sets both (`SpanStyle::with_cs_twins`:
+  `ApplyFormatting` with no `font_slot`, ModifyStyle, HTML paste);
+  `TextAttrsPatch.font_slot` = `Latin` / `ComplexScript` (the `cs_only`
+  flag) narrows it.
+- `SpanStyle::char_style` keeps the run's `<w:rStyle>` id next to the
+  folded style properties; the writer emits it first. A source
+  `<w:rPrChange>`'s recorded `<w:rStyle>` rides `Revision::prev_attrs`
+  the same way, so rejecting the change writes it back (#295 × #104).
+- The paragraph mark (`Paragraph::mark_style`, #293) goes through the
+  same `apply_rpr`, so its twins (`<w:bCs>`, `<w:szCs>`, `w:cs`) are
+  modeled there too; `<w:rStyle>` stays verbatim on a mark.
+- On/off properties write an explicit OFF (`<w:b w:val="0"/>`).
+- A regenerated `<w:rPr>` adopts its source by MEANING
+  (`schema::source_markup::adopt_source_rpr_children`): a child whose
+  source twin folds to the same model value keeps the source bytes
+  (`<w:b w:val="false" />`, `<w:rFonts w:ascii="X" />` without the
+  regenerated `w:hAnsi`, `<w:highlight>` for a regenerated `<w:shd>`); a
+  changed `<w:rFonts>` / `<w:u>` keeps its unowned attributes
+  (`w:eastAsia`, `w:hint`, `w:color`); a source child the model reads as
+  nothing (`<w:rFonts w:hint="cs"/>`, `<w:color w:val="auto"/>`) is
+  re-emitted. `<w:rStyle>` is never resurrected.
+- Harness: `tools/roundtrip` step 45 (`complex_script_size.docx`, a
+  `<w:bCs/>` + `<w:rStyle>` run, a Word-shaped Arabic run).
+
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.
 - Phase 2+ will introduce `Run` model with bold/italic/font/size. Add corresponding XML emission only when the parser reads them too.

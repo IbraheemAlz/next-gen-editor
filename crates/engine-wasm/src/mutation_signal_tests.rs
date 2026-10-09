@@ -85,6 +85,7 @@ fn no_attrs() -> TextAttrsPatch {
         language: None,
         caps: None,
         small_caps: None,
+        font_slot: None,
     }
 }
 

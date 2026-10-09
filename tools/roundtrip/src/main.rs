@@ -30,6 +30,7 @@
 //! Exit 0 on PASS, non-zero on FAIL.
 
 mod comments;
+mod complex_script;
 mod inline_spans;
 mod note_containers;
 mod package_families;
@@ -350,6 +351,7 @@ fn run_default() -> Result<()> {
     reader_hardening::run_field_phases_roundtrip()?;
     reader_hardening::run_alternate_content_roundtrip()?;
     comments::run_comment_patch_roundtrip()?;
+    complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
 
     println!("\nPASS");
@@ -4939,6 +4941,29 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         "commented text".into(),
                         "pictures \u{FFFC}\u{FFFC}".into(),
                         "last paragraph".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #359 — one run with `w:sz="22" w:szCs="28"` mixing Latin
+        and Arabic, a `<w:rtl/>` run, a run with only `w:sz` over a
+        docDefaults `w:szCs`. Zero-edit drift 0; the default harness's
+        step 45 edits it. */
+        PrebuiltFixture {
+            name: "complex_script_size.docx",
+            bytes: format_docx::test_fixtures::complex_script_size_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 3,
+                    paragraph_texts: vec![
+                        format_docx::test_fixtures::CS_SIZE_MIXED_TEXT.into(),
+                        format_docx::test_fixtures::CS_SIZE_RTL_TEXT.into(),
+                        format_docx::test_fixtures::CS_SIZE_CASCADE_TEXT.into(),
                     ],
                 },
                 roundtrip: RoundtripBounds {

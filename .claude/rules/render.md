@@ -14,6 +14,13 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
 - `PositionedGlyph` stores advances/offsets only, no absolute `x`; position is
   the run pen plus the cumulative `x_advance`. The pen advances for glyph id 0
   (`.notdef`) too, even though it is not drawn.
+- Issues #359 / #104 / #249 — a `StyleSpan` carries an optional
+  complex-script set (`StyleSpan::cs`: size, shift, weight, slant,
+  family; `None` when equal to the Latin set). `build_line` and the
+  width probe segment by script AND complex-script class
+  (`segment_by_script_class`) and shape each piece with
+  `StyleSpan::face_for(complex)` — keep the two in step, and never read
+  `span.px_size` / `span.bold` / `span.font_family` directly for a piece.
 
 ## Canvas2D backend
 

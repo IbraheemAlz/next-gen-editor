@@ -20,7 +20,9 @@ pub fn rpr_child_is_modeled(name: &[u8]) -> bool {
         b"w:rStyle"
             | b"w:rFonts"
             | b"w:b"
+            | b"w:bCs"
             | b"w:i"
+            | b"w:iCs"
             | b"w:caps"
             | b"w:smallCaps"
             | b"w:strike"
@@ -243,6 +245,13 @@ pub fn family_from_docx(name: &str) -> Option<FontFamily> {
     FontFamily::from_display_name(name)
 }
 
+/// `<w:sz>` / `<w:szCs>` `w:val` (half-points) as points.
+fn half_points(e: &BytesStart) -> Option<f32> {
+    attr_val(e, b"w:val")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|half_pts| (half_pts as f32) / 2.0)
+}
+
 /// An OOXML toggle property: bare `<w:b/>` is on; `<w:b w:val="false"/>` off.
 pub fn toggle_on(e: &BytesStart) -> bool {
     match attr_val(e, b"w:val") {
@@ -255,7 +264,11 @@ pub fn toggle_on(e: &BytesStart) -> bool {
 pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
     match name {
         b"w:b" => style.bold = Some(toggle_on(e)),
+        /* Issue #104 — the complex-script twins Word bolds / italicizes
+        Arabic, Hebrew, Thai, … text by. */
+        b"w:bCs" => style.bold_cs = Some(toggle_on(e)),
         b"w:i" => style.italic = Some(toggle_on(e)),
+        b"w:iCs" => style.italic_cs = Some(toggle_on(e)),
         b"w:strike" => style.strike = Some(toggle_on(e)),
         b"w:caps" => style.caps = Some(toggle_on(e)),
         b"w:smallCaps" => style.small_caps = Some(toggle_on(e)),
@@ -310,37 +323,51 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             three the engine has loaded. Resolved names hit
             `font_family`; unresolved names park in `raw_font_family`
             so the writer round-trips them verbatim (Word reopens with
-            the original face the author chose). Theme attributes
-            (`asciiTheme` / `hAnsiTheme` / `cstheme`) park in
-            `font_theme` — Word's "Update Style" depends on them. */
-            let name = attr_val(e, b"w:ascii")
-                .or_else(|| attr_val(e, b"w:hAnsi"))
-                .or_else(|| attr_val(e, b"w:cs"));
+            the original face the author chose). The Latin theme
+            attributes (`asciiTheme` / `hAnsiTheme`) still park in the
+            legacy single-slot `font_theme`; every slot's binding rides
+            `font_bindings` (issue #355), which the writer prefers. */
+            let name = attr_val(e, b"w:ascii").or_else(|| attr_val(e, b"w:hAnsi"));
             if let Some(n) = name {
                 match family_from_docx(&n) {
                     Some(fam) => style.font_family = Some(fam),
                     None => style.raw_font_family = Some(n),
                 }
             }
-            let theme = attr_val(e, b"w:asciiTheme")
-                .or_else(|| attr_val(e, b"w:hAnsiTheme"))
-                .or_else(|| attr_val(e, b"w:cstheme"));
+            let theme = attr_val(e, b"w:asciiTheme").or_else(|| attr_val(e, b"w:hAnsiTheme"));
             if let Some(t) = theme {
                 style.font_theme = Some(t);
             }
-            /* Issue #355 — the per-slot bindings layout resolves through. */
-            style.font_bindings = crate::parts::theme::rfonts_bindings(e);
+            /* Issue #249 — the complex-script slot stays apart: an
+            Arabic run naming `w:ascii="Times New Roman"
+            w:cs="Simplified Arabic"` shapes its Latin with the first and
+            its Arabic with the second (`w:cs` alone no longer becomes the
+            Latin face either). `w:eastAsia` / `w:hint` stay unmodeled —
+            the writer carries them over from the source element. */
+            let cs_family = attr_val(e, b"w:cs").and_then(|n| family_from_docx(&n));
+            let cs_modeled = cs_family.is_some();
+            if let Some(fam) = cs_family {
+                style.font_family_cs = Some(fam);
+            }
+            /* Issue #355 — the per-slot bindings layout resolves through
+            (name vs theme reference per ascii / hAnsi / eastAsia / cs);
+            `w:cstheme` lives only here, on the `cs` slot. */
+            style.font_bindings = crate::parts::theme::rfonts_bindings(e, cs_modeled);
         }
         /* `<w:sz w:val="N"/>` and `<w:szCs w:val="N"/>` — N is half-points
-        (Word's native encoding; `w:val="24"` = 12 pt). `w:sz` targets ASCII
-        + high-ANSI runs; `w:szCs` targets complex-script (Arabic, Hebrew,
-        Thai) runs. The engine carries one `font_size` slot, so both fold
-        into it; `w:szCs` wins when both appear because OOXML lists it
-        second in CT_RPr and complex-script docs depend on it. */
-        b"w:sz" | b"w:szCs" => {
-            if let Some(half_pts) = attr_val(e, b"w:val").and_then(|v| v.trim().parse::<u32>().ok())
-            {
-                style.font_size = Some((half_pts as f32) / 2.0);
+        (Word's native encoding; `w:val="24"` = 12 pt). `w:sz` sizes the
+        Latin (ASCII + high-ANSI) characters, `w:szCs` the complex-script
+        ones (Arabic, Hebrew, Thai, …). Issue #359 — two slots: Arabic
+        documents routinely carry `w:sz="22" w:szCs="28"` on one run, and
+        folding both into one size laid the Latin text out at 14 pt. */
+        b"w:sz" => {
+            if let Some(pt) = half_points(e) {
+                style.font_size = Some(pt);
+            }
+        }
+        b"w:szCs" => {
+            if let Some(pt) = half_points(e) {
+                style.font_size_cs = Some(pt);
             }
         }
         _ => {}
@@ -381,7 +408,8 @@ mod tests {
         assert!(rpr_child_rank(b"w14:glow") < rpr_child_rank(b"w:rPrChange"));
         assert!(rpr_child_is_modeled(b"w:highlight"));
         assert!(rpr_child_is_modeled(b"w:rStyle"));
-        assert!(!rpr_child_is_modeled(b"w:bCs"));
+        assert!(rpr_child_is_modeled(b"w:bCs"));
+        assert!(rpr_child_is_modeled(b"w:iCs"));
         assert!(!rpr_child_is_modeled(b"w:lang"));
     }
 

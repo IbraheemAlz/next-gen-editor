@@ -134,7 +134,11 @@ fn word_default_theme_names_reach_layout_and_fall_back() {
         let p = doc.nth_paragraph(i).expect("paragraph");
         build_style_spans(p, sctx, 11.0, [0, 0, 0, 255], 1.0)
             .into_iter()
-            .map(|s| (s.font_family, s.font_family_cs))
+            .map(|s| {
+                /* The complex-script piece's family (issue #359's twin set). */
+                let cs = s.face_for(true).font_family.map(str::to_string);
+                (s.font_family, cs)
+            })
             .collect()
     };
     let pair = |l: &str, c: &str| (Some(l.to_string()), Some(c.to_string()));

@@ -19,9 +19,9 @@ pub(crate) fn span(len: u32) -> StyleSpan {
         strike: false,
         bg_color: None,
         font_family: None,
-        font_family_cs: None,
         caps_transform: false,
         baseline_shift_px: 0.0,
+        cs: None,
     }
 }
 
@@ -51,11 +51,11 @@ pub(crate) fn para(
     marker: Option<&str>,
     rtl: bool,
 ) -> ParagraphBox {
-    /* Issue #355 — Arabic-script segments take the complex-script
-    family slot. */
+    /* Issues #355 / #359 — complex-script pieces take `StyleSpan::cs`'s
+    face; `cs: None` (from `span`) means it equals the Latin set, so the
+    Arabic text shapes in `font_family`. */
     let spans = [StyleSpan {
         font_family: rtl.then(|| "amiri".into()),
-        font_family_cs: rtl.then(|| "amiri".into()),
         ..span(text.len() as u32)
     }];
     let mut p = layout_paragraph(ParagraphConfig {

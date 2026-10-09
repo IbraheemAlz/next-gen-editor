@@ -395,12 +395,13 @@ impl RunFontBindings {
 /// document writes `w:ascii="Arial"` and the text shows Arial, although
 /// the inherited `w:asciiTheme` was never removed. A patch without
 /// bindings that still names a family (the toolbar, `ModifyStyle`, HTML
-/// paste) claims the three slots the writer spells for it — ascii, hAnsi,
-/// cs — so their inherited theme bindings yield.
+/// paste) claims the slots the writer spells for it ([`SlotClaims`]): a
+/// Latin family `ascii` + `hAnsi`, a complex-script family (issue #249)
+/// `cs` — so their inherited theme bindings yield.
 pub(crate) fn merge_font_bindings(
     base: Option<Box<RunFontBindings>>,
     patch: Option<Box<RunFontBindings>>,
-    patch_names_family: bool,
+    claims: SlotClaims,
 ) -> Option<Box<RunFontBindings>> {
     match (base, patch) {
         (base, Some(p)) => {
@@ -413,16 +414,33 @@ pub(crate) fn merge_font_bindings(
             };
             (!merged.is_empty()).then(|| Box::new(merged))
         }
-        (Some(mut b), None) if patch_names_family => {
-            for slot in [&mut b.ascii, &mut b.h_ansi, &mut b.cs] {
+        (Some(mut b), None) if claims.latin || claims.complex_script => {
+            let claim = |slot: &mut Option<FontBinding>| {
                 if matches!(slot, Some(FontBinding::Theme(_))) {
                     *slot = Some(FontBinding::Name);
                 }
+            };
+            if claims.latin {
+                claim(&mut b.ascii);
+                claim(&mut b.h_ansi);
+            }
+            if claims.complex_script {
+                claim(&mut b.cs);
             }
             Some(b)
         }
         (base, None) => base,
     }
+}
+
+/// Issues #355 / #249 — which `<w:rFonts>` slots a binding-less patch
+/// names a family for ([`merge_font_bindings`]): `latin` — `font_family` /
+/// `raw_font_family` (written as `w:ascii` + `w:hAnsi`); `complex_script`
+/// — `font_family_cs` (written as `w:cs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SlotClaims {
+    pub latin: bool,
+    pub complex_script: bool,
 }
 
 /// The text class a family is resolved for — which `<w:rFonts>` slot
@@ -484,9 +502,12 @@ impl crate::SpanStyle {
     /// name, which is how a producer that writes both caches the
     /// resolved face.
     ///
-    /// The explicit family is the reader's single name slot (`w:ascii`,
-    /// else `w:hAnsi`, else `w:cs`) for every class until the per-slot
-    /// names land (issue #249).
+    /// The explicit family is the class's own name slot (issue #249):
+    /// `font_family` / `raw_font_family` (`w:ascii`, else `w:hAnsi`) for
+    /// the Latin classes and East Asian text, `font_family_cs` (`w:cs`)
+    /// for complex-script text — which never borrows the Latin name, as
+    /// in Word (an unset `w:cs` leaves Arabic text on the font stack's
+    /// per-script face, not on the run's Latin face).
     pub fn resolve_font(
         &self,
         theme: Option<&DocumentTheme>,
@@ -509,17 +530,18 @@ impl crate::SpanStyle {
                 from_theme: true,
             });
         }
-        self.font_family
-            .clone()
-            .or_else(|| {
+        let explicit = match class {
+            FontClass::ComplexScript => self.font_family_cs.clone(),
+            _ => self.font_family.clone().or_else(|| {
                 self.raw_font_family
                     .as_deref()
                     .and_then(crate::FontFamily::from_display_name)
-            })
-            .map(|family| ResolvedFont {
-                family,
-                from_theme: false,
-            })
+            }),
+        };
+        explicit.map(|family| ResolvedFont {
+            family,
+            from_theme: false,
+        })
     }
 }
 
@@ -981,11 +1003,25 @@ mod tests {
             Some("Calibri")
         );
 
-        /* The toolbar (no bindings) claims ascii / hAnsi / cs. */
-        let toolbar = crate::SpanStyle {
+        /* A Latin-only pick (no bindings, `FontSlot::Latin`) claims
+        ascii / hAnsi alone — issue #249: Arabic keeps its theme face. */
+        let latin_only = crate::SpanStyle {
             font_family: Some(crate::FontFamily::Amiri),
             ..Default::default()
         };
+        let eff = defaults().merged_with(latin_only.clone());
+        assert_eq!(family(&eff, &t, FontClass::Latin).as_deref(), Some("Amiri"));
+        assert_eq!(
+            family(&eff, &t, FontClass::ComplexScript).as_deref(),
+            Some("Arial")
+        );
+        let b = eff.font_bindings.as_deref().unwrap();
+        assert_eq!(b.h_ansi, Some(FontBinding::Name));
+        assert_eq!(b.cs, theme_b("minorBidi"));
+
+        /* The toolbar (no bindings, both script slots — `with_cs_twins`)
+        claims ascii / hAnsi / cs. */
+        let toolbar = latin_only.with_cs_twins();
         let eff = defaults().merged_with(toolbar);
         assert_eq!(family(&eff, &t, FontClass::Latin).as_deref(), Some("Amiri"));
         assert_eq!(

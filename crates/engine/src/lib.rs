@@ -1527,6 +1527,41 @@ impl GrabBag {
     }
 }
 
+/// Issue #359 — `true` when `fragment` is an OOXML on/off toggle element
+/// named `qname` that is ON: bare `<w:rtl/>`, or a `w:val` other than
+/// `false` / `0` / `off` (ECMA-376 Part 1 §17.17.4, `ST_OnOff`). A
+/// different element, including one whose name merely starts with
+/// `qname` (`<w:rtlGutter/>`), is `false`.
+pub fn toggle_fragment_on(fragment: &[u8], qname: &[u8]) -> bool {
+    let Some(rest) = fragment
+        .strip_prefix(b"<")
+        .and_then(|f| f.strip_prefix(qname))
+    else {
+        return false;
+    };
+    match rest.first() {
+        Some(b'/' | b'>') => true,
+        Some(c) if c.is_ascii_whitespace() => {
+            let Some(at) = rest.windows(6).position(|w| w == b"w:val=") else {
+                return true;
+            };
+            let value = &rest[at + 6..];
+            let Some((&quote, value)) = value.split_first() else {
+                return true;
+            };
+            let end = value
+                .iter()
+                .position(|&b| b == quote)
+                .unwrap_or(value.len());
+            !matches!(
+                value[..end].to_ascii_lowercase().as_slice(),
+                b"false" | b"0" | b"off"
+            )
+        }
+        _ => false,
+    }
+}
+
 /// Issues #199 / #106 — one raw XML attribute captured from a source
 /// element the model reads only partially (`<w:p w:rsidR="…">`,
 /// `<w:r w:rsidRPr="…">`, `<w:t xml:space="preserve">`). `name` is the
@@ -2123,17 +2158,58 @@ impl DocumentEnvelope {
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
+///
+/// Issues #359 / #104 / #249 — OOXML formats every character with ONE of
+/// two property sets chosen by its script class: the Latin slots
+/// (`font_size` = `<w:sz>`, …) or their complex-script twins
+/// (`font_size_cs` = `<w:szCs>`, …) for Arabic / Hebrew / Thai / …
+/// characters ([`text_pipeline`'s `is_complex_script`]) and for every
+/// character of a run flagged `<w:rtl/>` / `<w:cs/>`
+/// ([`Self::forces_complex_script`]). The twins cascade independently,
+/// exactly like Word: a run with `<w:sz w:val="22"/><w:szCs
+/// w:val="28"/>` lays its Latin text out at 11 pt and its Arabic at 14 pt.
+/// Engine-authored formatting writes both slots
+/// ([`Self::with_cs_twins`]) unless the caller names one.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct SpanStyle {
     pub font_size: Option<f32>,
+    /// Issue #359 — `<w:szCs>`: the complex-script twin of
+    /// [`Self::font_size`], in points. Absent from snapshots while unset,
+    /// so a document without complex-script sizes snapshots byte-for-byte
+    /// as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_size_cs: Option<f32>,
     pub color: Option<[u8; 4]>,
     pub bold: Option<bool>,
+    /// Issue #104 — `<w:bCs>`: the complex-script twin of [`Self::bold`].
+    /// Word bolds Arabic text by `bCs`, so un-bolding through the UI must
+    /// clear it too. Absent from snapshots while unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold_cs: Option<bool>,
     pub italic: Option<bool>,
+    /// Issue #104 — `<w:iCs>`: the complex-script twin of [`Self::italic`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic_cs: Option<bool>,
     pub underline: Option<UnderlineStyle>,
     pub strike: Option<bool>,
     pub bg_color: Option<[u8; 4]>,
     pub font_family: Option<FontFamily>,
+    /// Issue #249 — `<w:rFonts w:cs>`: the complex-script twin of
+    /// [`Self::font_family`] (which holds `w:ascii` / `w:hAnsi`). Arabic
+    /// documents name a Latin face and an Arabic face on the same run;
+    /// folding them into one slot shaped the Arabic with the Latin face.
+    /// The slot's theme binding (`w:cstheme`) rides
+    /// [`Self::font_bindings`]`.cs` (issue #355).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_family_cs: Option<FontFamily>,
+    /// Issue #104 — the run's `<w:rStyle>` character-style id. The reader
+    /// still folds the style's properties into the span (the layout and
+    /// toolbar read one flat style); the id rides along so a regenerated
+    /// run writes `<w:rStyle>` back instead of flattening the character
+    /// style into direct formatting (Word's "clear formatting" keeps it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub char_style: Option<String>,
     /// `<w:caps/>` — display every character of the run as its uppercase
     /// equivalent. Applied as a `to_uppercase` transform at shape time so
     /// glyph metrics + BiDi + line breaking all see the visible string.
@@ -2210,13 +2286,99 @@ impl SpanStyle {
         }
     }
 
+    /// Issue #359 — mirror every set Latin slot onto its unset
+    /// complex-script twin: the "both slots" rule of engine-authored
+    /// formatting (Word's ribbon size / bold / italic / font apply to both
+    /// script classes). A twin the caller already set is kept.
+    pub fn with_cs_twins(mut self) -> SpanStyle {
+        if self.font_size_cs.is_none() {
+            self.font_size_cs = self.font_size;
+        }
+        if self.bold_cs.is_none() {
+            self.bold_cs = self.bold;
+        }
+        if self.italic_cs.is_none() {
+            self.italic_cs = self.italic;
+        }
+        if self.font_family_cs.is_none() {
+            self.font_family_cs = self.font_family.clone();
+        }
+        self
+    }
+
+    /// Issue #359 — the `cs_only` form of a formatting patch: every Latin
+    /// slot moves onto its complex-script twin and the Latin slot is left
+    /// unset, so applying the patch touches only complex-script text.
+    pub fn into_cs_only(mut self) -> SpanStyle {
+        if let Some(size) = self.font_size.take() {
+            self.font_size_cs = Some(size);
+        }
+        if let Some(bold) = self.bold.take() {
+            self.bold_cs = Some(bold);
+        }
+        if let Some(italic) = self.italic.take() {
+            self.italic_cs = Some(italic);
+        }
+        if let Some(family) = self.font_family.take() {
+            self.font_family_cs = Some(family);
+        }
+        self
+    }
+
+    /// Issue #359 — `self` as complex-script text sees it: every Latin
+    /// slot replaced by its complex-script twin (unset twin ⇒ unset, the
+    /// caller's default applies — the twins never fall back on each
+    /// other). The toolbar read-back uses it so a caret in Arabic text
+    /// reports the size Word shows there. Issue #355 — the `cs` slot
+    /// binding moves onto the Latin slots too, so resolving the view's
+    /// Latin family ([`SpanStyle::resolve_font`]) answers what Arabic
+    /// text resolves.
+    pub fn complex_script_view(&self) -> SpanStyle {
+        let font_bindings = self.font_bindings.as_deref().and_then(|b| {
+            let view = RunFontBindings {
+                ascii: b.cs.clone(),
+                h_ansi: b.cs.clone(),
+                east_asia: b.east_asia.clone(),
+                cs: b.cs.clone(),
+            };
+            (!view.is_empty()).then(|| Box::new(view))
+        });
+        SpanStyle {
+            font_size: self.font_size_cs,
+            bold: self.bold_cs,
+            italic: self.italic_cs,
+            font_family: self.font_family_cs.clone(),
+            raw_font_family: None,
+            font_theme: None,
+            font_bindings,
+            ..self.clone()
+        }
+    }
+
+    /// Issue #359 — `true` when the run carries `<w:rtl/>` or `<w:cs/>`
+    /// (both ride the grab bag): OOXML then formats EVERY character of the
+    /// run — Latin digits and punctuation included — with the
+    /// complex-script twins (ECMA-376 Part 1 §17.3.2.7 / §17.3.2.30).
+    pub fn forces_complex_script(&self) -> bool {
+        GrabBag::fragments_of(&self.grab_bag)
+            .iter()
+            .any(|f| toggle_fragment_on(f, b"w:rtl") || toggle_fragment_on(f, b"w:cs"))
+    }
+
     /// Overlay `patch`'s set fields onto `self`.
     pub fn merged_with(self, patch: SpanStyle) -> SpanStyle {
         /* Issue #355 — an engine-authored family (no slot bindings) claims
-        the slots its writer spells; see `theme::merge_font_bindings`. */
-        let names_family = patch.font_bindings.is_none()
-            && (patch.font_family.is_some() || patch.raw_font_family.is_some());
-        let font_theme = if names_family && patch.font_theme.is_none() {
+        the slots its writer spells; see `theme::merge_font_bindings`.
+        Issue #249 — per script slot: a Latin family (`w:ascii` /
+        `w:hAnsi`) claims those two, a complex-script one (`w:cs`) the
+        `cs` slot, so a Latin-only font pick leaves the Arabic text on
+        its theme face. */
+        let claims = theme::SlotClaims {
+            latin: patch.font_bindings.is_none()
+                && (patch.font_family.is_some() || patch.raw_font_family.is_some()),
+            complex_script: patch.font_bindings.is_none() && patch.font_family_cs.is_some(),
+        };
+        let font_theme = if claims.latin && patch.font_theme.is_none() {
             None
         } else {
             patch.font_theme.or(self.font_theme)
@@ -2230,13 +2392,18 @@ impl SpanStyle {
         };
         SpanStyle {
             font_size: patch.font_size.or(self.font_size),
+            font_size_cs: patch.font_size_cs.or(self.font_size_cs),
             color: patch.color.or(self.color),
             bold: patch.bold.or(self.bold),
+            bold_cs: patch.bold_cs.or(self.bold_cs),
             italic: patch.italic.or(self.italic),
+            italic_cs: patch.italic_cs.or(self.italic_cs),
             underline: patch.underline.or(self.underline),
             strike: patch.strike.or(self.strike),
             bg_color: patch.bg_color.or(self.bg_color),
             font_family: patch.font_family.or(self.font_family),
+            font_family_cs: patch.font_family_cs.or(self.font_family_cs),
+            char_style: patch.char_style.or(self.char_style),
             caps: patch.caps.or(self.caps),
             small_caps: patch.small_caps.or(self.small_caps),
             vert_align: patch.vert_align.or(self.vert_align),
@@ -2250,7 +2417,7 @@ impl SpanStyle {
             font_bindings: theme::merge_font_bindings(
                 self.font_bindings,
                 patch.font_bindings,
-                names_family,
+                claims,
             ),
             color_theme,
         }
@@ -11778,6 +11945,103 @@ impl UndoStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* ---- issues #359 / #104 / #249: complex-script twins ---------- */
+
+    #[test]
+    fn toggle_fragment_on_reads_st_on_off() {
+        assert!(toggle_fragment_on(b"<w:rtl/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl w:val=\"true\"/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl w:val='1'/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl></w:rtl>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"false\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"0\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"off\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtlGutter/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:lang w:bidi=\"ar-SA\"/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:cs/>", b"w:cs"));
+    }
+
+    #[test]
+    fn rtl_or_cs_in_the_bag_forces_complex_script() {
+        let mut s = SpanStyle::default();
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:lang w:val=\"en-US\"/>".to_vec());
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:rtl w:val=\"0\"/>".to_vec());
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:cs/>".to_vec());
+        assert!(s.forces_complex_script());
+    }
+
+    #[test]
+    fn cs_twins_mirror_move_and_view() {
+        let latin = SpanStyle {
+            font_size: Some(11.0),
+            ..Default::default()
+        };
+        let both = latin.clone().with_cs_twins();
+        assert_eq!(both.font_size_cs, Some(11.0));
+        /* A twin the caller set is kept. */
+        let kept = SpanStyle {
+            font_size_cs: Some(14.0),
+            ..latin.clone()
+        }
+        .with_cs_twins();
+        assert_eq!(kept.font_size_cs, Some(14.0));
+        let cs_only = latin.clone().into_cs_only();
+        assert_eq!(
+            (cs_only.font_size, cs_only.font_size_cs),
+            (None, Some(11.0))
+        );
+        /* The view never falls back across twins. */
+        assert_eq!(latin.complex_script_view().font_size, None);
+        assert_eq!(kept.complex_script_view().font_size, Some(14.0));
+        /* The twins cascade independently. */
+        let base = SpanStyle {
+            font_size: Some(12.0),
+            font_size_cs: Some(16.0),
+            ..Default::default()
+        };
+        let merged = base.merged_with(latin);
+        assert_eq!(
+            (merged.font_size, merged.font_size_cs),
+            (Some(11.0), Some(16.0))
+        );
+        /* Issue #104 — the weight / slant twins follow the same rules. */
+        let bold = SpanStyle {
+            bold: Some(true),
+            italic: Some(false),
+            ..Default::default()
+        };
+        let both = bold.clone().with_cs_twins();
+        assert_eq!((both.bold_cs, both.italic_cs), (Some(true), Some(false)));
+        let cs_only = bold.clone().into_cs_only();
+        assert_eq!((cs_only.bold, cs_only.bold_cs), (None, Some(true)));
+        let view = SpanStyle {
+            bold_cs: Some(false),
+            ..bold
+        }
+        .complex_script_view();
+        assert_eq!((view.bold, view.italic), (Some(false), None));
+        /* Issue #249 — the family slot too. */
+        let fam = SpanStyle {
+            font_family: Some(FontFamily::LiberationSans),
+            font_theme: Some("minorHAnsi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fam.clone().with_cs_twins().font_family_cs,
+            Some(FontFamily::LiberationSans)
+        );
+        let cs_only = fam.clone().into_cs_only();
+        assert_eq!(
+            (cs_only.font_family, cs_only.font_family_cs),
+            (None, Some(FontFamily::LiberationSans))
+        );
+        let view = fam.complex_script_view();
+        assert_eq!((view.font_family, view.font_theme), (None, None));
+    }
 
     /* ---- issue #23: dynamic, string-backed FontFamily ------------- */
 

@@ -133,14 +133,10 @@ pub struct StyleSpan {
     pub strike: bool,
     pub bg_color: Option<[u8; 4]>,
     /// Resolved font id for an explicit family request; `None` keeps the
-    /// per-script default face (Backlog #9). Issue #355 — serves every
-    /// segment except Arabic-script ones (see [`Self::font_family_cs`]).
+    /// per-script default face (Backlog #9). Issue #355 — the Latin slot
+    /// (`w:ascii` / `w:hAnsi` + their theme bindings): serves every piece
+    /// except complex-script ones, which take [`Self::cs`]'s family.
     pub font_family: Option<String>,
-    /// Issue #355 — resolved font id for the span's Arabic-script segments
-    /// (the `<w:rFonts>` complex-script slot: `w:cs` / `w:cstheme`);
-    /// `None` keeps the per-script default face. A theme can name
-    /// different body faces for Latin and Arabic text in one run.
-    pub font_family_cs: Option<String>,
     /// Audit gap A.H3 — uppercase the source bytes of this span before
     /// shaping. Set by `build_style_spans` for `<w:caps>` and `<w:smallCaps>`
     /// spans; the shaper guards against case-changing length deltas
@@ -159,6 +155,84 @@ pub struct StyleSpan {
     /// and the line doesn't grow visibly when a single superscript
     /// gets inserted into a body run.
     pub baseline_shift_px: f32,
+    /// Issues #359 / #104 / #249 — the complex-script twins of the
+    /// size / weight / slant / family above (`<w:szCs>`, `<w:bCs>`,
+    /// `<w:iCs>`, `<w:rFonts w:cs>`), used for every piece of the span
+    /// whose characters are complex script (`text_pipeline::
+    /// is_complex_script`) — or for the whole span when
+    /// [`ComplexScriptAttrs::whole_span`]. `None` ⇒ complex-script text
+    /// formats exactly like the rest of the span (the engine leaves it
+    /// `None` whenever the twins equal the Latin attributes).
+    pub cs: Option<ComplexScriptAttrs>,
+}
+
+/// Issues #359 / #104 / #249 — a [`StyleSpan`]'s complex-script attribute
+/// set (see [`StyleSpan::cs`]). Sizes are layout px like the span's own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComplexScriptAttrs {
+    pub px_size: f32,
+    /// `<w:vertAlign>` shift recomputed against [`Self::px_size`].
+    pub baseline_shift_px: f32,
+    pub bold: bool,
+    pub italic: bool,
+    /// Resolved font id of the complex-script slot (`<w:rFonts w:cs>`,
+    /// or its `w:cstheme` binding through the document theme — issue
+    /// #355); `None` keeps the per-script default face. A theme can name
+    /// different body faces for Latin and Arabic text in one run.
+    pub font_family: Option<String>,
+    /// The run is flagged `<w:rtl/>` / `<w:cs/>`: every character —
+    /// Latin digits and punctuation included — uses this set.
+    pub whole_span: bool,
+}
+
+/// The attributes one shaped piece of a [`StyleSpan`] uses — the Latin set
+/// or the complex-script twins ([`StyleSpan::face_for`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpanFace<'a> {
+    pub px_size: f32,
+    pub baseline_shift_px: f32,
+    pub bold: bool,
+    pub italic: bool,
+    pub font_family: Option<&'a str>,
+}
+
+impl StyleSpan {
+    /// Issues #359 / #104 / #249 — attach `cs` as this span's
+    /// complex-script set, or clear it when it formats exactly like the
+    /// Latin set (then [`Self::face_for`] answers the same either way, and
+    /// the nominal path carries no twin).
+    pub fn with_cs(mut self, cs: ComplexScriptAttrs) -> StyleSpan {
+        let same = cs.px_size == self.px_size
+            && cs.baseline_shift_px == self.baseline_shift_px
+            && cs.bold == self.bold
+            && cs.italic == self.italic
+            && cs.font_family == self.font_family;
+        self.cs = (!same).then_some(cs);
+        self
+    }
+
+    /// Issues #359 / #104 / #249 — the attribute set a piece of this span
+    /// shapes with: the complex-script twins when the piece's characters
+    /// are complex script (`complex`) or the span forces them
+    /// ([`ComplexScriptAttrs::whole_span`]), the Latin set otherwise.
+    pub fn face_for(&self, complex: bool) -> SpanFace<'_> {
+        match &self.cs {
+            Some(cs) if complex || cs.whole_span => SpanFace {
+                px_size: cs.px_size,
+                baseline_shift_px: cs.baseline_shift_px,
+                bold: cs.bold,
+                italic: cs.italic,
+                font_family: cs.font_family.as_deref(),
+            },
+            _ => SpanFace {
+                px_size: self.px_size,
+                baseline_shift_px: self.baseline_shift_px,
+                bold: self.bold,
+                italic: self.italic,
+                font_family: self.font_family.as_deref(),
+            },
+        }
+    }
 }
 
 /// One shaped glyph, positioned by advance/offset relative to the pen. There is

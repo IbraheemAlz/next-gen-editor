@@ -67,16 +67,23 @@ pub fn read_document_theme(
 /// the slot is named, else nothing.
 ///
 /// `None` when the element binds no slot (a bare `w:hint`) and for the
-/// canonical shape — no theme attribute, names on `ascii`, `hAnsi` and
-/// `cs` (what the engine's own writer spells for a family), with or
-/// without an `eastAsia` name: a family without bindings claims exactly
-/// those three slots in [`engine::SpanStyle::merged_with`], so the two are
-/// the same statement for everything layout resolves (it has no East
-/// Asian class), an engine-authored family round-trips to an equal style,
-/// and Word's common all-four-names spelling keeps coalescing with an
-/// equally formatted neighbour instead of splitting a shaping run over a
-/// slot nothing reads.
-pub fn rfonts_bindings(e: &BytesStart) -> Option<Box<RunFontBindings>> {
+/// canonical shapes — no theme attribute, and exactly the name claims the
+/// model's own names imply: a Latin name on both `ascii` and `hAnsi` (or
+/// neither), a complex-script name on `cs` only when the model holds it
+/// (`cs_modeled` — the reader resolved it into `font_family_cs`, issue
+/// #249), an `eastAsia` name only alongside the Latin pair. A family
+/// without bindings claims exactly those slots in
+/// [`engine::SpanStyle::merged_with`] (`ascii` + `hAnsi` for a Latin name,
+/// `cs` for `font_family_cs`), so the two are the same statement for
+/// everything layout resolves (it has no East Asian class), an
+/// engine-authored family round-trips to an equal style (whichever script
+/// slots it set), and Word's common all-four-names spelling keeps
+/// coalescing with an equally formatted neighbour instead of splitting a
+/// shaping run over a slot nothing reads. A `w:cs` name the model cannot
+/// hold keeps the bindings explicit, so its `cs` claim survives the
+/// cascade (an inherited `w:cstheme` must not take that run's Arabic
+/// text over).
+pub fn rfonts_bindings(e: &BytesStart, cs_modeled: bool) -> Option<Box<RunFontBindings>> {
     let w_attr = |key: &[u8]| crate::schema::ct_rpr::attr_val(e, key);
     let slot = |name: &[u8], theme: &[u8]| match w_attr(theme) {
         Some(t) => Some(FontBinding::Theme(t)),
@@ -89,10 +96,12 @@ pub fn rfonts_bindings(e: &BytesStart) -> Option<Box<RunFontBindings>> {
         cs: slot(b"w:cs", b"w:cstheme"),
     };
     let named = Some(FontBinding::Name);
-    let canonical = b.ascii == named
-        && b.h_ansi == named
-        && b.cs == named
-        && matches!(b.east_asia, None | Some(FontBinding::Name));
+    let latin_pair = b.ascii == named && b.h_ansi == named;
+    let latin_none = b.ascii.is_none() && b.h_ansi.is_none();
+    let cs_implied = b.cs.is_none() || (b.cs == named && cs_modeled);
+    let east_asia_implied = b.east_asia.is_none() || (latin_pair && b.east_asia == named);
+    let canonical =
+        (latin_pair || (latin_none && b.cs == named)) && cs_implied && east_asia_implied;
     (!b.is_empty() && !canonical).then(|| Box::new(b))
 }
 

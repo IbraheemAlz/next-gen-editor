@@ -105,6 +105,7 @@ export type {
     UnderlineStyle,
     VerticalScript,
     FormattingToggle,
+    FontSlot,
     Alignment,
     Direction,
     PdfConformance,

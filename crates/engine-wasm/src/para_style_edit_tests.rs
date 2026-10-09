@@ -327,6 +327,7 @@ fn pending_bold_off_then_typing_is_plain() {
                 language: None,
                 caps: None,
                 small_caps: None,
+                font_slot: None,
             },
         },
     );
@@ -585,6 +586,7 @@ fn pending_bold_off_in_an_empty_bold_marked_paragraph_formats_the_mark() {
                 language: None,
                 caps: None,
                 small_caps: None,
+                font_slot: None,
             },
         },
     );

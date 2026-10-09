@@ -3051,11 +3051,15 @@ pub(crate) fn parse_document_xml_with_events(
                         saves from writing style-derived props as direct
                         formatting. Final precedence is unchanged:
                         defaults → pStyle chain → pmark → rStyle → direct. */
-                        let style = resolver.resolve_run(
+                        let mut style = resolver.resolve_run(
                             pmark_rpr.clone(),
                             r_style_id.as_deref(),
                             direct_rpr.clone(),
                         );
+                        /* Issue #104 — the character style's properties are
+                        folded in above; its id rides along so a regenerated
+                        run writes `<w:rStyle>` back. */
+                        style.char_style = r_style_id.clone();
                         markup.close_text_run(
                             start,
                             end,

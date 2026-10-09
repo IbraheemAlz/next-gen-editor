@@ -42,6 +42,18 @@
       "generator": "differential-native --gen-fixtures (hand-written OOXML)",
       "word_pdf": null,
       "word_pdf_status": "PENDING"
+    },
+    "mixed_cs_size.docx": {
+      "description": "Issue #359: 30 justified RTL paragraphs whose runs mix Arabic and Latin words with w:sz=22 / w:szCs=28 (11 pt Latin, 14 pt Arabic in the same run) plus a w:rtl number run.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    },
+    "mixed_cs_fonts.docx": {
+      "description": "Issues #359/#104/#249: 30 justified RTL mixed Arabic/Latin paragraphs whose runs name Liberation Sans in w:ascii/w:hAnsi and Noto Naskh Arabic in w:cs (faces both engines have), w:sz=22 / w:szCs=28, every other paragraph bold by w:bCs only.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
     }
   }
 }
