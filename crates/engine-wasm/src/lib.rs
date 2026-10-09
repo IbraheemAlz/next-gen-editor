@@ -6379,13 +6379,20 @@ fn caret_script_tag(para: &engine::Paragraph, offset: u32) -> &'static str {
         at -= 1;
     }
     let (before, after) = text.split_at(at);
+    /* Bounded: this runs on every `SelectionChanged`, and a long Latin
+    paragraph would otherwise be walked end to end each keystroke. */
     before
         .chars()
         .rev()
-        .chain(after.chars())
+        .take(SCRIPT_TAG_SCAN)
+        .chain(after.chars().take(SCRIPT_TAG_SCAN))
         .find_map(text_pipeline::complex_script_tag)
         .unwrap_or("Arab")
 }
+
+/// How far (in chars, each way) [`caret_script_tag`] looks for the
+/// caret's complex script.
+const SCRIPT_TAG_SCAN: usize = 256;
 
 /// Issues #359 / #104 / #249 — `true` when the character the toolbar
 /// read-back at `offset` stands for is complex script, so it reports the
@@ -13435,6 +13442,8 @@ impl Engine {
         };
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let full = &caret.full;
+        /* Built at most once, and only when a slot falls to `Default`. */
+        let stack = std::cell::OnceCell::new();
         let slot = |(family, source): (Option<EngineFontFamily>, bridge::FontSource),
                     script: text_pipeline::Script,
                     size: Option<f32>,
@@ -13444,7 +13453,7 @@ impl Engine {
             let (id, name) = match family {
                 Some(f) => (font_family_id(&f).to_string(), f.display_name().to_string()),
                 None => {
-                    let id = self.default_face_for(script, bold, italic);
+                    let id = self.default_face_for(&stack, script, bold, italic);
                     let name = EngineFontFamily::from_id(&id)
                         .map(|f| f.display_name().to_string())
                         .unwrap_or_default();
@@ -13500,14 +13509,22 @@ impl Engine {
     /// names no family for it (`FontStack::resolve` with no family): the
     /// `Default` source's family id. The layout config's root face when
     /// the stack cannot answer; empty before the first `RenderPage`.
-    fn default_face_for(&self, script: text_pipeline::Script, bold: bool, italic: bool) -> String {
+    /// `stack` caches the font stack across the two slots of one read-back.
+    fn default_face_for(
+        &self,
+        stack: &std::cell::OnceCell<FontStack>,
+        script: text_pipeline::Script,
+        bold: bool,
+        italic: bool,
+    ) -> String {
         let Some(cfg) = self.layout_cfg.as_ref() else {
             return String::new();
         };
         if self.fonts.is_empty() {
             return cfg.font_id.clone();
         }
-        FontStack::from_faces(self.fonts.clone(), &cfg.font_id)
+        stack
+            .get_or_init(|| FontStack::from_faces(self.fonts.clone(), &cfg.font_id))
             .resolve(script, None, bold, italic)
             .map_or_else(|| cfg.font_id.clone(), |(id, _, _)| id.clone())
     }
