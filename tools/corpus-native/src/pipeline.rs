@@ -524,6 +524,113 @@ pub struct DocResult {
     /// reported (`Event::Painted.layout_degraded`), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engine_degradations: Vec<String>,
+    /// Issue #355 — how the document's runs resolve theme fonts. Absent
+    /// when the read failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_fonts: Option<ThemeFontCensus>,
+}
+
+/// Issue #355 — theme-font resolution over every paragraph (body, table
+/// cells, headers / footers): each style span and each unstyled stretch
+/// is one "run", resolved (`SpanStyle::resolve_font` over the run
+/// cascade) for the text it actually holds — the Latin slot when it has
+/// non-Arabic letters (`ascii` / `hAnsi` by `FontClass::latin_for`), the
+/// complex-script slot when it has Arabic.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ThemeFontCensus {
+    /// The package has a theme part.
+    pub has_theme: bool,
+    /// Runs inspected.
+    pub runs: u64,
+    /// Runs whose Latin face comes from the theme.
+    pub latin_from_theme: u64,
+    /// Runs whose complex-script (Arabic) face comes from the theme.
+    pub cs_from_theme: u64,
+    /// Runs with a theme-resolved face for some class and no explicit
+    /// family — before #355 they fell to the font stack's fallback.
+    pub newly_resolved: u64,
+    /// The distinct theme faces those runs resolve to, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub faces: Vec<String>,
+}
+
+impl ThemeFontCensus {
+    fn of(doc: &engine::DocumentTree) -> ThemeFontCensus {
+        fn walk(blocks: &[engine::Block], f: &mut impl FnMut(&engine::Paragraph)) {
+            for b in blocks {
+                match b {
+                    engine::Block::Paragraph(p) => f(p),
+                    engine::Block::Table(t) => {
+                        for row in &t.rows {
+                            for cell in &row.cells {
+                                walk(&cell.blocks, f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let theme = doc.theme.as_deref();
+        let mut c = ThemeFontCensus {
+            has_theme: theme.is_some(),
+            ..Default::default()
+        };
+        let mut faces = std::collections::BTreeSet::new();
+        let mut visit = |p: &engine::Paragraph| {
+            let base = doc.resolve_style_run_cascade(p.style_id.as_deref());
+            /* `(style, text)` per span plus every unstyled gap. */
+            let mut runs: Vec<(engine::SpanStyle, &str)> = Vec::new();
+            let mut cursor = 0usize;
+            for r in &p.spans {
+                let (s, e) = (r.start as usize, r.end as usize);
+                if s > cursor {
+                    runs.push((base.clone(), p.text.get(cursor..s).unwrap_or("")));
+                }
+                runs.push((
+                    base.clone().merged_with(r.style.clone()),
+                    p.text.get(s..e).unwrap_or(""),
+                ));
+                cursor = cursor.max(e);
+            }
+            if cursor < p.text.len() {
+                runs.push((base.clone(), p.text.get(cursor..).unwrap_or("")));
+            }
+            let arabic = |ch: char| matches!(ch, '\u{0600}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}');
+            for (style, text) in runs {
+                c.runs += 1;
+                let latin = text
+                    .chars()
+                    .any(|ch| ch.is_alphanumeric() && !arabic(ch))
+                    .then(|| style.resolve_font(theme, engine::FontClass::latin_for(text), None))
+                    .flatten();
+                let cs = text
+                    .chars()
+                    .any(arabic)
+                    .then(|| {
+                        style.resolve_font(theme, engine::FontClass::ComplexScript, Some("Arab"))
+                    })
+                    .flatten();
+                let mut themed = false;
+                for (r, count) in [(latin, &mut c.latin_from_theme), (cs, &mut c.cs_from_theme)] {
+                    if let Some(r) = r.filter(|r| r.from_theme) {
+                        *count += 1;
+                        themed = true;
+                        faces.insert(r.family.display_name().to_string());
+                    }
+                }
+                if themed && style.font_family.is_none() && style.raw_font_family.is_none() {
+                    c.newly_resolved += 1;
+                }
+            }
+        };
+        let body: Vec<engine::Block> = doc.blocks.iter().cloned().collect();
+        walk(&body, &mut visit);
+        for blocks in doc.headers.values().chain(doc.footers.values()) {
+            walk(blocks, &mut visit);
+        }
+        c.faces = faces.into_iter().collect();
+        c
+    }
 }
 
 /// Issue #318 — the production-layout stage's switches.
@@ -573,6 +680,7 @@ impl DocResult {
             engine_layout_ms: None,
             engine_page_count: None,
             engine_fingerprint: None,
+            theme_fonts: None,
             engine_degradations: Vec::new(),
         }
     }
@@ -721,6 +829,7 @@ pub fn run_one(
     /* 1. read_docx. */
     let archive_a: DocxArchive = stage!("read_docx_1", format_docx::read_docx(bytes));
     rec.paragraph_count = Some(archive_a.document.paragraph_count());
+    rec.theme_fonts = Some(ThemeFontCensus::of(&archive_a.document));
 
     /* 2. Full layout (native — `crates/layout`, no browser). */
     let layout_t0 = Instant::now();

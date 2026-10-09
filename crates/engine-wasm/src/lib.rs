@@ -229,6 +229,17 @@ struct EngineSnapshotV1 {
     /// snapshots, so their bytes are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     package_hash: Option<String>,
+    /// Issue #355 — the current document's theme (`DocumentTree::theme`),
+    /// persisted ONCE like [`Self::source_package`]: every history entry
+    /// of one undo stack shares it (read at open, never mutated), so
+    /// [`Engine::capture_snapshot`] strips it from the entries and
+    /// [`Engine::restore_snapshot`] re-attaches it. Absent for a
+    /// theme-less document, so those snapshots' bytes are unchanged.
+    #[serde(
+        with = "engine::theme::arc_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    theme: Option<Arc<engine::DocumentTheme>>,
 }
 
 /// Issue #212 — the cached detached package (see `Engine::detached_package`).
@@ -2754,16 +2765,71 @@ struct StyleContext<'a> {
     /// Issue #80 — the marker the `NoteSelfRef` heading a note body
     /// paints; set only while laying out that note's blocks.
     note_self_mark: Option<&'a str>,
+    /// Issue #355 — the document theme run fonts resolve through.
+    theme: Option<&'a engine::DocumentTheme>,
+    /// Issue #355 — content hash of [`Self::theme`] (0 without one), folded
+    /// into every paragraph layout key: the same text and bindings under
+    /// another theme must never hit a cached box.
+    theme_key: u64,
 }
 
 impl<'a> StyleContext<'a> {
     fn of(doc: &'a engine::DocumentTree) -> StyleContext<'a> {
+        let theme = doc.theme.as_deref();
         StyleContext {
             styles: &doc.styles,
             run_defaults: &doc.style_run_defaults,
             note_markers: None,
             note_self_mark: None,
+            theme,
+            theme_key: theme.map_or(0, |t| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                t.hash(&mut h);
+                h.finish()
+            }),
         }
+    }
+
+    /// Issue #355 — the layout font ids for a cascade-merged run style:
+    /// `(Latin slot, complex-script slot)`, theme bindings resolved
+    /// through the document theme (`SpanStyle::resolve_font`). The Latin
+    /// id becomes the layout span's `font_family`, the complex-script id
+    /// its complex-script twin's (`ComplexScriptAttrs::font_family`,
+    /// issues #359 / #249), which every complex-script piece shapes with.
+    ///
+    /// `text` (the run's own characters) picks both: its non-complex
+    /// characters the Latin slot — `ascii` for ASCII text, `hAnsi` for
+    /// anything else (§17.3.2.26) — and its first complex-script
+    /// character the theme's supplemental script entry (`Arab` for Arabic,
+    /// `Hebr` for Hebrew, …; `Arab` when the run has none, e.g. the
+    /// empty composition probe).
+    fn run_font_ids(
+        &self,
+        style: &engine::SpanStyle,
+        text: &str,
+    ) -> (Option<String>, Option<String>) {
+        let id = |class, hint| {
+            style
+                .resolve_font(self.theme, class, hint)
+                .map(|r| font_family_id(&r.family).to_string())
+        };
+        let high_ansi = text
+            .chars()
+            .any(|c| !c.is_ascii() && !text_pipeline::is_complex_script(c));
+        let latin = if high_ansi {
+            engine::FontClass::HighAnsi
+        } else {
+            engine::FontClass::Latin
+        };
+        let script = text
+            .chars()
+            .find_map(text_pipeline::complex_script_tag)
+            .unwrap_or("Arab");
+        (
+            id(latin, None),
+            id(engine::FontClass::ComplexScript, Some(script)),
+        )
     }
 
     fn run_base(&self, style_id: Option<&str>) -> engine::SpanStyle {
@@ -2808,6 +2874,8 @@ fn build_style_spans(
     empty in fresh documents — byte-identical to the old flat gap. */
     let run_base = sctx.run_base(para.style_id.as_deref());
     let emit = |style: &engine::SpanStyle, start: u32, end: u32, out: &mut Vec<StyleSpan>| {
+        let text = para.text.get(start as usize..end as usize).unwrap_or("");
+        let (font_family, font_family_cs) = sctx.run_font_ids(style, text);
         let raw_base_px = style.font_size.unwrap_or(default_size) * scale;
         let vert = style.vert_align.unwrap_or(engine::VertAlign::Baseline);
         let (px_factor, shift_factor) = match vert {
@@ -2821,35 +2889,30 @@ fn build_style_spans(
             start,
             end,
             px_size: base_px,
-            color: style.color.unwrap_or(default_color),
+            /* Issue #355 — a theme colour supersedes the cached `w:val`. */
+            color: style.resolve_color(sctx.theme).unwrap_or(default_color),
             bold: style.bold.unwrap_or(false),
             italic: style.italic.unwrap_or(false),
             underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
             strike: style.strike.unwrap_or(false),
             bg_color: style.bg_color,
-            font_family: style
-                .font_family
-                .as_ref()
-                .map(font_family_id)
-                .map(str::to_string),
+            font_family,
             caps_transform: false,
             baseline_shift_px,
             cs: None,
         };
         /* Issues #359 / #104 / #249 — the complex-script twins, resolved
         through the same cascade (an unset twin takes the document
-        default, never the Latin value — Word's rule). */
+        default, never the Latin value — Word's rule); the family is the
+        `cs` slot as `run_font_ids` resolved it (theme binding incl. the
+        script's supplemental face, else `w:cs`). */
         let raw_cs_px = style.font_size_cs.unwrap_or(default_size) * scale;
         let cs = ComplexScriptAttrs {
             px_size: (raw_cs_px * px_factor).max(1.0),
             baseline_shift_px: raw_cs_px * shift_factor,
             bold: style.bold_cs.unwrap_or(false),
             italic: style.italic_cs.unwrap_or(false),
-            font_family: style
-                .font_family_cs
-                .as_ref()
-                .map(font_family_id)
-                .map(str::to_string),
+            font_family: font_family_cs,
             whole_span: style.forces_complex_script(),
         };
         let template = template.with_cs(cs);
@@ -3035,37 +3098,38 @@ fn composition_layout_spans(
         }
     }
     let st = para.style_at(off);
+    /* Issue #355 — the preview shapes in the face the committed text
+    around it resolves to (cascade + theme). */
+    let (font_family, font_family_cs) = sctx.run_font_ids(
+        &sctx
+            .run_base(para.style_id.as_deref())
+            .merged_with(st.clone()),
+        /* The preview's own text is not in `para.text`. */
+        "",
+    );
     let comp = StyleSpan {
         start: off,
         end: off + comp_len,
         px_size: st.font_size.unwrap_or(default_size) * scale,
-        color: st.color.unwrap_or([0, 0, 0, 255]),
+        color: st.resolve_color(sctx.theme).unwrap_or([0, 0, 0, 255]),
         bold: st.bold.unwrap_or(false),
         italic: st.italic.unwrap_or(false),
         underline: engine::UnderlineStyle::Single,
         strike: st.strike.unwrap_or(false),
         bg_color: st.bg_color,
-        font_family: st
-            .font_family
-            .as_ref()
-            .map(font_family_id)
-            .map(str::to_string),
+        font_family,
         caps_transform: false,
         baseline_shift_px: 0.0,
         cs: None,
     };
     /* Issue #359 — an Arabic composition previews at the complex-script
-    size it will commit with. */
+    size (and, #355, in the complex-script face) it will commit with. */
     let cs = ComplexScriptAttrs {
         px_size: st.font_size_cs.unwrap_or(default_size) * scale,
         baseline_shift_px: 0.0,
         bold: st.bold_cs.unwrap_or(false),
         italic: st.italic_cs.unwrap_or(false),
-        font_family: st
-            .font_family_cs
-            .as_ref()
-            .map(font_family_id)
-            .map(str::to_string),
+        font_family: font_family_cs,
         whole_span: st.forces_complex_script(),
     };
     out.push(comp.with_cs(cs));
@@ -3115,6 +3179,12 @@ fn paragraph_layout_key(
     run_base.strike.hash(&mut h);
     run_base.bg_color.hash(&mut h);
     run_base.raw_font_family.hash(&mut h);
+    /* Issue #355 — the base family and slot bindings feed the resolved
+    font ids, and the theme decides what a binding names. */
+    run_base.font_family.hash(&mut h);
+    run_base.font_bindings.hash(&mut h);
+    run_base.color_theme.hash(&mut h);
+    sctx.theme_key.hash(&mut h);
     run_base.caps.hash(&mut h);
     run_base.small_caps.hash(&mut h);
     hash_complex_script_slots(&run_base, &mut h);
@@ -3135,6 +3205,9 @@ fn paragraph_layout_key(
         run.style.strike.hash(&mut h);
         run.style.bg_color.hash(&mut h);
         run.style.font_family.hash(&mut h);
+        run.style.raw_font_family.hash(&mut h);
+        run.style.font_bindings.hash(&mut h);
+        run.style.color_theme.hash(&mut h);
         /* Without these three, flipping `<w:caps>`, `<w:smallCaps>`, or
         `<w:vertAlign>` produces the same hash as the prior state and
         the cache returns a stale `ParagraphBox` — the visible bug the
@@ -7567,7 +7640,19 @@ fn patch_to_latin_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
         /* Issue #84 — a formatting patch never carries a grab bag; the
         run's own bag survives the merge (`SpanStyle::merged_with`). */
         grab_bag: None,
-        ..Default::default()
+        /* Issue #355 — a patch naming a family claims the slots its
+        writer spells, one setting a colour drops the theme colour
+        (`SpanStyle::merged_with`). */
+        font_bindings: None,
+        color_theme: None,
+        /* Issues #359 / #104 / #249 — the complex-script twins and the
+        character style are filled by the slot routing
+        (`patch_to_span_style`); a patch never names a character style. */
+        font_size_cs: None,
+        bold_cs: None,
+        italic_cs: None,
+        font_family_cs: None,
+        char_style: None,
     }
 }
 
@@ -8854,6 +8939,18 @@ impl Engine {
                 }
             }
         }
+        /* Issue #355 — the theme rides the envelope once, like the package. */
+        let theme = doc_history.get(undo_cursor).and_then(|d| d.theme.clone());
+        if let Some(theme) = &theme {
+            for d in &mut doc_history {
+                if d.theme
+                    .as_ref()
+                    .is_some_and(|t| Arc::ptr_eq(t, theme) || **t == **theme)
+                {
+                    d.theme = None;
+                }
+            }
+        }
         EngineSnapshotV1 {
             source_package: persisted_package,
             doc_history,
@@ -8869,6 +8966,7 @@ impl Engine {
             layout_cfg: self.layout_cfg.as_ref().map(LayoutCfgSnapshot::capture),
             document_name: self.document_name.clone(),
             package_hash: None,
+            theme,
         }
     }
 
@@ -8984,6 +9082,14 @@ impl Engine {
             for d in &mut s.doc_history {
                 if d.source_package.is_none() {
                     d.source_package = Some(pkg.clone());
+                }
+            }
+        }
+        /* Issue #355 — re-attach the once-persisted theme. */
+        if let Some(theme) = s.theme.take() {
+            for d in &mut s.doc_history {
+                if d.theme.is_none() {
+                    d.theme = Some(theme.clone());
                 }
             }
         }
@@ -16048,7 +16154,13 @@ impl Engine {
                 raw_font_family: r.font_family,
                 font_theme: None,
                 grab_bag: None,
-                ..Default::default()
+                font_bindings: None,
+                color_theme: None,
+                font_size_cs: None,
+                bold_cs: None,
+                italic_cs: None,
+                font_family_cs: None,
+                char_style: None,
             }
             .with_cs_twins()
         });
@@ -19034,6 +19146,8 @@ mod tests {
             run_defaults: Box::leak(Box::default()),
             note_markers: None,
             note_self_mark: None,
+            theme: None,
+            theme_key: 0,
         }
     }
 
@@ -19064,6 +19178,8 @@ mod tests {
             run_defaults: &run_defaults,
             note_markers: None,
             note_self_mark: None,
+            theme: None,
+            theme_key: 0,
         };
         let mut para = engine::Paragraph {
             text: "hello world".into(),
@@ -19095,6 +19211,91 @@ mod tests {
             paragraph_layout_key(&para, &cfg, 1.0, 451.0, sctx),
             paragraph_layout_key(&para, &cfg, 1.0, 451.0, plain),
             "two style-table states must not collide on a cache key"
+        );
+    }
+
+    /// Issue #355 — theme-bound docDefaults lay out in the faces the theme
+    /// names, per script slot (Latin vs Arabic); a run naming a family
+    /// claims its slots; no theme part → no family (the font stack's
+    /// fallback, exactly as before). The layout key sees the theme.
+    #[test]
+    fn style_spans_resolve_theme_fonts_per_script_slot() {
+        let bind = |v: &str| Some(engine::FontBinding::Theme(v.into()));
+        let run_defaults = engine::SpanStyle {
+            font_bindings: Some(Box::new(engine::RunFontBindings {
+                ascii: bind("minorHAnsi"),
+                h_ansi: bind("minorHAnsi"),
+                east_asia: bind("minorEastAsia"),
+                cs: bind("minorBidi"),
+            })),
+            ..Default::default()
+        };
+        let mut theme = engine::DocumentTheme::default();
+        theme.fonts.minor.latin = "Liberation Sans".into();
+        theme
+            .fonts
+            .minor
+            .by_script
+            .insert("Arab".into(), "Noto Naskh Arabic".into());
+        let styles = std::collections::HashMap::new();
+        let ctx = |theme: Option<&'static engine::DocumentTheme>, key| StyleContext {
+            styles: Box::leak(Box::new(styles.clone())),
+            run_defaults: Box::leak(Box::new(run_defaults.clone())),
+            note_markers: None,
+            note_self_mark: None,
+            theme,
+            theme_key: key,
+        };
+        let theme: &'static engine::DocumentTheme = Box::leak(Box::new(theme));
+        let mut para = engine::Paragraph {
+            text: "body Amiri".into(),
+            ..Default::default()
+        };
+        /* The toolbar's font pick names both slots (`with_cs_twins`). */
+        para.spans.push(engine::StyleRun {
+            start: 5,
+            end: 10,
+            style: engine::SpanStyle {
+                font_family: Some(engine::FontFamily::Amiri),
+                ..Default::default()
+            }
+            .with_cs_twins(),
+        });
+        /* (Latin slot, complex-script slot) — the family a Latin piece
+        and a complex-script piece of each span shape with. */
+        let ids = |spans: &[StyleSpan]| -> Vec<(Option<String>, Option<String>)> {
+            spans
+                .iter()
+                .map(|s| {
+                    (
+                        s.face_for(false).font_family.map(str::to_string),
+                        s.face_for(true).font_family.map(str::to_string),
+                    )
+                })
+                .collect()
+        };
+        let pair = |l: &str, c: &str| (Some(l.to_string()), Some(c.to_string()));
+        let spans = build_style_spans(&para, ctx(Some(theme), 1), 12.0, [0, 0, 0, 255], 1.0);
+        assert_eq!(
+            ids(&spans),
+            [pair("liberation", "noto-naskh"), pair("amiri", "amiri")]
+        );
+        /* Issue #249 — a Latin-only family claims `ascii` / `hAnsi`
+        alone: the run's Arabic stays on the theme's complex-script face. */
+        let mut latin_only = para.clone();
+        latin_only.spans[0].style = engine::SpanStyle {
+            font_family: Some(engine::FontFamily::Amiri),
+            ..Default::default()
+        };
+        let spans = build_style_spans(&latin_only, ctx(Some(theme), 1), 12.0, [0, 0, 0, 255], 1.0);
+        assert_eq!(ids(&spans)[1], pair("amiri", "noto-naskh"));
+        let bare = build_style_spans(&para, ctx(None, 0), 12.0, [0, 0, 0, 255], 1.0);
+        assert_eq!(ids(&bare)[0], (None, None), "no theme part: fallback");
+        let cfg = autofit_test_cfg();
+        assert_ne!(
+            paragraph_layout_key(&para, &cfg, 1.0, 451.0, ctx(Some(theme), 1)),
+            paragraph_layout_key(&para, &cfg, 1.0, 451.0, ctx(Some(theme), 2)),
+            "another theme must not hit a cached box"
         );
     }
 
@@ -27334,6 +27535,47 @@ mod snapshot_tests {
         assert_eq!(**pkg, *current_pkg);
     }
 
+    /// Issue #355 — the parsed theme rides the snapshot envelope ONCE
+    /// (like the package), is re-attached to every history entry on
+    /// restore, and the re-snapshot is byte-stable.
+    #[test]
+    fn snapshot_persists_the_theme_once() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let theme = e.undo.current().theme.clone().expect("fixture has a theme");
+        assert_eq!(theme.fonts.minor.latin, "Calibri");
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(4, 0),
+            caret: bpos_top(4, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        for word in ["a", "b", "c"] {
+            let evt = apply(&mut e, insert(word));
+            assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        }
+        let bytes = e.snapshot_bytes().unwrap();
+        /* `by_script` is a model key (one per font collection) — the theme
+        part's own XML never spells it. */
+        let needle = b"by_script";
+        let hits = bytes.windows(needle.len()).filter(|w| w == needle).count();
+        assert_eq!(hits, 2, "one theme (major + minor) for the whole window");
+
+        let mut b = engine();
+        b.restore_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            b.snapshot_bytes().unwrap(),
+            bytes,
+            "byte-stable re-snapshot"
+        );
+        assert_eq!(b.undo.current().theme, Some(theme.clone()));
+        apply(&mut b, Command::Undo);
+        assert_eq!(
+            b.undo.current().theme,
+            Some(theme),
+            "re-attached to history"
+        );
+    }
+
     /// Issue #213 — the clipboard `.docx` fragment always went through
     /// `build_minimal_docx` alone, so copying a styled paragraph out of an
     /// opened `.docx` produced a fragment with no `styles.xml`: pasting it
@@ -27879,6 +28121,10 @@ mod revision_address_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
+
+/// Issue #355 — theme fonts / colours through read → layout.
+#[cfg(test)]
+mod theme_layout_tests;
 
 #[cfg(test)]
 mod document_lifecycle_tests;

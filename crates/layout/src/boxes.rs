@@ -133,7 +133,9 @@ pub struct StyleSpan {
     pub strike: bool,
     pub bg_color: Option<[u8; 4]>,
     /// Resolved font id for an explicit family request; `None` keeps the
-    /// per-script default face (Backlog #9).
+    /// per-script default face (Backlog #9). Issue #355 — the Latin slot
+    /// (`w:ascii` / `w:hAnsi` + their theme bindings): serves every piece
+    /// except complex-script ones, which take [`Self::cs`]'s family.
     pub font_family: Option<String>,
     /// Audit gap A.H3 — uppercase the source bytes of this span before
     /// shaping. Set by `build_style_spans` for `<w:caps>` and `<w:smallCaps>`
@@ -173,8 +175,10 @@ pub struct ComplexScriptAttrs {
     pub baseline_shift_px: f32,
     pub bold: bool,
     pub italic: bool,
-    /// Resolved font id of the `<w:rFonts w:cs>` family; `None` keeps the
-    /// per-script default face.
+    /// Resolved font id of the complex-script slot (`<w:rFonts w:cs>`,
+    /// or its `w:cstheme` binding through the document theme — issue
+    /// #355); `None` keeps the per-script default face. A theme can name
+    /// different body faces for Latin and Arabic text in one run.
     pub font_family: Option<String>,
     /// The run is flagged `<w:rtl/>` / `<w:cs/>`: every character —
     /// Latin digits and punctuation included — uses this set.

@@ -285,6 +285,23 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
     emit_rpr_adopting(style, None, out);
 }
 
+/// Issue #355 — the `<w:rFonts>` theme attributes a regenerated run
+/// writes: slot by slot from [`SpanStyle::font_bindings`] (exactly the
+/// slots the source bound — a `w:cstheme="minorBidi"` stays `minorBidi`,
+/// an unbound `w:eastAsiaTheme` is not synthesized), else — a style with
+/// no bindings (an older snapshot) — the legacy single `font_theme` on
+/// the three slots it always wrote. Never the resolved family: the
+/// binding, not the face the theme currently names, is the document's
+/// statement.
+fn rfonts_theme_attrs(style: &SpanStyle) -> Vec<(&'static str, &str)> {
+    match style.font_bindings.as_deref() {
+        Some(b) => b.theme_attrs().collect(),
+        None => style.font_theme.as_deref().map_or_else(Vec::new, |t| {
+            vec![("w:asciiTheme", t), ("w:hAnsiTheme", t), ("w:cstheme", t)]
+        }),
+    }
+}
+
 /// [`emit_rpr`] for a run regenerated from a source `<w:rPr>` (`source`):
 /// regenerated children keep the source spelling of an unchanged element
 /// (issue #106, [`PrChildren::adopt`]).
@@ -305,23 +322,23 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
     /* Audit gap A.M2 — `<w:rFonts>` round-trips a known FontFamily,
     a verbatim raw name, and/or a theme binding. The reader splits
     the source's `w:ascii` either into `font_family` (recognised) or
-    `raw_font_family` (verbatim string); the theme attrs park in
-    `font_theme`. Emit whichever slots are populated. */
+    `raw_font_family` (verbatim string); the theme attrs ride the slot
+    bindings (`font_bindings`, issue #355). Emit whichever slots are
+    populated. */
     let rfonts_name: Option<String> = style
         .font_family
         .as_ref()
         .map(|f| family_docx_name(f).to_string())
         .or_else(|| style.raw_font_family.clone());
-    /* Issue #249 — the complex-script slot writes `w:cs` / `w:cstheme`
-    from its own field: a run whose source named only a Latin face gains
-    no synthesized `w:cs`, and an engine-authored font change (which sets
-    both slots) still writes all three name attributes. */
+    /* Issue #249 — the complex-script slot writes `w:cs` from its own
+    field: a run whose source named only a Latin face gains no
+    synthesized `w:cs`, and an engine-authored font change (which sets
+    both slots) still writes all three name attributes. Issue #355 —
+    the theme attributes come from the slot bindings
+    ([`rfonts_theme_attrs`]; `w:cstheme` is the `cs` slot's). */
     let cs_name = style.font_family_cs.as_ref().map(family_docx_name);
-    if rfonts_name.is_some()
-        || cs_name.is_some()
-        || style.font_theme.is_some()
-        || style.font_theme_cs.is_some()
-    {
+    let theme_attrs = rfonts_theme_attrs(style);
+    if rfonts_name.is_some() || cs_name.is_some() || !theme_attrs.is_empty() {
         let mut s = String::from("<w:rFonts");
         let mut attr = |k: &str, v: &str| {
             s.push(' ');
@@ -337,12 +354,8 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
         if let Some(n) = cs_name {
             attr("w:cs", n);
         }
-        if let Some(t) = style.font_theme.as_deref() {
-            attr("w:asciiTheme", t);
-            attr("w:hAnsiTheme", t);
-        }
-        if let Some(t) = style.font_theme_cs.as_deref() {
-            attr("w:cstheme", t);
+        for (k, v) in theme_attrs {
+            attr(k, v);
         }
         s.push_str("/>");
         ch.push(rank(b"w:rFonts"), s);
@@ -369,11 +382,30 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
             None => {}
         }
     }
-    if let Some([r, g, b, _]) = style.color {
-        ch.push(
-            rank(b"w:color"),
-            format!("<w:color w:val=\"{r:02X}{g:02X}{b:02X}\"/>"),
-        );
+    if style.color.is_some() || style.color_theme.is_some() {
+        /* Issue #355 — `w:val` stays the cached RGB (`auto` when only the
+        theme half is known); the theme attributes follow as read. */
+        let mut s = match style.color {
+            Some([r, g, b, _]) => format!("<w:color w:val=\"{r:02X}{g:02X}{b:02X}\""),
+            None => String::from("<w:color w:val=\"auto\""),
+        };
+        if let Some(t) = style.color_theme.as_deref() {
+            for (attr, value) in [
+                ("w:themeColor", Some(&t.color)),
+                ("w:themeTint", t.tint.as_ref()),
+                ("w:themeShade", t.shade.as_ref()),
+            ] {
+                if let Some(v) = value {
+                    s.push(' ');
+                    s.push_str(attr);
+                    s.push_str("=\"");
+                    push_escaped_attr(v, &mut s);
+                    s.push('"');
+                }
+            }
+        }
+        s.push_str("/>");
+        ch.push(rank(b"w:color"), s);
     }
     /* `<w:sz>` / `<w:szCs>` — Word's half-point encoding; round to nearest.
     Issue #359 — each slot writes its own element: a source run with only
@@ -11071,3 +11103,8 @@ mod comment_patch_tests;
 #[cfg(test)]
 #[path = "writer_complex_script_tests.rs"]
 mod complex_script_tests;
+
+/// Issue #355 — `<w:rFonts>` theme bindings.
+#[cfg(test)]
+#[path = "writer_theme_tests.rs"]
+mod theme_tests;

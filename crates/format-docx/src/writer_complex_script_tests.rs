@@ -242,7 +242,11 @@ fn rfonts_cs_slot_reads_apart_from_ascii() {
         Some("Simplified Arabic")
     );
     assert_eq!(s.font_theme, None);
-    assert_eq!(s.font_theme_cs.as_deref(), Some("minorBidi"));
+    /* Issue #355 — `w:cstheme` is the `cs` slot's binding. */
+    assert_eq!(
+        s.font_bindings.as_deref().and_then(|b| b.cs.clone()),
+        Some(engine::FontBinding::Theme("minorBidi".into()))
+    );
 
     let (_, cs_only) = open_run(r#"<w:rFonts w:cs="Arial"/>"#, ARABIC);
     let s = cs_only.document.nth_paragraph(0).unwrap().style_at(0);

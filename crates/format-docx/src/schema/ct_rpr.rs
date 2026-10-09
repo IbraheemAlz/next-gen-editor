@@ -309,7 +309,11 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             };
             style.underline = Some(variant);
         }
-        b"w:color" => style.color = attr_val(e, b"w:val").and_then(|v| parse_hex_color(&v)),
+        b"w:color" => {
+            style.color = attr_val(e, b"w:val").and_then(|v| parse_hex_color(&v));
+            /* Issue #355 — the theme colour layout resolves through. */
+            style.color_theme = crate::parts::theme::theme_color_ref(e);
+        }
         b"w:highlight" => {
             style.bg_color = attr_val(e, b"w:val").and_then(|v| highlight_color(&v));
         }
@@ -319,9 +323,10 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             three the engine has loaded. Resolved names hit
             `font_family`; unresolved names park in `raw_font_family`
             so the writer round-trips them verbatim (Word reopens with
-            the original face the author chose). Theme attributes
-            (`asciiTheme` / `hAnsiTheme` / `cstheme`) park in
-            `font_theme` — Word's "Update Style" depends on them. */
+            the original face the author chose). The Latin theme
+            attributes (`asciiTheme` / `hAnsiTheme`) still park in the
+            legacy single-slot `font_theme`; every slot's binding rides
+            `font_bindings` (issue #355), which the writer prefers. */
             let name = attr_val(e, b"w:ascii").or_else(|| attr_val(e, b"w:hAnsi"));
             if let Some(n) = name {
                 match family_from_docx(&n) {
@@ -339,11 +344,28 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             its Arabic with the second (`w:cs` alone no longer becomes the
             Latin face either). `w:eastAsia` / `w:hint` stay unmodeled —
             the writer carries them over from the source element. */
-            if let Some(fam) = attr_val(e, b"w:cs").and_then(|n| family_from_docx(&n)) {
+            let cs_name = attr_val(e, b"w:cs");
+            let cs_family = cs_name.as_deref().and_then(family_from_docx);
+            if let Some(fam) = cs_family.clone() {
                 style.font_family_cs = Some(fam);
             }
-            if let Some(t) = attr_val(e, b"w:cstheme") {
-                style.font_theme_cs = Some(t);
+            /* Issue #355 — the per-slot bindings layout resolves through
+            (name vs theme reference per ascii / hAnsi / eastAsia / cs);
+            `w:cstheme` lives only here, on the `cs` slot. The canonical
+            all-names spelling reads as no bindings — the names themselves
+            claim the slots (`SpanStyle::merged_with`) — unless its `w:cs`
+            names a face the model cannot hold (no `font_family_cs`): then
+            the `cs` claim is kept explicit, or an inherited `w:cstheme`
+            would take that run's Arabic text over. */
+            style.font_bindings = crate::parts::theme::rfonts_bindings(e);
+            if style.font_bindings.is_none() && cs_name.is_some() && cs_family.is_none() {
+                use engine::FontBinding::Name;
+                style.font_bindings = Some(Box::new(engine::RunFontBindings {
+                    ascii: Some(Name),
+                    h_ansi: Some(Name),
+                    east_asia: attr_val(e, b"w:eastAsia").map(|_| Name),
+                    cs: Some(Name),
+                }));
             }
         }
         /* `<w:sz w:val="N"/>` and `<w:szCs w:val="N"/>` — N is half-points

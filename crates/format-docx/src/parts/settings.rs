@@ -25,6 +25,12 @@ pub struct SettingsPart {
     pub footnote_props: engine::NoteProps,
     /// Issue #80 — document-level `<w:endnotePr>`.
     pub endnote_props: engine::NoteProps,
+    /// Issue #355 — `<w:themeFontLang>`: the languages whose scripts pick
+    /// the theme's supplemental `<a:font script>` entries.
+    pub theme_font_lang: engine::ThemeFontLang,
+    /// Issue #355 — `<w:clrSchemeMapping>`: logical theme colour → scheme
+    /// slot, attribute local name → value, verbatim.
+    pub clr_scheme_mapping: engine::ColorSchemeMapping,
 }
 
 /// Decode an OOXML toggle attribute (`w:val` "false" / "0" / "off"
@@ -78,10 +84,57 @@ pub fn parse_settings_xml(xml: &[u8]) -> Result<SettingsPart, DocxError> {
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:evenAndOddHeaders" => {
                 out.even_and_odd_headers = toggle_attr(e.attributes());
             }
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:themeFontLang" => {
+                for a in e.attributes().flatten() {
+                    let Ok(v) = a.unescape_value() else { continue };
+                    let v = Some(v.into_owned()).filter(|v| !v.trim().is_empty());
+                    match a.key.as_ref() {
+                        b"w:val" => out.theme_font_lang.latin = v,
+                        b"w:eastAsia" => out.theme_font_lang.east_asia = v,
+                        b"w:bidi" => out.theme_font_lang.bidi = v,
+                        _ => {}
+                    }
+                }
+            }
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:clrSchemeMapping" => {
+                for a in e.attributes().flatten() {
+                    let key = a.key.as_ref();
+                    if let Some(local) = key.strip_prefix(b"w:")
+                        && let Ok(v) = a.unescape_value()
+                    {
+                        out.clr_scheme_mapping
+                            .entries
+                            .insert(String::from_utf8_lossy(local).into_owned(), v.into_owned());
+                    }
+                }
+            }
             Event::Eof => break,
             _ => {}
         }
         buf.clear();
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #355 — the two theme-selection settings Word writes.
+    #[test]
+    fn reads_theme_font_lang_and_colour_mapping() {
+        let xml = concat!(
+            r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:themeFontLang w:val="en-US" w:eastAsia="" w:bidi="ar-SA"/>"#,
+            r#"<w:clrSchemeMapping w:bg1="light1" w:t1="dark1" w:bg2="light2" w:t2="dark2" "#,
+            r#"w:accent1="accent1" w:hyperlink="hyperlink"/></w:settings>"#,
+        );
+        let s = parse_settings_xml(xml.as_bytes()).expect("parse");
+        assert_eq!(s.theme_font_lang.latin.as_deref(), Some("en-US"));
+        assert_eq!(s.theme_font_lang.east_asia, None, "empty = absent");
+        assert_eq!(s.theme_font_lang.bidi.as_deref(), Some("ar-SA"));
+        assert_eq!(s.clr_scheme_mapping.entries["t1"], "dark1");
+        assert_eq!(s.clr_scheme_mapping.entries["hyperlink"], "hyperlink");
+        assert_eq!(s.clr_scheme_mapping.entries.len(), 6);
+    }
 }

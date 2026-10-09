@@ -1051,7 +1051,28 @@ fn fold_rpr_child(xml: &[u8]) -> Option<SpanStyle> {
         _ => return None,
     }
     buf.clear();
-    matches!(reader.read_event_into(&mut buf).ok()?, Event::Eof).then_some(style)
+    if !matches!(reader.read_event_into(&mut buf).ok()?, Event::Eof) {
+        return None;
+    }
+    /* Issue #355 — a `Name` slot binding only records which slots the
+    element spells a name on; the names themselves are compared through
+    `font_family` / `raw_font_family` / `font_family_cs`. So a source
+    `<w:rFonts w:ascii="Cambria"/>` still reads like the regenerated
+    `w:ascii` + `w:hAnsi` spelling of the same model and keeps its own
+    bytes. Theme bindings are compared as read. */
+    if let Some(b) = style.font_bindings.take() {
+        let theme_only = |slot: Option<engine::FontBinding>| {
+            slot.filter(|v| matches!(v, engine::FontBinding::Theme(_)))
+        };
+        let b = engine::RunFontBindings {
+            ascii: theme_only(b.ascii),
+            h_ansi: theme_only(b.h_ansi),
+            east_asia: theme_only(b.east_asia),
+            cs: theme_only(b.cs),
+        };
+        style.font_bindings = (!b.is_empty()).then(|| Box::new(b));
+    }
+    Some(style)
 }
 
 /// Issue #249 — attributes of a modeled `<w:rPr>` child the model does not

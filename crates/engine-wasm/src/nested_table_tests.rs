@@ -359,6 +359,8 @@ fn empty_sctx() -> StyleContext<'static> {
         run_defaults: Box::leak(Box::default()),
         note_markers: None,
         note_self_mark: None,
+        theme: None,
+        theme_key: 0,
     }
 }
 

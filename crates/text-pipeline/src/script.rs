@@ -72,6 +72,37 @@ pub fn is_complex_script(c: char) -> bool {
     )
 }
 
+/// Issue #355 × #359 — the ISO 15924 tag of a complex-script character's
+/// script (`Arab`, `Hebr`, `Thai`, …: the keys of a theme's supplemental
+/// `<a:font script>` list), `None` for any character
+/// [`is_complex_script`] rejects. The complex-script font slot resolves a
+/// theme binding for the script of the text it serves.
+pub fn complex_script_tag(c: char) -> Option<&'static str> {
+    Some(match CodePointMapData::<UnicodeScript>::new().get(c) {
+        UnicodeScript::Arabic => "Arab",
+        UnicodeScript::Hebrew => "Hebr",
+        UnicodeScript::Syriac => "Syrc",
+        UnicodeScript::Thaana => "Thaa",
+        UnicodeScript::Nko => "Nkoo",
+        UnicodeScript::Samaritan => "Samr",
+        UnicodeScript::Mandaic => "Mand",
+        UnicodeScript::Thai => "Thai",
+        UnicodeScript::Lao => "Laoo",
+        UnicodeScript::Khmer => "Khmr",
+        UnicodeScript::Devanagari => "Deva",
+        UnicodeScript::Bengali => "Beng",
+        UnicodeScript::Gurmukhi => "Guru",
+        UnicodeScript::Gujarati => "Gujr",
+        UnicodeScript::Oriya => "Orya",
+        UnicodeScript::Tamil => "Taml",
+        UnicodeScript::Telugu => "Telu",
+        UnicodeScript::Kannada => "Knda",
+        UnicodeScript::Malayalam => "Mlym",
+        UnicodeScript::Sinhala => "Sinh",
+        _ => return None,
+    })
+}
+
 /// Issues #359 / #104 / #249 — [`segment_by_script`] refined by the
 /// complex-script class: maximal runs of one coarse [`Script`] AND one
 /// [`is_complex_script`] class, in logical order, each tagged with its
@@ -186,6 +217,32 @@ mod tests {
             'A', '\u{00E9}', '\u{4E2D}', '\u{0391}', ' ', '1', '\u{0640}',
         ] {
             assert!(!is_complex_script(c), "{c:?} is not complex script");
+        }
+    }
+
+    /// Issue #355 × #359 — the theme script tag exists exactly for the
+    /// complex-script characters.
+    #[test]
+    fn complex_script_tag_names_the_script_of_complex_characters() {
+        for (c, tag) in [
+            ('\u{0627}', "Arab"),
+            ('\u{FEFB}', "Arab"),
+            ('\u{05D0}', "Hebr"),
+            ('\u{0710}', "Syrc"),
+            ('\u{0E01}', "Thai"),
+            ('\u{0915}', "Deva"),
+        ] {
+            assert_eq!(complex_script_tag(c), Some(tag), "{c:?}");
+        }
+        for c in ['A', '\u{00E9}', '\u{4E2D}', ' ', '1', '\u{0640}'] {
+            assert_eq!(complex_script_tag(c), None, "{c:?}");
+        }
+        for c in (0x0590_u32..0x0E80).filter_map(char::from_u32) {
+            assert_eq!(
+                complex_script_tag(c).is_some(),
+                is_complex_script(c),
+                "{c:?}"
+            );
         }
     }
 
