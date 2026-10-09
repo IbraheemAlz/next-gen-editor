@@ -450,6 +450,20 @@ fn save_and_reread(
     Ok(out)
 }
 
+/// `got` carries the reviewer's paragraph-mark revision element `tag`
+/// (`<w:pPr><w:rPr><w:ins …/>`) under a numeric, non-zero id: an
+/// engine-made mark has no source id and is minted a package-unique one
+/// at save (issue #295 — it used to be written `w:id="0"`).
+fn has_minted_mark(got: &str, tag: &str) -> bool {
+    let head = format!(r#"<w:pPr><w:rPr><{tag} w:id=""#);
+    let tail = format!(r#"" w:author="{REVIEWER}" w:date="{REVIEW_DATE}"/></w:rPr></w:pPr>"#);
+    got.match_indices(&head).any(|(at, _)| {
+        let rest = &got[at + head.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && &rest[..digits] != "0" && rest[digits..].starts_with(&tail)
+    })
+}
+
 /// Issue #301 — step 37: a paragraph break typed with track changes on.
 ///
 /// a. `tracked_split_paragraph` records the new mark (ending the left
@@ -465,14 +479,11 @@ pub(crate) fn run_tracked_split_roundtrip() -> Result<()> {
     let split = archive
         .document
         .tracked_split_paragraph(at(0, 5), REVIEWER, REVIEW_DATE);
-    let mark = format!(
-        r#"<w:pPr><w:rPr><w:ins w:id="0" w:author="{REVIEWER}" w:date="{REVIEW_DATE}"/></w:rPr></w:pPr>"#
-    );
     let want_marks = vec![vec![(RevisionKind::Insert, None)], vec![], vec![]];
     let mut reread_split = None;
     for (got, reread) in save_and_reread("step 37a", &archive, &split)? {
-        if !got.contains(&mark) {
-            bail!("step 37a: the inserted mark was not written ({mark})\n{got}");
+        if !has_minted_mark(&got, "w:ins") {
+            bail!("step 37a: the inserted mark was not written\n{got}");
         }
         let marks: Vec<Vec<(RevisionKind, Option<u32>)>> = reread
             .blocks
@@ -529,13 +540,10 @@ pub(crate) fn run_tracked_cross_paragraph_delete_roundtrip() -> Result<()> {
         .try_tracked_delete_range(at(0, 6), at(1, 6), REVIEWER, REVIEW_DATE)
         .map_err(|e| anyhow::anyhow!("step 38a: refused: {e}"))?
         .doc;
-    let mark = format!(
-        r#"<w:pPr><w:rPr><w:del w:id="0" w:author="{REVIEWER}" w:date="{REVIEW_DATE}"/></w:rPr></w:pPr>"#
-    );
     let mut reread_deleted = None;
     for (got, reread) in save_and_reread("step 38a", &archive, &deleted)? {
-        if !got.contains(&mark) || !got.contains("<w:delText") {
-            bail!("step 38a: the deleted mark / text was not written ({mark})\n{got}");
+        if !has_minted_mark(&got, "w:del") || !got.contains("<w:delText") {
+            bail!("step 38a: the deleted mark / text was not written\n{got}");
         }
         let kinds: Vec<Vec<RevisionKind>> = reread
             .blocks

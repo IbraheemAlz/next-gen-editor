@@ -174,3 +174,119 @@ test('Ctrl+B then typing in a header produces a bold header run (#296)', async (
     expect(out.runs[0], '"Hi" is bold in the header').toEqual({ bold: true, mixed: false });
     expect(out.runs[1], '" there" is plain').toEqual({ bold: false, mixed: false });
 });
+
+/* Issue #292 — Backspace at the start of the paragraph after a heading,
+ * and Delete at the heading's end, join the paragraphs into ONE heading
+ * (the merge used to clear the paragraph style). */
+test('Backspace / Delete across the break after a heading keep the heading (#292)', async ({
+    page,
+}) => {
+    await boot(page);
+    const out = await page.evaluate(async () => {
+        const dispatch = (window as any).__dispatch;
+        const pos = (idx: number, offset: number) => ({
+            path: { steps: [{ kind: 'BLOCK', idx }] },
+            offset,
+        });
+        const caret = (idx: number, offset: number) =>
+            dispatch({
+                type: 'SET_SELECTION',
+                range: { start: pos(idx, offset), end: pos(idx, offset) },
+                caret: pos(idx, offset),
+            });
+        const styleOf = async (idx: number) =>
+            (await caret(idx, 0)).paragraph_style_id as string | undefined;
+        const del = (forward: boolean) =>
+            dispatch({ type: 'DELETE_AT_CARET', forward, by_word: false });
+        /* A fresh "Title" heading followed by an unstyled "Body". */
+        await caret(0, 0);
+        await dispatch({ type: 'SPLIT_PARAGRAPH', at: undefined });
+        await caret(0, 0);
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Title' });
+        await dispatch({
+            type: 'APPLY_STYLE',
+            range: { start: pos(0, 0), end: pos(0, 0) },
+            style_id: 'Heading1',
+        });
+        const split = async () => {
+            await caret(0, 5);
+            await dispatch({ type: 'SPLIT_PARAGRAPH', at: undefined });
+            await caret(1, 0);
+            await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Body' });
+            await dispatch({
+                type: 'APPLY_STYLE',
+                range: { start: pos(1, 0), end: pos(1, 0) },
+                style_id: undefined,
+            });
+        };
+        await split();
+        const bodyBefore = await styleOf(1);
+        await caret(1, 0);
+        await del(false);
+        const afterBackspace = await styleOf(0);
+        /* Undo the merge, then the forward-delete variant. */
+        await dispatch({ type: 'UNDO' });
+        await caret(0, 5);
+        await del(true);
+        const afterDelete = await styleOf(0);
+        await dispatch({
+            type: 'SET_SELECTION',
+            range: { start: pos(0, 0), end: pos(0, 9) },
+            caret: pos(0, 9),
+        });
+        const clip = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+        return {
+            bodyBefore,
+            afterBackspace,
+            afterDelete,
+            text: clip.plain as string,
+        };
+    });
+    expect(out.bodyBefore ?? null, 'the body starts unstyled').toBeNull();
+    expect(out.afterBackspace, 'Backspace keeps the heading').toBe('Heading1');
+    expect(out.afterDelete, 'Delete keeps the heading').toBe('Heading1');
+    expect(out.text.startsWith('TitleBody'), JSON.stringify(out.text)).toBe(true);
+});
+
+/* Issue #293 — Enter at the end of a bold run gives a new, empty paragraph
+ * whose MARK is bold (`<w:pPr><w:rPr><w:b/>`); typing there is bold, as in
+ * Word, and the toolbar previews it before the first keystroke. */
+test('Enter at the end of a bold run, then typing, is bold (#293)', async ({ page }) => {
+    await boot(page);
+    const out = await page.evaluate(async () => {
+        const dispatch = (window as any).__dispatch;
+        const pos = (idx: number, offset: number) => ({
+            path: { steps: [{ kind: 'BLOCK', idx }] },
+            offset,
+        });
+        const select = (idx: number, a: number, b: number) =>
+            dispatch({
+                type: 'SET_SELECTION',
+                range: { start: pos(idx, a), end: pos(idx, b) },
+                caret: pos(idx, b),
+            });
+        /* A fresh "Hello world" paragraph with "world" bold. */
+        await select(0, 0, 0);
+        await dispatch({ type: 'SPLIT_PARAGRAPH', at: undefined });
+        await select(0, 0, 0);
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Hello world' });
+        await select(0, 6, 11);
+        await dispatch({ type: 'APPLY_FORMATTING', range: undefined, attrs: { bold: true } });
+        await select(0, 11, 11);
+        await dispatch({ type: 'SPLIT_PARAGRAPH', at: undefined });
+        const preview = await select(1, 0, 0);
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Next' });
+        const typed = await select(1, 0, 4);
+        const first = await select(0, 0, 5);
+        return {
+            preview: preview.attrs_at_caret.bold as boolean,
+            typed: typed.attrs_at_caret.bold as boolean,
+            mixed: typed.attrs_mixed.bold as boolean,
+            hello: first.attrs_at_caret.bold as boolean,
+        };
+    });
+    expect(out.preview, 'the empty paragraph previews bold').toBe(true);
+    expect(out.typed, 'typed text is bold').toBe(true);
+    expect(out.mixed, 'all of it').toBe(false);
+    expect(out.hello, '"Hello" stays plain').toBe(false);
+});

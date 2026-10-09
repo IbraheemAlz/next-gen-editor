@@ -193,6 +193,13 @@ export interface EditorState {
      * `zoom`, so a component mounted after the recovery still sees it.
      */
     lastRecovery: Accessor<RecoveryReport | undefined>;
+    /**
+     * Issue #333 - whether the engine's event-log checkpoints have been
+     * failing past their bounded retries (`engine.onCheckpointStatus`);
+     * `false` when the engine reports no checkpoint health. Shared like
+     * `zoom`.
+     */
+    checkpointFailing: Accessor<boolean>;
 }
 
 /**
@@ -209,6 +216,7 @@ interface ViewState {
     deviceScale: Accessor<number | undefined>;
     rendererDowngrade: Accessor<RendererDowngrade | undefined>;
     lastRecovery: Accessor<RecoveryReport | undefined>;
+    checkpointFailing: Accessor<boolean>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -238,6 +246,11 @@ function viewStateFor(engine: EngineHandle): ViewState {
             engine.lastRecovery,
         );
         engine.onRecovery?.((report) => setLastRecovery(() => report));
+        /* Issue #333 - checkpoint health, seeded then fed by the client. */
+        const [checkpointFailing, setCheckpointFailing] = createSignal(
+            engine.checkpointStatus?.failing === true,
+        );
+        engine.onCheckpointStatus?.((s) => setCheckpointFailing(s.failing));
         engine.subscribe((evt: Event) => {
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
@@ -264,7 +277,7 @@ function viewStateFor(engine: EngineHandle): ViewState {
                 setRendererDowngrade(evt.renderer_downgrade);
             }
         });
-        return { zoom, deviceScale, rendererDowngrade, lastRecovery };
+        return { zoom, deviceScale, rendererDowngrade, lastRecovery, checkpointFailing };
     });
     viewStates.set(engine, state);
     return state;
@@ -413,5 +426,6 @@ export function createEditorState(): EditorState {
         deviceScale: view.deviceScale,
         rendererDowngrade: view.rendererDowngrade,
         lastRecovery: view.lastRecovery,
+        checkpointFailing: view.checkpointFailing,
     };
 }

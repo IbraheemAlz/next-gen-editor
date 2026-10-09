@@ -490,7 +490,10 @@ pub fn read_docx_with_settings(
             id.clone(),
             engine::ParagraphStyle {
                 id: id.clone(),
-                name: id.clone(),
+                /* Issue #297 — the display `<w:name>`, never the id: a
+                regenerated styles.xml writes this back, and Word's
+                gallery shows it (`heading 1`, not `Heading1`). */
+                name: def.name.clone().unwrap_or_default(),
                 based_on: def.based_on.clone(),
                 para: def.para.clone(),
                 run: def.run.clone(),

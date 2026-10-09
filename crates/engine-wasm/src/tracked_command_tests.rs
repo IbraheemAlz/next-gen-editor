@@ -138,6 +138,7 @@ fn rejecting_the_mark_row_merges_a_tracked_enter() {
             block: 0,
             start: 5,
             end: 5,
+            revision_id: None,
         },
     );
     assert_eq!(texts(&e), vec!["alpha beta"]);
@@ -263,6 +264,7 @@ fn forward_delete_at_a_paragraph_end_marks_the_mark() {
             block: 0,
             start: 3,
             end: 3,
+            revision_id: None,
         },
     );
     assert_eq!(texts(&e), vec!["one", "two"]);
