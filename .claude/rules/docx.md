@@ -172,6 +172,24 @@ the writer replays:
   object with no picture (shape, chart, OLE) has no regeneration and is
   ALWAYS written from its bytes — never dropped. Text boxes are stories
   (`InlineKind::TextBox`, issue #83) and splice through `parts::textbox`.
+- **Markup compatibility (issue #351).** `mc:AlternateContent` reads ONE
+  branch at every level — the first `mc:Choice` whose `Requires` prefixes
+  the reader understands (`schema::mce`: by URI when declared on the AC /
+  choice, else by conventional name — `wps`, `wpg`, `wpc`, `w14`, `w15`,
+  `w16*`, `wp14`, `a14`, VML, …), else the `mc:Fallback` — and keeps the
+  others as bytes: run level, `scan_drawing` / the text-box lowering scan
+  the selected branch of the whole-element capture (the writer's verified
+  re-scan decides identically from the same bytes); paragraph level, the
+  wrapper is an opener / closer marker pair (`MarkupCapture::
+  wrapper_start` — the run-level `<w:sdt>` mechanism, #245); block level
+  and between cells / rows, an envelope (`BlockEnvelopes`, like a
+  block-level `<w:sdt>`). Inside a cell paragraph the table walker skips
+  drawings / AC / text-box stories whole (`parse_cell_paragraph` owns
+  them), so a box's own `<w:p>` is never a cell block. An element whose
+  prefix the root's `mc:Ignorable` lists and whose namespace the reader
+  does not understand (`NamespaceScope::ignores_element`) is never walked
+  for content — kept verbatim between blocks / between runs; re-rooted
+  parses (cells, text-box stories) re-declare `mc:Ignorable`.
 - Known exception: a part with two `<w:body>` elements (POI's
   `MultipleBodyBug.docx`) gets the synthesized header.
 

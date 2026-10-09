@@ -312,6 +312,32 @@ pub fn nested_sdt_docx(depth: usize) -> Vec<u8> {
     package_with_document_xml(&document_xml_with_body(&body), &[])
 }
 
+/// Issue #351 — an `<mc:AlternateContent>` text box as Word writes one: a
+/// DrawingML `wps` text box in the `<mc:Choice Requires="{requires}">`
+/// (story text `choice story`) and its VML `<w:pict><v:textbox>` duplicate
+/// in the `<mc:Fallback>` (story text `fallback story`). The `mc`, `wp`,
+/// `a`, `wps` and `v` prefixes must be bound on the part root.
+pub fn alternate_content_text_box(requires: &str) -> String {
+    format!(
+        concat!(
+            r#"<mc:AlternateContent><mc:Choice Requires="{requires}"><w:drawing>"#,
+            r#"<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" "#,
+            r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">"#,
+            r#"<wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+            r#"<wp:extent cx="914400" cy="457200"/><wp:wrapNone/><wp:docPr id="1" name="Text Box 1"/>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:wsp><wps:txbx><w:txbxContent><w:p><w:r><w:t>choice story</w:t></w:r></w:p></w:txbxContent></wps:txbx>"#,
+            r#"<wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice>"#,
+            r##"<mc:Fallback><w:pict><v:shape id="s1" type="#_x0000_t202" style="position:absolute;width:72pt;height:36pt">"##,
+            r#"<v:textbox><w:txbxContent><w:p><w:r><w:t>fallback story</w:t></w:r></w:p></w:txbxContent></v:textbox>"#,
+            r#"</v:shape></w:pict></mc:Fallback></mc:AlternateContent>"#,
+        ),
+        requires = requires
+    )
+}
+
 /// Issue #348 — `depth` tables nested cell-in-cell, the innermost cell
 /// holding the paragraph `deep`; every enclosing cell ends with the
 /// paragraph ECMA-376 requires after a nested table.

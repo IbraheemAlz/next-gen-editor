@@ -344,6 +344,7 @@ fn run_default() -> Result<()> {
     revision_ids::run_revision_ids_roundtrip()?;
     paragraph_format::run_paragraph_format_roundtrip()?;
     reader_hardening::run_field_phases_roundtrip()?;
+    reader_hardening::run_alternate_content_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

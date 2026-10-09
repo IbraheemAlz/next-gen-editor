@@ -1,6 +1,6 @@
 //! Reader hardening: hostile input (issue #349 — numbers, #350 — field
-//! markers) must read into a sane model and still round-trip
-//! byte-identical on a zero-edit save.
+//! markers, #351 — markup-compatibility branches) must read into a sane
+//! model and still round-trip byte-identical on a zero-edit save.
 
 use crate::error::DocxWarning;
 use crate::opc::archive::read_docx;
@@ -372,4 +372,245 @@ fn unclosed_begins_close_at_the_paragraph_end() {
     assert_eq!(source_bytes_rewritten(&xml, &saved), 0, "{saved}");
     assert_eq!(saved.matches(r#"w:fldCharType="begin""#).count(), 200);
     assert!(saved.contains(">code<"));
+}
+
+/* ------------------------------------------------------------------ */
+/* Issue #351 — markup compatibility                                   */
+/* ------------------------------------------------------------------ */
+
+use crate::test_fixtures::alternate_content_text_box;
+
+/// The single text box of paragraph `p` and its story's text.
+fn text_box_story(p: &engine::Paragraph) -> String {
+    let boxes: Vec<_> = p
+        .inline_objects
+        .iter()
+        .filter_map(|o| match &o.kind {
+            engine::InlineKind::TextBox { story, .. } => Some(story),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        boxes.len(),
+        1,
+        "exactly one text box: {:?}",
+        p.inline_objects
+    );
+    boxes[0]
+        .body
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .map(|q| q.text.clone())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// A paragraph-level `mc:AlternateContent` (`wps` text box choice, VML
+/// fallback): the text box appears ONCE, its story from the choice; the
+/// zero-edit save is byte-identical and an edit keeps both branches.
+#[test]
+fn paragraph_level_alternate_content_reads_its_choice_once() {
+    let ac = alternate_content_text_box("wps");
+    let para = format!(
+        "<w:p>{}{}{}</w:p>",
+        text("before "),
+        ac.replace("<w:drawing>", "<w:r><w:drawing>")
+            .replace("</w:drawing>", "</w:drawing></w:r>")
+            .replace("<w:pict>", "<w:r><w:pict>")
+            .replace("</w:pict>", "</w:pict></w:r>"),
+        text(" after"),
+    );
+    let xml = document(&para, SECT);
+    let archive = assert_zero_edit_identity(&xml);
+    let p = archive.document.blocks[0].as_paragraph().expect("p");
+    assert_eq!(p.text, "before \u{FFFC} after");
+    assert_eq!(text_box_story(p), "choice story");
+
+    let edited = archive
+        .document
+        .insert_text(archive.document.end_of_document(), "X");
+    let saved = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+    assert_eq!(saved, xml.replacen("> after<", "> afterX<", 1));
+    let edited = archive.document.insert_text(
+        engine::LogicalPos {
+            path: engine::BlockPath::top(0),
+            offset: 0,
+        },
+        "Y",
+    );
+    let saved = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+    assert_eq!(source_bytes_rewritten(&xml, &saved), 0, "{saved}");
+
+    /* `Requires="w99"` (unknown): the VML fallback is taken. */
+    let xml = xml.replace(r#"Requires="wps""#, r#"Requires="w99""#);
+    let archive = assert_zero_edit_identity(&xml);
+    let p = archive.document.blocks[0].as_paragraph().expect("p");
+    assert_eq!(p.text, "before \u{FFFC} after");
+    assert_eq!(text_box_story(p), "fallback story");
+}
+
+/// A run-level `mc:AlternateContent` honours `Requires` too.
+#[test]
+fn run_level_alternate_content_evaluates_requires() {
+    for (requires, story) in [("wps", "choice story"), ("w99", "fallback story")] {
+        let para = format!(
+            "<w:p>{}<w:r>{}</w:r></w:p>",
+            text("x"),
+            alternate_content_text_box(requires)
+        );
+        let xml = document(&para, SECT);
+        let archive = assert_zero_edit_identity(&xml);
+        let p = archive.document.blocks[0].as_paragraph().expect("p");
+        assert_eq!(p.text, "x\u{FFFC}");
+        assert_eq!(text_box_story(p), story, "Requires={requires}");
+        let edited = archive
+            .document
+            .insert_text(archive.document.end_of_document(), "X");
+        let saved = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(source_bytes_rewritten(&xml, &saved), 0, "{saved}");
+    }
+}
+
+/// A block-level `mc:AlternateContent`: only the selected branch's
+/// paragraph is a body block; the envelope keeps every branch.
+#[test]
+fn block_level_alternate_content_selects_one_branch() {
+    for (requires, expect) in [("w14", "choice"), ("w99", "fallback")] {
+        let body = format!(
+            concat!(
+                r#"<w:p><w:r><w:t>first</w:t></w:r></w:p>"#,
+                r#"<mc:AlternateContent><mc:Choice Requires="{r}"><w:p><w:r><w:t>choice</w:t></w:r></w:p></mc:Choice>"#,
+                r#"<mc:Fallback><w:p><w:r><w:t>fallback</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent>"#,
+                r#"<w:p><w:r><w:t>last</w:t></w:r></w:p>"#,
+            ),
+            r = requires
+        );
+        let xml = document(&body, SECT);
+        let archive = assert_zero_edit_identity(&xml);
+        let texts: Vec<_> = archive
+            .document
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| p.text.clone())
+            .collect();
+        assert_eq!(texts, ["first", expect, "last"], "Requires={requires}");
+        /* Edit the selected paragraph: the envelope survives. */
+        let edited = archive.document.insert_text(
+            engine::LogicalPos {
+                path: engine::BlockPath::top(1),
+                offset: expect.len() as u32,
+            },
+            "X",
+        );
+        let saved = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(
+            saved,
+            xml.replacen(&format!(">{expect}<"), &format!(">{expect}X<"), 1),
+            "Requires={requires}"
+        );
+    }
+}
+
+/// `mc:AlternateContent` between table rows (issue #290's shape): one
+/// branch's rows are the table's rows, and a cell edit — which
+/// regenerates the table — keeps the whole AlternateContent around them.
+#[test]
+fn row_level_alternate_content_survives_table_regeneration() {
+    let body = concat!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>"#,
+        r#"<w:tr><w:tc><w:p><w:r><w:t>r1</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<mc:AlternateContent><mc:Choice Requires="w14">"#,
+        r#"<w:tr><w:tc><w:p><w:r><w:t>r2</w:t></w:r></w:p></w:tc></w:tr></mc:Choice>"#,
+        r#"<mc:Fallback><w:tr><w:tc><w:p><w:r><w:t>r2</w:t></w:r></w:p></w:tc></w:tr></mc:Fallback>"#,
+        r#"</mc:AlternateContent></w:tbl><w:p/>"#,
+    );
+    let xml = document(body, SECT);
+    let archive = assert_zero_edit_identity(&xml);
+    let t = archive.document.blocks[0].as_table().expect("table");
+    assert_eq!(t.rows.len(), 2, "one branch's row");
+    let at = engine::LogicalPos {
+        path: engine::BlockPath {
+            steps: vec![
+                engine::PathStep::Block(0),
+                engine::PathStep::Cell { row: 0, col: 0 },
+                engine::PathStep::Block(0),
+            ],
+        },
+        offset: 2,
+    };
+    let edited = archive.document.insert_text(at, "X");
+    let saved = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+    assert_eq!(saved, xml.replacen(">r1<", ">r1X<", 1));
+}
+
+/// `mc:AlternateContent` between the paragraphs of a table cell used to be
+/// walked branch by branch — the cell's text came out once per branch.
+#[test]
+fn cell_level_alternate_content_reads_one_branch() {
+    let body = concat!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc>"#,
+        r#"<mc:AlternateContent><mc:Choice Requires="w14"><w:p><w:r><w:t>cell</w:t></w:r></w:p></mc:Choice>"#,
+        r#"<mc:Fallback><w:p><w:r><w:t>cell</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent>"#,
+        r#"</w:tc></w:tr></w:tbl><w:p/>"#,
+    );
+    let xml = document(body, SECT);
+    let archive = assert_zero_edit_identity(&xml);
+    let t = archive.document.blocks[0].as_table().expect("table");
+    let cell = &t.rows[0].cells[0];
+    assert_eq!(cell.blocks.len(), 1, "{:?}", cell.blocks);
+    assert_eq!(cell.blocks[0].as_paragraph().unwrap().text, "cell");
+}
+
+/// A text box inside a table cell paragraph: the table walker no longer
+/// takes the box's own `<w:p>` (in either branch) for a cell block.
+#[test]
+fn text_box_in_a_table_cell_stays_inside_its_paragraph() {
+    let body = format!(
+        concat!(
+            r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc>"#,
+            r#"<w:p><w:r><w:t>in cell</w:t></w:r><w:r>{}</w:r></w:p>"#,
+            r#"</w:tc></w:tr></w:tbl><w:p/>"#,
+        ),
+        alternate_content_text_box("wps")
+    );
+    let xml = document(&body, SECT);
+    let archive = assert_zero_edit_identity(&xml);
+    let t = archive.document.blocks[0].as_table().expect("table");
+    let cell = &t.rows[0].cells[0];
+    assert_eq!(cell.blocks.len(), 1, "{:?}", cell.blocks);
+    let p = cell.blocks[0].as_paragraph().unwrap();
+    assert_eq!(p.text, "in cell\u{FFFC}");
+    assert_eq!(text_box_story(p), "choice story");
+}
+
+/// `mc:Ignorable`: an element in an ignorable namespace the reader does
+/// not understand is ignored — its text never shows — and kept verbatim.
+#[test]
+fn ignorable_unknown_elements_are_not_walked() {
+    let para = format!(
+        r#"<w:p><w99:ext w99:v="1">{}</w99:ext>{}</w:p><w99:block><w:p><w:r><w:t>also hidden</w:t></w:r></w:p></w99:block><w:p>{}</w:p>"#,
+        text("hidden"),
+        text("shown"),
+        text("tail")
+    );
+    let xml = document(&para, SECT);
+    let archive = assert_zero_edit_identity(&xml);
+    let texts: Vec<_> = archive
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .map(|p| p.text.clone())
+        .collect();
+    assert_eq!(texts, ["shown", "tail"]);
+    let edited = archive.document.insert_text(
+        engine::LogicalPos {
+            path: engine::BlockPath::top(0),
+            offset: 5,
+        },
+        "X",
+    );
+    let saved = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+    assert_eq!(saved, xml.replacen(">shown<", ">shownX<", 1));
 }

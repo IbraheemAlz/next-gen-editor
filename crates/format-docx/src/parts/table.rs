@@ -21,6 +21,7 @@ use crate::schema::ct_tbl;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::mce;
 use crate::schema::measure::{SIGNED_TWIPS, TWIPS, attr_measure_twips, attr_pct};
 use crate::schema::source_markup::raw_attrs;
 use engine::{
@@ -170,6 +171,15 @@ impl OpenElement {
 /// cells of the current row, blocks of the current cell) — everything
 /// between rows and between cells: whitespace, range markers and the
 /// `<w:sdt>` / `<w:customXml>` wrappers around rows or cells.
+/// Issue #351 — the table walker level a tracked `mc:AlternateContent`
+/// sits at (whose `BlockEnvelopes` tracker keeps it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltTableLevel {
+    Cell,
+    Row,
+    Table,
+}
+
 fn parse_table_bytes_at(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
@@ -226,6 +236,9 @@ fn parse_table_bytes_at(
     let mut open_grid: Option<OpenElement> = None;
     let mut open_tr_pr: Option<OpenElement> = None;
     let mut open_tc_pr: Option<OpenElement> = None;
+    /* Issue #351 — tracked `mc:AlternateContent` elements: `(level, start
+    tag, a branch was taken, element-stack depth at its start)`. */
+    let mut alt_stack: Vec<(AltTableLevel, BytesStart<'static>, bool, usize)> = Vec::new();
 
     loop {
         let event = reader.read_event_into(&mut buf)?;
@@ -239,6 +252,24 @@ fn parse_table_bytes_at(
             Event::Start(e) => {
                 let name = e.name().as_ref().to_owned();
                 match name.as_slice() {
+                    /* Issue #351 — inside a cell paragraph a drawing, an
+                    `mc:AlternateContent` or a text-box story is the
+                    paragraph parser's business (`parse_cell_paragraph`):
+                    skip it whole, so neither branch of an AlternateContent
+                    nor a text box's own `<w:p>` / `<w:tbl>` is taken for a
+                    cell block. */
+                    b"w:drawing"
+                    | b"mc:AlternateContent"
+                    | b"w:pict"
+                    | b"w:object"
+                    | b"w:txbxContent"
+                        if nested_tbl_depth == 0 && p_start_byte.is_some() =>
+                    {
+                        let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
                     b"w:tbl" if !in_table => {
                         in_table = true;
                         markup.attrs = raw_attrs(&e, ns);
@@ -326,6 +357,49 @@ fn parse_table_bytes_at(
                         cell_env.open_container(prev_pos);
                         if let Some(cell) = cur_cell.as_ref() {
                             cell_env.set_blocks_at_open(cell.blocks.len());
+                        }
+                    }
+                    /* Issue #351 — `mc:AlternateContent` between cell
+                    blocks, between cells or between rows: an envelope
+                    around the branch a consumer selects (its other branches
+                    ride the opener / closer bytes), so a cell's text is no
+                    longer read once per branch. */
+                    b"mc:AlternateContent" if at_cell_level || row_level || table_level => {
+                        let level = if at_cell_level {
+                            cell_env.open_container(prev_pos);
+                            if let Some(cell) = cur_cell.as_ref() {
+                                cell_env.set_blocks_at_open(cell.blocks.len());
+                            }
+                            AltTableLevel::Cell
+                        } else if row_level {
+                            tc_env.open_container(prev_pos);
+                            if let Some(row) = cur_row.as_ref() {
+                                tc_env.set_blocks_at_open(row.cells.len());
+                            }
+                            AltTableLevel::Row
+                        } else {
+                            row_env.open_container(prev_pos);
+                            row_env.set_blocks_at_open(rows.len());
+                            AltTableLevel::Table
+                        };
+                        alt_stack.push((level, e.clone().into_owned(), false, stack.len()));
+                    }
+                    b"mc:Choice" | b"mc:Fallback"
+                        if nested_tbl_depth == 0
+                            && p_start_byte.is_none()
+                            && alt_stack.last().is_some_and(|f| f.3 + 1 == stack.len()) =>
+                    {
+                        let frame = alt_stack.last_mut().expect("guarded");
+                        let take = !frame.2
+                            && (name.as_slice() == b"mc:Fallback"
+                                || mce::choice_selectable(Some(&frame.1), &e));
+                        if take {
+                            frame.2 = true;
+                        } else {
+                            let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                            prev_pos = reader.buffer_position() as usize;
+                            buf.clear();
+                            continue;
                         }
                     }
                     /* Issue #248 — a content control / custom-XML element
@@ -580,6 +654,28 @@ fn parse_table_bytes_at(
                             row_env.note_block_end(end_pos);
                         }
                     }
+                    /* Issue #351 — a tracked `mc:AlternateContent` closes
+                    (`stack` still holds its own name here). */
+                    b"mc:AlternateContent"
+                        if alt_stack.last().is_some_and(|f| f.3 + 1 == stack.len()) =>
+                    {
+                        match alt_stack.pop().map(|f| f.0) {
+                            Some(AltTableLevel::Cell) => {
+                                if let Some(cell) = cur_cell.as_mut() {
+                                    cell_env.close_container(xml, end_pos, &mut cell.blocks);
+                                }
+                            }
+                            Some(AltTableLevel::Row) => {
+                                if let Some(row) = cur_row.as_mut() {
+                                    tc_env.close_container(xml, end_pos, &mut row.cells);
+                                }
+                            }
+                            Some(AltTableLevel::Table) => {
+                                row_env.close_container(xml, end_pos, &mut rows);
+                            }
+                            None => {}
+                        }
+                    }
                     /* Issue #120 — a cell-level container closes. */
                     b"w:sdt" | b"w:customXml" if at_cell_level && cell_env.in_container() => {
                         if let Some(cell) = cur_cell.as_mut() {
@@ -638,7 +734,14 @@ fn parse_table_bytes_at(
                 /* Issue #120 — whitespace between two cell blocks (a
                 pretty-printed part) rides the following block; issue
                 #248 — the same between cells and between rows. */
-                let container = matches!(parent, b"w:sdtContent" | b"w:customXml");
+                let container = matches!(
+                    parent,
+                    b"w:sdtContent"
+                        | b"w:customXml"
+                        | b"mc:AlternateContent"
+                        | b"mc:Choice"
+                        | b"mc:Fallback"
+                );
                 if let Some(frag) = slice_fragment(xml, prev_pos, end_pos) {
                     if at_cell_level && (container || parent == b"w:tc") {
                         cell_env.push_verbatim(frag);
@@ -731,6 +834,14 @@ fn parse_cell_paragraph(
         wrapped.extend_from_slice(prefix.as_bytes());
         wrapped.extend_from_slice(b"=\"");
         wrapped.extend_from_slice(uri.as_bytes());
+        wrapped.push(b'"');
+    }
+    /* Issue #351 — the nested parse honours the same `mc:Ignorable`. */
+    if let Some((name, value)) = ns.ignorable_attr() {
+        wrapped.push(b' ');
+        wrapped.extend_from_slice(name.as_bytes());
+        wrapped.extend_from_slice(b"=\"");
+        wrapped.extend_from_slice(value.as_bytes());
         wrapped.push(b'"');
     }
     wrapped.extend_from_slice(b"><w:body>");

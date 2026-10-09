@@ -23,6 +23,7 @@ use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::mce;
 use crate::schema::measure::{PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt};
 use crate::schema::source_markup::{
     MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_textless_run_child,
@@ -307,6 +308,29 @@ fn close_open_field_code(
     stack.truncate(first);
     crate::error::warn(DocxWarning::UnclosedField { count });
     markup.close_field_spans(first + 1, xml, end, ns);
+}
+
+/// Issue #351 — where an `<mc:AlternateContent>` the body walker tracks
+/// lives: between blocks (its envelope rides the selected branch's first /
+/// last block, like a block-level `<w:sdt>`) or inside a paragraph (its
+/// wrapper rides the paragraph's source markup as an opener / closer
+/// pair, like a run-level `<w:sdt>`). A run-level one is captured whole as
+/// an inline object instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltLevel {
+    Block,
+    Paragraph,
+}
+
+/// Issue #351 — one tracked `<mc:AlternateContent>`.
+struct AltFrame {
+    level: AltLevel,
+    /// Its start tag (namespace declarations for `Requires`).
+    tag: BytesStart<'static>,
+    /// A branch was taken (every later sibling branch is skipped).
+    selected: bool,
+    /// The walker is inside the taken branch.
+    in_branch: bool,
 }
 
 /// Apply one `<w:fldChar>` event to the field state machine.
@@ -1247,6 +1271,9 @@ fn parse_document_xml_inner(
     the bytes the writer used to synthesize. */
     let had_bom = xml_raw.len() != xml.len();
     let mut envelopes = BlockEnvelopes::new();
+    /* Issue #351 — block- / paragraph-level `mc:AlternateContent` open at
+    the cursor, innermost last. */
+    let mut alt_stack: Vec<AltFrame> = Vec::new();
     let mut in_block_container = false;
     let mut root_is_document = false;
     let mut root_end: usize = 0;
@@ -1410,6 +1437,86 @@ fn parse_document_xml_inner(
                         buf.clear();
                         continue;
                     }
+                    /* Issue #351 — `mc:AlternateContent` between runs or
+                    between blocks: only the branch a consumer selects is
+                    walked (the first `mc:Choice` whose `Requires` the
+                    reader understands, else the `mc:Fallback`); the
+                    branches not taken ride the opener / closer bytes. */
+                    b"mc:AlternateContent" if in_para && !in_ppr => {
+                        markup.wrapper_start(prev_pos);
+                        alt_stack.push(AltFrame {
+                            level: AltLevel::Paragraph,
+                            tag: e.clone().into_owned(),
+                            selected: false,
+                            in_branch: false,
+                        });
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    b"mc:AlternateContent" if at_block_level => {
+                        envelopes.open_container(prev_pos);
+                        envelopes.set_blocks_at_open(out_blocks.len());
+                        alt_stack.push(AltFrame {
+                            level: AltLevel::Block,
+                            tag: e.clone().into_owned(),
+                            selected: false,
+                            in_branch: false,
+                        });
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    b"mc:Choice" | b"mc:Fallback"
+                        if !in_run && alt_stack.last().is_some_and(|f| !f.in_branch) =>
+                    {
+                        let frame = alt_stack.last_mut().expect("guarded");
+                        let take = !frame.selected
+                            && (name.as_ref() == b"mc:Fallback"
+                                || mce::choice_selectable(Some(&frame.tag), &e));
+                        if take {
+                            frame.selected = true;
+                            frame.in_branch = true;
+                            let end = reader.buffer_position() as usize;
+                            if frame.level == AltLevel::Paragraph {
+                                let close: &'static [u8] = if name.as_ref() == b"mc:Choice" {
+                                    b"</mc:Choice></mc:AlternateContent>"
+                                } else {
+                                    b"</mc:Fallback></mc:AlternateContent>"
+                                };
+                                markup.wrapper_content_start(
+                                    xml,
+                                    end,
+                                    para_text.len() as u32,
+                                    &ns,
+                                    false,
+                                    close,
+                                );
+                            }
+                            prev_pos = end;
+                        } else {
+                            let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                            prev_pos = reader.buffer_position() as usize;
+                        }
+                        buf.clear();
+                        continue;
+                    }
+                    /* Issue #351 — an element the root's `mc:Ignorable`
+                    says to ignore (an ignorable prefix the reader does not
+                    understand) is never walked for content: kept verbatim
+                    between blocks or between runs. */
+                    n if (at_block_level || (in_para && !in_ppr)) && ns.ignores_element(n) => {
+                        if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            if at_block_level {
+                                envelopes.push_verbatim(frag);
+                            } else {
+                                markup.marker(para_text.len() as u32, frag, &ns);
+                            }
+                        }
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
                     b"w:sdtPr" | b"w:sdtEndPr" if in_para => {
                         let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
                         prev_pos = reader.buffer_position() as usize;
@@ -1437,6 +1544,14 @@ fn parse_document_xml_inner(
                         if let Some(frag) = capture_subtree(xml, start, &mut reader, &e)? {
                             let end = reader.buffer_position() as usize;
                             let scan = scan_drawing(&frag);
+                            /* Issue #351 — an `mc:AlternateContent` is lowered
+                            from the branch a consumer selects (the bytes keep
+                            every branch). */
+                            let selected: &[u8] = if frag.starts_with(b"<mc:AlternateContent") {
+                                mce::selected_content(&frag).unwrap_or_default()
+                            } else {
+                                &frag
+                            };
                             /* Issue #83 — a text box (a `<wps:wsp>` shape with
                             a `<wps:txbx>` story, or a VML `<v:textbox>`) is
                             modeled as a story: its blocks parse through the
@@ -1444,7 +1559,7 @@ fn parse_document_xml_inner(
                             container and the `<w:txbxContent>` ranges are
                             the writer's splice points. */
                             let text_box = if scan.drawing_ml {
-                                lower_text_box(&frag, resolver, &ns).map(|tb| {
+                                lower_text_box(selected, resolver, &ns).map(|tb| {
                                     (
                                         scan.cx.unwrap_or(0),
                                         scan.cy.unwrap_or(0),
@@ -1453,7 +1568,7 @@ fn parse_document_xml_inner(
                                     )
                                 })
                             } else {
-                                textbox::parse_vml(&frag, resolver, &ns)
+                                textbox::parse_vml(selected, resolver, &ns)
                                     .map(|v| (v.width_emu, v.height_emu, v.anchor, v.story))
                             };
                             let at = (para_text.len() + run_text.len()) as u32;
@@ -1870,6 +1985,34 @@ fn parse_document_xml_inner(
                         markup.sdt_start(prev_pos);
                         markup.sdt_end(xml, here, para_text.len() as u32, &ns);
                     }
+                    /* Issue #351 — a self-closing branch of a tracked
+                    `mc:AlternateContent`: taking it selects nothing. */
+                    b"mc:Choice" | b"mc:Fallback"
+                        if !in_run && alt_stack.last().is_some_and(|f| !f.in_branch) =>
+                    {
+                        let frame = alt_stack.last_mut().expect("guarded");
+                        if !frame.selected
+                            && (name.as_ref() == b"mc:Fallback"
+                                || mce::choice_selectable(Some(&frame.tag), &e))
+                        {
+                            frame.selected = true;
+                            if frame.level == AltLevel::Paragraph {
+                                markup.wrapper_content_start(
+                                    xml,
+                                    here,
+                                    para_text.len() as u32,
+                                    &ns,
+                                    true,
+                                    b"</mc:AlternateContent>",
+                                );
+                            }
+                        }
+                    }
+                    n if in_para && !in_run && !in_ppr && ns.ignores_element(n) => {
+                        if let Some(frag) = slice_fragment(xml, prev_pos, here) {
+                            markup.marker(para_text.len() as u32, frag, &ns);
+                        }
+                    }
                     b"w:pPr" if in_para && !in_run => markup.close_ppr(xml, here, &ns),
                     b"w:rPr" if in_para && in_run => {
                         if let Some(frag) = slice_fragment(xml, prev_pos, here) {
@@ -1968,7 +2111,7 @@ fn parse_document_xml_inner(
                     represent: verbatim, attached to the following block
                     (or after the last one). Comment range markers are
                     ALSO recorded as ranges in their own arms below. */
-                    n if at_block_level && is_block_level_marker(n) => {
+                    n if at_block_level && (is_block_level_marker(n) || ns.ignores_element(n)) => {
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
                             envelopes.push_verbatim(frag);
@@ -2459,6 +2602,32 @@ fn parse_document_xml_inner(
                     b"w:sdtContent" if p_start_byte.is_some() && !in_run => {
                         markup.sdt_content_end(prev_pos);
                     }
+                    /* Issue #351 — the taken branch / the tracked
+                    `mc:AlternateContent` close. */
+                    b"mc:Choice" | b"mc:Fallback"
+                        if !in_run && alt_stack.last().is_some_and(|f| f.in_branch) =>
+                    {
+                        if let Some(frame) = alt_stack.last_mut() {
+                            frame.in_branch = false;
+                            if frame.level == AltLevel::Paragraph {
+                                markup.sdt_content_end(prev_pos);
+                            }
+                        }
+                    }
+                    b"mc:AlternateContent"
+                        if !in_run && alt_stack.last().is_some_and(|f| !f.in_branch) =>
+                    {
+                        let end = reader.buffer_position() as usize;
+                        match alt_stack.pop().map(|f| f.level) {
+                            Some(AltLevel::Paragraph) => {
+                                markup.sdt_end(xml, end, para_text.len() as u32, &ns);
+                            }
+                            Some(AltLevel::Block) => {
+                                envelopes.close_container(xml, end, &mut out_blocks);
+                            }
+                            None => {}
+                        }
+                    }
                     b"w:sdt" if p_start_byte.is_some() && !in_run => {
                         markup.sdt_end(
                             xml,
@@ -2695,6 +2864,9 @@ fn parse_document_xml_inner(
                         }
                     }
                     b"w:p" => {
+                        /* Issue #351 — an `mc:AlternateContent` never spans
+                        a paragraph end. */
+                        alt_stack.retain(|f| f.level != AltLevel::Paragraph);
                         /* Issue #350 — unbalanced field code ends here. */
                         close_open_field_code(
                             &mut field_stack,

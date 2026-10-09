@@ -88,9 +88,11 @@ fn check_fixture(
             let back = read_docx(&saved).context("re-read")?;
             let text = back
                 .document
-                .paragraph_text(*block)
-                .unwrap_or_default()
-                .to_owned();
+                .blocks
+                .get(*block as usize)
+                .and_then(engine::Block::as_paragraph)
+                .map(|p| p.text.clone())
+                .unwrap_or_default();
             if !text.contains(INSERT_TEXT.trim()) {
                 bail!("{step} {path}: the insert is not visible on re-read: {text:?}");
             }
@@ -177,6 +179,100 @@ pub(crate) fn run_field_phases_roundtrip() -> Result<()> {
     }
     println!(
         "[roundtrip] step 41c OK — 200 unclosed begins close at their paragraph end; the next paragraph is visible"
+    );
+    Ok(())
+}
+
+/* =================================== #351 — markup compatibility ==== */
+
+/// The story text of the single text box in paragraph `idx`.
+fn text_box_story(archive: &format_docx::DocxArchive, idx: u32) -> Result<String> {
+    let p = archive
+        .document
+        .nth_paragraph(idx)
+        .context("text-box paragraph")?;
+    let stories: Vec<String> = p
+        .inline_objects
+        .iter()
+        .filter_map(|o| match &o.kind {
+            engine::InlineKind::TextBox { story, .. } => Some(
+                story
+                    .body
+                    .iter()
+                    .filter_map(engine::Block::as_paragraph)
+                    .map(|q| q.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            ),
+            _ => None,
+        })
+        .collect();
+    match stories.as_slice() {
+        [one] => Ok(one.clone()),
+        other => bail!("expected one text box, found {other:?}"),
+    }
+}
+
+/// Issue #351 — step 42: `mc:AlternateContent` at paragraph, block and
+/// cell level reads ONE branch (the first satisfiable choice, else the
+/// fallback) and keeps every branch through a save.
+pub(crate) fn run_alternate_content_roundtrip() -> Result<()> {
+    /* 42a — paragraph level: a `wps` text box choice with a VML fallback. */
+    let ac = format_docx::test_fixtures::alternate_content_text_box("wps")
+        .replace("<w:drawing>", "<w:r><w:drawing>")
+        .replace("</w:drawing>", "</w:drawing></w:r>")
+        .replace("<w:pict>", "<w:r><w:pict>")
+        .replace("</w:pict>", "</w:pict></w:r>");
+    let xml = document(&format!(
+        "<w:p>{}{ac}{}</w:p>",
+        text("before "),
+        text(" after")
+    ));
+    let archive = check_fixture(
+        "step 42a",
+        &xml,
+        &["before \u{FFFC} after"],
+        &[(0, 0), (0, 7), (0, 15)],
+    )?;
+    let story = text_box_story(&archive, 0)?;
+    if story != "choice story" {
+        bail!("step 42a: text box story {story:?}, expected the choice's");
+    }
+    println!(
+        "[roundtrip] step 42a OK — paragraph-level AlternateContent reads its wps choice once; edits are pure insertions"
+    );
+
+    /* 42b — an unknown requirement takes the fallback. */
+    let xml = xml.replace(r#"Requires="wps""#, r#"Requires="w99""#);
+    let archive = check_fixture("step 42b", &xml, &["before \u{FFFC} after"], &[(0, 15)])?;
+    let story = text_box_story(&archive, 0)?;
+    if story != "fallback story" {
+        bail!("step 42b: text box story {story:?}, expected the fallback's");
+    }
+    println!("[roundtrip] step 42b OK — Requires=\"w99\" takes the VML fallback");
+
+    /* 42c — block level and between the paragraphs of a table cell. */
+    let body = concat!(
+        r#"<mc:AlternateContent><mc:Choice Requires="w14"><w:p><w:r><w:t>choice</w:t></w:r></w:p></mc:Choice>"#,
+        r#"<mc:Fallback><w:p><w:r><w:t>fallback</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent>"#,
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc>"#,
+        r#"<mc:AlternateContent><mc:Choice Requires="w14"><w:p><w:r><w:t>cell</w:t></w:r></w:p></mc:Choice>"#,
+        r#"<mc:Fallback><w:p><w:r><w:t>cell</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent>"#,
+        r#"</w:tc></w:tr></w:tbl><w:p><w:r><w:t>last</w:t></w:r></w:p>"#,
+    );
+    let xml = document(body);
+    let archive = check_fixture("step 42c", &xml, &["choice", "last"], &[(0, 6), (2, 4)])?;
+    let cell_blocks = archive
+        .document
+        .blocks
+        .get(1)
+        .and_then(engine::Block::as_table)
+        .map(|t| t.rows[0].cells[0].blocks.len());
+    if cell_blocks != Some(1) {
+        bail!("step 42c: the cell holds {cell_blocks:?} blocks, expected 1");
+    }
+    println!(
+        "[roundtrip] step 42c OK — block- and cell-level AlternateContent read one branch and keep both"
     );
     Ok(())
 }

@@ -83,6 +83,14 @@ pub(crate) fn parse_story(
         wrapped.extend_from_slice(uri.as_bytes());
         wrapped.push(b'"');
     }
+    /* Issue #351 — the nested parse honours the same `mc:Ignorable`. */
+    if let Some((name, value)) = ns.ignorable_attr() {
+        wrapped.push(b' ');
+        wrapped.extend_from_slice(name.as_bytes());
+        wrapped.extend_from_slice(b"=\"");
+        wrapped.extend_from_slice(value.as_bytes());
+        wrapped.push(b'"');
+    }
     wrapped.extend_from_slice(b"><w:body>");
     wrapped.extend_from_slice(inner);
     wrapped.extend_from_slice(b"</w:body></w:document>");

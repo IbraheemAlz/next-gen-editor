@@ -12,6 +12,7 @@ pub mod ct_rpr;
 pub mod ct_tbl;
 pub mod drawing;
 pub mod grab_bag;
+pub(crate) mod mce;
 pub(crate) mod measure;
 pub mod source_markup;
 pub mod wp_anchor;
