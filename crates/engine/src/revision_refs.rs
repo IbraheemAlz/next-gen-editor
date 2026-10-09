@@ -4,9 +4,10 @@
 //!
 //! A [`RevisionRef`] names a revision by where it lives: the paragraph
 //! (a story-rooted [`BlockPath`]) and the slot in it — the n-th text
-//! overlay of [`Paragraph::revisions`] or the paragraph-mark revision
-//! ([`Paragraph::mark_revision`]). A [`RevisionPick`] is the set one
-//! resolution pass touches.
+//! overlay of [`Paragraph::revisions`] or the n-th change on the
+//! paragraph mark ([`Paragraph::mark_revisions`] — a mark can carry
+//! several, issue #303). A [`RevisionPick`] is the set one resolution
+//! pass touches.
 //!
 //! Issue #304 — the review UI addresses a revision by a stable
 //! `revision_id` ([`DocumentTree::revision_entries`]), not by its range:
@@ -31,8 +32,8 @@ use crate::{Block, BlockPath, DocumentTree, Paragraph, PathStep, Revision, Revis
 pub enum RevisionSlot {
     /// `Paragraph::revisions[i]`.
     Text(u32),
-    /// `Paragraph::mark_revision`.
-    Mark,
+    /// `Paragraph::mark_revisions[i]`.
+    Mark(u32),
 }
 
 /// One tracked change: the paragraph it lives in and its slot there.
@@ -64,13 +65,13 @@ impl RevisionPick {
         }
     }
 
-    /// The paragraph-mark revision of the paragraph at `path`.
-    pub(crate) fn mark(&self, path: &BlockPath) -> bool {
+    /// Paragraph-mark revision `i` of the paragraph at `path`.
+    pub(crate) fn mark(&self, path: &BlockPath, i: usize) -> bool {
         match self {
             Self::All => true,
             Self::Only(set) => set.contains(&RevisionRef {
                 path: path.clone(),
-                slot: RevisionSlot::Mark,
+                slot: RevisionSlot::Mark(i as u32),
             }),
         }
     }
@@ -90,8 +91,9 @@ pub struct RevisionEntry<'a> {
 impl DocumentTree {
     /// Issue #304 — every tracked change the resolver reaches (the body
     /// and one level of table cells), in document order — per paragraph
-    /// its text revisions, then its mark — each with its stable
-    /// `revision_id`. Ids are unique within the document.
+    /// its text revisions, then its mark's changes in order (one entry
+    /// each, issue #303) — each with its stable `revision_id`. Ids are
+    /// unique within the document.
     pub fn revision_entries(&self) -> Vec<RevisionEntry<'_>> {
         let mut used = HashSet::new();
         let mut out = Vec::new();
@@ -101,7 +103,12 @@ impl DocumentTree {
                 .iter()
                 .enumerate()
                 .map(|(i, r)| (RevisionSlot::Text(i as u32), r))
-                .chain(p.mark_revision.iter().map(|r| (RevisionSlot::Mark, r)));
+                .chain(
+                    p.mark_revisions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| (RevisionSlot::Mark(i as u32), r)),
+                );
             for (slot, r) in slots {
                 let mut id = content_key(p, slot, r);
                 while !used.insert(id) {
@@ -135,7 +142,8 @@ impl DocumentTree {
     /// paragraph `block` covering exactly `[start, end)`; a
     /// paragraph-mark revision answers to the empty range at the
     /// paragraph end (issue #262 — `revisions_snapshot` lists it so; text
-    /// revisions are never empty). Two wrappers over one range are
+    /// revisions are never empty) — the FIRST of a mark's changes (issue
+    /// #303). Two wrappers over one range, and a mark's later changes, are
     /// ambiguous here — address them by id ([`Self::revision_by_id`]).
     pub fn revision_at_range(&self, block: u32, start: u32, end: u32) -> Option<RevisionRef> {
         let p = self
@@ -153,10 +161,10 @@ impl DocumentTree {
                 slot: RevisionSlot::Text(i as u32),
             });
         }
-        (start == end && p.mark_revision.is_some() && start as usize == p.text.len()).then_some(
+        (start == end && !p.mark_revisions.is_empty() && start as usize == p.text.len()).then_some(
             RevisionRef {
                 path,
-                slot: RevisionSlot::Mark,
+                slot: RevisionSlot::Mark(0),
             },
         )
     }
@@ -171,7 +179,7 @@ impl DocumentTree {
         let p = self.paragraph_at_path(&at.path)?;
         let target = match at.slot {
             RevisionSlot::Text(i) => p.revisions.get(i as usize),
-            RevisionSlot::Mark => p.mark_revision.as_ref(),
+            RevisionSlot::Mark(i) => p.mark_revisions.get(i as usize),
         }?;
         let mut picked = HashSet::from([at.clone()]);
         if let Some(name) = move_of(target) {
@@ -184,11 +192,13 @@ impl DocumentTree {
                         });
                     }
                 }
-                if p.mark_revision.as_ref().and_then(move_of) == Some(name) {
-                    picked.insert(RevisionRef {
-                        path,
-                        slot: RevisionSlot::Mark,
-                    });
+                for (i, r) in p.mark_revisions.iter().enumerate() {
+                    if move_of(r) == Some(name) {
+                        picked.insert(RevisionRef {
+                            path: path.clone(),
+                            slot: RevisionSlot::Mark(i as u32),
+                        });
+                    }
                 }
             }
         }
@@ -280,9 +290,9 @@ fn content_key(p: &Paragraph, slot: RevisionSlot, r: &Revision) -> u32 {
             let e = p.snap_offset(r.end.min(len)).max(s);
             p.text.get(s as usize..e as usize).unwrap_or("")
         }
-        RevisionSlot::Mark => p.text.as_str(),
+        RevisionSlot::Mark(_) => p.text.as_str(),
     };
-    h.write(&[kind, u8::from(slot == RevisionSlot::Mark)]);
+    h.write(&[kind, u8::from(matches!(slot, RevisionSlot::Mark(_)))]);
     h.write_str(&r.author);
     h.write_str(&r.date);
     match r.id {

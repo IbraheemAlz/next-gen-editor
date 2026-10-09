@@ -211,7 +211,7 @@ fn engine_made_revisions_get_distinct_ids() {
     let mut doc = doc;
     let mut blocks = doc.blocks.clone();
     if let engine::Block::Paragraph(p) = &mut blocks[0] {
-        p.mark_revision = Some(engine::Revision {
+        p.mark_revisions = vec![engine::Revision {
             start: 0,
             end: 0,
             kind: engine::RevisionKind::Insert,
@@ -220,7 +220,7 @@ fn engine_made_revisions_get_distinct_ids() {
             id: None,
             prev_attrs: None,
             move_name: None,
-        });
+        }];
     }
     doc.blocks = blocks;
     let xml = build_document_xml(&doc, &HashMap::new());

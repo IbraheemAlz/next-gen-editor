@@ -62,7 +62,7 @@ fn picture_paragraph(kind: RevisionKind) -> DocumentTree {
     if let Block::Paragraph(p) = &mut blocks[0] {
         let len = p.text.len() as u32;
         p.revisions = vec![rev(kind, 0, len)];
-        p.mark_revision = Some(rev(kind, 0, 0));
+        p.mark_revisions = vec![rev(kind, 0, 0)];
     }
     d.blocks = blocks;
     assert_eq!(objects(&d), vec![(0, 4)]);
@@ -163,7 +163,7 @@ fn a_missing_revision_is_a_no_op() {
     let d = picture_paragraph(RevisionKind::Insert);
     let missing = RevisionRef {
         path: BlockPath::top(1),
-        slot: RevisionSlot::Mark,
+        slot: RevisionSlot::Mark(0),
     };
     assert!(d.resolve_revision(&missing, true).is_none());
     let bad_index = RevisionRef {
@@ -188,7 +188,7 @@ fn one_at_a_time_matches_all_at_once() {
         let mut blocks = d.blocks.clone();
         if let Block::Paragraph(p) = &mut blocks[0] {
             p.revisions = vec![rev(RevisionKind::Delete, 5, 10)];
-            p.mark_revision = Some(rev(RevisionKind::Delete, 0, 0));
+            p.mark_revisions = vec![rev(RevisionKind::Delete, 0, 0)];
         }
         if let Block::Paragraph(p) = &mut blocks[1] {
             p.revisions = vec![rev(RevisionKind::Insert, 0, 4)];
@@ -207,7 +207,7 @@ fn one_at_a_time_matches_all_at_once() {
                 .enumerate()
                 .find_map(|(b, blk)| {
                     blk.as_paragraph()
-                        .filter(|p| !p.revisions.is_empty() || p.mark_revision.is_some())
+                        .filter(|p| !p.revisions.is_empty() || !p.mark_revisions.is_empty())
                         .map(|p| (b as u32, p))
                 })
                 .expect("a paragraph with a revision");
@@ -416,11 +416,11 @@ fn a_move_across_paragraphs_resolves_every_piece() {
     let mut blocks = d.blocks.clone();
     if let Block::Paragraph(p) = &mut blocks[0] {
         p.revisions = vec![moved(RevisionKind::MoveFrom, 0, 4, "m")];
-        p.mark_revision = Some(moved(RevisionKind::MoveFrom, 0, 0, "m"));
+        p.mark_revisions = vec![moved(RevisionKind::MoveFrom, 0, 0, "m")];
     }
     if let Block::Paragraph(p) = &mut blocks[2] {
         p.revisions = vec![moved(RevisionKind::MoveTo, 0, 2, "m")];
-        p.mark_revision = Some(moved(RevisionKind::MoveTo, 0, 0, "m"));
+        p.mark_revisions = vec![moved(RevisionKind::MoveTo, 0, 0, "m")];
     }
     d.blocks = blocks;
     let to = id_of(&d, 2, RevisionSlot::Text(0));
@@ -429,7 +429,9 @@ fn a_move_across_paragraphs_resolves_every_piece() {
         .unwrap();
     assert_eq!(texts(&accepted), vec!["x", "to", "end"]);
     assert!(!accepted.has_revisions());
-    let from_mark = d.revision_by_id(id_of(&d, 0, RevisionSlot::Mark)).unwrap();
+    let from_mark = d
+        .revision_by_id(id_of(&d, 0, RevisionSlot::Mark(0)))
+        .unwrap();
     let rejected = d.resolve_revision(&from_mark, false).unwrap();
     /* The destination's text and its moved-in mark go: the emptied
     paragraph vanishes; the source keeps its text and its break. */
@@ -531,4 +533,64 @@ fn a_split_format_change_resolves_on_both_halves() {
     let p = rejected.nth_paragraph(0).unwrap();
     assert!(p.revisions.is_empty());
     assert!(p.spans.iter().all(|s| s.style == prev), "{:?}", p.spans);
+}
+
+/* ===== issues #303 / #304 — a mark carrying two changes, by id ====== */
+
+/// `"ab"`'s mark was inserted by A, then deleted by B (Word writes
+/// `<w:ins/><w:del/>`); `"cd"` follows. Each change is its own entry with
+/// its own id; the range addresses only the first.
+fn double_mark() -> DocumentTree {
+    let mut d = DocumentTree::from_paragraphs(["ab".to_string(), "cd".to_string()]);
+    let mut blocks = d.blocks.clone();
+    if let Block::Paragraph(p) = &mut blocks[0] {
+        p.mark_revisions = vec![
+            rev(RevisionKind::Insert, 0, 0),
+            Revision {
+                author: "B".into(),
+                ..rev(RevisionKind::Delete, 0, 0)
+            },
+        ];
+    }
+    d.blocks = blocks;
+    d
+}
+
+fn marks(d: &DocumentTree, block: u32) -> Vec<RevisionKind> {
+    d.nth_paragraph(block)
+        .map(|p| p.mark_revisions.iter().map(|r| r.kind).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn each_change_of_a_double_mark_has_its_own_id() {
+    let d = double_mark();
+    let first = id_of(&d, 0, RevisionSlot::Mark(0));
+    let second = id_of(&d, 0, RevisionSlot::Mark(1));
+    assert_ne!(first, second);
+    assert_eq!(
+        d.revision_at_range(0, 2, 2).map(|r| r.slot),
+        Some(RevisionSlot::Mark(0))
+    );
+    let by = |id: u32| d.revision_by_id(id).unwrap();
+
+    /* Accepting B's deletion removes the mark: the paragraphs merge and
+    A's insertion goes with the mark it described. */
+    let out = d.resolve_revision(&by(second), true).unwrap();
+    assert_eq!(texts(&out), vec!["abcd"]);
+    assert!(!out.has_revisions());
+    /* Rejecting it keeps the mark — and A's pending insertion of it. */
+    let out = d.resolve_revision(&by(second), false).unwrap();
+    assert_eq!(texts(&out), vec!["ab", "cd"]);
+    assert_eq!(marks(&out, 0), vec![RevisionKind::Insert]);
+    /* Accepting A's insertion leaves B's deletion pending; rejecting it
+    removes the mark. */
+    let out = d.resolve_revision(&by(first), true).unwrap();
+    assert_eq!(texts(&out), vec!["ab", "cd"]);
+    assert_eq!(marks(&out, 0), vec![RevisionKind::Delete]);
+    let out = d.resolve_revision(&by(first), false).unwrap();
+    assert_eq!(texts(&out), vec!["abcd"]);
+    /* Accept-all / reject-all: either way one change removes the mark. */
+    assert_eq!(texts(&d.resolve_all_revisions(true)), vec!["abcd"]);
+    assert_eq!(texts(&d.resolve_all_revisions(false)), vec!["abcd"]);
 }

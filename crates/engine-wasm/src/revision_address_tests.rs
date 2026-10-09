@@ -112,7 +112,7 @@ fn engine_with_deleted_paragraph() -> Engine {
     let mut doc = DocumentTree::from_paragraphs(["gone".into(), "kept".into()]);
     if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0) {
         p.revisions.push(rev(engine::RevisionKind::Delete, 0, 4));
-        p.mark_revision = Some(rev(engine::RevisionKind::Delete, 0, 0));
+        p.mark_revisions = vec![rev(engine::RevisionKind::Delete, 0, 0)];
     }
     let mut e = engine_with(doc);
     e.selection = Some(SelectionState {
@@ -167,7 +167,7 @@ fn an_address_naming_no_revision_pushes_no_undo_step() {
     assert_eq!(texts(&e), vec!["gone", "kept"]);
     let p = e.undo.current().nth_paragraph(0).unwrap();
     assert_eq!(p.revisions.len(), 1);
-    assert!(p.mark_revision.is_some());
+    assert!(!p.mark_revisions.is_empty());
 }
 
 /// Tika-792's shape: `"s."` — "s" deleted, "." moved here and deleted
@@ -273,4 +273,46 @@ fn rejecting_the_source_half_rejects_the_destination() {
         .map(|r| r.kind)
         .collect();
     assert_eq!(kinds, vec!["delete", "insert"]);
+}
+
+/// Issues #303 / #304 — a mark carrying two changes lists one mark row
+/// per change, each with its own id; rejecting the SECOND (unreachable by
+/// range) by id keeps the paragraphs and the first change.
+#[test]
+fn each_change_of_a_double_mark_is_its_own_row() {
+    let mut doc = DocumentTree::from_paragraphs(["ab".into(), "cd".into()]);
+    if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0) {
+        p.mark_revisions = vec![
+            rev(engine::RevisionKind::Insert, 0, 0),
+            engine::Revision {
+                author: "B".into(),
+                ..rev(engine::RevisionKind::Delete, 0, 0)
+            },
+        ];
+    }
+    let mut e = engine_with(doc);
+    let rows = revision_rows(e.undo.current());
+    let marks: Vec<(u32, u32, &str, bool)> = rows
+        .iter()
+        .map(|r| (r.start, r.end, r.kind, r.mark))
+        .collect();
+    assert_eq!(marks, vec![(2, 2, "insert", true), (2, 2, "delete", true)]);
+    assert_ne!(rows[0].revision_id, rows[1].revision_id);
+    let second = rows[1].clone();
+    apply(
+        &mut e,
+        reject(
+            second.block,
+            second.start,
+            second.end,
+            Some(second.revision_id),
+        ),
+    );
+    assert_eq!(texts(&e), vec!["ab", "cd"]);
+    let left = revision_rows(e.undo.current());
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        (left[0].kind, left[0].revision_id),
+        ("insert", rows[0].revision_id)
+    );
 }

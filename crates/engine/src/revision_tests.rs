@@ -131,7 +131,7 @@ fn with_markup(mut d: DocumentTree) -> DocumentTree {
 fn set_mark(d: &mut DocumentTree, block: usize, kind: RevisionKind) {
     let mut blocks = d.blocks.clone();
     if let Block::Paragraph(p) = &mut blocks[block] {
-        p.mark_revision = Some(rev(kind, 0, 0));
+        p.mark_revisions = vec![rev(kind, 0, 0)];
     }
     d.blocks = blocks;
 }
@@ -208,7 +208,7 @@ fn reject_all_of_a_mark_deletion_keeps_both_paragraphs() {
     let d = commented(d, pos(0, 2), pos(1, 2));
     let rejected = d.resolve_all_revisions(false);
     assert_eq!(texts(&rejected), vec!["alpha", "beta"]);
-    assert!(rejected.nth_paragraph(0).unwrap().mark_revision.is_none());
+    assert!(rejected.nth_paragraph(0).unwrap().mark_revisions.is_empty());
     assert_eq!(covered(&rejected), covered(&d));
     let accepted = d.resolve_all_revisions(true);
     assert_eq!(texts(&accepted), vec!["alphabeta"]);
@@ -387,7 +387,7 @@ fn a_mark_revision_in_a_table_cell_merges_in_the_cell() {
             t.rows[0].cells[0].blocks = vec![
                 Block::Paragraph(Paragraph {
                     text: "x".into(),
-                    mark_revision: Some(rev(RevisionKind::Delete, 0, 0)),
+                    mark_revisions: vec![rev(RevisionKind::Delete, 0, 0)],
                     ..Paragraph::default()
                 }),
                 Block::Paragraph(Paragraph {
@@ -401,4 +401,144 @@ fn a_mark_revision_in_a_table_cell_merges_in_the_cell() {
     assert!(d.has_revisions());
     assert_eq!(cell(&d.resolve_all_revisions(true)), vec!["xy"]);
     assert_eq!(cell(&d.resolve_all_revisions(false)), vec!["x", "y"]);
+}
+
+/* ======================= issue #303 — several changes on one mark ==== */
+
+/// A mark one reviewer inserted and another deleted (`<w:ins/><w:del/>`).
+fn ins_then_del(d: &mut DocumentTree, block: usize) {
+    let mut blocks = d.blocks.clone();
+    if let Block::Paragraph(p) = &mut blocks[block] {
+        p.mark_revisions = vec![
+            rev(RevisionKind::Insert, 0, 0),
+            Revision {
+                author: "B".into(),
+                ..rev(RevisionKind::Delete, 0, 0)
+            },
+        ];
+    }
+    d.blocks = blocks;
+}
+
+/// Accept-all resolves both changes in order (the insertion stays, the
+/// deletion merges); reject-all too (the rejected insertion removes the
+/// mark, the deletion goes with it). Nothing is left either way.
+#[test]
+fn a_mark_with_two_changes_resolves_both_in_accept_and_reject_all() {
+    let mut d = with_markup(DocumentTree::from_paragraphs([
+        "one ".to_string(),
+        "two".to_string(),
+    ]));
+    ins_then_del(&mut d, 0);
+    assert_eq!(
+        d.nth_paragraph(0).unwrap().mark_revision().map(|r| r.kind),
+        Some(RevisionKind::Insert),
+        "the single accessor is the first change"
+    );
+    for accept in [true, false] {
+        let out = d.resolve_all_revisions(accept);
+        assert_eq!(texts(&out), vec!["one two"], "accept={accept}");
+        assert!(!out.has_revisions(), "accept={accept}");
+        assert!(
+            out.blocks
+                .iter()
+                .filter_map(Block::as_paragraph)
+                .all(in_step)
+        );
+    }
+}
+
+/// A single decision addresses the FIRST change: accepting the
+/// insertion leaves the deletion pending (one row left), and accepting
+/// that one merges; rejecting the insertion merges at once.
+#[test]
+fn a_single_decision_resolves_the_first_change_of_a_mark() {
+    let mut d = DocumentTree::from_paragraphs(["ab".to_string(), "cd".to_string()]);
+    ins_then_del(&mut d, 0);
+    let once = d.accept_revision_at(0, 2, 2);
+    assert_eq!(texts(&once), vec!["ab", "cd"]);
+    let left = &once.nth_paragraph(0).unwrap().mark_revisions;
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        (left[0].kind, left[0].author.as_str()),
+        (RevisionKind::Delete, "B")
+    );
+    let twice = once.accept_revision_at(0, 2, 2);
+    assert_eq!(texts(&twice), vec!["abcd"]);
+    assert!(!twice.has_revisions());
+    let rejected = d.reject_revision_at(0, 2, 2);
+    assert_eq!(texts(&rejected), vec!["abcd"]);
+    assert!(!rejected.has_revisions());
+}
+
+/// A mark that cannot merge (the container's last paragraph) just loses
+/// every decided change.
+#[test]
+fn an_unmergeable_mark_drops_all_its_changes() {
+    let mut d = DocumentTree::from_paragraphs(["only".to_string()]);
+    ins_then_del(&mut d, 0);
+    let out = d.resolve_all_revisions(true);
+    assert_eq!(texts(&out), vec!["only"]);
+    assert!(!out.has_revisions());
+}
+
+/// Issue #303 — the snapshot encoding: no change is skipped, ONE change
+/// encodes byte-identically to the pre-#303 `mark_revision:
+/// Option<Revision>` field (so an old snapshot re-encodes unchanged), two
+/// are a sequence under the same key; every shape decodes back.
+#[test]
+fn mark_revisions_snapshot_encoding_is_backward_compatible() {
+    use crate::snapshot::{decode, encode};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Default)]
+    #[serde(default)]
+    struct Old {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mark_revision: Option<Revision>,
+    }
+    #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+    #[serde(default)]
+    struct New {
+        text: String,
+        #[serde(
+            rename = "mark_revision",
+            with = "crate::mark_revisions_serde",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        mark_revisions: Vec<Revision>,
+    }
+    let one = rev(RevisionKind::Delete, 0, 0);
+    for old in [
+        Old {
+            text: "x".into(),
+            mark_revision: None,
+        },
+        Old {
+            text: "x".into(),
+            mark_revision: Some(one.clone()),
+        },
+    ] {
+        let old_bytes = encode(&old).unwrap();
+        let new: New = decode(&old_bytes).unwrap().payload;
+        let want: Vec<Revision> = old.mark_revision.iter().cloned().collect();
+        assert_eq!(new.mark_revisions, want);
+        assert_eq!(encode(&new).unwrap(), old_bytes, "re-encodes unchanged");
+    }
+    let two = New {
+        text: "x".into(),
+        mark_revisions: vec![rev(RevisionKind::Insert, 0, 0), one],
+    };
+    let bytes = encode(&two).unwrap();
+    let back: New = decode(&bytes).unwrap().payload;
+    assert_eq!(back, two);
+    assert_eq!(encode(&back).unwrap(), bytes, "byte-stable");
+    /* And through the real tree. */
+    let mut d = DocumentTree::from_paragraphs(["a".to_string(), "b".to_string()]);
+    ins_then_del(&mut d, 0);
+    let bytes = encode(&d).unwrap();
+    let back: DocumentTree = decode(&bytes).unwrap().payload;
+    assert_eq!(back.nth_paragraph(0).unwrap().mark_revisions.len(), 2);
+    assert_eq!(encode(&back).unwrap(), bytes);
 }
