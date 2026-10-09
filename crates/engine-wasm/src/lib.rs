@@ -37,6 +37,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use table_cache::LayoutCache;
 use text_pipeline::{
     Alignment, FontStack, LoadedFont, ShapingDirection, first_strong_direction, shape_text,
 };
@@ -44,6 +45,9 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod pdf_semantics;
+/// Issue #379 — the content-keyed table layout cache that survives
+/// between paints.
+mod table_cache;
 
 #[wasm_bindgen(start)]
 pub fn boot() {
@@ -510,8 +514,8 @@ thread_local! {
 }
 
 /// Issue #318 — test-only: while alive, every sub-paginator degradation
-/// note on this thread (`NestingCapped`, `AutofitCap`, `CacheMismatch`)
-/// panics, the way a strict `layout::Watchdog` turns its notes into hard
+/// note on this thread (`NestingCapped`, `AutofitCap`, `CacheMismatch`,
+/// `TableCacheMismatch`) panics, the way a strict `layout::Watchdog` turns its notes into hard
 /// failures — CI catches a new recovery instead of a silent note.
 #[cfg(test)]
 struct StrictLayoutNotes(bool);
@@ -557,6 +561,7 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::NoteRestartCap => LayoutDegradeReason::NoteRestartCap,
         R::FloatClampedByNotes => LayoutDegradeReason::FloatClampedByNotes,
         R::NestingCapped => LayoutDegradeReason::NestingCapped,
+        R::TableCacheMismatch => LayoutDegradeReason::TableCacheMismatch,
     };
     LayoutDegraded {
         reason,
@@ -864,9 +869,12 @@ pub struct Engine {
     pending_format: Option<SpanStyle>,
     /// Incremental-relayout cache (Backlog #13): memoizes `layout_paragraph`
     /// keyed by a content + render-config hash. An edit only re-shapes the
-    /// changed paragraph; the rest are clones shifted by a Y delta. `RefCell`
-    /// because `build_page` populates it behind a `&self` borrow.
-    layout_cache: RefCell<LruCache<u64, ParagraphBox>>,
+    /// changed paragraph; the rest are clones shifted by a Y delta. Issue
+    /// #379 — it also holds the content-keyed table layout cache
+    /// ([`table_cache`]), so a repaint no longer re-lays unchanged tables;
+    /// `clear()` drops both. `RefCell` because `build_page` populates it
+    /// behind a `&self` borrow.
+    layout_cache: RefCell<LayoutCache>,
     /// Issue #34/#51 — memo of the last `build_pages` run (see
     /// [`LayoutSnapshot`]). `RefCell` because `document_geometry` and
     /// friends populate it behind `&self`.
@@ -1033,9 +1041,9 @@ pub struct Engine {
 /// document (1000 paragraphs) plus edit churn.
 const LAYOUT_CACHE_CAP: usize = 4096;
 
-/// A fresh, empty paragraph layout cache.
-fn new_layout_cache() -> RefCell<LruCache<u64, ParagraphBox>> {
-    RefCell::new(LruCache::new(
+/// A fresh, empty paragraph + table layout cache.
+fn new_layout_cache() -> RefCell<LayoutCache> {
+    RefCell::new(LayoutCache::new(
         NonZeroUsize::new(LAYOUT_CACHE_CAP).expect("LAYOUT_CACHE_CAP is non-zero"),
     ))
 }
@@ -2551,7 +2559,7 @@ fn story_has_frame_float(blocks: &[engine::Block], boxes: bool) -> bool {
 fn lay_text_box_frame(
     f: &mut layout::FloatBox,
     ctx: &TextBoxLayoutCtx<'_>,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     comp: Option<&CompositionState>,
     nested_comp: Option<(&EngineBlockPath, u32, &CompositionState)>,
     depth: u32,
@@ -2565,7 +2573,7 @@ fn lay_text_box_frame(
     let inner_w = (width - l - r).max(1.0);
     let inner_h = (height - t - b).max(0.0);
     let story = Arc::clone(&tb.source.story);
-    let lay = |plan: &layout::WrapPlan, cache: &mut LruCache<u64, ParagraphBox>| {
+    let lay = |plan: &layout::WrapPlan, cache: &mut LayoutCache| {
         layout_story_blocks_cut(
             &story.body,
             inner_w,
@@ -3507,7 +3515,7 @@ fn layout_note_blocks(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     composition: Option<&CompositionState>,
 ) -> Vec<LayoutBlock> {
     layout_story_blocks_cut(
@@ -3536,7 +3544,7 @@ fn layout_story_blocks_cut(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     composition: Option<&CompositionState>,
     plan: &layout::WrapPlan,
 ) -> Vec<LayoutBlock> {
@@ -3702,7 +3710,7 @@ fn build_note_bodies(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     active_comp: Option<(engine::NoteAnchor, &CompositionState)>,
 ) -> (
     HashMap<engine::NoteAnchor, layout::NoteBody>,
@@ -3799,7 +3807,7 @@ fn note_table_at<'t>(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     active_comp: Option<(engine::NoteAnchor, &CompositionState)>,
 ) -> &'t NoteTable {
     tables.entry(width.to_bits()).or_insert_with(|| {
@@ -3872,7 +3880,7 @@ fn reshape_resolved_fields(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     story_skip: Option<(u32, bool)>,
 ) {
     for (page_idx, page) in pages.iter_mut().enumerate() {
@@ -4024,7 +4032,7 @@ fn build_header_footer_box(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     source_rid: Option<&str>,
     composition: Option<&CompositionState>,
 ) -> Option<layout::HeaderFooterBox> {
@@ -4464,13 +4472,20 @@ const MAX_TABLE_LAYOUT_DEPTH: u32 = 32;
 /// outlives the call (an address is meaningless after it). Hits are
 /// still verified (issue #87 doctrine: a fast path is a prediction) —
 /// [`cached_table_is_consistent`] and friends — and a hit that fails is
-/// re-laid from scratch with a `CacheMismatch` note.
+/// re-laid from scratch with a `TableCacheMismatch` note (issue #379;
+/// `CacheMismatch` is the paragraph LRU's).
+///
+/// Issue #379 — beneath this per-call memo sits the CONTENT-keyed
+/// [`table_cache`] (`cache.tables`), which survives between paints: a
+/// memo miss looks the table (and a cell's intrinsic widths) up by its
+/// content fingerprint before laying it out.
 struct TableLayout<'r, 'a> {
     fonts: &'r FontStack,
     cfg: &'r RenderConfig,
     scale: f32,
     sctx: StyleContext<'a>,
-    cache: &'r mut LruCache<u64, ParagraphBox>,
+    /// The paragraph LRU + the content-keyed table cache.
+    cache: &'r mut LayoutCache,
     /// `(inner table address, available width bits)` → its laid-out box.
     boxes: HashMap<(usize, u32), TableBox>,
     /// `(table address, available width bits, grid hint given)` → the
@@ -4484,6 +4499,12 @@ struct TableLayout<'r, 'a> {
     flat_intrinsic: HashMap<usize, (f32, f32)>,
     /// A table past [`MAX_TABLE_LAYOUT_DEPTH`] was flattened.
     nesting_capped: bool,
+    /// Issue #379 — `(table address, depth)` → its content key and
+    /// nesting-cap flag ([`table_cache::table_content_key`]).
+    content_keys: HashMap<(usize, u32), (u64, bool)>,
+    /// Issue #379 — `(cell blocks address, block count, depth)` → their
+    /// content key and nesting-cap flag ([`table_cache::cell_blocks_key`]).
+    cell_keys: HashMap<(usize, usize, u32), (u64, bool)>,
 }
 
 impl<'r, 'a> TableLayout<'r, 'a> {
@@ -4492,7 +4513,7 @@ impl<'r, 'a> TableLayout<'r, 'a> {
         cfg: &'r RenderConfig,
         scale: f32,
         sctx: StyleContext<'a>,
-        cache: &'r mut LruCache<u64, ParagraphBox>,
+        cache: &'r mut LayoutCache,
     ) -> Self {
         Self {
             fonts,
@@ -4505,6 +4526,8 @@ impl<'r, 'a> TableLayout<'r, 'a> {
             intrinsic: HashMap::new(),
             flat_intrinsic: HashMap::new(),
             nesting_capped: false,
+            content_keys: HashMap::new(),
+            cell_keys: HashMap::new(),
         }
     }
 }
@@ -4539,10 +4562,11 @@ fn layout_table_box(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
 ) -> TableBox {
     let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
-    let laid = layout_table_box_uncached(&mut tl, table, available_width_px, 0);
+    /* Issue #379 — through the content-keyed cache that outlives the call. */
+    let laid = table_cache::layout_table_box_persistent(&mut tl, table, available_width_px, 0);
     if tl.nesting_capped {
         note_layout_degradation(LayoutDegradeReason::NestingCapped);
     }
@@ -4568,9 +4592,10 @@ fn layout_table_box_at(
             return hit.clone();
         }
         tl.boxes.remove(&key);
-        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+        note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
-    let laid = layout_table_box_uncached(tl, table, available_width_px, depth);
+    /* Issue #379 — a memo miss asks the content-keyed cache first. */
+    let laid = table_cache::layout_table_box_persistent(tl, table, available_width_px, depth);
     tl.boxes.insert(key, laid.clone());
     laid
 }
@@ -4917,7 +4942,7 @@ fn autofit_distribute_uncached(
     #[cfg(test)]
     AUTOFIT_SOLVES.with(|n| n.set(n.get() + 1));
     let scale = tl.scale;
-    let n_cols = autofit_column_count(table, grid_hint);
+    let n_cols = autofit_column_count(table, grid_hint.len());
     if n_cols == 0 {
         return Vec::new();
     }
@@ -5070,8 +5095,9 @@ fn autofit_distribute_uncached(
 }
 
 /// Number of autofit columns: max(grid, max row's cell-count). The grid
-/// might be empty; cells might over-/under-shoot it; take the union.
-fn autofit_column_count(table: &engine::Table, grid_hint: &[f32]) -> usize {
+/// (`grid_len` columns) might be empty; cells might over-/under-shoot it;
+/// take the union.
+fn autofit_column_count(table: &engine::Table, grid_len: usize) -> usize {
     let max_cols_in_rows = table
         .rows
         .iter()
@@ -5083,7 +5109,7 @@ fn autofit_column_count(table: &engine::Table, grid_hint: &[f32]) -> usize {
         })
         .max()
         .unwrap_or(0);
-    grid_hint.len().max(max_cols_in_rows)
+    grid_len.max(max_cols_in_rows)
 }
 
 /// Issue #318 — [`autofit_distribute_uncached`] once per (table, width,
@@ -5104,11 +5130,11 @@ fn autofit_distribute_at(
         !grid_hint.is_empty(),
     );
     if let Some(hit) = tl.columns.get(&key) {
-        if hit.len() == autofit_column_count(table, grid_hint) {
+        if hit.len() == autofit_column_count(table, grid_hint.len()) {
             return hit.clone();
         }
         tl.columns.remove(&key);
-        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+        note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
     let widths = autofit_distribute_uncached(tl, table, available_width_px, grid_hint, depth);
     tl.columns.insert(key, widths.clone());
@@ -5127,7 +5153,7 @@ fn autofit_distribute(
     scale: f32,
     grid_hint: &[f32],
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
 ) -> Vec<f32> {
     let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
     autofit_distribute_at(&mut tl, table, available_width_px, grid_hint, 0)
@@ -5142,7 +5168,7 @@ fn measure_unbreakable_width(
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
 ) -> (f32, f32) {
     let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
     measure_unbreakable_width_at(&mut tl, blocks, 1)
@@ -5163,9 +5189,10 @@ fn measure_unbreakable_width_at(
             return (lo, hi);
         }
         tl.intrinsic.remove(&key);
-        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+        note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
-    let measured = measure_unbreakable_width_uncached(tl, blocks, depth);
+    /* Issue #379 — a memo miss asks the content-keyed cache first. */
+    let measured = table_cache::measure_unbreakable_width_persistent(tl, blocks, depth);
     tl.intrinsic.insert(key, measured);
     measured
 }
@@ -5352,7 +5379,7 @@ fn flattened_intrinsic_width(tl: &mut TableLayout<'_, '_>, table: &engine::Table
             return (lo, hi);
         }
         tl.flat_intrinsic.remove(&key);
-        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+        note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
     let (mut lo, mut hi) = (0.0_f32, 0.0_f32);
     for para in flatten_table_paragraphs(table) {
@@ -5789,8 +5816,9 @@ fn collect_paragraph_line_geom(
 }
 
 /// Walk a table's rows/cells and emit `LineGeom`s for every paragraph
-/// inside a cell. Continue cells are skipped — their visual content
-/// is owned by the Restart cell above them.
+/// inside a cell — and, issue #377, inside every table nested in a
+/// cell. Continue cells are skipped — their visual content is owned by
+/// the Restart cell above them.
 fn collect_table_line_geom(
     table_box: &TableBox,
     table_block_idx: u32,
@@ -5798,6 +5826,47 @@ fn collect_table_line_geom(
     table_origin_y: f32,
     out: &mut Vec<LineGeom>,
 ) {
+    collect_table_line_geom_at(
+        table_box,
+        &[BridgePathStep::Block {
+            idx: table_block_idx,
+        }],
+        table_origin_x,
+        table_origin_y,
+        0,
+        out,
+    );
+}
+
+/// Issue #377 — [`collect_table_line_geom`] for a table at nesting
+/// `level` (0 = the outermost table of its story) whose path is
+/// `table_path`. A table nested in a cell recurses with its origin
+/// accumulated onto the cell's (the renderer's own walk: cell origin +
+/// the inner table's `origin`, which carries its cell-local stacking
+/// and `place_table` offset) and its path extended by
+/// `[Cell{r,c}, Block(b)]`, so a click inside it resolves to the inner
+/// paragraph instead of the nearest outer-cell line.
+///
+/// Bounded by the layout's nesting cap: only tables at a level below
+/// [`MAX_TABLE_LAYOUT_DEPTH`] are grids, so the recursion is at most
+/// that deep. The cells of a table at the LAST grid level
+/// (`MAX_TABLE_LAYOUT_DEPTH - 1`) are not mapped: their content may hold
+/// the paragraphs of a flattened deeper table (#318, `NestingCapped`),
+/// which are not 1:1 with the cell's model blocks, so a `Block(b)` step
+/// derived from the box index could name the wrong paragraph. A click
+/// there resolves to the nearest mapped line instead — the pre-#377
+/// behaviour, on a document the layout already reported as degraded.
+fn collect_table_line_geom_at(
+    table_box: &TableBox,
+    table_path: &[BridgePathStep],
+    table_origin_x: f32,
+    table_origin_y: f32,
+    level: u32,
+    out: &mut Vec<LineGeom>,
+) {
+    if level + 1 >= MAX_TABLE_LAYOUT_DEPTH {
+        return;
+    }
     for row in &table_box.rows {
         let row_x = table_origin_x + row.origin.x;
         let row_y = table_origin_y + row.origin.y;
@@ -5807,41 +5876,51 @@ fn collect_table_line_geom(
             }
             let cell_x = row_x + cell.origin.x;
             let cell_y = row_y + cell.origin.y;
+            /* The renderer paints a cell's content from its padded
+            content origin (`render::scene::paint_table`: `<w:tcMar>` /
+            `<w:tblCellMar>`, resolved by the layout); the hit map must
+            invert exactly that walk. Before #377 it used the cell's
+            border-box origin, so every caret, highlight and click in a
+            cell sat one left padding (Word's stock 5.4 pt) off its
+            glyphs — and a nested table would compound that per level. */
+            let content_x = cell_x + cell.padding_left;
+            let content_y = cell_y + cell.padding_top;
             for (block_idx, content) in cell.content.iter().enumerate() {
-                let LayoutBlock::Paragraph(para_box) = content else {
-                    continue;
-                };
-                let path = BridgeBlockPath {
-                    steps: vec![
-                        BridgePathStep::Block {
-                            idx: table_block_idx,
-                        },
-                        /* Issue #91 — a split table's fragments re-base
-                        their rows (and a row split inside its cells
-                        re-bases the cell content): map back to the
-                        model row / cell block. */
-                        BridgePathStep::Cell {
-                            row: row.source_row,
-                            col: c as u32,
-                        },
-                        BridgePathStep::Block {
-                            idx: cell.content_offset + block_idx as u32,
-                        },
-                    ],
-                };
-                collect_paragraph_line_geom(
-                    para_box,
-                    cell_x,
-                    cell_y,
-                    /* Hit-target = the entire cell rectangle, so a
-                    click anywhere in the cell lands on this
-                    paragraph's lines — not the leftmost cell that
-                    happens to share `y_top`. */
-                    cell_x,
-                    cell.size.width,
-                    &path,
-                    out,
-                );
+                let mut steps = Vec::with_capacity(table_path.len() + 2);
+                steps.extend_from_slice(table_path);
+                /* Issue #91 — a split table's fragments re-base their
+                rows (and a row split inside its cells re-bases the cell
+                content): map back to the model row / cell block. */
+                steps.push(BridgePathStep::Cell {
+                    row: row.source_row,
+                    col: c as u32,
+                });
+                steps.push(BridgePathStep::Block {
+                    idx: cell.content_offset + block_idx as u32,
+                });
+                match content {
+                    LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
+                        para_box,
+                        content_x,
+                        content_y,
+                        /* Hit-target = the entire cell rectangle, so a
+                        click anywhere in the cell lands on this
+                        paragraph's lines — not the leftmost cell that
+                        happens to share `y_top`. */
+                        cell_x,
+                        cell.size.width,
+                        &BridgeBlockPath { steps },
+                        out,
+                    ),
+                    LayoutBlock::Table(inner) => collect_table_line_geom_at(
+                        inner,
+                        &steps,
+                        content_x + inner.origin.x,
+                        content_y + inner.origin.y,
+                        level + 1,
+                        out,
+                    ),
+                }
             }
         }
     }
@@ -6037,7 +6116,15 @@ fn collect_table_image_rects(
                         },
                     ],
                 };
-                collect_paragraph_image_rects(para_box, cell_x, cell_y, &path, out);
+                /* Issue #377 — from the padded content origin, where the
+                renderer paints the picture (see `collect_table_line_geom_at`). */
+                collect_paragraph_image_rects(
+                    para_box,
+                    cell_x + cell.padding_left,
+                    cell_y + cell.padding_top,
+                    &path,
+                    out,
+                );
             }
         }
     }
@@ -18293,6 +18380,18 @@ impl Engine {
             .map_or(0, |s| s.pages.len())
     }
 
+    /// Issue #379 — lay the document out again, in full, with every
+    /// layout cache that survives a paint still warm (the paragraph LRU
+    /// and the content-keyed table cache): only the layout-snapshot memo
+    /// is dropped, so this is the repaint an edit elsewhere in the
+    /// document triggers, minus the edit. The corpus probe times it and
+    /// checks it reproduces the cold layout exactly
+    /// ([`Self::layout_probe_for_fuzzing`] before == after).
+    pub fn relayout_warm_for_fuzzing(&mut self) -> Result<(), Box<Event>> {
+        self.layout_snapshot.replace(None);
+        self.ensure_layout_for_fuzzing()
+    }
+
     /// Issue #318 — what a whole-corpus layout probe compares across two
     /// builds of the engine: the most recent layout snapshot's page count,
     /// its [`layout::geometry_fingerprint`] and the degradation reasons it
@@ -28853,6 +28952,15 @@ mod note_band_tests;
 /// (linear in nesting depth, verified hits) and the nesting cap.
 #[cfg(test)]
 mod nested_table_tests;
+
+/// Issue #377 — hit-testing, caret / selection rects, word selection and
+/// drags inside tables nested in table cells.
+#[cfg(test)]
+mod nested_table_hit_tests;
+
+/// Issue #379 — the content-keyed table layout cache across repaints.
+#[cfg(test)]
+mod table_cache_tests;
 
 #[cfg(test)]
 mod part_media_tests;

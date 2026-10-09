@@ -169,6 +169,20 @@ function main() {
         for (const r of unverifiedTimeouts) console.log(`    ${r.path}`);
     }
 
+    /* --- Issue #379 - warm repaint: a second full production layout with
+    every cross-paint layout cache warm must reproduce the cold layout. A
+    mismatch is a cache bug (a stale or colliding entry served). --- */
+    const withRepaint = records.filter((r) => typeof r.engine_repaint_consistent === 'boolean');
+    const repaintInconsistent = withRepaint.filter((r) => r.engine_repaint_consistent === false);
+    const sumMs = (rs, key) => rs.reduce((acc, r) => acc + (r[key] ?? 0), 0);
+    console.log('\n=== Warm repaint (#379) ===');
+    console.log(
+        `  ${withRepaint.length} documents: cold layout ${sumMs(withRepaint, 'engine_layout_ms')} ms total, ` +
+            `warm repaint ${sumMs(withRepaint, 'engine_repaint_ms')} ms total`,
+    );
+    console.log(`  inconsistent (warm != cold - a layout-cache bug): ${repaintInconsistent.length}`);
+    for (const r of repaintInconsistent) console.log(`    ${r.path}`);
+
     const buckets = new Map(); // signature -> { count, examplePath, exampleBytes, message, outcome, stage }
     for (const r of records) {
         if (r.outcome === 'ok') continue;
@@ -366,6 +380,7 @@ function main() {
             edit_bound_exceeded_informational: editOutOfBoundInformational.map((r) => r.path),
         },
         edit_rewrite_root_causes: Object.fromEntries(sortedCauses),
+        warm_repaint_inconsistent: repaintInconsistent.map((r) => r.path),
         /* Issue #384 — `--regen-check` mismatch classes (paragraphs). */
         regen_check: {
             documents: regenChecked.length,
