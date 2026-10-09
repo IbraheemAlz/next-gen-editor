@@ -170,11 +170,11 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                     /* Issue #348 — a refused open (the package exceeded
                        the reader's resource limits) says so plainly; the
                        previous document stays open. Issue #345 — so does
-                       an encrypted (password-protected) package: there is
-                       no password prompt yet, the message says what the
-                       file is and what to do. */
-                    /* Issue #345 — a protection refusal is toasted by
-                       the ErrorToast (engine copy), not here. */
+                       an encrypted package opened through the API (an
+                       open from File → Open prompts for the password
+                       instead, and its errors belong to that dialog); a
+                       protection refusal is toasted by the ErrorToast
+                       (engine copy), not here. */
                     if (evt.kind === 'Protected') break;
                     if (
                         dialogOwnsErrors &&
