@@ -25,6 +25,7 @@ import {
 import {
     createEditorCommands,
     createEditorState,
+    protectionAdmits,
     useEngine,
 } from '@nge/core';
 import { focusEditorInput } from './focus';
@@ -67,6 +68,21 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
     const inStory = () => state.editingStory() !== undefined;
     const gatedTitle = (label: string) =>
         inStory() ? 'Not available while editing a header or footer' : label;
+    /* Issue #345 — the open document's enforced protection: Track
+     * Changes is locked by every mode (`trackedChanges` forces it on),
+     * accepting / rejecting is refused by every mode, comments only by
+     * `readOnly` / `forms` (`protectionAdmits`, generated from
+     * `bridge::meta`). Disabled with a reason, never a silent refusal. */
+    const protectedTitle = (label: string, type: string, locked = false) => {
+        const mode = state.protection();
+        if (mode === undefined) return gatedTitle(label);
+        return locked || !protectionAdmits(mode, type)
+            ? 'Not available: this document is protected'
+            : gatedTitle(label);
+    };
+    const trackLocked = () => state.protection() !== undefined;
+    const commentLocked = () => !protectionAdmits(state.protection(), 'INSERT_COMMENT');
+    const revisionsLocked = () => !protectionAdmits(state.protection(), 'ACCEPT_ALL_REVISIONS');
 
     /* Propagate the author input to the engine review identity so
      * tracked revisions stop being stamped with the "You" default.
@@ -115,6 +131,9 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
         const unsub = engine.subscribe((evt) => {
             if (
                 evt.type === 'ERROR' &&
+                /* Issue #345 — protection refusals are toasted by the
+                   ErrorToast. */
+                evt.kind !== 'Protected' &&
                 (evt.message.includes('ToggleTrackChanges') ||
                     evt.message.includes('AcceptRevision') ||
                     evt.message.includes('RejectRevision') ||
@@ -173,10 +192,12 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 aria-label="Track changes"
                 aria-pressed={tracking()}
                 data-active={tracking()}
-                title={gatedTitle(
+                title={protectedTitle(
                     tracking() ? 'Track Changes — recording' : 'Track Changes — off',
+                    'TOGGLE_TRACK_CHANGES',
+                    trackLocked(),
                 )}
-                disabled={inStory()}
+                disabled={inStory() || trackLocked()}
                 onClick={() => void onToggleTracking()}
             >
                 <span aria-hidden="true">⌖</span>
@@ -187,8 +208,8 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="New comment"
-                title={gatedTitle('New comment on selected range')}
-                disabled={!ready() || inStory()}
+                title={protectedTitle('New comment on selected range', 'INSERT_COMMENT')}
+                disabled={!ready() || inStory() || commentLocked()}
                 onClick={() => setCommentDraftOpen((v) => !v)}
             >
                 <span aria-hidden="true">💬</span>
@@ -199,8 +220,8 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="Accept all revisions"
-                title={gatedTitle('Accept all tracked changes')}
-                disabled={inStory()}
+                title={protectedTitle('Accept all tracked changes', 'ACCEPT_ALL_REVISIONS')}
+                disabled={inStory() || revisionsLocked()}
                 onClick={() => void acceptAll()}
             >
                 <span aria-hidden="true">✓✓</span>
@@ -211,8 +232,8 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="Reject all revisions"
-                title={gatedTitle('Reject all tracked changes')}
-                disabled={inStory()}
+                title={protectedTitle('Reject all tracked changes', 'REJECT_ALL_REVISIONS')}
+                disabled={inStory() || revisionsLocked()}
                 onClick={() => void rejectAll()}
             >
                 <span aria-hidden="true">✗✗</span>

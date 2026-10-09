@@ -88,6 +88,8 @@ pub use tracked::{TrackedDeletion, TrackedEditError};
 pub mod html;
 pub mod numbering;
 pub mod package;
+/// Issue #345 — `w:documentProtection` model + form-region predicates.
+pub mod protection;
 pub mod snapshot;
 pub mod theme;
 
@@ -97,6 +99,7 @@ pub use fields::{
     TypedField, render_date_time_picture,
 };
 pub use package::{MediaRef, PackageEntry, SourcePackage};
+pub use protection::{DocumentProtection, FormEdit, FormRegion, ProtectionEdit};
 pub use theme::{
     ColorScheme, ColorSchemeMapping, DocumentTheme, FontBinding, FontClass, FontScheme,
     ResolvedFont, RunFontBindings, SchemeColor, ThemeColorRef, ThemeFontLang, ThemeFontRef,
@@ -1033,6 +1036,13 @@ pub struct DocumentSettings {
     /// and only a host calling `format_docx::read_docx_with_settings`
     /// with the strict ECMA-376 reading sets it `false`.
     pub widow_control_default: bool,
+    /// Issue #345 — `<w:documentProtection>` as read (`None` when the
+    /// part has none). Read-only ingest: `settings.xml` passes through
+    /// byte-identical, hash and salt included. The engine enforces
+    /// [`DocumentProtection::enforced_mode`]. Skipped when `None`, so an
+    /// unprotected document's snapshot encodes exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protection: Option<DocumentProtection>,
 }
 
 impl Default for DocumentSettings {
@@ -1042,6 +1052,7 @@ impl Default for DocumentSettings {
             author: None,
             default_page_size: DefaultPageSize::default(),
             widow_control_default: true,
+            protection: None,
         }
     }
 }

@@ -19,6 +19,7 @@ import {
 } from './event-log';
 import { nextCleanState } from './clean-state';
 import { nextRetry } from './retry-schedule';
+import { journalSafe } from './journal-safe';
 import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
@@ -1580,7 +1581,11 @@ function noteCleanState(cmd: Command, evt: Event): void {
  * `logSequence` increments synchronously so sequence order is preserved even
  * though the IndexedDB writes settle asynchronously. Returns the row's seq.
  */
-function logCommand(cmd: Command): number {
+function logCommand(command: Command): number {
+    /* Issue #345 — an encrypted document's password never reaches the
+       durable log (a replay without it answers EncryptedDocument; the
+       snapshot pinned after the open restores the document instead). */
+    const cmd = journalSafe(command);
     const seq = ++logSequence;
     const write = appendCommand(seq, cmd).then(
         () => noteJournalWriteOk(),

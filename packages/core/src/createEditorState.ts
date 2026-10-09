@@ -40,6 +40,7 @@ import type {
     LayoutDegraded,
     PreviousSessionInfo,
     LogicalRange,
+    ProtectionMode,
     RecoveryReport,
     Rect,
     RendererDowngrade,
@@ -156,6 +157,13 @@ export interface EditorState {
      * when the caret has no addressable paragraph.
      */
     paragraphIndent: Accessor<BridgeIndent>;
+    /**
+     * Issue #345 — the editing restriction the open document enforces
+     * (`readOnly` / `comments` / `trackedChanges` / `forms`), or
+     * `undefined` for an unrestricted document. Drives the protection
+     * badge; the engine refuses whatever the mode does not allow.
+     */
+    protection: Accessor<ProtectionMode | undefined>;
     /**
      * Sprint 14 (#14) — engine track-changes recording state.
      * `ReviewControls`'s Track toggle binds its active state to
@@ -463,6 +471,7 @@ export function createEditorState(): EditorState {
     const ZERO_INDENT: BridgeIndent = { start_pt: 0, end_pt: 0, first_line_pt: 0 };
     const [paragraphIndent, setParagraphIndent] = createSignal<BridgeIndent>(ZERO_INDENT);
     const [isTrackingChanges, setIsTrackingChanges] = createSignal(false);
+    const [protection, setProtection] = createSignal<ProtectionMode | undefined>(undefined);
     const [paragraphBorders, setParagraphBorders] =
         createSignal<BridgeCellBorders | undefined>(undefined);
     const [editingStory, setEditingStory] =
@@ -498,6 +507,7 @@ export function createEditorState(): EditorState {
                 setTabStops(evt.tab_stops);
                 setParagraphIndent(evt.paragraph_indent ?? ZERO_INDENT);
                 setIsTrackingChanges(evt.is_tracking_changes);
+                setProtection(evt.protection);
                 setParagraphBorders(evt.paragraph_borders);
                 setEditingStory(evt.editing_story);
                 setFieldCodeView(evt.field_code_view);
@@ -577,6 +587,7 @@ export function createEditorState(): EditorState {
         tabStops,
         paragraphIndent,
         isTrackingChanges,
+        protection,
         paragraphBorders,
         editingStory,
         fieldCodeView,

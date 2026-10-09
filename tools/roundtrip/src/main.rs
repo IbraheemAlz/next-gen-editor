@@ -35,6 +35,7 @@ mod inline_spans;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod protection;
 mod reader_cascade;
 mod reader_hardening;
 mod revision_ids;
@@ -363,6 +364,7 @@ fn run_default() -> Result<()> {
     tracked_coverage::run_tracked_paste_roundtrip()?;
     tracked_coverage::run_tracked_table_rows_roundtrip()?;
     tracked_coverage::run_section_break_revision_roundtrip()?;
+    protection::run_document_protection_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

@@ -768,6 +768,7 @@ pub fn base_engine(u: &mut Unstructured) -> engine_wasm::Engine {
                 name: Some("fuzz.docx".to_string()),
                 defaults: None,
                 limits: None,
+                password: None,
             });
         }
     }
@@ -840,6 +841,7 @@ pub fn snapshot_seeds() -> Vec<(&'static str, Vec<u8>)> {
             name: Some("seed.docx".to_string()),
             defaults: None,
             limits: None,
+            password: None,
         });
         let _ = e.apply_sync(bridge::Command::InsertText {
             text: " edited".to_string(),
