@@ -162,8 +162,8 @@ jobs:
       # job timeout killed it — red, the wrong classification for a finding).
       # Bounds: a per-job budget (MINIMIZE_BUDGET_SECS, default 900),
       # per-artifact `timeout` <= 180 s with `-max_total_time=120`, and the
-      # order crash -> leak -> oom -> timeout so real crashes are minimized
-      # first. Once the budget is spent the remaining artifacts get
+      # order crash -> leak -> oom; `timeout-*` artifacts are never tmin'd
+      # (copied straight to `.min`). Once the budget is spent the remaining artifacts get
       # `.min = original`: never lost, never minimized. Straight-line code,
       # one `cp` fallback — nothing here can loop on its own output.
       - name: Minimize any crash artifact
@@ -178,7 +178,15 @@ jobs:
           case "$BUDGET" in ''|*[!0-9]*) BUDGET=900 ;; esac
           START="$SECONDS"
           DIR="artifacts/${{ matrix.target }}"
-          for kind in crash leak oom timeout; do
+          # Hangs are not minimizable in practice: tmin runs every execution
+          # to the 30 s timeout and (run 37937811241) ran each of the four
+          # artifacts to its outer kill without output. Skip it: .min = original.
+          for f in "$DIR"/timeout-*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.min) continue ;; esac
+            cp "$f" "$f.min"
+          done
+          for kind in crash leak oom; do
             for f in "$DIR"/"$kind"-*; do
               [ -f "$f" ] || continue
               case "$f" in *.min) continue ;; esac

@@ -191,7 +191,7 @@ D5.10 are external/human sign-offs, not code.
     `rust-native` job) fails loudly if they go stale.
   - Bounded post-processing (`fuzz-nightly.yml`): crash minimization has a
     per-job budget (`minimize_budget_secs`, default 900 s; <= 180 s per
-    artifact, order crash/leak/oom/timeout; past the budget `.min` = the
+    artifact, crash/leak/oom only — `timeout-*` is never tmin'd; past the budget `.min` = the
     original) and filing is capped at 3 new issues per target per run, with
     all `timeout-*` artifacts folded into ONE issue (deduped on the smallest
     reproducer's sha256) and the overflow listed in the last issue's body.
