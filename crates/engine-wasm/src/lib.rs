@@ -7860,6 +7860,9 @@ impl Engine {
                     Event::FontLoaded {
                         id,
                         metrics: bridge_metrics,
+                        /* Issue #329 — a new face can start serving a
+                        family the open document names. */
+                        substituted: self.font_substitutions(),
                     }
                 }
                 Err(e) => Event::error(format!("LoadFont: {e}")),
@@ -13493,7 +13496,8 @@ impl Engine {
         };
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let full = &caret.full;
-        /* Built at most once, and only when a slot falls to `Default`. */
+        /* Built at most once, and only when a slot falls to `Default` or
+        names a family the substitution table may serve (issue #329). */
         let stack = std::cell::OnceCell::new();
         let slot = |(family, source): (Option<EngineFontFamily>, bridge::FontSource),
                     script: text_pipeline::Script,
@@ -13501,6 +13505,14 @@ impl Engine {
                     bold: Option<bool>,
                     italic: Option<bool>| {
             let (bold, italic) = (bold.unwrap_or(false), italic.unwrap_or(false));
+            /* Issue #329 — a named family the engine does not have, served
+            by the substitution table, reports `Substituted`. */
+            let source = match &family {
+                Some(f) if self.is_substituted(&stack, font_family_id(f), script, bold, italic) => {
+                    bridge::FontSource::Substituted
+                }
+                _ => source,
+            };
             let (id, name) = match family {
                 Some(f) => (font_family_id(&f).to_string(), f.display_name().to_string()),
                 None => {
@@ -13554,6 +13566,36 @@ impl Engine {
                 bridge::FontSlot::Latin
             },
         }
+    }
+
+    /// Issue #329 — whether layout shapes `script` text named `family` (a
+    /// resolution id) with a substitute (`FamilyMatch::Substituted`).
+    /// `stack` caches the font stack like [`Self::default_face_for`].
+    fn is_substituted(
+        &self,
+        stack: &std::cell::OnceCell<FontStack>,
+        family: &str,
+        script: text_pipeline::Script,
+        bold: bool,
+        italic: bool,
+    ) -> bool {
+        let Some(cfg) = self.layout_cfg.as_ref() else {
+            return false;
+        };
+        /* Cheap exits first — this runs on every `SelectionChanged`: a
+        loaded id, or a family the table has no row for, never
+        substitutes, and needs no font stack. */
+        if self.fonts.is_empty()
+            || self.fonts.contains_key(family)
+            || text_pipeline::substitution_for(family, text_pipeline::ScriptClass::of(script))
+                .is_none()
+        {
+            return false;
+        }
+        stack
+            .get_or_init(|| FontStack::from_faces(self.fonts.clone(), &cfg.font_id))
+            .resolve_family(family, script, bold, italic)
+            .is_some_and(|r| matches!(r.matched, text_pipeline::FamilyMatch::Substituted(_)))
     }
 
     /// Issue #423 — the face layout shapes `script` text with when the run
@@ -16813,7 +16855,10 @@ impl Engine {
         if let Err(e) = self.install_new_document(doc) {
             return *e;
         }
-        Event::DocumentLoaded { paragraph_count }
+        Event::DocumentLoaded {
+            paragraph_count,
+            substituted: self.font_substitutions(),
+        }
     }
 
     /// Issue #338 — `Command::CloseDocument`: back to the seeded empty
@@ -16914,7 +16959,12 @@ impl Engine {
                 if let Err(e) = self.install_new_document(archive.document) {
                     return *e;
                 }
-                Event::DocumentLoaded { paragraph_count }
+                /* Issue #329 — what the layout substitutes for the
+                families the document names. */
+                Event::DocumentLoaded {
+                    paragraph_count,
+                    substituted: self.font_substitutions(),
+                }
             }
             Err(e) => {
                 let kind = match e {
@@ -28729,6 +28779,13 @@ mod document_protection_tests;
 
 /// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
 mod protection_gate;
+
+/// Issue #329 — the font substitutions the open document's layout makes.
+mod font_substitution;
+
+/// Issue #329 — substitution reporting + the `Substituted` font source.
+#[cfg(test)]
+mod font_substitution_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

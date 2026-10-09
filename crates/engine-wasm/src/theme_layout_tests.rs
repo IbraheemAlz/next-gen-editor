@@ -123,11 +123,13 @@ fn theme_bound_runs_shape_against_the_theme_faces() {
 /// Word's stock theme: the spans name Calibri / Calibri Light for Latin
 /// and Arial / Times New Roman for Arabic (what `+Body` / `+Headings` /
 /// `+Body CS` / `+Headings CS` are in Word) — none of which the editor
-/// ships, so every run still falls to the font stack and the geometry is
-/// exactly the theme-less geometry. Substitution (#329) is what makes
-/// these names render.
+/// ships. Issue #329: the Arabic names substitute (Noto Naskh Arabic, the
+/// table's Arabic row for Arial and Times New Roman), so the Arabic text
+/// leaves the stack's per-script default (Amiri) and the geometry moves
+/// off the theme-less geometry; Calibri still falls back here (this stack
+/// has no Carlito).
 #[test]
-fn word_default_theme_names_reach_layout_and_fall_back() {
+fn word_default_theme_names_reach_layout_and_substitute() {
     let doc = read(&theme_word_default_docx());
     let sctx = StyleContext::of(&doc);
     let ids = |i: u32| -> Vec<(Option<String>, Option<String>)> {
@@ -178,14 +180,26 @@ fn word_default_theme_names_reach_layout_and_fall_back() {
         ]
     );
 
-    let (_, fp) = faces_by_paragraph(&engine_with_shipped_faces(doc.clone()));
+    let (paras, fp) = faces_by_paragraph(&engine_with_shipped_faces(doc.clone()));
+    let arabic: Vec<&str> = paras
+        .iter()
+        .flatten()
+        .filter(|(t, _)| t.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)))
+        .map(|(_, f)| f.as_str())
+        .collect();
+    assert!(!arabic.is_empty());
+    assert!(
+        arabic.iter().all(|f| *f == "noto-naskh"),
+        "Arabic in Arial / Times New Roman takes the Naskh substitute: {paras:?}"
+    );
     let mut themeless = doc;
     themeless.theme = None;
     let (_, bare_fp) = faces_by_paragraph(&engine_with_shipped_faces(themeless));
     eprintln!("THEME WORD DEFAULT FINGERPRINT = {fp:#x}");
+    assert_ne!(fp, bare_fp, "the Arabic substitutes move the geometry");
     assert_eq!(
-        fp, bare_fp,
-        "unshipped theme faces fall back exactly as before"
+        bare_fp, PINNED_THEME_LOADED_FACES_NO_THEME,
+        "the theme-less fallback geometry is unchanged"
     );
     assert_eq!(
         fp, PINNED_THEME_WORD_DEFAULT,
@@ -196,4 +210,6 @@ fn word_default_theme_names_reach_layout_and_fall_back() {
 /// Recorded on this change via `--nocapture` (issue #355).
 const PINNED_THEME_LOADED_FACES: u64 = 0x6d2d0b138e4dc1a5;
 const PINNED_THEME_LOADED_FACES_NO_THEME: u64 = 0x076c0f0f592c8182;
-const PINNED_THEME_WORD_DEFAULT: u64 = 0x076c0f0f592c8182;
+/// Issue #329 — was `0x076c0f0f592c8182` (the theme-less geometry) before
+/// the Arabic substitution rows.
+const PINNED_THEME_WORD_DEFAULT: u64 = 0x4df3a5a67d4aaeba;

@@ -200,7 +200,13 @@ fn open_plain_text_splits_lines_and_auto_directs_them() {
     bytes.extend_from_slice("Hello\r\nمرحبا بالعالم\n\n123\rEnd\n".as_bytes());
     let loaded = open(&mut e, &bytes, DocFormat::PlainText, "dir/notes.txt");
     assert!(
-        matches!(loaded, Event::DocumentLoaded { paragraph_count: 5 }),
+        matches!(
+            loaded,
+            Event::DocumentLoaded {
+                paragraph_count: 5,
+                ..
+            }
+        ),
         "{loaded:?}"
     );
     assert_eq!(
@@ -257,7 +263,13 @@ fn open_plain_text_decodes_utf16_and_tolerates_invalid_utf8() {
 
     let loaded = open(&mut e, b"", DocFormat::PlainText, "empty.txt");
     assert!(
-        matches!(loaded, Event::DocumentLoaded { paragraph_count: 1 }),
+        matches!(
+            loaded,
+            Event::DocumentLoaded {
+                paragraph_count: 1,
+                ..
+            }
+        ),
         "{loaded:?}"
     );
 }

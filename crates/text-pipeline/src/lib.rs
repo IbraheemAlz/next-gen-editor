@@ -5,6 +5,7 @@
 //! Phase 1 weeks 10–13:`bidi` + `line_break` + `justify`.
 //! Phase 3: `justify_kashida` (priority-band Kashida) + `script` (Unicode
 //! script detection + per-script font resolution, §13.A).
+//! Issue #329: `substitution` (metric-compatible font substitution table).
 
 pub mod bidi;
 pub mod fonts;
@@ -13,10 +14,12 @@ pub mod justify_kashida;
 pub mod line_break;
 pub mod script;
 pub mod shape;
+pub mod substitution;
 
 pub use bidi::{BidiAnalysis, VisualRun, analyze_bidi, first_strong_direction};
 pub use fonts::{
-    FontError, FontId, FontMetrics, FontStack, GlyphMetrics, LoadedFont, RasterizedGlyph, Synthesis,
+    FamilyMatch, FamilyResolution, FontError, FontId, FontMetrics, FontStack, GlyphMetrics,
+    LoadedFont, RasterizedGlyph, Resolved, Synthesis,
 };
 pub use justify::{Alignment, JustifyMode};
 pub use line_break::break_opportunities;
@@ -25,3 +28,4 @@ pub use script::{
     segment_by_script_class,
 };
 pub use shape::{ShapedGlyph, ShapedRun, ShapingDirection, shape_text};
+pub use substitution::{SUBSTITUTIONS, ScriptClass, Substitution, family_key, substitution_for};
