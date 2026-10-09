@@ -92,7 +92,7 @@ const PASTE_BODY: &str = concat!(
     r#"<w:p><w:r><w:t>last</w:t></w:r></w:p>"#,
 );
 
-/// Issue #366 — step 49: a two-paragraph paste with track changes on,
+/// Issue #366 — step 52: a two-paragraph paste with track changes on,
 /// through the plain multi-line path and the rich (HTML) path.
 ///
 /// a. The pasted text saves inside `<w:ins>` (both paragraphs) and the
@@ -132,20 +132,20 @@ pub(crate) fn run_tracked_paste_roundtrip() -> Result<()> {
     for (how, pasted) in &pastes {
         if texts(pasted) != want_texts || tracked(pasted) != want_tracked {
             bail!(
-                "step 49a ({how}): pasted {:?} / {:?}",
+                "step 52a ({how}): pasted {:?} / {:?}",
                 texts(pasted),
                 tracked(pasted)
             );
         }
         let mut reread_pasted = None;
-        for (got, reread) in save_and_reread(&format!("step 49a ({how})"), &archive, pasted)? {
+        for (got, reread) in save_and_reread(&format!("step 52a ({how})"), &archive, pasted)? {
             let ins_runs = got.matches("<w:ins ").count();
             if !has_minted_inserted_mark(&got) || ins_runs < 3 {
-                bail!("step 49a ({how}): the inserted text / mark was not written\n{got}");
+                bail!("step 52a ({how}): the inserted text / mark was not written\n{got}");
             }
             if texts(&reread) != want_texts || tracked(&reread) != want_tracked {
                 bail!(
-                    "step 49a ({how}): re-read {:?} / {:?}",
+                    "step 52a ({how}): re-read {:?} / {:?}",
                     texts(&reread),
                     tracked(&reread)
                 );
@@ -157,7 +157,7 @@ pub(crate) fn run_tracked_paste_roundtrip() -> Result<()> {
             (false, vec!["alpha beta", "last"]),
             (true, want_texts.clone()),
         ] {
-            let step = if accept { "step 49c" } else { "step 49b" };
+            let step = if accept { "step 52c" } else { "step 52b" };
             let resolved = reread_pasted.resolve_all_revisions(accept);
             if texts(&resolved) != want || resolved.has_revisions() {
                 bail!("{step} ({how}): resolved to {:?}", texts(&resolved));
@@ -174,13 +174,13 @@ pub(crate) fn run_tracked_paste_roundtrip() -> Result<()> {
         let (_, rewritten, _) = rewritten_region(xml.as_bytes(), &got);
         if rewritten != 0 {
             bail!(
-                "step 49b ({how}): the reject rewrote {rewritten} source bytes\n{}",
+                "step 52b ({how}): the reject rewrote {rewritten} source bytes\n{}",
                 String::from_utf8_lossy(&got)
             );
         }
     }
     println!(
-        "[roundtrip] step 49 OK — a tracked paste (plain + HTML) saves w:ins text + an inserted mark; reject-all restores the source, accept-all keeps it"
+        "[roundtrip] step 52 OK — a tracked paste (plain + HTML) saves w:ins text + an inserted mark; reject-all restores the source, accept-all keeps it"
     );
     Ok(())
 }
@@ -234,7 +234,7 @@ fn row(kinds: &[RevisionKind], cells: [&str; 2]) -> (Vec<RevisionKind>, Vec<Stri
     )
 }
 
-/// Issue #365 — step 50: tracked table rows (`tracked_table_rows.docx`:
+/// Issue #365 — step 53: tracked table rows (`tracked_table_rows.docx`:
 /// a deleted row, an inserted row, `<w:tblPrChange>` / `<w:trPrChange>`
 /// history).
 ///
@@ -260,18 +260,18 @@ pub(crate) fn run_tracked_table_rows_roundtrip() -> Result<()> {
         row(&[RevisionKind::Insert], ["new A", "new B"]),
     ];
     if table_rows(doc) != fixture {
-        bail!("step 50a: rows read as {:?}", table_rows(doc));
+        bail!("step 53a: rows read as {:?}", table_rows(doc));
     }
     for (path, out) in [
         ("write_docx", write_docx(&archive, doc).context("write")?),
         ("save_docx", format_docx::save_docx(doc).context("ui save")?),
     ] {
         if extract_doc_xml(&out)? != source {
-            bail!("step 50a: the untouched {path} save drifted");
+            bail!("step 53a: the untouched {path} save drifted");
         }
     }
     println!(
-        "[roundtrip] step 50a OK — trPr ins / del read as row revisions; zero-edit save byte-identical"
+        "[roundtrip] step 53a OK — trPr ins / del read as row revisions; zero-edit save byte-identical"
     );
 
     for (r, c) in [(0, 0), (1, 1), (2, 0)] {
@@ -286,19 +286,19 @@ pub(crate) fn run_tracked_table_rows_roundtrip() -> Result<()> {
                 format_docx::save_docx(&edited).context("ui save")?,
             ),
         ] {
-            assert_document_xml_well_formed(&out).with_context(|| format!("step 50b {path}"))?;
+            assert_document_xml_well_formed(&out).with_context(|| format!("step 53b {path}"))?;
             let got = extract_doc_xml(&out)?;
             let (_, rewritten, _) = rewritten_region(&source, &got);
             if rewritten != 0 {
                 bail!(
-                    "step 50b {path}: typing in row {r} rewrote {rewritten} source bytes\n{}",
+                    "step 53b {path}: typing in row {r} rewrote {rewritten} source bytes\n{}",
                     String::from_utf8_lossy(&got)
                 );
             }
         }
     }
     println!(
-        "[roundtrip] step 50b OK — typing in a tracked table is a pure insertion (row revisions + trPrChange / tblPrChange verbatim)"
+        "[roundtrip] step 53b OK — typing in a tracked table is a pure insertion (row revisions + trPrChange / tblPrChange verbatim)"
     );
 
     for (accept, want) in [
@@ -317,11 +317,11 @@ pub(crate) fn run_tracked_table_rows_roundtrip() -> Result<()> {
         let resolved = doc.resolve_all_revisions(accept);
         if table_rows(&resolved) != want || resolved.has_revisions() {
             bail!(
-                "step 50c (accept={accept}): resolved to {:?}",
+                "step 53c (accept={accept}): resolved to {:?}",
                 table_rows(&resolved)
             );
         }
-        for (got, reread) in save_and_reread("step 50c", &archive, &resolved)? {
+        for (got, reread) in save_and_reread("step 53c", &archive, &resolved)? {
             if got.contains("<w:del ")
                 || got.contains("<w:ins ")
                 || got.contains("<w:delText")
@@ -331,19 +331,19 @@ pub(crate) fn run_tracked_table_rows_roundtrip() -> Result<()> {
                 || table_rows(&reread) != want
             {
                 bail!(
-                    "step 50c (accept={accept}): saved {:?}\n{got}",
+                    "step 53c (accept={accept}): saved {:?}\n{got}",
                     table_rows(&reread)
                 );
             }
         }
     }
     println!(
-        "[roundtrip] step 50c OK — accept-all / reject-all remove the right row; saves clean, property history kept"
+        "[roundtrip] step 53c OK — accept-all / reject-all remove the right row; saves clean, property history kept"
     );
 
     let deleted = doc
         .try_tracked_delete_range(cell(0, 0, 0), cell(1, 1, 6), REVIEWER, REVIEW_DATE)
-        .map_err(|e| anyhow::anyhow!("step 50d: refused: {e}"))?
+        .map_err(|e| anyhow::anyhow!("step 53d: refused: {e}"))?
         .doc;
     let want = vec![
         row(&[RevisionKind::Delete], ["kept A", "kept B"]),
@@ -351,13 +351,13 @@ pub(crate) fn run_tracked_table_rows_roundtrip() -> Result<()> {
         row(&[RevisionKind::Insert], ["new A", "new B"]),
     ];
     if table_rows(&deleted) != want {
-        bail!("step 50d: recorded {:?}", table_rows(&deleted));
+        bail!("step 53d: recorded {:?}", table_rows(&deleted));
     }
     let mut reread_deleted = None;
-    for (got, reread) in save_and_reread("step 50d", &archive, &deleted)? {
+    for (got, reread) in save_and_reread("step 53d", &archive, &deleted)? {
         let minted = format!(r#"" w:author="{REVIEWER}" w:date="{REVIEW_DATE}"/><w:trPrChange "#);
         if !got.contains(&minted) || table_rows(&reread) != want {
-            bail!("step 50d: saved {:?}\n{got}", table_rows(&reread));
+            bail!("step 53d: saved {:?}\n{got}", table_rows(&reread));
         }
         reread_deleted = Some(reread);
     }
@@ -366,19 +366,19 @@ pub(crate) fn run_tracked_table_rows_roundtrip() -> Result<()> {
         .revision_entries()
         .into_iter()
         .find(|e| e.at.slot == (engine::RevisionSlot::Row { row: 0, index: 0 }))
-        .context("step 50d: the first row's change is not listed")?;
+        .context("step 53d: the first row's change is not listed")?;
     let one = reread
         .resolve_revision(&first.at, true)
-        .context("step 50d: no such revision")?;
+        .context("step 53d: no such revision")?;
     if table_rows(&one) != want[1..] {
-        bail!("step 50d: accepting row 0 left {:?}", table_rows(&one));
+        bail!("step 53d: accepting row 0 left {:?}", table_rows(&one));
     }
     let all = one.resolve_all_revisions(true);
     if table_rows(&all) != vec![row(&[], ["new A", "new B"])] || all.has_revisions() {
-        bail!("step 50d: accept-all left {:?}", table_rows(&all));
+        bail!("step 53d: accept-all left {:?}", table_rows(&all));
     }
     println!(
-        "[roundtrip] step 50d OK — a tracked deletion of two rows saves trPr/del (fresh id); one row accepts by id, accept-all the rest"
+        "[roundtrip] step 53d OK — a tracked deletion of two rows saves trPr/del (fresh id); one row accepts by id, accept-all the rest"
     );
     Ok(())
 }
@@ -401,7 +401,7 @@ fn sections(doc: &DocumentTree) -> Vec<(i32, Option<String>, Option<String>)> {
         .collect()
 }
 
-/// Issue #367 — step 51: a section break on a tracked paragraph mark
+/// Issue #367 — step 54: a section break on a tracked paragraph mark
 /// (`section_break_revision.docx`: the first section's `<w:sectPr>` on a
 /// deleted mark, its header references inherited by the final section).
 ///
@@ -433,7 +433,7 @@ pub(crate) fn run_section_break_revision_roundtrip() -> Result<()> {
         || sections(doc) != vec![small.clone(), a4(h1.clone(), h2.clone())]
     {
         bail!(
-            "step 51a: read {:?} / {:?}",
+            "step 54a: read {:?} / {:?}",
             p0.mark_revisions,
             sections(doc)
         );
@@ -443,11 +443,11 @@ pub(crate) fn run_section_break_revision_roundtrip() -> Result<()> {
         ("save_docx", format_docx::save_docx(doc).context("ui save")?),
     ] {
         if extract_doc_xml(&out)? != source {
-            bail!("step 51a: the untouched {path} save drifted");
+            bail!("step 54a: the untouched {path} save drifted");
         }
     }
     println!(
-        "[roundtrip] step 51a OK — a deleted mark carrying a section break reads; zero-edit save byte-identical"
+        "[roundtrip] step 54a OK — a deleted mark carrying a section break reads; zero-edit save byte-identical"
     );
 
     let merged_texts = vec![format!("{t0}{t1}"), t2.to_string()];
@@ -455,12 +455,12 @@ pub(crate) fn run_section_break_revision_roundtrip() -> Result<()> {
     let want = vec![a4(h1.clone(), h2.clone())];
     if texts(&accepted) != merged_texts || sections(&accepted) != want || accepted.has_revisions() {
         bail!(
-            "step 51b: accepted {:?} / {:?}",
+            "step 54b: accepted {:?} / {:?}",
             texts(&accepted),
             sections(&accepted)
         );
     }
-    for (got, reread) in save_and_reread("step 51b", &archive, &accepted)? {
+    for (got, reread) in save_and_reread("step 54b", &archive, &accepted)? {
         let refs = [
             r#"<w:headerReference w:type="default" r:id="rIdH1"/>"#,
             r#"<w:headerReference w:type="first" r:id="rIdH2"/>"#,
@@ -473,14 +473,14 @@ pub(crate) fn run_section_break_revision_roundtrip() -> Result<()> {
             || !reread.headers.contains_key("rIdH1")
         {
             bail!(
-                "step 51b: saved {:?} / {:?}\n{got}",
+                "step 54b: saved {:?} / {:?}\n{got}",
                 texts(&reread),
                 sections(&reread)
             );
         }
     }
     println!(
-        "[roundtrip] step 51b OK — accept-all joins the following section (A4); the dropped section's headers backfill its empty slots"
+        "[roundtrip] step 54b OK — accept-all joins the following section (A4); the dropped section's headers backfill its empty slots"
     );
 
     let rejected = doc.resolve_all_revisions(false);
@@ -489,18 +489,18 @@ pub(crate) fn run_section_break_revision_roundtrip() -> Result<()> {
         || sections(&rejected) != want
         || rejected.has_revisions()
     {
-        bail!("step 51c: rejected {:?}", sections(&rejected));
+        bail!("step 54c: rejected {:?}", sections(&rejected));
     }
-    for (got, reread) in save_and_reread("step 51c", &archive, &rejected)? {
+    for (got, reread) in save_and_reread("step 54c", &archive, &rejected)? {
         if got.contains("<w:del ")
             || got.matches("<w:sectPr").count() != 2
             || sections(&reread) != want
             || reread.has_revisions()
         {
-            bail!("step 51c: saved {:?}\n{got}", sections(&reread));
+            bail!("step 54c: saved {:?}\n{got}", sections(&reread));
         }
     }
-    println!("[roundtrip] step 51c OK — reject-all keeps both sections, saved clean");
+    println!("[roundtrip] step 54c OK — reject-all keeps both sections, saved clean");
 
     let inserted = read_docx(&section_break_revision_docx(true))
         .context("read inserted-break fixture")?
@@ -514,13 +514,13 @@ pub(crate) fn run_section_break_revision_roundtrip() -> Result<()> {
         || accepted.has_revisions()
     {
         bail!(
-            "step 51d: rejected {:?} / accepted {:?}",
+            "step 54d: rejected {:?} / accepted {:?}",
             sections(&rejected),
             sections(&accepted)
         );
     }
     println!(
-        "[roundtrip] step 51d OK — a tracked section break (inserted mark): reject removes it, accept keeps it"
+        "[roundtrip] step 54d OK — a tracked section break (inserted mark): reject removes it, accept keeps it"
     );
     Ok(())
 }

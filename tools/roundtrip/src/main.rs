@@ -35,6 +35,7 @@ mod inline_spans;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod reader_cascade;
 mod reader_hardening;
 mod revision_ids;
 mod revisions;
@@ -356,6 +357,9 @@ fn run_default() -> Result<()> {
     theme::run_theme_fonts_roundtrip()?;
     theme::run_unregistered_family_roundtrip()?;
     complex_script::run_font_dialog_slots_roundtrip()?;
+    reader_cascade::run_mark_formatting_roundtrip()?;
+    reader_cascade::run_sibling_prefix_roundtrip()?;
+    reader_cascade::run_style_borders_roundtrip()?;
     tracked_coverage::run_tracked_paste_roundtrip()?;
     tracked_coverage::run_tracked_table_rows_roundtrip()?;
     tracked_coverage::run_section_break_revision_roundtrip()?;
@@ -4995,7 +4999,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #365 — a table under review: a tracked row deletion, a
         tracked row insertion, `<w:tblPrChange>` / `<w:trPrChange>`
-        history. Zero-edit drift 0; the default harness's step 50 edits,
+        history. Zero-edit drift 0; the default harness's step 53 edits,
         resolves and re-records it. */
         PrebuiltFixture {
             name: "tracked_table_rows.docx",
@@ -5014,7 +5018,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #367 — a section break on a tracked (deleted) paragraph
         mark, its headers inherited by the final section. Zero-edit
-        drift 0; the default harness's step 51 accepts / rejects it. */
+        drift 0; the default harness's step 54 accepts / rejects it. */
         PrebuiltFixture {
             name: "section_break_revision.docx",
             bytes: format_docx::test_fixtures::section_break_revision_docx(false),
