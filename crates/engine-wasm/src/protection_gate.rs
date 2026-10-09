@@ -13,8 +13,8 @@
 //! - admitted classes are refined:
 //!   - `trackedChanges` forces review mode on: `ToggleTrackChanges
 //!     { enabled: false }` is refused, and only text edits the engine
-//!     records as revisions pass (a multi-line plain paste is inserted
-//!     untracked, so it is refused);
+//!     records as revisions pass (typing, deletion, Enter, plain and rich
+//!     paste and IME commits — issue #366 — and run formatting);
 //!   - `forms` admits a text edit only inside form-field content
 //!     (`DocumentTree::form_region_for_edit`): a block- or run-level
 //!     content control, a legacy text form field, an unprotected
@@ -126,14 +126,6 @@ impl Engine {
                     Command::ToggleTrackChanges { enabled: false } => Some(
                         self.protection_refusal(mode, cmd, "Track Changes cannot be turned off."),
                     ),
-                    Command::PastePlain { text } if text.contains(['\n', '\r']) => {
-                        Some(self.protection_refusal(
-                            mode,
-                            cmd,
-                            "a multi-paragraph paste cannot be recorded as a tracked change \
-                             yet — paste one paragraph at a time.",
-                        ))
-                    }
                     Command::InsertText { at: None, .. } if self.selection.is_none() => {
                         Some(self.protection_refusal(
                             mode,
@@ -282,6 +274,22 @@ impl Engine {
                 } else {
                     typing(caret, text)
                 }
+            }
+            /* Rich paste may insert paragraphs and tables: only a
+            block-level content control can take it. */
+            Command::PasteHtml { .. } => {
+                let caret = self
+                    .selection
+                    .as_ref()
+                    .map_or_else(|| bpos_top(0, 0), |s| s.caret.clone());
+                let (start, end) = selection_or(caret);
+                TextIntent::Edit(TextTarget {
+                    start,
+                    end,
+                    edit: FormEdit::Break,
+                    text: String::new(),
+                    raw_delete: None,
+                })
             }
             Command::DeleteRange { range } => {
                 match self.resolve_edit_range("DeleteRange", range.clone()) {

@@ -100,9 +100,9 @@ pub enum ProtectionClass {
     /// Comment threads (insert / reply / resolve / delete): admitted by
     /// `comments` and `trackedChanges`.
     Comment,
-    /// Caret-relative text edits (typing, deletion, plain paste, Enter,
-    /// the IME commit): admitted by `trackedChanges` (recorded as
-    /// revisions — the engine refuses the shapes it cannot record) and,
+    /// Caret-relative text edits (typing, deletion, plain and rich paste,
+    /// Enter, the IME commit): admitted by `trackedChanges` (recorded as
+    /// revisions — issue #366 made pastes and IME commits tracked) and,
     /// inside form-field content only, by `forms`.
     Text,
     /// Run formatting (recorded as a format revision while review mode is
@@ -113,8 +113,7 @@ pub enum ProtectionClass {
     ReviewToggle,
     /// Every other document change (structure, paragraph formatting,
     /// styles, sections, tables, pictures, fields, notes, accepting /
-    /// rejecting revisions, rich paste): refused under every enforced
-    /// mode.
+    /// rejecting revisions): refused under every enforced mode.
     Other,
 }
 
@@ -411,7 +410,7 @@ command_meta! {
     SetParagraphAlign { .. } => M::FORMAT,
     SetParagraphDirection { .. } => M::FORMAT,
     // ---- Backlog sprint 7 ------------------------------------------------------
-    PasteHtml { .. } => M::EDIT.body_only(),
+    PasteHtml { .. } => M::EDIT.body_only().protection(P::Text),
     // ---- Phase 5 PR 3 — tables ------------------------------------------------
     InsertTable { .. } => M::EDIT,
     DeleteTable { .. } => M::EDIT,

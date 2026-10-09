@@ -348,6 +348,9 @@ fn read_only_refuses_every_change() {
         },
         Command::SplitParagraph { at: None },
         Command::PastePlain { text: "p".into() },
+        Command::PasteHtml {
+            html: "<p>p</p>".into(),
+        },
         Command::ToggleFormatting {
             attr: bridge::FormattingToggle::Bold,
             underline_style: None,
@@ -508,13 +511,39 @@ fn tracked_changes_protection_forces_review_mode() {
     assert!(e.tracking_changes);
     let evt = apply(&mut e, Command::ToggleTrackChanges { enabled: true });
     assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    /* Pastes are tracked insertions (issue #366): admitted. */
+    caret(&mut e, 0, 0);
+    let evt = apply(
+        &mut e,
+        Command::PastePlain {
+            text: "one\ntwo ".into(),
+        },
+    );
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    let first = e
+        .undo
+        .current()
+        .paragraph_at_path(&engine::BlockPath::top(0))
+        .unwrap();
+    assert!(
+        first
+            .revisions
+            .iter()
+            .any(|r| r.kind == engine::RevisionKind::Insert),
+        "the pasted line is a tracked insertion: {:?}",
+        first.revisions
+    );
+    let evt = apply(
+        &mut e,
+        Command::PasteHtml {
+            html: "<p>rich</p>".into(),
+        },
+    );
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
     /* Accept / reject and untrackable edits are refused. */
     for cmd in [
         Command::AcceptAllRevisions,
         Command::RejectAllRevisions,
-        Command::PastePlain {
-            text: "one\ntwo".into(),
-        },
         Command::SetParagraphAlign {
             range: BridgeLogicalRange {
                 start: bpos_top(0, 0),
@@ -568,6 +597,15 @@ fn forms_protection_confines_edits_to_form_content() {
         &mut e,
         Command::SplitParagraph { at: None }
     )));
+    assert!(
+        is_protected(&apply(
+            &mut e,
+            Command::PasteHtml {
+                html: "<p>x</p>".into(),
+            },
+        )),
+        "a rich paste needs a block-level control"
+    );
 
     /* Run-level content control `Your name here` ([6, 20) of paragraph 1). */
     caret(&mut e, 1, 20);
