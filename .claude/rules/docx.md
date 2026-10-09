@@ -248,6 +248,13 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   a paragraph only through `revisions::remove_text` (one overlay-shift
   rule: an inline object whose sentinel was removed goes with it), and
   `markup-assert` checks every inline object still anchors on a U+FFFC.
+  Issue #304 — a `revisions_snapshot` row carries a stable
+  `revision_id` (`DocumentTree::revision_entries`: a content hash —
+  kind, author, date, `w:id`, move name, covered text — probed to be
+  unique in document order; nothing stored on the model), which
+  `AcceptRevision` / `RejectRevision` take instead of the range, so two
+  wrappers over one range are both reachable; resolving either half of
+  a tracked move resolves every move revision sharing its `move_name`.
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

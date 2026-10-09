@@ -127,6 +127,11 @@ export interface RevisionSnapshot {
     /** Issue #262 — a paragraph-MARK revision (a tracked paragraph split
      *  or merge), addressed by the empty range at the paragraph end. */
     mark?: boolean;
+    /** Issue #304 — the revision's stable id: unique per row, unchanged
+     *  by edits elsewhere (two wrappers over one range are two ids).
+     *  Pass it to `acceptRevision` / `rejectRevision`. Optional so
+     *  engines that pre-date it still satisfy the contract. */
+    revision_id?: number;
 }
 
 /** Read-only comment row consumed by the Comments rail. Sprint 7

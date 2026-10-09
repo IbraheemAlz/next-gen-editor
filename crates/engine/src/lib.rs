@@ -62,7 +62,7 @@ mod block_remap;
 pub use block_remap::CellMove;
 pub mod fields;
 mod revision_refs;
-pub use revision_refs::{RevisionPick, RevisionRef, RevisionSlot};
+pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};
 #[cfg(test)]
 mod revision_tests;
 mod revisions;

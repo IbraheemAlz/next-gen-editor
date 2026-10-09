@@ -1228,40 +1228,7 @@ impl Engine {
     /// `Delete`), author, and date. The TS shell uses this to render
     /// hover tooltips over revision-marked text in the canvas.
     pub fn revisions_snapshot(&self) -> Result<JsValue, JsValue> {
-        let doc = self.undo.current();
-        let mut rows: Vec<RevisionOut> = Vec::new();
-        for (block_idx, block) in doc.blocks.iter().enumerate() {
-            if let engine::Block::Paragraph(p) = block {
-                for r in &p.revisions {
-                    rows.push(RevisionOut {
-                        block: block_idx as u32,
-                        start: r.start,
-                        end: r.end,
-                        kind: revision_kind_label(r.kind),
-                        author: r.author.clone(),
-                        date: r.date.clone(),
-                        move_name: r.move_name.clone(),
-                        mark: false,
-                    });
-                }
-                /* Issue #262 — the paragraph-mark revision, addressed as
-                the empty range at the paragraph end (what
-                `AcceptRevision` / `RejectRevision` resolve it by). */
-                if let Some(r) = &p.mark_revision {
-                    let end = p.text.len() as u32;
-                    rows.push(RevisionOut {
-                        block: block_idx as u32,
-                        start: end,
-                        end,
-                        kind: revision_kind_label(r.kind),
-                        author: r.author.clone(),
-                        date: r.date.clone(),
-                        move_name: r.move_name.clone(),
-                        mark: true,
-                    });
-                }
-            }
-        }
+        let rows = revision_rows(self.undo.current());
         serde_wasm_bindgen::to_value(&rows)
             .map_err(|e| JsValue::from_str(&format!("encode revisions: {e}")))
     }
@@ -1337,7 +1304,7 @@ struct PaintDimsOut {
     paint_geometry_seq: u64,
 }
 
-#[derive(::serde::Serialize)]
+#[derive(::serde::Serialize, Debug, Clone, PartialEq)]
 struct RevisionOut {
     block: u32,
     start: u32,
@@ -1353,6 +1320,46 @@ struct RevisionOut {
     /// addressed by the empty range `start == end == text length`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mark: bool,
+    /// Issue #304 — the revision's stable id
+    /// (`DocumentTree::revision_entries`): what `AcceptRevision` /
+    /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
+    /// by edits elsewhere — two wrappers over one range are two ids.
+    revision_id: u32,
+}
+
+/// The `revisions_snapshot()` rows: every tracked change of the
+/// top-level paragraphs, in document order — per paragraph its text
+/// revisions, then its mark (issue #262: the empty range at the
+/// paragraph end) — each with its issue #304 `revision_id`.
+fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
+    doc.revision_entries()
+        .into_iter()
+        .filter_map(|e| {
+            let block = match e.at.path.steps.as_slice() {
+                [EnginePathStep::Block(b)] => *b,
+                _ => return None,
+            };
+            let r = e.revision;
+            let mark = e.at.slot == engine::RevisionSlot::Mark;
+            let (start, end) = if mark {
+                let end = e.paragraph.text.len() as u32;
+                (end, end)
+            } else {
+                (r.start, r.end)
+            };
+            Some(RevisionOut {
+                block,
+                start,
+                end,
+                kind: revision_kind_label(r.kind),
+                author: r.author.clone(),
+                date: r.date.clone(),
+                move_name: r.move_name.clone(),
+                mark,
+                revision_id: e.id,
+            })
+        })
+        .collect()
 }
 
 /// The `revisions_snapshot()` wire label of a revision kind.
@@ -7446,12 +7453,18 @@ impl Engine {
             Command::SetReviewIdentity { author, date } => {
                 self.do_set_review_identity(author, date)
             }
-            Command::AcceptRevision { block, start, end } => {
-                self.do_resolve_revision(block, start, end, true)
-            }
-            Command::RejectRevision { block, start, end } => {
-                self.do_resolve_revision(block, start, end, false)
-            }
+            Command::AcceptRevision {
+                block,
+                start,
+                end,
+                revision_id,
+            } => self.do_resolve_revision(block, start, end, revision_id, true),
+            Command::RejectRevision {
+                block,
+                start,
+                end,
+                revision_id,
+            } => self.do_resolve_revision(block, start, end, revision_id, false),
             Command::AcceptAllRevisions => self.do_resolve_all_revisions(true),
             Command::RejectAllRevisions => self.do_resolve_all_revisions(false),
             Command::InsertComment {
@@ -15047,12 +15060,24 @@ impl Engine {
     /// Edition). Issue #305 — the single revision resolves through the
     /// accept-all resolver (`DocumentTree::resolve_revision`), as one
     /// undo step with the selection clamped like accept-all's; an
-    /// address that names no revision pushes nothing.
-    fn do_resolve_revision(&mut self, block: u32, start: u32, end: u32, accept: bool) -> Event {
+    /// address that names no revision pushes nothing. Issue #304 — a
+    /// `revision_id` (the stable id `revisions_snapshot` lists) is the
+    /// address when present, the range otherwise; either half of a
+    /// tracked move resolves the whole move.
+    fn do_resolve_revision(
+        &mut self,
+        block: u32,
+        start: u32,
+        end: u32,
+        revision_id: Option<u32>,
+        accept: bool,
+    ) -> Event {
         let doc = self.undo.current();
-        let resolved = doc
-            .revision_at_range(block, start, end)
-            .and_then(|at| doc.resolve_revision(&at, accept));
+        let at = match revision_id {
+            Some(id) => doc.revision_by_id(id),
+            None => doc.revision_at_range(block, start, end),
+        };
+        let resolved = at.and_then(|at| doc.resolve_revision(&at, accept));
         let Some(new_doc) = resolved else {
             self.announce(AnnouncementPriority::Polite, "No such tracked change");
             return self.selection_changed();
