@@ -37,6 +37,29 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --release
 
+      # Issue #321 — `engine-wasm`'s `fuzz-native` feature is off by default
+      # (and never built into the wasm artifact), so the step above
+      # collects ZERO of the tests gated on it: the only native tests that
+      # drive real `Command`s through `Engine::apply` (the fuzz-surface
+      # smoke test, the `OpenDocument.defaults` bridge tests). Run them
+      # explicitly and assert the count so a future `cfg` slip that
+      # silently drops them to 0 goes red instead of green.
+      - name: cargo test engine-wasm (fuzz-native feature)
+        run: |
+          set -euo pipefail
+          cargo test -p engine-wasm --release --features fuzz-native 2>&1 | tee fuzz-native-test.log
+          # The feature-gated tests specifically (the ungated ones alone
+          # already pass 289 tests, so a bare "N passed" cannot catch the
+          # gate going dark).
+          for t in fuzz_native_surface_drives_engine_end_to_end \
+                   open_document_bridge_defaults_page_size_letter_reaches_the_parser \
+                   open_document_bridge_widow_control_false_reproduces_pinned_pre_95_fingerprints; do
+            if ! grep -q "tests::$t ... ok" fuzz-native-test.log; then
+              echo "::error::feature-gated test $t did not run / pass"
+              exit 1
+            fi
+          done
+
       # Issue #287 — both harnesses are documented gates and run by every
       # local merge gate; nothing in CI ran them, so a rustybuzz shaping
       # change or a `.docx` round-trip drift would have passed. Release

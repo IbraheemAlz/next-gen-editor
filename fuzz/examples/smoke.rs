@@ -23,6 +23,11 @@
 //! (debug works too; release matters once inputs start building large
 //! tables/documents — a few hundred iterations in debug can take minutes).
 //!
+//! The engine is driven through `engine-wasm`'s `fuzz-native` feature, which
+//! `fuzz/Cargo.toml` enables on its dependency — the same feature set the
+//! `cargo test -p engine-wasm --features fuzz-native` CI step (issue #321)
+//! runs the bridge-level tests under.
+//!
 //! Flags (all optional):
 //! - `--target <name>`     run only that target (`rpc_command`, …).
 //! - `--iterations <n>`    random-sweep inputs per target (default 500).

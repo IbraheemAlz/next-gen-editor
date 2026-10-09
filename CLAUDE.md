@@ -289,7 +289,13 @@ Engine backlog" references a real issue.
 
 - `cargo fmt --all -- --check` clean.
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- `cargo test --workspace` (native unit tests).
+- `cargo test --workspace` (native unit tests), **plus** `cargo test -p
+  engine-wasm --features fuzz-native` (issue #321): the bridge-level tests
+  that drive real `Command`s through `Engine::apply` natively
+  (`fuzz_native_surface_drives_engine_end_to_end`, the two `OpenDocument.defaults`
+  bridge tests) are `cfg`-gated on that off-by-default
+  feature, so `--workspace` alone collects 0 of them. CI's `rust-native`
+  job runs it and fails if the named tests did not execute.
 - `wasm-pack test --headless --chrome crates/engine-wasm` (browser unit tests).
 - `wasm-pack build --release` then assert artifact `< 15728640` bytes.
 - `cargo run -p shape-regression --release` — 0 failed on the corpus.
@@ -318,7 +324,7 @@ Engine backlog" references a real issue.
   checks. Both run inside `ci.yml`'s blocking `rust-native` job, alongside
   fmt/clippy/`cargo test --workspace` — not a separate silent lane.
 - CI (`ci.yml`), blocking: `rust-native` (fmt + clippy + `cargo test
-  --workspace` + shape-regression + roundtrip + the two fuzz-crate steps
+  --workspace` + `--features fuzz-native` + shape-regression + roundtrip + the two fuzz-crate steps
   above; 30 min cap), `wasm` (build + size
   budget + `wasm-pack test` + the `engine-wasm-pkg` artifact upload),
   `e2e` (this suite, issue #230). Non-blocking (`continue-on-error: true`):
