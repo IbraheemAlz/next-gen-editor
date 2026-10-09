@@ -6950,6 +6950,19 @@ fn package_limits(o: Option<bridge::PackageLimitsOverride>) -> format_docx::Pack
     }
 }
 
+/// Issue #345 — the wire spelling of an enforced restriction
+/// (`ProtectionEdit::None` never reaches here: it enforces nothing).
+fn bridge_protection_mode(mode: engine::ProtectionEdit) -> bridge::ProtectionMode {
+    match mode {
+        engine::ProtectionEdit::ReadOnly | engine::ProtectionEdit::None => {
+            bridge::ProtectionMode::ReadOnly
+        }
+        engine::ProtectionEdit::Comments => bridge::ProtectionMode::Comments,
+        engine::ProtectionEdit::TrackedChanges => bridge::ProtectionMode::TrackedChanges,
+        engine::ProtectionEdit::Forms => bridge::ProtectionMode::Forms,
+    }
+}
+
 /// Issues #339 / #348 — a `.txt` / `.html` file is one "part": refuse it,
 /// before decoding, when it is larger than the host's `max_part_bytes` or
 /// `max_total_bytes` (`PackageLimits::DEFAULT` when unset). The previous
@@ -12764,7 +12777,15 @@ impl Engine {
             /* Issue #260 — `apply` re-stamps this after the command's own
             mutation bump; outside `apply` (replay) it is already final. */
             document_revision: self.mutation_seq,
+            /* Issue #345 — the body document's enforced restriction. */
+            protection: self.protection_mode().map(bridge_protection_mode),
         }
+    }
+
+    /// Issue #345 — the editing restriction the open document enforces
+    /// (always the BODY tree's settings, whatever story is active).
+    fn protection_mode(&self) -> Option<engine::ProtectionEdit> {
+        self.undo.current().protection_mode()
     }
 
     /// Issue #42 — the paragraph-under-caret's `<w:numPr><w:ilvl>`, or

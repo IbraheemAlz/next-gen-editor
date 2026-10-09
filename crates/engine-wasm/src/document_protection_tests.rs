@@ -126,3 +126,52 @@ fn a_legacy_compound_file_is_not_reported_as_encrypted() {
     assert!(message.contains("97-2003"), "{message}");
     assert_eq!(e.undo.current().to_plain_text(), "keep me");
 }
+
+fn selection_protection(e: &mut Engine) -> Option<bridge::ProtectionMode> {
+    let evt = apply(
+        e,
+        Command::SetSelection {
+            range: BridgeLogicalRange {
+                start: bpos_top(0, 0),
+                end: bpos_top(0, 0),
+            },
+            caret: bpos_top(0, 0),
+        },
+    );
+    let Event::SelectionChanged { protection, .. } = evt else {
+        panic!("SetSelection answers SelectionChanged, got {evt:?}");
+    };
+    protection
+}
+
+/// Issue #345 — `SelectionChanged.protection` reports the enforced mode of
+/// the open document, and a new document clears it.
+#[test]
+fn selection_changed_reports_the_enforced_mode() {
+    let mut e = engine_with(DocumentTree::from_text("plain"));
+    assert_eq!(selection_protection(&mut e), None);
+    let evt = open_docx(&mut e, format_docx::test_fixtures::forms_protected_docx());
+    assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+    assert_eq!(
+        selection_protection(&mut e),
+        Some(bridge::ProtectionMode::Forms)
+    );
+    let evt = apply(&mut e, Command::CloseDocument);
+    assert!(
+        matches!(
+            evt,
+            Event::SelectionChanged {
+                protection: None,
+                ..
+            }
+        ),
+        "{evt:?}"
+    );
+    /* Not enforced → not reported. */
+    let off = format_docx::test_fixtures::protected_docx(
+        "<w:p><w:r><w:t>x</w:t></w:r></w:p>",
+        "<w:documentProtection w:edit=\"readOnly\" w:enforcement=\"0\"/>",
+    );
+    open_docx(&mut e, off);
+    assert_eq!(selection_protection(&mut e), None);
+}

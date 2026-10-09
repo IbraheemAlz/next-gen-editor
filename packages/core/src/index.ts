@@ -100,6 +100,7 @@ export type {
     DocumentDefaults,
     DefaultPageSize,
     ErrorKind,
+    ProtectionMode,
     PackageLimitsOverride,
     TextAttrsPatch,
     UnderlineStyle,

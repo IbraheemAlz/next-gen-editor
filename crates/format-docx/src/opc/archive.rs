@@ -685,6 +685,9 @@ fn read_docx_scoped(
         .and_then(|(_, b)| crate::parts::settings::parse_settings_xml(b).ok());
     if let Some(settings) = &settings_part {
         document.settings.even_and_odd_headers = settings.even_and_odd_headers;
+        /* Issue #345 — the editing restriction the engine enforces (the
+        part's bytes still pass through verbatim). */
+        document.settings.protection = settings.protection.clone();
         /* Issue #80 — document-level note properties. */
         document.footnote_props = settings.footnote_props;
         document.endnote_props = settings.endnote_props;

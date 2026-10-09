@@ -67,6 +67,8 @@ export type { ReviewControlsProps } from './ReviewControls';
 export { StatusBar } from './StatusBar';
 export type { StatusBarProps } from './StatusBar';
 
+export { ProtectionBadge, PROTECTION_LABELS } from './ProtectionBadge';
+
 export { SettingsMenu } from './SettingsMenu';
 
 export { TrapOverlay } from './TrapOverlay';

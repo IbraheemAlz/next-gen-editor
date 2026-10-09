@@ -407,6 +407,14 @@ pub enum Event {
         /// that predate it.
         #[serde(default)]
         document_revision: u64,
+        /// Issue #345 — the editing restriction the document enforces
+        /// (`<w:documentProtection w:enforcement="1">` with a restricting
+        /// `w:edit`), so the shell can badge it; `None` for an
+        /// unrestricted document. Additive: skipped on the wire when
+        /// `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        protection: Option<ProtectionMode>,
     },
     /// Issue #239 — reply to `SetZoom` / `SetDeviceScale` when no
     /// `RenderPage` has run yet: there is no layout config to fold the
@@ -521,6 +529,25 @@ pub enum ErrorKind {
     /// an MS-OFFCRYPTO / ECMA-376 Part 2 `EncryptedPackage`, not a ZIP. The
     /// open was refused; the previous document stays open.
     EncryptedDocument,
+    /// Issue #345 — the document's enforced `w:documentProtection` refused
+    /// the command (a read-only document, comments-only, tracked-changes
+    /// only, or an edit outside form-field content). Nothing changed.
+    Protected,
+}
+
+/// Issue #345 — an enforced editing restriction (`w:documentProtection`
+/// `w:edit`, spelled as in OOXML on the wire).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProtectionMode {
+    /// No edits at all.
+    ReadOnly,
+    /// Comments only.
+    Comments,
+    /// Every edit is tracked; review mode is forced on.
+    TrackedChanges,
+    /// Only form-field content (content controls, text form fields).
+    Forms,
 }
 
 impl Event {
@@ -1076,6 +1103,25 @@ mod a11y_note_wire_tests {
         })
         .unwrap();
         assert_eq!(encrypted["kind"], "EncryptedDocument");
+    }
+
+    /// Issue #345 — protection modes spell `w:edit`; the typed refusal.
+    #[test]
+    fn protection_wire_shapes() {
+        for (mode, wire) in [
+            (ProtectionMode::ReadOnly, "readOnly"),
+            (ProtectionMode::Comments, "comments"),
+            (ProtectionMode::TrackedChanges, "trackedChanges"),
+            (ProtectionMode::Forms, "forms"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), wire);
+        }
+        let refused = serde_json::to_value(Event::Error {
+            message: "protected".into(),
+            kind: Some(ErrorKind::Protected),
+        })
+        .unwrap();
+        assert_eq!(refused["kind"], "Protected");
     }
 
     fn run(text: &str, note_ref: Option<A11yNoteRef>) -> A11yRun {

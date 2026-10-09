@@ -1,0 +1,17 @@
+/* Issue #345 — the enforced-protection status chip. */
+.nge-protection {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+    padding: 2px var(--nge-space-2);
+    background: var(--nge-color-surface-alt);
+    border: 1px solid var(--nge-color-border-strong);
+    border-radius: var(--nge-radius-sm);
+    color: var(--nge-color-text);
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.nge-protection__icon {
+    font-size: 11px;
+}
