@@ -51,9 +51,11 @@ impl DocumentTree {
     ///    chain of merges resolves in one pass): an accepted deleted /
     ///    moved-away mark, or a rejected inserted / moved-in one, merges
     ///    the paragraph with the next one; otherwise the mark just loses
-    ///    its revision. A mark in front of a table, at the end of its
-    ///    container, or carrying a section break cannot merge and only
-    ///    loses its revision. A mark carrying several changes (issue #303)
+    ///    its revision. A mark in front of a table or at the end of its
+    ///    container cannot merge and only loses its revision; a mark
+    ///    carrying a section break merges by Word's rule (issue #367 —
+    ///    [`Self::merge_paragraph_with_next`]: the text joins the
+    ///    following section). A mark carrying several changes (issue #303)
     ///    resolves them in order: any one that removes the mark merges.
     ///    Issue #365 — a table's rows resolve in the same walk, after the
     ///    marks inside its cells and before the paragraph in front of it:
@@ -382,9 +384,21 @@ impl DocumentTree {
     /// paragraph after it (the merged paragraph ends with the tail's mark
     /// and its revisions), remapping the comment anchors. `false` — and
     /// nothing done — when that mark cannot go: the next block is not a
-    /// paragraph (a table, or the container's end) or the mark carries a
-    /// section break. Shared by the mark resolution above and the tracked
-    /// deletion of a reviewer's own inserted mark (issue #298).
+    /// paragraph (a table, or the container's end). Shared by the mark
+    /// resolution above and the tracked deletion of a reviewer's own
+    /// inserted mark (issue #298).
+    ///
+    /// Issue #367 — a mark carrying a SECTION BREAK goes too, by Word's
+    /// rule for deleting a section break (the one `delete_range` applies,
+    /// issue #70): the text before the break joins the FOLLOWING section
+    /// and takes its properties — the merged paragraph ends with the
+    /// tail's mark, so the tail's `section_end` (or, with none, the next
+    /// terminal's / the body's) is what survives — and the dropped
+    /// section's header / footer references are backfilled into the
+    /// surviving terminal's EMPTY slots ([`Self::backfill_dropped_refs`]):
+    /// a slot the following section owns keeps its own part, a slot it
+    /// inherited (absence = link-to-previous) keeps resolving to the part
+    /// it inherited, now that the section it inherited from is gone.
     pub(crate) fn merge_paragraph_with_next(&mut self, container: &[PathStep], i: u32) -> bool {
         let Some(blocks) = container_blocks(self, container) else {
             return false;
@@ -394,9 +408,10 @@ impl DocumentTree {
         else {
             return false;
         };
-        if head.section_end.is_some() {
-            return false;
-        }
+        let dropped = head
+            .section_end
+            .as_deref()
+            .map(|s| (s.header_refs.clone(), s.footer_refs.clone()));
         let path = child(container, i);
         let head_len = head.text.len() as u32;
         let mut top = self.blocks.clone();
@@ -414,7 +429,72 @@ impl DocumentTree {
             self.blocks = top;
             self.remap_paragraph_merge(&path, head_len, i + 1, 0);
         }
+        if let Some((headers, footers)) = dropped
+            && container.is_empty()
+        {
+            self.backfill_dropped_refs(i, &headers, &footers);
+        }
         true
+    }
+
+    /// Issue #367 — a section break at body block `from` (or before it)
+    /// was removed: fold the dropped section's header / footer refs into
+    /// the empty slots of the section that now covers that text — the
+    /// first terminal (`section_end`) at or after `from`, else the body's
+    /// final section. The `delete_range` backfill (issue #70), for one
+    /// dropped terminal.
+    fn backfill_dropped_refs(
+        &mut self,
+        from: u32,
+        headers: &crate::HeaderFooterRefs,
+        footers: &crate::HeaderFooterRefs,
+    ) {
+        if headers.is_empty() && footers.is_empty() {
+            return;
+        }
+        let fill = |h: &mut crate::HeaderFooterRefs, f: &mut crate::HeaderFooterRefs| {
+            let before = (h.clone(), f.clone());
+            h.inherit_missing_from(headers);
+            f.inherit_missing_from(footers);
+            before != (h.clone(), f.clone())
+        };
+        let terminal =
+            self.blocks
+                .iter()
+                .enumerate()
+                .skip(from as usize)
+                .find_map(|(k, b)| match b {
+                    Block::Paragraph(p) if p.section_end.is_some() => Some(k as u32),
+                    _ => None,
+                });
+        match terminal {
+            Some(k) => {
+                let Some(mut props) = self
+                    .blocks
+                    .get(k as usize)
+                    .and_then(Block::as_paragraph)
+                    .and_then(|p| p.section_end.clone())
+                else {
+                    return;
+                };
+                let (mut h, mut f) = (props.header_refs.clone(), props.footer_refs.clone());
+                if fill(&mut h, &mut f) {
+                    props.header_refs = h;
+                    props.footer_refs = f;
+                    let mut top = self.blocks.clone();
+                    let _ = mutate_paragraph_in_top(&mut top, &BlockPath::top(k), |p| {
+                        p.section_end = Some(props);
+                    });
+                    self.blocks = top;
+                }
+            }
+            None => {
+                let mut body = self.body_section.clone();
+                if fill(&mut body.header_refs, &mut body.footer_refs) {
+                    self.body_section = body;
+                }
+            }
+        }
     }
 }
 

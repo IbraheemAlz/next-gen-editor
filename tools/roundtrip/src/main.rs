@@ -356,6 +356,7 @@ fn run_default() -> Result<()> {
     theme::run_theme_fonts_roundtrip()?;
     tracked_coverage::run_tracked_paste_roundtrip()?;
     tracked_coverage::run_tracked_table_rows_roundtrip()?;
+    tracked_coverage::run_section_break_revision_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -5003,6 +5004,27 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 asserts: FixtureAsserts {
                     paragraph_count: 2,
                     paragraph_texts: vec!["Rows under review".into(), "after".into()],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #367 — a section break on a tracked (deleted) paragraph
+        mark, its headers inherited by the final section. Zero-edit
+        drift 0; the default harness's step 49 accepts / rejects it. */
+        PrebuiltFixture {
+            name: "section_break_revision.docx",
+            bytes: format_docx::test_fixtures::section_break_revision_docx(false),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 3,
+                    paragraph_texts: format_docx::test_fixtures::SECTION_BREAK_TEXTS
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect(),
                 },
                 roundtrip: RoundtripBounds {
                     document_xml_drift_bytes: 0,

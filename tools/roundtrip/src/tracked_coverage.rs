@@ -382,3 +382,145 @@ pub(crate) fn run_tracked_table_rows_roundtrip() -> Result<()> {
     );
     Ok(())
 }
+
+/// The doc's sections: `(page width in twips, default header rid, first
+/// header rid)` per effective section, the headers as resolved through
+/// link-to-previous.
+fn sections(doc: &DocumentTree) -> Vec<(i32, Option<String>, Option<String>)> {
+    let secs = doc.effective_sections();
+    let resolved = engine::resolve_hf_inheritance(&secs);
+    secs.iter()
+        .zip(resolved)
+        .map(|(s, (h, _))| {
+            (
+                (s.geometry.width * 20.0).round() as i32,
+                h.default.clone(),
+                h.first.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Issue #367 — step 49: a section break on a tracked paragraph mark
+/// (`section_break_revision.docx`: the first section's `<w:sectPr>` on a
+/// deleted mark, its header references inherited by the final section).
+///
+/// a. The mark reads as a deletion carrying the section break; the
+///    untouched save is byte-identical on both save paths.
+/// b. Accept-all merges paragraph 0 into the FOLLOWING section (Word's
+///    rule): one section, the final section's A4 page; the dropped
+///    section's header refs fill the final section's empty slots, so the
+///    headers resolve to the same parts. Saved on both paths: one
+///    `<w:sectPr>` carrying both `<w:headerReference>`s, no `<w:del>`;
+///    the re-read agrees.
+/// c. Reject-all keeps both sections, the revision gone, saved clean.
+/// d. The same break as a tracked INSERTION: reject-all removes it,
+///    accept-all keeps it.
+pub(crate) fn run_section_break_revision_roundtrip() -> Result<()> {
+    use format_docx::test_fixtures::{SECTION_BREAK_TEXTS, section_break_revision_docx};
+    let [t0, t1, t2] = SECTION_BREAK_TEXTS;
+    let bytes = section_break_revision_docx(false);
+    let source = extract_doc_xml(&bytes)?;
+    let archive = read_docx(&bytes).context("read section-break fixture")?;
+    let doc = &archive.document;
+    let h1 = Some("rIdH1".to_string());
+    let h2 = Some("rIdH2".to_string());
+    let small = (7920, h1.clone(), h2.clone());
+    let a4 = |h: Option<String>, f: Option<String>| (11906, h, f);
+    let p0 = doc.nth_paragraph(0).context("paragraph 0")?;
+    if p0.mark_revisions.iter().map(|r| r.kind).collect::<Vec<_>>() != vec![RevisionKind::Delete]
+        || p0.section_end.is_none()
+        || sections(doc) != vec![small.clone(), a4(h1.clone(), h2.clone())]
+    {
+        bail!(
+            "step 49a: read {:?} / {:?}",
+            p0.mark_revisions,
+            sections(doc)
+        );
+    }
+    for (path, out) in [
+        ("write_docx", write_docx(&archive, doc).context("write")?),
+        ("save_docx", format_docx::save_docx(doc).context("ui save")?),
+    ] {
+        if extract_doc_xml(&out)? != source {
+            bail!("step 49a: the untouched {path} save drifted");
+        }
+    }
+    println!(
+        "[roundtrip] step 49a OK — a deleted mark carrying a section break reads; zero-edit save byte-identical"
+    );
+
+    let merged_texts = vec![format!("{t0}{t1}"), t2.to_string()];
+    let accepted = doc.resolve_all_revisions(true);
+    let want = vec![a4(h1.clone(), h2.clone())];
+    if texts(&accepted) != merged_texts || sections(&accepted) != want || accepted.has_revisions() {
+        bail!(
+            "step 49b: accepted {:?} / {:?}",
+            texts(&accepted),
+            sections(&accepted)
+        );
+    }
+    for (got, reread) in save_and_reread("step 49b", &archive, &accepted)? {
+        let refs = [
+            r#"<w:headerReference w:type="default" r:id="rIdH1"/>"#,
+            r#"<w:headerReference w:type="first" r:id="rIdH2"/>"#,
+        ];
+        if got.contains("<w:del ")
+            || got.matches("<w:sectPr").count() != 1
+            || refs.iter().any(|r| !got.contains(r))
+            || texts(&reread) != merged_texts
+            || sections(&reread) != want
+            || !reread.headers.contains_key("rIdH1")
+        {
+            bail!(
+                "step 49b: saved {:?} / {:?}\n{got}",
+                texts(&reread),
+                sections(&reread)
+            );
+        }
+    }
+    println!(
+        "[roundtrip] step 49b OK — accept-all joins the following section (A4); the dropped section's headers backfill its empty slots"
+    );
+
+    let rejected = doc.resolve_all_revisions(false);
+    let want = vec![small.clone(), a4(h1.clone(), h2.clone())];
+    if texts(&rejected) != vec![t0, t1, t2]
+        || sections(&rejected) != want
+        || rejected.has_revisions()
+    {
+        bail!("step 49c: rejected {:?}", sections(&rejected));
+    }
+    for (got, reread) in save_and_reread("step 49c", &archive, &rejected)? {
+        if got.contains("<w:del ")
+            || got.matches("<w:sectPr").count() != 2
+            || sections(&reread) != want
+            || reread.has_revisions()
+        {
+            bail!("step 49c: saved {:?}\n{got}", sections(&reread));
+        }
+    }
+    println!("[roundtrip] step 49c OK — reject-all keeps both sections, saved clean");
+
+    let inserted = read_docx(&section_break_revision_docx(true))
+        .context("read inserted-break fixture")?
+        .document;
+    let rejected = inserted.resolve_all_revisions(false);
+    let accepted = inserted.resolve_all_revisions(true);
+    if texts(&rejected) != merged_texts
+        || sections(&rejected) != vec![a4(h1.clone(), h2.clone())]
+        || sections(&accepted) != vec![small, a4(h1, h2)]
+        || rejected.has_revisions()
+        || accepted.has_revisions()
+    {
+        bail!(
+            "step 49d: rejected {:?} / accepted {:?}",
+            sections(&rejected),
+            sections(&accepted)
+        );
+    }
+    println!(
+        "[roundtrip] step 49d OK — a tracked section break (inserted mark): reject removes it, accept keeps it"
+    );
+    Ok(())
+}

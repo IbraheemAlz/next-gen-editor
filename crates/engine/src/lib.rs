@@ -70,6 +70,8 @@ mod paragraph_merge_tests;
 #[cfg(test)]
 mod revision_tests;
 mod revisions;
+#[cfg(test)]
+mod section_mark_tests;
 mod text_remap;
 mod tracked;
 #[cfg(test)]

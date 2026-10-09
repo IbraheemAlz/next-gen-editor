@@ -687,3 +687,67 @@ fn an_ime_commit_over_a_selection_marks_it_deleted() {
     apply(&mut e, Command::AcceptAllRevisions);
     assert_eq!(texts(&e), vec!["alpha 日本"]);
 }
+
+/* ======================= issue #367 — a section break on a tracked mark ==== */
+
+/// `[long text ending a small-page section (its mark: `kind`), "tail"]`
+/// over an A4 body section.
+fn small_section_doc(kind: engine::RevisionKind) -> DocumentTree {
+    let long = "words that need several small pages to hold them all ".repeat(6);
+    let mut d = DocumentTree::from_paragraphs([long, "tail".to_string()]);
+    let mut blocks = d.blocks.clone();
+    if let engine::Block::Paragraph(p) = &mut blocks[0] {
+        p.section_end = Some(Box::new(engine::SectionProps {
+            /* 3 in × 2.5 in, ¼ in margins. */
+            geometry: engine::PageGeometry::from_twips(4320, 3600, 360, 360, 360, 360, 180, 180),
+            ..engine::SectionProps::default()
+        }));
+        p.mark_revisions = vec![engine::Revision {
+            start: 0,
+            end: 0,
+            kind,
+            author: "Other".into(),
+            date: "2026-10-09T00:00:00Z".into(),
+            id: None,
+            prev_attrs: None,
+            move_name: None,
+        }];
+    }
+    d.blocks = blocks;
+    d
+}
+
+/// Page count + per-page width (pt) of `e`'s current layout, under the
+/// strict watchdog (a layout recovery fails the test).
+fn pages_of(e: &Engine) -> (usize, Vec<f32>) {
+    let _strict = StrictLayoutNotes::on();
+    let (pages, _, _, info) = e.build_pages(1.0, false, None).expect("layout");
+    assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+    (pages.len(), pages.iter().map(|p| p.size.width).collect())
+}
+
+/// Accepting the deletion of a mark that ends a section merges the text
+/// into the FOLLOWING section: the small pages are gone, everything lays
+/// out on the A4 body section's page; rejecting keeps both sections.
+#[test]
+fn the_page_count_follows_the_surviving_section() {
+    let a4 = engine::PageGeometry::a4().width;
+    let mut e = tests::test_engine_with_doc(small_section_doc(engine::RevisionKind::Delete));
+    let (before, widths) = pages_of(&e);
+    assert!(before >= 3, "the small section spans pages: {before}");
+    assert!(widths[..before - 1].iter().all(|&w| w < a4));
+    assert_eq!(widths[before - 1], a4, "the body section's page");
+    apply(&mut e, Command::AcceptAllRevisions);
+    assert_eq!(e.undo.current().effective_sections().len(), 1);
+    let (after, widths) = pages_of(&e);
+    assert_eq!(after, 1, "one A4 page holds the merged text");
+    assert_eq!(widths, vec![a4]);
+    apply(&mut e, Command::Undo);
+    apply(&mut e, Command::RejectAllRevisions);
+    assert_eq!(pages_of(&e).0, before);
+    assert!(!e.undo.current().has_revisions());
+    /* A tracked section break (an inserted mark) rejected: the same. */
+    let mut e = tests::test_engine_with_doc(small_section_doc(engine::RevisionKind::Insert));
+    apply(&mut e, Command::RejectAllRevisions);
+    assert_eq!(pages_of(&e), (1, vec![a4]));
+}
