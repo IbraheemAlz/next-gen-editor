@@ -7,6 +7,9 @@
  * `crates/bridge/src/command.rs` — the generated TS shapes live in
  * `crates/engine-wasm/pkg/engine_wasm.d.ts`. Add new methods here when
  * the bridge grows; do not let downstream UI assemble raw Command objects.
+ * Issue #338 — and classify the method in `facadeMap.ts`: its tsc-checked
+ * maps refuse a method that dispatches a command the engine only stubs
+ * (`StubCommandType`, generated from `crates/bridge/src/meta.rs`).
  *
  * tsify-next renders `Option<T>` as `T | undefined`. With
  * `exactOptionalPropertyTypes: true` every field must be set explicitly,
@@ -54,6 +57,7 @@ import type {
     ListKind,
     BridgeStyleProperties,
 } from './types';
+import type { LiveCommand } from './facadeMap';
 
 /** Sprint 12 (#11) — paragraph style id. The engine now models real
  *  `<w:styles>` entries on `DocumentTree.styles`; `cmd.applyStyle`
@@ -475,11 +479,16 @@ export interface EditorCommands {
     saveDocument(format: DocFormat): Promise<Event>;
     saveDocx(): Promise<Event>;
     exportPdf(conformance: PdfConformance): Promise<Event>;
-    /** Engine-pending — dispatches but engine returns
-     *  `Event::Error` until a Core Engine HTML serializer ships. */
+    /** `SaveDocument { format: 'html' }` — `crates/format-html` (Sprint 9). */
     exportHtml(): Promise<Event>;
-    /** Engine-pending — same status as [`exportHtml`]. */
+    /** `SaveDocument { format: 'plain_text' }` — `DocumentTree::to_plain_text`. */
     exportPlainText(): Promise<Event>;
+    /** Issue #338 — back to the seeded empty document: selection, undo
+     *  history, comments, revisions, media, the retained `.docx` source
+     *  package and the document name are cleared (fonts, zoom and the
+     *  review identity survive). Answers `SELECTION_CHANGED`; the worker
+     *  then broadcasts the accessibility delta + `PAINTED` and pins the
+     *  next event-log snapshot as the new document's base. */
     closeDocument(): Promise<Event>;
 
     /* Clipboard */
@@ -490,8 +499,10 @@ export interface EditorCommands {
     pastePlain(text: string): Promise<Event>;
     pasteHtml(html: string): Promise<Event>;
 
-    /* Escape hatch — for commands not yet covered above. */
-    raw(cmd: Command, transfer?: Transferable[]): Promise<Event>;
+    /* Escape hatch — for commands not yet covered above. Issue #338 — typed
+     * over LIVE commands only: a command the engine merely stubs does not
+     * type-check here either. */
+    raw(cmd: LiveCommand, transfer?: Transferable[]): Promise<Event>;
 }
 
 function build(

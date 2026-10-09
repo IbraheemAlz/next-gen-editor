@@ -281,7 +281,8 @@ command_meta! {
     OpenDocument { .. } => M::EDIT.new_document().exits_story().partial(339),
     SaveDocument { .. } => M::QUERY,
     ExportPdf { .. } => M::QUERY,
-    CloseDocument => M::EDIT.new_document().body_only().stub(338),
+    // Issue #338 — back to the seeded empty document.
+    CloseDocument => M::EDIT.new_document().exits_story(),
     DeleteRange { .. } => M::EDIT.body_only(),
     ReplaceRange { .. } => M::EDIT.body_only(),
     ApplyFormatting { .. } => M::FORMAT,

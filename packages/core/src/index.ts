@@ -61,6 +61,13 @@ export { recoveryNotices, recoveryDegraded } from './recovery';
  * importable on its own as `@nge/core/command-meta`, which the worker and
  * `EngineClient` use so they never pull Solid into the worker bundle). */
 export { COMMAND_META, commandMeta } from './commandMeta.generated';
+export { COMMAND_FACADE, FACADE_METHOD_COMMANDS } from './facadeMap';
+export type {
+    FacadeTarget,
+    FacadeMemberTarget,
+    LiveCommand,
+    LiveCommandType,
+} from './facadeMap';
 export type {
     CommandMeta,
     CommandStatus,

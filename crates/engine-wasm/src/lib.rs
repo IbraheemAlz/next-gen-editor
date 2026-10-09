@@ -7138,7 +7138,7 @@ impl Engine {
                 PdfConformance::A2u => format_pdf::PdfProfile::A2u,
                 PdfConformance::X3 => format_pdf::PdfProfile::X3,
             }),
-            Command::CloseDocument => phase3_stub("CloseDocument"),
+            Command::CloseDocument => self.do_close_document(),
             Command::DeleteRange { range } => self.do_delete_range(range),
             Command::ReplaceRange { range, text } => self.do_replace_range(range, text),
             Command::ApplyFormatting { range, attrs } => self.apply_formatting(range, attrs),
@@ -15557,6 +15557,76 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #51 / #338 / #339 — install `doc` as a brand-new document:
+    /// a fresh undo stack (a mutation — issue #194), the caret at the
+    /// start, and every piece of per-document state reset, then repaint.
+    /// Shared by `.docx` loads, `CloseDocument` and the plain-text / HTML
+    /// `OpenDocument` paths, so a reset can never forget a field one of
+    /// them remembers.
+    ///
+    /// Issue #51 — leaving `lazy_layout` alone carried the previous doc's
+    /// scroll high-water mark into the new doc, so the first paint laid
+    /// out from page 1 down to wherever the OLD document was scrolled.
+    /// Keep `viewport_h` (a property of the canvas, not the document) so
+    /// `lazy_runway` stays calibrated, but restart the band at the top.
+    /// Stale `composition` / `pending_format` could splice preview text or
+    /// styling into the new doc; stale `image_cache` bitmaps collide on
+    /// reused rel ids (`rId4` exists in most .docx files); a stale
+    /// `a11y_cache` would diff against the old tree. (`do_recover` resets
+    /// the same set for the same reason.)
+    fn install_new_document(&mut self, doc: DocumentTree) -> Result<(), Box<Event>> {
+        self.install_undo_stack(UndoStack::new(doc, UNDO_CAP));
+        self.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.lazy_layout = LazyLayoutState {
+            viewport_y: 0.0,
+            viewport_h: self.lazy_layout.viewport_h,
+            min_target_y: INITIAL_COLD_OPEN_BUDGET_PT.max(self.lazy_layout.viewport_h),
+        };
+        self.composition = None;
+        self.pending_format = None;
+        self.caret_affinity = CaretAffinity::default();
+        self.a11y_cache = None;
+        self.image_cache.clear();
+        self.last_paint_dims = LastPaintDims::default();
+        self.layout_cache.get_mut().clear();
+        /* Issue #77 — a document opens in the result view. */
+        self.field_code_view = false;
+        /* A fresh UndoStack restarts revision at 0, which the memo key
+        cannot distinguish from the old stack's 0. */
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        self.maybe_repaint_result()
+    }
+
+    /// Issue #338 — `Command::CloseDocument`: back to the seeded empty
+    /// document (the interactive boot's `RenderPage { text: "" }` tree —
+    /// one empty paragraph, default section), keeping the session (fonts,
+    /// layout config, zoom, review identity, render clock). Selection,
+    /// undo history, comments, revisions, media, the retained source
+    /// package (#134 — the next save goes through the minimal-package
+    /// writer) and the document name all go; track-changes recording
+    /// turns off, as in a new Word document. An active story was already
+    /// exited by `story_gate` (`StoryPolicy::ExitsStory`). Answers
+    /// `SelectionChanged`; the worker sees `mutation_seq` move and
+    /// broadcasts the accessibility delta + `Painted`, and pins the next
+    /// snapshot as the new document's base (`CommandMeta.new_document`).
+    fn do_close_document(&mut self) -> Event {
+        self.document_name = None;
+        self.tracking_changes = false;
+        self.stashed_body_selection = None;
+        *self.detached_package.borrow_mut() = None;
+        if let Err(e) = self.install_new_document(DocumentTree::from_text("")) {
+            return *e;
+        }
+        self.announce(AnnouncementPriority::Polite, "Document closed");
+        self.selection_changed()
+    }
+
     /// Sprint 3 (UI Edition) — shared body for the legacy
     /// `LoadDocx` and the new `OpenDocument { format: Docx }`
     /// commands. Replaces the active document, resets the caret,
@@ -15583,52 +15653,13 @@ impl Engine {
         {
             Ok(archive) => {
                 let paragraph_count = archive.document.paragraph_count();
-                self.install_undo_stack(UndoStack::new(archive.document, 100));
-                self.selection = Some(SelectionState {
-                    anchor: bpos_top(0, 0),
-                    caret: bpos_top(0, 0),
-                    ideal_x: None,
-                    kind: SelectionKind::Linear,
-                });
-                /* Issue #51 — a document swap invalidates every piece of
-                per-document state, not just the layout cache. Leaving
-                `lazy_layout` alone carried the previous doc's scroll
-                high-water mark into the new doc, so the first paint laid
-                out from page 1 down to wherever the OLD document was
-                scrolled. Keep `viewport_h` (a property of the canvas,
-                not the document) so `lazy_runway` stays calibrated, but
-                restart the band at the top. Stale `composition` /
-                `pending_format` could splice preview text or styling
-                into the new doc; stale `image_cache` bitmaps collide on
-                reused rel ids (`rId4` exists in most .docx files);
-                a stale `a11y_cache` would diff against the old tree.
-                (do_recover resets the same set for the same reason.) */
-                self.lazy_layout = LazyLayoutState {
-                    viewport_y: 0.0,
-                    viewport_h: self.lazy_layout.viewport_h,
-                    min_target_y: INITIAL_COLD_OPEN_BUDGET_PT.max(self.lazy_layout.viewport_h),
-                };
-                self.composition = None;
-                self.pending_format = None;
-                self.caret_affinity = CaretAffinity::default();
-                self.a11y_cache = None;
-                self.image_cache.clear();
-                self.last_paint_dims = LastPaintDims::default();
-                self.layout_cache.get_mut().clear();
-                /* Issue #77 — a document opens in the result view. */
-                self.field_code_view = false;
-                /* A fresh UndoStack restarts revision at 0, which the
-                memo key cannot distinguish from the old stack's 0. */
-                self.invalidate_layout_snapshot();
-                self.dirty.invalidate(full_page_rect(self.scale()));
-                /* Issue #51/#54 — this was the only repaint in the file
-                that DISCARDED its Result. A failed post-load paint
-                (missing font, backend error) previously returned
-                `DocumentLoaded` anyway, leaving every canvas showing the
-                previous document while the status bar reported the new
-                one. Surface the error; the document itself is loaded,
-                and the shell decides how to present the failure. */
-                if let Err(e) = self.maybe_repaint_result() {
+                /* Issue #51/#54 — a failed post-load paint (missing font,
+                backend error) previously returned `DocumentLoaded` anyway,
+                leaving every canvas showing the previous document while
+                the status bar reported the new one. Surface the error; the
+                document itself is loaded, and the shell decides how to
+                present the failure. */
+                if let Err(e) = self.install_new_document(archive.document) {
                     return *e;
                 }
                 Event::DocumentLoaded { paragraph_count }
@@ -26967,6 +26998,9 @@ mod revision_command_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
+
+#[cfg(test)]
+mod document_lifecycle_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

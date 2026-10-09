@@ -33,7 +33,7 @@ export interface CommandMeta {
 /** Commands that answer a placeholder error for every input. The
  *  `@nge/core` facade map types these as `'stub'` only, so no facade
  *  method can dispatch one (issue #338). */
-export type StubCommandType = 'INIT' | 'DISPOSE' | 'TICK' | 'CLOSE_DOCUMENT' | 'MERGE_PARAGRAPH' | 'UNLOAD_FONT';
+export type StubCommandType = 'INIT' | 'DISPOSE' | 'TICK' | 'MERGE_PARAGRAPH' | 'UNLOAD_FONT';
 
 /** Commands real for only part of their input space. */
 export type PartialCommandType = 'OPEN_DOCUMENT' | 'SET_IMAGE_WRAP';
@@ -57,7 +57,7 @@ export const COMMAND_META: { readonly [K in CommandType]: CommandMeta } = {
     OPEN_DOCUMENT: { variant: 'OpenDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'partial', issue: 339 } },
     SAVE_DOCUMENT: { variant: 'SaveDocument', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
     EXPORT_PDF: { variant: 'ExportPdf', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    CLOSE_DOCUMENT: { variant: 'CloseDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'body_only', status: { kind: 'stub', issue: 338 } },
+    CLOSE_DOCUMENT: { variant: 'CloseDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' } },
     DELETE_RANGE: { variant: 'DeleteRange', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
     REPLACE_RANGE: { variant: 'ReplaceRange', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
     APPLY_FORMATTING: { variant: 'ApplyFormatting', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
