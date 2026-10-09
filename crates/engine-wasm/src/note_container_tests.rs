@@ -329,6 +329,33 @@ fn header_footnote_lands_once_on_the_first_page_showing_the_header() {
 
 const PINNED_NOTE_HEADER: u64 = 0x9009be57586d03e5;
 
+/// Issue #317 — the committed `footnotes_endnotes.docx` (3 footnotes, 2
+/// endnotes, one page): each footnote paints once in the page's footnote
+/// band, each endnote once in the trailing endnote band — never in the
+/// footnote band too (the pre-#317 line fitter reserved both kinds there:
+/// 5 footnote-band entries, fingerprint `0x5b969a56172220ed`). Pinned.
+#[test]
+fn endnote_references_paint_only_in_the_trailing_band() {
+    let bytes = include_bytes!("../../format-docx/tests/fixtures/footnotes_endnotes.docx");
+    let archive = format_docx::read_docx(bytes).expect("fixture");
+    let engine = tests::test_engine_with_doc(archive.document);
+    let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+    assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+    let kinds = |band: fn(&PageBox) -> &layout::NoteBand| -> Vec<engine::NoteKind> {
+        pages
+            .iter()
+            .flat_map(|p| band(p).entries.iter().map(|e| e.kind))
+            .collect()
+    };
+    assert_eq!(kinds(|p| &p.footnotes), vec![engine::NoteKind::Footnote; 3]);
+    assert_eq!(kinds(|p| &p.endnotes), vec![engine::NoteKind::Endnote; 2]);
+    let fp = layout::geometry_fingerprint(&pages);
+    eprintln!("NOTE CONTAINER FINGERPRINT footnotes_endnotes = {fp:#x}");
+    assert_eq!(fp, PINNED_FOOTNOTES_ENDNOTES, "footnotes_endnotes moved");
+}
+
+const PINNED_FOOTNOTES_ENDNOTES: u64 = 0x5f524151979df92b;
+
 /// A header note spans sections: a NextPage section break builds a fresh
 /// paginator, which must not place the note a second time.
 #[test]

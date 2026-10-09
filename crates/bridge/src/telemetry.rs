@@ -67,6 +67,13 @@ pub enum TelemetryKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[tsify(optional)]
         renderer_downgrade: Option<RendererDowngrade>,
+        /// Issue #315 — what the recovery this trap triggered had to give
+        /// up (booleans + counts only, no document content): present on a
+        /// `Recovered` sample, omitted while `Pending` / on `Failed`, so a
+        /// `Pending` sample keeps its exact #86 shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        recovery: Option<RecoveryFlags>,
     },
     /// Issue #86 — one document-open latency sample. `size_bytes` is the
     /// `.docx` archive's byte length (not its content); `backend` is the
@@ -90,6 +97,36 @@ pub enum RecoveryOutcome {
     Recovered,
     Failed,
     Pending,
+}
+
+/// Issue #315 — the shape of one completed crash recovery, carried on
+/// [`TelemetryKind::Crash::recovery`]. Mirrors the shell's `RecoveryInfo`
+/// (#241 / #268): which base the session came back from and every way it
+/// degraded. Booleans and counts only — no PII, no document content.
+/// Every field defaults, so a collector tolerates a sender that predates
+/// any one of them.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RecoveryFlags {
+    /// A persisted base snapshot was restored (`false`: the command log
+    /// alone was replayed, or nothing could be).
+    pub snapshot_restored: bool,
+    /// The restored base was the document's pinned snapshot (#268).
+    pub pinned_base: bool,
+    /// The pinned base was restored WITHOUT its pruned tail: edits made
+    /// after it were lost (#268).
+    pub tail_dropped: bool,
+    /// The recovered document lost its retained source package: saving
+    /// goes through the minimal writer (#268).
+    pub package_lost: bool,
+    /// No snapshot restored and the log no longer reached its first
+    /// command: the document could not be rebuilt at all (#241).
+    pub log_truncated: bool,
+    /// Newer snapshots skipped because they would not restore (#241).
+    pub snapshot_fallbacks: u32,
+    /// Readable snapshots passed over for an older base that still had
+    /// its package (#268).
+    pub package_fallbacks: u32,
 }
 
 /// Coarse error classification for telemetry — carries no PII.
@@ -136,6 +173,7 @@ mod tests {
             recent_commands: vec!["INSERT_TEXT".to_string(), "APPLY_FORMATTING".to_string()],
             recovery_outcome: RecoveryOutcome::Recovered,
             renderer_downgrade: None,
+            recovery: None,
         };
         let json = roundtrip(&kind);
         assert_eq!(
@@ -162,6 +200,7 @@ mod tests {
             recent_commands: vec![],
             recovery_outcome: RecoveryOutcome::Pending,
             renderer_downgrade: None,
+            recovery: None,
         };
         let json = serde_json::to_value(&kind).unwrap();
         let mut keys: Vec<&str> = json
@@ -194,6 +233,7 @@ mod tests {
                 reason: crate::common::RendererDowngradeReason::CrashLoop,
                 consecutive_traps: 2,
             }),
+            recovery: None,
         };
         let json = roundtrip(&kind);
         assert_eq!(
@@ -220,6 +260,78 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Issue #315 — a recovered sample carries the recovery's flags as
+    /// plain booleans + counts; a sample without the key (every #86-era
+    /// sender, and every `Pending` sample) still decodes, and a partial
+    /// flags object fills the missing fields with defaults.
+    #[test]
+    fn crash_kind_carries_the_recovery_flags() {
+        let kind = TelemetryKind::Crash {
+            trap_message: "RuntimeError: unreachable".to_string(),
+            recent_commands: vec!["INSERT_TEXT".to_string()],
+            recovery_outcome: RecoveryOutcome::Recovered,
+            renderer_downgrade: None,
+            recovery: Some(RecoveryFlags {
+                snapshot_restored: true,
+                pinned_base: true,
+                tail_dropped: true,
+                package_lost: false,
+                log_truncated: false,
+                snapshot_fallbacks: 3,
+                package_fallbacks: 0,
+            }),
+        };
+        let json = roundtrip(&kind);
+        assert_eq!(
+            json["recovery"],
+            serde_json::json!({
+                "snapshot_restored": true,
+                "pinned_base": true,
+                "tail_dropped": true,
+                "package_lost": false,
+                "log_truncated": false,
+                "snapshot_fallbacks": 3,
+                "package_fallbacks": 0,
+            })
+        );
+        assert!(json.get("renderer_downgrade").is_none());
+
+        let legacy: TelemetryKind = serde_json::from_value(serde_json::json!({
+            "type": "CRASH",
+            "trap_message": "x",
+            "recent_commands": [],
+            "recovery_outcome": "PENDING",
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            TelemetryKind::Crash { recovery: None, .. }
+        ));
+
+        let partial: TelemetryKind = serde_json::from_value(serde_json::json!({
+            "type": "CRASH",
+            "trap_message": "x",
+            "recent_commands": [],
+            "recovery_outcome": "RECOVERED",
+            "recovery": { "package_lost": true },
+        }))
+        .unwrap();
+        let TelemetryKind::Crash {
+            recovery: Some(flags),
+            ..
+        } = partial
+        else {
+            panic!("recovery flags decoded");
+        };
+        assert_eq!(
+            flags,
+            RecoveryFlags {
+                package_lost: true,
+                ..RecoveryFlags::default()
+            }
+        );
     }
 
     #[test]
@@ -278,6 +390,7 @@ mod tests {
                     recent_commands: vec!["UNDO".to_string()],
                     recovery_outcome: RecoveryOutcome::Failed,
                     renderer_downgrade: None,
+                    recovery: None,
                 },
                 timestamp_ms: 42.0,
             }],

@@ -33,7 +33,17 @@
  * snapshot, a last resort that beats losing the document when every
  * other snapshot is unreadable. It is persisted detached like every
  * snapshot, so its size is bounded by the #212 detachment, and the
- * package it names is kept by the same reference count. */
+ * package it names is kept by the same reference count.
+ *
+ * Issue #314 — a snapshot row never names a package the store does not
+ * hold. `persistSnapshot` checks the `packages` store INSIDE the
+ * transaction that writes the row: bytes supplied → written if absent;
+ * no bytes (the caller believes the store already holds them) → the
+ * package must be there, or the whole transaction aborts with
+ * `PackageMissingError`. Either the row lands with its package, or
+ * nothing lands — no snapshot depends on another transaction's success
+ * (the worker marks a hash as stored only once a transaction holding it
+ * COMMITTED, see `engine.worker.ts` `takeSnapshot`). */
 import type { Command } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 const DB_NAME = 'engine-log';
@@ -52,16 +62,37 @@ interface SnapshotRow {
     bytes: Uint8Array;
     /** Issue #212 — the detached source package this snapshot names. */
     packageHash?: string;
+    /** Issue #315 — wall-clock time (ms since the epoch) the row was
+     *  persisted; absent on rows written before it existed. */
+    at?: number;
 }
 interface PackageRow {
     hash: string;
     bytes: Uint8Array;
 }
 /** Issue #212 — the detached package a snapshot is persisted with: its
- *  content key, plus the bytes when the store does not hold them yet. */
+ *  content key, plus the bytes when the store does not hold them yet.
+ *  Issue #314 — with `bytes` the package is written in the snapshot's
+ *  own transaction unless the store already holds it; without, the
+ *  store MUST already hold it (else `PackageMissingError`). */
 export interface SnapshotPackage {
     hash: string;
     bytes?: Uint8Array;
+}
+
+/** Issue #314 — `persistSnapshot` was asked to persist a row naming a
+ *  package without its bytes, and the `packages` store does not hold that
+ *  package (never committed, garbage-collected, or deleted): the
+ *  transaction aborted and NOTHING was written. The caller must forget
+ *  that it believed the package stored, so the next snapshot ships the
+ *  bytes again. */
+export class PackageMissingError extends Error {
+    readonly hash: string;
+    constructor(hash: string) {
+        super(`event log: snapshot names package ${hash}, which the store does not hold`);
+        this.name = 'PackageMissingError';
+        this.hash = hash;
+    }
 }
 /** Issue #241 — `meta` row: highest command seq deleted by pruning (0 =
  *  the log is complete from the session's first command). */
@@ -111,6 +142,9 @@ export interface RecoveryCandidate {
     tailComplete?: boolean;
     /** Issue #268 — this is the document's pinned base snapshot. */
     pinned?: boolean;
+    /** Issue #315 — when the snapshot was persisted (ms since the epoch),
+     *  so a recovery that loses the edits after it can say since when. */
+    takenAt?: number;
 }
 
 /** Everything `EngineClient.recover()` hands the respawned worker. */
@@ -225,8 +259,11 @@ export async function appendCommand(seq: number, cmd: Command): Promise<void> {
  *  Issue #212 — `pkg` names the detached source package the snapshot was
  *  taken without; its bytes (first snapshot of a document) go to the
  *  `packages` store in the same transaction, so a snapshot row never
- *  lands without the package it names. Issue #268 — `opts.pin` makes it
- *  the document's pinned base (exempt from pruning; see the header). */
+ *  lands without the package it names. Issue #314 — and that holds for
+ *  a row persisted WITHOUT bytes too: the transaction verifies the store
+ *  holds the package and aborts with `PackageMissingError` otherwise
+ *  (see the header). Issue #268 — `opts.pin` makes it the document's
+ *  pinned base (exempt from pruning; see the header). */
 export async function persistSnapshot(
     seq: number,
     bytes: Uint8Array,
@@ -238,9 +275,30 @@ export async function persistSnapshot(
     const store = tx.objectStore('snapshots');
     const packages = tx.objectStore('packages');
     const meta = tx.objectStore('meta');
-    const row: SnapshotRow = pkg ? { seq, bytes, packageHash: pkg.hash } : { seq, bytes };
-    if (pkg?.bytes) {
-        packages.put({ hash: pkg.hash, bytes: pkg.bytes } satisfies PackageRow);
+    const at = Date.now();
+    const row: SnapshotRow = pkg ? { seq, bytes, packageHash: pkg.hash, at } : { seq, bytes, at };
+    /* Issue #314 — the package the row names, resolved INSIDE this
+       transaction. Requests run in issue order, so this lookup (and the
+       put its callback may issue) completes before the package GC below
+       counts references — and the GC sees this row's reference, put
+       synchronously right after. */
+    let abortReason: Error | undefined;
+    if (pkg) {
+        const held = packages.getKey(pkg.hash);
+        held.onsuccess = () => {
+            if (held.result !== undefined) return;
+            if (pkg.bytes) {
+                /* Not stored yet (first snapshot of the document, or an
+                   earlier write of it failed): write it with this row.
+                   Already stored → no multi-MB rewrite. */
+                packages.put({ hash: pkg.hash, bytes: pkg.bytes } satisfies PackageRow);
+            } else {
+                /* The caller believed it stored — it is not. Land
+                   nothing rather than a row naming a missing package. */
+                abortReason = new PackageMissingError(pkg.hash);
+                tx.abort();
+            }
+        };
     }
     store.put(row);
     if (opts?.pin) meta.put({ id: PINNED_ID, seq } satisfies PinnedRow);
@@ -297,7 +355,11 @@ export async function persistSnapshot(
             }
         };
     };
-    await txDone(tx);
+    try {
+        await txDone(tx);
+    } catch (e: unknown) {
+        throw abortReason ?? e;
+    }
 }
 
 /**
@@ -336,6 +398,7 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
                     tailComplete: row.seq >= prunedThrough,
                 };
                 if (row.seq === pinnedSeq) candidate.pinned = true;
+                if (typeof row.at === 'number') candidate.takenAt = row.at;
                 if (row.packageHash !== undefined) {
                     candidate.packageHash = row.packageHash;
                     const pkg = packages.get(row.packageHash);
