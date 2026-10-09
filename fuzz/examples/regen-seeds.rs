@@ -31,8 +31,19 @@ fn main() {
             bytes
         );
     }
+    /* Issue #318 — the 200-deep nested-table `layout_paginate` seed. */
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/layout_paginate/seed_nested_200");
+    let bytes = engine_fuzz::layout_gen::nesting_seed(200);
+    std::fs::write(&path, &bytes)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
     println!(
-        "regen-seeds: done — {} scenario seed(s) rewritten",
+        "wrote {} ({} bytes): {:02x?}",
+        path.display(),
+        bytes.len(),
+        bytes
+    );
+    println!(
+        "regen-seeds: done — {} scenario seed(s) + the nesting seed rewritten",
         Scenario::ALL.len()
     );
 }

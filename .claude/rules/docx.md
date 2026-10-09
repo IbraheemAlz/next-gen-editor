@@ -63,6 +63,17 @@ The `tools/roundtrip/` harness asserts:
   (rank tables in `schema/ct_rpr.rs`, `ct_ppr.rs`, `ct_tbl.rs`).
 - The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole; its
   modeled children still seed the run baseline (`fold_rpr_fragment`).
+  Issue #293 — they are also modeled as `Paragraph::mark_style`
+  (`schema::ct_rpr::mark_rpr_style`; `None` = not modeled, the bag is the
+  truth): typing into an empty paragraph inherits it, `split_at` gives an
+  EMPTY half the insertion formatting at the split point, `concat` keeps
+  the surviving paragraph's. The writer re-emits the bag fragment while
+  `mark_rpr_style(fragment) == mark_style` (also a condition of the
+  verified pPr passthrough), else regenerates it from `mark_style` keeping
+  the fragment's unmodeled children (`unmodeled_rpr_children`) and the
+  source spelling of unchanged ones; the #262 mark revision is re-injected
+  after. Harness: `tools/roundtrip` step 40 (`paragraph_format.rs` — with
+  the #292 merge and the #297 style names).
 - **When you model a new child:** add it to the `*_child_is_modeled`
   predicate *and* emit it through the `PrChildren` sink in `writer.rs`
   at its rank — never both bag it and emit it (duplicate child).
@@ -229,19 +240,77 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   positioned verbatim markers. Untracked `insert_text` carries every
   revision with its text (shift at / after the start, grow strictly
   inside).
-- **Paragraph-mark revisions (issue #262).** `<w:pPr><w:rPr><w:ins/>`
-  (`<w:del/>`, `<w:moveFrom/>`, `<w:moveTo/>`) is lifted out of the
-  mark-rPr grab-bag fragment into `Paragraph::mark_revision`
-  (`parts::document::split_mark_revision`) and recorded on
-  `SourcePPr::mark_revision`; the verified pPr passthrough requires it
-  unchanged, a regenerated pPr re-injects it as the rPr's first child
-  (`writer::with_mark_revision`). The mark travels with the paragraph
-  END (split → right half, concat → tail's). `DocumentTree::
-  resolve_all_revisions` (`Command::AcceptAllRevisions` /
-  `RejectAllRevisions`, one undo step) resolves text revisions per
-  paragraph, then merges paragraphs for resolved marks per container
-  from the end — through `splice_text` + `remap_text_edit_record` /
+- **Paragraph-mark revisions (issues #262 / #303).** `<w:pPr><w:rPr><w:ins/>`
+  (`<w:del/>`, `<w:moveFrom/>`, `<w:moveTo/>`) — ALL of them, in source
+  order (a mark one reviewer inserted and another deleted carries two) —
+  is lifted out of the mark-rPr grab-bag fragment into
+  `Paragraph::mark_revisions` (`parts::document::split_mark_revisions`;
+  `Paragraph::mark_revision()` is the first-change accessor) and recorded
+  on `SourcePPr::mark_revisions`; the verified pPr passthrough requires
+  them unchanged, a regenerated pPr re-injects them as the rPr's first
+  children in schema order (`writer::with_mark_revisions`). Snapshots keep
+  the pre-#303 key: one change encodes as the bare revision, several as a
+  sequence. The mark travels with the paragraph END (split → right half,
+  concat → tail's). `DocumentTree::resolve_all_revisions`
+  (`Command::AcceptAllRevisions` / `RejectAllRevisions`, one undo step)
+  resolves text revisions per paragraph, then merges paragraphs for
+  resolved marks per container from the end — a mark's changes in order,
+  any one that removes the mark merges; a single Accept/Reject decides
+  the addressed one (by range: the first) — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
+  Issue #305 — the single `AcceptRevision` / `RejectRevision` is the
+  SAME resolver (`DocumentTree::resolve_revisions` with a
+  `RevisionPick::Only`, addressed by `engine::RevisionRef`); text leaves
+  a paragraph only through `revisions::remove_text` (one overlay-shift
+  rule: an inline object whose sentinel was removed goes with it), and
+  `markup-assert` checks every inline object still anchors on a U+FFFC.
+  Issue #304 — a `revisions_snapshot` row carries a stable
+  `revision_id` (`DocumentTree::revision_entries`: a content hash —
+  kind, author, date, `w:id`, move name, covered text — probed to be
+  unique in document order; nothing stored on the model), which
+  `AcceptRevision` / `RejectRevision` take instead of the range, so two
+  wrappers over one range — and each change of a mark carrying several
+  (`RevisionSlot::Mark(i)`, one row each) — are all reachable; resolving
+  either half of a tracked move resolves every move revision sharing its
+  `move_name`.
+- **Annotation ids (issue #295).** Regenerated content never prints a
+  tracked-change annotation `w:id` (`ins` / `del` / `moveFrom` /
+  `moveTo` / `rPrChange` / `pPrChange` / …) directly: `writer::
+  revision_ids` writes a KEEP-`n` token for an id the model carries
+  (`serialize_paragraph` tokenizes its whole output, verbatim run /
+  paragraph properties included) and a FRESH token for an engine-made
+  revision; `write_docx_inner` resolves them over every regenerated part
+  together (body first, then headers / footers, notes) — a KEEP keeps
+  its id the first time unless passthrough bytes of its own part spell
+  it, the rest get ids above every id in the package (fidelity first: an
+  id two source parts already shared is left alone). A run split in two (sub-
+  range formatting, a paragraph split, a writer cut) writes its
+  `<w:rPrChange>` once with the source id; range markers are never
+  rewritten; a save that regenerates nothing is untouched. The reader
+  also models a run's `<w:rPrChange>` as a `FormatChange` revision over
+  the run (`parts::format_change`: `prev_attrs` = the recorded rPr) —
+  the element still rides the grab bag; accepting drops it
+  (`SpanStyle::for_typing`), rejecting restores `prev_attrs`.
+- **Recording structural tracked changes (issues #301 / #298).** Enter
+  with review mode on (`DocumentTree::tracked_split_paragraph`, engine
+  `crates/engine/src/tracked.rs`) records the NEW mark — the one ending
+  the left half, Word's `<w:ins/>` on the first paragraph — as inserted;
+  `split_at` carries the text revisions — and, issue #292, the
+  hyperlinks — onto both halves, so `split_paragraph`, tracked Enter, a
+  cross-paragraph delete's halves and clipboard slices all do (a
+  straddling change is cut once, `tracked::split_revisions`; the right
+  piece drops its source id, and `concat` re-joins the two pieces). A
+  tracked deletion (`try_tracked_delete_range`; `tracked_delete_range`
+  wraps it) works over any range inside ONE container: per paragraph the
+  reviewer's own pending insertions are removed outright (the #265 path,
+  `revisions::remove_text`), already-deleted bytes are left alone, the
+  rest is marked `Delete`; every swallowed mark is marked `Delete` — or,
+  when it is the reviewer's own inserted mark, removed (the paragraphs
+  merge through `merge_paragraph_with_next`). A range across a cell
+  boundary or over a table is refused (`TrackedEditError`, answered as
+  `Event::Error` — never a silent no-op). Tracked Backspace leaves the
+  caret at the START of what it marked (Word: it steps over struck
+  text).
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

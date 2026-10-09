@@ -19,7 +19,8 @@ export type RecoveryNoticeKind =
     | 'log-truncated'
     | 'tail-dropped'
     | 'package-lost'
-    | 'renderer-downgrade';
+    | 'renderer-downgrade'
+    | 'checkpoint-failing';
 
 export interface RecoveryNotice {
     kind: RecoveryNoticeKind;
@@ -109,4 +110,25 @@ export function recoveryNotices(
  *  (anything `recoveryNotices` would show). */
 export function recoveryDegraded(report: RecoveryReport | undefined): boolean {
     return recoveryNotices(report).length > 0;
+}
+
+/**
+ * Issue #333 - the warning for event-log checkpoints that stopped
+ * landing (the worker's bounded snapshot-write retries are exhausted):
+ * nothing is lost yet, but a crash now would replay a long tail or lose
+ * work, so the user is told to save. `[]` while checkpoints are fine.
+ */
+export function checkpointNotices(failing: boolean): RecoveryNotice[] {
+    if (!failing) return [];
+    return [
+        {
+            kind: 'checkpoint-failing',
+            title: 'Changes are not being checkpointed',
+            detail:
+                'The editor could not write its automatic recovery points (the browser ' +
+                'storage may be full or blocked). If the editor crashes now, recent edits ' +
+                'may be lost.',
+            action: 'Save your work now.',
+        },
+    ];
 }

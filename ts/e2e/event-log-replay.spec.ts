@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page, type Worker } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 
 /* D2.6 exit gate: event-log replay + sequence continuity. Flood enough
@@ -565,4 +565,126 @@ test('pruned log + the package row lost: the recovered loss is visible (#315)', 
     await expect(banner).toContainText('Save As');
     await page.evaluate(() => window.dispatchEvent(new Event('nge-toggle-hud')));
     await expect(page.locator('.nge-hud__recovery-losses')).toHaveText('package lost');
+});
+
+/* Issue #333 - a failed snapshot WRITE is retried on its own clock (2 s,
+   4 s, 8 s), independent of new commands; after the last retry fails the
+   shell says the log is not being checkpointed. The worker's
+   `IDBObjectStore.put` is mocked to abort the transaction of the first N
+   `snapshots` puts. */
+async function snapshotSeqs(page: Page): Promise<number[]> {
+    return page.evaluate(
+        () =>
+            new Promise<number[]>((resolve, reject) => {
+                const open = indexedDB.open('engine-log');
+                open.onsuccess = () => {
+                    const db = open.result;
+                    const tx = db.transaction(['snapshots'], 'readonly');
+                    const keys = tx.objectStore('snapshots').getAllKeys();
+                    tx.oncomplete = () => {
+                        db.close();
+                        resolve(keys.result as number[]);
+                    };
+                    tx.onerror = () => reject(tx.error);
+                };
+                open.onerror = () => reject(open.error);
+            }),
+    );
+}
+
+async function mockSnapshotWrites(page: Page, failFirst: number): Promise<Worker> {
+    let worker: Worker | undefined;
+    for (let i = 0; i < 100 && !worker; i++) {
+        worker = page.workers().find((x) => x.url().includes('engine.worker'));
+        if (!worker) await page.waitForTimeout(50);
+    }
+    if (!worker) throw new Error('engine worker not found');
+    await worker.evaluate((n: number) => {
+        const g = globalThis as any;
+        g.__snapPuts = 0;
+        g.__snapFailFirst = n;
+        if (g.__snapMocked) return;
+        g.__snapMocked = true;
+        const realPut = IDBObjectStore.prototype.put;
+        IDBObjectStore.prototype.put = function (
+            this: IDBObjectStore,
+            value: unknown,
+            key?: IDBValidKey,
+        ): IDBRequest<IDBValidKey> {
+            const req = realPut.call(this, value, key);
+            if (this.name === 'snapshots') {
+                g.__snapPuts += 1;
+                if (g.__snapPuts <= g.__snapFailFirst) this.transaction!.abort();
+            }
+            return req;
+        };
+    }, failFirst);
+    return worker;
+}
+
+async function bootAndWaitForFirstSnapshot(page: Page): Promise<void> {
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+    /* The boot's own idle snapshot, so the mock only sees the test's. */
+    await expect.poll(() => snapshotSeqs(page), { timeout: 10_000 }).not.toEqual([]);
+}
+
+test('a failed snapshot write is retried without new commands; the third attempt lands (#333)', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await bootAndWaitForFirstSnapshot(page);
+    const before = Math.max(...(await snapshotSeqs(page)));
+    const worker = await mockSnapshotWrites(page, 2);
+    await page.evaluate(() =>
+        (window as any).__dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'x' }),
+    );
+    /* Idle snapshot (+1.5 s) fails, retry (+2 s) fails, retry (+4 s) lands:
+       no further typing in between. */
+    await expect
+        .poll(() => worker.evaluate(() => (globalThis as any).__snapPuts as number), {
+            timeout: 25_000,
+        })
+        .toBe(3);
+    await expect
+        .poll(async () => Math.max(...(await snapshotSeqs(page))), { timeout: 10_000 })
+        .toBeGreaterThan(before);
+    const stats = await page.evaluate(() => {
+        const c = (window as any).__engineClient;
+        return { failures: c.checkpointFailures, failing: c.checkpointStatus.failing };
+    });
+    expect(stats.failures, 'two failed writes counted').toBe(2);
+    expect(stats.failing).toBe(false);
+    await expect(page.locator('.nge-recovery-banner')).toHaveCount(0);
+});
+
+test('exhausted snapshot-write retries raise the "not being checkpointed" warning (#333)', async ({
+    page,
+}) => {
+    test.setTimeout(90_000);
+    await bootAndWaitForFirstSnapshot(page);
+    await mockSnapshotWrites(page, Number.MAX_SAFE_INTEGER);
+    await page.evaluate(() =>
+        (window as any).__dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'x' }),
+    );
+    /* +1.5 s idle, then retries at +2 s, +4 s, +8 s. */
+    const banner = page.locator('.nge-recovery-banner');
+    await expect(banner).toBeVisible({ timeout: 40_000 });
+    await expect(banner).toHaveAttribute('role', 'alert');
+    await expect(banner).toHaveAttribute('data-kinds', 'checkpoint-failing');
+    await expect(banner).toContainText('Changes are not being checkpointed');
+    await expect(banner).toContainText('Save your work');
+    expect(
+        await page.evaluate(() => (window as any).__engineClient.checkpointFailures as number),
+        'initial write + 3 retries',
+    ).toBe(4);
+
+    /* The store heals: the next checkpoint lands and the warning goes. */
+    await mockSnapshotWrites(page, 0);
+    await page.evaluate(() =>
+        (window as any).__dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'y' }),
+    );
+    await expect(banner).toHaveCount(0, { timeout: 15_000 });
 });

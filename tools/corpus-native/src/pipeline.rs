@@ -23,7 +23,8 @@ use crate::panics::{self, CaughtPanic};
 use format_docx::DocxArchive;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use text_pipeline::FontStack;
 
 /// Text inserted by the optional scripted-edit check. Plain ASCII so its
@@ -360,6 +361,42 @@ pub struct DocResult {
     /// save and — with the scripted edit — the edited one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_save_matches_write_docx: Option<bool>,
+    /// Issue #318 — wall-clock ms of the PRODUCTION layout
+    /// (`engine-wasm`'s `Engine::build_pages`: the real table grid +
+    /// autofit, header/footer bands, notes, wrap convergence), driven
+    /// through the canvas-less `fuzz-native` surface. Unlike
+    /// [`Self::layout_ms`] (this harness's reduced, table-flattening
+    /// layout) this is what a worker spends before its first paint.
+    /// Absent when the stage was skipped (`--no-engine-layout`) or did
+    /// not finish inside `--layout-budget-ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_layout_ms: Option<u128>,
+    /// Issue #318 — page count of the production layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_page_count: Option<usize>,
+    /// Issue #318 — `layout::geometry_fingerprint` of the production
+    /// layout (hex), so two corpus runs on two builds of the engine can
+    /// be diffed document by document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_fingerprint: Option<String>,
+    /// Issue #318 — every `LayoutDegradeReason` the production layout
+    /// reported (`Event::Painted.layout_degraded`), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_degradations: Vec<String>,
+}
+
+/// Issue #318 — the production-layout stage's switches.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineLayoutOpts {
+    /// Run the stage at all (`--no-engine-layout` turns it off).
+    pub enabled: bool,
+    /// Per-document budget (`--layout-budget-ms`). A layout still running
+    /// past it is reported as [`Outcome::Timeout`] with stage
+    /// `engine_layout` — every other column of the record is kept — and
+    /// the worker process exits, abandoning the layout thread. The
+    /// driver's `--timeout-secs` stays the hard backstop for the rest of
+    /// the pipeline.
+    pub budget: Duration,
 }
 
 impl DocResult {
@@ -391,6 +428,10 @@ impl DocResult {
             edit_check: None,
             ui_save_siblings_identical: None,
             ui_save_matches_write_docx: None,
+            engine_layout_ms: None,
+            engine_page_count: None,
+            engine_fingerprint: None,
+            engine_degradations: Vec::new(),
         }
     }
 
@@ -486,6 +527,7 @@ pub fn run_one(
     fonts: &FontStack,
     with_edit: bool,
     dump_drift: Option<&std::path::Path>,
+    engine_opts: EngineLayoutOpts,
 ) -> DocResult {
     let mut rec = DocResult::new(path_label, bytes.len() as u64);
     let overall_start = Instant::now();
@@ -724,8 +766,76 @@ pub fn run_one(
         }
     }
 
+    /* 8. Issue #318 — the production layout, timed under the budget.
+    Last, so a document that blows the budget still reports every
+    round-trip column above. */
+    if engine_opts.enabled {
+        engine_layout(&mut rec, &archive_a.document, engine_opts.budget);
+    }
+
     rec.elapsed_ms = overall_start.elapsed().as_millis();
     rec
+}
+
+/// Issue #318 — stack for the production-layout thread. Table layout
+/// recurses once per nesting level (the reader caps the typed tree at
+/// `MAX_TABLE_NESTING_DEPTH`); a spawned thread's 2 MiB default is far
+/// below what the worker's main thread gets, so ask for plenty.
+const ENGINE_LAYOUT_STACK_BYTES: usize = 256 << 20;
+
+/// What the production-layout thread reports back.
+type EngineLayoutReport = Result<Result<engine_wasm::LayoutProbe, String>, CaughtPanic>;
+
+/// Issue #318 — run `engine-wasm`'s production layout over `doc` on a
+/// helper thread and wait at most `budget` for it. A layout cannot be
+/// cancelled from outside, so a blown budget marks the record
+/// [`Outcome::Timeout`] (stage `engine_layout`) and leaves the thread
+/// behind — the worker process exits right after printing the record.
+fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Duration) {
+    let doc = doc.clone();
+    let (tx, rx) = mpsc::channel::<(EngineLayoutReport, Duration)>();
+    let spawned = std::thread::Builder::new()
+        .name("engine-layout".into())
+        .stack_size(ENGINE_LAYOUT_STACK_BYTES)
+        .spawn(move || {
+            let t0 = Instant::now();
+            let report = panics::catch(move || {
+                let mut engine = engine_wasm::Engine::new_headless(doc);
+                match engine.ensure_layout_for_fuzzing() {
+                    Ok(()) => engine
+                        .layout_probe_for_fuzzing()
+                        .ok_or_else(|| "no layout snapshot after layout".to_string()),
+                    Err(e) => Err(format!("{e:?}")),
+                }
+            });
+            let _ = tx.send((report, t0.elapsed()));
+        });
+    if let Err(e) = spawned {
+        rec.mark_error("engine_layout", &format!("spawn failed: {e}"));
+        return;
+    }
+    /* A failure an earlier stage recorded outranks anything found here. */
+    let first_failure = rec.outcome == Outcome::Ok;
+    match rx.recv_timeout(budget) {
+        Ok((Ok(Ok(probe)), took)) => {
+            rec.engine_layout_ms = Some(took.as_millis());
+            rec.engine_page_count = Some(probe.page_count);
+            rec.engine_fingerprint = Some(format!("{:#018x}", probe.fingerprint));
+            rec.engine_degradations = probe.degradations;
+        }
+        Ok((Ok(Err(e)), _)) if first_failure => rec.mark_error("engine_layout", &e),
+        Ok((Err(p), _)) if first_failure => rec.mark_panic("engine_layout", &p),
+        Ok(_) => {}
+        Err(_) if first_failure => {
+            rec.outcome = Outcome::Timeout;
+            rec.stage = Some("engine_layout".into());
+            rec.message = Some(format!(
+                "production layout exceeded the {} ms per-document budget",
+                budget.as_millis()
+            ));
+        }
+        Err(_) => {}
+    }
 }
 
 #[cfg(test)]

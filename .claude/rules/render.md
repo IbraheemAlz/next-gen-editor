@@ -67,6 +67,19 @@ hard failure so CI catches a new loop instead of a silent recovery.
 - The nominal path stays output-identical: `geometry_fingerprint` pins
   the pre-watchdog geometry for every paginator and engine fixture. A
   self-defense change that moves a pinned fingerprint moves the goldens.
+- **Bound slow progress, not only churn (issue #318).** The watchdog
+  catches non-progress; a recursion that re-does a subtree per ancestor
+  pass makes progress and still never finishes (nested-table autofit
+  was `F(2·depth)` grid layouts). Any per-level re-measure of a subtree
+  goes through a memo scoped to ONE top-level layout (engine-wasm
+  `TableLayout`: inner table per width, column solve per width,
+  intrinsic widths per cell — keyed by the subtree's address in the
+  immutably borrowed tree, verified on every hit), and recursion over
+  document nesting is capped (`MAX_TABLE_LAYOUT_DEPTH` = 32: deeper
+  tables flatten to their paragraphs, `NestingCapped`). A probe pass
+  that only needs a size takes it from the size's own computation
+  (a nested table's width is its column sum) — never from a full
+  layout at a width the final pass will not use.
 
 ## PDF export
 
