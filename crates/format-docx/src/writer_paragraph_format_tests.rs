@@ -229,6 +229,44 @@ fn enter_after_a_bold_run_saves_a_bold_mark_on_the_new_paragraph() {
     assert_eq!(typed.nth_paragraph(1).unwrap().style_at(0).bold, Some(true));
 }
 
+/// Issue #295 × #293 — a REGENERATED mark `<w:rPr>` keeps its unmodeled
+/// `<w:rPrChange>` history, and its annotation `w:id` goes through the
+/// package-wide id pass like every other: a paragraph split in two whose
+/// halves both regenerate the mark writes the source id once and a fresh
+/// one on the other half — never the same `w:id` twice.
+#[test]
+fn a_regenerated_mark_rpr_gets_package_unique_annotation_ids() {
+    let body = concat!(
+        r#"<w:p><w:pPr><w:rPr><w:b/><w:rPrChange w:id="7" w:author="A" w:date="2026-01-01T00:00:00Z"><w:rPr/></w:rPrChange></w:rPr></w:pPr>"#,
+        r#"<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">ab cd</w:t></w:r></w:p>"#,
+    );
+    let parsed = read_docx(&package(STYLES_XML, &document(body))).expect("read");
+    let italic = SpanStyle {
+        bold: Some(true),
+        italic: Some(true),
+        ..Default::default()
+    };
+    let split = parsed.document.split_paragraph(at(0, 2));
+    let both = with_mark(&with_mark(&split, 0, italic.clone()), 1, italic);
+    let bytes = write_docx(&parsed, &both).expect("write");
+    crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+    let out = document_xml_of(&bytes);
+    assert_eq!(out.matches("<w:rPrChange ").count(), 2, "{out}");
+    assert_eq!(out.matches(r#"<w:rPrChange w:id="7""#).count(), 1, "{out}");
+    assert_eq!(
+        out.matches("<w:i/>").count(),
+        2,
+        "both marks regenerated: {out}"
+    );
+    let back = read_docx(&bytes).expect("re-read");
+    for i in 0..2 {
+        assert_eq!(
+            mark_of(&back.document, i).and_then(|m| m.italic),
+            Some(true)
+        );
+    }
+}
+
 /// A tracked paragraph mark (#262) and a changed mark style regenerate
 /// together: the revision stays the rPr's first child.
 #[test]
@@ -239,7 +277,7 @@ fn a_changed_mark_keeps_the_mark_revision_first() {
     );
     let parsed = read_docx(&package(STYLES_XML, &document(body))).expect("read");
     let p0 = parsed.document.nth_paragraph(0).unwrap();
-    assert!(p0.mark_revision.is_some());
+    assert!(p0.mark_revision().is_some());
     assert_eq!(
         mark_of(&parsed.document, 0).and_then(|m| m.bold),
         Some(true)

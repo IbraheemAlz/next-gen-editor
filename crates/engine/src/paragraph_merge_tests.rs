@@ -345,3 +345,41 @@ fn text_edit_maps_ranges_like_the_text() {
     );
     assert_eq!(rep.map_range(5, 10), Some((4, 12)));
 }
+
+/// Issues #292 × #301 / #298 — the tracked paths split and merge through
+/// the same primitives: a tracked Enter inside a hyperlink and a pending
+/// insertion cuts each ONCE (one piece per half, the right piece of the
+/// change without its source id), and the reviewer's own tracked
+/// Backspace over that inserted mark merges the paragraphs back to ONE
+/// link and ONE insertion — the heading style kept.
+#[test]
+fn tracked_enter_then_own_backspace_keeps_one_link_and_one_insertion() {
+    let mut p = heading("Title body");
+    p.hyperlinks.push(link(2, 8));
+    p.revisions.push(insertion(4, 9));
+    let d = doc(vec![p]);
+    let split = d.tracked_split_paragraph(pos(0, 6), "Reviewer", "2026-02-02T00:00:00Z");
+    let (l, r) = (
+        split.nth_paragraph(0).unwrap(),
+        split.nth_paragraph(1).unwrap(),
+    );
+    assert_eq!((l.text.as_str(), r.text.as_str()), ("Title ", "body"));
+    assert_eq!((l.hyperlinks.len(), r.hyperlinks.len()), (1, 1));
+    assert_eq!((l.revisions.len(), r.revisions.len()), (1, 1), "cut once");
+    assert_eq!((l.revisions[0].id, r.revisions[0].id), (Some(7), None));
+    assert_eq!(l.mark_revisions.len(), 1, "the new mark is tracked");
+    assert_heading(l);
+    assert_heading(r);
+
+    let back = split
+        .try_tracked_delete_range(pos(0, 6), pos(1, 0), "Reviewer", "2026-02-02T00:00:00Z")
+        .expect("tracked backspace")
+        .doc;
+    assert_eq!(back.blocks.len(), 1, "the own inserted mark is removed");
+    let p = back.nth_paragraph(0).unwrap();
+    assert_eq!(p.text, "Title body");
+    assert_eq!(p.hyperlinks, vec![link(2, 8)]);
+    assert_eq!(p.revisions, vec![insertion(4, 9)]);
+    assert!(p.mark_revisions.is_empty());
+    assert_heading(p);
+}

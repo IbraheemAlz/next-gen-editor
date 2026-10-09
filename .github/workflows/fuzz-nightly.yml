@@ -8,12 +8,24 @@ name: fuzz-nightly
 # runtime, which is why this lives in its own scheduled workflow rather
 # than blocking every PR.
 #
-# Each matrix leg: restores the corpus + artifacts cache, runs
+# Each matrix leg: restores the corpus cache, runs
 # `cargo +nightly fuzz run <target>` for a fixed budget, minimizes any
 # crash it finds (`cargo +nightly fuzz tmin`), uploads the crash as a
 # workflow artifact, and auto-files a GitHub issue with the (minimized)
 # reproducer attached — deduplicated by a content-hash title so a crash
 # that reproduces every night doesn't spam a fresh issue each run.
+#
+# Pass/fail contract (the lane went red every night for weeks because the
+# last step failed on ANY crash artifact, and the cache — which only saves
+# on a green job — never grew):
+#   - no crash found       -> green
+#   - crash found          -> green, and an issue is filed (the crash
+#                             artifacts + issues are the source of truth,
+#                             not the job colour)
+#   - infrastructure error -> RED, in the step named "Fail on fuzzer
+#     infrastructure error": the fuzzer never started (build / toolchain /
+#     startup abort), `gh` could not list or create issues, or a crash's
+#     reproducer is a zero-length file (never file a content-free issue).
 
 on:
   schedule:
@@ -79,12 +91,12 @@ jobs:
       # corpus entries this run's fuzzing discovered under the new key.
       # A same-key cache is immutable in GitHub Actions, so a STATIC key
       # here would silently stop growing after the first run.
-      - name: Cache fuzz corpus + artifacts
+      - name: Cache fuzz corpus
         uses: actions/cache@v4
         with:
-          path: |
-            fuzz/corpus/${{ matrix.corpus_dir }}
-            fuzz/artifacts/${{ matrix.target }}
+          # The corpus only: crash artifacts must NOT be restored, or a
+          # crash filed weeks ago re-triggers every night forever.
+          path: fuzz/corpus/${{ matrix.corpus_dir }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
@@ -97,24 +109,25 @@ jobs:
 
       - name: Run cargo fuzz
         id: run
-        # Crash artifacts (not this step's exit code) are the source of
-        # truth for pass/fail — see "Fail the job when a crash was found".
-        continue-on-error: true
         working-directory: fuzz
+        # Never fails the step: crashes are read from the artifacts dir and
+        # infrastructure errors are classified in the last step. A crashing
+        # session legitimately exits non-zero (77) under `-fork`.
         run: |
           set -uo pipefail
-          mkdir -p "corpus/${{ matrix.corpus_dir }}" "artifacts/${{ matrix.target }}"
+          mkdir -p "corpus/${{ matrix.corpus_dir }}"
+          rm -rf "artifacts/${{ matrix.target }}"
+          mkdir -p "artifacts/${{ matrix.target }}"
           DURATION="${{ github.event.inputs.duration_secs || '1800' }}"
           # `-fork=4`: libFuzzer runs testcases in forked worker processes
           # and restarts a worker that crashes instead of ending the whole
           # session — load-bearing here, not just a speed knob. A known,
-          # not-yet-fixed bug (e.g. `rpc_command`'s `SetSelection` clamp
-          # gap — see the PR description) reproduces on a large fraction
-          # of inputs; without `-fork`, `cargo fuzz run` stops at the
-          # FIRST crash of a whole session, so every nightly run would
-          # burn its entire budget re-finding the same issue in the first
-          # few seconds and never explore anything else. Each worker
-          # crash still gets minimized + filed exactly the same way.
+          # not-yet-fixed bug reproduces on a large fraction of inputs;
+          # without `-fork`, `cargo fuzz run` stops at the FIRST crash of
+          # a whole session, so every nightly run would burn its entire
+          # budget re-finding the same issue in the first few seconds and
+          # never explore anything else. Each worker crash still gets
+          # minimized + filed exactly the same way.
           cargo +nightly fuzz run "${{ matrix.target }}" -- \
             "corpus/${{ matrix.corpus_dir }}" \
             -fork=4 \
@@ -126,9 +139,18 @@ jobs:
             -timeout=30 \
             -artifact_prefix="artifacts/${{ matrix.target }}/" \
             2>&1 | tee fuzz-run.log
-          # libFuzzer's own exit code, not `tee`'s — surfaced via PIPESTATUS
-          # so a crash still fails the run even though `tee` itself exits 0.
-          exit "${PIPESTATUS[0]}"
+          # libFuzzer's own exit code, not `tee`'s.
+          rc="${PIPESTATUS[0]}"
+          echo "libFuzzer exit status: $rc"
+          # "INFO: Seed:" is printed by libFuzzer as soon as the harness
+          # binary starts. Its absence means the build or the process
+          # startup failed — an infrastructure error, not a finding.
+          if grep -q '^INFO: Seed:' fuzz-run.log; then
+            echo "started=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "started=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
 
       - name: Minimize any crash artifact
         if: always()
@@ -136,10 +158,21 @@ jobs:
         run: |
           set -uo pipefail
           shopt -s nullglob
-          for f in artifacts/${{ matrix.target }}/crash-* artifacts/${{ matrix.target }}/oom-* artifacts/${{ matrix.target }}/timeout-*; do
+          for f in artifacts/${{ matrix.target }}/crash-* artifacts/${{ matrix.target }}/leak-* artifacts/${{ matrix.target }}/oom-* artifacts/${{ matrix.target }}/timeout-*; do
             [ -f "$f" ] || continue
-            echo "Minimizing $f"
-            cargo +nightly fuzz tmin "${{ matrix.target }}" "$f" -o "$f.min" || cp "$f" "$f.min"
+            case "$f" in *.min) continue ;; esac
+            echo "Minimizing $f ($(stat -c %s "$f") bytes)"
+            # cargo-fuzz has no `-o`; libFuzzer's `-exact_artifact_path`
+            # is where tmin writes the smallest still-crashing input.
+            rm -f "$f.min"
+            timeout 600 cargo +nightly fuzz tmin "${{ matrix.target }}" "$f" -- \
+              -max_total_time=300 -exact_artifact_path="$f.min" || true
+            # tmin can fail, time out, or emit an empty file: fall back to
+            # the un-minimized crash input so the reproducer is never lost.
+            if [ ! -s "$f.min" ]; then
+              echo "tmin produced no usable output for $f; using the original input"
+              cp "$f" "$f.min"
+            fi
           done
 
       - name: Upload crash artifacts
@@ -159,13 +192,37 @@ jobs:
         run: |
           set -uo pipefail
           shopt -s nullglob
+          : > infra-errors.txt
+          EXISTING=""
+          EXISTING_LOADED=0
           for f in artifacts/${{ matrix.target }}/*.min; do
             [ -f "$f" ] || continue
+            # A zero-length reproducer is content-free: it carries no
+            # information to triage (the empty-input crash behind #323 /
+            # #324 was a per-iteration leak reported against the empty
+            # unit). Do not file it; surface it instead.
+            if [ ! -s "$f" ]; then
+              echo "::error::zero-length reproducer $f for ${{ matrix.target }}; not filing an issue"
+              echo "zero-length reproducer: $f" >> infra-errors.txt
+              continue
+            fi
             HASH="$(sha256sum "$f" | cut -c1-12)"
+            # The title carries the TARGET name, so the same 12-hex prefix
+            # in two targets can never suppress each other.
             TITLE="fuzz(${{ matrix.target }}): crash $HASH"
-            # Dedup across nightly runs — same minimized input hashes the
-            # same, so a recurring crash gets one issue, not one per night.
-            EXISTING="$(gh issue list --state all --search "\"$TITLE\" in:title" --json title --jq '.[].title' || true)"
+            # Dedup across nightly runs — the same minimized input hashes
+            # the same, so a recurring crash gets one issue, not one per
+            # night. List every issue (open + closed) once and match the
+            # exact title: GitHub's search tokenizer is not a reliable
+            # exact-match oracle for titles with parens and colons.
+            if [ "$EXISTING_LOADED" -eq 0 ]; then
+              if ! EXISTING="$(gh issue list --state all --limit 2000 --json title --jq '.[].title')"; then
+                echo "::error::could not list existing issues"
+                echo "gh issue list failed" >> infra-errors.txt
+                break
+              fi
+              EXISTING_LOADED=1
+            fi
             if grep -qxF "$TITLE" <<<"$EXISTING"; then
               echo "Already filed: $TITLE"
               continue
@@ -176,7 +233,7 @@ jobs:
               echo
               echo "- Target: \`${{ matrix.target }}\`"
               echo "- Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-              echo "- Minimized reproducer: \`$(basename "$f")\` (attached below and in the run's uploaded artifact)"
+              echo "- Reproducer: \`$(basename "$f")\` ($(stat -c %s "$f") bytes; attached below and in the run's uploaded artifact)"
               echo
               echo "### Reproducer (base64)"
               echo
@@ -193,21 +250,37 @@ jobs:
               echo "cargo +nightly fuzz run ${{ matrix.target }} repro.bin"
               echo '```'
             } > "$BODY_FILE"
-            gh issue create \
+            if gh issue create \
               --title "$TITLE" \
               --label tech-debt \
               --label core-engine \
-              --body-file "$BODY_FILE"
+              --body-file "$BODY_FILE"; then
+              EXISTING="$EXISTING"$'\n'"$TITLE"
+            else
+              echo "::error::gh issue create failed for $TITLE"
+              echo "gh issue create failed: $TITLE" >> infra-errors.txt
+            fi
           done
 
-      - name: Fail the job when a crash was found
+      - name: Fail on fuzzer infrastructure error
         if: always()
         working-directory: fuzz
         run: |
           shopt -s nullglob
-          files=(artifacts/${{ matrix.target }}/crash-* artifacts/${{ matrix.target }}/oom-* artifacts/${{ matrix.target }}/timeout-*)
+          files=(artifacts/${{ matrix.target }}/crash-* artifacts/${{ matrix.target }}/leak-* artifacts/${{ matrix.target }}/oom-* artifacts/${{ matrix.target }}/timeout-*)
           if [ ${#files[@]} -gt 0 ]; then
-            echo "${#files[@]} crash artifact(s) for ${{ matrix.target }} — see the filed issue(s) above."
-            exit 1
+            echo "${#files[@]} crash artifact(s) for ${{ matrix.target }} — filed/deduplicated as issues above; this is a finding, not a job failure."
+          else
+            echo "No crashes for ${{ matrix.target }}."
           fi
-          echo "No crashes for ${{ matrix.target }}."
+          status=0
+          if [ "${{ steps.run.outputs.started }}" != "true" ]; then
+            echo "::error::the ${{ matrix.target }} fuzzer never started (build or startup failure) — see the 'Run cargo fuzz' step log"
+            status=1
+          fi
+          if [ -s infra-errors.txt ]; then
+            echo "::error::issue-filing / reproducer problems:"
+            cat infra-errors.txt
+            status=1
+          fi
+          exit "$status"

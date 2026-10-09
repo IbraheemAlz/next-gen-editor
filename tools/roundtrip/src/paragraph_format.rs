@@ -94,7 +94,7 @@ fn save_both(a: &format_docx::DocxArchive, doc: &engine::DocumentTree) -> Result
     Ok(bytes)
 }
 
-/// Issues #292 / #293 / #297 — step 36.
+/// Issues #292 / #293 / #297 — step 40.
 ///
 /// a. A zero-edit save is byte-identical (`document.xml`, `styles.xml`),
 ///    and the paragraph marks are modeled.
@@ -126,7 +126,7 @@ pub(crate) fn run_paragraph_format_roundtrip() -> Result<()> {
     if mark(doc, 3).and_then(|m| m.italic) != Some(true) || mark(doc, 2).is_some() {
         bail!("paragraph marks: {:?} / {:?}", mark(doc, 2), mark(doc, 3));
     }
-    println!("[roundtrip] step 36a OK — untouched save byte-identical; paragraph marks modeled");
+    println!("[roundtrip] step 40a OK — untouched save byte-identical; paragraph marks modeled");
 
     let merged = doc.delete_range(at(0, 5), at(1, 0));
     let bytes = save_both(&a, &merged)?;
@@ -149,7 +149,7 @@ pub(crate) fn run_paragraph_format_roundtrip() -> Result<()> {
         );
     }
     println!(
-        "[roundtrip] step 36b OK — Backspace after a heading keeps its pPr, paraId and the tail's hyperlink"
+        "[roundtrip] step 40b OK — Backspace after a heading keeps its pPr, paraId and the tail's hyperlink"
     );
 
     let split = doc.split_paragraph(at(2, 11)).insert_text(at(3, 0), "Next");
@@ -176,7 +176,7 @@ pub(crate) fn run_paragraph_format_roundtrip() -> Result<()> {
         bail!("typing into the italic-marked empty paragraph:\n{out}");
     }
     println!(
-        "[roundtrip] step 36c OK — Enter after a bold run saves a bold mark + run; an empty marked paragraph types its mark"
+        "[roundtrip] step 40c OK — Enter after a bold run saves a bold mark + run; an empty marked paragraph types its mark"
     );
 
     let bigger = SpanStyle {
@@ -198,6 +198,6 @@ pub(crate) fn run_paragraph_format_roundtrip() -> Result<()> {
     if b.document.styles.get("Heading1").map(|s| s.name.as_str()) != Some("heading 1") {
         bail!("re-read Heading1 name");
     }
-    println!("[roundtrip] step 36d OK — ModifyStyle keeps every style's display name");
+    println!("[roundtrip] step 40d OK — ModifyStyle keeps every style's display name");
     Ok(())
 }

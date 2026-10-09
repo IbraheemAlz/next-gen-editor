@@ -66,6 +66,15 @@ pub struct LoadedFont {
 
 impl LoadedFont {
     pub fn parse(id: String, data: Vec<u8>) -> Result<Self, FontError> {
+        /* Validate BEFORE leaking: a rejected font (garbage bytes from a
+        hostile `LoadFont`, or the fuzzer) must not strand its buffer —
+        LeakSanitizer flags it and a long session would accumulate them.
+        The probe borrows `data` and is dropped before the leak. */
+        if FontRef::from_index(&data, 0).is_none()
+            || rustybuzz::Face::from_slice(&data, 0).is_none()
+        {
+            return Err(FontError::Parse);
+        }
         /* Leak the bytes to `'static`: the cached `rustybuzz::Face` borrows
         them, and a loaded font is never freed during a session anyway. */
         let data: &'static [u8] = Vec::leak(data);
@@ -341,6 +350,19 @@ impl FontStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* Nightly-fuzz regression (#323/#324 follow-up): garbage and empty
+    bytes are a typed `Parse` error, and the validation happens before the
+    buffer is leaked (LeakSanitizer would flag the stranded buffer). */
+    #[test]
+    fn parse_rejects_garbage_without_leaking() {
+        for bytes in [vec![], vec![0u8; 8], b"not a font at all".to_vec()] {
+            assert!(matches!(
+                LoadedFont::parse("junk".to_string(), bytes),
+                Err(FontError::Parse)
+            ));
+        }
+    }
 
     /* Issue #23 — a dynamically-registered custom font (here `cairo`, the
     `fonts.json` worked example) resolves by its string id for both Latin and
