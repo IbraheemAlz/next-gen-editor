@@ -122,6 +122,14 @@ export interface EngineClientLike {
     onRendererDowngrade?(fn: (d: RendererDowngrade | undefined) => void): () => void;
     retryGpuRenderer?(): Promise<void>;
     /**
+     * Issue #428 - switch the render backend IN PLACE (the Settings menu):
+     * the #270 retire-respawn path with the renderer pinned
+     * (`'canvas2d'`) or re-probed (`'vello'`). The document survives; a
+     * page reload is never involved. Implementations without it omit the
+     * method and the Settings menu shows the active renderer only.
+     */
+    setRenderer?(kind: 'vello' | 'canvas2d'): Promise<void>;
+    /**
      * Issue #330 - optional in-place engine restart for the crash overlay:
      * `restartInPlace` re-spawns the engine from the event log (joining a
      * recovery already under way), `prepareCarryOver` makes the next page

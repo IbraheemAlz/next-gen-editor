@@ -165,6 +165,8 @@ export const FACADE_METHOD_COMMANDS: { readonly [M in keyof EditorCommands]: Fac
         requestStats: ['REQUEST_STATS'],
         canRetryGpuRenderer: 'host',
         retryGpuRenderer: 'host',
+        canSetRenderer: 'host',
+        setRenderer: 'host',
         requestPaint: ['REQUEST_PAINT'],
         setZoom: ['SET_ZOOM'],
         setDeviceScale: ['SET_DEVICE_SCALE'],
