@@ -325,6 +325,15 @@ fn read_docx_scoped(
     widow_control_default: bool,
     limits: &PackageLimits,
 ) -> Result<DocxArchive, DocxError> {
+    /* Issue #345 — an OLE compound file is never a ZIP: an encrypted
+    package (or a legacy binary document) gets its own typed refusal
+    instead of "invalid Zip archive". */
+    if let Some(kind) = crate::opc::cfb::sniff_compound_file(bytes) {
+        return Err(match kind {
+            crate::opc::cfb::CompoundFileKind::EncryptedPackage => DocxError::Encrypted,
+            crate::opc::cfb::CompoundFileKind::Other => DocxError::CompoundFile,
+        });
+    }
     /* Issue #348 — every entry through the bounded reader (never an
     allocation from the declared size), then the XML shape bounds of every
     part the reader walks, before any typed walk. */

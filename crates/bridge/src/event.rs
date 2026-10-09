@@ -516,6 +516,11 @@ pub enum ErrorKind {
     /// open was refused before anything was allocated from the package's
     /// own size claims. The previous document stays open.
     PackageTooLarge,
+    /// Issue #345 — the file is an encrypted (password-protected) Office
+    /// document: an OLE compound file (`D0 CF 11 E0 A1 B1 1A E1`) carrying
+    /// an MS-OFFCRYPTO / ECMA-376 Part 2 `EncryptedPackage`, not a ZIP. The
+    /// open was refused; the previous document stays open.
+    EncryptedDocument,
 }
 
 impl Event {
@@ -1064,6 +1069,13 @@ mod a11y_note_wire_tests {
             typed,
             serde_json::json!({ "type": "ERROR", "message": "too big", "kind": "PackageTooLarge" })
         );
+        /* Issue #345 — the encrypted-package refusal. */
+        let encrypted = serde_json::to_value(Event::Error {
+            message: "locked".into(),
+            kind: Some(ErrorKind::EncryptedDocument),
+        })
+        .unwrap();
+        assert_eq!(encrypted["kind"], "EncryptedDocument");
     }
 
     fn run(text: &str, note_ref: Option<A11yNoteRef>) -> A11yRun {

@@ -10,6 +10,7 @@
 //! structurally; the bytes themselves still ride the pass-through.
 
 pub mod archive;
+pub mod cfb;
 pub mod content_types;
 pub mod limits;
 pub mod part_names;

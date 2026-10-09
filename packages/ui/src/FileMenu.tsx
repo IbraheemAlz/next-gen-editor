@@ -35,6 +35,7 @@ import {
 import {
     createEditorCommands,
     useEngine,
+    type ErrorKind,
     type PdfConformance,
 } from '@nge/core';
 import './FileMenu.css';
@@ -79,6 +80,24 @@ function triggerDownload(bytes: Uint8Array, mime: string, filename: string): voi
     a.remove();
     /* Defer revoke so Safari has time to start the download. */
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** The banner text for an engine `ERROR`: typed refusals (issues #348 /
+ *  #345) get a plain-language lead, everything else shows the engine's
+ *  own message. */
+function errorMessage(kind: ErrorKind | undefined, message: string): string {
+    switch (kind) {
+        case 'PackageTooLarge':
+            return `This document is too large or too deeply nested to open safely. ${message}`;
+        case 'EncryptedDocument':
+            return (
+                'This document is encrypted with a password. Opening encrypted documents ' +
+                'is not supported yet — remove the password in the app that created it ' +
+                '(File → Info → Protect Document → Encrypt with Password in Word), then open it again.'
+            );
+        default:
+            return message;
+    }
 }
 
 export const FileMenu: Component<FileMenuProps> = (props) => {
@@ -126,12 +145,11 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                 case 'ERROR':
                     /* Issue #348 — a refused open (the package exceeded
                        the reader's resource limits) says so plainly; the
-                       previous document stays open. */
-                    setError(
-                        evt.kind === 'PackageTooLarge'
-                            ? `This document is too large or too deeply nested to open safely. ${evt.message}`
-                            : evt.message,
-                    );
+                       previous document stays open. Issue #345 — so does
+                       an encrypted (password-protected) package: there is
+                       no password prompt yet, the message says what the
+                       file is and what to do. */
+                    setError(errorMessage(evt.kind, evt.message));
                     setPendingExportFormat(null);
                     setTimeout(() => setError(null), 6000);
                     break;

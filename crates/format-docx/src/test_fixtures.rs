@@ -791,3 +791,27 @@ pub fn theme_loaded_faces_docx() -> Vec<u8> {
         ("Amiri", "Amiri"),
     ))
 }
+
+/* ------------------------------------------------------------------ */
+/* Issue #345 — encrypted packages + document protection               */
+/* ------------------------------------------------------------------ */
+
+/// Issue #345 — an OLE compound file shaped like an MS-OFFCRYPTO encrypted
+/// package: the root storage holds an agile `EncryptionInfo` header (version
+/// 4.4, a stub descriptor) and an `EncryptedPackage` stream of zeros. It is
+/// NOT decryptable — it exercises the detection path
+/// (`Event::Error { kind: EncryptedDocument }`), e.g. as
+/// `ts/e2e/fixtures/encrypted_stub.docx`.
+pub fn encrypted_package_stub() -> Vec<u8> {
+    let mut info = vec![0x04, 0x00, 0x04, 0x00, 0x40, 0x00, 0x00, 0x00];
+    info.extend_from_slice(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+<encryption xmlns=\"http://schemas.microsoft.com/office/2006/encryption\"/>",
+    );
+    let mut package = 4096u64.to_le_bytes().to_vec();
+    package.resize(8 + 4096, 0);
+    crate::opc::cfb::test_writer::build(&[
+        ("EncryptionInfo", &info),
+        ("EncryptedPackage", &package),
+    ])
+}

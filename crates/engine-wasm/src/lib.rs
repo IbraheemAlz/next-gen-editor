@@ -16560,8 +16560,15 @@ impl Engine {
                 Event::DocumentLoaded { paragraph_count }
             }
             Err(e) => {
-                let kind = matches!(e, format_docx::DocxError::PackageTooLarge { .. })
-                    .then_some(bridge::ErrorKind::PackageTooLarge);
+                let kind = match e {
+                    format_docx::DocxError::PackageTooLarge { .. } => {
+                        Some(bridge::ErrorKind::PackageTooLarge)
+                    }
+                    /* Issue #345 — an encrypted (password-protected)
+                    package: the shell says so instead of "not a zip". */
+                    format_docx::DocxError::Encrypted => Some(bridge::ErrorKind::EncryptedDocument),
+                    _ => None,
+                };
                 Event::Error {
                     message: format!("{origin}: {e}"),
                     kind,
@@ -28128,6 +28135,10 @@ mod theme_layout_tests;
 
 #[cfg(test)]
 mod document_lifecycle_tests;
+
+/// Issue #345 — encrypted packages + document protection enforcement.
+#[cfg(test)]
+mod document_protection_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

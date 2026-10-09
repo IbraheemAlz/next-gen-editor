@@ -37,6 +37,21 @@ pub enum DocxError {
     /// of being clamped into some other part's name.
     #[error("unsafe part name: {0}")]
     UnsafePartName(String),
+    /// Issue #345 — the bytes are an OLE compound file carrying an
+    /// MS-OFFCRYPTO / ECMA-376 Part 2 encrypted package (`EncryptionInfo` +
+    /// `EncryptedPackage` streams): the document is password protected.
+    /// Refused before the ZIP reader sees it (it used to fail as "invalid
+    /// Zip archive").
+    #[error("the document is encrypted (password protected)")]
+    Encrypted,
+    /// Issue #345 — the bytes are an OLE compound file that is NOT an
+    /// encrypted OOXML package: a legacy binary Office document (Word
+    /// 97–2003 `.doc`, …) or a damaged container.
+    #[error(
+        "not a .docx package: the file is an OLE compound file (a Word 97-2003 .doc or another \
+         legacy binary format)"
+    )]
+    CompoundFile,
 }
 
 /// Non-fatal reader diagnostics. The document opened, but some subtree was
