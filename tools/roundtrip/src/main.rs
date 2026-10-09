@@ -31,6 +31,7 @@
 
 mod inline_spans;
 mod note_containers;
+mod paragraph_format;
 mod revisions;
 mod table_markup;
 
@@ -335,6 +336,7 @@ fn run_default() -> Result<()> {
     run_hyperlink_identity_roundtrip()?;
     run_comment_anchor_roundtrip()?;
     note_containers::run_note_containers_roundtrip()?;
+    paragraph_format::run_paragraph_format_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

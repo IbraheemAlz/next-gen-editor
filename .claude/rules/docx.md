@@ -72,7 +72,8 @@ The `tools/roundtrip/` harness asserts:
   verified pPr passthrough), else regenerates it from `mark_style` keeping
   the fragment's unmodeled children (`unmodeled_rpr_children`) and the
   source spelling of unchanged ones; the #262 mark revision is re-injected
-  after.
+  after. Harness: `tools/roundtrip` step 36 (`paragraph_format.rs` — with
+  the #292 merge and the #297 style names).
 - **When you model a new child:** add it to the `*_child_is_modeled`
   predicate *and* emit it through the `PrChildren` sink in `writer.rs`
   at its rank — never both bag it and emit it (duplicate child).
