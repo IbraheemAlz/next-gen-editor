@@ -15216,7 +15216,13 @@ impl Engine {
                 &self.review_author,
                 &self.current_review_date(),
             )
-            .map_err(|e| Box::new(Event::error(format!("{cmd}: {e}"))))
+            .map_err(|e| {
+                /* Issue #364 - typed, so the shell shows a visible refusal. */
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                    kind: Some(bridge::ErrorKind::TrackedDeletionRefused),
+                })
+            })
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching

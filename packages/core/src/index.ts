@@ -26,6 +26,7 @@ export {
     useEngine,
     useDocumentDefaults,
     useTelemetryEndpoint,
+    useDebugSurfaces,
 } from './EngineProvider';
 export type { EngineProviderProps, EngineHandle } from './EngineProvider';
 
@@ -40,7 +41,7 @@ export {
 export type { EditorCommands, ParagraphStyleId } from './createEditorCommands';
 
 export { createEditorState } from './createEditorState';
-export type { EditorState } from './createEditorState';
+export type { EditorState, CheckpointHealth, EditorError } from './createEditorState';
 
 export { createFontRegistry } from './createFontRegistry';
 export type {
@@ -68,9 +69,15 @@ export type {
     CommentSnapshot,
     RecoveryReport,
     CheckpointStatus,
+    PreviousSessionInfo,
 } from './types';
 
-export { recoveryNotices, recoveryDegraded, checkpointNotices } from './recovery';
+export {
+    recoveryNotices,
+    recoveryDegraded,
+    checkpointNotices,
+    previousSessionNotice,
+} from './recovery';
 
 /* Issue #342 — per-command metadata generated from `bridge::meta` (also
  * importable on its own as `@nge/core/command-meta`, which the worker and

@@ -1,0 +1,43 @@
+/* Issue #364 - transient engine-refusal toast. The wrapper is a persistent
+   live region (zero-size while empty, never intercepts the pointer); the
+   card sits bottom-centre, clear of the status bar, below the Dev HUD. */
+.nge-toast {
+    position: fixed;
+    left: 50%;
+    bottom: calc(var(--nge-space-5) * 2);
+    transform: translateX(-50%);
+    z-index: var(--nge-z-popover);
+    width: min(520px, calc(100vw - var(--nge-space-4) * 2));
+    pointer-events: none;
+}
+
+.nge-toast__message {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--nge-space-3);
+    padding: var(--nge-space-3) var(--nge-space-4);
+    background: var(--nge-color-bg);
+    border: 1px solid var(--nge-color-warning);
+    border-left-width: 4px;
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-lg);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-md)/1.45 var(--nge-font-ui);
+}
+
+.nge-toast__icon {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--nge-color-warning);
+    color: var(--nge-color-bg);
+    font: 700 var(--nge-font-size-md)/1 var(--nge-font-ui);
+}
+
+.nge-toast__text {
+    min-width: 0;
+}

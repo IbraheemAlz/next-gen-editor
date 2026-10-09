@@ -318,9 +318,11 @@ fn a_tracked_delete_over_a_table_answers_an_error() {
         },
     }));
     match evt {
-        Event::Error { message, .. } => {
+        Event::Error { message, kind } => {
             assert!(message.starts_with("DeleteRange: "), "{message}");
             assert!(message.contains("table"), "{message}");
+            // Issue #364 - typed, so the shell can show a visible refusal.
+            assert_eq!(kind, Some(bridge::ErrorKind::TrackedDeletionRefused));
         }
         other => panic!("expected a typed error, got {other:?}"),
     }

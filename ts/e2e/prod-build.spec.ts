@@ -15,7 +15,11 @@ const TS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
    release does (`vite build`, NO `VITE_NGE_DEV_HOOKS`), serves it with
    `vite preview` on a free port, and proves a production page exposes no
    engine handle and does not let the URL pick a telemetry sink. A second
-   build WITH the flag proves the gate is the flag, not an accident. */
+   build WITH the flag proves the gate is the flag, not an accident.
+   Issue #389 extends the same contract to the remaining debug surfaces: the
+   fixed `#stats` box (gone everywhere - the Dev HUD owns the readout),
+   `window.__lastStats`, the `?clipboardPrefetch=0` URL parameter and the
+   Settings menu's URL-driven renderer switch. */
 
 function freePort(): Promise<number> {
     return new Promise((resolvePort, reject) => {
@@ -71,6 +75,7 @@ const HOOKS = [
     '__fontRegistry',
     '__telemetryFlush',
     '__clipboardPrefetch',
+    '__lastStats',
 ] as const;
 
 test('a production build exposes no engine hooks on window (#340)', async ({ page }) => {
@@ -82,7 +87,9 @@ test('a production build exposes no engine hooks on window (#340)', async ({ pag
         page.on('request', (r) => requests.push(r.url()));
         /* The URL tries to choose a telemetry sink: a production page must
            ignore it (and telemetry is opt-in anyway). */
-        await page.goto(`${server.url}?telemetryEndpoint=http://127.0.0.1:9/evil`);
+        await page.goto(
+            `${server.url}?telemetryEndpoint=http://127.0.0.1:9/evil&clipboardPrefetch=0`,
+        );
         await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
             timeout: 60_000,
         });
@@ -96,6 +103,19 @@ test('a production build exposes no engine hooks on window (#340)', async ({ pag
         expect(requests.filter((u) => u.startsWith('http://127.0.0.1:9'))).toEqual([]);
         /* The app itself works: the shell mounted. */
         await expect(page.locator('.nge-shell')).toBeVisible();
+        /* Issue #389 - no fixed #stats debug box, and the URL parameter
+           cannot switch the clipboard prefetch off. */
+        await expect(page.locator('#stats')).toHaveCount(0);
+        await expect(page.locator('textarea[data-nge-hidden-input]')).toHaveAttribute(
+            'data-clipboard-prefetch',
+            'on',
+        );
+        /* ... and the Settings menu offers no URL-driven renderer switch. */
+        await page.getByRole('button', { name: 'Settings' }).click();
+        await expect(page.locator('.nge-settings__menu')).toBeVisible();
+        await expect(page.getByRole('button', { name: /Switch to (Vello|Canvas2D)/ })).toHaveCount(
+            0,
+        );
     } finally {
         server.stop();
         rmSync(outDir, { recursive: true, force: true });
@@ -107,7 +127,7 @@ test('a build made with VITE_NGE_DEV_HOOKS=1 installs the hooks (#340)', async (
     const outDir = mkdtempSync(join(tmpdir(), 'nge-prod-build-hooks-'));
     const server = await buildAndServe(outDir, { ...process.env, VITE_NGE_DEV_HOOKS: '1' });
     try {
-        await page.goto(server.url);
+        await page.goto(`${server.url}?clipboardPrefetch=0`);
         await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
             timeout: 60_000,
         });
@@ -119,6 +139,18 @@ test('a build made with VITE_NGE_DEV_HOOKS=1 installs the hooks (#340)', async (
         expect(await page.evaluate(() => typeof (window as any).__setTelemetryEnabled)).toBe(
             'function',
         );
+        /* Issue #389 - under the flag the URL parameter and the renderer
+           switch are honoured, `__lastStats` fills, and still no #stats box. */
+        await expect(page.locator('textarea[data-nge-hidden-input]')).toHaveAttribute(
+            'data-clipboard-prefetch',
+            'off',
+        );
+        await expect(page.locator('#stats')).toHaveCount(0);
+        await page.waitForFunction(() => (window as any).__lastStats !== undefined, undefined, {
+            timeout: 15_000,
+        });
+        await page.getByRole('button', { name: 'Settings' }).click();
+        await expect(page.getByRole('button', { name: /Switch to Vello/ })).toBeVisible();
     } finally {
         server.stop();
         rmSync(outDir, { recursive: true, force: true });
