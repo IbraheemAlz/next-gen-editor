@@ -1567,19 +1567,33 @@ fn emit_tab_leader_glyphs(
     if x + step > hi {
         return true;
     }
+    /* Issue #422 — an untileable advance (huge / non-finite): the caller's
+    rule fallback paints it instead of millions of glyphs. */
+    let Some(bound) = pdf_tile_bound(x, hi, step) else {
+        return false;
+    };
     let gy = page_h - baseline;
     /* Issue #327 — only now, with at least one dot certain to show, does
     the fill glyph join the font's subset. */
     let bytes = font.fo.show_code(gid).to_be_bytes();
     content.begin_text();
     content.set_font(Name(font.fo.resource.as_bytes()), font.px_size);
-    while x + step <= hi {
+    for _ in 0..bound {
+        if x + step > hi {
+            break;
+        }
         content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, gy]);
         content.show(Str(&bytes));
         x += step;
     }
     content.end_text();
     true
+}
+
+/// Issue #422 — [`layout::pattern_tile_bound`] for the PDF painters' `f32`
+/// geometry: `None` = do not tile (huge / non-finite span), paint a rule.
+fn pdf_tile_bound(lo: f32, hi: f32, pitch: f32) -> Option<usize> {
+    layout::pattern_tile_bound(f64::from(lo), f64::from(hi), f64::from(pitch))
 }
 
 /// Issue #144 — the PDF twin of `render/scene.rs::push_tab_leader`: fills
@@ -1618,7 +1632,18 @@ fn emit_tab_leader_rule(
                 baseline - px * 0.3
             };
             let mut x = (lo / step).ceil() * step;
-            while x + dot <= hi {
+            /* Issue #422 — bounded tiling; an untileable advance paints
+            as a rule. */
+            let Some(bound) = pdf_tile_bound(x, hi, step) else {
+                if lo.is_finite() && hi.is_finite() {
+                    rect(content, lo, y, hi, y + dot);
+                }
+                return;
+            };
+            for _ in 0..bound {
+                if x + dot > hi {
+                    break;
+                }
                 rect(content, x, y, x + dot, y + dot);
                 x += step;
             }
@@ -1628,7 +1653,16 @@ fn emit_tab_leader_rule(
             let dash = px * 0.25;
             let y = baseline - px * 0.28;
             let mut x = (lo / step).ceil() * step;
-            while x + dash <= hi {
+            let Some(bound) = pdf_tile_bound(x, hi, step) else {
+                if lo.is_finite() && hi.is_finite() {
+                    rect(content, lo, y, hi, y + dot);
+                }
+                return;
+            };
+            for _ in 0..bound {
+                if x + dash > hi {
+                    break;
+                }
                 rect(content, x, y, x + dash, y + dot);
                 x += step;
             }
@@ -1676,17 +1710,32 @@ fn emit_underline_pattern(
     thickness: f32,
 ) {
     use engine::UnderlineStyle::*;
+    /* Issue #422 — same bound as the canvas twin: a non-finite span paints
+    nothing, an untileable one (more than `layout::MAX_PATTERN_TILES`
+    fills) paints as one solid stroke. */
+    if !(x0.is_finite() && x1.is_finite() && top.is_finite() && thickness.is_finite()) {
+        return;
+    }
+    let solid = |content: &mut Content| {
+        fill_decoration_rect(content, page_h, x0, x1, top, thickness);
+    };
     match style {
         None => {}
-        Single => fill_decoration_rect(content, page_h, x0, x1, top, thickness),
+        Single => solid(content),
         Double => {
-            fill_decoration_rect(content, page_h, x0, x1, top, thickness);
+            solid(content);
             fill_decoration_rect(content, page_h, x0, x1, top + thickness * 2.0, thickness);
         }
         Dotted => {
             let pitch = (thickness * 2.0).max(2.0);
+            let Some(bound) = pdf_tile_bound(x0, x1, pitch) else {
+                return solid(content);
+            };
             let mut x = x0;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + thickness).min(x1);
                 fill_decoration_rect(content, page_h, x, end, top, thickness);
                 x += pitch;
@@ -1695,8 +1744,14 @@ fn emit_underline_pattern(
         Dashed => {
             let dash = (thickness * 4.0).max(3.0);
             let gap = dash;
+            let Some(bound) = pdf_tile_bound(x0, x1, dash + gap) else {
+                return solid(content);
+            };
             let mut x = x0;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + dash).min(x1);
                 fill_decoration_rect(content, page_h, x, end, top, thickness);
                 x += dash + gap;
@@ -1706,11 +1761,17 @@ fn emit_underline_pattern(
             /* Sawtooth: tile pairs of short rects on alternating rows.
             Period = `4 * thickness`; each half-period is one short rect. */
             let half = (thickness * 2.0).max(2.0);
+            let Some(bound) = pdf_tile_bound(x0, x1, half) else {
+                return solid(content);
+            };
             let top_band = top - thickness;
             let bottom_band = top + thickness;
             let mut x = x0;
             let mut up = true;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + half).min(x1);
                 let band_top = if up { top_band } else { bottom_band };
                 fill_decoration_rect(content, page_h, x, end, band_top, thickness);
@@ -2317,6 +2378,51 @@ fn fnv1a64(data: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// Issue #422 — the PDF decoration painters share the canvas twins'
+/// tiling bound: a giant span is one stroke, never millions of operators.
+#[cfg(test)]
+mod pattern_bound_tests {
+    use super::*;
+
+    /// Rectangles painted (`re` operators — each decoration fill is one).
+    fn fills(content: Content) -> usize {
+        let bytes = content.finish().to_vec();
+        bytes.windows(3).filter(|w| w == b" re").count()
+    }
+
+    #[test]
+    fn patterned_underline_over_a_giant_span_is_one_fill() {
+        for style in [
+            engine::UnderlineStyle::Wavy,
+            engine::UnderlineStyle::Dotted,
+            engine::UnderlineStyle::Dashed,
+        ] {
+            let mut c = Content::new();
+            emit_underline_pattern(&mut c, 842.0, style, 10.0, 640_730_000.0, 50.0, 1.0);
+            assert_eq!(fills(c), 1, "{style:?}");
+            let mut c = Content::new();
+            emit_underline_pattern(&mut c, 842.0, style, 0.0, f32::INFINITY, 50.0, 1.0);
+            assert_eq!(fills(c), 0, "{style:?}");
+            // Nominal spans still tile.
+            let mut c = Content::new();
+            emit_underline_pattern(&mut c, 842.0, style, 0.0, 300.0, 50.0, 1.0);
+            assert!(fills(c) > 10, "{style:?}");
+        }
+    }
+
+    #[test]
+    fn tab_leader_rule_over_a_giant_advance_is_one_fill() {
+        for kind in [TabLeaderKind::Dot, TabLeaderKind::Hyphen] {
+            let mut c = Content::new();
+            emit_tab_leader_rule(&mut c, 842.0, kind, 0.0, 1e12, 50.0, 12.0);
+            assert_eq!(fills(c), 1, "{kind:?}");
+            let mut c = Content::new();
+            emit_tab_leader_rule(&mut c, 842.0, kind, 0.0, f32::INFINITY, 50.0, 12.0);
+            assert_eq!(fills(c), 0, "{kind:?}");
+        }
+    }
 }
 
 #[cfg(test)]

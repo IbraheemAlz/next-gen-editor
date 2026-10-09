@@ -223,11 +223,16 @@ pub enum Scenario {
     /// dangling for a later command to "self-heal". Was
     /// `repro_117_undo_repaint_error`.
     SelectionClampAfterUndo,
+    /// Issue #422 — the smoke-sweep input (#3875) that drove the driver to
+    /// 46.5 GB: an inline image inserted at its "original" 640 730 085 px
+    /// width stretches its run, and a wavy (then dotted, dashed) underline
+    /// over it tiled one display-list fill per ~2 px. Now one stroke.
+    PatternedUnderlineGiantImage,
 }
 
 impl Scenario {
     /// Every scenario, in the fixed order [`Scenario::index`] encodes.
-    pub const ALL: [Scenario; 12] = [
+    pub const ALL: [Scenario; 13] = [
         Scenario::NanZoom,
         Scenario::NanDeviceScale,
         Scenario::BadRenderDate,
@@ -240,6 +245,9 @@ impl Scenario {
         Scenario::TableMergeCellsOutOfRange,
         Scenario::SelectionClampOutOfRange,
         Scenario::SelectionClampAfterUndo,
+        // Issue #422 — appended: an index is a position in this array, so
+        // new scenarios go last and every committed seed stays valid.
+        Scenario::PatternedUnderlineGiantImage,
     ];
 
     /// The committed corpus file this scenario's seed lives at, relative
@@ -258,6 +266,7 @@ impl Scenario {
             Scenario::TableMergeCellsOutOfRange => "repro_116_1",
             Scenario::SelectionClampOutOfRange => "repro_117_1",
             Scenario::SelectionClampAfterUndo => "repro_117_undo_repaint_error",
+            Scenario::PatternedUnderlineGiantImage => "repro_422_patterned_underline_giant_image",
         }
     }
 
@@ -539,6 +548,50 @@ impl Scenario {
                 // shape (a stale selection surviving a tree swap).
                 Command::Undo,
             ],
+            Scenario::PatternedUnderlineGiantImage => {
+                let underline = |style| Command::ApplyFormatting {
+                    range: None,
+                    attrs: TextAttrsPatch {
+                        bold: None,
+                        italic: None,
+                        underline: Some(style),
+                        strike: None,
+                        font_family: None,
+                        font_size: None,
+                        color: None,
+                        bg_color: None,
+                        script: None,
+                        language: None,
+                        caps: None,
+                        small_caps: None,
+                    },
+                };
+                vec![
+                    Command::InsertText {
+                        at: None,
+                        text: "before image after".to_string(),
+                    },
+                    // The reproducer's exact image: 640 730 085 × 261 489 430
+                    // px, kept at its original size.
+                    Command::InsertImage {
+                        at: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 7,
+                        },
+                        image: ImageBlob {
+                            bytes: vec![148, 164, 30],
+                            mime: "\thS".to_string(),
+                            width: 640_730_085,
+                            height: 261_489_430,
+                        },
+                        fit: ImageFit::Original,
+                    },
+                    Command::SelectAll,
+                    underline(UnderlineStyle::Wavy),
+                    underline(UnderlineStyle::Dotted),
+                    underline(UnderlineStyle::Dashed),
+                ]
+            }
         }
     }
 

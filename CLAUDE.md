@@ -180,8 +180,12 @@ D5.10 are external/human sign-offs, not code.
     bound stands in for a termination watchdog (`Engine::
     layout_page_count_for_fuzzing`).
   - `fuzz/examples/smoke.rs` is a stable-only driver (no nightly needed)
-    proving all four work: `cargo run --manifest-path fuzz/Cargo.toml
-    --example smoke --release`.
+    proving all four work: `systemd-run --user --scope -p MemoryMax=16G
+    --quiet -- cargo run --manifest-path fuzz/Cargo.toml --example smoke
+    --release` — always under the cap (issue #422, see "Bash / agent
+    ergonomics"); it prints `smoke: peak RSS …` (keep it < 4 GB) and
+    aborts on its own on a runaway input (live-heap ceiling, `RLIMIT_AS`,
+    per-input timeout), naming the input.
   - Issue #229 — the `rpc_command` corpus's #186/#187 regression seeds are
     derived from `command_gen::Scenario`'s explicit builder (a fixed-prefix
     fast path in `gen_targeted_command`, immune to unrelated arms' byte-
@@ -438,6 +442,17 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
 
 - **Working dir drifts** between Bash tool calls. Use absolute paths or `cd /home/ibrahim/Desktop/code/next-gen-editor &&` at the top of every multi-step command.
 - Long-running processes (vite dev, wasm-pack build) run in `run_in_background: true`.
+- **Heavy local runs go through a memory-capped scope (issue #422).** The
+  fuzz smoke driver / sweeps, `tools/corpus-native`, Playwright and `cargo
+  test --workspace` run as `systemd-run --user --scope -p MemoryMax=16G
+  --quiet -- <command>` (inherits env + cwd). On 2026-10-09 one uncapped
+  smoke input reached 46.5 GB and the OOM killer took the whole terminal
+  scope — session, agents, merge queues, Chrome. `fuzz/examples/smoke.rs`
+  also self-limits (`RLIMIT_AS` 8 GiB, a 2 GiB live-heap ceiling, a 300 s
+  per-input timeout — `SMOKE_AS_LIMIT_MB` / `SMOKE_RSS_LIMIT_MB` /
+  `SMOKE_TIMEOUT_SECS`; the offending input is printed and, with
+  `SMOKE_ARTIFACT_DIR`, saved) and prints its peak RSS at exit; bisect a
+  heavy input with `--from/--to/--log-inputs`.
 - Don't `git add .` blindly. Stage by explicit path.
 - Commit messages: heredoc + a `Co-Authored-By:` trailer naming the model that wrote the change (e.g. `Claude Fable 5.1`, `Claude Opus 5.5`, `Claude Sonnet 5`, each `<noreply@anthropic.com>`); the session that merges adds its `Claude-Session:` link.
 - **Parallel agents in git worktrees.** A shared `CARGO_TARGET_DIR` across

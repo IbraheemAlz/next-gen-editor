@@ -614,3 +614,25 @@ fn ignorable_unknown_elements_are_not_walked() {
     let saved = document_xml_of(&write_docx(&archive, &edited).expect("write"));
     assert_eq!(saved, xml.replacen(">shown<", ">shownX<", 1));
 }
+
+/// Issue #422 — `<w:start w:val="2147483647"/>` on a letter level: the
+/// counter saturates instead of overflowing on the next item, and every
+/// marker stays short (the repeated-letter form used to spell 82 MB).
+#[test]
+fn a_hostile_numbering_start_keeps_markers_bounded() {
+    let numbering = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="2147483647"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+    let item = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p>"#;
+    let xml = document(&item.repeat(3), SECT);
+    let docx = package_with_document_xml(&xml, &[("word/numbering.xml", numbering.as_bytes())]);
+    let a = read_docx(&docx).expect("read");
+    let markers: Vec<_> = a
+        .document
+        .blocks
+        .iter()
+        .filter_map(|b| b.as_paragraph()?.resolved_marker.clone())
+        .collect();
+    for m in &markers {
+        assert!(m.len() <= 16, "marker of {} bytes", m.len());
+    }
+}

@@ -26747,6 +26747,87 @@ mod snapshot_tests {
         assert_eq!(s.undo_cursor, 0);
     }
 
+    /// Issue #422 — `engine()`'s snapshot with the current document's
+    /// `blocks` header (an `im::Vector`, whose serde visitor preallocates
+    /// the declared count uncapped) rewritten to claim 4 G entries.
+    fn snapshot_with_a_lying_block_count() -> Vec<u8> {
+        let bytes = engine().snapshot_bytes().unwrap();
+        // `a6 "blocks"` then a fixarray / array16 / array32 header.
+        let key = b"\xa6blocks";
+        let at = bytes
+            .windows(key.len())
+            .position(|w| w == key)
+            .expect("the snapshot names a blocks field")
+            + key.len();
+        let header_len = match bytes[at] {
+            0x90..=0x9f => 1,
+            0xdc => 3,
+            0xdd => 5,
+            other => panic!("blocks is not an array header: {other:#x}"),
+        };
+        let mut lying = bytes[..at].to_vec();
+        lying.push(0xdd);
+        lying.extend_from_slice(&u32::MAX.to_be_bytes());
+        lying.extend_from_slice(&bytes[at + header_len..]);
+        lying
+    }
+
+    /// Issue #422 — one flipped length in a persisted snapshot must be
+    /// refused with a typed error before anything is allocated (a wasm
+    /// worker would abort on the `4 G × size_of::<Block>()` reservation),
+    /// and the refused restore leaves the engine untouched.
+    #[test]
+    fn restore_refuses_a_lying_block_count_before_allocating() {
+        let lying = snapshot_with_a_lying_block_count();
+        let mut b = engine();
+        let doc_before = engine::snapshot::encode(b.undo.current()).unwrap();
+        let depth_before = b.undo.depth();
+        let err = b.restore_from_bytes(&lying).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SnapshotError::DeclaredLength {
+                    declared: 4_294_967_295,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            engine::snapshot::encode(b.undo.current()).unwrap(),
+            doc_before
+        );
+        assert_eq!(b.undo.depth(), depth_before);
+    }
+
+    /// Issue #422 — the same envelope through the production entry:
+    /// `Command::Recover` reports the unreadable base and replays the tail
+    /// onto a fresh document — `Recovered`, never a trap.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn recover_survives_a_lying_block_count() {
+        let mut b = engine();
+        let evt = b.apply_sync(Command::Recover {
+            snapshot: snapshot_with_a_lying_block_count(),
+            log_tail: vec![Command::InsertText {
+                text: "tail".into(),
+                at: None,
+            }],
+            renderer_downgrade: None,
+            package: None,
+        });
+        assert!(
+            matches!(
+                evt,
+                Event::Recovered {
+                    snapshot_restored: false,
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
+    }
+
     #[test]
     fn restore_clamps_a_hostile_selection_into_the_document() {
         let hostile = EngineSnapshotV1 {

@@ -46,9 +46,7 @@ pub const FUZZ_PACKAGE_LIMITS: format_docx::PackageLimits = format_docx::Package
 
 /// Issue #348 — `data` read directly as a `.docx` package under
 /// [`FUZZ_PACKAGE_LIMITS`].
-pub fn read_raw_package(
-    data: &[u8],
-) -> Result<format_docx::DocxArchive, format_docx::DocxError> {
+pub fn read_raw_package(data: &[u8]) -> Result<format_docx::DocxArchive, format_docx::DocxError> {
     format_docx::read_docx_with_limits(
         data,
         engine::DefaultPageSize::A4,
@@ -110,13 +108,28 @@ pub fn run_rpc_command(data: &[u8]) {
     let seed_text = command_gen::gen_seed_text(&mut u);
     let mut engine = engine_wasm::Engine::new_headless(engine::DocumentTree::from_text(&seed_text));
     let commands = command_gen::gen_command_sequence(&mut u, MAX_COMMAND_SEQUENCE);
-    for cmd in commands {
+    let trace = trace_enabled();
+    for (step, cmd) in commands.into_iter().enumerate() {
+        if trace {
+            eprintln!(
+                "[rpc_command] step {step}: {}",
+                format!("{cmd:?}").chars().take(300).collect::<String>()
+            );
+        }
         /* Kept only for the failure message: the variant name (not the
         payload, which would defeat the smoke driver's per-message
         dedup) tells triage WHICH command broke an invariant. Formatted
         lazily — `assert!`'s message arguments run only on failure. */
         let keep = cmd.clone();
-        let _evt = engine.apply_sync(cmd);
+        let started = trace.then(std::time::Instant::now);
+        let evt = engine.apply_sync(cmd);
+        if let Some(t) = started {
+            eprintln!(
+                "[rpc_command]   -> {} in {} ms",
+                format!("{evt:?}").chars().take(80).collect::<String>(),
+                t.elapsed().as_millis()
+            );
+        }
         assert!(
             engine.undo_depth() <= 100,
             "undo depth exceeded its 100-snapshot bound after {}",
@@ -138,6 +151,14 @@ pub fn run_rpc_command(data: &[u8]) {
     if engine.ensure_layout_for_fuzzing().is_ok() {
         let _ = engine.rasterize_last_layout_for_fuzzing();
     }
+}
+
+/// Issue #422 — `ENGINE_FUZZ_TRACE=1` prints every generated command
+/// before it runs (`run_rpc_command`), so a slow or memory-hungry input
+/// found by `examples/smoke.rs --log-inputs` can be pinned to one command.
+fn trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("ENGINE_FUZZ_TRACE").is_some_and(|v| v != "0"))
 }
 
 /// The `Command` variant's name (`InsertTable`, `SetSelection`, …) — the
@@ -312,6 +333,13 @@ mod tests {
         run_format_pdf_image_decode(&[]);
     }
 
+    /// Issue #422 — the committed reproducer scenario runs to completion
+    /// (one solid stroke per patterned underline, not millions of fills).
+    #[test]
+    fn the_422_reproducer_seed_completes() {
+        run_rpc_command(&command_gen::Scenario::PatternedUnderlineGiantImage.seed_bytes());
+    }
+
     /// Issue #348 — the committed hostile `docx_reader` seeds are exactly
     /// what [`hostile_docx_seeds`] builds (re-run `examples/regen-seeds`
     /// after changing a builder), and each reaches its expected outcome
@@ -322,7 +350,10 @@ mod tests {
         for (name, bytes, expect) in hostile_docx_seeds() {
             let committed = std::fs::read(dir.join(name))
                 .unwrap_or_else(|e| panic!("{name}: {e} — run examples/regen-seeds"));
-            assert!(committed == bytes, "{name} is stale — run examples/regen-seeds");
+            assert!(
+                committed == bytes,
+                "{name} is stale — run examples/regen-seeds"
+            );
             run_docx_reader(&bytes);
             let got = read_raw_package(&bytes);
             match expect {
@@ -344,11 +375,7 @@ mod tests {
 /// name, package bytes, the limit [`read_raw_package`] must refuse it with
 /// — `None` when it must read)`. Built by `format_docx::test_fixtures`, so
 /// no blob is hand-maintained; `examples/regen-seeds` writes them.
-pub fn hostile_docx_seeds() -> Vec<(
-    &'static str,
-    Vec<u8>,
-    Option<format_docx::PackageLimit>,
-)> {
+pub fn hostile_docx_seeds() -> Vec<(&'static str, Vec<u8>, Option<format_docx::PackageLimit>)> {
     use format_docx::PackageLimit;
     use format_docx::test_fixtures as fx;
     vec![

@@ -14,6 +14,11 @@ set -eo pipefail   # pipefail is load-bearing: every gate pipes into `tail`,
 
 export PATH="/home/linuxbrew/.linuxbrew/bin:$HOME/.cargo/bin:$PATH"
 
+# Issue #422 — heavy local runs go through a memory-capped scope: one
+# uncapped fuzz-smoke input once reached 46.5 GB and the OOM killer took the
+# whole terminal scope (session, agents, Chrome) with it. Inherits env + cwd.
+CAP="systemd-run --user --scope -p MemoryMax=16G --quiet --"
+
 echo "=== 1. fmt ==="
 cargo fmt --all -- --check
 
@@ -21,11 +26,17 @@ echo "=== 2. clippy ==="
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "=== 3. native tests ==="
-cargo test --workspace --lib
+$CAP cargo test --workspace --lib
 
 echo "=== 3b. native tests behind fuzz-native (issue #321) ==="
 # Off by default => `--workspace` above collects 0 of these.
-cargo test -p engine-wasm --features fuzz-native 2>&1 | tail -5
+$CAP cargo test -p engine-wasm --features fuzz-native 2>&1 | tail -5
+
+echo "=== 3c. fuzz crate + smoke sweep (D5.5, issue #422) ==="
+$CAP cargo test --manifest-path fuzz/Cargo.toml 2>&1 | tail -5
+# The driver self-limits too (RLIMIT_AS 8 GiB, 2 GiB live-heap ceiling, 300 s
+# per-input timeout) and prints `smoke: peak RSS …` — keep it well under 4 GB.
+$CAP cargo run --manifest-path fuzz/Cargo.toml --example smoke --release 2>&1 | tail -6
 
 echo "=== 4. wasm build ==="
 wasm-pack build --target web --release crates/engine-wasm 2>&1 | tail -5
@@ -57,7 +68,7 @@ echo "=== 7. shape-regression ==="
 cargo run -p shape-regression --release 2>&1 | tail -10
 
 echo "=== 8. roundtrip ==="
-cargo run -p roundtrip --release 2>&1 | tail -5
+$CAP cargo run -p roundtrip --release 2>&1 | tail -5
 
 echo "=== 9. visual diffs ==="
 # Vite must already be running on :5173 for this step.

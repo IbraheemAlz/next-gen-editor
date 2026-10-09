@@ -60,6 +60,12 @@ layout = { path = "../crates/layout" }
 render = { path = "../crates/render" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Issue #422 — `examples/smoke.rs` caps its own address space
+# (`setrlimit(RLIMIT_AS)`) so a runaway input aborts the driver, not the
+# machine. Already in the lock file transitively; no new crate.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "docx_reader"
 path = "fuzz_targets/docx_reader.rs"
