@@ -1400,7 +1400,7 @@ mod tests {
         assert!(
             matches!(
                 events.last(),
-                Some(Event::Error { message }) if message.contains("MergeCells")
+                Some(Event::Error { message, .. }) if message.contains("MergeCells")
             ),
             "MergeCells past the table's shape must return a typed Error \
              naming the command, not panic: {:?}",

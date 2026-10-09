@@ -78,7 +78,23 @@ impl DrawingScan {
 /// `<w:pict>`, `<w:object>`) for the facts the typed model carries. Never
 /// fails: an unparseable fragment scans as "no picture, no size" and is
 /// preserved opaquely.
+///
+/// Issue #351 — an `<mc:AlternateContent>` scans only the branch a
+/// consumer selects (`schema::mce::select_branch`: the first choice whose
+/// `Requires` the reader understands, else the fallback). The decision is
+/// made from the fragment's own bytes, so the writer's verified re-scan of
+/// the same bytes agrees with the reader.
 pub fn scan_drawing(fragment: &[u8]) -> DrawingScan {
+    if fragment.starts_with(b"<mc:AlternateContent") {
+        return super::mce::selected_content(fragment)
+            .map(scan_element)
+            .unwrap_or_default();
+    }
+    scan_element(fragment)
+}
+
+/// [`scan_drawing`] of one element (never an `AlternateContent`).
+fn scan_element(fragment: &[u8]) -> DrawingScan {
     let mut out = DrawingScan::default();
     let mut reader = Reader::from_reader(fragment);
     reader.config_mut().trim_text(false);

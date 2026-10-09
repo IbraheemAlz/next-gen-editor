@@ -172,6 +172,7 @@ fn open(e: &mut Engine, bytes: &[u8], format: DocFormat, name: &str) -> Event {
             format,
             name: Some(name.into()),
             defaults: None,
+            limits: None,
         },
     )
 }
@@ -281,6 +282,7 @@ fn open_html_keeps_tables_and_directions() {
                 page_size: Some(WirePageSize::Letter),
                 widow_control: None,
             }),
+            limits: None,
         },
     );
     assert!(matches!(loaded, Event::DocumentLoaded { .. }), "{loaded:?}");
@@ -318,9 +320,52 @@ fn open_html_keeps_tables_and_directions() {
 fn open_pdf_is_an_honest_error() {
     let mut e = engine_with(DocumentTree::from_text("keep me"));
     let evt = open(&mut e, b"%PDF-1.7", DocFormat::Pdf, "x.pdf");
-    let Event::Error { message } = evt else {
+    let Event::Error { message, .. } = evt else {
         panic!("PDF import answers Error, got {evt:?}");
     };
     assert!(message.contains("export format"), "{message}");
     assert_eq!(e.undo.current().to_plain_text(), "keep me");
+}
+
+/// Issues #339 / #348 — the host's `OpenDocument.limits` bound a `.txt` /
+/// `.html` file like one package part: an oversized file is refused before
+/// decoding, typed `PackageTooLarge`, and the open document is untouched.
+#[test]
+fn open_text_honours_the_host_package_limits() {
+    let mut e = engine_with(DocumentTree::from_text("keep me"));
+    for format in [DocFormat::PlainText, DocFormat::Html] {
+        let evt = apply(
+            &mut e,
+            Command::OpenDocument {
+                bytes: b"0123456789".to_vec(),
+                format,
+                name: Some("big".into()),
+                defaults: None,
+                limits: Some(bridge::PackageLimitsOverride {
+                    max_part_bytes: Some(4),
+                    ..Default::default()
+                }),
+            },
+        );
+        let Event::Error { message, kind } = evt else {
+            panic!("an oversized file answers Error, got {evt:?}");
+        };
+        assert_eq!(kind, Some(bridge::ErrorKind::PackageTooLarge), "{message}");
+        assert_eq!(e.undo.current().to_plain_text(), "keep me");
+    }
+    /* Under the bound it opens. */
+    let evt = apply(
+        &mut e,
+        Command::OpenDocument {
+            bytes: b"0123".to_vec(),
+            format: DocFormat::PlainText,
+            name: None,
+            defaults: None,
+            limits: Some(bridge::PackageLimitsOverride {
+                max_part_bytes: Some(4),
+                ..Default::default()
+            }),
+        },
+    );
+    assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
 }

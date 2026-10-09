@@ -38,6 +38,29 @@ paths:
   `DocxWarning::TableNestingTooDeep` on `DocxArchive::warnings`. Never add
   an unbounded recursion over attacker-shaped input (POI ships a 5000-deep
   17 KB file).
+- **Package limits (issue #348).** Every ZIP entry is read through
+  `opc::limits::read_entry_bounded` (`take(limit + 1)`) — never
+  `Vec::with_capacity(file.size())`: the central directory's declared size
+  is attacker-controlled (a 4 GiB claim trapped the wasm worker).
+  `PackageLimits` (64 MiB part / 128 MiB package / 10k entries / XML depth
+  256 / 4M elements per part; `read_docx_with_limits`, overridable from
+  `Command::OpenDocument.limits`) is checked before any typed walk — the
+  XML shape caps run over every part the reader may walk (every `.xml` /
+  `.rels` entry but custom XML data and `docProps/*` other than
+  `core.xml` — the #353 main part can live anywhere), and depth inside a
+  table nested past the #111 cap is not counted (it is opaque bytes). Overflow is
+  `DocxError::PackageTooLarge` → `Event::Error { kind: PackageTooLarge }`
+  (the shell's File-menu banner), never a trap.
+- **Measures (issue #349).** Page geometry, `<w:ind>`, `<w:spacing>` and
+  table widths go through `schema::measure` (`attr_measure*`): integer or
+  decimal twips, ECMA universal-measure units (`in` / `cm` / `mm` / `pt` /
+  `pc` / `pi`), never `NaN` / infinite (unusable → the default +
+  `DocxWarning::InvalidMeasure`), clamped to ±31 680 twips (Word's 22 in;
+  pages ≥ 144) with `DocxWarning::MeasureClamped`. Never parse a measure
+  with `f32::from_str` (it accepts `NaN`). Deep helpers report through
+  `error::warn` into the read's sink (`collect_read_warnings`; a no-op in
+  the writer's re-parses). Verified-reuse equality never uses float `==`:
+  `writer::same_section_props` compares geometry by bits.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:
@@ -150,6 +173,24 @@ the writer replays:
   object with no picture (shape, chart, OLE) has no regeneration and is
   ALWAYS written from its bytes — never dropped. Text boxes are stories
   (`InlineKind::TextBox`, issue #83) and splice through `parts::textbox`.
+- **Markup compatibility (issue #351).** `mc:AlternateContent` reads ONE
+  branch at every level — the first `mc:Choice` whose `Requires` prefixes
+  the reader understands (`schema::mce`: by URI when declared on the AC /
+  choice, else by conventional name — `wps`, `wpg`, `wpc`, `w14`, `w15`,
+  `w16*`, `wp14`, `a14`, VML, …), else the `mc:Fallback` — and keeps the
+  others as bytes: run level, `scan_drawing` / the text-box lowering scan
+  the selected branch of the whole-element capture (the writer's verified
+  re-scan decides identically from the same bytes); paragraph level, the
+  wrapper is an opener / closer marker pair (`MarkupCapture::
+  wrapper_start` — the run-level `<w:sdt>` mechanism, #245); block level
+  and between cells / rows, an envelope (`BlockEnvelopes`, like a
+  block-level `<w:sdt>`). Inside a cell paragraph the table walker skips
+  drawings / AC / text-box stories whole (`parse_cell_paragraph` owns
+  them), so a box's own `<w:p>` is never a cell block. An element whose
+  prefix the root's `mc:Ignorable` lists and whose namespace the reader
+  does not understand (`NamespaceScope::ignores_element`) is never walked
+  for content — kept verbatim between blocks / between runs; re-rooted
+  parses (cells, text-box stories) re-declare `mc:Ignorable`.
 - Known exception: a part with two `<w:body>` elements (POI's
   `MultipleBodyBug.docx`) gets the synthesized header.
 
@@ -325,6 +366,20 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   equals `FieldSource::instruction` and outside a `<w:del>`; a
   `<w:fldSimple>` only while its element nests with every regenerated
   wrapper (`simple_field_nests`), else the complex form.
+- **Field phases (issue #350).** Text (`<w:t>`, `<w:delText>`, tabs,
+  breaks) never enters the visible paragraph while any open field is in
+  its instruction part (`field_code_hidden`) — a nested field's RESULT
+  there is code too: `IF { MERGEFIELD x } = …` shows only the IF's
+  result, the inner field gets no overlay and joins the outer
+  `Field::instruction` as `{ MERGEFIELD x }` (Word's code-view spelling);
+  its bytes ride the outer field's source prologue. Nesting is capped at
+  32 (`FieldCap`; deeper fields are hidden code), a `separate` / `end`
+  with no open field is ignored (its run kept verbatim), and a field
+  still in its instruction part at `</w:p>` is closed there
+  (`close_open_field_code`) — a stray `begin` can no longer hide every
+  later paragraph — with the broken code kept as one content marker
+  (`MarkupCapture::close_field_spans`). Result-part fields still span
+  paragraphs (TOC). Each case is a `DocxWarning`.
 - Offsets are remapped by `delete_text`, `split_at`, `concat` and — for
   every in-place text change — `Paragraph::splice_text` (`engine::
   text_remap`, issues #250 / #252), which returns the `TextEdit` the

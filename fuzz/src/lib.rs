@@ -21,11 +21,40 @@ use arbitrary::Unstructured;
 /// `format_docx::read_docx`. The reader must never panic; returning `Err`
 /// on a deliberately-hostile package is the correct, expected outcome.
 pub fn run_docx_reader(data: &[u8]) {
+    /* Issue #348 — an input that IS a ZIP package (the committed `.docx`
+    seeds, a hostile package from `corpus/docx_reader/hostile_*`, a mutation
+    of either) is also read as-is, under tight limits so a compression
+    bomb seed reaches the typed refusal in milliseconds. */
+    if data.starts_with(b"PK\x03\x04") {
+        let _ = read_raw_package(data);
+    }
     let mut u = Unstructured::new(data);
     let Some(bytes) = docx_gen::build_docx(&mut u) else {
         return;
     };
     let _ = format_docx::read_docx(&bytes);
+}
+
+/// Issue #348 — the resource bounds the fuzz targets read raw packages
+/// under: the stock XML shape caps, byte budgets small enough that a bomb
+/// is refused without inflating megabytes per iteration.
+pub const FUZZ_PACKAGE_LIMITS: format_docx::PackageLimits = format_docx::PackageLimits {
+    max_part_bytes: 4 * 1024 * 1024,
+    max_total_bytes: 8 * 1024 * 1024,
+    ..format_docx::PackageLimits::DEFAULT
+};
+
+/// Issue #348 — `data` read directly as a `.docx` package under
+/// [`FUZZ_PACKAGE_LIMITS`].
+pub fn read_raw_package(
+    data: &[u8],
+) -> Result<format_docx::DocxArchive, format_docx::DocxError> {
+    format_docx::read_docx_with_limits(
+        data,
+        engine::DefaultPageSize::A4,
+        true,
+        &FUZZ_PACKAGE_LIMITS,
+    )
 }
 
 /// `docx_roundtrip` (D5.5, new target) — read -> write -> read must be
@@ -282,4 +311,71 @@ mod tests {
         run_layout_paginate(&[]);
         run_format_pdf_image_decode(&[]);
     }
+
+    /// Issue #348 — the committed hostile `docx_reader` seeds are exactly
+    /// what [`hostile_docx_seeds`] builds (re-run `examples/regen-seeds`
+    /// after changing a builder), and each reaches its expected outcome
+    /// through the raw-package path without a panic.
+    #[test]
+    fn hostile_docx_seeds_are_committed_and_typed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_reader");
+        for (name, bytes, expect) in hostile_docx_seeds() {
+            let committed = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("{name}: {e} — run examples/regen-seeds"));
+            assert!(committed == bytes, "{name} is stale — run examples/regen-seeds");
+            run_docx_reader(&bytes);
+            let got = read_raw_package(&bytes);
+            match expect {
+                Some(limit) => assert!(
+                    matches!(
+                        &got,
+                        Err(format_docx::DocxError::PackageTooLarge { limit: l, .. }) if *l == limit
+                    ),
+                    "{name}: {:?}",
+                    got.as_ref().map(|_| "read")
+                ),
+                None => assert!(got.is_ok(), "{name}: {:?}", got.err()),
+            }
+        }
+    }
+}
+
+/// Issue #348 — the hostile `.docx` seeds of `corpus/docx_reader/`: `(file
+/// name, package bytes, the limit [`read_raw_package`] must refuse it with
+/// — `None` when it must read)`. Built by `format_docx::test_fixtures`, so
+/// no blob is hand-maintained; `examples/regen-seeds` writes them.
+pub fn hostile_docx_seeds() -> Vec<(
+    &'static str,
+    Vec<u8>,
+    Option<format_docx::PackageLimit>,
+)> {
+    use format_docx::PackageLimit;
+    use format_docx::test_fixtures as fx;
+    vec![
+        (
+            "hostile_declared_4gib_part.docx",
+            fx::lying_size_docx(4 * 1024 * 1024 * 1024),
+            None,
+        ),
+        (
+            "hostile_declared_u64_max_part.docx",
+            fx::lying_size_docx(u64::MAX - 1),
+            None,
+        ),
+        (
+            "hostile_bomb_16mib_zeros.docx",
+            fx::compressible_bomb_docx(16 * 1024 * 1024),
+            Some(PackageLimit::PartBytes),
+        ),
+        (
+            "hostile_sdt_5000_nested.docx",
+            fx::nested_sdt_docx(5000),
+            Some(PackageLimit::XmlDepth),
+        ),
+        (
+            "table_nested_60_deep.docx",
+            fx::nested_tables_docx(60),
+            None,
+        ),
+    ]
 }

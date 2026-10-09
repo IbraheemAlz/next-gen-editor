@@ -21,6 +21,17 @@ pub enum DocxError {
     /// well-formed document (unclosed elements at EOF, no root element).
     #[error("malformed XML: {0}")]
     MalformedXml(String),
+    /// Issue #348 — the package exceeded one of the reader's
+    /// [`crate::PackageLimits`] (a part or the whole package inflating past
+    /// its byte budget, too many entries, an XML part nested too deep or
+    /// holding too many elements). The open is refused before anything is
+    /// allocated from the attacker-controlled sizes.
+    #[error("package too large: {limit} exceeds the reader's limit of {max}{}", part.as_deref().map(|p| format!(" (in `{p}`)")).unwrap_or_default())]
+    PackageTooLarge {
+        limit: crate::opc::limits::PackageLimit,
+        max: u64,
+        part: Option<String>,
+    },
     /// Issue #353 — a relationship target (or archive path) resolves
     /// outside the package (`../../x`) or carries a NUL: refused instead
     /// of being clamped into some other part's name.
@@ -39,6 +50,29 @@ pub enum DocxWarning {
     /// `deep-table-cell.docx` nests 5000 tables; unbounded recursion
     /// overflowed the stack.
     TableNestingTooDeep { limit: u32 },
+    /// Issue #349 — a measure attribute (`attr`, e.g. `w:pgSz/@w:w`) held
+    /// an unusable `value` (not a number, `NaN`, infinite, a unit its type
+    /// does not allow, negative where only non-negative values are legal):
+    /// it was ignored and the default applies. The source bytes are kept.
+    InvalidMeasure { attr: String, value: String },
+    /// Issue #349 — a measure attribute held a finite `value` outside its
+    /// spec range; the model uses it clamped to `twips`. The source bytes
+    /// are kept.
+    MeasureClamped {
+        attr: String,
+        value: String,
+        twips: i64,
+    },
+    /// Issue #350 — complex fields still open in their instruction part
+    /// when their paragraph ended (`count` of them): closed there, so their
+    /// hidden instruction never swallows the following paragraphs.
+    UnclosedField { count: u32 },
+    /// Issue #350 — a `separate` / `end` field character with no open
+    /// field (`kind` is the `w:fldCharType`): ignored.
+    StrayFieldChar { kind: String },
+    /// Issue #350 — complex fields nested deeper than `limit`: the extra
+    /// levels are not modeled (their text stays hidden code).
+    FieldNestingTooDeep { limit: u32 },
     /// Issue #325 — the main part binds WordprocessingML under a prefix
     /// (or as the default namespace) the literal-qname reader does not
     /// match. `normalized` = the part was re-prefixed into the canonical
@@ -55,6 +89,56 @@ pub enum DocxWarning {
     /// Issue #353 — a relationship target of a sibling part escapes the
     /// package; it was ignored (the fixed sibling name applies).
     UnsafeRelationshipTarget { target: String },
+}
+
+/// Most reader warnings one read collects; later ones are dropped (a
+/// hostile part can repeat the same bad value a million times).
+const MAX_READ_WARNINGS: usize = 1000;
+
+thread_local! {
+    /// Issues #349 / #350 — the warnings sink of the read in progress
+    /// ([`collect_read_warnings`]); `None` outside a read, where [`warn`]
+    /// is a no-op (the writer re-parses source bytes for its verified
+    /// passthroughs and must not report anything).
+    static READ_WARNINGS: std::cell::RefCell<Option<Vec<DocxWarning>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Report a non-fatal reader diagnostic to the read in progress. Deep
+/// helpers (`schema::measure`, the field machinery) have no warnings
+/// vector in hand; this is their channel.
+pub(crate) fn warn(w: DocxWarning) {
+    READ_WARNINGS.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut()
+            && v.len() < MAX_READ_WARNINGS
+        {
+            v.push(w);
+        }
+    });
+}
+
+/// Run `f` with a fresh warnings sink; whatever [`warn`] collected is
+/// appended to `out` afterwards (nested scopes each flush into their own
+/// `out`). The previous sink is restored even if `f` panics.
+pub(crate) fn collect_read_warnings<T>(
+    out: &mut Vec<DocxWarning>,
+    f: impl FnOnce(&mut Vec<DocxWarning>) -> T,
+) -> T {
+    struct Restore(Option<Option<Vec<DocxWarning>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(prev) = self.0.take() {
+                READ_WARNINGS.with(|c| *c.borrow_mut() = prev);
+            }
+        }
+    }
+    let prev = READ_WARNINGS.with(|c| c.borrow_mut().replace(Vec::new()));
+    let mut guard = Restore(Some(prev));
+    let r = f(out);
+    let prev = guard.0.take().unwrap_or_default();
+    let collected = READ_WARNINGS.with(|c| std::mem::replace(&mut *c.borrow_mut(), prev));
+    out.extend(collected.unwrap_or_default());
+    r
 }
 
 /// Issues #244 / #245 — non-fatal writer diagnostics: a best-effort

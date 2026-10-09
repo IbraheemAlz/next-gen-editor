@@ -38,6 +38,10 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Default)]
 pub struct NamespaceScope {
     decls: Vec<(String, String)>,
+    /// Issue #351 — the prefixes the root's `mc:Ignorable` lists (ECMA-376
+    /// Part 3 §10.1.1): an element in one of them that the reader does not
+    /// understand is ignored — kept as bytes, never walked for content.
+    ignorable: Vec<String>,
     /// Issue #325 — the root's default namespace (`xmlns="…"`), if any.
     default_ns: Option<String>,
 }
@@ -48,6 +52,7 @@ impl NamespaceScope {
     /// verbatim into an attribute position.
     pub fn from_root(root: &BytesStart) -> Self {
         let mut decls = Vec::new();
+        let mut ignorable_raw: Vec<(String, String)> = Vec::new();
         let mut default_ns = None;
         for a in root.attributes().flatten() {
             if let Some(prefix) = a.key.as_ref().strip_prefix(b"xmlns:") {
@@ -57,9 +62,57 @@ impl NamespaceScope {
                 ));
             } else if a.key.as_ref() == b"xmlns" {
                 default_ns = Some(String::from_utf8_lossy(&a.value).into_owned());
+            } else if let Some(prefix) = a.key.as_ref().strip_suffix(b":Ignorable") {
+                ignorable_raw.push((
+                    String::from_utf8_lossy(prefix).into_owned(),
+                    String::from_utf8_lossy(&a.value).into_owned(),
+                ));
             }
         }
-        Self { decls, default_ns }
+        /* Issue #351 — only the Markup Compatibility namespace's
+        `Ignorable` counts. */
+        let is_mc = |prefix: &str| {
+            decls
+                .iter()
+                .any(|(p, u)| p == prefix && u == crate::schema::mce::NS_MC)
+        };
+        let ignorable = ignorable_raw
+            .iter()
+            .filter(|(prefix, _)| is_mc(prefix))
+            .flat_map(|(_, value)| value.split_ascii_whitespace().map(str::to_owned))
+            .collect();
+        Self {
+            decls,
+            ignorable,
+            default_ns,
+        }
+    }
+
+    /// Issue #351 — `true` for an element `qname` the root's
+    /// `mc:Ignorable` says to ignore: its prefix is listed there and its
+    /// namespace is not one the reader understands.
+    pub fn ignores_element(&self, qname: &[u8]) -> bool {
+        let Some(prefix) = crate::schema::mce::prefix_of(qname) else {
+            return false;
+        };
+        self.ignorable.iter().any(|p| p == prefix)
+            && !self
+                .uri(prefix)
+                .is_some_and(crate::schema::mce::understands_uri)
+    }
+
+    /// Issue #351 — the root's `mc:Ignorable` attribute as `(qualified
+    /// name, value)`, for a synthesized wrapper root (cell paragraphs,
+    /// text-box stories) to re-declare.
+    pub fn ignorable_attr(&self) -> Option<(String, String)> {
+        if self.ignorable.is_empty() {
+            return None;
+        }
+        let (prefix, _) = self
+            .decls
+            .iter()
+            .find(|(_, u)| u == crate::schema::mce::NS_MC)?;
+        Some((format!("{prefix}:Ignorable"), self.ignorable.join(" ")))
     }
 
     /// Issue #325 — validate the root's bindings against the fast path

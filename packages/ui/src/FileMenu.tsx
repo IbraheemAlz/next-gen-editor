@@ -124,7 +124,14 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                     triggerDownload(evt.bytes, 'application/pdf', `${stem()}.pdf`);
                     break;
                 case 'ERROR':
-                    setError(evt.message);
+                    /* Issue #348 — a refused open (the package exceeded
+                       the reader's resource limits) says so plainly; the
+                       previous document stays open. */
+                    setError(
+                        evt.kind === 'PackageTooLarge'
+                            ? `This document is too large or too deeply nested to open safely. ${evt.message}`
+                            : evt.message,
+                    );
                     setPendingExportFormat(null);
                     setTimeout(() => setError(null), 6000);
                     break;

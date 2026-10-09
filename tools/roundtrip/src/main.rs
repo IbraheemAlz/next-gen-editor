@@ -33,6 +33,7 @@ mod inline_spans;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod reader_hardening;
 mod revision_ids;
 mod revisions;
 mod table_markup;
@@ -344,6 +345,8 @@ fn run_default() -> Result<()> {
     revision_ids::run_revision_ids_roundtrip()?;
     paragraph_format::run_paragraph_format_roundtrip()?;
     package_families::run_package_families_roundtrip()?;
+    reader_hardening::run_field_phases_roundtrip()?;
+    reader_hardening::run_alternate_content_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
