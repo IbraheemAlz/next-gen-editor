@@ -12,9 +12,9 @@
 
 use crate::text_remap::TextEdit;
 use crate::{
-    Block, BlockPath, DocumentTree, Hyperlink, Paragraph, PathStep, Revision, RevisionKind,
-    SpanStyle, StyleRun, delete_block_at_path, mutate_paragraph_in_top, parent_container_snapshot,
-    replace_block_in_top, shift_paragraph_offsets_after,
+    Block, BlockPath, DocumentTree, Paragraph, PathStep, RevisionKind, SpanStyle, StyleRun,
+    delete_block_at_path, mutate_paragraph_in_top, parent_container_snapshot, replace_block_in_top,
+    shift_paragraph_offsets_after,
 };
 
 impl DocumentTree {
@@ -205,43 +205,12 @@ fn vanishes_whole(p: &Paragraph) -> bool {
 }
 
 /// `head` + `tail` for a resolved paragraph-mark revision: the head's
-/// mark is gone. [`Paragraph::concat`] plus what it does not carry: both
-/// sides' hyperlinks and revisions (shifted), the head's paragraph style —
-/// or, when the head's text was removed whole, the tail's paragraph
-/// properties (the surviving paragraph is the tail's).
+/// mark is gone. Issue #292 — exactly [`Paragraph::concat`] now: it
+/// carries both sides' hyperlinks and revisions (shifted) and the head's
+/// paragraph style — or, when the head's text was removed whole, the
+/// tail's paragraph properties (the surviving paragraph is the tail's).
 fn merge_pair(head: &Paragraph, tail: &Paragraph) -> Paragraph {
-    let shift = head.text.len() as u32;
-    let mut m = head.concat(tail);
-    m.hyperlinks = head.hyperlinks.clone();
-    m.hyperlinks
-        .extend(tail.hyperlinks.iter().map(|h| Hyperlink {
-            start: h.start + shift,
-            end: h.end + shift,
-            ..h.clone()
-        }));
-    m.revisions = head.revisions.clone();
-    m.revisions.extend(tail.revisions.iter().map(|r| Revision {
-        start: r.start + shift,
-        end: r.end + shift,
-        ..r.clone()
-    }));
-    if head.text.is_empty() {
-        m.props = tail.props.clone();
-        m.style_id = tail.style_id.clone();
-        m.direct_overrides = tail.direct_overrides.clone();
-        m.list_item = tail.list_item;
-        m.resolved_marker = tail.resolved_marker.clone();
-        m.resolved_list_indent = tail.resolved_list_indent;
-        if let Some(mk) = m.source_markup.as_deref_mut() {
-            let t = tail.source_markup.as_deref();
-            mk.attrs = t.map(|t| t.attrs.clone()).unwrap_or_default();
-            mk.ppr = t.and_then(|t| t.ppr.clone());
-        }
-    } else {
-        m.style_id = head.style_id.clone();
-        m.direct_overrides = head.direct_overrides.clone();
-    }
-    m
+    head.concat(tail)
 }
 
 /// Resolve every text revision of `para` (see

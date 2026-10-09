@@ -10264,3 +10264,9 @@ mod inline_span_tests;
 #[cfg(test)]
 #[path = "writer_table_markup_tests.rs"]
 mod table_markup_tests;
+
+/// Issues #292 / #293 / #297 — paragraph formatting through edits and
+/// saves (merges, the paragraph mark's run properties, style names).
+#[cfg(test)]
+#[path = "writer_paragraph_format_tests.rs"]
+mod paragraph_format_tests;

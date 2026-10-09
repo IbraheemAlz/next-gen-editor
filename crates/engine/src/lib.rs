@@ -62,10 +62,13 @@ mod block_remap;
 pub use block_remap::CellMove;
 pub mod fields;
 #[cfg(test)]
+mod paragraph_merge_tests;
+#[cfg(test)]
 mod revision_tests;
 mod revisions;
 mod text_remap;
 pub use text_remap::TextEdit;
+use text_remap::join_at_seam;
 pub mod html;
 pub mod numbering;
 pub mod package;
@@ -3814,7 +3817,7 @@ impl Paragraph {
                 }
             })
             .collect();
-        Paragraph {
+        let mut out = Paragraph {
             text,
             spans,
             props: self.props.clone(),
@@ -3823,17 +3826,15 @@ impl Paragraph {
             resolved_list_indent: self.resolved_list_indent,
             dirty: true,
             source_xml: None,
-            /* Unlike `apply_style` (issue #56), THIS rebuild changes `text` —
-            every stashed byte offset (hyperlink spans, revision ranges)
-            would dangle across the deleted range. Clearing these overlays
-            is a known, deliberately out-of-scope limitation (offset
-            remapping is a separate, larger task), not an oversight.
-            Inline objects are remapped above (issue #69) — an anchor is a
-            single sentinel byte, so the remap is exact (issue #80: a
-            footnote reference survives editing the words around it). */
+            /* Inline objects are remapped above (issue #69) — an anchor is
+            a single sentinel byte, so the remap is exact (issue #80: a
+            footnote reference survives editing the words around it).
+            Issue #292 — hyperlinks and revisions are remapped below,
+            through the same edit record (they used to be cleared: the
+            old #56 limitation). */
             inline_objects,
-            hyperlinks: Vec::new(),
-            revisions: Vec::new(),
+            hyperlinks: self.hyperlinks.clone(),
+            revisions: self.revisions.clone(),
             fields,
             /* Issue #277 — the paragraph style binding and the direct
             paragraph formatting are not offset-anchored (same class as
@@ -3850,7 +3851,13 @@ impl Paragraph {
             source_markup: markup,
             /* Issue #262 — the paragraph mark is untouched. */
             mark_revision: self.mark_revision.clone(),
-        }
+        };
+        out.remap_range_overlays(TextEdit {
+            at: s,
+            removed: gap,
+            inserted: 0,
+        });
+        out
     }
 
     /// Split into `[0, at)` and `[at, len)`. Spans straddling `at` are split.
@@ -3878,8 +3885,9 @@ impl Paragraph {
         }
         /* Splitting shifts every offset in the right half to be relative to
         `at` — the same "offsets genuinely shift" class as `delete_text`
-        (see its comment). Hyperlink/revision dropping is the same
-        deliberately out-of-scope limitation (issue #56); FIELDS remap
+        (see its comment). Hyperlinks and revisions remap through the
+        edit each half is (issue #292, below): a link or a tracked change
+        straddling the split point continues on both halves. FIELDS remap
         (issue #43): whole-side fields survive, a field straddling the
         split point is dropped (the atom is broken). */
         let mut fields_left = Vec::new();
@@ -3933,7 +3941,7 @@ impl Paragraph {
                 });
             }
         }
-        (
+        let mut halves = (
             Paragraph {
                 text: self.text[..at as usize].to_owned(),
                 spans: left,
@@ -3944,8 +3952,8 @@ impl Paragraph {
                 dirty: true,
                 source_xml: None,
                 inline_objects: objects_left,
-                hyperlinks: Vec::new(),
-                revisions: Vec::new(),
+                hyperlinks: self.hyperlinks.clone(),
+                revisions: self.revisions.clone(),
                 fields: fields_left,
                 /* Issue #277 — both halves keep the paragraph style and
                 the direct paragraph formatting (Word: a mid-paragraph
@@ -3980,8 +3988,8 @@ impl Paragraph {
                 dirty: true,
                 source_xml: None,
                 inline_objects: Vec::new(),
-                hyperlinks: Vec::new(),
-                revisions: Vec::new(),
+                hyperlinks: self.hyperlinks.clone(),
+                revisions: self.revisions.clone(),
                 fields: fields_right,
                 style_id: self.style_id.clone(),
                 direct_overrides: self.direct_overrides.clone(),
@@ -3994,12 +4002,56 @@ impl Paragraph {
                 /* Issue #262 — the original mark ends the right half. */
                 mark_revision: self.mark_revision.clone(),
             },
-        )
+        );
+        /* Issue #292 — each half is the original minus the other one. */
+        let len = self.text.len() as u32;
+        halves.0.remap_range_overlays(TextEdit {
+            at,
+            removed: len - at,
+            inserted: 0,
+        });
+        halves.1.remap_range_overlays(TextEdit {
+            at: 0,
+            removed: at,
+            inserted: 0,
+        });
+        /* A tracked change cut in two keeps its source `w:id` on the left
+        piece only: two wrappers sharing one id would collide on save. */
+        for r in &mut halves.1.revisions {
+            let cut = |o: &Revision| {
+                o.start < at
+                    && o.end > at
+                    && r.start == 0
+                    && r.end == o.end - at
+                    && o.kind == r.kind
+                    && o.id == r.id
+            };
+            if r.id.is_some() && self.revisions.iter().any(cut) {
+                r.id = None;
+            }
+        }
+        halves
     }
 
-    /// Append `other` to a copy of `self`, shifting `other`'s spans right.
-    /// The merged paragraph keeps `self`'s alignment — the surviving
-    /// paragraph mark wins when a paragraph break is deleted.
+    /// Append `other` to a copy of `self`, shifting `other`'s offsets
+    /// right — the paragraph merge behind Backspace at a paragraph start,
+    /// Delete at a paragraph end, a cross-paragraph deletion and the
+    /// edges of a multi-paragraph paste.
+    ///
+    /// Issue #292 — Word semantics for the PARAGRAPH formatting: the
+    /// merged paragraph keeps `self`'s (the head's) paragraph style,
+    /// direct paragraph formatting, resolved properties (alignment,
+    /// direction, …) and list binding, and the source paragraph identity
+    /// (`w14:paraId`, rsids and the recorded `<w:pPr>`, issue #199: the
+    /// left ids win). One exception, as in Word: an EMPTY head merges
+    /// away without imposing anything — the result is the tail's
+    /// paragraph (Backspace at the start of a heading that follows an
+    /// empty paragraph leaves the heading a heading). Both sides'
+    /// hyperlinks, revisions, fields and inline objects survive, the
+    /// tail's shifted through one [`TextEdit`] (`remap_range_overlays`).
+    ///
+    /// The paragraph MARK is the tail's: `section_end` and `mark_revision`
+    /// travel with it (the head's mark is the one deleted).
     pub fn concat(&self, other: &Paragraph) -> Paragraph {
         let shift = self.text.len() as u32;
         let mut text = self.text.clone();
@@ -4012,13 +4064,8 @@ impl Paragraph {
                 style: run.style.clone(),
             });
         }
-        /* Concatenation shifts `other`'s offsets right by `self`'s length —
-        the same "offsets genuinely shift" class as `delete_text` (see its
-        comment). Hyperlink/revision dropping is the same deliberately
-        out-of-scope limitation, not an oversight (issue #56); the merged
-        paragraph also has two candidate `style_id`s to reconcile, which
-        offset remapping would need to resolve anyway. FIELDS remap
-        (issue #43): both sides' fields survive, tail's shifted right. */
+        /* FIELDS remap (issue #43): both sides' fields survive, tail's
+        shifted right. */
         let mut fields = self.fields.clone();
         /* Issue #81 — a multi-paragraph Head runs to the paragraph end,
         which the merge just moved. */
@@ -4047,27 +4094,69 @@ impl Paragraph {
                 source_xml: o.source_xml.clone(),
             });
         }
+        /* Issue #292 — the tail's range overlays through the edit the merge
+        is for them: the head's bytes inserted in front. */
+        let mut tail_overlays = Paragraph {
+            hyperlinks: other.hyperlinks.clone(),
+            revisions: other.revisions.clone(),
+            ..Paragraph::default()
+        };
+        tail_overlays.remap_range_overlays(TextEdit {
+            at: 0,
+            removed: 0,
+            inserted: shift,
+        });
+        let mut hyperlinks = self.hyperlinks.clone();
+        join_at_seam(&mut hyperlinks, tail_overlays.hyperlinks, shift, |h, t| {
+            h.target == t.target && h.attrs == t.attrs
+        });
+        let mut revisions = self.revisions.clone();
+        join_at_seam(&mut revisions, tail_overlays.revisions, shift, |h, t| {
+            h.kind == t.kind
+                && h.author == t.author
+                && h.date == t.date
+                && h.prev_attrs == t.prev_attrs
+                && h.move_name == t.move_name
+                && (t.id.is_none() || t.id == h.id)
+        });
+        /* Issue #292 — whose paragraph formatting survives: the head's,
+        unless the head is empty (it merges away). */
+        let fmt = if self.text.is_empty() { other } else { self };
+        let mut source_markup = SourceMarkup::concat(
+            &self.source_markup,
+            self.text.len() as u32,
+            &other.source_markup,
+            other.text.len() as u32,
+        );
+        if self.text.is_empty()
+            && let Some(m) = source_markup.as_deref_mut()
+        {
+            /* The surviving paragraph is the tail's: its identity and its
+            recorded `<w:pPr>` (verified against its props on write). */
+            let t = other.source_markup.as_deref();
+            m.attrs = t.map(|t| t.attrs.clone()).unwrap_or_default();
+            m.ppr = t.and_then(|t| t.ppr.clone());
+        }
         Paragraph {
             text,
             spans,
-            props: self.props.clone(),
-            list_item: self.list_item,
-            resolved_marker: self.resolved_marker.clone(),
-            resolved_list_indent: self.resolved_list_indent,
+            props: fmt.props.clone(),
+            list_item: fmt.list_item,
+            resolved_marker: fmt.resolved_marker.clone(),
+            resolved_list_indent: fmt.resolved_list_indent,
             dirty: true,
             source_xml: None,
             inline_objects,
-            hyperlinks: Vec::new(),
-            revisions: Vec::new(),
+            hyperlinks,
+            revisions,
             fields,
-            style_id: None,
-            direct_overrides: ParaProperties::default(),
-            /* Phase 3 (#40) — DELIBERATELY INVERTED from the head-wins
-            convention every other field above follows: the surviving
-            paragraph mark for `section_end` purposes is the TAIL's.
-            A merge deletes the HEAD's mark, and with it any section
-            break riding that mark — Word-exact (deleting a section
-            break makes the preceding text adopt the FOLLOWING
+            style_id: fmt.style_id.clone(),
+            direct_overrides: fmt.direct_overrides.clone(),
+            /* Phase 3 (#40) — DELIBERATELY the tail's, whatever `fmt` is:
+            the surviving paragraph mark for `section_end` purposes is the
+            TAIL's. A merge deletes the HEAD's mark, and with it any
+            section break riding that mark — Word-exact (deleting a
+            section break makes the preceding text adopt the FOLLOWING
             section's properties). Do not "fix" this to self.*. */
             section_end: other.section_end.clone(),
             bookmarks,
@@ -4076,12 +4165,7 @@ impl Paragraph {
             markup, so a content control wrapping both still wraps the
             merge. */
             body_xml: BodyPassthrough::merged(&self.body_xml, &other.body_xml),
-            source_markup: SourceMarkup::concat(
-                &self.source_markup,
-                self.text.len() as u32,
-                &other.source_markup,
-                other.text.len() as u32,
-            ),
+            source_markup,
             /* Issue #262 — the head's mark is the one deleted: the
             surviving mark (and its tracked change) is the tail's. */
             mark_revision: other.mark_revision.clone(),
