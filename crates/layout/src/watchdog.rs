@@ -127,6 +127,13 @@ pub enum DegradeReason {
     /// references across pages. The last pass's labels were kept, so a
     /// reference may show an ordinal counted against a neighbouring page.
     NoteRestartCap,
+    /// Issue #318 — a table nested past the layout's nesting cap
+    /// (`MAX_TABLE_LAYOUT_DEPTH` in the engine) was flattened: its
+    /// paragraphs were stacked, in document order, in the cell holding
+    /// it instead of being laid out as a grid. Bounds the cost of a
+    /// pathologically deep (hostile or corrupt) nesting — a paint, never
+    /// a hang.
+    NestingCapped,
 }
 
 impl DegradeReason {
@@ -150,6 +157,7 @@ impl DegradeReason {
             DegradeReason::WrapPolygonFallback => "WRAP_POLYGON_FALLBACK",
             DegradeReason::PageRefCap => "PAGE_REF_CAP",
             DegradeReason::NoteRestartCap => "NOTE_RESTART_CAP",
+            DegradeReason::NestingCapped => "NESTING_CAPPED",
         }
     }
 }
