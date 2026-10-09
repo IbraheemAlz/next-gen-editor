@@ -262,7 +262,7 @@ fn fld_char(kind: &str) -> String {
 }
 
 fn instr_run(u: &mut Unstructured) -> String {
-    let code = escape_xml(*pick(u, FIELD_INSTRUCTIONS));
+    let code = escape_xml(pick::<&str>(u, FIELD_INSTRUCTIONS));
     format!(r#"<w:r><w:instrText xml:space="preserve">{code}</w:instrText></w:r>"#)
 }
 
@@ -315,7 +315,7 @@ fn gen_complex_field(u: &mut Unstructured, depth_left: u32) -> String {
 /// [`MAX_FIELD_NESTING`] chain occasionally) or a `fldSimple`.
 fn gen_field(u: &mut Unstructured) -> String {
     if u.ratio(1, 3).unwrap_or(false) {
-        let instr = escape_attr(*pick(u, FIELD_INSTRUCTIONS));
+        let instr = escape_attr(pick::<&str>(u, FIELD_INSTRUCTIONS));
         let result = if u.ratio(4, 5).unwrap_or(true) {
             gen_run(u)
         } else {

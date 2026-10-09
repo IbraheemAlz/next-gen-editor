@@ -394,6 +394,9 @@ Engine backlog" references a real issue.
   Command parity matrix (`bridge::meta` × facade map × UI badges × e2e ×
   fuzz) into the `rust-native` job summary; its floor also runs as
   `parity`'s unit tests in `cargo test --workspace`.
+- `cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings`
+  (issue #437) — the fuzz crate is its own workspace, so the workspace clippy
+  run never lints it; `ci.yml`'s `rust-native` job runs this as its own step.
 - `cargo check --manifest-path fuzz/Cargo.toml` — the D5.5 fuzz crate
   compiles. `cargo test --manifest-path fuzz/Cargo.toml` (issue #229) — the
   fuzz crate's own unit tests, including the #186/#187 regression-seed

@@ -44,6 +44,11 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Issue #437 — same reason as the fmt step above: `--workspace` does
+      # not reach the fuzz crate, so its lints were never gated.
+      - name: cargo clippy (fuzz crate)
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
       - name: cargo test
         run: cargo test --workspace --release
 
