@@ -283,3 +283,85 @@ fn the_editor_faces_substitute_the_word_default_theme() {
         .expect("the body's first run");
     assert_eq!(calibri_run.font, "carlito");
 }
+
+/* ================================================================
+Issue #329 — Word's font-derived line pitch for documents read from a
+Word package.
+================================================================ */
+
+/// Paragraph heights of page 1 at scale 1.
+fn paragraph_heights(e: &Engine) -> Vec<f32> {
+    let (pages, _, _, info) = e.build_pages(1.0, false, None).expect("layout");
+    assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+    pages[0]
+        .blocks
+        .iter()
+        .map(|b| b.as_paragraph().expect("paragraph").size.height)
+        .collect()
+}
+
+/// Single / `auto` 480 / `atLeast` 30 pt / `exact` 20 pt / an empty
+/// paragraph, in the test face (Liberation Sans at the 16 px layout
+/// default): read from a Word package (`document_envelope` captured) the
+/// pitch is Word's — 1.149 em per single line (win extent + external
+/// leading), doubled, floored at 30, exactly 20, and the empty line sized
+/// by its mark's face; an engine-authored document keeps the configured
+/// 26 px pitch.
+#[test]
+fn a_word_document_takes_its_line_pitch_from_the_faces() {
+    let para = |text: &str, line_height| {
+        engine::Block::Paragraph(engine::Paragraph {
+            text: text.into(),
+            props: engine::ParaProperties {
+                line_height,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+    let blocks = vec![
+        para("single", None),
+        para("double", Some(engine::LineHeight::Auto { twips: 480 })),
+        para("at least", Some(engine::LineHeight::AtLeast { twips: 600 })),
+        para("exact", Some(engine::LineHeight::Exact { twips: 400 })),
+        para("", None),
+    ];
+    let mut doc = DocumentTree::from_blocks(blocks);
+    let configured = paragraph_heights(&tests::test_engine_with_doc(doc.clone()));
+    assert_eq!(configured, [26.0, 52.0, 30.0, 20.0, 26.0]);
+
+    doc.document_envelope = engine::DocumentEnvelope {
+        root_tag: b"<w:document>".to_vec(),
+        body_tag: b"<w:body>".to_vec(),
+        tail: b"</w:body></w:document>".to_vec(),
+        ..Default::default()
+    };
+    let word = paragraph_heights(&tests::test_engine_with_doc(doc));
+    let single = 16.0 * 2355.0 / 2048.0;
+    let want = [single, 2.0 * single, 30.0, 20.0, single];
+    for (got, want) in word.iter().zip(want) {
+        assert!((got - want).abs() < 1e-3, "{word:?} vs {want}");
+    }
+}
+
+/// Under Word's pitch an empty paragraph is as tall as its MARK's face at
+/// the mark's size (issue #370's rule, here for the font pitch): a 24 pt
+/// mark gives a 24 pt line.
+#[test]
+fn an_empty_word_paragraph_is_sized_by_its_mark() {
+    let mut doc = DocumentTree::from_blocks(vec![engine::Block::Paragraph(engine::Paragraph {
+        mark_style: Some(Box::new(SpanStyle {
+            font_size: Some(24.0),
+            ..Default::default()
+        })),
+        ..Default::default()
+    })]);
+    doc.document_envelope = engine::DocumentEnvelope {
+        root_tag: b"<w:document>".to_vec(),
+        body_tag: b"<w:body>".to_vec(),
+        tail: b"</w:body></w:document>".to_vec(),
+        ..Default::default()
+    };
+    let h = paragraph_heights(&tests::test_engine_with_doc(doc));
+    assert!((h[0] - 24.0 * 2355.0 / 2048.0).abs() < 1e-3, "{h:?}");
+}

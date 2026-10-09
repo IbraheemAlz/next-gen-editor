@@ -207,9 +207,12 @@ fn word_default_theme_names_reach_layout_and_substitute() {
     );
 }
 
-/// Recorded on this change via `--nocapture` (issue #355).
-const PINNED_THEME_LOADED_FACES: u64 = 0x6d2d0b138e4dc1a5;
-const PINNED_THEME_LOADED_FACES_NO_THEME: u64 = 0x076c0f0f592c8182;
-/// Issue #329 — was `0x076c0f0f592c8182` (the theme-less geometry) before
-/// the Arabic substitution rows.
-const PINNED_THEME_WORD_DEFAULT: u64 = 0x4df3a5a67d4aaeba;
+/// Recorded on this change via `--nocapture` (issue #355). Issue #329 —
+/// all three moved by Word's font-derived line pitch for a document read
+/// from a Word package: `0x6d2d0b138e4dc1a5` / `0x076c0f0f592c8182` before.
+const PINNED_THEME_LOADED_FACES: u64 = 0xc6b3f6319baf5995;
+const PINNED_THEME_LOADED_FACES_NO_THEME: u64 = 0xce6c9bd79840f4ff;
+/// Issue #329 — `0x076c0f0f592c8182` (the theme-less geometry) before the
+/// Arabic substitution rows, `0x4df3a5a67d4aaeba` with them under the
+/// configured pitch; Word's font-derived pitch moves it again.
+const PINNED_THEME_WORD_DEFAULT: u64 = 0x877c438e4a983cfe;

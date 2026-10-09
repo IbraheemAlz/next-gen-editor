@@ -47,6 +47,96 @@ pub struct FontMetrics {
     pub x_height: f32,
 }
 
+/// Issue #329 — a face's line metrics under **Word's rule** (Windows Word,
+/// the platform Arabic documents are authored on), in font units:
+///
+/// - `OS/2.fsSelection` bit 7 (`USE_TYPO_METRICS`) set → the typographic
+///   ascender / descender / line gap;
+/// - otherwise `usWinAscent` / `usWinDescent`, plus GDI's *external
+///   leading* — the part of `hhea.lineGap` the win extent does not already
+///   absorb: `max(0, hhea.lineGap − ((winAscent + winDescent) −
+///   (hhea.ascender − hhea.descender)))`. That is what makes Word's single
+///   spacing for 12 pt Times New Roman 13.8 pt rather than 13.3 pt;
+/// - no usable `OS/2` → the `hhea` values.
+///
+/// A single line is `ascent + descent + line_gap` tall; the gap sits above
+/// the ascent (GDI's external leading is leading *above* the text). Mac
+/// Word uses the `hhea` values instead — see [`LoadedFont::line_metrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineMetrics {
+    pub units_per_em: u16,
+    pub ascent: i32,
+    pub descent: i32,
+    pub line_gap: i32,
+}
+
+impl LineMetrics {
+    /// `(ascent + line gap, descent)` in px at `px_size`: the line box's
+    /// split at the baseline for one line of this face.
+    pub fn scaled(&self, px_size: f32) -> (f32, f32) {
+        let upem = f32::from(self.units_per_em.max(1));
+        let k = px_size / upem;
+        (
+            (self.ascent + self.line_gap) as f32 * k,
+            self.descent as f32 * k,
+        )
+    }
+
+    /// The single-spaced line height in em (`(ascent + descent + gap) / upem`).
+    pub fn line_height_em(&self) -> f32 {
+        (self.ascent + self.descent + self.line_gap) as f32 / f32::from(self.units_per_em.max(1))
+    }
+}
+
+/// Issue #329 — [`LineMetrics`] for `face` (Word's rule; see there).
+fn word_line_metrics(face: &rustybuzz::Face<'_>) -> LineMetrics {
+    let tables = face.tables();
+    let hhea = tables.hhea;
+    let upem = tables.head.units_per_em;
+    let hhea_metrics = LineMetrics {
+        units_per_em: upem,
+        ascent: i32::from(hhea.ascender),
+        descent: -i32::from(hhea.descender),
+        line_gap: i32::from(hhea.line_gap).max(0),
+    };
+    let Some(os2) = tables.os2 else {
+        return hhea_metrics;
+    };
+    if os2.use_typographic_metrics() {
+        return LineMetrics {
+            units_per_em: upem,
+            ascent: i32::from(os2.typographic_ascender()),
+            descent: -i32::from(os2.typographic_descender()),
+            line_gap: i32::from(os2.typographic_line_gap()).max(0),
+        };
+    }
+    /* `usWinAscent` / `usWinDescent` (OS/2 bytes 74..78) are unsigned;
+    ttf-parser reads them as `i16` and negates the descent, which
+    overflows on a hostile 0x8000 — read the raw bytes instead. */
+    let raw = face
+        .raw_face()
+        .table(rustybuzz::ttf_parser::Tag::from_bytes(b"OS/2"))
+        .and_then(|d| {
+            let u16_at = |at: usize| Some(u16::from_be_bytes([*d.get(at)?, *d.get(at + 1)?]));
+            Some((u16_at(74)?, u16_at(76)?))
+        });
+    let Some((win_ascent, win_descent)) = raw.map(|(a, d)| (i32::from(a), i32::from(d))) else {
+        return hhea_metrics;
+    };
+    if win_ascent + win_descent <= 0 {
+        return hhea_metrics;
+    }
+    let hhea_extent = i32::from(hhea.ascender) - i32::from(hhea.descender);
+    let external_leading =
+        (i32::from(hhea.line_gap) - ((win_ascent + win_descent) - hhea_extent)).max(0);
+    LineMetrics {
+        units_per_em: upem,
+        ascent: win_ascent,
+        descent: win_descent,
+        line_gap: external_leading,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphMetrics {
     pub advance_width: f32,
@@ -84,6 +174,8 @@ pub struct LoadedFont {
     /// well as against the face's id, so a face registered under any id
     /// still answers to its real name ("Liberation Sans" → `liberation`).
     family_names: Vec<String>,
+    /// Issue #329 — Word's line metrics for the face ([`LineMetrics`]).
+    line_metrics: LineMetrics,
 }
 
 /// Issue #329 — identifies the face (id, units per em, family names);
@@ -116,12 +208,14 @@ impl LoadedFont {
         let upem = face.metrics(&[]).units_per_em;
         let rb_face = rustybuzz::Face::from_slice(data, 0).ok_or(FontError::Parse)?;
         let family_names = name_table_families(&rb_face);
+        let line_metrics = word_line_metrics(&rb_face);
         Ok(Self {
             id,
             data,
             rb_face,
             units_per_em: upem,
             family_names,
+            line_metrics,
         })
     }
 
@@ -129,6 +223,15 @@ impl LoadedFont {
     /// (typographic family first, then the legacy family), as written.
     pub fn family_names(&self) -> &[String] {
         &self.family_names
+    }
+
+    /// Issue #329 — the face's line metrics under Word's (Windows) rule,
+    /// which a `.docx` document's font-derived line pitch is built from.
+    /// Unlike [`Self::metrics`] (swash: typographic metrics when
+    /// `USE_TYPO_METRICS`, else `hhea`, no line gap) this follows what
+    /// Word does with the `OS/2` win extent and GDI's external leading.
+    pub fn line_metrics(&self) -> LineMetrics {
+        self.line_metrics
     }
 
     pub fn id(&self) -> &str {
@@ -806,5 +909,55 @@ mod tests {
             .resolve(Script::Latin, Some("Times New Roman"), true, false)
             .expect("resolve");
         assert!(synth.faux_bold);
+    }
+
+    /* Issue #329 — Word's line metrics, against the published vertical
+    metrics of the shipped faces (see `LineMetrics`): Liberation Sans
+    (no USE_TYPO_METRICS) takes its win extent plus 67 units of external
+    leading — Arial's 1.15 em; Carlito the win extent (Calibri's 1.22 em);
+    Amiri and Noto Naskh Arabic set USE_TYPO_METRICS and take the
+    typographic values (Amiri 1.758 em, not its 2.76 em win extent). */
+    #[test]
+    fn line_metrics_follow_words_rule() {
+        let lm = |bytes: &[u8]| {
+            LoadedFont::parse("f".into(), bytes.to_vec())
+                .expect("parse")
+                .line_metrics()
+        };
+        let liberation = lm(include_bytes!(
+            "../../../ts/fonts/LiberationSans-Regular.ttf"
+        ));
+        assert_eq!(
+            liberation,
+            LineMetrics {
+                units_per_em: 2048,
+                ascent: 1854,
+                descent: 434,
+                line_gap: 67
+            }
+        );
+        assert!((liberation.line_height_em() - 1.149).abs() < 0.001);
+        let carlito = lm(include_bytes!(
+            "../../../ts/public/fonts/Carlito-Regular.ttf"
+        ));
+        assert_eq!(
+            (carlito.ascent, carlito.descent, carlito.line_gap),
+            (1950, 550, 0)
+        );
+        let amiri = lm(include_bytes!("../../../ts/fonts/Amiri-Regular.ttf"));
+        assert_eq!(
+            (amiri.ascent, amiri.descent, amiri.line_gap),
+            (1124, 634, 0)
+        );
+        let naskh = lm(include_bytes!(
+            "../../../ts/fonts/NotoNaskhArabic-Regular.ttf"
+        ));
+        assert_eq!(
+            (naskh.ascent, naskh.descent, naskh.line_gap),
+            (1069, 634, 0)
+        );
+        /* `scaled` puts the gap above the baseline. */
+        let (a, d) = liberation.scaled(2048.0);
+        assert_eq!((a, d), (1921.0, 434.0));
     }
 }

@@ -3376,6 +3376,7 @@ mod tests {
                 bg_color: None,
                 baseline_shift_px: 0.0,
             },
+            metrics_font: None,
         });
         p
     }
@@ -4822,6 +4823,7 @@ mod tests {
                 bg_color: None,
                 baseline_shift_px: 0.0,
             },
+            metrics_font: None,
         });
         p
     }

@@ -2785,6 +2785,14 @@ struct StyleContext<'a> {
     /// into every paragraph layout key: the same text and bindings under
     /// another theme must never hit a cached box.
     theme_key: u64,
+    /// Issue #329 — lay the document out with Word's font-derived line
+    /// pitch ([`layout::FontLinePitch`], `text_pipeline::LineMetrics`)
+    /// instead of the configured one: `true` for a document read from a
+    /// Word package (its `document.xml` envelope was captured), whose
+    /// `<w:spacing>` values mean what they mean in Word. Engine-authored
+    /// documents (the seeded editor page, `.txt` / `.html` opens, the
+    /// `RenderPage` harness) keep the configured `line_height`.
+    word_line_metrics: bool,
 }
 
 impl<'a> StyleContext<'a> {
@@ -2802,6 +2810,7 @@ impl<'a> StyleContext<'a> {
                 t.hash(&mut h);
                 h.finish()
             }),
+            word_line_metrics: doc.document_envelope.is_captured(),
         }
     }
 
@@ -3199,6 +3208,20 @@ fn paragraph_layout_key(
     run_base.font_bindings.hash(&mut h);
     run_base.color_theme.hash(&mut h);
     sctx.theme_key.hash(&mut h);
+    /* Issue #329 — the line-pitch model, and (under Word's) the paragraph
+    mark's face, which sizes a line with no text run. */
+    sctx.word_line_metrics.hash(&mut h);
+    if sctx.word_line_metrics
+        && let Some(mark) = para.mark_style.as_deref()
+    {
+        mark.font_size.map(f32::to_bits).hash(&mut h);
+        mark.font_family.hash(&mut h);
+        mark.raw_font_family.hash(&mut h);
+        mark.font_bindings.hash(&mut h);
+        mark.bold.hash(&mut h);
+        mark.italic.hash(&mut h);
+        hash_complex_script_slots(mark, &mut h);
+    }
     run_base.caps.hash(&mut h);
     run_base.small_caps.hash(&mut h);
     hash_complex_script_slots(&run_base, &mut h);
@@ -3492,6 +3515,107 @@ fn resolve_line_height(
     }
 }
 
+/// Issue #329 — Word's bounds on a `lineRule="auto"` multiple (0.06 to
+/// 132 lines); a hostile `w:line` cannot collapse or explode the pitch.
+const WORD_LINE_MULTIPLE_RANGE: (f32, f32) = (0.06, 132.0);
+
+/// Issue #329 — a paragraph's line pitch as `layout_paragraph` takes it:
+/// `(line_height_px, exact, font_line)`. Under the configured model
+/// (`!sctx.word_line_metrics`) and for `lineRule="exact"` this is
+/// [`resolve_line_height`] with no font pitch. Under Word's model the
+/// pitch is font-derived — `auto` is a multiple of each line's single
+/// height (`w:line / 240`; no `w:spacing` = single), `atLeast` that single
+/// height floored at the value — and `line_height_px` is the nominal pitch
+/// of a line in the paragraph mark's face (what the float-cutout band
+/// heuristics size against).
+fn paragraph_line_rule(
+    para: &engine::Paragraph,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    base_direction: ShapingDirection,
+) -> (f32, bool, Option<layout::FontLinePitch>) {
+    let (lh_px, exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    if !sctx.word_line_metrics || exact {
+        return (lh_px, exact, None);
+    }
+    let empty = mark_line_extents(para, cfg, scale, sctx, fonts, base_direction)
+        .unwrap_or((lh_px * 0.82, lh_px * 0.18));
+    let (multiple, at_least) = match para.props.line_height {
+        Some(engine::LineHeight::Auto { twips }) => {
+            let (lo, hi) = WORD_LINE_MULTIPLE_RANGE;
+            let m = twips as f32 / 240.0;
+            (if m.is_finite() { m.clamp(lo, hi) } else { 1.0 }, 0.0)
+        }
+        Some(engine::LineHeight::AtLeast { twips }) => {
+            (1.0, twips_to_layout_px(twips, scale).max(0.0))
+        }
+        _ => (1.0, 0.0),
+    };
+    let nominal = ((empty.0 + empty.1) * multiple).max(at_least);
+    (
+        nominal,
+        false,
+        Some(layout::FontLinePitch {
+            multiple,
+            at_least,
+            empty,
+        }),
+    )
+}
+
+/// Issue #329 — `(ascent + line gap, descent)` in layout px of one line in
+/// the paragraph MARK's face (Word sizes a line with no text from the
+/// mark's run properties): the style chain's run base under the mark's own
+/// formatting, its complex-script set in an RTL paragraph, resolved
+/// through the font stack exactly like a text run (substitution and the
+/// substitute's metrics face included). `None` when the stack holds no
+/// face.
+fn mark_line_extents(
+    para: &engine::Paragraph,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    base_direction: ShapingDirection,
+) -> Option<(f32, f32)> {
+    let mut style = sctx.run_base(para.style_id.as_deref());
+    if let Some(mark) = para.mark_style.as_deref() {
+        style = style.merged_with(mark.clone());
+    }
+    let (latin, cs) = sctx.run_font_ids(&style, "");
+    let complex = matches!(base_direction, ShapingDirection::Rtl) || style.forces_complex_script();
+    let (script, family, size, bold, italic) = if complex {
+        (
+            text_pipeline::Script::Arabic,
+            cs,
+            style.font_size_cs,
+            style.bold_cs,
+            style.italic_cs,
+        )
+    } else {
+        (
+            text_pipeline::Script::Latin,
+            latin,
+            style.font_size,
+            style.bold,
+            style.italic,
+        )
+    };
+    let r = fonts.resolve_detailed(
+        script,
+        family.as_deref(),
+        bold.unwrap_or(false),
+        italic.unwrap_or(false),
+    )?;
+    let face = r.metrics_id.and_then(|id| fonts.face(id)).unwrap_or(r.face);
+    Some(
+        face.line_metrics()
+            .scaled(size.unwrap_or(cfg.px_size) * scale),
+    )
+}
+
 /// Issue #80 — lay out one note story's blocks at `content_width` into
 /// a stacked block list (origins from `y = 0`), through the SAME cached
 /// paragraph + table pipeline the body uses. `sctx` carries the display
@@ -3667,7 +3791,8 @@ fn layout_note_paragraph_with_composition(
     }
     let base_direction = resolve_base_direction(para, cfg);
     let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
-    let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    let (lh_px, lh_exact, font_line) =
+        paragraph_line_rule(para, cfg, scale, sctx, fonts, base_direction);
     layout_paragraph(ParagraphConfig {
         text: &text,
         fonts,
@@ -3685,6 +3810,7 @@ fn layout_note_paragraph_with_composition(
         px_size_for_marker: cfg.px_size * scale,
         inline_objects: &infos,
         tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+        font_line,
     })
 }
 
@@ -4055,8 +4181,8 @@ fn build_header_footer_box(
                 let base_direction = resolve_base_direction(para, cfg);
                 let (ind_s, ind_e, ind_fl, ind_h) =
                     effective_layout_indents(para, base_direction, scale);
-                let (lh_px, lh_exact) =
-                    resolve_line_height(para.props.line_height, cfg.line_height, scale);
+                let (lh_px, lh_exact, font_line) =
+                    paragraph_line_rule(para, cfg, scale, sctx, fonts, base_direction);
                 let (text, spans) = if let Some(c) = comp {
                     let off = c.at.offset as usize;
                     let mut text = String::with_capacity(para.text.len() + c.text.len());
@@ -4123,6 +4249,7 @@ fn build_header_footer_box(
                     px_size_for_marker: cfg.px_size * scale,
                     inline_objects: &inline_infos,
                     tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+                    font_line,
                 });
                 /* Phase 2 audit (gap D.1) — propagate field overlays so
                 the paginator can re-evaluate PAGE / NUMPAGES per page.
@@ -5499,7 +5626,8 @@ fn layout_paragraph_wrapped_uncached(
     let base_direction = resolve_base_direction(para, cfg);
     let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
     let inline_infos = build_inline_object_infos(para, cfg, scale, sctx);
-    let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    let (lh_px, lh_exact, font_line) =
+        paragraph_line_rule(para, cfg, scale, sctx, fonts, base_direction);
     let para_cfg = ParagraphConfig {
         text: &para.text,
         fonts,
@@ -5517,6 +5645,7 @@ fn layout_paragraph_wrapped_uncached(
         px_size_for_marker: cfg.px_size * scale,
         inline_objects: &inline_infos,
         tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+        font_line,
     };
     layout::layout_paragraph_wrapped(para_cfg, cuts)
 }
@@ -10254,8 +10383,14 @@ impl Engine {
                             let (ind_s, ind_e, ind_fl, ind_h) =
                                 effective_layout_indents(para, base_direction, scale);
                             let tab_stops_px = tab_stops_to_layout_px(&para.props.tab_stops, scale);
-                            let (lh_px, lh_exact) =
-                                resolve_line_height(para.props.line_height, cfg.line_height, scale);
+                            let (lh_px, lh_exact, font_line) = paragraph_line_rule(
+                                para,
+                                &cfg,
+                                scale,
+                                sctx,
+                                &font_stack,
+                                base_direction,
+                            );
                             layout::layout_paragraph_wrapped(
                                 ParagraphConfig {
                                     text: &text,
@@ -10277,6 +10412,7 @@ impl Engine {
                                     px_size_for_marker: cfg.px_size * scale,
                                     inline_objects: &[],
                                     tab_stops_px: &tab_stops_px,
+                                    font_line,
                                 },
                                 cuts,
                             )
@@ -18913,6 +19049,7 @@ mod tests {
             direction: ShapingDirection::Ltr,
             source_range: 0..2,
             attrs,
+            metrics_font: None,
         };
         let line = LineBox {
             origin: Point { x: 0.0, y: 0.0 },
@@ -19647,6 +19784,7 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
+            word_line_metrics: false,
         }
     }
 
@@ -19679,6 +19817,7 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
+            word_line_metrics: false,
         };
         let mut para = engine::Paragraph {
             text: "hello world".into(),
@@ -19744,6 +19883,7 @@ mod tests {
             note_self_mark: None,
             theme,
             theme_key: key,
+            word_line_metrics: false,
         };
         let theme: &'static engine::DocumentTheme = Box::leak(Box::new(theme));
         let mut para = engine::Paragraph {
@@ -19868,6 +20008,7 @@ mod tests {
                 px_size_for_marker: 12.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                font_line: None,
             })
             .size
             .height
@@ -19932,6 +20073,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert!(
@@ -19976,6 +20118,7 @@ mod tests {
             px_size_for_marker: 16.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert!(
@@ -20021,6 +20164,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         let trailing_edge = marker.origin.x + marker.width;
@@ -20089,6 +20233,7 @@ mod tests {
                 px_size_for_marker: 12.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                font_line: None,
             });
             let marker = para.marker.as_ref().expect("marker box");
             assert!(
@@ -20150,6 +20295,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert_eq!(
@@ -20676,7 +20822,7 @@ mod tests {
             .expect("band layout");
         assert!(
             !info.is_full_layout,
-            "a 2000px band over a 116-page doc must report a culled layout"
+            "a 2000px band over an 82-page doc must report a culled layout"
         );
         assert!(
             pages.len() < 24,
@@ -20693,9 +20839,11 @@ mod tests {
         let (all_pages, _, _, full_info) =
             engine.build_pages(2.0, false, None).expect("full layout");
         assert!(full_info.is_full_layout);
+        /* Issue #329 — 116 pages under the configured 26 px pitch, 82
+        under Word's font-derived one (Liberation Sans: 1.15 em). */
         assert!(
-            all_pages.len() > 100,
-            "full layout of the 50p fixture spans 100+ pages, got {}",
+            all_pages.len() > 60,
+            "full layout of the 50p fixture spans 60+ pages, got {}",
             all_pages.len()
         );
     }
@@ -26074,10 +26222,13 @@ mod tests {
         );
     }
 
-    /// Recorded on the pre-#87 adapter via `--nocapture`.
+    /// Recorded on the pre-#87 adapter via `--nocapture`. Issue #329 — the
+    /// two 50-page entries (the only fixture read from a Word package) moved
+    /// with Word's font-derived line pitch: `0xf565e610ffdbc22d` (116 pages)
+    /// and `0x3b2d3d53655395a1` before; 82 pages now.
     const PINNED_ENGINE_FINGERPRINTS: &[(&str, u64)] = &[
-        ("50p_full_x2", 0xf565e610ffdbc22d),
-        ("50p_band_2000_x2", 0x3b2d3d53655395a1),
+        ("50p_full_x2", 0x341267f577563dc0),
+        ("50p_band_2000_x2", 0xd014bb2dc81283ce),
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
         /* Issue #75 — `<w:pageBreakBefore/>` alone (new fixture, recorded
         on the #75 adapter; every other value is unchanged by it). */
@@ -26104,9 +26255,11 @@ mod tests {
     /// Word default (ON). Recorded via `--nocapture` when #95 landed:
     /// only the 50-page perf document moves (its flow leaves single
     /// lines at page edges); the other four equal the OFF anchor.
+    /// Issue #329 — the 50-page entries moved with Word's font-derived line
+    /// pitch: `0xa7f584534ce2ac6f` / `0x25ddf363691ee633` before; 84 pages.
     const PINNED_WIDOW_DEFAULT_FINGERPRINTS: &[(&str, u64)] = &[
-        ("50p_full_x2", 0xa7f584534ce2ac6f),
-        ("50p_band_2000_x2", 0x25ddf363691ee633),
+        ("50p_full_x2", 0x2859dac37f27b6af),
+        ("50p_band_2000_x2", 0xbd7ba49646a045a3),
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
         ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
@@ -26135,15 +26288,17 @@ mod tests {
         fixtures: Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)>,
         pinned: &[(&str, u64)],
     ) {
+        /* Every fixture is checked before failing, so one run lists every
+        moved pin (a layout-model change moves several at once). */
+        let mut moved: Vec<String> = Vec::new();
         for (name, pages, degradations) in fixtures {
             let fp = layout::geometry_fingerprint(&pages);
             match pinned.iter().find(|(n, _)| *n == name) {
-                Some((_, want)) => assert_eq!(
-                    fp,
-                    *want,
+                Some((_, want)) if fp != *want => moved.push(format!(
                     "fixture `{name}` changed geometry (got {fp:#x}, pinned {want:#x}, {} pages)",
                     pages.len()
-                ),
+                )),
+                Some(_) => {}
                 None => eprintln!(
                     "ENGINE FINGERPRINT {name} = {fp:#x} ({} pages)",
                     pages.len()
@@ -26154,6 +26309,7 @@ mod tests {
                 "nominal fixture `{name}` reported degradations: {degradations:?}"
             );
         }
+        assert!(moved.is_empty(), "{}", moved.join("\n"));
     }
 
     /* ================================================================

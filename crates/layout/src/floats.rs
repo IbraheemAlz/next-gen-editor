@@ -527,6 +527,7 @@ mod tests {
                 direction: ShapingDirection::Ltr,
                 source_range: 0..5,
                 attrs: attrs(),
+                metrics_font: None,
             }],
             alignment: Alignment::Start,
             source_start: 0,

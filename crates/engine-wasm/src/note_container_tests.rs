@@ -354,7 +354,9 @@ fn endnote_references_paint_only_in_the_trailing_band() {
     assert_eq!(fp, PINNED_FOOTNOTES_ENDNOTES, "footnotes_endnotes moved");
 }
 
-const PINNED_FOOTNOTES_ENDNOTES: u64 = 0x5f524151979df92b;
+/// Issue #329 — moved by Word's font-derived line pitch for a document
+/// read from a Word package; was `0x5f524151979df92b`.
+const PINNED_FOOTNOTES_ENDNOTES: u64 = 0xf2d2b78a29326154;
 
 /// A header note spans sections: a NextPage section break builds a fresh
 /// paginator, which must not place the note a second time.

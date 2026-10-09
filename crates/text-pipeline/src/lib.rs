@@ -19,7 +19,7 @@ pub mod substitution;
 pub use bidi::{BidiAnalysis, VisualRun, analyze_bidi, first_strong_direction};
 pub use fonts::{
     FamilyMatch, FamilyResolution, FontError, FontId, FontMetrics, FontStack, GlyphMetrics,
-    LoadedFont, RasterizedGlyph, Resolved, Synthesis,
+    LineMetrics, LoadedFont, RasterizedGlyph, Resolved, Synthesis,
 };
 pub use justify::{Alignment, JustifyMode};
 pub use line_break::break_opportunities;

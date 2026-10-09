@@ -3089,6 +3089,7 @@ mod tests {
             px_size_for_marker: 18.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
         });
         /* Phase 6 — `source_paragraph_id` is engine-wasm's job in
         production; the test stamps it manually so `/ToUnicode` lookups
@@ -3215,6 +3216,7 @@ mod tests {
             px_size_for_marker: 22.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
         });
         let cell_borders = engine::default_word_borders();
         let cell = layout::TableCellBox {
@@ -3326,6 +3328,7 @@ mod tests {
                 px_size_for_marker: 22.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                font_line: None,
             });
             let cell = layout::TableCellBox {
                 origin: layout::Point { x: 0.0, y: 0.0 },
@@ -3423,6 +3426,7 @@ mod tests {
                 px_size_for_marker: 22.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                font_line: None,
             });
             assert_eq!(para.lines.len(), 3, "one word per line");
             let h = if exact { 30.0 } else { para.size.height };
@@ -3539,6 +3543,7 @@ mod tests {
                     px_size_for_marker: 22.0,
                     inline_objects: &[],
                     tab_stops_px: &[],
+                    font_line: None,
                 });
                 layout::TableCellBox {
                     origin: layout::Point { x, y: 0.0 },
@@ -4392,6 +4397,7 @@ mod tests {
             px_size_for_marker: 18.0,
             inline_objects: &[],
             tab_stops_px: &[(250.0, layout::paragraph::TabKind::Right, leader)],
+            font_line: None,
         });
         para.source_paragraph_id = 0;
         PageBox {
@@ -4628,6 +4634,7 @@ mod tests {
                 bg_color: None,
                 baseline_shift_px: 0.0,
             },
+            metrics_font: None,
         };
         let para = ParagraphBox {
             origin: Point { x: 36.0, y: 0.0 },
@@ -4957,6 +4964,7 @@ mod tests {
             px_size_for_marker: 22.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
         });
         let glyphs_per_row: usize = para
             .lines
@@ -5072,6 +5080,7 @@ mod tests {
             px_size_for_marker: 22.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
         });
         let glyphs: usize = para
             .lines

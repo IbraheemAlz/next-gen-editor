@@ -58,6 +58,7 @@ fn hello_page(stack: &FontStack) -> PageBox {
         px_size_for_marker: 18.0,
         inline_objects: &[],
         tab_stops_px: &[],
+        font_line: None,
     });
     para.source_paragraph_id = 0;
     PageBox {

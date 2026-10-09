@@ -153,6 +153,32 @@ pub struct ParagraphConfig<'a> {
     /// L2.1 (#6) — non-`Left` kinds (Center/Right/Decimal) trigger the
     /// shape-then-place pass in `apply_tab_advances`.
     pub tab_stops_px: &'a [TabStopPx],
+    /// Issue #329 — Word's font-derived line pitch. `Some` makes every
+    /// line as tall as its runs' faces say (`text_pipeline::LineMetrics`,
+    /// Word's rule) times [`FontLinePitch::multiple`] instead of
+    /// [`Self::line_height`]; `line_height` then only feeds the heuristics
+    /// that need a nominal line (float-cutout band minimums). Ignored when
+    /// [`Self::line_height_exact`] is set. `None` is the configured-pitch
+    /// model every engine-authored document uses.
+    pub font_line: Option<FontLinePitch>,
+}
+
+/// Issue #329 — Word's line pitch for a paragraph of a `.docx` document
+/// (`<w:spacing w:lineRule>` `auto` / `atLeast`; `exact` stays on the
+/// configured pitch): a line's single height is the largest
+/// `ascent + line gap` plus the largest `descent` among its runs' faces
+/// (each run's [`VisualRun::metrics_font`], else its own face), at the
+/// run's size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FontLinePitch {
+    /// `lineRule="auto"` multiple (`w:line / 240`); `1.0` is single.
+    pub multiple: f32,
+    /// `lineRule="atLeast"` floor in layout px; `0.0` for `auto`.
+    pub at_least: f32,
+    /// `(ascent + line gap, descent)` in layout px for a line with no text
+    /// run — an empty paragraph, a doubled soft break — taken from the
+    /// paragraph mark's face at its size.
+    pub empty: (f32, f32),
 }
 
 /// L2.1 (#6) — geometric kind of a single custom tab stop. Mirrors
@@ -283,8 +309,13 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     let mut lines: Vec<LineBox> = Vec::with_capacity(composed.len());
     let mut y = 0.0_f32;
     for (i, (mut line, _)) in composed.into_iter().enumerate() {
-        let (ascent, descent) =
-            line_extents(&line, cfg.fonts, cfg.line_height, cfg.line_height_exact);
+        let (ascent, descent) = line_extents(
+            &line,
+            cfg.fonts,
+            cfg.line_height,
+            cfg.line_height_exact,
+            cfg.font_line.as_ref(),
+        );
         /* First-line indent / hanging: hanging shifts the first line *back*
         toward the leading edge; firstLine shifts it *forward* into the body.
         Both already in layout px. Subsequent lines — soft-wrapped OR forced
@@ -330,7 +361,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     if lines.is_empty() {
         let inner_origin =
             alignment_origin_x(0.0, content_width, cfg.alignment, cfg.base_direction);
-        lines.push(LineBox {
+        let mut line = LineBox {
             origin: Point {
                 x: leading_off + inner_origin,
                 y: 0.0,
@@ -344,8 +375,18 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             source_start: 0,
             segments: Vec::new(),
             segment: 0,
-        });
-        y = cfg.line_height;
+        };
+        /* Issue #329 — under the font-derived pitch the empty line takes
+        the paragraph mark's face (`FontLinePitch::empty`). */
+        if let Some(pitch) = cfg.font_line.as_ref()
+            && !cfg.line_height_exact
+        {
+            let (a, d) = font_line_extents(&line, cfg.fonts, pitch);
+            line.baseline = a;
+            line.height = a + d;
+        }
+        y = line.height;
+        lines.push(line);
     }
     let height = y;
     /* Phase 4 — list marker (`"1."`, `"a)"`, `"•"`). Shape against the
@@ -629,7 +670,13 @@ fn compose_band(
         if cfg.alignment == Alignment::Justify && broke && !paragraph_last {
             justify_line(&mut line, seg.width(), cfg.text, cfg.fonts);
         }
-        let (a, d) = line_extents(&line, cfg.fonts, cfg.line_height, cfg.line_height_exact);
+        let (a, d) = line_extents(
+            &line,
+            cfg.fonts,
+            cfg.line_height,
+            cfg.line_height_exact,
+            cfg.font_line.as_ref(),
+        );
         ascent = ascent.max(a);
         descent = descent.max(d);
         let inner = alignment_origin_x(line.width, seg.width(), line.alignment, cfg.base_direction);
@@ -837,6 +884,7 @@ fn build_marker(
                 faux_italic: false,
                 baseline_shift_px: 0.0,
             },
+            metrics_font: None,
         },
         width,
         text: text.to_string(),
@@ -868,6 +916,7 @@ fn compose_lines_with_width<'a>(
         px_size_for_marker: cfg.px_size_for_marker,
         inline_objects: cfg.inline_objects,
         tab_stops_px: cfg.tab_stops_px,
+        font_line: cfg.font_line,
     };
     compose_lines(&scoped)
 }
@@ -1133,7 +1182,18 @@ fn next_tab_stop_after(pen_x: f32, custom: &[TabStopPx]) -> TabStopPx {
 ///
 /// Closes Issue #22 symptoms (1) and (2): top-padding clip + overlapping
 /// line wrap on massive `font_size`.
-fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32, exact: bool) -> (f32, f32) {
+fn line_extents(
+    line: &LineBox,
+    fonts: &FontStack,
+    line_height: f32,
+    exact: bool,
+    font_line: Option<&FontLinePitch>,
+) -> (f32, f32) {
+    if let Some(pitch) = font_line
+        && !exact
+    {
+        return font_line_extents(line, fonts, pitch);
+    }
     let mut font_ascent = 0.0_f32;
     let mut font_descent = 0.0_f32;
     let mut inline_image_h = 0.0_f32;
@@ -1193,6 +1253,50 @@ fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32, exact: bool
     let ascent = (total * 0.82).max(inline_image_h);
     let descent = total - ascent;
     (ascent, descent)
+}
+
+/// Issue #329 — [`line_extents`] under Word's font-derived pitch: the
+/// single height is the largest `ascent + line gap` plus the largest
+/// `descent` among the line's runs (Word's rule, `text_pipeline::
+/// LineMetrics`; a run's [`VisualRun::metrics_font`] stands in for its
+/// face), an inline image raising the ascent; a line with no text run
+/// takes [`FontLinePitch::empty`]. The line is `multiple ×` that, at least
+/// [`FontLinePitch::at_least`], and the extra (or missing) space goes
+/// ABOVE the text, as in Word: the baseline sits one descent above the
+/// line's bottom.
+fn font_line_extents(line: &LineBox, fonts: &FontStack, pitch: &FontLinePitch) -> (f32, f32) {
+    let mut ascent = 0.0_f32;
+    let mut descent = 0.0_f32;
+    let mut measured = false;
+    let mut inline_image_h = 0.0_f32;
+    for run in &line.runs {
+        let face = run
+            .metrics_font
+            .as_deref()
+            .and_then(|id| fonts.face(id))
+            .or_else(|| fonts.face(&run.font));
+        if let Some(face) = face
+            && run.glyphs.iter().any(|g| g.inline_image_rel_id.is_none())
+        {
+            let (a, d) = face.line_metrics().scaled(run.attrs.px_size);
+            ascent = ascent.max(a);
+            descent = descent.max(d);
+            measured = true;
+        }
+        for g in &run.glyphs {
+            if g.inline_image_rel_id.is_some() {
+                inline_image_h = inline_image_h.max(g.inline_object_height);
+            }
+        }
+    }
+    if !measured {
+        (ascent, descent) = pitch.empty;
+    }
+    let ascent = ascent.max(inline_image_h);
+    let single = ascent + descent;
+    let total = (single * pitch.multiple).max(pitch.at_least).max(0.0);
+    let line_ascent = (total - descent).max(0.0);
+    (line_ascent, total - line_ascent)
 }
 
 /// Greedy line breaking. Returns each line paired with whether it ended at a
@@ -1516,12 +1620,16 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
 
         for (rel_start, rel_end, script, complex, span, marker) in subs {
             let sf = span.face_for(complex);
-            let Some((font_id, face, synth)) =
+            let Some(resolved) =
                 cfg.fonts
-                    .resolve(script, sf.font_family, sf.bold, sf.italic)
+                    .resolve_detailed(script, sf.font_family, sf.bold, sf.italic)
             else {
                 continue;
             };
+            let (font_id, face, synth) = (resolved.id, resolved.face, resolved.synthesis);
+            /* Issue #329 — a substituted family's line metrics may come
+            from the original's metric clone (`FontLinePitch`). */
+            let metrics_font = resolved.metrics_id.cloned();
             if let Some(info) = marker
                 && let InlineObjectInfoKind::NoteMarker { text, anchor } = &info.kind
             {
@@ -1673,6 +1781,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     bg_color: span.bg_color,
                     baseline_shift_px: sf.baseline_shift_px,
                 },
+                metrics_font: metrics_font.clone(),
             });
         }
     }
@@ -1773,6 +1882,7 @@ fn shape_note_marker(
             bg_color: span.bg_color,
             baseline_shift_px: sf.baseline_shift_px + raise,
         },
+        metrics_font: None,
     }
 }
 
@@ -2325,6 +2435,7 @@ mod tests {
             direction: ShapingDirection::Ltr,
             source_range: 0..text.len() as u32,
             attrs: test_attrs(),
+            metrics_font: None,
         }];
         LineBox {
             origin: Point::default(),
@@ -2741,6 +2852,7 @@ mod tests {
             marker_text: None,
             px_size_for_marker: 10.0,
             tab_stops_px: &[],
+            font_line: None,
         })
     }
 
@@ -2783,5 +2895,199 @@ mod tests {
             whole_span: true,
         };
         assert!(span.with_cs(same).cs.is_none());
+    }
+
+    /* ================================================================
+    Issue #329 — Word's font-derived line pitch (`FontLinePitch`).
+    ================================================================ */
+
+    /// The editor's Latin face, Noto Naskh Arabic, under their ids.
+    fn substitution_stack() -> FontStack {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let face = |id: &str, bytes: &[u8]| {
+            Arc::new(text_pipeline::LoadedFont::parse(id.into(), bytes.to_vec()).expect("font"))
+        };
+        let mut faces = HashMap::new();
+        faces.insert(
+            "liberation".to_string(),
+            face(
+                "liberation",
+                include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf"),
+            ),
+        );
+        faces.insert(
+            "noto-naskh".to_string(),
+            face(
+                "noto-naskh",
+                include_bytes!("../../../ts/fonts/NotoNaskhArabic-Regular.ttf"),
+            ),
+        );
+        FontStack::from_faces(faces, "liberation")
+    }
+
+    fn family_span(len: u32, px: f32, family: Option<&str>) -> StyleSpan {
+        StyleSpan {
+            font_family: family.map(str::to_string),
+            px_size: px,
+            ..twin_span(len, false)
+        }
+        .with_cs(crate::boxes::ComplexScriptAttrs {
+            px_size: px,
+            baseline_shift_px: 0.0,
+            bold: false,
+            italic: false,
+            font_family: family.map(str::to_string),
+            whole_span: false,
+        })
+    }
+
+    fn pitch_layout(
+        fonts: &FontStack,
+        text: &str,
+        spans: &[StyleSpan],
+        line_height: f32,
+        font_line: Option<FontLinePitch>,
+        max_width: f32,
+    ) -> ParagraphBox {
+        layout_paragraph(ParagraphConfig {
+            text,
+            fonts,
+            inline_objects: &[],
+            spans,
+            base_direction: ShapingDirection::Ltr,
+            max_width,
+            line_height,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 10.0,
+            tab_stops_px: &[],
+            font_line,
+        })
+    }
+
+    const SINGLE: FontLinePitch = FontLinePitch {
+        multiple: 1.0,
+        at_least: 0.0,
+        empty: (9.0, 3.0),
+    };
+
+    /// A line is as tall as its face says under Word's rule — Liberation
+    /// Sans (Arial's metrics): 1.149 em, its 67-unit external leading above
+    /// the ascent — never the configured `line_height`; a multiple scales
+    /// it with the extra space above the text (the baseline stays one
+    /// descent above the line's bottom); `atLeast` floors it.
+    #[test]
+    fn font_pitch_takes_the_line_height_from_the_face() {
+        let fonts = substitution_stack();
+        let text = "Word line pitch";
+        let spans = [family_span(text.len() as u32, 20.0, Some("liberation"))];
+        let single = pitch_layout(&fonts, text, &spans, 99.0, Some(SINGLE), 1000.0);
+        let l = &single.lines[0];
+        let (ascent, descent) = (20.0 * 1921.0 / 2048.0, 20.0 * 434.0 / 2048.0);
+        assert!((l.height - (ascent + descent)).abs() < 1e-3, "{}", l.height);
+        assert!((l.baseline - ascent).abs() < 1e-3);
+        assert!((single.size.height - l.height).abs() < 1e-3);
+
+        let double = pitch_layout(
+            &fonts,
+            text,
+            &spans,
+            99.0,
+            Some(FontLinePitch {
+                multiple: 2.0,
+                ..SINGLE
+            }),
+            1000.0,
+        );
+        let d = &double.lines[0];
+        assert!((d.height - 2.0 * l.height).abs() < 1e-3);
+        assert!(
+            (d.baseline - (d.height - descent)).abs() < 1e-3,
+            "extra space above"
+        );
+
+        let floored = pitch_layout(
+            &fonts,
+            text,
+            &spans,
+            99.0,
+            Some(FontLinePitch {
+                at_least: 40.0,
+                ..SINGLE
+            }),
+            1000.0,
+        );
+        assert!((floored.lines[0].height - 40.0).abs() < 1e-3);
+        /* The configured model is untouched by the field's existence. */
+        let configured = pitch_layout(&fonts, text, &spans, 30.0, None, 1000.0);
+        assert!((configured.lines[0].height - 30.0).abs() < 1e-3);
+    }
+
+    /// Each line takes its OWN runs' metrics (a wrapped paragraph whose
+    /// second line holds only Arabic is taller there), and a line with no
+    /// text run — the empty paragraph — takes `FontLinePitch::empty`.
+    #[test]
+    fn font_pitch_is_per_line_and_empty_lines_take_the_mark() {
+        let fonts = substitution_stack();
+        let text = "Latin words here \u{0646}\u{0635} \u{0639}\u{0631}\u{0628}\u{064A}";
+        let spans = [family_span(text.len() as u32, 20.0, None)];
+        let para = pitch_layout(&fonts, text, &spans, 99.0, Some(SINGLE), 140.0);
+        assert!(para.lines.len() >= 2, "{} lines", para.lines.len());
+        /* Liberation Sans 1.149 em; Noto Naskh Arabic 1.703 em
+        (USE_TYPO_METRICS). */
+        let (latin_h, arabic_h) = (20.0 * 2355.0 / 2048.0, 20.0 * 1.703);
+        let (mut latin_only, mut with_arabic) = (0, 0);
+        for line in &para.lines {
+            if line.runs.iter().any(|r| r.font == "noto-naskh") {
+                with_arabic += 1;
+                assert!((line.height - arabic_h).abs() < 1e-2, "{}", line.height);
+            } else {
+                latin_only += 1;
+                assert!((line.height - latin_h).abs() < 1e-2, "{}", line.height);
+            }
+        }
+        assert!(
+            latin_only > 0 && with_arabic > 0,
+            "{} lines",
+            para.lines.len()
+        );
+
+        let empty = pitch_layout(&fonts, "", &[], 99.0, Some(SINGLE), 140.0);
+        assert_eq!(empty.lines.len(), 1);
+        assert!((empty.lines[0].height - 12.0).abs() < 1e-3);
+        assert!((empty.lines[0].baseline - 9.0).abs() < 1e-3);
+        assert!((empty.size.height - 12.0).abs() < 1e-3);
+    }
+
+    /// A substituted family whose row names the original's metric clone
+    /// (Arabic text in a run named Arial: shaped with the Naskh substitute,
+    /// laid out with Arial's — Liberation Sans's — line height, as Word
+    /// lays it out with Arial) carries `metrics_font`, and the font pitch
+    /// measures that face.
+    #[test]
+    fn a_metrics_clone_sizes_a_substituted_run() {
+        let fonts = substitution_stack();
+        let text = "\u{0646}\u{0635} \u{0639}\u{0631}\u{0628}\u{064A}";
+        let spans = [family_span(text.len() as u32, 20.0, Some("arial"))];
+        let para = pitch_layout(&fonts, text, &spans, 99.0, Some(SINGLE), 1000.0);
+        let run = &para.lines[0].runs[0];
+        assert_eq!(run.font, "noto-naskh");
+        assert_eq!(run.metrics_font.as_deref(), Some("liberation"));
+        assert!((para.lines[0].height - 20.0 * 2355.0 / 2048.0).abs() < 1e-3);
+        /* "Simplified Arabic" has no metrics clone: the Naskh face's own. */
+        let spans = [family_span(
+            text.len() as u32,
+            20.0,
+            Some("simplified-arabic"),
+        )];
+        let para = pitch_layout(&fonts, text, &spans, 99.0, Some(SINGLE), 1000.0);
+        assert_eq!(para.lines[0].runs[0].metrics_font, None);
+        assert!((para.lines[0].height - 20.0 * 1.703).abs() < 1e-2);
     }
 }

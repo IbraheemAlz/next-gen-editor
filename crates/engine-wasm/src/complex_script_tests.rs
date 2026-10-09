@@ -140,8 +140,10 @@ fn mixed_run_lays_latin_and_arabic_out_at_their_own_sizes() {
     );
 }
 
-/// Recorded on this change via `--nocapture` (issue #359).
-const PINNED_CS_SIZE: u64 = 0x77225ebeb9c6b3ba;
+/// Recorded on this change via `--nocapture` (issue #359). Issue #329 —
+/// moved by Word's font-derived line pitch for a document read from a
+/// Word package; was `0x77225ebeb9c6b3ba`.
+const PINNED_CS_SIZE: u64 = 0x64507e83ea6684d6;
 
 /// The old single slot let `w:szCs` win: the same paragraph with BOTH
 /// sizes at 14 pt needs more room — the twin split is what moves the

@@ -72,4 +72,6 @@ fn rtl_start_border_paints_on_the_right_and_end_on_the_left() {
 }
 
 const GOLDEN_X: [i32; 4] = [72, 523, 72, 72];
-const GOLDEN_Y: [(i32, i32); 4] = [(72, 26), (98, 26), (124, 26), (150, 26)];
+/// Issue #329 — one line of the test face (Liberation Sans, 16 px) under
+/// Word's font-derived pitch: 18.4 px (was the configured 26 px).
+const GOLDEN_Y: [(i32, i32); 4] = [(72, 18), (90, 18), (109, 18), (127, 18)];

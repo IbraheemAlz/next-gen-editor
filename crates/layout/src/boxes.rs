@@ -514,6 +514,13 @@ pub struct VisualRun {
     /// Byte range in the source paragraph text this run was shaped from.
     pub source_range: Range<u32>,
     pub attrs: TextAttrs,
+    /// Issue #329 — the face whose line metrics stand in for [`Self::font`]'s
+    /// in a font-derived line pitch ([`crate::FontLinePitch`]): set when the
+    /// run's family was substituted and the substitution names the
+    /// original's metric clone (Arabic text in a run named Arial shapes with
+    /// a Naskh face but takes Arial's — Liberation Sans's — line height, as
+    /// Word lays it out with Arial). `None` uses `font`'s own metrics.
+    pub metrics_font: Option<FontId>,
 }
 
 /// One laid-out line. `origin` is relative to the parent [`ParagraphBox`];

@@ -670,9 +670,13 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   rename the other slot or hide behind an inherited family.
 - Read-back (issue #423): `SelectionChanged` carries
   `resolved_font_latin` / `resolved_font_cs` + `font_source` (Explicit /
-  Theme / Style / Default) and `slot_formats`, so the toolbar and the
-  Font dialog show the family the caret's text actually resolves to;
-  `attrs_at_caret.font_family` keeps its old meaning.
+  Theme / Style / Default, and `Substituted` when a substitute face
+  serves the named family — issue #329) and `slot_formats`, so the
+  toolbar and the Font dialog show the family the caret's text actually
+  resolves to; `attrs_at_caret.font_family` keeps its old meaning.
+- Substitution (issue #329) is layout-only: the document keeps the name
+  it was written with (`w:rFonts` is never rewritten to the substitute);
+  `DocumentLoaded` / `FontLoaded.substituted` report what layout swaps.
 - Harness: `tools/roundtrip` step 45 (`complex_script_size.docx`, a
   `<w:bCs/>` + `<w:rStyle>` run, a Word-shaped Arabic run), step 47
   (raw family per slot, both storage forms) and step 48 (each Font
