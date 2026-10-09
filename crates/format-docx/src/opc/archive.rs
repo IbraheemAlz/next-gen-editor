@@ -265,6 +265,10 @@ pub fn read_docx_with_settings(
     }
 
     let xml = document_xml.ok_or_else(|| DocxError::MissingEntry(DOC_XML.into()))?;
+    let mut warnings: Vec<DocxWarning> = Vec::new();
+    /* Issue #325 — validate the root's namespace bindings; a non-canonical
+    spelling is normalised (regenerate-only) instead of reading empty. */
+    let xml = canonical_main_part(xml, &mut warnings);
 
     /* Phase 3 — `word/styles.xml` rides the pass-through but feeds the
     cascade resolver. Absent or malformed → empty table (all paragraphs
@@ -278,7 +282,6 @@ pub fn read_docx_with_settings(
         _ => StyleTable::default(),
     };
     let resolver = StyleResolver::new(&style_table);
-    let mut warnings: Vec<DocxWarning> = Vec::new();
     let mut document = parse_document_xml_with_warnings(
         &xml,
         &resolver,
@@ -623,6 +626,42 @@ pub fn read_docx_with_settings(
         document_root_attrs,
         warnings,
     })
+}
+
+/// Issue #325 — gate the main part on its root's namespace bindings
+/// ([`crate::schema::grab_bag::NamespaceScope::classify_root`]). Canonical
+/// roots (either family) are returned untouched — the byte-identical fast
+/// path. A non-canonical root is re-prefixed
+/// ([`crate::schema::ns_normalize::canonicalize_prefixes`]) and reported;
+/// when even that fails, or the root is no WordprocessingML at all, the
+/// part is returned as-is with a typed warning — never a silent empty
+/// document.
+fn canonical_main_part(xml: Vec<u8>, warnings: &mut Vec<DocxWarning>) -> Vec<u8> {
+    use crate::schema::family::RootBinding;
+    use crate::schema::ns_normalize::{canonicalize_prefixes, inspect_root};
+    match inspect_root(&xml) {
+        RootBinding::Canonical(_) => xml,
+        RootBinding::NotWordprocessingMl => {
+            warnings.push(DocxWarning::NotWordprocessingMl);
+            xml
+        }
+        RootBinding::NonCanonical { detail } => match canonicalize_prefixes(&xml) {
+            Ok(normalised) => {
+                warnings.push(DocxWarning::NonCanonicalNamespaces {
+                    detail,
+                    normalized: true,
+                });
+                normalised
+            }
+            Err(e) => {
+                warnings.push(DocxWarning::NonCanonicalNamespaces {
+                    detail: format!("{detail}; normalisation failed: {e}"),
+                    normalized: false,
+                });
+                xml
+            }
+        },
+    }
 }
 
 /// Guess a MIME type from a `word/media/*` archive entry name. The OOXML

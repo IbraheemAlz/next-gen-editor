@@ -34,6 +34,16 @@ pub enum DocxWarning {
     /// `deep-table-cell.docx` nests 5000 tables; unbounded recursion
     /// overflowed the stack.
     TableNestingTooDeep { limit: u32 },
+    /// Issue #325 — the main part binds WordprocessingML under a prefix
+    /// (or as the default namespace) the literal-qname reader does not
+    /// match. `normalized` = the part was re-prefixed into the canonical
+    /// spelling and read; it is then **regenerate-only** (a zero-edit
+    /// save re-emits the normalised bytes, not the source's). `false` =
+    /// normalisation itself failed and the part read as-is (likely empty).
+    NonCanonicalNamespaces { detail: String, normalized: bool },
+    /// Issue #325 — the main part's root is not a WordprocessingML element
+    /// in either namespace family; it reads as an empty document.
+    NotWordprocessingMl,
 }
 
 /// Issues #244 / #245 — non-fatal writer diagnostics: a best-effort

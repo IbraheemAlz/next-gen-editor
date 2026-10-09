@@ -15,6 +15,7 @@ use crate::parts::comments::{
 use crate::parts::document::parse_sect_pr_fragment;
 use crate::parts::footnotes::emit_note_pr;
 use crate::parts::numbering::build_numbering_xml;
+use crate::schema::NsFamily;
 use crate::schema::block_envelope::EnvelopeStack;
 use crate::schema::comment_anchors;
 use crate::schema::ct_ppr::ppr_child_rank;
@@ -547,9 +548,10 @@ fn jc_val(a: Alignment) -> &'static str {
 pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
     let mut out = String::with_capacity(1024);
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
-    out.push_str(
+    out.push_str(&crate::schema::family::to_family(
         "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
-    );
+        doc_family(doc),
+    ));
     out.push_str("<w:docDefaults><w:rPrDefault>");
     emit_rpr(&doc.style_run_defaults, &mut out);
     out.push_str("</w:rPrDefault><w:pPrDefault>");
@@ -2143,10 +2145,11 @@ fn emit_anchored_image_drawing(
 /// the inline and anchored emitters. Byte-identical to the Phase 7 inline
 /// output (the visual-diff / round-trip fixtures pin it).
 fn emit_pic_graphic(rel_id: &str, cx: i64, cy: i64, out: &mut String) {
+    let graphic_data_uri = fam("http://schemas.openxmlformats.org/drawingml/2006/picture");
     out.push_str(&format!(
         "<wp:cNvGraphicFramePr/>\
          <a:graphic>\
-         <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+         <a:graphicData uri=\"{graphic_data_uri}\">\
          <pic:pic>\
          <pic:nvPicPr><pic:cNvPr id=\"0\" name=\"Image\"/><pic:cNvPicPr/></pic:nvPicPr>\
          <pic:blipFill>\
@@ -2684,6 +2687,8 @@ fn build_document_xml_with_root(
     root_attrs: &[(String, String)],
 ) -> String {
     let mut out = String::with_capacity(2048);
+    /* Issue #325 — mint in the document's own namespace family. */
+    let _family = FamilyScope::enter(doc_family(doc));
     /* Issue #112 — the read-time page-size fallback (issue #109) the
     verified sectPr passthrough re-parses against; see
     `sect_pr_source_is_current`. */
@@ -2742,9 +2747,10 @@ fn build_document_xml_with_root(
         } else {
             DOC_XML_HEADER
         };
-        let extra = extra_root_attrs(header, root_attrs);
+        let header = fam(header);
+        let extra = extra_root_attrs(&header, root_attrs);
         if extra.is_empty() {
-            out.push_str(header);
+            out.push_str(&header);
         } else {
             /* Every header constant closes the root tag right before
             `<w:body>`; splice the carried declarations in there. */
@@ -2816,6 +2822,52 @@ thread_local! {
     /// document in hand.
     static WRITE_DEFAULT_GEOMETRY: std::cell::Cell<engine::PageGeometry> =
         const { std::cell::Cell::new(engine::PageGeometry::a4()) };
+    /// Issue #325 — the ISO 29500 namespace family of the document being
+    /// written (its `w` URI): every namespace URI / relationship type the
+    /// writer MINTS goes through [`fam`] / [`mint_root`], so a saved Strict
+    /// package never becomes a Transitional / Strict hybrid.
+    static WRITE_FAMILY: std::cell::Cell<NsFamily> =
+        const { std::cell::Cell::new(NsFamily::Transitional) };
+}
+
+/// RAII guard: sets [`WRITE_FAMILY`] for the duration of one write.
+struct FamilyScope(NsFamily);
+
+impl FamilyScope {
+    fn enter(family: NsFamily) -> Self {
+        Self(WRITE_FAMILY.with(|f| f.replace(family)))
+    }
+}
+
+impl Drop for FamilyScope {
+    fn drop(&mut self) {
+        WRITE_FAMILY.with(|f| f.set(self.0));
+    }
+}
+
+/// The family a tree was read in: the `w` URI of its captured root tag,
+/// else of its recorded root attributes; Transitional for an
+/// engine-authored tree.
+fn doc_family(doc: &DocumentTree) -> NsFamily {
+    if doc.document_envelope.is_captured() {
+        return crate::schema::family::family_of_root_tag(&doc.document_envelope.root_tag);
+    }
+    doc.document_root_attrs
+        .iter()
+        .find(|(k, _)| k == "xmlns:w")
+        .and_then(|(_, v)| crate::schema::family::family_of_w_uri(v))
+        .unwrap_or_default()
+}
+
+/// A minted string (Transitional spelling in source) in the current
+/// write's namespace family.
+fn fam(s: &str) -> Cow<'_, str> {
+    crate::schema::family::to_family(s, WRITE_FAMILY.with(|f| f.get()))
+}
+
+/// A minted part's root start tag in the current write's family.
+fn mint_root(part: Vec<u8>) -> Vec<u8> {
+    crate::schema::family::root_tag_to_family(part, WRITE_FAMILY.with(|f| f.get()))
 }
 
 /// Issue #112 — the namespace bindings the rendered `body` needs from the
@@ -2849,11 +2901,13 @@ fn bindings_used_by(body: &str, needs_wps: bool) -> Vec<(&'static str, &'static 
         ),
         ("wps", crate::parts::textbox::NS_WPS),
     ];
+    let family = WRITE_FAMILY.with(|f| f.get());
     CANDIDATES
         .into_iter()
         .filter(|(prefix, _)| {
             *prefix == "w" || (*prefix == "wps" && needs_wps) || unbound.contains(*prefix)
         })
+        .map(|(prefix, uri)| (prefix, crate::schema::family::uri_in(uri, family)))
         .collect()
 }
 
@@ -3064,6 +3118,8 @@ pub fn write_docx_with_notes(
     doc: &DocumentTree,
 ) -> Result<(Vec<u8>, Vec<WriteNote>), DocxError> {
     let _source_scope = AgainstSourceScope::enter(true);
+    /* Issue #325 — every URI / rel type minted below follows the source's family. */
+    let _family = FamilyScope::enter(doc_family(doc));
     let outer = WRITE_NOTES.with(|c| c.borrow_mut().replace(Vec::new()));
     let res = write_docx_inner(archive, doc);
     let notes = WRITE_NOTES.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
@@ -3114,7 +3170,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         let (comments_bytes, minted_paraids): (Option<Vec<u8>>, HashMap<u32, String>) =
             if any_unminted_resolved && !comments_already_present {
                 let (bytes, map) = build_comments_xml(&doc.comment_defs);
-                (Some(bytes), map)
+                (Some(mint_root(bytes)), map)
             } else {
                 (None, HashMap::new())
             };
@@ -3145,7 +3201,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         verbatim — round-trip remains byte-identical for documents
         that never touched a list. */
         let numbering_bytes: Option<Vec<u8>> = if doc.numbering.dirty {
-            Some(build_numbering_xml(&doc.numbering))
+            Some(mint_root(build_numbering_xml(&doc.numbering)))
         } else {
             None
         };
@@ -3181,11 +3237,11 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                     patch_settings_even_odd(xml, doc.settings.even_and_odd_headers).into_bytes(),
                 ),
                 None if doc.settings.even_and_odd_headers => Some(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                    fam("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
                      <w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
-                     <w:evenAndOddHeaders/></w:settings>"
-                        .to_string()
-                        .into_bytes(),
+                     <w:evenAndOddHeaders/></w:settings>")
+                    .into_owned()
+                    .into_bytes(),
                 ),
                 None => None,
             }
@@ -3789,12 +3845,13 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
             for (rid, target) in &body_media_rows {
                 fresh.push_str(&format!(
                     "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{target}\"/>\n",
-                    crate::media_plan::IMAGE_REL_TYPE
+                    fam(crate::media_plan::IMAGE_REL_TYPE)
                 ));
             }
             for (rid, target) in &new_hyperlink_rel_entries {
                 fresh.push_str(&format!(
-                    "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL_TYPE}\" Target=\"{target}\" TargetMode=\"External\"/>\n"
+                    "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{target}\" TargetMode=\"External\"/>\n",
+                    fam(HYPERLINK_REL_TYPE)
                 ));
             }
             /* Phase 3 (#39) — fresh header/footer rels on a document
@@ -3802,12 +3859,14 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
             for (rid, part_name, _, rel_type, _) in &hf_new_parts {
                 let target = part_name.strip_prefix("word/").unwrap_or(part_name);
                 fresh.push_str(&format!(
-                    "<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>\n"
+                    "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{target}\"/>\n",
+                    fam(rel_type)
                 ));
             }
             if synth_settings {
                 fresh.push_str(&format!(
-                    "<Relationship Id=\"ngeSettings1\" Type=\"{SETTINGS_REL_TYPE}\" Target=\"settings.xml\"/>\n"
+                    "<Relationship Id=\"ngeSettings1\" Type=\"{}\" Target=\"settings.xml\"/>\n",
+                    fam(SETTINGS_REL_TYPE)
                 ));
             }
             fresh.push_str("</Relationships>");
@@ -4292,20 +4351,22 @@ fn build_hf_xml(
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     out.push('<');
     out.push_str(tag);
-    out.push_str(" xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"");
+    out.push_str(&fam(
+        " xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"",
+    ));
     if has_image {
         /* Issue #69 — `wp14` for a floating picture's percentage offsets. */
-        out.push_str(
+        out.push_str(&fam(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\
              \u{20}xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"\
              \u{20}xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"\
              \u{20}xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"\
              \u{20}xmlns:wp14=\"http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing\"",
-        );
+        ));
     } else if has_link {
-        out.push_str(
+        out.push_str(&fam(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
-        );
+        ));
     }
     /* Issue #84 — Word binds the same prefix set on every part root; a
     header story's passthrough paragraphs and grab-bag fragments need
@@ -4371,18 +4432,20 @@ fn build_notes_xml(
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     out.push('<');
     out.push_str(root);
-    out.push_str(" xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"");
+    out.push_str(&fam(
+        " xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"",
+    ));
     if has_image {
-        out.push_str(
+        out.push_str(&fam(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\
              \u{20}xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"\
              \u{20}xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"\
              \u{20}xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"",
-        );
+        ));
     } else if has_link {
-        out.push_str(
+        out.push_str(&fam(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
-        );
+        ));
     }
     let extra = extra_root_attrs(&out, root_attrs);
     out.push_str(&extra);
@@ -4568,6 +4631,7 @@ fn inject_doc_rel<'a>(
     if rels_xml.contains(&target_needle) {
         return Cow::Borrowed(rels_xml);
     }
+    let rel_type = fam(rel_type);
     let Some(close_idx) = rels_xml.find("</Relationships>") else {
         return Cow::Borrowed(rels_xml);
     };
