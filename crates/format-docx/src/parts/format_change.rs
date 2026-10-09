@@ -22,17 +22,17 @@ use engine::SpanStyle;
 
 /// The revision template (`start` / `end` are the caller's: the run's
 /// text range) for the `<w:rPrChange>` start tag `e` whose whole element
-/// is `frag` (self-closing or not). `baseline` is the paragraph-mark run
-/// formatting the live run resolved against.
+/// is `frag` (self-closing or not). The recorded formatting resolves like
+/// the live run's span style: character-style chain + direct rPr (issue
+/// #369 — the paragraph mark's rPr is no baseline of either).
 pub(crate) fn format_change_revision(
     e: &BytesStart<'_>,
     frag: &[u8],
     ns: &NamespaceScope,
     resolver: &StyleResolver<'_>,
-    baseline: &SpanStyle,
 ) -> engine::Revision {
     let (direct, r_style) = recorded_rpr(frag, ns);
-    let mut prev = resolver.resolve_run(baseline.clone(), r_style.as_deref(), direct);
+    let mut prev = resolver.resolve_run(SpanStyle::default(), r_style.as_deref(), direct);
     /* Issue #104 — like a live run, the recorded formatting keeps its
     character-style id, so a rejected change writes `<w:rStyle>` back
     instead of flattening the style into direct formatting. */

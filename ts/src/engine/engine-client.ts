@@ -116,6 +116,9 @@ export interface RevisionSnapshot {
     /** Issue #262 — a paragraph-MARK revision (a tracked paragraph split
      *  or merge), addressed by the empty range at the paragraph end. */
     mark?: boolean;
+    /** Issue #365 — a tracked table-ROW insertion / deletion: the row's
+     *  index in the top-level table at `block` (`start == end == 0`). */
+    row?: number;
     /** Issue #304 — the revision's stable id (`ACCEPT_REVISION` /
      *  `REJECT_REVISION` `revision_id`): unique per row, unchanged by
      *  edits elsewhere. */

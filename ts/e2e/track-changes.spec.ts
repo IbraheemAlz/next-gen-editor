@@ -149,3 +149,141 @@ test('tracked Backspace at a paragraph start marks the break; Backspace over you
     const nothing = await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
     expect(nothing.undo_depth).toBe(depth);
 });
+
+/* Issue #366 — pasted text and IME commits are tracked insertions too:
+ * reject all removes them (merging the paragraphs a multi-line paste
+ * split), accept all keeps them. */
+
+for (const [how, cmd] of [
+    ['plain', { type: 'PASTE_PLAIN', text: 'one\ntwo' }],
+    ['HTML', { type: 'PASTE_HTML', html: '<p>one</p><p>two</p>' }],
+] as const) {
+    test(`a tracked ${how} paste of two paragraphs rejects to the original`, async ({ page }) => {
+        await boot(page);
+        await seed(page, ['alpha beta']);
+        const depth = (await run(page, [caret(0, 5)])).undo_depth as number;
+        const pasted = await run(page, [cmd]);
+        expect(pasted.type).toBe('SELECTION_CHANGED');
+        expect(pasted.undo_depth).toBe(depth + 1);
+        expect(await plain(page)).toBe('alphaone\ntwo beta');
+        await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
+        expect(await plain(page)).toBe('alpha beta');
+        await run(page, [{ type: 'UNDO' }]);
+        expect(await plain(page)).toBe('alphaone\ntwo beta');
+        await run(page, [{ type: 'ACCEPT_ALL_REVISIONS' }]);
+        expect(await plain(page)).toBe('alphaone\ntwo beta');
+        /* Nothing left pending. */
+        const settled = (await run(page, [caret(0, 0)])).undo_depth as number;
+        const again = await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
+        expect(again.undo_depth).toBe(settled);
+    });
+}
+
+test('a tracked IME commit through the hidden input is an insertion reject removes', async ({
+    page,
+}) => {
+    await boot(page);
+    await seed(page, ['alpha beta']);
+    await run(page, [caret(0, 6)]);
+    /* The real HiddenInput composition handlers (BEGIN / UPDATE /
+     * END_COMPOSITION), fired as one synchronous burst. */
+    await page.evaluate(() => {
+        const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-nge-hidden-input]');
+        if (!ta) throw new Error('editor hidden input missing');
+        const fire = (type: string, data: string): void => {
+            ta.dispatchEvent(new CompositionEvent(type, { data, bubbles: true }));
+        };
+        fire('compositionstart', '');
+        fire('compositionupdate', 'に');
+        fire('compositionupdate', '日本');
+        fire('compositionend', '日本');
+    });
+    expect(await plain(page)).toBe('alpha 日本beta');
+    /* One change, by the reviewer: the sidebar's single reject removes it. */
+    const rows = await page.evaluate(async () => {
+        const client = (window as any).__engineClient;
+        return (await client.revisionsSnapshot()) as Array<{ kind: string; start: number; end: number; revision_id: number }>;
+    });
+    expect(rows.map((r) => [r.kind, r.start, r.end])).toEqual([['insert', 6, 12]]);
+    await run(page, [
+        {
+            type: 'REJECT_REVISION',
+            block: 0,
+            start: 6,
+            end: 12,
+            revision_id: rows[0]!.revision_id,
+        },
+    ]);
+    expect(await plain(page)).toBe('alpha beta');
+});
+
+/* Issue #365 — tracked table rows: selecting two rows and pressing Delete
+ * with review mode on marks the rows deleted (`<w:trPr><w:del/>`) instead
+ * of answering an error; the sidebar lists each row, accepting one removes
+ * exactly that row, accept-all the rest. Row counts read the a11y mirror's
+ * table (engine truth, valid under headless Chrome). */
+
+const inCell = (row: number, col: number, offset: number) => ({
+    path: {
+        steps: [
+            { kind: 'BLOCK', idx: 1 },
+            { kind: 'CELL', row, col },
+            { kind: 'BLOCK', idx: 0 },
+        ],
+    },
+    offset,
+});
+const caretIn = (row: number, col: number) => ({
+    type: 'SET_SELECTION',
+    range: { start: inCell(row, col, 0), end: inCell(row, col, 0) },
+    caret: inCell(row, col, 0),
+});
+
+test('select two table rows in review mode, Delete, accept', async ({ page }) => {
+    await boot(page);
+    const cells: unknown[] = [];
+    for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 2; c++) {
+            cells.push(caretIn(r, c), { type: 'INSERT_TEXT', at: undefined, text: `r${r}c${c}` });
+        }
+    }
+    await run(page, [
+        { type: 'SELECT_ALL' },
+        { type: 'INSERT_TEXT', at: undefined, text: 'before' },
+        { type: 'INSERT_TABLE', at: { steps: [{ kind: 'BLOCK', idx: 1 }] }, rows: 3, cols: 2 },
+        ...cells,
+        { type: 'TOGGLE_TRACK_CHANGES', enabled: true },
+    ]);
+    const tableRows = page.locator('table[role="table"] tr[role="row"]');
+    await expect(tableRows).toHaveCount(3);
+
+    const depth = (await run(page, [caretIn(0, 0)])).undo_depth as number;
+    const deleted = await run(page, [
+        {
+            type: 'SET_SELECTION',
+            range: { start: inCell(0, 0, 0), end: inCell(1, 1, 4) },
+            caret: inCell(1, 1, 4),
+        },
+        { type: 'DELETE_AT_CARET', forward: true, by_word: false },
+    ]);
+    /* Not an error, one undo step; the rows stay (struck) until accepted. */
+    expect(deleted.type).toBe('SELECTION_CHANGED');
+    expect(deleted.undo_depth).toBe(depth + 1);
+    await expect(tableRows).toHaveCount(3);
+
+    const sidebar = page.getByRole('complementary', { name: 'Track changes' });
+    const rows = sidebar.locator('.nge-tc__row');
+    await sidebar.getByRole('button', { name: 'Refresh' }).click();
+    await expect(rows).toHaveCount(2);
+    await expect(rows.first()).toContainText('Table row deleted');
+    await expect(rows.first()).toContainText('row 1');
+
+    await rows.first().getByRole('button', { name: 'Accept revision' }).click();
+    await expect(rows).toHaveCount(1);
+    await expect(tableRows).toHaveCount(2);
+
+    await run(page, [{ type: 'ACCEPT_ALL_REVISIONS' }]);
+    await expect(tableRows).toHaveCount(1);
+    await expect(page.locator('table[role="table"]')).toContainText('r2c0');
+    await expect(page.locator('table[role="table"]')).not.toContainText('r1c0');
+});

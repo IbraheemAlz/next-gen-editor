@@ -104,11 +104,12 @@ pub(crate) fn schema_rank(order: &[&[u8]], name: &[u8], change_elem: &[u8]) -> u
 
 /// Issue #84 — fold the top-level children of a captured `<w:rPr>…</w:rPr>`
 /// fragment into `style` through [`apply_rpr`]. Used for the
-/// paragraph-mark run properties: the whole element rides the paragraph's
-/// grab bag for round-trip, while its modeled children still seed the
-/// run baseline exactly as before. Nested subtrees (`<w:rPrChange>`) are
-/// skipped so the recorded *previous* formatting never overrides the
-/// live one.
+/// paragraph-mark run properties ([`mark_rpr_style`]): the whole element
+/// rides the paragraph's grab bag for round-trip, while its modeled
+/// children are the mark's style (issue #369 — the mark's only: they
+/// never seed the paragraph's runs). Nested subtrees (`<w:rPrChange>`)
+/// are skipped so the recorded *previous* formatting never overrides
+/// the live one.
 pub fn fold_rpr_fragment(fragment: &[u8], style: &mut SpanStyle) {
     let mut reader = Reader::from_reader(fragment);
     reader.config_mut().trim_text(false);

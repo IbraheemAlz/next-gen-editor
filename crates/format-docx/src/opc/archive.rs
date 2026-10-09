@@ -352,7 +352,10 @@ fn read_docx_scoped(
     other_entries.shrink_to_fit();
     /* Issue #325 — validate the root's namespace bindings; a non-canonical
     spelling is normalised (regenerate-only) instead of reading empty. */
-    let xml = canonical_main_part(xml, &mut warnings);
+    let xml = canonical_main_part(&part_names.main, xml, &mut warnings);
+    /* Issue #394 — the same for every WordprocessingML sibling the reader
+    walks, before any of them is parsed. */
+    canonical_sibling_parts(&mut other_entries, &part_names, &mut warnings);
 
     /* Phase 3 — `word/styles.xml` rides the pass-through but feeds the
     cascade resolver. Absent or malformed → empty table (all paragraphs
@@ -738,31 +741,116 @@ fn read_docx_scoped(
 /// when even that fails, or the root is no WordprocessingML at all, the
 /// part is returned as-is with a typed warning — never a silent empty
 /// document.
-fn canonical_main_part(xml: Vec<u8>, warnings: &mut Vec<DocxWarning>) -> Vec<u8> {
+fn canonical_main_part(name: &str, xml: Vec<u8>, warnings: &mut Vec<DocxWarning>) -> Vec<u8> {
     use crate::schema::family::RootBinding;
-    use crate::schema::ns_normalize::{canonicalize_prefixes, inspect_root};
+    use crate::schema::ns_normalize::inspect_root;
     match inspect_root(&xml) {
         RootBinding::Canonical(_) => xml,
         RootBinding::NotWordprocessingMl => {
             warnings.push(DocxWarning::NotWordprocessingMl);
             xml
         }
-        RootBinding::NonCanonical { detail } => match canonicalize_prefixes(&xml) {
-            Ok(normalised) => {
-                warnings.push(DocxWarning::NonCanonicalNamespaces {
-                    detail,
-                    normalized: true,
-                });
-                normalised
-            }
-            Err(e) => {
-                warnings.push(DocxWarning::NonCanonicalNamespaces {
-                    detail: format!("{detail}; normalisation failed: {e}"),
-                    normalized: false,
-                });
-                xml
-            }
-        },
+        RootBinding::NonCanonical { detail } => normalise_part(name, xml, detail, warnings),
+    }
+}
+
+/// Issue #394 — [`canonical_main_part`] for the WordprocessingML siblings
+/// the reader walks: `styles.xml`, `numbering.xml`, `settings.xml`,
+/// `footnotes.xml`, `endnotes.xml`, `comments.xml` and every header /
+/// footer part the main part's relationships name. A non-canonical part
+/// is replaced IN `entries` by its normalised bytes, so every consumer —
+/// the typed parsers, the writer's verbatim passthrough, the in-place
+/// patches (`comments.xml`), a regenerated header's root bindings, the
+/// tree's retained source package — sees one consistent canonical
+/// spelling: the part is regenerate-only (its source bytes are never
+/// spliced into), reported as [`DocxWarning::NonCanonicalNamespaces`].
+/// Canonical parts stay byte-identical, as do parts the reader never
+/// walks (custom XML, `fontTable.xml`, the theme) and a sibling whose
+/// root is no WordprocessingML at all (it reads as before; only the main
+/// part reports [`DocxWarning::NotWordprocessingMl`]).
+fn canonical_sibling_parts(
+    entries: &mut [(String, Vec<u8>)],
+    names: &PartNames,
+    warnings: &mut Vec<DocxWarning>,
+) {
+    use crate::schema::family::RootBinding;
+    use crate::schema::ns_normalize::inspect_root;
+    let mut parts: Vec<String> = [
+        &names.styles,
+        &names.numbering,
+        &names.settings,
+        &names.footnotes,
+        &names.endnotes,
+        &names.comments,
+    ]
+    .into_iter()
+    .cloned()
+    .collect();
+    parts.extend(header_footer_parts(entries, names));
+    let mut seen = std::collections::HashSet::new();
+    for part in parts {
+        if !seen.insert(part.clone()) {
+            continue;
+        }
+        let Some(slot) = entries.iter_mut().find(|(n, _)| *n == part) else {
+            continue;
+        };
+        if let RootBinding::NonCanonical { detail } = inspect_root(&slot.1) {
+            let xml = std::mem::take(&mut slot.1);
+            slot.1 = normalise_part(&part, xml, detail, warnings);
+        }
+    }
+}
+
+/// Issue #394 — the archive entries of every header / footer part the
+/// main part's relationships target (both namespace families' rel types),
+/// in relationship order.
+fn header_footer_parts(entries: &[(String, Vec<u8>)], names: &PartNames) -> Vec<String> {
+    const REL_BASE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
+    let Some(rels) = entries
+        .iter()
+        .find(|(n, _)| *n == names.main_rels)
+        .and_then(|(_, b)| crate::opc::relationships::parse_relationships(b).ok())
+    else {
+        return Vec::new();
+    };
+    let header = format!("{REL_BASE}header");
+    let footer = format!("{REL_BASE}footer");
+    rels.by_type(&header)
+        .chain(rels.by_type(&footer))
+        .filter(|r| r.target_mode == crate::opc::relationships::TargetMode::Internal)
+        .map(|r| resolve_in_package(entries, &names.main, &r.target))
+        .collect()
+}
+
+/// Issues #325 / #394 — re-prefix one non-canonical part (`detail` names
+/// the first offending binding) and report it. A part the normaliser
+/// cannot rewrite is returned as-is (it will likely read empty), still
+/// reported.
+fn normalise_part(
+    name: &str,
+    xml: Vec<u8>,
+    detail: String,
+    warnings: &mut Vec<DocxWarning>,
+) -> Vec<u8> {
+    use crate::schema::ns_normalize::canonicalize_prefixes;
+    match canonicalize_prefixes(&xml) {
+        Ok(normalised) => {
+            warnings.push(DocxWarning::NonCanonicalNamespaces {
+                part: name.to_string(),
+                detail,
+                normalized: true,
+            });
+            normalised
+        }
+        Err(e) => {
+            warnings.push(DocxWarning::NonCanonicalNamespaces {
+                part: name.to_string(),
+                detail: format!("{detail}; normalisation failed: {e}"),
+                normalized: false,
+            });
+            xml
+        }
     }
 }
 

@@ -11,11 +11,20 @@
 //!   so a [`StyleDef::kind`] consumer can tell them apart, but their
 //!   properties are not currently folded into the engine model.
 //!
+//! Issue #395 — a style's (and the docDefaults') `<w:pPr><w:pBdr>` is
+//! read into its paragraph properties like a paragraph's own: physical
+//! edges as read, an explicit `nil` / `none` edge as a set "no border"
+//! edge (so it can remove an inherited one), and the logical
+//! `<w:start>` / `<w:end>` edges folded by the style's OWN `<w:bidi>`
+//! once the style ends — the cascade turns them to the paragraph's
+//! final direction (`engine::ParaProperties::cascade`).
+//!
 //! The pass-through invariant is preserved: `word/styles.xml` rides
 //! [`crate::opc::archive::DocxArchive::other_entries`] verbatim. This module
 //! never serialises.
 
 use crate::error::DocxError;
+use crate::schema::ct_pbdr::{PbdrLogical, apply_pbdr_edge};
 use crate::schema::ct_ppr::apply_ppr;
 use crate::schema::ct_rpr::{apply_rpr, attr_val};
 use engine::{ParaProperties, SpanStyle};
@@ -94,6 +103,9 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let mut cur_style: Option<StyleScratch> = None;
     let mut in_doc_defaults = false;
+    /* Issue #395 — the docDefaults' logical `<w:pBdr>` edges, folded by
+    the defaults' own direction when `<w:docDefaults>` ends. */
+    let mut defaults_pbdr = PbdrLogical::default();
     // True when the current `<w:rPr>` is a paragraph-mark `<w:pPr>/<w:rPr>` —
     // there's a `<w:pPr>` somewhere above on the stack. Phase 4+ may model
     // paragraph-mark run formatting; today we skip it.
@@ -121,6 +133,13 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
             .last()
             .map(|n| n.as_slice() == b"w:style")
             .unwrap_or(false)
+    };
+    /* Issue #395 — `<w:pPr>/<w:pBdr>` (a style's or the docDefaults'). */
+    let in_pbdr = |stack: &[Vec<u8>]| -> bool {
+        matches!(
+            stack,
+            [.., parent, last] if last.as_slice() == b"w:pBdr" && parent.as_slice() == b"w:pPr"
+        )
     };
     /* Audit gap A.M17 — `<w:style>/<w:pPr>/<w:numPr>`. */
     let in_numpr = |stack: &[Vec<u8>]| -> bool {
@@ -166,6 +185,14 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                             in_doc_defaults,
                         );
                     }
+                    n if in_pbdr(&stack) => apply_to_pbdr(
+                        n,
+                        &e,
+                        &mut table,
+                        &mut cur_style,
+                        &mut defaults_pbdr,
+                        in_doc_defaults,
+                    ),
                     n if in_ppr(&stack) => {
                         apply_to_ppr(n, &e, &mut table, &mut cur_style, in_doc_defaults);
                     }
@@ -203,6 +230,14 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                             in_doc_defaults,
                         );
                     }
+                    n if in_pbdr(&stack) => apply_to_pbdr(
+                        n,
+                        &e,
+                        &mut table,
+                        &mut cur_style,
+                        &mut defaults_pbdr,
+                        in_doc_defaults,
+                    ),
                     n if in_ppr(&stack) => {
                         apply_to_ppr(n, &e, &mut table, &mut cur_style, in_doc_defaults);
                     }
@@ -212,7 +247,10 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
             Event::End(e) => {
                 let name = e.name().as_ref().to_owned();
                 match name.as_slice() {
-                    b"w:docDefaults" => in_doc_defaults = false,
+                    b"w:docDefaults" => {
+                        in_doc_defaults = false;
+                        std::mem::take(&mut defaults_pbdr).fold_into(&mut table.defaults.para);
+                    }
                     b"w:style" => {
                         if let Some(s) = cur_style.take()
                             && let Some(def) = s.into_def()
@@ -243,6 +281,9 @@ struct StyleScratch {
     next: Option<String>,
     para: ParaProperties,
     run: SpanStyle,
+    /// Issue #395 — the style's logical `<w:pBdr>` edges, folded by its
+    /// own direction in [`Self::into_def`].
+    pbdr_logical: PbdrLogical,
 }
 
 impl StyleScratch {
@@ -255,18 +296,21 @@ impl StyleScratch {
             next: None,
             para: ParaProperties::default(),
             run: SpanStyle::default(),
+            pbdr_logical: PbdrLogical::default(),
         }
     }
     fn into_def(self) -> Option<StyleDef> {
         let id = self.id?;
         let kind = self.kind?;
+        let mut para = self.para;
+        self.pbdr_logical.fold_into(&mut para);
         Some(StyleDef {
             id,
             name: self.name,
             kind,
             based_on: self.based_on,
             next: self.next,
-            para: self.para,
+            para,
             run: self.run,
         })
     }
@@ -297,6 +341,29 @@ fn apply_to_ppr(
         apply_ppr(name, e, &mut table.defaults.para);
     } else if let Some(s) = cur_style.as_mut() {
         apply_ppr(name, e, &mut s.para);
+    }
+}
+
+/// Issue #395 — one `<w:pBdr>` edge child of a style's (or the
+/// docDefaults') `<w:pPr>`: a logical edge is held until the owner's
+/// direction is known, a physical one lands in its slot.
+fn apply_to_pbdr(
+    name: &[u8],
+    e: &BytesStart,
+    table: &mut StyleTable,
+    cur_style: &mut Option<StyleScratch>,
+    defaults_pbdr: &mut PbdrLogical,
+    in_doc_defaults: bool,
+) {
+    let (para, logical) = if in_doc_defaults && cur_style.is_none() {
+        (&mut table.defaults.para, defaults_pbdr)
+    } else if let Some(s) = cur_style.as_mut() {
+        (&mut s.para, &mut s.pbdr_logical)
+    } else {
+        return;
+    };
+    if !logical.accept(name, e) {
+        apply_pbdr_edge(name, e, para);
     }
 }
 
@@ -393,5 +460,46 @@ mod tests {
 
         let emphasis = t.by_id.get("Emphasis").unwrap();
         assert_eq!(emphasis.kind, StyleKind::Character);
+    }
+
+    /// Issue #395 — `<w:pPr><w:pBdr>` on a style and on the docDefaults:
+    /// physical edges as read, `nil` as a set "no border" edge, logical
+    /// edges by the owner's OWN direction (`<w:bidi>` after `<w:pBdr>`),
+    /// table-border children never mistaken for paragraph borders.
+    #[test]
+    fn parses_paragraph_borders_on_styles_and_doc_defaults() {
+        let xml = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults><w:pPrDefault><w:pPr><w:pBdr><w:between w:val="single" w:sz="4"/></w:pBdr></w:pPr></w:pPrDefault></w:docDefaults>
+  <w:style w:type="paragraph" w:styleId="Title"><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="8" w:space="4" w:color="4F81BD"/></w:pBdr></w:pPr></w:style>
+  <w:style w:type="paragraph" w:styleId="NoTop"><w:pPr><w:pBdr><w:top w:val="nil"/></w:pBdr></w:pPr></w:style>
+  <w:style w:type="paragraph" w:styleId="Rtl"><w:pPr><w:pBdr><w:start w:val="single"/><w:end w:val="double"/></w:pBdr><w:bidi/></w:pPr></w:style>
+  <w:style w:type="table" w:styleId="Grid"><w:tblPr><w:tblBorders><w:top w:val="single"/></w:tblBorders></w:tblPr></w:style>
+</w:styles>"#;
+        let t = parse_styles_xml(xml).expect("parse");
+        let between = t.defaults.para.borders.clone().expect("defaults pBdr");
+        assert!(between.inside_h.is_some() && between.top.is_none());
+
+        let title = t.by_id["Title"].para.borders.clone().expect("Title pBdr");
+        let bottom = title.bottom.expect("bottom");
+        assert_eq!(bottom.size_eighth_pt, 8);
+        assert_eq!(bottom.color, Some([0x4F, 0x81, 0xBD, 255]));
+
+        let no_top = t.by_id["NoTop"].para.borders.clone().expect("NoTop pBdr");
+        assert_eq!(no_top.top.map(|s| s.style), Some(engine::BorderStyle::None));
+
+        let rtl = &t.by_id["Rtl"].para;
+        let b = rtl.borders.clone().expect("Rtl pBdr");
+        assert_eq!(
+            b.right.map(|s| s.style),
+            Some(engine::BorderStyle::Single),
+            "start = right in the style's own RTL"
+        );
+        assert_eq!(b.left.map(|s| s.style), Some(engine::BorderStyle::Double));
+        assert!(rtl.border_spelling.start && rtl.border_spelling.end);
+
+        assert!(
+            t.by_id["Grid"].para.borders.is_none(),
+            "a table style's tblBorders are not paragraph borders"
+        );
     }
 }
