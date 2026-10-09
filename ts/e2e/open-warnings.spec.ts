@@ -150,6 +150,13 @@ test('the telemetry DOC_OPEN sample carries per-kind read-warning counts, codes 
         { kind: 'InvalidMeasure', count: 1 },
         { kind: 'MeasureClamped', count: 1 },
     ]);
-    /* Codes and counts only: no detail string (it echoes document bytes). */
-    expect(JSON.stringify(sample)).not.toContain('99999');
+    /* Codes and counts only: no detail string (it echoes document bytes).
+       Not a bare `99999` substring check: a float like `open_ms:
+       67.42999997735023` contains one. */
+    for (const w of sample.read_warnings ?? []) {
+        expect(Object.keys(w).sort()).toEqual(['count', 'kind']);
+    }
+    const json = JSON.stringify(sample);
+    expect(json).not.toContain('pgMar');
+    expect(json).not.toContain('"99999"');
 });
