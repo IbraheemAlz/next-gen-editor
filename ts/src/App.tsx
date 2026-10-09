@@ -215,6 +215,23 @@ export function App() {
        caret + selection overlays render from. */
     const store = createEngineStore(client);
 
+    /* Issue #254 — the comments rail selected a comment's text: bring the
+       caret into view. The caret overlay is mounted on the page holding
+       it; before the next frame it may still be moving. */
+    const revealCaret = (): void => {
+        requestAnimationFrame(() => {
+            const caretEl = viewportEl?.querySelector<HTMLElement>('.caret');
+            if (caretEl) {
+                caretEl.scrollIntoView({ block: 'center', inline: 'nearest' });
+                return;
+            }
+            const c = store.caret();
+            if (viewportEl && c) {
+                viewportEl.scrollTop = Math.max(0, c.y - viewportEl.clientHeight / 2);
+            }
+        });
+    };
+
     /* §10 D4.10 — drop a .docx anywhere on the page to load it. */
     onMount(() => onCleanup(attachDragDrop(client)));
 
@@ -326,6 +343,7 @@ export function App() {
                 telemetry={telemetryConfig}
                 telemetryEndpoint={telemetryEndpoint}
                 engineReady={() => !booting()}
+                onRevealCaret={revealCaret}
             >
                 <div class="editor-viewport" ref={viewportEl}>
                     {/* Phase 6c multi-canvas DOM — one `.editor-page` per

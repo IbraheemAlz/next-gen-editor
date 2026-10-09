@@ -11,6 +11,7 @@
  * (via `tsify-next`) into the `engine-wasm` wasm-pack package, so that is the
  * real import site. */
 import type {
+    BlockPath,
     Command,
     DocFormat,
     DocumentDefaults,
@@ -81,6 +82,9 @@ export interface CommentSnapshot {
     start_offset: number;
     end_block: number;
     end_offset: number;
+    /** Issue #254 — full anchor paths (cell comments address their cell). */
+    start_path: BlockPath;
+    end_path: BlockPath;
     resolved: boolean;
     /** Issue #27 — parent comment `w:id` when this row is a threaded
      *  reply; `undefined` on top-level comments. */
