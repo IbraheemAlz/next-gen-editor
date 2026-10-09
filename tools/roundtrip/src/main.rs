@@ -31,6 +31,7 @@
 
 mod inline_spans;
 mod note_containers;
+mod paragraph_format;
 mod revision_ids;
 mod revisions;
 mod table_markup;
@@ -340,6 +341,7 @@ fn run_default() -> Result<()> {
     revisions::run_tracked_split_roundtrip()?;
     revisions::run_tracked_cross_paragraph_delete_roundtrip()?;
     revision_ids::run_revision_ids_roundtrip()?;
+    paragraph_format::run_paragraph_format_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4346,6 +4348,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         }]),
     };
     vec![

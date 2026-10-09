@@ -18,7 +18,7 @@ use crate::parts::numbering::build_numbering_xml;
 use crate::schema::block_envelope::EnvelopeStack;
 use crate::schema::comment_anchors;
 use crate::schema::ct_ppr::ppr_child_rank;
-use crate::schema::ct_rpr::rpr_child_rank;
+use crate::schema::ct_rpr::{mark_rpr_style, rpr_child_rank, unmodeled_rpr_children};
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::fragment_qname;
@@ -566,9 +566,14 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
         let def = &doc.styles[id];
         out.push_str("<w:style w:type=\"paragraph\" w:styleId=\"");
         push_escaped_attr(id, &mut out);
-        out.push_str("\"><w:name w:val=\"");
-        push_escaped_attr(&def.name, &mut out);
-        out.push_str("\"/>");
+        out.push_str("\">");
+        /* Issue #297 — the display name as read (`heading 1`), not the
+        id; a style read without `<w:name>` (empty name) stays without. */
+        if !def.name.is_empty() {
+            out.push_str("<w:name w:val=\"");
+            push_escaped_attr(&def.name, &mut out);
+            out.push_str("\"/>");
+        }
         if let Some(parent) = &def.based_on {
             out.push_str("<w:basedOn w:val=\"");
             push_escaped_attr(parent, &mut out);
@@ -857,6 +862,11 @@ fn serialize_paragraph_body(
     } else {
         std::borrow::Cow::Borrowed(&para.props)
     };
+    /* Issue #293 — the mark's rPr spells the modeled mark style. */
+    let props = match with_mark_style(&props, para.mark_style.as_deref()) {
+        Some(p) => std::borrow::Cow::Owned(p),
+        None => props,
+    };
     /* Issues #262 / #303 — the paragraph-mark revisions re-enter the
     mark's rPr, all of them, in order. */
     let props = if para.mark_revisions.is_empty() {
@@ -1045,6 +1055,74 @@ fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
         /* Issues #262 / #303 — the bytes spell the paragraph-mark
         revisions. */
         && sp.mark_revisions == para.mark_revisions
+        /* Issue #293 — and the mark's run properties. */
+        && mark_rpr_is_current(&para.props, para.mark_style.as_deref())
+}
+
+/// Issue #293 — the paragraph-mark `<w:rPr>` fragment riding the pPr
+/// grab bag, if any.
+fn mark_rpr_fragment(props: &ParaProperties) -> Option<&[u8]> {
+    engine::GrabBag::fragments_of(&props.grab_bag)
+        .iter()
+        .find(|f| fragment_qname(f) == b"w:rPr")
+        .map(Vec::as_slice)
+}
+
+/// Issue #293 — `true` while the mark `<w:rPr>` in `props`' bag (or its
+/// absence) still spells `mark` (`Paragraph::mark_style`, modeled fields
+/// only); a `None` mark is not modeled — the bag is the truth.
+fn mark_rpr_is_current(props: &ParaProperties, mark: Option<&SpanStyle>) -> bool {
+    let Some(mark) = mark else {
+        return true;
+    };
+    let spelled = mark_rpr_fragment(props)
+        .map(mark_rpr_style)
+        .unwrap_or_default();
+    spelled
+        == SpanStyle {
+            grab_bag: None,
+            ..mark.clone()
+        }
+}
+
+/// Issue #293 — `props` with the mark `<w:rPr>` fragment regenerated from
+/// `mark` when the recorded one no longer spells it (`None` when it
+/// still does): the modeled children from `mark`, the recorded
+/// fragment's unmodeled ones (`<w:lang>`, `<w:rStyle>`, the
+/// `<w:rPrChange>` history …) kept, each unchanged child in its source
+/// spelling ([`emit_rpr_adopting`]). A mark with nothing to say drops
+/// the fragment.
+fn with_mark_style(props: &ParaProperties, mark: Option<&SpanStyle>) -> Option<ParaProperties> {
+    if mark_rpr_is_current(props, mark) {
+        return None;
+    }
+    let mark = mark?;
+    let old = mark_rpr_fragment(props);
+    let kept = old.map(unmodeled_rpr_children).unwrap_or_default();
+    let style = SpanStyle {
+        grab_bag: (!kept.is_empty()).then(|| Box::new(engine::GrabBag { fragments: kept })),
+        ..mark.clone()
+    };
+    let mut rpr = String::new();
+    emit_rpr_adopting(&style, old, &mut rpr);
+    let mut p = props.clone();
+    let bag = p.grab_bag.get_or_insert_with(Default::default);
+    let at = bag
+        .fragments
+        .iter()
+        .position(|f| fragment_qname(f) == b"w:rPr");
+    match (at, rpr.is_empty()) {
+        (Some(i), true) => {
+            bag.fragments.remove(i);
+        }
+        (Some(i), false) => bag.fragments[i] = rpr.into_bytes(),
+        (None, false) => bag.fragments.push(rpr.into_bytes()),
+        (None, true) => {}
+    }
+    if bag.fragments.is_empty() {
+        p.grab_bag = None;
+    }
+    Some(p)
 }
 
 /// Issues #262 / #303 — `props` with the paragraph-mark revisions `revs`
@@ -4890,6 +4968,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4933,6 +5012,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4980,6 +5060,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5041,6 +5122,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5088,6 +5170,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5195,6 +5278,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7060,6 +7144,7 @@ mod tests {
                 body_xml: None,
                 source_markup: None,
                 mark_revisions: Vec::new(),
+                mark_style: None,
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -7121,6 +7206,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7249,6 +7335,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -7281,6 +7368,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7341,6 +7429,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -8022,6 +8111,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -8664,6 +8754,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -10337,6 +10428,12 @@ mod inline_span_tests;
 #[cfg(test)]
 #[path = "writer_table_markup_tests.rs"]
 mod table_markup_tests;
+
+/// Issues #292 / #293 / #297 — paragraph formatting through edits and
+/// saves (merges, the paragraph mark's run properties, style names).
+#[cfg(test)]
+#[path = "writer_paragraph_format_tests.rs"]
+mod paragraph_format_tests;
 
 /// Issue #295 — package-unique tracked-change annotation ids.
 #[cfg(test)]

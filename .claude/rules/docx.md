@@ -63,6 +63,17 @@ The `tools/roundtrip/` harness asserts:
   (rank tables in `schema/ct_rpr.rs`, `ct_ppr.rs`, `ct_tbl.rs`).
 - The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole; its
   modeled children still seed the run baseline (`fold_rpr_fragment`).
+  Issue #293 — they are also modeled as `Paragraph::mark_style`
+  (`schema::ct_rpr::mark_rpr_style`; `None` = not modeled, the bag is the
+  truth): typing into an empty paragraph inherits it, `split_at` gives an
+  EMPTY half the insertion formatting at the split point, `concat` keeps
+  the surviving paragraph's. The writer re-emits the bag fragment while
+  `mark_rpr_style(fragment) == mark_style` (also a condition of the
+  verified pPr passthrough), else regenerates it from `mark_style` keeping
+  the fragment's unmodeled children (`unmodeled_rpr_children`) and the
+  source spelling of unchanged ones; the #262 mark revision is re-injected
+  after. Harness: `tools/roundtrip` step 40 (`paragraph_format.rs` — with
+  the #292 merge and the #297 style names).
 - **When you model a new child:** add it to the `*_child_is_modeled`
   predicate *and* emit it through the `PrChildren` sink in `writer.rs`
   at its rank — never both bag it and emit it (duplicate child).
@@ -284,8 +295,11 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   with review mode on (`DocumentTree::tracked_split_paragraph`, engine
   `crates/engine/src/tracked.rs`) records the NEW mark — the one ending
   the left half, Word's `<w:ins/>` on the first paragraph — as inserted;
-  `split_paragraph` now carries the text revisions onto both halves
-  (a straddling change is cut; the right piece drops its source id). A
+  `split_at` carries the text revisions — and, issue #292, the
+  hyperlinks — onto both halves, so `split_paragraph`, tracked Enter, a
+  cross-paragraph delete's halves and clipboard slices all do (a
+  straddling change is cut once, `tracked::split_revisions`; the right
+  piece drops its source id, and `concat` re-joins the two pieces). A
   tracked deletion (`try_tracked_delete_range`; `tracked_delete_range`
   wraps it) works over any range inside ONE container: per paragraph the
   reviewer's own pending insertions are removed outright (the #265 path,

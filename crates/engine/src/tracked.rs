@@ -80,7 +80,9 @@ pub(crate) fn mark_change(kind: RevisionKind, author: &str, date: &str) -> Revis
 /// left half keeps those before `at`, the right half gets those after it
 /// (shifted), and a change straddling `at` is cut in two. The right piece
 /// of a cut change carries no source `w:id` (ids are document-unique; the
-/// writer assigns one).
+/// writer assigns one). Issue #292 — the one cut every split uses:
+/// [`Paragraph::split_at`] calls it, and `Paragraph::concat` re-joins the
+/// two pieces at the seam.
 pub(crate) fn split_revisions(revs: &[Revision], at: u32) -> (Vec<Revision>, Vec<Revision>) {
     let mut left = Vec::new();
     let mut right = Vec::new();
