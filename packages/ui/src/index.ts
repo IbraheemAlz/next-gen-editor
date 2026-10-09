@@ -80,6 +80,8 @@ export type { RulerProps } from './Ruler';
 
 export { TextFormatButtons } from './TextFormatButtons';
 export { FontPickers } from './FontPickers';
+export { FontDialog } from './FontDialog';
+export type { FontDialogProps } from './FontDialog';
 export { ColorPickers } from './ColorPickers';
 export { AlignmentButtons } from './AlignmentButtons';
 export { InsertTableButton } from './InsertTableButton';

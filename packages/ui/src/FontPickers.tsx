@@ -24,7 +24,7 @@
  * the registry does not ship (Word's Calibri) still shows by name, as a
  * disabled placeholder option, instead of silently showing the first
  * registry font. Picks stay "Both" slots (Word's ribbon); per-slot picks
- * live in the Font dialog (issue #420).
+ * live in the Font dialog (issue #420), opened by the "Font…" button.
  */
 import { createSignal, createMemo, createEffect, For, Show, type Component } from 'solid-js';
 import {
@@ -33,6 +33,7 @@ import {
     useFontRegistry,
 } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { FontDialog } from './FontDialog';
 import './FontPickers.css';
 
 const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72];
@@ -42,6 +43,8 @@ export const FontPickers: Component = () => {
     const state = createEditorState();
     const registry = useFontRegistry();
     const [pending, setPending] = createSignal(false);
+    /* Issue #420 — the per-script-slot Font dialog. */
+    const [dialogOpen, setDialogOpen] = createSignal(false);
 
     const ready = createMemo(() => state.selection() !== undefined);
     /* Issue #423 — the slot the caret's text reads, and its resolution. */
@@ -165,6 +168,19 @@ export const FontPickers: Component = () => {
             <datalist id="nge-font-sizes">
                 <For each={FONT_SIZES}>{(s) => <option value={s.toString()} />}</For>
             </datalist>
+            <button
+                class="nge-btn nge-font__more"
+                type="button"
+                aria-haspopup="dialog"
+                aria-label="Font dialog: format Latin and complex-script text separately"
+                title="Font… — family, size, bold and italic for Latin text and for complex scripts (Arabic, Hebrew, …) separately"
+                disabled={!ready()}
+                data-nge-command="APPLY_FORMATTING"
+                onClick={() => setDialogOpen(true)}
+            >
+                Font…
+            </button>
+            <FontDialog open={dialogOpen()} onClose={() => setDialogOpen(false)} />
         </div>
     );
 };

@@ -37,7 +37,7 @@ export {
     emptyPatch,
     emptyDocumentDefaults,
 } from './createEditorCommands';
-export type { EditorCommands, ParagraphStyleId } from './createEditorCommands';
+export type { EditorCommands, ParagraphStyleId, SlotFormatPatch } from './createEditorCommands';
 
 export { createEditorState } from './createEditorState';
 export type { EditorState } from './createEditorState';

@@ -605,3 +605,39 @@ fn an_unregistered_family_claims_only_the_targeted_slot() {
         assert!(!notdef);
     }
 }
+
+/// Issue #420 — `setBold` / `setItalic` with a slot (and the Font dialog's
+/// per-section Apply) route weight and slant like size and family: a
+/// complex-script-only bold + italic shows on the Arabic alone, a Latin
+/// one on the Latin alone; the toolbar's slot-less patch still sets both.
+#[test]
+fn apply_formatting_routes_bold_and_italic_by_font_slot() {
+    let len = BCS_TEXT.len() as u32;
+    let styled = |slot: Option<FontSlot>| TextAttrsPatch {
+        bold: Some(true),
+        italic: Some(true),
+        font_size: None,
+        ..patch(0.0, slot)
+    };
+    for (slot, latin, arabic) in [
+        (Some(FontSlot::ComplexScript), (false, false), (true, true)),
+        (Some(FontSlot::Latin), (true, true), (false, false)),
+        (None, (true, true), (true, true)),
+    ] {
+        let mut e = engine_for_run("");
+        select(&mut e, 0, 0, len);
+        apply(
+            &mut e,
+            Command::ApplyFormatting {
+                range: None,
+                attrs: styled(slot),
+            },
+        );
+        let runs = faces(&e);
+        assert!(runs.iter().any(|r| r.0) && runs.iter().any(|r| !r.0));
+        for (cs, b, i) in runs {
+            let want = if cs { arabic } else { latin };
+            assert_eq!((b, i), want, "{slot:?}: complex={cs}");
+        }
+    }
+}

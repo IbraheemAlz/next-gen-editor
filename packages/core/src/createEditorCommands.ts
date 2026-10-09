@@ -128,6 +128,18 @@ export function emptyDocumentDefaults(): DocumentDefaults {
     return { page_size: undefined, widow_control: undefined };
 }
 
+/**
+ * Issue #420 — the per-slot formatting `EditorCommands.setSlotFormat`
+ * writes: every field optional, only the present ones are applied.
+ * `fontFamily` is a font-registry id (`FontRegistry.fonts()[n].id`).
+ */
+export interface SlotFormatPatch {
+    fontFamily?: string;
+    fontSize?: number;
+    bold?: boolean;
+    italic?: boolean;
+}
+
 export interface EditorCommands {
     /* Lifecycle */
     requestStats(): Promise<Event>;
@@ -180,17 +192,34 @@ export interface EditorCommands {
 
     /* Formatting — `range` defaults to the engine-owned live selection. */
     applyAttrs(attrs: Partial<TextAttrsPatch>, range?: LogicalRange): Promise<Event>;
-    setBold(value: boolean, range?: LogicalRange): Promise<Event>;
-    setItalic(value: boolean, range?: LogicalRange): Promise<Event>;
+    /** Issue #420 — `slot` picks the script slot, as for `setFontSize`:
+     *  omitted (or `'Both'`, Word's ribbon) = `<w:b>` AND `<w:bCs>`;
+     *  `'Latin'` = `<w:b>` only; `'ComplexScript'` = `<w:bCs>` only. */
+    setBold(value: boolean, range?: LogicalRange, slot?: FontSlot): Promise<Event>;
+    /** Issue #420 — `slot` as for `setBold` (`<w:i>` / `<w:iCs>`). */
+    setItalic(value: boolean, range?: LogicalRange, slot?: FontSlot): Promise<Event>;
     setStrike(value: boolean, range?: LogicalRange): Promise<Event>;
     setUnderline(style: UnderlineStyle, range?: LogicalRange): Promise<Event>;
     setVerticalScript(script: VerticalScript, range?: LogicalRange): Promise<Event>;
-    setFontFamily(family: string, range?: LogicalRange): Promise<Event>;
+    /** Issue #420 — `slot` as for `setBold`: `'Latin'` names
+     *  `w:ascii` / `w:hAnsi` only, `'ComplexScript'` `w:cs` only (the
+     *  Arabic face), omitted / `'Both'` all three. */
+    setFontFamily(family: string, range?: LogicalRange, slot?: FontSlot): Promise<Event>;
     /** Issue #359 — `slot` picks the script slot the size writes: omitted
      *  (or `'Both'`) sets Latin AND complex-script text, as Word's ribbon
      *  does; `'Latin'` = `<w:sz>` only; `'ComplexScript'` = `<w:szCs>`
      *  only (Arabic / Hebrew / Thai text). */
     setFontSize(pt: number, range?: LogicalRange, slot?: FontSlot): Promise<Event>;
+    /**
+     * Issue #420 — family / size / weight / slant of ONE script slot in a
+     * single `APPLY_FORMATTING` (one undo step): the Font dialog's
+     * "Latin text" (`'Latin'`) or "Complex scripts" (`'ComplexScript'`)
+     * section. Only the fields present are written, so a mixed selection
+     * keeps everything the user did not touch. A collapsed caret arms
+     * the formatting for the next keystroke (pending style), like every
+     * formatting helper.
+     */
+    setSlotFormat(slot: FontSlot, format: SlotFormatPatch, range?: LogicalRange): Promise<Event>;
     setColor(r: number, g: number, b: number, a?: number, range?: LogicalRange): Promise<Event>;
     setHighlight(r: number, g: number, b: number, a?: number, range?: LogicalRange): Promise<Event>;
     /** `<w:caps/>` — render every glyph uppercase. */
@@ -591,6 +620,11 @@ function build(
             range: range as LogicalRange,
             attrs: { ...emptyPatch(), ...patch },
         });
+    /* Issues #359 / #420 — an omitted slot stays off the wire (the engine
+     * reads it as `Both`, Word's ribbon), so older engines see the exact
+     * patch they always did. */
+    const slotted = (patch: Partial<TextAttrsPatch>, slot?: FontSlot): Partial<TextAttrsPatch> =>
+        slot === undefined ? patch : { ...patch, font_slot: slot };
 
     return {
         requestStats: () => dispatch({ type: 'REQUEST_STATS' }),
@@ -628,8 +662,8 @@ function build(
             dispatch({ type: 'MOVE_CARET', direction, extend }),
 
         applyAttrs: (patch, range) => fmt(patch, range),
-        setBold: (value, range) => fmt({ bold: value }, range),
-        setItalic: (value, range) => fmt({ italic: value }, range),
+        setBold: (value, range, slot) => fmt(slotted({ bold: value }, slot), range),
+        setItalic: (value, range, slot) => fmt(slotted({ italic: value }, slot), range),
         setStrike: (value, range) => fmt({ strike: value }, range),
         setUnderline: (style, range) => fmt({ underline: style }, range),
         /* TextAttrsPatch.script holds a VerticalScript on the wire — the
@@ -637,9 +671,16 @@ function build(
          * Sprint 1 (UI Edition) Super/Sub buttons hit this path with no
          * bridge change required. */
         setVerticalScript: (script, range) => fmt({ script }, range),
-        setFontFamily: (font_family, range) => fmt({ font_family }, range),
-        setFontSize: (font_size, range, slot) =>
-            fmt(slot === undefined ? { font_size } : { font_size, font_slot: slot }, range),
+        setFontFamily: (font_family, range, slot) => fmt(slotted({ font_family }, slot), range),
+        setFontSize: (font_size, range, slot) => fmt(slotted({ font_size }, slot), range),
+        setSlotFormat: (slot, format, range) => {
+            const patch: Partial<TextAttrsPatch> = { font_slot: slot };
+            if (format.fontFamily !== undefined) patch.font_family = format.fontFamily;
+            if (format.fontSize !== undefined) patch.font_size = format.fontSize;
+            if (format.bold !== undefined) patch.bold = format.bold;
+            if (format.italic !== undefined) patch.italic = format.italic;
+            return fmt(patch, range);
+        },
         setColor: (r, g, b, a = 255, range) => fmt({ color: { r, g, b, a } }, range),
         setHighlight: (r, g, b, a = 255, range) =>
             fmt({ bg_color: { r, g, b, a } }, range),
