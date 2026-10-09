@@ -14,6 +14,8 @@ pub mod ct_tbl;
 pub mod drawing;
 pub mod family;
 pub mod grab_bag;
+pub(crate) mod mce;
+pub(crate) mod measure;
 pub mod ns_normalize;
 pub mod source_markup;
 pub mod wp_anchor;

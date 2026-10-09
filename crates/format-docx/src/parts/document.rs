@@ -23,6 +23,8 @@ use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::mce;
+use crate::schema::measure::{PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt};
 use crate::schema::source_markup::{
     MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_textless_run_child,
 };
@@ -33,11 +35,6 @@ use engine::{
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
-
-/// Twips (1/20 pt) → layout pt. OOXML page geometry is encoded in twips.
-fn twips_to_pt(s: &str) -> Option<f32> {
-    s.trim().parse::<f32>().ok().map(|v| v / 20.0)
-}
 
 /// Accumulator for one `<w:sectPr>` while the parser is inside it. Folded into
 /// a [`PageGeometry`] + header/footer refs when `</w:sectPr>` closes.
@@ -229,6 +226,113 @@ struct FieldCursor<'a> {
     in_table: bool,
 }
 
+/// Issue #350 — deepest complex-field nesting the reader models. Deeper
+/// fields are kept as hidden field code (their bytes ride the paragraph);
+/// a stray `begin` can no longer grow the stack without bound.
+const MAX_FIELD_NESTING: usize = 32;
+
+/// Issue #350 — the field characters [`handle_fld_char`] never sees: those
+/// of fields nested past [`MAX_FIELD_NESTING`] (counted in `overflow`, so
+/// their `separate` / `end` pair with them and not with a modeled field)
+/// and `separate` / `end` with no open field at all. Interior mutability
+/// so it can sit in a match guard.
+#[derive(Default)]
+struct FieldCap {
+    overflow: std::cell::Cell<u32>,
+}
+
+impl FieldCap {
+    /// `true` when this `<w:fldChar>` is absorbed (not modeled); `depth`
+    /// is the open field stack's length.
+    fn absorb(&self, e: &BytesStart<'_>, depth: usize) -> bool {
+        let kind = attr_val(e, b"w:fldCharType").unwrap_or_default();
+        let overflow = self.overflow.get();
+        match kind.trim() {
+            "begin" if overflow > 0 || depth >= MAX_FIELD_NESTING => {
+                if overflow == 0 {
+                    crate::error::warn(DocxWarning::FieldNestingTooDeep {
+                        limit: MAX_FIELD_NESTING as u32,
+                    });
+                }
+                self.overflow.set(overflow + 1);
+                true
+            }
+            "separate" if overflow > 0 => true,
+            "end" if overflow > 0 => {
+                self.overflow.set(overflow - 1);
+                true
+            }
+            k @ ("separate" | "end") if depth == 0 => {
+                crate::error::warn(DocxWarning::StrayFieldChar {
+                    kind: k.to_string(),
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Issue #350 — `true` while the cursor is inside field CODE: some open
+/// field is still in its instruction part (between `begin` and
+/// `separate`) — a nested field's result there is part of the enclosing
+/// instruction — or a field past the nesting cap is open. Text there never
+/// enters the visible paragraph text.
+fn field_code_hidden(stack: &[FieldBuilder], cap: &FieldCap) -> bool {
+    cap.overflow.get() > 0 || stack.iter().any(|f| f.cached_start.is_none())
+}
+
+/// Issue #350 — `</w:p>` (whose `<` sits at byte `end`): a field still in
+/// its instruction part cannot continue into the next paragraph — close
+/// it (and everything nested in it), with a reader warning, so a stray
+/// `begin` can never hide the rest of the document. Fields already in
+/// their result part stay open (a TOC's result spans paragraphs). The
+/// closed range — the outermost unclosed field's `begin` run to the
+/// paragraph end — is kept whole as a content marker when its bytes allow
+/// (see `MarkupCapture::close_field_spans`), so a regenerated paragraph
+/// keeps the broken field code instead of dropping it.
+fn close_open_field_code(
+    stack: &mut Vec<FieldBuilder>,
+    cap: &FieldCap,
+    markup: &mut MarkupCapture,
+    xml: &[u8],
+    end: usize,
+    ns: &NamespaceScope,
+) {
+    let first = stack.iter().position(|f| f.cached_start.is_none());
+    let overflow = cap.overflow.replace(0);
+    let Some(first) = first.or((overflow > 0).then_some(stack.len())) else {
+        return;
+    };
+    let count = (stack.len() - first) as u32 + overflow;
+    stack.truncate(first);
+    crate::error::warn(DocxWarning::UnclosedField { count });
+    markup.close_field_spans(first + 1, xml, end, ns);
+}
+
+/// Issue #351 — where an `<mc:AlternateContent>` the body walker tracks
+/// lives: between blocks (its envelope rides the selected branch's first /
+/// last block, like a block-level `<w:sdt>`) or inside a paragraph (its
+/// wrapper rides the paragraph's source markup as an opener / closer
+/// pair, like a run-level `<w:sdt>`). A run-level one is captured whole as
+/// an inline object instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltLevel {
+    Block,
+    Paragraph,
+}
+
+/// Issue #351 — one tracked `<mc:AlternateContent>`.
+struct AltFrame {
+    level: AltLevel,
+    /// Its start tag (namespace declarations for `Requires`).
+    tag: BytesStart<'static>,
+    /// A branch was taken (every later sibling branch is skipped).
+    selected: bool,
+    /// The walker is inside the taken branch.
+    in_branch: bool,
+}
+
 /// Apply one `<w:fldChar>` event to the field state machine.
 ///
 /// `fldCharType="begin"` pushes a fresh [`FieldBuilder`] onto the stack.
@@ -262,9 +366,25 @@ fn handle_fld_char(
             }
         }
         "end" => {
-            if let Some(top) = stack.pop()
-                && let Some(start) = top.cached_start
+            let Some(top) = stack.pop() else {
+                return;
+            };
+            /* Issue #350 — a field nested in an enclosing field's CODE
+            (`IF { MERGEFIELD x } = …`) is part of that code: it joins the
+            enclosing instruction the way Word's field-code view spells it,
+            and its result — hidden text — is no overlay. */
+            if let Some(parent) = stack.last_mut()
+                && parent.cached_start.is_none()
             {
+                parent.instruction.push_str("{ ");
+                parent.instruction.push_str(top.instruction.trim());
+                parent.instruction.push_str(" }");
+                return;
+            }
+            if stack.iter().any(|f| f.cached_start.is_none()) {
+                return;
+            }
+            if let Some(start) = top.cached_start {
                 let end = here;
                 let instruction = top.instruction.trim().to_string();
                 /* Issue #81 — a result that crossed into a later top-level
@@ -849,31 +969,34 @@ impl SectPrAccum {
             }
         }
         match name {
+            /* Issue #349 — one lenient measure reader: finite, in
+            range, unit suffixes honoured; an unusable value keeps the
+            default and is reported (the bytes ride `source_xml`). */
             b"w:pgSz" => {
-                if let Some(v) = attr_val(e, b"w:w").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:w", PAGE_SIZE) {
                     self.width = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:h").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:h", PAGE_SIZE) {
                     self.height = Some(v);
                 }
             }
             b"w:pgMar" => {
-                if let Some(v) = attr_val(e, b"w:top").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:top", SIGNED_TWIPS) {
                     self.margin_top = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:right").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:right", TWIPS) {
                     self.margin_right = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:bottom").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:bottom", SIGNED_TWIPS) {
                     self.margin_bottom = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:left").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:left", TWIPS) {
                     self.margin_left = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:header").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:header", TWIPS) {
                     self.header_offset = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:footer").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:footer", TWIPS) {
                     self.footer_offset = Some(v);
                 }
             }
@@ -1036,7 +1159,7 @@ pub fn parse_document_xml(
     resolver: &StyleResolver<'_>,
 ) -> Result<DocumentTree, DocxError> {
     let mut warnings = Vec::new();
-    parse_document_xml_with_warnings(xml, resolver, &mut warnings, PageGeometry::default())
+    parse_document_xml_inner(xml, resolver, &mut warnings, PageGeometry::default())
 }
 
 /// Strip a leading UTF-8 byte-order mark (`EF BB BF`).
@@ -1063,6 +1186,23 @@ pub(crate) fn strip_utf8_bom(xml: &[u8]) -> &[u8] {
 /// (`opc::archive`) is the host-facing entry point that threads a
 /// `DefaultPageSize::Letter` geometry down to this parameter instead.
 pub fn parse_document_xml_with_warnings(
+    xml: &[u8],
+    resolver: &StyleResolver<'_>,
+    warnings: &mut Vec<DocxWarning>,
+    default_page_geometry: PageGeometry,
+) -> Result<DocumentTree, DocxError> {
+    /* Issues #349 / #350 — the deep helpers' diagnostics (measures, the
+    field machinery) reach `warnings` through the read's sink. */
+    crate::error::collect_read_warnings(warnings, |warnings| {
+        parse_document_xml_inner(xml, resolver, warnings, default_page_geometry)
+    })
+}
+
+/// [`parse_document_xml_with_warnings`] without opening a warnings scope:
+/// diagnostics raised through `crate::error::warn` go to the enclosing
+/// read (a cell paragraph, a text-box story or a header part reports into
+/// the package read that is parsing it).
+fn parse_document_xml_inner(
     xml: &[u8],
     resolver: &StyleResolver<'_>,
     warnings: &mut Vec<DocxWarning>,
@@ -1137,7 +1277,12 @@ pub(crate) fn reparse_paragraph(
         wrapped.extend_from_slice(crate::schema::NS_W.as_bytes());
         wrapped.push(b'"');
     }
-    for (k, v) in root_attrs.iter().filter(|(k, _)| k.starts_with("xmlns")) {
+    /* The namespace declarations and (issue #351) `mc:Ignorable`, so the
+    re-read selects the same `mc:AlternateContent` branches. */
+    for (k, v) in root_attrs
+        .iter()
+        .filter(|(k, _)| k.starts_with("xmlns") || k.ends_with(":Ignorable"))
+    {
         wrapped.push(b' ');
         wrapped.extend_from_slice(k.as_bytes());
         wrapped.extend_from_slice(b"=\"");
@@ -1164,7 +1309,9 @@ pub(crate) fn reparse_paragraph(
 /// pieces carry their full cell path, and an unpaired piece (one end of a
 /// range that crosses the parsed fragment) is still reported — the writer
 /// verifies a patched paragraph against them, and the cell parser lifts a
-/// cell paragraph's pieces into its table's.
+/// cell paragraph's pieces into its table's. Like
+/// `parse_document_xml_inner`, it opens no warnings scope (issue #349):
+/// diagnostics go to the enclosing read.
 pub(crate) fn parse_document_xml_with_events(
     xml: &[u8],
     resolver: &StyleResolver<'_>,
@@ -1213,6 +1360,8 @@ pub(crate) fn parse_document_xml_with_events(
     text begins (set when `separate` arrives) and the accumulating
     instruction string. `cached_start: None` before `separate`. */
     let mut field_stack: Vec<FieldBuilder> = Vec::new();
+    /* Issue #350 — fields past the nesting cap, stray field characters. */
+    let field_cap = FieldCap::default();
     /* Issue #43 — `<w:fldSimple w:instr="…">cached runs</w:fldSimple>`,
     the compact single-element field form Word emits for simple PAGE /
     DATE fields. Stack of (instruction, cached-start); the close tag
@@ -1308,6 +1457,9 @@ pub(crate) fn parse_document_xml_with_events(
     the bytes the writer used to synthesize. */
     let had_bom = xml_raw.len() != xml.len();
     let mut envelopes = BlockEnvelopes::new();
+    /* Issue #351 — block- / paragraph-level `mc:AlternateContent` open at
+    the cursor, innermost last. */
+    let mut alt_stack: Vec<AltFrame> = Vec::new();
     let mut in_block_container = false;
     let mut root_is_document = false;
     let mut root_end: usize = 0;
@@ -1471,6 +1623,86 @@ pub(crate) fn parse_document_xml_with_events(
                         buf.clear();
                         continue;
                     }
+                    /* Issue #351 — `mc:AlternateContent` between runs or
+                    between blocks: only the branch a consumer selects is
+                    walked (the first `mc:Choice` whose `Requires` the
+                    reader understands, else the `mc:Fallback`); the
+                    branches not taken ride the opener / closer bytes. */
+                    b"mc:AlternateContent" if in_para && !in_ppr => {
+                        markup.wrapper_start(prev_pos);
+                        alt_stack.push(AltFrame {
+                            level: AltLevel::Paragraph,
+                            tag: e.clone().into_owned(),
+                            selected: false,
+                            in_branch: false,
+                        });
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    b"mc:AlternateContent" if at_block_level => {
+                        envelopes.open_container(prev_pos);
+                        envelopes.set_blocks_at_open(out_blocks.len());
+                        alt_stack.push(AltFrame {
+                            level: AltLevel::Block,
+                            tag: e.clone().into_owned(),
+                            selected: false,
+                            in_branch: false,
+                        });
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    b"mc:Choice" | b"mc:Fallback"
+                        if !in_run && alt_stack.last().is_some_and(|f| !f.in_branch) =>
+                    {
+                        let frame = alt_stack.last_mut().expect("guarded");
+                        let take = !frame.selected
+                            && (name.as_ref() == b"mc:Fallback"
+                                || mce::choice_selectable(Some(&frame.tag), &e));
+                        if take {
+                            frame.selected = true;
+                            frame.in_branch = true;
+                            let end = reader.buffer_position() as usize;
+                            if frame.level == AltLevel::Paragraph {
+                                let close: &'static [u8] = if name.as_ref() == b"mc:Choice" {
+                                    b"</mc:Choice></mc:AlternateContent>"
+                                } else {
+                                    b"</mc:Fallback></mc:AlternateContent>"
+                                };
+                                markup.wrapper_content_start(
+                                    xml,
+                                    end,
+                                    para_text.len() as u32,
+                                    &ns,
+                                    false,
+                                    close,
+                                );
+                            }
+                            prev_pos = end;
+                        } else {
+                            let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                            prev_pos = reader.buffer_position() as usize;
+                        }
+                        buf.clear();
+                        continue;
+                    }
+                    /* Issue #351 — an element the root's `mc:Ignorable`
+                    says to ignore (an ignorable prefix the reader does not
+                    understand) is never walked for content: kept verbatim
+                    between blocks or between runs. */
+                    n if (at_block_level || (in_para && !in_ppr)) && ns.ignores_element(n) => {
+                        if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            if at_block_level {
+                                envelopes.push_verbatim(frag);
+                            } else {
+                                markup.marker(para_text.len() as u32, frag, &ns);
+                            }
+                        }
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
                     b"w:sdtPr" | b"w:sdtEndPr" if in_para => {
                         let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
                         prev_pos = reader.buffer_position() as usize;
@@ -1498,6 +1730,14 @@ pub(crate) fn parse_document_xml_with_events(
                         if let Some(frag) = capture_subtree(xml, start, &mut reader, &e)? {
                             let end = reader.buffer_position() as usize;
                             let scan = scan_drawing(&frag);
+                            /* Issue #351 — an `mc:AlternateContent` is lowered
+                            from the branch a consumer selects (the bytes keep
+                            every branch). */
+                            let selected: &[u8] = if frag.starts_with(b"<mc:AlternateContent") {
+                                mce::selected_content(&frag).unwrap_or_default()
+                            } else {
+                                &frag
+                            };
                             /* Issue #83 — a text box (a `<wps:wsp>` shape with
                             a `<wps:txbx>` story, or a VML `<v:textbox>`) is
                             modeled as a story: its blocks parse through the
@@ -1505,7 +1745,7 @@ pub(crate) fn parse_document_xml_with_events(
                             container and the `<w:txbxContent>` ranges are
                             the writer's splice points. */
                             let text_box = if scan.drawing_ml {
-                                lower_text_box(&frag, resolver, &ns).map(|tb| {
+                                lower_text_box(selected, resolver, &ns).map(|tb| {
                                     (
                                         scan.cx.unwrap_or(0),
                                         scan.cy.unwrap_or(0),
@@ -1514,7 +1754,7 @@ pub(crate) fn parse_document_xml_with_events(
                                     )
                                 })
                             } else {
-                                textbox::parse_vml(&frag, resolver, &ns)
+                                textbox::parse_vml(selected, resolver, &ns)
                                     .map(|v| (v.width_emu, v.height_emu, v.anchor, v.story))
                             };
                             let at = (para_text.len() + run_text.len()) as u32;
@@ -1738,6 +1978,12 @@ pub(crate) fn parse_document_xml_with_events(
                         markup.run_text_elt(&e, &ns);
                     }
                     b"w:instrText" => in_instr_text = true,
+                    /* Issue #350 — a field character past the nesting cap,
+                    or one with no open field: not modeled, its run is kept
+                    verbatim. */
+                    b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
+                        markup.run_keep_verbatim();
+                    }
                     b"w:fldChar" => {
                         /* fldChar drives the field state machine. The
                         attribute value lives on the start tag's `w:fldCharType`
@@ -1926,6 +2172,34 @@ pub(crate) fn parse_document_xml_with_events(
                         markup.sdt_start(prev_pos);
                         markup.sdt_end(xml, here, para_text.len() as u32, &ns);
                     }
+                    /* Issue #351 — a self-closing branch of a tracked
+                    `mc:AlternateContent`: taking it selects nothing. */
+                    b"mc:Choice" | b"mc:Fallback"
+                        if !in_run && alt_stack.last().is_some_and(|f| !f.in_branch) =>
+                    {
+                        let frame = alt_stack.last_mut().expect("guarded");
+                        if !frame.selected
+                            && (name.as_ref() == b"mc:Fallback"
+                                || mce::choice_selectable(Some(&frame.tag), &e))
+                        {
+                            frame.selected = true;
+                            if frame.level == AltLevel::Paragraph {
+                                markup.wrapper_content_start(
+                                    xml,
+                                    here,
+                                    para_text.len() as u32,
+                                    &ns,
+                                    true,
+                                    b"</mc:AlternateContent>",
+                                );
+                            }
+                        }
+                    }
+                    n if in_para && !in_run && !in_ppr && ns.ignores_element(n) => {
+                        if let Some(frag) = slice_fragment(xml, prev_pos, here) {
+                            markup.marker(para_text.len() as u32, frag, &ns);
+                        }
+                    }
                     b"w:pPr" if in_para && !in_run => markup.close_ppr(xml, here, &ns),
                     b"w:rPr" if in_para && in_run => {
                         if let Some(frag) = slice_fragment(xml, prev_pos, here) {
@@ -2024,7 +2298,7 @@ pub(crate) fn parse_document_xml_with_events(
                     represent: verbatim, attached to the following block
                     (or after the last one). Comment range markers are
                     ALSO recorded as ranges in their own arms below. */
-                    n if at_block_level && is_block_level_marker(n) => {
+                    n if at_block_level && (is_block_level_marker(n) || ns.ignores_element(n)) => {
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
                             envelopes.push_verbatim(frag);
@@ -2041,6 +2315,9 @@ pub(crate) fn parse_document_xml_with_events(
                     }
                     b"w:ilvl" if in_num_pr => {
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
+                    }
+                    /* Issue #350 — inside field code: not visible. */
+                    b"w:tab" | b"w:br" if in_run && field_code_hidden(&field_stack, &field_cap) => {
                     }
                     b"w:tab" if in_run => {
                         /* Audit gap A.M5 — `<w:tab/>` inside a `<w:r>`.
@@ -2251,6 +2528,9 @@ pub(crate) fn parse_document_xml_with_events(
                             });
                         }
                     }
+                    b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
+                        markup.run_keep_verbatim();
+                    }
                     b"w:fldChar" => {
                         let depth_before = field_stack.len();
                         let fields_before = para_fields.len();
@@ -2382,6 +2662,13 @@ pub(crate) fn parse_document_xml_with_events(
                     _ => {}
                 }
             }
+            /* Issue #350 — field code (an instruction part, a nested
+            field's result inside one) is never visible text; its runs
+            ride the source markup / the field's source prologue. */
+            Event::Text(_)
+                if (in_text_elt || in_del_text_elt)
+                    && in_tbl == 0
+                    && field_code_hidden(&field_stack, &field_cap) => {}
             Event::Text(t) if (in_text_elt || in_del_text_elt) && in_tbl == 0 => {
                 run_text.push_str(&t.unescape()?);
             }
@@ -2451,7 +2738,9 @@ pub(crate) fn parse_document_xml_with_events(
                 runs is exactly the point of the stack-based state
                 machine, otherwise a `PAGE \* MERGEFORMAT` split across
                 `PAGE` and ` \* MERGEFORMAT` runs would lose its switch. */
-                if let Some(top) = field_stack.last_mut() {
+                if field_cap.overflow.get() == 0
+                    && let Some(top) = field_stack.last_mut()
+                {
                     top.instruction.push_str(&t.unescape()?);
                 }
             }
@@ -2516,6 +2805,32 @@ pub(crate) fn parse_document_xml_with_events(
                     and element close. */
                     b"w:sdtContent" if p_start_byte.is_some() && !in_run => {
                         markup.sdt_content_end(prev_pos);
+                    }
+                    /* Issue #351 — the taken branch / the tracked
+                    `mc:AlternateContent` close. */
+                    b"mc:Choice" | b"mc:Fallback"
+                        if !in_run && alt_stack.last().is_some_and(|f| f.in_branch) =>
+                    {
+                        if let Some(frame) = alt_stack.last_mut() {
+                            frame.in_branch = false;
+                            if frame.level == AltLevel::Paragraph {
+                                markup.sdt_content_end(prev_pos);
+                            }
+                        }
+                    }
+                    b"mc:AlternateContent"
+                        if !in_run && alt_stack.last().is_some_and(|f| !f.in_branch) =>
+                    {
+                        let end = reader.buffer_position() as usize;
+                        match alt_stack.pop().map(|f| f.level) {
+                            Some(AltLevel::Paragraph) => {
+                                markup.sdt_end(xml, end, para_text.len() as u32, &ns);
+                            }
+                            Some(AltLevel::Block) => {
+                                envelopes.close_container(xml, end, &mut out_blocks);
+                            }
+                            None => {}
+                        }
                     }
                     b"w:sdt" if p_start_byte.is_some() && !in_run => {
                         markup.sdt_end(
@@ -2753,6 +3068,18 @@ pub(crate) fn parse_document_xml_with_events(
                         }
                     }
                     b"w:p" => {
+                        /* Issue #351 — an `mc:AlternateContent` never spans
+                        a paragraph end. */
+                        alt_stack.retain(|f| f.level != AltLevel::Paragraph);
+                        /* Issue #350 — unbalanced field code ends here. */
+                        close_open_field_code(
+                            &mut field_stack,
+                            &field_cap,
+                            &mut markup,
+                            xml,
+                            prev_pos,
+                            &ns,
+                        );
                         /* Read position after `</w:p>` — that's where the `>`
                         closes — gives us the end byte. */
                         let p_end_byte = reader.buffer_position() as usize;

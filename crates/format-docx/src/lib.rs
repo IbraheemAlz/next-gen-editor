@@ -22,6 +22,8 @@ pub mod numbering_resolver;
 pub mod opc;
 pub mod parts;
 pub mod reader;
+#[cfg(test)]
+mod reader_hardening_tests;
 pub mod schema;
 pub mod style_resolver;
 #[doc(hidden)]
@@ -31,8 +33,9 @@ pub mod writer;
 pub use error::{DocxError, DocxWarning, WriteNote};
 pub use opc::archive::{
     DOC_XML, DocxArchive, check_document_xml_well_formed, check_part_xml_well_formed, read_docx,
-    read_docx_with_settings,
+    read_docx_with_limits, read_docx_with_settings,
 };
+pub use opc::limits::{PackageLimit, PackageLimits};
 pub use writer::{build_minimal_docx, save_docx, write_docx, write_docx_with_notes};
 
 /// Issue #213 — build a clipboard `.docx` fragment for `doc`, and — when

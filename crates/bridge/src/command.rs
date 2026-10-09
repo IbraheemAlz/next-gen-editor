@@ -198,6 +198,15 @@ pub enum Command {
         #[serde(default)]
         #[tsify(optional)]
         defaults: Option<DocumentDefaults>,
+        /// Issue #348 — overrides for the reader's resource limits
+        /// (`format_docx::PackageLimits`: part / package byte budgets,
+        /// entry count, XML depth / element count). `None` (and every
+        /// field left unset) keeps the defaults sized to the worker budget.
+        /// A package past a limit is refused with `Event::Error { kind:
+        /// PackageTooLarge }`.
+        #[serde(default)]
+        #[tsify(optional)]
+        limits: Option<PackageLimitsOverride>,
     },
     SaveDocument {
         format: DocFormat,
@@ -1258,6 +1267,31 @@ pub struct DocumentDefaults {
     pub widow_control: Option<bool>,
 }
 
+/// Issue #348 — host overrides for the `.docx` reader's resource limits
+/// ([`Command::OpenDocument`]'s `limits`). `None` keeps the reader's
+/// default for that bound (`format_docx::PackageLimits::DEFAULT`: 64 MiB
+/// per part, 128 MiB per package, 10 000 entries, XML depth 256,
+/// 4 000 000 elements per part).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct PackageLimitsOverride {
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_part_bytes: Option<u64>,
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_total_bytes: Option<u64>,
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_entries: Option<u32>,
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_xml_depth: Option<u32>,
+    #[serde(default)]
+    #[tsify(optional)]
+    pub max_xml_elements: Option<u64>,
+}
+
 /// A sparse patch of inline text attributes — `None` fields are left
 /// Issue #21 — patch for a style's `<w:pPr>` half. A pragmatic subset
 /// of the paragraph surface (alignment / direction / line spacing /
@@ -1482,6 +1516,7 @@ mod tests {
                 format: DocFormat::Docx,
                 name: None,
                 defaults: None,
+                limits: None,
             } if bytes == vec![1, 2, 3]
         ));
 

@@ -21,7 +21,7 @@
 use crate::error::DocxError;
 use engine::SourcePackage;
 use std::collections::HashSet;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use zip::ZipArchive;
 use zip::write::{SimpleFileOptions, ZipWriter};
 
@@ -109,11 +109,14 @@ pub fn add_style_parts(docx: &[u8], package: &SourcePackage) -> Result<Vec<u8>, 
 
     let mut archive = ZipArchive::new(Cursor::new(docx))?;
     let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(archive.len() + extras.len());
+    /* Issue #348 — read through the bounded reader, never allocating
+    from the declared entry size. */
+    let mut total = 0u64;
+    let limits = crate::opc::limits::PackageLimits::DEFAULT;
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
+        let file = archive.by_index(i)?;
         let name = file.name().to_string();
-        let mut buf = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut buf)?;
+        let buf = crate::opc::limits::read_entry_bounded(file, &name, &limits, &mut total)?;
         entries.push((name, buf));
     }
 
@@ -208,6 +211,7 @@ mod tests {
     use crate::opc::relationships::parse_relationships;
     use crate::writer::build_minimal_docx;
     use engine::{DocumentTree, Paragraph};
+    use std::io::Read;
 
     fn zip_entries(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut a = ZipArchive::new(Cursor::new(bytes)).expect("zip");

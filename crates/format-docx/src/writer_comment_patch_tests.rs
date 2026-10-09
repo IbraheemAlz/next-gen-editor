@@ -59,7 +59,7 @@ const COMMENTS_IDS: &str = concat!(
 fn package(body: &str, comments: Option<&str>) -> (String, DocxArchive) {
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="{W}" xmlns:r="{REL}" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body>{body}<w:sectPr/></w:body></w:document>"#
+<w:document xmlns:w="{W}" xmlns:r="{REL}" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><w:body>{body}<w:sectPr/></w:body></w:document>"#
     );
     let mut parts: Vec<(String, String)> = vec![
         (
@@ -706,5 +706,63 @@ fn a_splice_into_a_paragraph_with_tracked_changes_keeps_its_ids() {
         );
         let back = read_docx(&bytes).expect("re-read");
         assert_eq!(anchored_text(&back.document, id), covered);
+    }
+}
+
+/// Issue #351 × #282 / #284 — comment range markers inside an
+/// `mc:AlternateContent`: the selected branch's markers anchor the
+/// comment (once — the other branch is kept as bytes, not read), in a body
+/// paragraph and in a cell paragraph alike; a new comment beside it is
+/// still a pure insertion, and deleting the comment strips its markers
+/// from EVERY branch.
+#[test]
+fn comment_markers_inside_alternate_content_come_from_the_selected_branch() {
+    let ac = concat!(
+        r#"<w:r><w:t xml:space="preserve">a </w:t></w:r>"#,
+        r#"<mc:AlternateContent><mc:Choice Requires="w14"><w:commentRangeStart w:id="0"/><w:r><w:t>chosen</w:t></w:r><w:commentRangeEnd w:id="0"/></mc:Choice>"#,
+        r#"<mc:Fallback><w:commentRangeStart w:id="0"/><w:r><w:t>fallback</w:t></w:r><w:commentRangeEnd w:id="0"/></mc:Fallback></mc:AlternateContent>"#,
+        r#"<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="0"/></w:r>"#,
+        r#"<w:r><w:t xml:space="preserve"> tail words</w:t></w:r>"#,
+    );
+    for in_cell in [false, true] {
+        let body = if in_cell {
+            format!(
+                r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:p>{ac}</w:p></w:tc></w:tr></w:tbl><w:p/>"#
+            )
+        } else {
+            format!("<w:p>{ac}</w:p>")
+        };
+        let (xml, archive) = package(&body, Some(COMMENTS));
+        let doc = &archive.document;
+        let ranges: Vec<_> = doc.comment_ranges.iter().filter(|r| r.id == 0).collect();
+        assert_eq!(ranges.len(), 1, "cell={in_cell}: {:?}", doc.comment_ranges);
+        assert_eq!(anchored_text(doc, 0), "chosen", "cell={in_cell}");
+        let path = ranges[0].start.path.clone();
+        assert_eq!(path.steps.len(), if in_cell { 3 } else { 1 });
+        assert_eq!(document_xml_of(&save(&archive, doc)), xml, "zero-edit");
+
+        /* A new comment on "tail" beside it: a pure insertion. */
+        let (with_new, id) = doc.insert_comment(
+            LogicalPos::new(path.clone(), 9),
+            LogicalPos::new(path.clone(), 13),
+            "n".into(),
+            "Me".into(),
+            String::new(),
+        );
+        let bytes = save(&archive, &with_new);
+        let out = document_xml_of(&bytes);
+        assert!(pure_insertion(&xml, &out), "cell={in_cell}: {out}");
+        let back = read_docx(&bytes).expect("re-read");
+        assert_eq!(anchored_text(&back.document, id), "tail");
+        assert_eq!(anchored_text(&back.document, 0), "chosen");
+
+        /* Deleting comment 0 strips it from both branches. */
+        let out = document_xml_of(&save(&archive, &doc.delete_comment(0)));
+        assert!(!out.contains(r#"w:id="0""#), "cell={in_cell}: {out}");
+        assert!(out.contains("fallback") && out.contains("chosen"), "{out}");
+        assert!(
+            pure_insertion(&out, &xml),
+            "cell={in_cell}: a pure deletion"
+        );
     }
 }

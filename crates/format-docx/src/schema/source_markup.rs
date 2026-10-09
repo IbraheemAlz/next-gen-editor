@@ -216,6 +216,10 @@ struct RunCapture {
     trail: Vec<u8>,
     /// Issue #243 — the `w:id` of a `<w:commentReference>` in the run.
     comment_ref: Option<u32>,
+    /// Issue #350 — the run holds field markup the reader does not model
+    /// (a field character past the nesting cap, a stray `separate` /
+    /// `end`): a text-less run is kept verbatim despite `has_modeled`.
+    keep_verbatim: bool,
 }
 
 /// Issue #245 — where run-level whitespace lands in [`RunPad`].
@@ -269,7 +273,15 @@ struct SdtCapture {
     unusable: bool,
     /// Byte offset of `</w:sdtContent>` once it began.
     content_end: Option<usize>,
+    /// Issue #351 — the closer written when the source closer's bytes are
+    /// unusable: `</w:sdtContent></w:sdt>` for a content control,
+    /// `</mc:Choice></mc:AlternateContent>` (or `</mc:Fallback>…`) for a
+    /// paragraph-level `mc:AlternateContent` wrapper.
+    default_close: &'static [u8],
 }
+
+/// Issue #245 — the stock closer of a run-level content control.
+const SDT_CLOSE: &[u8] = b"</w:sdtContent></w:sdt>";
 
 impl SdtCapture {
     /// Between `<w:sdt>` and `<w:sdtContent>`, or after `</w:sdtContent>`:
@@ -427,6 +439,15 @@ impl MarkupCapture {
 
     /// Issue #245 — a run-level `<w:sdt>` start tag at byte `start`.
     pub fn sdt_start(&mut self, start: usize) {
+        self.wrapper_start(start);
+    }
+
+    /// Issues #245 / #351 — an in-paragraph wrapper element (a run-level
+    /// `<w:sdt>`, a paragraph-level `<mc:AlternateContent>`) starts at byte
+    /// `start`. Its head (the `sdtPr`, the branches not taken) lies inside
+    /// the opener, its tail inside the closer; the content between rides
+    /// the paragraph as usual.
+    pub fn wrapper_start(&mut self, start: usize) {
         if !self.open || self.run.is_some() {
             return;
         }
@@ -435,6 +456,7 @@ impl MarkupCapture {
             opener: None,
             unusable: false,
             content_end: None,
+            default_close: SDT_CLOSE,
         });
     }
 
@@ -450,6 +472,25 @@ impl MarkupCapture {
         ns: &NamespaceScope,
         empty: bool,
     ) {
+        self.wrapper_content_start(xml, end, at, ns, empty, SDT_CLOSE);
+    }
+
+    /// Issues #245 / #351 — the content of the innermost open wrapper
+    /// begins at byte `end` (text offset `at`): everything since the
+    /// wrapper's start is the opener. `default_close` stands in for the
+    /// closer if its source bytes turn out unusable.
+    pub fn wrapper_content_start(
+        &mut self,
+        xml: &[u8],
+        end: usize,
+        at: u32,
+        ns: &NamespaceScope,
+        empty: bool,
+        default_close: &'static [u8],
+    ) {
+        if let Some(top) = self.sdts.last_mut() {
+            top.default_close = default_close;
+        }
         let Some(top) = self.sdts.last() else {
             return;
         };
@@ -468,7 +509,7 @@ impl MarkupCapture {
                     xml: bytes,
                     role: MarkerRole::Open {
                         id,
-                        close_xml: b"</w:sdtContent></w:sdt>".to_vec(),
+                        close_xml: default_close.to_vec(),
                     },
                     comment: None,
                 });
@@ -508,7 +549,7 @@ impl MarkupCapture {
                 .content_end
                 .and_then(|s| xml.get(s..end))
                 .filter(|b| bound_by_root(b, ns))
-                .map_or_else(|| b"</w:sdtContent></w:sdt>".to_vec(), <[u8]>::to_vec);
+                .map_or_else(|| top.default_close.to_vec(), <[u8]>::to_vec);
             if let Some(MarkerRole::Open { close_xml, .. }) =
                 self.markers.get_mut(opener).map(|m| &mut m.role)
             {
@@ -637,6 +678,14 @@ impl MarkupCapture {
         }
     }
 
+    /// Issue #350 — the open run holds unmodeled field markup (see
+    /// `RunCapture::keep_verbatim`).
+    pub fn run_keep_verbatim(&mut self) {
+        if let Some(r) = self.run.as_mut() {
+            r.keep_verbatim = true;
+        }
+    }
+
     /// The open run holds modeled text-less content
     /// ([`is_modeled_textless_run_child`]).
     pub fn run_modeled(&mut self) {
@@ -699,7 +748,7 @@ impl MarkupCapture {
             });
             return;
         }
-        if !r.has_modeled
+        if (!r.has_modeled || r.keep_verbatim)
             && let Some(frag) = xml.get(r.xml_start..end)
             && frag.starts_with(b"<w:r")
             && bound_by_root(frag, ns)
@@ -759,6 +808,38 @@ impl MarkupCapture {
                 xml_start,
                 at,
                 marker_mark: span.marker_mark,
+            });
+        }
+    }
+
+    /// Issue #350 — the fields at nesting `depth` and deeper were closed
+    /// at the paragraph end (`end`: the byte offset of `</w:p>`) while
+    /// still in their instruction part. When the outermost one began in a
+    /// clean run, everything from that run to the paragraph end — the
+    /// unbalanced field code, every hidden run — is kept whole as ONE
+    /// content marker (replacing the markers captured inside it), so a
+    /// regenerated paragraph re-emits the broken field verbatim.
+    pub fn close_field_spans(&mut self, depth: usize, xml: &[u8], end: usize, ns: &NamespaceScope) {
+        let mut outermost = None;
+        while self.field_spans.last().is_some_and(|f| f.depth >= depth) {
+            outermost = self.field_spans.pop();
+        }
+        self.field_due = None;
+        let Some(span) = outermost.filter(|s| s.depth == depth) else {
+            return;
+        };
+        if let Some(start) = span.xml_start
+            && let Some(frag) = xml.get(start..end)
+            && frag.starts_with(b"<w:r")
+            && is_balanced_fragment(frag)
+            && bound_by_root(frag, ns)
+        {
+            self.markers.truncate(span.marker_mark);
+            self.markers.push(SourceMarker {
+                at: span.at,
+                xml: frag.to_vec(),
+                role: MarkerRole::Content,
+                comment: None,
             });
         }
     }
