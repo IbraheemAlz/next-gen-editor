@@ -40,7 +40,13 @@ discipline.
     `attrsAtCaret`, `attrsMixed`, `paragraphAlignment`,
     `paragraphDirection`, `selectionKind`, `canUndo`, `canRedo`,
     `stats`, `lastPaintMs`, `paintVersion`,
-    `estimatedDocumentHeight`, `renderer`.
+    `estimatedDocumentHeight`, `renderer`; the recovery / honesty
+    signals `lastRecovery` + `recoveryNotices()` / `recoveryDegraded()`
+    (issue #315), `checkpointState` (`Event::CheckpointState`, #390),
+    `lastError` (every `Event::Error`, #364); and the font read-back
+    `resolvedFonts` / `fontSource` / `slotFormats` / `caretFontSlot`
+    (#423, #420). A new engine event field lands here as one more
+    signal, never as a second `subscribe`.
   - `src/types.ts` — re-exports every bridge type from the wasm-pack
     output plus the `EngineClientLike` + `EngineClientSnapshots`
     interface contracts. **Single point of coupling** to
