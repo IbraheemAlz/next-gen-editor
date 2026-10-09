@@ -188,8 +188,10 @@ const MAX_COMMAND_SEQUENCE: usize = 64;
 /// entry point — see `crates/engine-wasm`'s `fuzz-native` feature) including
 /// the auto-repaint -> layout pipeline, then the native glyph rasterizer.
 /// Invariants asserted after every command: no panic (the fuzz harness
-/// itself), the undo stack never exceeds its 100-snapshot bound, and the
-/// live selection always resolves inside the current document.
+/// itself), the undo stack never exceeds its 100-snapshot bound, the
+/// live selection always resolves inside the current document, and
+/// (issue #341) a command answered with `Event::Error` changed nothing
+/// (`Engine::state_fingerprint_for_fuzzing`).
 pub fn run_rpc_command(data: &[u8]) {
     let mut u = Unstructured::new(data);
     let seed_text = command_gen::gen_seed_text(&mut u);
