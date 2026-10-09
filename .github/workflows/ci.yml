@@ -48,7 +48,10 @@ jobs:
       # drive real `Command`s through `Engine::apply` (the fuzz-surface
       # smoke test, the `OpenDocument.defaults` bridge tests). Run them
       # explicitly and assert the count so a future `cfg` slip that
-      # silently drops them to 0 goes red instead of green.
+      # silently drops them to 0 goes red instead of green. (Since #318
+      # `tools/corpus-native` depends on the feature, so feature
+      # unification turns it on for the `--workspace` step too — this
+      # step stays the guaranteed, counted run.)
       - name: cargo test engine-wasm (fuzz-native feature)
         run: |
           set -euo pipefail

@@ -137,6 +137,9 @@ pub enum ErrorCode {
     DocumentParse,
     FontLoad,
     Rpc,
+    /// Issue #333 - a persisted event-log snapshot write failed (the
+    /// worker retries with backoff; each failure is one sample).
+    CheckpointFailed,
     Unknown,
 }
 
@@ -377,6 +380,19 @@ mod tests {
         assert_eq!(
             roundtrip(&kind),
             serde_json::json!({ "type": "ERROR", "code": "ENGINE_TRAP", "recoverable": true })
+        );
+    }
+
+    #[test]
+    fn checkpoint_failed_error_code_is_screaming_snake() {
+        // Issue #333 - the TS collector mirrors this exact wire spelling.
+        let kind = TelemetryKind::Error {
+            code: ErrorCode::CheckpointFailed,
+            recoverable: true,
+        };
+        assert_eq!(
+            roundtrip(&kind),
+            serde_json::json!({ "type": "ERROR", "code": "CHECKPOINT_FAILED", "recoverable": true })
         );
     }
 

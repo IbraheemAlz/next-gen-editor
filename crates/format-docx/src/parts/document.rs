@@ -16,7 +16,9 @@ use crate::parts::table::parse_table_bytes_with_warnings;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
-use crate::schema::ct_rpr::{apply_rpr, attr_val, fold_rpr_fragment, rpr_child_is_modeled};
+use crate::schema::ct_rpr::{
+    apply_rpr, attr_val, fold_rpr_fragment, mark_rpr_style, rpr_child_is_modeled,
+};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
@@ -380,12 +382,28 @@ struct RevisionOpen {
     move_name: Option<String>,
 }
 
-/// Issue #262 — lift the paragraph-mark revision (`<w:ins>` / `<w:del>` /
-/// `<w:moveFrom>` / `<w:moveTo>`, the leading `EG_ParaRPrTrackChanges`
-/// children of CT_ParaRPr) out of a captured `<w:pPr>/<w:rPr>` fragment.
-/// Returns the first one found (a second stays in the fragment verbatim)
-/// and the fragment without its bytes.
-pub(crate) fn split_mark_revision(frag: Vec<u8>) -> (Option<engine::Revision>, Vec<u8>) {
+/// Issues #262 / #303 — lift the paragraph-mark revisions (`<w:ins>` /
+/// `<w:del>` / `<w:moveFrom>` / `<w:moveTo>`, the leading
+/// `EG_ParaRPrTrackChanges` children of CT_ParaRPr) out of a captured
+/// `<w:pPr>/<w:rPr>` fragment. Returns every one found, in source order,
+/// and the fragment without their bytes (a second change used to stay in
+/// the fragment verbatim and resurface after the first was accepted).
+pub(crate) fn split_mark_revisions(mut frag: Vec<u8>) -> (Vec<engine::Revision>, Vec<u8>) {
+    let mut revs = Vec::new();
+    loop {
+        match split_mark_revision(frag) {
+            (Some(rev), rest) => {
+                revs.push(rev);
+                frag = rest;
+            }
+            (None, rest) => return (revs, rest),
+        }
+    }
+}
+
+/// [`split_mark_revisions`]'s step: the FIRST paragraph-mark revision of
+/// `frag` and the fragment without its bytes.
+fn split_mark_revision(frag: Vec<u8>) -> (Option<engine::Revision>, Vec<u8>) {
     let mut reader = Reader::from_reader(frag.as_slice());
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -1072,9 +1090,13 @@ pub fn parse_document_xml_with_warnings(
     let mut p_style_id: Option<String> = None;
     let mut direct_ppr = ParaProperties::default();
     let mut pmark_rpr = SpanStyle::default();
-    /* Issue #262 — the tracked change on the paragraph mark
-    (`<w:pPr><w:rPr><w:ins/>`), lifted out of the mark's rPr grab bag. */
-    let mut para_mark_revision: Option<engine::Revision> = None;
+    /* Issues #262 / #303 — the tracked changes on the paragraph mark
+    (`<w:pPr><w:rPr><w:ins/><w:del/>`), lifted out of the mark's rPr grab
+    bag. */
+    let mut para_mark_revisions: Vec<engine::Revision> = Vec::new();
+    /* Issue #293 — the paragraph mark's modeled run properties (the
+    `<w:pPr><w:rPr>` fragment the bag carries, folded). */
+    let mut para_mark_style: Option<Box<SpanStyle>> = None;
     /* Phase 4 — `<w:numPr>/<w:numId>` + `<w:ilvl>` accumulators. We don't
     inherit either field from a paragraph style here; that's a separate
     cascade source Phase 4 ships without modelling. */
@@ -1156,6 +1178,9 @@ pub fn parse_document_xml_with_warnings(
     let mut r_style_id: Option<String> = None;
     let mut direct_rpr = SpanStyle::default();
     let mut run_text = String::new();
+    /* Issue #295 — the open run's `<w:rPrChange>` as a FormatChange
+    revision template; the run's text range is stamped at its close. */
+    let mut run_format_change: Option<engine::Revision> = None;
 
     /* Source-byte capture for the passthrough optimisation. `prev_pos` is
     the byte offset of the just-yielded event's end — equivalently the
@@ -1432,13 +1457,15 @@ pub fn parse_document_xml_with_warnings(
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pmark_rpr = SpanStyle::default();
-                        para_mark_revision = None;
+                        para_mark_revisions.clear();
+                        para_mark_style = None;
                     }
                     b"w:r" => {
                         in_run = true;
                         run_start_byte = prev_pos;
                         r_style_id = None;
                         direct_rpr = SpanStyle::default();
+                        run_format_change = None;
                         run_text.clear();
                         markup.open_run(&e, &ns, prev_pos, para_text.len() as u32);
                     }
@@ -1453,12 +1480,19 @@ pub fn parse_document_xml_with_warnings(
                         overriding the live formatting. */
                         if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
                             fold_rpr_fragment(&frag, &mut pmark_rpr);
-                            /* Issue #262 — the mark's tracked change is
-                            modeled (`Paragraph::mark_revision`); the bag
-                            keeps the rest and the writer re-injects it. */
-                            let (mark, frag) = split_mark_revision(frag);
-                            if para_mark_revision.is_none() {
-                                para_mark_revision = mark;
+                            /* Issues #262 / #303 — the mark's tracked
+                            changes are modeled (`Paragraph::mark_revisions`,
+                            all of them); the bag keeps the rest and the
+                            writer re-injects them. */
+                            let (marks, frag) = split_mark_revisions(frag);
+                            if para_mark_revisions.is_empty() {
+                                para_mark_revisions = marks;
+                            }
+                            /* Issue #293 — modeled only while the bag keeps
+                            the bytes it was folded from (the writer
+                            verifies the one against the other). */
+                            if bound_by_root(&frag, &ns) {
+                                para_mark_style = Some(Box::new(mark_rpr_style(&frag)));
                             }
                             stash(&mut direct_ppr.grab_bag, frag, &ns);
                         }
@@ -1651,6 +1685,14 @@ pub fn parse_document_xml_with_warnings(
                         grab bag and the parser skips it, so nothing inside
                         can masquerade as live run formatting. */
                         if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            /* Issue #295 — a tracked formatting change is
+                            also modeled, for review. */
+                            if n == b"w:rPrChange" {
+                                run_format_change =
+                                    Some(crate::parts::format_change::format_change_revision(
+                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                    ));
+                            }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
                         }
                     }
@@ -2092,6 +2134,9 @@ pub fn parse_document_xml_with_warnings(
                         still rides the bag (byte-stable regeneration). */
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            if bound_by_root(&frag, &ns) {
+                                para_mark_style = Some(Box::default());
+                            }
                             stash(&mut direct_ppr.grab_bag, frag, &ns);
                         }
                     }
@@ -2102,6 +2147,14 @@ pub fn parse_document_xml_with_warnings(
                         `<w14:glow>`, …) → the run's grab bag, verbatim. */
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            /* Issue #295 — an empty tracked formatting
+                            change (no recorded rPr) is modeled too. */
+                            if n == b"w:rPrChange" {
+                                run_format_change =
+                                    Some(crate::parts::format_change::format_change_revision(
+                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                    ));
+                            }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
                         }
                     }
@@ -2484,6 +2537,15 @@ pub fn parse_document_xml_with_warnings(
                             &style,
                             &para_text[start as usize..end as usize],
                         );
+                        /* Issue #295 — the run's tracked formatting change
+                        covers the run's text. */
+                        if let Some(change) = run_format_change.take() {
+                            para_revisions.push(engine::Revision {
+                                start,
+                                end,
+                                ..change
+                            });
+                        }
                         if style != SpanStyle::default() {
                             match spans.last_mut() {
                                 Some(last) if last.end == start && last.style == style => {
@@ -2541,11 +2603,11 @@ pub fn parse_document_xml_with_warnings(
                             &style_id_for_paragraph,
                             list_item,
                         );
-                        /* Issue #262 — the recorded pPr bytes carry the
-                        mark revision: verified against it on write. */
+                        /* Issues #262 / #303 — the recorded pPr bytes carry
+                        the mark revisions: verified against them on write. */
                         if let Some(sp) = source_markup.as_deref_mut().and_then(|m| m.ppr.as_mut())
                         {
-                            sp.mark_revision = para_mark_revision.clone();
+                            sp.mark_revisions = para_mark_revisions.clone();
                         }
                         out_blocks.push(Block::Paragraph(Paragraph {
                             text: std::mem::take(&mut para_text),
@@ -2575,7 +2637,8 @@ pub fn parse_document_xml_with_warnings(
                             opener, whitespace) attaches before this one. */
                             body_xml: envelopes.take_before(),
                             source_markup,
-                            mark_revision: para_mark_revision.take(),
+                            mark_revisions: std::mem::take(&mut para_mark_revisions),
+                            mark_style: para_mark_style.take(),
                         }));
                         envelopes.note_block_end(p_end_byte);
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this

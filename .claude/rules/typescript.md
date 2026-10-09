@@ -38,7 +38,7 @@ paths:
 ## RPC channel
 - Worker handles two top-level message kinds: `INIT` (one-shot setup) and `COMMAND` (issued by main after init).
 - Main side: Promise-based `dispatch(cmd) → Event` with `{ type: 'COMMAND', id, cmd }` requests + `{ type: 'COMMAND_RESULT', id, event }` replies. Track `pending` map by id.
-- Expose `window.__dispatch` for Playwright test hooks. Also `window.__paintIdle` and `window.__engineReady`.
+- Expose `window.__dispatch` for Playwright test hooks via `installDevHook` (`ts/src/dev-hooks.ts`, issue #340) - never an unconditional `window.__x = ...` for an engine handle. Also `window.__paintIdle` and `window.__engineReady`.
 
 ## Vite config
 - `server.fs.allow` must include the workspace root so the worker can import `../crates/engine-wasm/pkg/*`.

@@ -61,11 +61,22 @@ use serde::{Deserialize, Serialize};
 mod block_remap;
 pub use block_remap::CellMove;
 pub mod fields;
+mod revision_refs;
+pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};
+#[cfg(test)]
+mod paragraph_mark_tests;
+#[cfg(test)]
+mod paragraph_merge_tests;
 #[cfg(test)]
 mod revision_tests;
 mod revisions;
 mod text_remap;
+mod tracked;
+#[cfg(test)]
+mod tracked_tests;
 pub use text_remap::TextEdit;
+use text_remap::join_at_seam;
+pub use tracked::{TrackedDeletion, TrackedEditError};
 pub mod html;
 pub mod numbering;
 pub mod package;
@@ -322,9 +333,14 @@ pub struct DocumentTree {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct ParagraphStyle {
+    /// `w:styleId` — what `<w:pStyle w:val>` / `<w:basedOn>` /
+    /// `<w:next>` reference (`Heading1`).
     pub id: String,
-    /// Human-readable name from `<w:name w:val>`. Drives the styles
-    /// dropdown label; falls back to `id` when absent.
+    /// Human-readable name from `<w:name w:val>` (`heading 1`, a localized
+    /// or custom name) — issue #297: read separately from the id and
+    /// written back as read, so a regenerated `styles.xml` never renames a
+    /// style. Empty when the source style has no `<w:name>` (the writer
+    /// then omits the element; a display label falls back to `id`).
     pub name: String,
     /// `<w:basedOn w:val>` — parent style id. The cascade walker
     /// folds the chain root-first.
@@ -1515,11 +1531,17 @@ pub struct SourcePPr {
     pub props: ParaProperties,
     pub style_id: Option<String>,
     pub list_item: Option<ListItem>,
-    /// Issue #262 — the paragraph-mark revision `xml` spells (its
-    /// `<w:rPr><w:ins/>`): the bytes are re-emitted only while the
-    /// paragraph still carries exactly this one. Skipped when `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mark_revision: Option<Revision>,
+    /// Issues #262 / #303 — the paragraph-mark revisions `xml` spells
+    /// (its `<w:rPr><w:ins/><w:del/>`), in source order: the bytes are
+    /// re-emitted only while the paragraph still carries exactly these.
+    /// Encoded like [`Paragraph::mark_revisions`] (key `mark_revision`,
+    /// skipped when empty).
+    #[serde(
+        rename = "mark_revision",
+        with = "mark_revisions_serde",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub mark_revisions: Vec<Revision>,
 }
 
 /// Issues #199 / #106 — one source `<w:r>` covering the text bytes
@@ -3495,22 +3517,111 @@ pub struct Paragraph {
     /// paragraphs. Boxed: `Paragraph` clones constantly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_markup: Option<Box<SourceMarkup>>,
-    /// Issue #262 — a tracked change on the paragraph MARK
+    /// Issue #262 — the tracked changes on the paragraph MARK
     /// (`<w:pPr><w:rPr><w:ins/>` / `<w:del/>` / `<w:moveFrom/>` /
-    /// `<w:moveTo/>`): an inserted mark is a tracked paragraph SPLIT, a
-    /// deleted one a tracked MERGE with the following paragraph. Only
-    /// `kind` / `author` / `date` / `id` / `move_name` are meaningful —
-    /// `start` / `end` are unused (0). Accepting a deleted (or moved-
-    /// away) mark, or rejecting an inserted (or moved-in) one, merges
-    /// this paragraph with the next ([`DocumentTree::resolve_all_revisions`]).
+    /// `<w:moveTo/>`), in source order: an inserted mark is a tracked
+    /// paragraph SPLIT, a deleted one a tracked MERGE with the following
+    /// paragraph. Only `kind` / `author` / `date` / `id` / `move_name`
+    /// are meaningful — `start` / `end` are unused (0). Accepting a
+    /// deleted (or moved-away) mark, or rejecting an inserted (or
+    /// moved-in) one, merges this paragraph with the next
+    /// ([`DocumentTree::resolve_all_revisions`]).
+    ///
+    /// Issue #303 — a mark can carry more than one change (Word writes
+    /// `<w:ins/><w:del/>` for a mark one reviewer inserted and another
+    /// deleted). They resolve IN ORDER: the first one whose decision
+    /// removes the mark merges the paragraphs and the later ones go with
+    /// it. [`Paragraph::mark_revision`] is the single-change accessor
+    /// (the first one).
     ///
     /// Travel rules: the mark belongs to the paragraph END, so
     /// `split_at` gives it to the RIGHT half (the left half gets a fresh
     /// mark) and `concat` keeps the TAIL's (like `section_end`);
-    /// clipboard fragments clear it. Skipped when `None`, so a pre-#262
-    /// snapshot encodes unchanged.
+    /// clipboard fragments clear it. Skipped when empty; one change
+    /// encodes exactly as the pre-#303 `mark_revision: Option<Revision>`
+    /// field did (two or more as a sequence under the same key), so a
+    /// pre-#262 / pre-#303 snapshot decodes and re-encodes unchanged.
+    #[serde(
+        rename = "mark_revision",
+        with = "mark_revisions_serde",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub mark_revisions: Vec<Revision>,
+    /// Issue #293 — the paragraph MARK's own run properties
+    /// (`<w:pPr><w:rPr>`): the formatting of the pilcrow, which Word
+    /// gives to text typed into the paragraph while it is EMPTY. Modeled
+    /// fields only (no grab bag): the mark's unmodeled children ride the
+    /// pPr grab bag inside the source `<w:rPr>` fragment, and the writer
+    /// re-emits that fragment verbatim while it still spells this style,
+    /// else regenerates it from this style (keeping the unmodeled
+    /// children). `None` = not modeled — no mark rPr was read, the
+    /// paragraph is engine-synthesized, or the tree predates #293 — and
+    /// the bag is the truth.
+    ///
+    /// Travel rules: `split_at` gives an EMPTY half the insertion
+    /// formatting at the split point (Enter at the end of a bold run →
+    /// the new empty paragraph types bold; Enter at a paragraph start →
+    /// the empty paragraph above takes the first character's format), a
+    /// non-empty half keeps the original; `concat` keeps the surviving
+    /// paragraph's (the head's, the tail's when the head is empty);
+    /// typing into an empty paragraph inherits it. Skipped when `None`,
+    /// so a pre-#293 snapshot encodes unchanged. Boxed: `Paragraph`
+    /// clones constantly.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mark_revision: Option<Revision>,
+    pub mark_style: Option<Box<SpanStyle>>,
+}
+
+/// Issue #303 — snapshot encoding of a paragraph mark's tracked changes
+/// ([`Paragraph::mark_revisions`], [`SourcePPr::mark_revisions`]) under
+/// the pre-#303 key `mark_revision`: ONE change is written as the bare
+/// [`Revision`] (byte-identical to the old `Option<Revision>` field), two
+/// or more as a sequence. Reading accepts either shape, and a nil.
+mod mark_revisions_serde {
+    use super::Revision;
+    use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+    use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::{Deserialize, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(revs: &[Revision], s: S) -> Result<S::Ok, S::Error> {
+        match revs {
+            [one] => one.serialize(s),
+            many => many.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Revision>, D::Error> {
+        d.deserialize_any(OneOrMany)
+    }
+
+    struct OneOrMany;
+
+    impl<'de> Visitor<'de> for OneOrMany {
+        type Value = Vec<Revision>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a paragraph-mark revision or a sequence of them")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            Revision::deserialize(MapAccessDeserializer::new(map)).map(|r| vec![r])
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            Vec::<Revision>::deserialize(SeqAccessDeserializer::new(seq))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(OneOrMany)
+        }
+    }
 }
 
 /// Issue #81 — one paragraph-scoped bookmark. `id` is the source
@@ -3526,6 +3637,12 @@ pub struct Bookmark {
 }
 
 impl Paragraph {
+    /// Issue #262 — the (first) tracked change on the paragraph mark; see
+    /// [`Self::mark_revisions`] for a mark carrying several (issue #303).
+    pub fn mark_revision(&self) -> Option<&Revision> {
+        self.mark_revisions.first()
+    }
+
     /// Resolved style at byte offset `at` (default if no span covers it).
     pub fn style_at(&self, at: u32) -> SpanStyle {
         self.spans
@@ -3546,8 +3663,33 @@ impl Paragraph {
     /// sticky formatting): the character before `at`, or at the
     /// paragraph start the character after it, never an inline-object anchor.
     pub fn typing_style_at(&self, at: u32) -> SpanStyle {
+        /* Issue #293 — an empty paragraph has no neighbouring character:
+        Word types with the paragraph MARK's run properties. */
+        if self.text.is_empty() {
+            return self
+                .mark_style
+                .as_deref()
+                .map_or_else(SpanStyle::default, SpanStyle::for_typing);
+        }
         self.inheriting_span(self.snap_offset(at))
             .map_or_else(SpanStyle::default, |i| self.spans[i].style.for_typing())
+    }
+
+    /// Issue #293 — the mark a NEW paragraph mark inserted at byte `at`
+    /// gets: the insertion formatting there ([`Self::typing_style_at`],
+    /// modeled fields only — a run's grab bag never moves onto a mark).
+    /// Equal formatting keeps the current mark as is (`None` stays `None`
+    /// for unformatted text), so an unformatted split adds no `<w:rPr>`.
+    fn insertion_mark(&self, at: u32) -> Option<Box<SpanStyle>> {
+        let style = SpanStyle {
+            grab_bag: None,
+            ..self.typing_style_at(at)
+        };
+        if style == self.mark_style.as_deref().cloned().unwrap_or_default() {
+            self.mark_style.clone()
+        } else {
+            Some(Box::new(style))
+        }
     }
 
     /// Issue #276 — index of the style span an insertion at (snapped)
@@ -3660,7 +3802,8 @@ impl Paragraph {
             /* Issues #199 / #106 — no offset moves; the writer verifies
             each run's recorded `<w:rPr>` against the new style. */
             source_markup: self.source_markup.clone(),
-            mark_revision: self.mark_revision.clone(),
+            mark_revisions: self.mark_revisions.clone(),
+            mark_style: self.mark_style.clone(),
         }
     }
 
@@ -3814,7 +3957,7 @@ impl Paragraph {
                 }
             })
             .collect();
-        Paragraph {
+        let mut out = Paragraph {
             text,
             spans,
             props: self.props.clone(),
@@ -3823,17 +3966,15 @@ impl Paragraph {
             resolved_list_indent: self.resolved_list_indent,
             dirty: true,
             source_xml: None,
-            /* Unlike `apply_style` (issue #56), THIS rebuild changes `text` —
-            every stashed byte offset (hyperlink spans, revision ranges)
-            would dangle across the deleted range. Clearing these overlays
-            is a known, deliberately out-of-scope limitation (offset
-            remapping is a separate, larger task), not an oversight.
-            Inline objects are remapped above (issue #69) — an anchor is a
-            single sentinel byte, so the remap is exact (issue #80: a
-            footnote reference survives editing the words around it). */
+            /* Inline objects are remapped above (issue #69) — an anchor is
+            a single sentinel byte, so the remap is exact (issue #80: a
+            footnote reference survives editing the words around it).
+            Issue #292 — hyperlinks and revisions are remapped below,
+            through the same edit record (they used to be cleared: the
+            old #56 limitation). */
             inline_objects,
-            hyperlinks: Vec::new(),
-            revisions: Vec::new(),
+            hyperlinks: self.hyperlinks.clone(),
+            revisions: self.revisions.clone(),
             fields,
             /* Issue #277 — the paragraph style binding and the direct
             paragraph formatting are not offset-anchored (same class as
@@ -3849,8 +3990,15 @@ impl Paragraph {
             body_xml: self.body_xml.clone(),
             source_markup: markup,
             /* Issue #262 — the paragraph mark is untouched. */
-            mark_revision: self.mark_revision.clone(),
-        }
+            mark_revisions: self.mark_revisions.clone(),
+            mark_style: self.mark_style.clone(),
+        };
+        out.remap_range_overlays(TextEdit {
+            at: s,
+            removed: gap,
+            inserted: 0,
+        });
+        out
     }
 
     /// Split into `[0, at)` and `[at, len)`. Spans straddling `at` are split.
@@ -3878,8 +4026,9 @@ impl Paragraph {
         }
         /* Splitting shifts every offset in the right half to be relative to
         `at` — the same "offsets genuinely shift" class as `delete_text`
-        (see its comment). Hyperlink/revision dropping is the same
-        deliberately out-of-scope limitation (issue #56); FIELDS remap
+        (see its comment). Hyperlinks and revisions remap through the
+        edit each half is (issue #292, below): a link or a tracked change
+        straddling the split point continues on both halves. FIELDS remap
         (issue #43): whole-side fields survive, a field straddling the
         split point is dropped (the atom is broken). */
         let mut fields_left = Vec::new();
@@ -3933,7 +4082,25 @@ impl Paragraph {
                 });
             }
         }
-        (
+        /* Issue #293 — an EMPTY half is where the caret lands to type: its
+        mark takes the insertion formatting at the split point (Word: Enter
+        at the end of a bold run types bold in the new paragraph; Enter at
+        a paragraph start gives the empty paragraph above the first
+        character's format). A non-empty half keeps the original mark. */
+        let len = self.text.len() as u32;
+        let (left_mark, right_mark) = (
+            if at == 0 && len > 0 {
+                self.insertion_mark(at)
+            } else {
+                self.mark_style.clone()
+            },
+            if at == len {
+                self.insertion_mark(at)
+            } else {
+                self.mark_style.clone()
+            },
+        );
+        let mut halves = (
             Paragraph {
                 text: self.text[..at as usize].to_owned(),
                 spans: left,
@@ -3944,8 +4111,8 @@ impl Paragraph {
                 dirty: true,
                 source_xml: None,
                 inline_objects: objects_left,
-                hyperlinks: Vec::new(),
-                revisions: Vec::new(),
+                hyperlinks: self.hyperlinks.clone(),
+                revisions: self.revisions.clone(),
                 fields: fields_left,
                 /* Issue #277 — both halves keep the paragraph style and
                 the direct paragraph formatting (Word: a mid-paragraph
@@ -3968,7 +4135,8 @@ impl Paragraph {
                 body_xml: BodyPassthrough::before_only(&self.body_xml),
                 source_markup: markup_left,
                 /* Issue #262 — a fresh mark for the left half. */
-                mark_revision: None,
+                mark_revisions: Vec::new(),
+                mark_style: left_mark,
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -3980,8 +4148,8 @@ impl Paragraph {
                 dirty: true,
                 source_xml: None,
                 inline_objects: Vec::new(),
-                hyperlinks: Vec::new(),
-                revisions: Vec::new(),
+                hyperlinks: self.hyperlinks.clone(),
+                revisions: self.revisions.clone(),
                 fields: fields_right,
                 style_id: self.style_id.clone(),
                 direct_overrides: self.direct_overrides.clone(),
@@ -3992,14 +4160,50 @@ impl Paragraph {
                 body_xml: BodyPassthrough::after_only(&self.body_xml),
                 source_markup: markup_right,
                 /* Issue #262 — the original mark ends the right half. */
-                mark_revision: self.mark_revision.clone(),
+                mark_revisions: self.mark_revisions.clone(),
+                mark_style: right_mark,
             },
-        )
+        );
+        /* Issue #292 — each half is the original minus the other one:
+        the hyperlinks remap through that edit record. Issues #301 / #292
+        — the text revisions are cut ONCE, here, by
+        `tracked::split_revisions` (the right piece of a straddling change
+        gives up its source `w:id`: two wrappers must not share one), so
+        every split — Enter, tracked Enter, a cross-paragraph delete's
+        halves, a clipboard slice — carries them the same way. */
+        halves.0.remap_range_overlays(TextEdit {
+            at,
+            removed: len - at,
+            inserted: 0,
+        });
+        halves.1.remap_range_overlays(TextEdit {
+            at: 0,
+            removed: at,
+            inserted: 0,
+        });
+        (halves.0.revisions, halves.1.revisions) = tracked::split_revisions(&self.revisions, at);
+        halves
     }
 
-    /// Append `other` to a copy of `self`, shifting `other`'s spans right.
-    /// The merged paragraph keeps `self`'s alignment — the surviving
-    /// paragraph mark wins when a paragraph break is deleted.
+    /// Append `other` to a copy of `self`, shifting `other`'s offsets
+    /// right — the paragraph merge behind Backspace at a paragraph start,
+    /// Delete at a paragraph end, a cross-paragraph deletion and the
+    /// edges of a multi-paragraph paste.
+    ///
+    /// Issue #292 — Word semantics for the PARAGRAPH formatting: the
+    /// merged paragraph keeps `self`'s (the head's) paragraph style,
+    /// direct paragraph formatting, resolved properties (alignment,
+    /// direction, …) and list binding, and the source paragraph identity
+    /// (`w14:paraId`, rsids and the recorded `<w:pPr>`, issue #199: the
+    /// left ids win). One exception, as in Word: an EMPTY head merges
+    /// away without imposing anything — the result is the tail's
+    /// paragraph (Backspace at the start of a heading that follows an
+    /// empty paragraph leaves the heading a heading). Both sides'
+    /// hyperlinks, revisions, fields and inline objects survive, the
+    /// tail's shifted through one [`TextEdit`] (`remap_range_overlays`).
+    ///
+    /// The paragraph MARK is the tail's: `section_end` and `mark_revision`
+    /// travel with it (the head's mark is the one deleted).
     pub fn concat(&self, other: &Paragraph) -> Paragraph {
         let shift = self.text.len() as u32;
         let mut text = self.text.clone();
@@ -4012,13 +4216,8 @@ impl Paragraph {
                 style: run.style.clone(),
             });
         }
-        /* Concatenation shifts `other`'s offsets right by `self`'s length —
-        the same "offsets genuinely shift" class as `delete_text` (see its
-        comment). Hyperlink/revision dropping is the same deliberately
-        out-of-scope limitation, not an oversight (issue #56); the merged
-        paragraph also has two candidate `style_id`s to reconcile, which
-        offset remapping would need to resolve anyway. FIELDS remap
-        (issue #43): both sides' fields survive, tail's shifted right. */
+        /* FIELDS remap (issue #43): both sides' fields survive, tail's
+        shifted right. */
         let mut fields = self.fields.clone();
         /* Issue #81 — a multi-paragraph Head runs to the paragraph end,
         which the merge just moved. */
@@ -4047,27 +4246,69 @@ impl Paragraph {
                 source_xml: o.source_xml.clone(),
             });
         }
+        /* Issue #292 — the tail's range overlays through the edit the merge
+        is for them: the head's bytes inserted in front. */
+        let mut tail_overlays = Paragraph {
+            hyperlinks: other.hyperlinks.clone(),
+            revisions: other.revisions.clone(),
+            ..Paragraph::default()
+        };
+        tail_overlays.remap_range_overlays(TextEdit {
+            at: 0,
+            removed: 0,
+            inserted: shift,
+        });
+        let mut hyperlinks = self.hyperlinks.clone();
+        join_at_seam(&mut hyperlinks, tail_overlays.hyperlinks, shift, |h, t| {
+            h.target == t.target && h.attrs == t.attrs
+        });
+        let mut revisions = self.revisions.clone();
+        join_at_seam(&mut revisions, tail_overlays.revisions, shift, |h, t| {
+            h.kind == t.kind
+                && h.author == t.author
+                && h.date == t.date
+                && h.prev_attrs == t.prev_attrs
+                && h.move_name == t.move_name
+                && (t.id.is_none() || t.id == h.id)
+        });
+        /* Issue #292 — whose paragraph formatting survives: the head's,
+        unless the head is empty (it merges away). */
+        let fmt = if self.text.is_empty() { other } else { self };
+        let mut source_markup = SourceMarkup::concat(
+            &self.source_markup,
+            self.text.len() as u32,
+            &other.source_markup,
+            other.text.len() as u32,
+        );
+        if self.text.is_empty()
+            && let Some(m) = source_markup.as_deref_mut()
+        {
+            /* The surviving paragraph is the tail's: its identity and its
+            recorded `<w:pPr>` (verified against its props on write). */
+            let t = other.source_markup.as_deref();
+            m.attrs = t.map(|t| t.attrs.clone()).unwrap_or_default();
+            m.ppr = t.and_then(|t| t.ppr.clone());
+        }
         Paragraph {
             text,
             spans,
-            props: self.props.clone(),
-            list_item: self.list_item,
-            resolved_marker: self.resolved_marker.clone(),
-            resolved_list_indent: self.resolved_list_indent,
+            props: fmt.props.clone(),
+            list_item: fmt.list_item,
+            resolved_marker: fmt.resolved_marker.clone(),
+            resolved_list_indent: fmt.resolved_list_indent,
             dirty: true,
             source_xml: None,
             inline_objects,
-            hyperlinks: Vec::new(),
-            revisions: Vec::new(),
+            hyperlinks,
+            revisions,
             fields,
-            style_id: None,
-            direct_overrides: ParaProperties::default(),
-            /* Phase 3 (#40) — DELIBERATELY INVERTED from the head-wins
-            convention every other field above follows: the surviving
-            paragraph mark for `section_end` purposes is the TAIL's.
-            A merge deletes the HEAD's mark, and with it any section
-            break riding that mark — Word-exact (deleting a section
-            break makes the preceding text adopt the FOLLOWING
+            style_id: fmt.style_id.clone(),
+            direct_overrides: fmt.direct_overrides.clone(),
+            /* Phase 3 (#40) — DELIBERATELY the tail's, whatever `fmt` is:
+            the surviving paragraph mark for `section_end` purposes is the
+            TAIL's. A merge deletes the HEAD's mark, and with it any
+            section break riding that mark — Word-exact (deleting a
+            section break makes the preceding text adopt the FOLLOWING
             section's properties). Do not "fix" this to self.*. */
             section_end: other.section_end.clone(),
             bookmarks,
@@ -4076,15 +4317,11 @@ impl Paragraph {
             markup, so a content control wrapping both still wraps the
             merge. */
             body_xml: BodyPassthrough::merged(&self.body_xml, &other.body_xml),
-            source_markup: SourceMarkup::concat(
-                &self.source_markup,
-                self.text.len() as u32,
-                &other.source_markup,
-                other.text.len() as u32,
-            ),
+            source_markup,
             /* Issue #262 — the head's mark is the one deleted: the
             surviving mark (and its tracked change) is the tail's. */
-            mark_revision: other.mark_revision.clone(),
+            mark_revisions: other.mark_revisions.clone(),
+            mark_style: fmt.mark_style.clone(),
         }
     }
 
@@ -4974,7 +5211,8 @@ impl DocumentTree {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
+            mark_style: None,
         }));
         Self {
             blocks,
@@ -5027,7 +5265,8 @@ impl DocumentTree {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
+                mark_style: None,
             }));
         }
         Self {
@@ -6232,19 +6471,13 @@ impl DocumentTree {
         doc
     }
 
-    /// Sprint 14 (#14) — track-changes-aware delete.
-    ///
-    /// Boundary math:
-    /// - **Range entirely inside a same-author Insert** → shrink the
-    ///   Insert AND remove the text. Inserts never originated in the
-    ///   source; deleting one's own pending insertion is a no-revision
-    ///   undo of that pending edit.
-    /// - **Range outside any Insert** → preserve the text, mark a
-    ///   fresh `Delete` revision covering the range. Adjacent
-    ///   same-author Delete gets merged.
-    /// - Mixed cases (range straddles Insert + non-Insert) fall back
-    ///   to the marker-only behaviour for v1 (text preserved, Delete
-    ///   stamped over the whole range; the overlapped Insert remains).
+    /// Sprint 14 (#14) — track-changes-aware delete: the reviewer's own
+    /// pending insertions inside the range are removed, everything else
+    /// is marked deleted — text and, across paragraphs (issue #298), the
+    /// swallowed paragraph marks. See [`Self::try_tracked_delete_range`],
+    /// which this wraps; a range it refuses (crossing a cell boundary,
+    /// spanning a table) leaves the tree unchanged here — interactive
+    /// callers use the `try_` form and report the refusal.
     pub fn tracked_delete_range(
         &self,
         start: LogicalPos,
@@ -6252,123 +6485,8 @@ impl DocumentTree {
         author: String,
         date: String,
     ) -> Self {
-        let (start, end) = order_positions(start, end);
-        if start == end || !same_parent(&start.path, &end.path) {
-            return self.clone();
-        }
-        let Some(s_idx) = start.path.last_block_index() else {
-            return self.clone();
-        };
-        let Some(e_idx) = end.path.last_block_index() else {
-            return self.clone();
-        };
-        if s_idx != e_idx {
-            /* Cross-paragraph tracked-delete falls back to the
-            mark-only flow per-paragraph; v1 limitation. */
-            return self.clone();
-        }
-        let target_path = start.path.clone();
-        /* Issue #115 — snap both ends to char boundaries before any
-        revision math or `replace_range` sees them. */
-        let (s_off, e_off) = match self.paragraph_at_path(&target_path) {
-            Some(p) => (p.snap_offset(start.offset), p.snap_offset(end.offset)),
-            None => (start.offset, end.offset),
-        };
-        if s_off >= e_off {
-            return self.clone();
-        }
-        let mut blocks = self.blocks.clone();
-        let mut removed_edit = None;
-        let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
-            /* Range entirely inside a same-author Insert? If so, undo
-            the Insert (remove text + shrink the Insert overlay). */
-            let owning_insert = para.revisions.iter().any(|r| {
-                r.kind == RevisionKind::Insert
-                    && r.author == author
-                    && r.start <= s_off
-                    && e_off <= r.end
-            });
-            if owning_insert {
-                let s = s_off.min(para.text.len() as u32);
-                let e = e_off.min(para.text.len() as u32);
-                let removed_len = e.saturating_sub(s);
-                if e > s {
-                    /* Issues #250 / #252 — one splice drives the source
-                    markup and (below) the comment anchors. Issue #265 —
-                    the SAME (at, removed) window then drives every other
-                    byte-offset table through `shift_paragraph_offsets_after`
-                    (spans, hyperlinks, fields, inline objects, and the
-                    revisions themselves): the owning Insert satisfies
-                    `start <= s && e <= end`, so the shared gap-shift rule
-                    shrinks its `end` by `removed_len` and leaves `start`
-                    alone — exactly the old bespoke shrink — and drops it
-                    outright if that shrinks it to empty, via the same
-                    `retain` every other overlay gets. This is the
-                    `apply_revision_decision` (accept/reject) bookkeeping,
-                    reused so a field, hyperlink or picture inside a
-                    reviewer's own removed insertion leaves no stale
-                    offsets. */
-                    let edit = para.splice_text(s, removed_len, "");
-                    shift_paragraph_offsets_after(para, edit.at, edit.removed);
-                    removed_edit = Some(edit);
-                }
-                para.dirty = true;
-                return;
-            }
-            /* Marker-only delete: stamp a fresh Delete over the range
-            (text preserved). Merge with adjacent same-author Delete. */
-            let new_end = e_off;
-            let merged_left = para
-                .revisions
-                .iter_mut()
-                .find(|r| r.kind == RevisionKind::Delete && r.end == s_off && r.author == author);
-            if let Some(left) = merged_left {
-                left.end = new_end;
-                left.date = date.clone();
-            } else {
-                para.revisions.push(Revision {
-                    start: s_off,
-                    end: new_end,
-                    kind: RevisionKind::Delete,
-                    author: author.clone(),
-                    date: date.clone(),
-                    id: None,
-                    prev_attrs: None,
-                    move_name: None,
-                });
-            }
-            para.dirty = true;
-        });
-        let mut out = Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-        };
-        if let Some(e) = removed_edit {
-            out.remap_text_edit_record(&target_path, e);
-        }
-        out
+        self.try_tracked_delete_range(start, end, &author, &date)
+            .map_or_else(|_| self.clone(), |t| t.doc)
     }
 
     /// Sprint 14 (#14) — track-changes-aware format-change stamp.
@@ -6491,7 +6609,8 @@ impl DocumentTree {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
+                mark_style: None,
             }));
             return Self {
                 blocks,
@@ -6535,6 +6654,13 @@ impl DocumentTree {
             /* Issue #276 — pick the span to continue on the PRE-edit
             paragraph, at the offset `splice_text` snaps to. */
             let grow = para.inheriting_span(para.snap_offset(off.min(para.text.len() as u32)));
+            /* Issue #293 — an empty paragraph has no character to continue:
+            the typed text takes the paragraph mark's run properties. */
+            let from_mark = para
+                .text
+                .is_empty()
+                .then(|| para.typing_style_at(0))
+                .filter(|s| *s != SpanStyle::default());
             /* Issues #199 / #106 / #252 — ONE splice drives the source
             markup here and the comment anchors below. */
             let e = para.splice_text(off, 0, text);
@@ -6568,6 +6694,9 @@ impl DocumentTree {
                 if typed != donor {
                     *para = para.set_style(off, off + len, typed);
                 }
+            }
+            if let Some(mark) = from_mark {
+                *para = para.set_style(off, off + len, mark);
             }
             /* Issue #43 — FIELD anchors shift too (they render live now;
             a stale range would repaint the wrong bytes). Typing at a
@@ -6650,6 +6779,38 @@ impl DocumentTree {
         if let Some(e) = edit {
             out.remap_text_edit_record(&target, e);
         }
+        out
+    }
+
+    /// Issue #293 — Word applies formatting typed into an EMPTY paragraph to
+    /// its mark as well (sticky formatting armed in an empty paragraph IS
+    /// the mark's formatting). The interactive typing paths call this after
+    /// overlaying pending formatting onto text typed into a paragraph that
+    /// was empty: the mark takes the typed text's modeled style, so the
+    /// paragraph saves with a mark that agrees with its text. A no-op when
+    /// they already agree (plain typing inherits the mark).
+    pub fn mark_follows_text(&self, para: &BlockPath) -> Self {
+        let mut blocks = self.blocks.clone();
+        let mut changed = false;
+        let _ = mutate_paragraph_in_top(&mut blocks, para, |p| {
+            if p.text.is_empty() {
+                return;
+            }
+            let style = SpanStyle {
+                grab_bag: None,
+                ..p.style_at(0)
+            };
+            if style != p.mark_style.as_deref().cloned().unwrap_or_default() {
+                p.mark_style = Some(Box::new(style));
+                p.dirty = true;
+                changed = true;
+            }
+        });
+        if !changed {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        out.blocks = blocks;
         out
     }
 
@@ -7219,107 +7380,10 @@ impl DocumentTree {
     `DocumentTree`.
     =========================================================== */
 
-    /// Accept a tracked-change revision identified by (top-level
-    /// `block`, byte `start`, byte `end`). Semantics:
-    ///   - `Insert + Accept` → keep the inserted text, drop the overlay
-    ///   - `Delete + Accept` → drop the deleted text + drop the overlay
-    pub fn accept_revision_at(&self, block: u32, start: u32, end: u32) -> Self {
-        self.apply_revision_decision(block, start, end, /* accept = */ true)
-    }
-
-    /// Reject a tracked-change revision identified by (top-level
-    /// `block`, byte `start`, byte `end`). Semantics:
-    ///   - `Insert + Reject` → drop the inserted text + drop the overlay
-    ///   - `Delete + Reject` → keep the original text, drop the overlay
-    pub fn reject_revision_at(&self, block: u32, start: u32, end: u32) -> Self {
-        self.apply_revision_decision(block, start, end, /* accept = */ false)
-    }
-
-    fn apply_revision_decision(&self, block: u32, start: u32, end: u32, accept: bool) -> Self {
-        /* Issue #262 — a paragraph-MARK revision is addressed as the
-        empty range at the paragraph end (`revisions_snapshot` lists it
-        so); text revisions are never empty. */
-        if start == end
-            && let Some(p) = self
-                .blocks
-                .get(block as usize)
-                .and_then(Block::as_paragraph)
-            && p.mark_revision.is_some()
-            && start as usize == p.text.len()
-            && !p.revisions.iter().any(|r| r.start == start && r.end == end)
-        {
-            return self.resolve_mark_revision_at(block, accept);
-        }
-        let mut blocks = self.blocks.clone();
-        let path = BlockPath::top(block);
-        let mut removed_edit = None;
-        let _ = mutate_paragraph_in_top(&mut blocks, &path, |para| {
-            let Some(idx) = para
-                .revisions
-                .iter()
-                .position(|r| r.start == start && r.end == end)
-            else {
-                return;
-            };
-            /* Remove the matched revision FIRST so the offset-shift
-             * helper does not also `retain`-drop it (which would make
-             * any post-shift index lookup brittle). */
-            let rev = para.revisions.remove(idx);
-            /* Issue #262 — a rejected formatting change restores the
-            recorded style. */
-            if !accept
-                && rev.kind == RevisionKind::FormatChange
-                && let Some(prev) = &rev.prev_attrs
-            {
-                revisions::restyle(para, rev.start, rev.end, prev);
-            }
-            /* Reject Insert / MoveTo, accept Delete / MoveFrom (issue
-            #247): the text goes; otherwise it stays live. */
-            let delete_text = rev.kind.removes_text(accept);
-            if delete_text {
-                let s = para.snap_offset(rev.start);
-                let e = para.snap_offset(rev.end);
-                if s < e {
-                    /* Issues #250 / #252 — one splice drives the source
-                    markup and (below) the comment anchors. */
-                    let edit = para.splice_text(s, e - s, "");
-                    shift_paragraph_offsets_after(para, edit.at, edit.removed);
-                    removed_edit = Some(edit);
-                }
-            }
-            para.dirty = true;
-        });
-        let mut out = Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-        };
-        if let Some(e) = removed_edit {
-            out.remap_text_edit_record(&path, e);
-        }
-        out
-    }
+    /* Issue #305 — the single-revision accept / reject
+    (`accept_revision_at` / `reject_revision_at`) lives in
+    `revision_refs` and runs through the same resolver as accept-all
+    (`revisions::DocumentTree::resolve_revisions`). */
 
     /// Sprint 7 (UI Edition) — append a new comment anchored to a
     /// logical range. Picks a fresh `id` (max existing + 1) and
@@ -9084,6 +9148,10 @@ impl DocumentTree {
         let Some(p) = self.paragraph_at_path(&at.path) else {
             return self.clone();
         };
+        /* Issue #301 — the text's tracked changes travel with it (cut
+        once, by `split_at`, issue #292): Enter inside a reviewer's
+        pending insertion used to turn the typed text into plain,
+        unreviewable text. */
         let (left, mut right) = p.split_at(at.offset);
         /* Issue #277 — Word's "next style" rule: Enter at the very END
         of a paragraph gives the NEW paragraph its style's `<w:next>`
@@ -10813,59 +10881,6 @@ fn walk_paragraphs<F: FnMut(&Paragraph)>(blocks: &Vector<Block>, f: &mut F) {
     }
 }
 
-/// Sprint 7 (UI Edition) helper — shift every byte-offset-bearing
-/// field on `para` LEFT by `removed_len`, for every value at or
-/// after `from`. Mirrors the rightward shift performed by
-/// `insert_inline_image_at` in reverse. Used when a tracked-change
-/// revision is rejected (Insert) or accepted (Delete) — and (issue
-/// #265) when the reviewer's own pending insertion is removed by
-/// `tracked_delete_range` — and the covered text range is sliced out.
-fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u32) {
-    let to = from + removed_len;
-    let shift = |v: &mut u32| {
-        if *v >= to {
-            *v -= removed_len;
-        } else if *v > from {
-            *v = from;
-        }
-    };
-    for s in &mut para.spans {
-        shift(&mut s.start);
-        shift(&mut s.end);
-    }
-    para.spans.retain(|s| s.start < s.end);
-    /* Issue #265 — an inline object is a single sentinel byte, not a
-    range: one whose sentinel lies inside the removed gap has nothing
-    left to clamp onto (unlike a span/field/hyperlink, which can be
-    clipped to the gap's edge) and is dropped, exactly like
-    `Paragraph::delete_text`'s rule for the same case. */
-    para.inline_objects.retain_mut(|io| {
-        if io.at >= to {
-            io.at -= removed_len;
-            true
-        } else {
-            io.at < from
-        }
-    });
-    for h in &mut para.hyperlinks {
-        shift(&mut h.start);
-        shift(&mut h.end);
-    }
-    para.hyperlinks.retain(|h| h.start < h.end);
-    for r in &mut para.revisions {
-        shift(&mut r.start);
-        shift(&mut r.end);
-    }
-    para.revisions.retain(|r| r.start < r.end);
-    for f in &mut para.fields {
-        shift(&mut f.start);
-        shift(&mut f.end);
-    }
-    para.fields.retain(|f| f.start < f.end);
-    /* Issues #199 / #106 / #250 — the source markup was remapped by the
-    caller's `Paragraph::splice_text`, together with the text. */
-}
-
 /// Phase 3 (#40) — clipboard fragments are never section-marker
 /// carriers: `slice` / `slice_blocks` strip on the way out and
 /// `insert_rich` / `insert_rich_blocks` strip on the way in, so no
@@ -10880,7 +10895,7 @@ fn strip_section_marker(mut p: Paragraph) -> Paragraph {
     (`w14:paraId`) and rsids: a pasted copy is a new paragraph. */
     p.source_markup = None;
     /* Issue #262 — nor a tracked change on the source paragraph's mark. */
-    p.mark_revision = None;
+    p.mark_revisions.clear();
     p
 }
 
@@ -13578,7 +13593,8 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
+            mark_style: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -13609,7 +13625,8 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
+            mark_style: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -13637,7 +13654,8 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
+            mark_style: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -13743,7 +13761,8 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
+            mark_style: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -13785,7 +13804,8 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
+            mark_style: None,
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -14284,7 +14304,8 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -14332,7 +14353,8 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
+            mark_style: None,
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -14379,7 +14401,8 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
+                mark_style: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -14404,7 +14427,8 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
+                mark_style: None,
             },
         ];
         let (out, caret) = doc.insert_rich(

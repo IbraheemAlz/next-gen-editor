@@ -740,6 +740,10 @@ pub enum LayoutDegradeReason {
     /// footnote band and was too tall to lift clear of it; it was pinned
     /// at the body top and paints over the band.
     FloatClampedByNotes,
+    /// Issue #318 — a table nested past the layout's nesting cap was
+    /// flattened to its paragraphs (stacked, in document order, in the
+    /// cell holding it) instead of laid out as a grid.
+    NestingCapped,
 }
 
 /// Issue #87 — one degradation note on `Event::Painted`. `page` is the

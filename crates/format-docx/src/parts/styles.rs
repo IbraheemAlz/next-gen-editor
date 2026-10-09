@@ -44,6 +44,10 @@ pub enum StyleKind {
 #[derive(Debug, Clone)]
 pub struct StyleDef {
     pub id: String,
+    /// Issue #297 — `<w:name w:val="…"/>`: the style's display name
+    /// (`heading 1`, a localized or custom name), distinct from the
+    /// `w:styleId` (`Heading1`). `None` when the source omits it.
+    pub name: Option<String>,
     pub kind: StyleKind,
     /// `<w:basedOn w:val="…"/>` — the parent style id. The resolver folds
     /// the cascade root-first along this chain.
@@ -111,6 +115,13 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
             .map(|n| n.as_slice() == b"w:pPr")
             .unwrap_or(false)
     };
+    /* Issue #297 — a direct child of `<w:style>` (its `<w:name>`). */
+    let in_style = |stack: &[Vec<u8>]| -> bool {
+        stack
+            .last()
+            .map(|n| n.as_slice() == b"w:style")
+            .unwrap_or(false)
+    };
     /* Audit gap A.M17 — `<w:style>/<w:pPr>/<w:numPr>`. */
     let in_numpr = |stack: &[Vec<u8>]| -> bool {
         stack
@@ -136,6 +147,11 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                     b"w:next" => {
                         if let Some(s) = cur_style.as_mut() {
                             s.next = attr_val(&e, b"w:val");
+                        }
+                    }
+                    b"w:name" if in_style(&stack) => {
+                        if let Some(s) = cur_style.as_mut() {
+                            s.name = attr_val(&e, b"w:val");
                         }
                     }
                     n if in_rpr(&stack) && !pmark_rpr(&stack) => {
@@ -168,6 +184,11 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                     b"w:next" => {
                         if let Some(s) = cur_style.as_mut() {
                             s.next = attr_val(&e, b"w:val");
+                        }
+                    }
+                    b"w:name" if in_style(&stack) => {
+                        if let Some(s) = cur_style.as_mut() {
+                            s.name = attr_val(&e, b"w:val");
                         }
                     }
                     n if in_rpr(&stack) && !pmark_rpr(&stack) => {
@@ -216,6 +237,7 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
 #[derive(Debug)]
 struct StyleScratch {
     id: Option<String>,
+    name: Option<String>,
     kind: Option<StyleKind>,
     based_on: Option<String>,
     next: Option<String>,
@@ -227,6 +249,7 @@ impl StyleScratch {
     fn from_start(e: &BytesStart) -> Self {
         Self {
             id: attr_val(e, b"w:styleId"),
+            name: None,
             kind: attr_val(e, b"w:type").as_deref().and_then(parse_kind),
             based_on: None,
             next: None,
@@ -239,6 +262,7 @@ impl StyleScratch {
         let kind = self.kind?;
         Some(StyleDef {
             id,
+            name: self.name,
             kind,
             based_on: self.based_on,
             next: self.next,
@@ -356,6 +380,9 @@ mod tests {
         assert_eq!(base.based_on, None);
         assert_eq!(base.next, None);
         assert_eq!(base.run.bold, Some(true));
+        /* Issue #297 — the display name, not the id. */
+        assert_eq!(base.name.as_deref(), Some("Base Style"));
+        assert_eq!(t.by_id["Emphasis"].name, None, "no <w:name>");
 
         let child = t.by_id.get("ChildStyle").unwrap();
         assert_eq!(child.based_on.as_deref(), Some("BaseStyle"));
