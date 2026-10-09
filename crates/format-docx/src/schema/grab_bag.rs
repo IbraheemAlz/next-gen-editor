@@ -26,6 +26,7 @@
 //! siblings publish.
 
 use crate::error::DocxError;
+use crate::schema::family::{self, NsFamily, RootBinding};
 use engine::GrabBag;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -37,6 +38,8 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Default)]
 pub struct NamespaceScope {
     decls: Vec<(String, String)>,
+    /// Issue #325 — the root's default namespace (`xmlns="…"`), if any.
+    default_ns: Option<String>,
 }
 
 impl NamespaceScope {
@@ -45,15 +48,60 @@ impl NamespaceScope {
     /// verbatim into an attribute position.
     pub fn from_root(root: &BytesStart) -> Self {
         let mut decls = Vec::new();
+        let mut default_ns = None;
         for a in root.attributes().flatten() {
             if let Some(prefix) = a.key.as_ref().strip_prefix(b"xmlns:") {
                 decls.push((
                     String::from_utf8_lossy(prefix).into_owned(),
                     String::from_utf8_lossy(&a.value).into_owned(),
                 ));
+            } else if a.key.as_ref() == b"xmlns" {
+                default_ns = Some(String::from_utf8_lossy(&a.value).into_owned());
             }
         }
-        Self { decls }
+        Self { decls, default_ns }
+    }
+
+    /// Issue #325 — validate the root's bindings against the fast path
+    /// (the reader matches literal `w:` / `r:` / `a:` qnames). The
+    /// canonical prefixes bound to either namespace family keep the fast
+    /// path; any other prefix, a default-namespace WordprocessingML root,
+    /// or a canonical prefix rebound to a foreign URI is `NonCanonical`,
+    /// which the caller answers with a typed warning plus a prefix
+    /// normalisation (`schema::ns_normalize`) — never a silent empty
+    /// document. A `w:` root with no `xmlns:w` at all stays on the fast
+    /// path (fragments and hand-written test inputs).
+    pub fn classify_root(&self, root_qname: &[u8]) -> RootBinding {
+        for p in family::FAST_PATH_PREFIXES {
+            if let Some(uri) = self.uri(p)
+                && !family::uri_fits_prefix(p, uri)
+            {
+                return RootBinding::NonCanonical {
+                    detail: format!("prefix `{p}` is bound to unexpected namespace `{uri}`"),
+                };
+            }
+        }
+        let is_w_family = |uri: &str| family::family_of_w_uri(uri).is_some();
+        match prefix_of(root_qname).as_deref() {
+            Some("w") => match self.uri("w") {
+                Some(uri) => family::family_of_w_uri(uri)
+                    .map(RootBinding::Canonical)
+                    .unwrap_or(RootBinding::NotWordprocessingMl),
+                None => RootBinding::Canonical(NsFamily::Transitional),
+            },
+            Some(other) => match self.uri(other) {
+                Some(uri) if is_w_family(uri) => RootBinding::NonCanonical {
+                    detail: format!("WordprocessingML is bound to prefix `{other}`, not `w`"),
+                },
+                _ => RootBinding::NotWordprocessingMl,
+            },
+            None => match self.default_ns.as_deref() {
+                Some(uri) if is_w_family(uri) => RootBinding::NonCanonical {
+                    detail: "WordprocessingML is the default namespace".to_string(),
+                },
+                _ => RootBinding::NotWordprocessingMl,
+            },
+        }
     }
 
     /// URI bound to `prefix` on the root, if any.
