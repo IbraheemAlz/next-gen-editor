@@ -257,7 +257,7 @@ export function App() {
                covers a snapshot-less recovery whose replayed tail carried
                the boot RENDER_PAGE: re-seeding would wipe the replayed
                document and snap the zoom back to 100 %. */
-            generation > 0 && client.lastRecovery?.layoutRestored === true,
+            client.lastRecovery?.layoutRestored === true,
         );
         setBooting(false);
         /* Issue #54 — the boot paint presents while the opaque
@@ -285,7 +285,8 @@ export function App() {
             console.error('[boot] settle repaint failed:', settle.message);
         }
         window.__paintIdle = true;
-        if (generation > 0) {
+        /* Issue #330 — generation 0 can also be a recovery (a carried-over reload). */
+        if (generation > 0 || client.lastRecovery !== undefined) {
             window.__recovered = true;
         }
         if (firstReady) {

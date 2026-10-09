@@ -178,8 +178,49 @@ export interface RecoveryInfo {
     cause: RecoveryCause;
 }
 
-/** Issue #270 — see `RecoveryInfo.cause`. */
-export type RecoveryCause = 'trap' | 'renderer-retry';
+/** Issue #270 — see `RecoveryInfo.cause`. Issue #330 — `engine-reload`
+ *  is the crash overlay's "Reload engine" (an in-place restart from the
+ *  log) and `page-reload` a boot that honoured a carry-over. */
+export type RecoveryCause = 'trap' | 'renderer-retry' | 'engine-reload' | 'page-reload';
+
+/** Issue #330 — `sessionStorage` key of the one-shot "carry the document
+ *  across this reload" token (see `EngineClient.prepareCarryOver`). */
+const CARRY_OVER_KEY = 'nge.carry-over';
+/** Issue #330 — a carry-over older than this is stale (a reload takes
+ *  seconds, not minutes) and ignored. */
+const CARRY_OVER_MAX_AGE_MS = 2 * 60 * 1000;
+/** Issue #330 — how long a planned retirement may take before the
+ *  worker is declared unresponsive and terminated anyway. */
+const RETIRE_TIMEOUT_MS = 3000;
+
+function writeCarryOver(documentId: string): void {
+    try {
+        globalThis.sessionStorage?.setItem(
+            CARRY_OVER_KEY,
+            JSON.stringify({ documentId, at: Date.now() }),
+        );
+    } catch {
+        /* storage blocked: the reload starts a fresh session */
+    }
+}
+
+/** Issue #330 — read AND remove the carry-over token: honoured once. */
+function takeCarryOver(documentId: string): boolean {
+    try {
+        const raw = globalThis.sessionStorage?.getItem(CARRY_OVER_KEY);
+        globalThis.sessionStorage?.removeItem(CARRY_OVER_KEY);
+        if (!raw) return false;
+        const t = JSON.parse(raw) as { documentId?: unknown; at?: unknown };
+        return (
+            t.documentId === documentId &&
+            typeof t.at === 'number' &&
+            Date.now() - t.at >= 0 &&
+            Date.now() - t.at < CARRY_OVER_MAX_AGE_MS
+        );
+    } catch {
+        return false;
+    }
+}
 
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
  *  stops re-probing the GPU and forces Canvas2D (so a persistently failing
@@ -298,6 +339,11 @@ export class EngineClient {
     private retiring = false;
     /** Issue #270 — why the NEXT `recover()` runs (`RecoveryInfo.cause`). */
     private pendingCause: RecoveryCause = 'trap';
+    /** Issue #330 — set from the moment the shell is asked to remount a
+     *  canvas and call `recover()` until that recovery settles. Lets
+     *  "Reload engine" join a recovery already under way instead of
+     *  starting a second one. */
+    private recoveryPending: { promise: Promise<void>; settle: () => void } | undefined;
     /** Issue #240 — the persisted streak currently marks a live Vello
      *  generation (cleared on a clean `pagehide`). */
     private streakLive = false;
@@ -413,6 +459,21 @@ export class EngineClient {
                     'persisted (< 24 h) — booting on Canvas2D without probing the GPU',
             );
         }
+        /* Issue #330 - a reload that carries the document: recover from the
+           log instead of starting a session (INIT clears it). Only when the
+           log actually holds something; an empty one is a normal boot. */
+        if (takeCarryOver(this.documentId)) {
+            const log = await loadRecoveryLog().catch(() => undefined);
+            if (
+                log &&
+                (log.commands.length > 0 || log.candidates.some((c) => c.snapshot.length > 0))
+            ) {
+                this.worker.terminate();
+                this.pendingCause = 'page-reload';
+                await this.recover(canvas);
+                return;
+            }
+        }
         const r = await this.send(
             {
                 type: 'INIT',
@@ -490,14 +551,97 @@ export class EngineClient {
         if (!retired.ok) {
             console.warn('[recovery] renderer retry: the worker did not retire cleanly', retired.error);
         }
+        this.markRecoveryPending();
+        this.respawnAfterRetire('renderer-retry');
+    }
+
+    private markRecoveryPending(): void {
+        if (this.recoveryPending) return;
+        let settle!: () => void;
+        const promise = new Promise<void>((r) => (settle = r));
+        this.recoveryPending = { promise, settle };
+    }
+
+    /**
+     * Issue #330 — the crash overlay's "Reload engine": restart the engine
+     * IN PLACE from the event log, never a page reload (a reload is a new
+     * session, whose boot clears the log — the document was lost). A
+     * recovery already under way is joined, not repeated. Otherwise the
+     * live worker is retired (everything dispatched is applied, the log
+     * head snapshotted and flushed — the #270 path) and respawned exactly
+     * like a crash recovery. A worker that does not answer the retirement
+     * within `RETIRE_TIMEOUT_MS` is terminated anyway: the log already
+     * holds everything it acknowledged. Resolves once the recovery
+     * settles.
+     */
+    async restartInPlace(): Promise<void> {
+        if (this.recoveryPending) return this.recoveryPending.promise;
+        if (this.retiring) return;
+        this.retiring = true;
+        const generation = this.generations;
+        let retired: WorkerReply;
+        try {
+            retired = await this.retireWorker();
+        } finally {
+            this.retiring = false;
+        }
+        const joined = this.recoveryPending as { promise: Promise<void> } | undefined;
+        if (joined) return joined.promise;
+        if (this.generations !== generation || retired.trap) return;
+        if (!retired.ok) {
+            console.warn('[recovery] engine reload: the worker did not retire cleanly', retired.error);
+        }
+        this.markRecoveryPending();
+        const done = this.recoveryPending!.promise;
+        this.respawnAfterRetire('engine-reload');
+        return done;
+    }
+
+    /** Retire the live worker (RETIRE), bounded by `RETIRE_TIMEOUT_MS`. */
+    private retireWorker(): Promise<WorkerReply> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<WorkerReply>((resolve) => {
+            timer = setTimeout(
+                () => resolve({ ok: false, error: 'worker did not answer the retirement' }),
+                RETIRE_TIMEOUT_MS,
+            );
+        });
+        return Promise.race([this.send({ type: 'RETIRE' }), timeout]).finally(() => {
+            if (timer !== undefined) clearTimeout(timer);
+        });
+    }
+
+    /** Terminate the retired worker, settle its requests and hand over to
+     *  the shell (`onCrash` remounts a fresh canvas -> `recover()`). */
+    private respawnAfterRetire(cause: RecoveryCause): void {
         this.worker.terminate();
         this.recovering = true;
         for (const resolve of this.pending.values()) {
-            resolve({ ok: false, error: 'engine worker retired for a renderer retry' });
+            resolve({ ok: false, error: 'engine worker restarted in place' });
         }
         this.pending.clear();
-        this.pendingCause = 'renderer-retry';
+        this.pendingCause = cause;
         this.onCrash();
+    }
+
+    /**
+     * Issue #330 — the crash overlay's "Reload page": make the coming page
+     * reload carry the document. The live worker (if any) is retired so
+     * the log holds its head, then a one-shot token is left in
+     * `sessionStorage`; the next boot's `init()` honours it by recovering
+     * from the log instead of starting a new session (which would clear
+     * it). A plain reload without this call still starts a new session.
+     */
+    async prepareCarryOver(): Promise<void> {
+        if (!this.recoveryPending && !this.recovering && !this.retiring) {
+            this.retiring = true;
+            try {
+                await this.retireWorker();
+            } finally {
+                this.retiring = false;
+            }
+        }
+        writeCarryOver(this.documentId);
     }
 
     /** Worker generations spawned so far (1 = boot; +1 per recovery). */
@@ -571,6 +715,19 @@ export class EngineClient {
      * brand-new OffscreenCanvas — the trapped surface is gone.
      */
     async recover(canvas: OffscreenCanvas): Promise<void> {
+        try {
+            await this.recoverInner(canvas);
+        } finally {
+            /* Issue #330 - settle the pending-recovery latch, unless the
+               replay itself trapped again (a new recovery is then due). */
+            if (!this.recovering && this.recoveryPending) {
+                this.recoveryPending.settle();
+                this.recoveryPending = undefined;
+            }
+        }
+    }
+
+    private async recoverInner(canvas: OffscreenCanvas): Promise<void> {
         /* Issue #270 — read before any await: a trap during this recovery
            starts the next one as a plain `trap`. */
         const cause = this.pendingCause;
@@ -638,6 +795,7 @@ export class EngineClient {
         );
         if (!r.ok) throw new Error(r.error);
         this.activeRenderer = r.renderer ?? 'canvas2d';
+        if (r.crossOriginIsolated !== undefined) this.workerIsolated = r.crossOriginIsolated;
         /* Issue #270 — this generation probed unless it was forced. */
         this.bootProbed = this.downgrade === undefined;
         const recovered = r.evt?.type === 'RECOVERED' ? r.evt : undefined;
@@ -902,6 +1060,7 @@ export class EngineClient {
            subscribers (TrapOverlay, telemetry ENGINE_TRAP) see the crash. */
         const trapEvt: Event = { type: 'TRAP', stack };
         this.subscribers.forEach((s) => s(trapEvt));
+        this.markRecoveryPending();
         this.onCrash();
     }
 }

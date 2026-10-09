@@ -1138,6 +1138,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             ok: true,
             evt,
             renderer,
+            /* Issue #330 - a boot that recovers (carry-over) never saw INIT's reply. */
+            crossOriginIsolated: self.crossOriginIsolated,
             restored,
             appliedCommands: recovered?.applied_commands ?? 0,
             snapshotFallbacks,
