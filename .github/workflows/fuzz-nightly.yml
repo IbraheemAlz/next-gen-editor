@@ -37,6 +37,10 @@ on:
         description: 'Per-target fuzz budget, in seconds'
         required: false
         default: '1800'
+      minimize_budget_secs:
+        description: 'Per-job crash-minimization budget, in seconds'
+        required: false
+        default: '900'
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,7 +53,7 @@ jobs:
   fuzz:
     name: cargo fuzz (${{ matrix.target }})
     runs-on: ubuntu-24.04
-    # 30 min fuzz budget (default) + build/minimize/upload overhead.
+    # 30 min fuzz budget (default) + build + 15 min minimize budget + upload.
     timeout-minutes: 50
     permissions:
       issues: write
@@ -152,28 +156,57 @@ jobs:
           fi
           exit 0
 
+      # Bounded (run 37937811241: one deterministic `rpc_command` hang under
+      # `-fork=4` left many `timeout-*` files; the old per-artifact
+      # `timeout 600` loop with no overall bound sat for ~40 min until the
+      # job timeout killed it — red, the wrong classification for a finding).
+      # Bounds: a per-job budget (MINIMIZE_BUDGET_SECS, default 900),
+      # per-artifact `timeout` <= 180 s with `-max_total_time=120`, and the
+      # order crash -> leak -> oom -> timeout so real crashes are minimized
+      # first. Once the budget is spent the remaining artifacts get
+      # `.min = original`: never lost, never minimized. Straight-line code,
+      # one `cp` fallback — nothing here can loop on its own output.
       - name: Minimize any crash artifact
         if: always()
         working-directory: fuzz
+        env:
+          MINIMIZE_BUDGET_INPUT: ${{ github.event.inputs.minimize_budget_secs }}
         run: |
           set -uo pipefail
           shopt -s nullglob
-          for f in artifacts/${{ matrix.target }}/crash-* artifacts/${{ matrix.target }}/leak-* artifacts/${{ matrix.target }}/oom-* artifacts/${{ matrix.target }}/timeout-*; do
-            [ -f "$f" ] || continue
-            case "$f" in *.min) continue ;; esac
-            echo "Minimizing $f ($(stat -c %s "$f") bytes)"
-            # cargo-fuzz has no `-o`; libFuzzer's `-exact_artifact_path`
-            # is where tmin writes the smallest still-crashing input.
-            rm -f "$f.min"
-            timeout 600 cargo +nightly fuzz tmin "${{ matrix.target }}" "$f" -- \
-              -max_total_time=300 -exact_artifact_path="$f.min" || true
-            # tmin can fail, time out, or emit an empty file: fall back to
-            # the un-minimized crash input so the reproducer is never lost.
-            if [ ! -s "$f.min" ]; then
-              echo "tmin produced no usable output for $f; using the original input"
-              cp "$f" "$f.min"
-            fi
+          BUDGET="${MINIMIZE_BUDGET_INPUT:-900}"
+          case "$BUDGET" in ''|*[!0-9]*) BUDGET=900 ;; esac
+          START="$SECONDS"
+          DIR="artifacts/${{ matrix.target }}"
+          for kind in crash leak oom timeout; do
+            for f in "$DIR"/"$kind"-*; do
+              [ -f "$f" ] || continue
+              case "$f" in *.min) continue ;; esac
+              rm -f "$f.min"
+              REMAINING=$(( BUDGET - (SECONDS - START) ))
+              if [ "$REMAINING" -lt 20 ]; then
+                echo "Minimize budget (${BUDGET}s) exhausted; keeping $f ($(stat -c %s "$f") bytes) un-minimized"
+                cp "$f" "$f.min"
+                continue
+              fi
+              LIMIT=180
+              [ "$REMAINING" -lt "$LIMIT" ] && LIMIT="$REMAINING"
+              MAXT=120
+              [ "$LIMIT" -le 130 ] && MAXT=$(( LIMIT - 10 ))
+              echo "Minimizing $f ($(stat -c %s "$f") bytes; ${REMAINING}s of budget left, limit ${LIMIT}s)"
+              # cargo-fuzz has no `-o`; libFuzzer's `-exact_artifact_path`
+              # is where tmin writes the smallest still-crashing input.
+              timeout -k 10 "$LIMIT" cargo +nightly fuzz tmin "${{ matrix.target }}" "$f" -- \
+                -max_total_time="$MAXT" -timeout=30 -exact_artifact_path="$f.min" || true
+              # tmin can fail, time out, or emit an empty file: fall back to
+              # the un-minimized input so the reproducer is never lost.
+              if [ ! -s "$f.min" ]; then
+                echo "tmin produced no usable output for $f; using the original input"
+                cp "$f" "$f.min"
+              fi
+            done
           done
+          echo "Minimization used $(( SECONDS - START ))s of the ${BUDGET}s budget."
 
       - name: Upload crash artifacts
         if: always()
@@ -184,6 +217,14 @@ jobs:
           if-no-files-found: ignore
           retention-days: 90
 
+      # Bounded filing: at most MAX_ISSUES (3) NEW issues per target per run,
+      # in the order crash -> leak -> oom -> timeout. All timeout artifacts of
+      # a target share one hang signature in practice, so they are ONE issue
+      # (every reproducer in the body, <= 4 KB each; larger ones referenced
+      # by artifact name), deduped against OPEN `fuzz(<target>): timeout ...`
+      # issues by the sha256 of the smallest reproducer. Whatever does not fit
+      # is listed (name, size, sha256) in the last filed issue's body and
+      # stays in the uploaded artifact.
       - name: File a GitHub issue per new crash
         if: always()
         env:
@@ -193,69 +234,148 @@ jobs:
           set -uo pipefail
           shopt -s nullglob
           : > infra-errors.txt
-          EXISTING=""
-          EXISTING_LOADED=0
-          for f in artifacts/${{ matrix.target }}/*.min; do
+          TARGET="${{ matrix.target }}"
+          DIR="artifacts/$TARGET"
+          MAX_ISSUES=3
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TAB=$'\t'
+
+          if ! EXISTING="$(gh issue list --state all --limit 2000 --json state,title --jq '.[] | .state + "\t" + .title')"; then
+            echo "::error::could not list existing issues"
+            echo "gh issue list failed" >> infra-errors.txt
+            exit 0
+          fi
+          # Exact-title match: GitHub's search tokenizer is not a reliable
+          # oracle for titles with parens and colons. The title carries the
+          # TARGET name, so equal hashes in two targets never collide.
+          filed_any() { grep -qxF "OPEN${TAB}$1" <<<"$EXISTING" || grep -qxF "CLOSED${TAB}$1" <<<"$EXISTING"; }
+          filed_open() { grep -qxF "OPEN${TAB}$1" <<<"$EXISTING"; }
+          describe() { echo "- \`$(basename "$1")\` ($(stat -c %s "$1") bytes) sha256 \`$(sha256sum "$1" | cut -d' ' -f1)\`"; }
+
+          # Pass 1: collect new units (one per crash/leak/oom file, one for
+          # all timeouts), in priority order. Dedup before counting, so a
+          # known crash never consumes a slot.
+          UNIT_KIND=(); UNIT_TITLE=(); UNIT_FILES=()
+          for kind in crash leak oom; do
+            for f in "$DIR"/"$kind"-*.min; do
+              [ -f "$f" ] || continue
+              if [ ! -s "$f" ]; then
+                # Content-free (the empty-input crash behind #323 / #324 was
+                # a per-iteration leak reported against the empty unit).
+                echo "::error::zero-length reproducer $f for $TARGET; not filing an issue"
+                echo "zero-length reproducer: $f" >> infra-errors.txt
+                continue
+              fi
+              TITLE="fuzz($TARGET): crash $(sha256sum "$f" | cut -c1-12)"
+              if filed_any "$TITLE"; then echo "Already filed: $TITLE"; continue; fi
+              UNIT_KIND+=(crash); UNIT_TITLE+=("$TITLE"); UNIT_FILES+=("$f")
+            done
+          done
+          TFILES=()
+          for f in "$DIR"/timeout-*.min; do
             [ -f "$f" ] || continue
-            # A zero-length reproducer is content-free: it carries no
-            # information to triage (the empty-input crash behind #323 /
-            # #324 was a per-iteration leak reported against the empty
-            # unit). Do not file it; surface it instead.
             if [ ! -s "$f" ]; then
-              echo "::error::zero-length reproducer $f for ${{ matrix.target }}; not filing an issue"
+              echo "::error::zero-length reproducer $f for $TARGET; not filing an issue"
               echo "zero-length reproducer: $f" >> infra-errors.txt
               continue
             fi
-            HASH="$(sha256sum "$f" | cut -c1-12)"
-            # The title carries the TARGET name, so the same 12-hex prefix
-            # in two targets can never suppress each other.
-            TITLE="fuzz(${{ matrix.target }}): crash $HASH"
-            # Dedup across nightly runs — the same minimized input hashes
-            # the same, so a recurring crash gets one issue, not one per
-            # night. List every issue (open + closed) once and match the
-            # exact title: GitHub's search tokenizer is not a reliable
-            # exact-match oracle for titles with parens and colons.
-            if [ "$EXISTING_LOADED" -eq 0 ]; then
-              if ! EXISTING="$(gh issue list --state all --limit 2000 --json title --jq '.[].title')"; then
-                echo "::error::could not list existing issues"
-                echo "gh issue list failed" >> infra-errors.txt
-                break
-              fi
-              EXISTING_LOADED=1
+            TFILES+=("$f")
+          done
+          if [ ${#TFILES[@]} -gt 0 ]; then
+            # Smallest first (ties by name) -> its hash names the issue.
+            mapfile -t TFILES < <(for f in "${TFILES[@]}"; do echo "$(stat -c %s "$f") $f"; done | sort -n -k1,1 -k2,2 | cut -d' ' -f2-)
+            TITLE="fuzz($TARGET): timeout $(sha256sum "${TFILES[0]}" | cut -c1-12)"
+            if filed_open "$TITLE"; then
+              echo "Already filed (open): $TITLE"
+            else
+              UNIT_KIND+=(timeout); UNIT_TITLE+=("$TITLE"); UNIT_FILES+=("${TFILES[*]}")
             fi
-            if grep -qxF "$TITLE" <<<"$EXISTING"; then
-              echo "Already filed: $TITLE"
-              continue
-            fi
+          fi
+
+          N=${#UNIT_TITLE[@]}
+          TO_FILE=$(( N < MAX_ISSUES ? N : MAX_ISSUES ))
+          echo "$N new finding(s) for $TARGET; filing $TO_FILE (cap $MAX_ISSUES)."
+
+          # Pass 2: file the first TO_FILE units; the last one also lists
+          # every unit that did not fit.
+          for (( i = 0; i < TO_FILE; i++ )); do
+            kind="${UNIT_KIND[$i]}"
+            TITLE="${UNIT_TITLE[$i]}"
+            read -r -a FILES <<<"${UNIT_FILES[$i]}"
             BODY_FILE="$(mktemp)"
             {
-              echo "Nightly structure-aware fuzzing found a crash (D5.5, issue #90)."
+              if [ "$kind" = timeout ]; then
+                echo "Nightly structure-aware fuzzing found a hang (D5.5, issue #90): ${#FILES[@]} libFuzzer \`timeout-*\` reproducer(s), which in practice share one hang signature, so they are filed as a single issue."
+              else
+                echo "Nightly structure-aware fuzzing found a crash (D5.5, issue #90)."
+              fi
               echo
-              echo "- Target: \`${{ matrix.target }}\`"
-              echo "- Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-              echo "- Reproducer: \`$(basename "$f")\` ($(stat -c %s "$f") bytes; attached below and in the run's uploaded artifact)"
+              echo "- Target: \`$TARGET\`"
+              echo "- Workflow run: $RUN_URL"
+              echo "- Every original and minimized input is in the run's uploaded \`fuzz-crashes-$TARGET-${{ github.run_id }}\` artifact."
               echo
-              echo "### Reproducer (base64)"
-              echo
-              echo '```'
-              base64 -w0 "$f"
-              echo
-              echo '```'
-              echo
-              echo "### Reproduce locally"
-              echo
-              echo '```'
-              echo "cd fuzz"
-              echo "base64 -d > repro.bin <<< '$(base64 -w0 "$f")'"
-              echo "cargo +nightly fuzz run ${{ matrix.target }} repro.bin"
-              echo '```'
+              if [ "$kind" = timeout ]; then
+                echo "### Reproducers (smallest first; base64 when <= 4 KB, else see the artifact)"
+                USED=0
+                for f in "${FILES[@]}"; do
+                  SZ="$(stat -c %s "$f")"
+                  echo
+                  describe "$f"
+                  if [ "$SZ" -le 4096 ] && [ "$USED" -lt 40000 ]; then
+                    B64="$(base64 -w0 "$f")"
+                    USED=$(( USED + ${#B64} ))
+                    echo '```'
+                    echo "$B64"
+                    echo '```'
+                  else
+                    echo "  (not inlined; see the artifact)"
+                  fi
+                done
+                echo
+                echo "### Reproduce locally"
+                echo
+                echo '```'
+                echo "cd fuzz"
+                echo "base64 -d > repro.bin <<< '<one of the base64 blobs above>'"
+                echo "cargo +nightly fuzz run $TARGET repro.bin -- -timeout=60"
+                echo '```'
+              else
+                f="${FILES[0]}"
+                echo "- Reproducer: \`$(basename "$f")\` ($(stat -c %s "$f") bytes; attached below and in the run's uploaded artifact)"
+                echo
+                echo "### Reproducer (base64)"
+                echo
+                echo '```'
+                base64 -w0 "$f"
+                echo
+                echo '```'
+                echo
+                echo "### Reproduce locally"
+                echo
+                echo '```'
+                echo "cd fuzz"
+                echo "base64 -d > repro.bin <<< '$(base64 -w0 "$f")'"
+                echo "cargo +nightly fuzz run $TARGET repro.bin"
+                echo '```'
+              fi
+              if [ "$i" -eq $(( TO_FILE - 1 )) ] && [ "$N" -gt "$TO_FILE" ]; then
+                echo
+                echo "### Further findings this run (not filed: per-run cap of $MAX_ISSUES issues per target)"
+                echo
+                echo "These stay in the uploaded artifact; they will be filed by a later run if they recur."
+                echo
+                for (( j = TO_FILE; j < N; j++ )); do
+                  read -r -a RFILES <<<"${UNIT_FILES[$j]}"
+                  for f in "${RFILES[@]}"; do describe "$f"; done
+                done | head -n 200
+              fi
             } > "$BODY_FILE"
             if gh issue create \
               --title "$TITLE" \
               --label tech-debt \
               --label core-engine \
               --body-file "$BODY_FILE"; then
-              EXISTING="$EXISTING"$'\n'"$TITLE"
+              EXISTING="$EXISTING"$'\n'"OPEN${TAB}$TITLE"
             else
               echo "::error::gh issue create failed for $TITLE"
               echo "gh issue create failed: $TITLE" >> infra-errors.txt
