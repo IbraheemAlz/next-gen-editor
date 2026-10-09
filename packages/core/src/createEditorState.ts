@@ -30,6 +30,7 @@ import type {
     CheckpointStatus,
     Direction,
     EngineStats,
+    ErrorKind,
     Event,
     LayoutDegraded,
     PreviousSessionInfo,
@@ -213,6 +214,16 @@ export interface EditorState {
      */
     checkpointState: Accessor<CheckpointHealth>;
     /**
+     * Issue #364 - the most recent `Event::Error` any command answered
+     * (engine refusals such as a tracked deletion across a table cell, or
+     * a typed `ErrorKind`), with the command that produced it and a
+     * running count; `undefined` until the first one. Every error reply
+     * moves it - a repeat of the same message is a NEW object - so a UI
+     * can show a transient, visible refusal instead of a key press that
+     * silently does nothing. Shared like `zoom`.
+     */
+    lastError: Accessor<EditorError | undefined>;
+    /**
      * Issue #388 - the previous page generation's unsaved session, set
      * aside at boot and waiting for Recover / Discard
      * (`engine.recoverPreviousSession` / `discardPreviousSession`);
@@ -230,6 +241,21 @@ export interface EditorState {
  * lazily under a detached root; the subscription lives as long as the
  * engine handle, which the shell keeps for the page lifetime.
  */
+/** Issue #364 - see `EditorState.lastError`. */
+export interface EditorError {
+    /** The typed class (`Event::Error.kind`), when the engine set one. */
+    kind: ErrorKind | undefined;
+    /** The command that was refused, parsed from the engine's
+     *  `<Command>: <reason>` message prefix; `undefined` when absent. */
+    command: string | undefined;
+    /** The engine's message, verbatim. */
+    message: string;
+    /** Errors seen so far this session (this one included). */
+    count: number;
+    /** When it arrived (ms since the epoch). */
+    at: number;
+}
+
 /** Issue #390 - see `EditorState.checkpointState`. */
 export interface CheckpointHealth {
     ok: boolean;
@@ -245,6 +271,7 @@ interface ViewState {
     lastRecovery: Accessor<RecoveryReport | undefined>;
     checkpointFailing: Accessor<boolean>;
     checkpointState: Accessor<CheckpointHealth>;
+    lastError: Accessor<EditorError | undefined>;
     previousSession: Accessor<PreviousSessionInfo | undefined>;
 }
 
@@ -294,7 +321,21 @@ function viewStateFor(engine: EngineHandle): ViewState {
             PreviousSessionInfo | undefined
         >(engine.previousSession);
         engine.onPreviousSession?.((p) => setPreviousSession(p));
+        /* Issue #364 - every `Event::Error` reply, with its command. */
+        const [lastError, setLastError] = createSignal<EditorError | undefined>(undefined);
+        let errorCount = 0;
         engine.subscribe((evt: Event) => {
+            if (evt.type === 'ERROR') {
+                errorCount += 1;
+                const prefix = /^([A-Za-z][A-Za-z0-9]*): /.exec(evt.message);
+                setLastError({
+                    kind: evt.kind,
+                    command: prefix?.[1],
+                    message: evt.message,
+                    count: errorCount,
+                    at: Date.now(),
+                });
+            }
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
             } else if (evt.type === 'ZOOM_PENDING') {
@@ -334,6 +375,7 @@ function viewStateFor(engine: EngineHandle): ViewState {
             lastRecovery,
             checkpointFailing,
             checkpointState,
+            lastError,
             previousSession,
         };
     });
@@ -486,6 +528,7 @@ export function createEditorState(): EditorState {
         lastRecovery: view.lastRecovery,
         checkpointFailing: view.checkpointFailing,
         checkpointState: view.checkpointState,
+        lastError: view.lastError,
         previousSession: view.previousSession,
     };
 }

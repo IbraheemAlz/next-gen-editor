@@ -41,6 +41,7 @@ import {
     StatusBar,
     TrapOverlay,
     RecoveryBanner,
+    ErrorToast,
     Ruler,
     ZoomControls,
     TextFormatButtons,
@@ -150,6 +151,10 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 {/* Issue #315 — a degraded crash recovery says what was
                     lost and what to do; a normal one stays silent. */}
                 <RecoveryBanner />
+                {/* Issue #364 - a visible, transient refusal for an engine
+                    error the user's key press caused (tracked deletion across
+                    a table cell, ...). */}
+                <ErrorToast />
             </div>
           </TelemetryProvider>
           </FontRegistryProvider>

@@ -202,6 +202,23 @@ export const DevHud: Component<DevHudProps> = (props) => {
                               : 'checkpoints failing'}
                     </dd>
 
+                    {/* Issue #364 - the last engine error any command
+                        answered (every error, toasted or not). */}
+                    <Show when={state.lastError()}>
+                        {(err) => (
+                            <>
+                                <dt>Last error</dt>
+                                <dd
+                                    class="nge-hud__lasterror nge-hud__warn"
+                                    title={err().message}
+                                >
+                                    {err().command ?? '?'} · {err().kind ?? 'untyped'} · #
+                                    {err().count}
+                                </dd>
+                            </>
+                        )}
+                    </Show>
+
                     <dt>WASM heap</dt>
                     <dd>{fmtBytes(state.stats()?.wasm_heap_bytes)}</dd>
 
