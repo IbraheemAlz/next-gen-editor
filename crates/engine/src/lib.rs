@@ -2140,11 +2140,26 @@ pub struct SpanStyle {
     pub font_size_cs: Option<f32>,
     pub color: Option<[u8; 4]>,
     pub bold: Option<bool>,
+    /// Issue #104 — `<w:bCs>`: the complex-script twin of [`Self::bold`].
+    /// Word bolds Arabic text by `bCs`, so un-bolding through the UI must
+    /// clear it too. Absent from snapshots while unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold_cs: Option<bool>,
     pub italic: Option<bool>,
+    /// Issue #104 — `<w:iCs>`: the complex-script twin of [`Self::italic`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic_cs: Option<bool>,
     pub underline: Option<UnderlineStyle>,
     pub strike: Option<bool>,
     pub bg_color: Option<[u8; 4]>,
     pub font_family: Option<FontFamily>,
+    /// Issue #104 — the run's `<w:rStyle>` character-style id. The reader
+    /// still folds the style's properties into the span (the layout and
+    /// toolbar read one flat style); the id rides along so a regenerated
+    /// run writes `<w:rStyle>` back instead of flattening the character
+    /// style into direct formatting (Word's "clear formatting" keeps it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub char_style: Option<String>,
     /// `<w:caps/>` — display every character of the run as its uppercase
     /// equivalent. Applied as a `to_uppercase` transform at shape time so
     /// glyph metrics + BiDi + line breaking all see the visible string.
@@ -2212,6 +2227,12 @@ impl SpanStyle {
         if self.font_size_cs.is_none() {
             self.font_size_cs = self.font_size;
         }
+        if self.bold_cs.is_none() {
+            self.bold_cs = self.bold;
+        }
+        if self.italic_cs.is_none() {
+            self.italic_cs = self.italic;
+        }
         self
     }
 
@@ -2221,6 +2242,12 @@ impl SpanStyle {
     pub fn into_cs_only(mut self) -> SpanStyle {
         if let Some(size) = self.font_size.take() {
             self.font_size_cs = Some(size);
+        }
+        if let Some(bold) = self.bold.take() {
+            self.bold_cs = Some(bold);
+        }
+        if let Some(italic) = self.italic.take() {
+            self.italic_cs = Some(italic);
         }
         self
     }
@@ -2233,6 +2260,8 @@ impl SpanStyle {
     pub fn complex_script_view(&self) -> SpanStyle {
         SpanStyle {
             font_size: self.font_size_cs,
+            bold: self.bold_cs,
+            italic: self.italic_cs,
             ..self.clone()
         }
     }
@@ -2254,11 +2283,14 @@ impl SpanStyle {
             font_size_cs: patch.font_size_cs.or(self.font_size_cs),
             color: patch.color.or(self.color),
             bold: patch.bold.or(self.bold),
+            bold_cs: patch.bold_cs.or(self.bold_cs),
             italic: patch.italic.or(self.italic),
+            italic_cs: patch.italic_cs.or(self.italic_cs),
             underline: patch.underline.or(self.underline),
             strike: patch.strike.or(self.strike),
             bg_color: patch.bg_color.or(self.bg_color),
             font_family: patch.font_family.or(self.font_family),
+            char_style: patch.char_style.or(self.char_style),
             caps: patch.caps.or(self.caps),
             small_caps: patch.small_caps.or(self.small_caps),
             vert_align: patch.vert_align.or(self.vert_align),
@@ -11689,6 +11721,22 @@ mod tests {
             (merged.font_size, merged.font_size_cs),
             (Some(11.0), Some(16.0))
         );
+        /* Issue #104 — the weight / slant twins follow the same rules. */
+        let bold = SpanStyle {
+            bold: Some(true),
+            italic: Some(false),
+            ..Default::default()
+        };
+        let both = bold.clone().with_cs_twins();
+        assert_eq!((both.bold_cs, both.italic_cs), (Some(true), Some(false)));
+        let cs_only = bold.clone().into_cs_only();
+        assert_eq!((cs_only.bold, cs_only.bold_cs), (None, Some(true)));
+        let view = SpanStyle {
+            bold_cs: Some(false),
+            ..bold
+        }
+        .complex_script_view();
+        assert_eq!((view.bold, view.italic), (Some(false), None));
     }
 
     /* ---- issue #23: dynamic, string-backed FontFamily ------------- */

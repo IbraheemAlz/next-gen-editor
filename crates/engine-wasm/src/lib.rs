@@ -2822,8 +2822,8 @@ fn build_style_spans(
         let cs = ComplexScriptAttrs {
             px_size: (raw_cs_px * px_factor).max(1.0),
             baseline_shift_px: raw_cs_px * shift_factor,
-            bold: template.bold,
-            italic: template.italic,
+            bold: style.bold_cs.unwrap_or(false),
+            italic: style.italic_cs.unwrap_or(false),
             font_family: template.font_family.clone(),
             whole_span: style.forces_complex_script(),
         };
@@ -3034,8 +3034,8 @@ fn composition_layout_spans(
     let cs = ComplexScriptAttrs {
         px_size: st.font_size_cs.unwrap_or(default_size) * scale,
         baseline_shift_px: 0.0,
-        bold: comp.bold,
-        italic: comp.italic,
+        bold: st.bold_cs.unwrap_or(false),
+        italic: st.italic_cs.unwrap_or(false),
         font_family: comp.font_family.clone(),
         whole_span: st.forces_complex_script(),
     };
@@ -3051,6 +3051,8 @@ fn composition_layout_spans(
 fn hash_complex_script_slots(style: &SpanStyle, h: &mut impl std::hash::Hasher) {
     use std::hash::Hash;
     style.font_size_cs.map(f32::to_bits).hash(h);
+    style.bold_cs.hash(h);
+    style.italic_cs.hash(h);
     style.forces_complex_script().hash(h);
 }
 
@@ -6292,6 +6294,28 @@ fn sample_paragraph_styles(
         record(SpanStyle::default());
         return;
     }
+    /* Issues #359 / #104 — each script class present in a segment samples
+    the attribute set it is laid out with: Latin text the Latin slots,
+    complex-script text (or every character of a `<w:rtl/>` run) the
+    complex-script twins. */
+    let mut emit = |style: SpanStyle, a: u32, b: u32| {
+        let slice = para.text.get(a as usize..b as usize).unwrap_or("");
+        let forced = style.forces_complex_script();
+        let (mut latin, mut cs) = (false, false);
+        for (_, _, complex) in text_pipeline::segment_by_script_class(slice) {
+            if complex || forced {
+                cs = true;
+            } else {
+                latin = true;
+            }
+        }
+        if cs {
+            record(style.complex_script_view());
+        }
+        if latin || !cs {
+            record(style);
+        }
+    };
     let mut cursor = lo;
     for run in &para.spans {
         if run.end <= cursor {
@@ -6303,15 +6327,15 @@ fn sample_paragraph_styles(
         let rs = run.start.max(cursor);
         let re = run.end.min(hi);
         if rs > cursor {
-            record(SpanStyle::default());
+            emit(SpanStyle::default(), cursor, rs);
         }
         if re > rs {
-            record(run.style.clone());
+            emit(run.style.clone(), rs, re);
         }
         cursor = re;
     }
     if cursor < hi {
-        record(SpanStyle::default());
+        emit(SpanStyle::default(), cursor, hi);
     }
 }
 

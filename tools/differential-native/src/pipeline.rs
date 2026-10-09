@@ -193,8 +193,8 @@ fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
     let cs = ComplexScriptAttrs {
         px_size: style.font_size_cs.unwrap_or(DEFAULT_FONT_SIZE_PT),
         baseline_shift_px: 0.0,
-        bold: span.bold,
-        italic: span.italic,
+        bold: style.bold_cs.unwrap_or(false),
+        italic: style.italic_cs.unwrap_or(false),
         font_family: span.font_family.clone(),
         whole_span: style.forces_complex_script(),
     };

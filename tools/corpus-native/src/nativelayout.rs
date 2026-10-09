@@ -167,8 +167,8 @@ fn style_span(start: u32, end: u32, style: &engine::SpanStyle) -> StyleSpan {
     .with_cs(layout::ComplexScriptAttrs {
         px_size: style.font_size_cs.unwrap_or(DEFAULT_PX_SIZE).max(1.0),
         baseline_shift_px: 0.0,
-        bold: style.bold.unwrap_or(false),
-        italic: style.italic.unwrap_or(false),
+        bold: style.bold_cs.unwrap_or(false),
+        italic: style.italic_cs.unwrap_or(false),
         font_family: None,
         whole_span: style.forces_complex_script(),
     })

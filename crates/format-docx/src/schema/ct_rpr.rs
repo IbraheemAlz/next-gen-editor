@@ -20,7 +20,9 @@ pub fn rpr_child_is_modeled(name: &[u8]) -> bool {
         b"w:rStyle"
             | b"w:rFonts"
             | b"w:b"
+            | b"w:bCs"
             | b"w:i"
+            | b"w:iCs"
             | b"w:caps"
             | b"w:smallCaps"
             | b"w:strike"
@@ -205,7 +207,11 @@ pub fn toggle_on(e: &BytesStart) -> bool {
 pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
     match name {
         b"w:b" => style.bold = Some(toggle_on(e)),
+        /* Issue #104 — the complex-script twins Word bolds / italicizes
+        Arabic, Hebrew, Thai, … text by. */
+        b"w:bCs" => style.bold_cs = Some(toggle_on(e)),
         b"w:i" => style.italic = Some(toggle_on(e)),
+        b"w:iCs" => style.italic_cs = Some(toggle_on(e)),
         b"w:strike" => style.strike = Some(toggle_on(e)),
         b"w:caps" => style.caps = Some(toggle_on(e)),
         b"w:smallCaps" => style.small_caps = Some(toggle_on(e)),
@@ -329,7 +335,8 @@ mod tests {
         assert!(rpr_child_rank(b"w14:glow") < rpr_child_rank(b"w:rPrChange"));
         assert!(rpr_child_is_modeled(b"w:highlight"));
         assert!(rpr_child_is_modeled(b"w:rStyle"));
-        assert!(!rpr_child_is_modeled(b"w:bCs"));
+        assert!(rpr_child_is_modeled(b"w:bCs"));
+        assert!(rpr_child_is_modeled(b"w:iCs"));
         assert!(!rpr_child_is_modeled(b"w:lang"));
     }
 

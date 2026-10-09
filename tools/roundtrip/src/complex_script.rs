@@ -10,8 +10,61 @@ use super::{INSERT_TEXT, assert_document_xml_well_formed, extract_doc_xml, read_
 use anyhow::{Context, Result, bail};
 use engine::{BlockPath, DocumentTree, LogicalPos, SpanStyle};
 use format_docx::test_fixtures::{
-    CS_SIZE_CASCADE_TEXT, CS_SIZE_MIXED_TEXT, complex_script_size_docx,
+    CS_SIZE_CASCADE_TEXT, CS_SIZE_MIXED_TEXT, complex_script_size_docx, docx_with_body,
 };
+
+/// Issue #104 — an Arabic run in rtl.docx's shape: bold by `<w:bCs/>`
+/// only, with a character style reference.
+const BCS_RUN: &str = r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rStyle w:val="Emph"/><w:bCs/><w:rtl/></w:rPr><w:t>مملكة إسبانيا</w:t></w:r><w:r><w:t xml:space="preserve"> (</w:t></w:r></w:p>"#;
+
+/// Step 41d — Ctrl+B on an Arabic `<w:bCs/>` run writes `<w:b/>` next to
+/// the existing `<w:bCs/>` and keeps its `<w:rStyle>`: a pure insertion.
+fn run_bcs_rstyle_step() -> Result<()> {
+    let src = docx_with_body(BCS_RUN);
+    let archive = read_docx(&src).context("read bCs fixture")?;
+    let doc_a = doc_xml_string(&src)?;
+    let p = archive.document.nth_paragraph(0).context("bCs paragraph")?;
+    let s = p.style_at(0);
+    if (s.bold, s.bold_cs, s.char_style.as_deref()) != (None, Some(true), Some("Emph")) {
+        bail!("bCs / rStyle not modeled: {s:?}");
+    }
+    let untouched = write_docx(&archive, &archive.document).context("untouched save")?;
+    if doc_xml_string(&untouched)? != doc_a {
+        bail!("untouched bCs document drifted");
+    }
+    let len = "مملكة إسبانيا".len();
+    let bolded = archive.document.apply_style(
+        pos(0, 0),
+        pos(0, len),
+        SpanStyle {
+            bold: Some(true),
+            ..SpanStyle::default()
+        }
+        .with_cs_twins(),
+    );
+    let bytes = write_docx(&archive, &bolded).context("write bolded")?;
+    assert_document_xml_well_formed(&bytes).context("bolded bCs .docx")?;
+    let xml = doc_xml_string(&bytes)?;
+    let expected = doc_a.replacen(
+        r#"<w:rStyle w:val="Emph"/><w:bCs/>"#,
+        r#"<w:rStyle w:val="Emph"/><w:b/><w:bCs/>"#,
+        1,
+    );
+    if xml != expected {
+        bail!(
+            "bold toggle on a bCs run is not a pure <w:b/> insertion\n--- expected ---\n{expected}\n--- got ---\n{xml}"
+        );
+    }
+    let back = read_docx(&bytes).context("re-read bolded")?.document;
+    let s = back.nth_paragraph(0).context("paragraph")?.style_at(0);
+    if (s.bold, s.bold_cs, s.char_style.as_deref()) != (Some(true), Some(true), Some("Emph")) {
+        bail!("b / bCs / rStyle lost on re-read: {s:?}");
+    }
+    println!(
+        "[roundtrip] step 41d OK — bold on an Arabic <w:bCs/> run inserts <w:b/> and keeps <w:rStyle> (both slots re-read)"
+    );
+    Ok(())
+}
 
 fn pos(para: u32, offset: usize) -> LogicalPos {
     LogicalPos {
@@ -143,5 +196,5 @@ pub(crate) fn run_complex_script_roundtrip() -> Result<()> {
     println!(
         "[roundtrip] step 41c OK — a set size writes w:sz + w:szCs, untouched text keeps its pair, no synthesized w:szCs"
     );
-    Ok(())
+    run_bcs_rstyle_step()
 }

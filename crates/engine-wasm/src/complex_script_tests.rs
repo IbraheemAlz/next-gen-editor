@@ -7,9 +7,10 @@
 //! layout to write.
 
 use super::*;
-use bridge::FontSlot;
+use bridge::{FontSlot, FormattingToggle};
 use format_docx::test_fixtures::{
     CS_SIZE_CASCADE_TEXT, CS_SIZE_MIXED_TEXT, CS_SIZE_RTL_TEXT, complex_script_size_docx,
+    docx_with_body,
 };
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -275,4 +276,136 @@ fn ui_save_keeps_each_slot() {
     let cascade = back.nth_paragraph(2).unwrap().style_at(0);
     assert_eq!(cascade.font_size, Some(11.0));
     assert_eq!(cascade.font_size_cs, None, "no szCs synthesized");
+}
+
+/* ================================================================
+Issue #104 — `<w:bCs>` / `<w:iCs>`.
+================================================================ */
+
+/// "Latin " then two Arabic words, in ONE run.
+const BCS_TEXT: &str = "Latin \u{0646}\u{0635} \u{0639}\u{0631}\u{0628}\u{064A}";
+
+/// A one-paragraph document whose single run carries `rpr`.
+fn engine_for_run(rpr: &str) -> Engine {
+    let body = format!(
+        r#"<w:p><w:r><w:rPr>{rpr}</w:rPr><w:t xml:space="preserve">{BCS_TEXT}</w:t></w:r></w:p>"#
+    );
+    let archive = format_docx::read_docx(&docx_with_body(&body)).expect("fixture");
+    engine_with(archive.document)
+}
+
+fn toggle_bold(e: &mut Engine) {
+    apply(
+        e,
+        Command::ToggleFormatting {
+            attr: FormattingToggle::Bold,
+            underline_style: None,
+        },
+    );
+}
+
+/// Every shaped run of paragraph 0 as (is complex script, faux bold,
+/// faux italic). No bold / italic face is loaded, so weight and slant
+/// show up as synthesis flags.
+fn faces(e: &Engine) -> Vec<(bool, bool, bool)> {
+    let doc = e.undo.current().clone();
+    let text = doc.nth_paragraph(0).unwrap().text.clone();
+    let (pages, _, _, _) = e.build_pages(1.0, false, None).expect("layout");
+    pages[0].blocks[0]
+        .as_paragraph()
+        .unwrap()
+        .lines
+        .iter()
+        .flat_map(|l| l.runs.iter())
+        .map(|r| {
+            let piece = &text[r.source_range.start as usize..r.source_range.end as usize];
+            (is_arabic(piece), r.attrs.faux_bold, r.attrs.faux_italic)
+        })
+        .collect()
+}
+
+/// Word bolds Arabic text by `<w:bCs>` and Latin text by `<w:b>`: a run
+/// with only `<w:bCs/>` (rtl.docx's shape) shows bold Arabic and regular
+/// Latin; one with only `<w:b/>` the opposite. Same for `<w:iCs>`.
+#[test]
+fn bcs_and_ics_style_only_the_complex_script_text() {
+    for (rpr, latin, arabic) in [
+        ("<w:bCs/>", (false, false), (true, false)),
+        ("<w:b/>", (true, false), (false, false)),
+        ("<w:b/><w:bCs/><w:iCs/>", (true, false), (true, true)),
+        ("<w:i/>", (false, true), (false, false)),
+    ] {
+        let runs = faces(&engine_for_run(rpr));
+        assert!(
+            runs.iter().any(|r| r.0) && runs.iter().any(|r| !r.0),
+            "{rpr}"
+        );
+        for (cs, b, i) in runs {
+            let want = if cs { arabic } else { latin };
+            assert_eq!((b, i), want, "{rpr}: complex={cs}");
+        }
+    }
+}
+
+/// Issue #104 — Ctrl+B on Arabic text reads the weight Word shows there
+/// (`bCs`) and writes BOTH slots: un-bolding a `<w:bCs/>` Arabic run turns
+/// `bCs` off (it used to go stale in the grab bag and stay bold in Word).
+#[test]
+fn toggle_bold_on_arabic_text_reads_and_writes_both_twins() {
+    let mut e = engine_for_run("<w:bCs/>");
+    let arabic_start = BCS_TEXT.find('\u{0646}').unwrap() as u32;
+    let len = BCS_TEXT.len() as u32;
+    assert!(
+        e.attrs_at(bpos_top(0, arabic_start + 2), true).bold,
+        "Arabic reads bCs"
+    );
+    assert!(!e.attrs_at(bpos_top(0, 2), true).bold, "Latin reads b");
+
+    select(&mut e, 0, arabic_start, len);
+    toggle_bold(&mut e);
+    let s = e
+        .undo
+        .current()
+        .nth_paragraph(0)
+        .unwrap()
+        .style_at(arabic_start);
+    assert_eq!(
+        (s.bold, s.bold_cs),
+        (Some(false), Some(false)),
+        "bold Arabic turns off"
+    );
+    assert!(faces(&e).iter().all(|f| !f.1), "nothing bold any more");
+
+    toggle_bold(&mut e);
+    let s = e
+        .undo
+        .current()
+        .nth_paragraph(0)
+        .unwrap()
+        .style_at(arabic_start);
+    assert_eq!((s.bold, s.bold_cs), (Some(true), Some(true)));
+
+    /* Saved: Word sees both. */
+    let saved = format_docx::save_docx(e.undo.current()).expect("save");
+    let back = format_docx::read_docx(&saved).expect("reread").document;
+    let s = back.nth_paragraph(0).unwrap().style_at(arabic_start);
+    assert_eq!((s.bold, s.bold_cs), (Some(true), Some(true)));
+}
+
+/// A range whose Latin part is regular and whose Arabic part is bold by
+/// `bCs` is MIXED for bold (the toolbar shows the indeterminate state and
+/// Ctrl+B turns everything on, Word's rule).
+#[test]
+fn mixed_detection_reads_each_script_class_with_its_twin() {
+    let mut e = engine_for_run("<w:bCs/>");
+    let len = BCS_TEXT.len() as u32;
+    let mixed = e.attrs_mixed_over(&bpos_top(0, 0), &bpos_top(0, len));
+    assert!(mixed.bold, "regular Latin + bCs Arabic is mixed");
+    assert!(!mixed.italic);
+    select(&mut e, 0, 0, len);
+    toggle_bold(&mut e);
+    assert!(
+        faces(&e).iter().all(|f| f.1),
+        "mixed turns ON for both classes"
+    );
 }

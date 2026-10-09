@@ -191,6 +191,38 @@ fn zip_entries(entries: Vec<(&str, &[u8])>) -> Vec<u8> {
     buf
 }
 
+/// A minimal package (no styles part) whose `<w:body>` holds `body` plus an
+/// A4 `<w:sectPr>`. Downstream crates' tests build small hand-written
+/// documents with it.
+pub fn docx_with_body(body: &str) -> Vec<u8> {
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:document xmlns:w=\"{W_NS}\"><w:body>{body}\
+         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
+         <w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" \
+         w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>\
+         </w:body></w:document>"
+    );
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+</Types>";
+    let dot_rels = rels(&[(
+        "rId1",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+        "word/document.xml",
+    )]);
+    let doc_rels = rels(&[]);
+    zip_entries(vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", dot_rels.as_bytes()),
+        ("word/document.xml", document.as_bytes()),
+        ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+    ])
+}
+
 /// Issue #359 — paragraph 0 of [`complex_script_size_docx`]: ONE run
 /// (`w:sz="22" w:szCs="28"`) mixing Latin and Arabic words, long enough to
 /// wrap, so the line breaks depend on BOTH sizes.

@@ -601,12 +601,22 @@ mod tests {
         };
         let plain = encode(&latin).unwrap();
         let has_key = |bytes: &[u8], key: &[u8]| bytes.windows(key.len()).any(|w| w == key);
-        assert!(
-            !has_key(&plain, b"font_size_cs"),
-            "unset twins are absent from the encoding"
-        );
+        for key in [
+            &b"font_size_cs"[..],
+            b"bold_cs",
+            b"italic_cs",
+            b"char_style",
+        ] {
+            assert!(
+                !has_key(&plain, key),
+                "unset twins are absent from the encoding"
+            );
+        }
         let twins = SpanStyle {
             font_size_cs: Some(14.0),
+            bold_cs: Some(true),
+            italic_cs: Some(false),
+            char_style: Some("Emph".into()),
             ..latin
         };
         let bytes = encode(&twins).unwrap();

@@ -209,7 +209,19 @@ impl PrChildren {
 
     /// Append every grab-bag fragment at its element's schema rank.
     fn push_bag(&mut self, bag: &Option<Box<engine::GrabBag>>, rank_of: fn(&[u8]) -> u16) {
+        /* Issue #104 — a bag captured before its element was modeled (a
+        crash-recovery snapshot written by an older build still carries
+        `<w:bCs/>` verbatim) never duplicates the child the model now
+        emits itself: the modeled value wins. */
+        let modeled: Vec<Vec<u8>> = self
+            .items
+            .iter()
+            .map(|(_, xml)| fragment_qname(xml.as_bytes()).to_vec())
+            .collect();
         for frag in engine::GrabBag::fragments_of(bag) {
+            if modeled.iter().any(|m| m.as_slice() == fragment_qname(frag)) {
+                continue;
+            }
             /* Fragments are byte slices of a part quick-xml already
             decoded as UTF-8; a lossy decode can only differ on bytes the
             reader would have rejected. */
@@ -266,6 +278,14 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
     }
     let rank = rpr_child_rank;
     let mut ch = PrChildren::new();
+    /* Issue #104 — the character style the run references; its folded
+    properties follow as direct formatting, exactly as before. */
+    if let Some(id) = style.char_style.as_deref() {
+        let mut s = String::from("<w:rStyle w:val=\"");
+        push_escaped_attr(id, &mut s);
+        s.push_str("\"/>");
+        ch.push(rank(b"w:rStyle"), s);
+    }
     /* Audit gap A.M2 — `<w:rFonts>` round-trips a known FontFamily,
     a verbatim raw name, and/or a theme binding. The reader splits
     the source's `w:ascii` either into `font_family` (recognised) or
@@ -302,8 +322,15 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
     if style.bold == Some(true) {
         ch.push(rank(b"w:b"), "<w:b/>".into());
     }
+    /* Issue #104 — the complex-script twins, each from its own slot. */
+    if style.bold_cs == Some(true) {
+        ch.push(rank(b"w:bCs"), "<w:bCs/>".into());
+    }
     if style.italic == Some(true) {
         ch.push(rank(b"w:i"), "<w:i/>".into());
+    }
+    if style.italic_cs == Some(true) {
+        ch.push(rank(b"w:iCs"), "<w:iCs/>".into());
     }
     /* CT_RPr ordering — caps/smallCaps sit between `<w:iCs/>` and
     `<w:strike/>` (OOXML §17.3.2). When both are on, Word's writer
@@ -10310,3 +10337,8 @@ mod inline_span_tests;
 #[cfg(test)]
 #[path = "writer_table_markup_tests.rs"]
 mod table_markup_tests;
+
+/// Issues #359 / #104 / #249 — complex-script run properties.
+#[cfg(test)]
+#[path = "writer_complex_script_tests.rs"]
+mod complex_script_tests;
