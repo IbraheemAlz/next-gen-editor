@@ -35,4 +35,18 @@ fn main() {
         "regen-seeds: done — {} scenario seed(s) rewritten",
         Scenario::ALL.len()
     );
+    /* Issue #348 — the hostile `docx_reader` packages, pinned by
+    `tests::hostile_docx_seeds_are_committed_and_typed`. */
+    let docx_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_reader");
+    let hostile = engine_fuzz::hostile_docx_seeds();
+    for (name, bytes, _) in &hostile {
+        let path = docx_dir.join(name);
+        std::fs::write(&path, bytes)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        println!("wrote {} ({} bytes)", path.display(), bytes.len());
+    }
+    println!(
+        "regen-seeds: done — {} hostile docx seed(s) rewritten",
+        hostile.len()
+    );
 }

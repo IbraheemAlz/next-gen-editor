@@ -316,7 +316,7 @@ fn a_tracked_delete_over_a_table_answers_an_error() {
         },
     }));
     match evt {
-        Event::Error { message } => {
+        Event::Error { message, .. } => {
             assert!(message.starts_with("DeleteRange: "), "{message}");
             assert!(message.contains("table"), "{message}");
         }

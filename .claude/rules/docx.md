@@ -38,6 +38,18 @@ paths:
   `DocxWarning::TableNestingTooDeep` on `DocxArchive::warnings`. Never add
   an unbounded recursion over attacker-shaped input (POI ships a 5000-deep
   17 KB file).
+- **Package limits (issue #348).** Every ZIP entry is read through
+  `opc::limits::read_entry_bounded` (`take(limit + 1)`) — never
+  `Vec::with_capacity(file.size())`: the central directory's declared size
+  is attacker-controlled (a 4 GiB claim trapped the wasm worker).
+  `PackageLimits` (64 MiB part / 128 MiB package / 10k entries / XML depth
+  256 / 4M elements per part; `read_docx_with_limits`, overridable from
+  `Command::OpenDocument.limits`) is checked before any typed walk — the
+  XML shape caps run over every part the reader walks (`word/**/*.xml`,
+  `*.rels`, `docProps/core.xml`), and depth inside a table nested past the
+  #111 cap is not counted (it is opaque bytes). Overflow is
+  `DocxError::PackageTooLarge` → `Event::Error { kind: PackageTooLarge }`
+  (the shell's File-menu banner), never a trap.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:

@@ -10,6 +10,9 @@
 
 use crate::error::{DocxError, DocxWarning};
 use crate::numbering_resolver::resolve_markers_blocks;
+use crate::opc::limits::{
+    PackageLimits, check_xml_part, is_walked_xml_part, read_entry_bounded, read_package_entries,
+};
 use crate::parts::comments::{parse_comments_extended_xml, parse_comments_xml};
 use crate::parts::document::parse_document_xml_with_warnings;
 use crate::parts::endnotes::parse_endnotes_xml;
@@ -22,7 +25,7 @@ use crate::parts::styles::{StyleTable, parse_styles_xml};
 use crate::style_resolver::StyleResolver;
 use engine::{DocumentTree, ImageBlob};
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use zip::ZipArchive;
 
 pub const DOC_XML: &str = "word/document.xml";
@@ -88,11 +91,11 @@ pub fn check_part_xml_well_formed(docx: &[u8], part_name: &str) -> Result<(), Do
     use quick_xml::reader::NsReader;
 
     let mut archive = ZipArchive::new(Cursor::new(docx))?;
-    let mut part = archive
+    let part = archive
         .by_name(part_name)
         .map_err(|_| DocxError::MissingEntry(part_name.into()))?;
-    let mut xml = Vec::with_capacity(part.size() as usize);
-    part.read_to_end(&mut xml)?;
+    /* Issue #348 — never allocate from the declared size. */
+    let xml = read_entry_bounded(part, part_name, &PackageLimits::DEFAULT, &mut 0)?;
 
     let mut reader = NsReader::from_reader(xml.as_slice());
     let config = reader.config_mut();
@@ -248,15 +251,36 @@ pub fn read_docx_with_settings(
     default_page_size: engine::DefaultPageSize,
     widow_control_default: bool,
 ) -> Result<DocxArchive, DocxError> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    read_docx_with_limits(
+        bytes,
+        default_page_size,
+        widow_control_default,
+        &PackageLimits::DEFAULT,
+    )
+}
+
+/// [`read_docx_with_settings`] under explicit resource bounds (issue
+/// #348): the package is refused with [`DocxError::PackageTooLarge`] when
+/// it holds more than `limits.max_entries` entries, when any entry (or the
+/// package as a whole) inflates past its byte budget — every entry is read
+/// through `take(limit + 1)`, the declared size is never trusted — or when
+/// an XML part the reader walks nests deeper than `limits.max_xml_depth`
+/// or holds more than `limits.max_xml_elements` elements. The other
+/// entry points use [`PackageLimits::DEFAULT`].
+pub fn read_docx_with_limits(
+    bytes: &[u8],
+    default_page_size: engine::DefaultPageSize,
+    widow_control_default: bool,
+    limits: &PackageLimits,
+) -> Result<DocxArchive, DocxError> {
     let mut other_entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut document_xml: Option<Vec<u8>> = None;
 
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let name = file.name().to_owned();
-        let mut buf = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut buf)?;
+    for (name, buf) in read_package_entries(bytes, limits)? {
+        /* Issue #348 — the XML shape bounds, before any typed walk. */
+        if is_walked_xml_part(&name) {
+            check_xml_part(&name, &buf, limits)?;
+        }
         if name == DOC_XML {
             document_xml = Some(buf);
         } else {
@@ -1065,5 +1089,144 @@ mod tests {
             letter.document.body_section.geometry,
             engine::PageGeometry::letter()
         );
+    }
+
+    /* ---------------------------------------------------------------
+    Issue #348 — package limits.
+    --------------------------------------------------------------- */
+
+    use crate::opc::limits::PackageLimit;
+    use crate::test_fixtures::{
+        compressible_bomb_docx, lying_size_docx, nested_sdt_docx, nested_tables_docx,
+    };
+
+    fn limit_of(err: &DocxError) -> Option<PackageLimit> {
+        match err {
+            DocxError::PackageTooLarge { limit, .. } => Some(*limit),
+            _ => None,
+        }
+    }
+
+    fn body_text(doc: &DocumentTree) -> String {
+        doc.to_plain_text()
+    }
+
+    /// A directory record claiming 4 GiB (or `u64::MAX`) for a 100-byte
+    /// part used to reach `Vec::with_capacity(declared)` — a "capacity
+    /// overflow" trap on wasm32 (and natively for the larger lie). The
+    /// declared size is never trusted now: the real bytes are read.
+    #[test]
+    fn a_lying_declared_size_never_reaches_the_allocator() {
+        for declared in [4 * 1024 * 1024 * 1024, u64::MAX - 1] {
+            let docx = lying_size_docx(declared);
+            let archive = read_docx(&docx).expect("the real part is small");
+            assert_eq!(body_text(&archive.document), "small", "declared {declared}");
+            /* The harness guard reads through the same bounded path. */
+            check_document_xml_well_formed(&docx).expect("well-formed");
+        }
+    }
+
+    /// A compression bomb is inflated only up to its budget + 1 byte and
+    /// refused with the typed error, naming the part.
+    #[test]
+    fn a_compressible_bomb_is_refused_at_the_part_budget() {
+        let limits = PackageLimits {
+            max_part_bytes: 1024 * 1024,
+            ..PackageLimits::DEFAULT
+        };
+        let docx = compressible_bomb_docx(8 * 1024 * 1024);
+        assert!(
+            docx.len() < 64 * 1024,
+            "the bomb is small on disk: {}",
+            docx.len()
+        );
+        let err = read_docx_with_limits(&docx, engine::DefaultPageSize::A4, true, &limits)
+            .expect_err("8 MiB > 1 MiB part budget");
+        assert_eq!(limit_of(&err), Some(PackageLimit::PartBytes), "{err:?}");
+        assert!(err.to_string().contains("word/media/bomb.bin"), "{err}");
+        /* Under the total budget instead: 3 × 600 KiB parts, 1 MiB total. */
+        let limits = PackageLimits {
+            max_total_bytes: 1024 * 1024,
+            ..PackageLimits::DEFAULT
+        };
+        let part = vec![0u8; 600 * 1024];
+        let docx = crate::test_fixtures::package_with_document_xml(
+            &crate::test_fixtures::document_xml_with_body("<w:p/>"),
+            &[("word/media/a.bin", &part), ("word/media/b.bin", &part)],
+        );
+        let err = read_docx_with_limits(&docx, engine::DefaultPageSize::A4, true, &limits)
+            .expect_err("1.2 MiB > 1 MiB total");
+        assert_eq!(limit_of(&err), Some(PackageLimit::TotalBytes), "{err:?}");
+        /* The stock budget reads the same package. */
+        read_docx(&docx).expect("well under the default limits");
+    }
+
+    #[test]
+    fn too_many_entries_are_refused_before_any_is_read() {
+        let limits = PackageLimits {
+            max_entries: 4,
+            ..PackageLimits::DEFAULT
+        };
+        let docx = crate::test_fixtures::package_with_document_xml(
+            &crate::test_fixtures::document_xml_with_body("<w:p/>"),
+            &[("word/media/a.bin", b"a")],
+        );
+        let err = read_docx_with_limits(&docx, engine::DefaultPageSize::A4, true, &limits)
+            .expect_err("5 entries > 4");
+        assert_eq!(limit_of(&err), Some(PackageLimit::Entries), "{err:?}");
+    }
+
+    /// 5000 content controls nested inside each other: refused by the XML
+    /// depth cap with the typed error instead of being walked.
+    #[test]
+    fn five_thousand_nested_sdts_are_refused_by_the_depth_cap() {
+        let err = read_docx(&nested_sdt_docx(5000)).expect_err("depth 10 000 > 256");
+        assert_eq!(limit_of(&err), Some(PackageLimit::XmlDepth), "{err:?}");
+        assert!(err.to_string().contains("word/document.xml"), "{err}");
+        /* A shallow chain still reads. */
+        let ok = read_docx(&nested_sdt_docx(20)).expect("40 levels");
+        assert_eq!(body_text(&ok.document), "deep");
+    }
+
+    /// 60 nested tables (depth ≈ 185) stay under the cap and read fully —
+    /// the innermost cell's text is reachable in the typed model.
+    #[test]
+    fn sixty_nested_tables_still_read() {
+        let archive = read_docx(&nested_tables_docx(60)).expect("60 nested tables read");
+        assert!(archive.warnings.is_empty(), "{:?}", archive.warnings);
+        let mut table = archive.document.blocks[0].as_table().expect("table");
+        let mut levels = 1;
+        loop {
+            let cell = &table.rows[0].cells[0];
+            match cell.blocks.first() {
+                Some(engine::Block::Table(inner)) => {
+                    table = inner;
+                    levels += 1;
+                }
+                Some(engine::Block::Paragraph(p)) => {
+                    assert_eq!(p.text, "deep");
+                    break;
+                }
+                None => panic!("empty cell at level {levels}"),
+            }
+        }
+        assert_eq!(levels, 60);
+    }
+
+    /// The element-count cap refuses a part with too many elements.
+    #[test]
+    fn the_element_cap_is_enforced_on_walked_parts() {
+        let limits = PackageLimits {
+            max_xml_elements: 50,
+            ..PackageLimits::DEFAULT
+        };
+        let body = "<w:p><w:r><w:t>x</w:t></w:r></w:p>".repeat(20);
+        let docx = crate::test_fixtures::package_with_document_xml(
+            &crate::test_fixtures::document_xml_with_body(&body),
+            &[],
+        );
+        let err = read_docx_with_limits(&docx, engine::DefaultPageSize::A4, true, &limits)
+            .expect_err("60+ elements > 50");
+        assert_eq!(limit_of(&err), Some(PackageLimit::XmlElements), "{err:?}");
     }
 }

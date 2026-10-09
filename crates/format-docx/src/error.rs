@@ -21,6 +21,17 @@ pub enum DocxError {
     /// well-formed document (unclosed elements at EOF, no root element).
     #[error("malformed XML: {0}")]
     MalformedXml(String),
+    /// Issue #348 — the package exceeded one of the reader's
+    /// [`crate::PackageLimits`] (a part or the whole package inflating past
+    /// its byte budget, too many entries, an XML part nested too deep or
+    /// holding too many elements). The open is refused before anything is
+    /// allocated from the attacker-controlled sizes.
+    #[error("package too large: {limit} exceeds the reader's limit of {max}{}", part.as_deref().map(|p| format!(" (in `{p}`)")).unwrap_or_default())]
+    PackageTooLarge {
+        limit: crate::opc::limits::PackageLimit,
+        max: u64,
+        part: Option<String>,
+    },
 }
 
 /// Non-fatal reader diagnostics. The document opened, but some subtree was

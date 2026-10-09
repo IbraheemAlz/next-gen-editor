@@ -64,6 +64,8 @@ export type {
     DocFormat,
     DocumentDefaults,
     DefaultPageSize,
+    ErrorKind,
+    PackageLimitsOverride,
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,

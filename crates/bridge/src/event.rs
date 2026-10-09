@@ -85,6 +85,13 @@ pub enum Event {
     },
     Error {
         message: String,
+        /// Issue #348 — a machine-readable class for errors the shell
+        /// presents specifically (a refused document open); `None` for
+        /// every other error. Additive: skipped on the wire when `None`,
+        /// so the pre-#348 `{ type: "ERROR", message }` shape is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        kind: Option<ErrorKind>,
     },
 
     // ===================================================================
@@ -487,6 +494,28 @@ pub enum Event {
         priority: AnnouncementPriority,
         message: String,
     },
+}
+
+/// Issue #348 — the class of an [`Event::Error`] the shell can present
+/// specifically.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The document package exceeded the reader's resource limits (a part
+    /// or the whole package inflating past its byte budget, too many ZIP
+    /// entries, XML nested too deep or holding too many elements): the
+    /// open was refused before anything was allocated from the package's
+    /// own size claims. The previous document stays open.
+    PackageTooLarge,
+}
+
+impl Event {
+    /// A plain [`Event::Error`] (no [`ErrorKind`]).
+    pub fn error(message: impl Into<String>) -> Self {
+        Event::Error {
+            message: message.into(),
+            kind: None,
+        }
+    }
 }
 
 /// Sprint 10 — `aria-live` priority for an `Event::Announcement`. The
@@ -1000,6 +1029,28 @@ pub enum A11yPatch {
 #[cfg(test)]
 mod a11y_note_wire_tests {
     use super::*;
+
+    /// Issue #348 — an untyped error keeps its pre-#348 wire shape (no
+    /// `kind` key) and an old payload decodes; a typed one carries `kind`.
+    #[test]
+    fn error_kind_is_additive_on_the_wire() {
+        let plain = serde_json::to_value(Event::error("x")).unwrap();
+        assert_eq!(
+            plain,
+            serde_json::json!({ "type": "ERROR", "message": "x" })
+        );
+        let back: Event = serde_json::from_value(plain).unwrap();
+        assert!(matches!(back, Event::Error { kind: None, .. }));
+        let typed = serde_json::to_value(Event::Error {
+            message: "too big".into(),
+            kind: Some(ErrorKind::PackageTooLarge),
+        })
+        .unwrap();
+        assert_eq!(
+            typed,
+            serde_json::json!({ "type": "ERROR", "message": "too big", "kind": "PackageTooLarge" })
+        );
+    }
 
     fn run(text: &str, note_ref: Option<A11yNoteRef>) -> A11yRun {
         A11yRun {
