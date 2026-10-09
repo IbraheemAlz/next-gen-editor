@@ -1,7 +1,9 @@
 //! Issue #360 — the document-model side table `format_pdf::
 //! export_pdf_document` consumes: what the PDF needs (headings for the
 //! outline, hyperlinks and bookmarks for link annotations, core
-//! properties for `/Info` + XMP) that the layout box tree does not carry.
+//! properties for `/Info` + XMP; list membership, enclosing table cells,
+//! paragraph languages and picture alt text for the tagged export) that
+//! the layout box tree does not carry.
 //!
 //! The table is indexed like `do_export_pdf`'s `para_texts` — by
 //! `ParagraphBox::source_paragraph_id` — so every walk here mirrors the
