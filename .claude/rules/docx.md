@@ -84,9 +84,10 @@ The `tools/roundtrip/` harness asserts:
   `TableProperties`, `RowProperties`, `CellProperties`) and the writer
   re-emits it, interleaved with the modeled children **in schema order**
   (rank tables in `schema/ct_rpr.rs`, `ct_ppr.rs`, `ct_tbl.rs`).
-- The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole; its
-  modeled children still seed the run baseline (`fold_rpr_fragment`).
-  Issue #293 — they are also modeled as `Paragraph::mark_style`
+- The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole. Issue
+  #369 — Word applies it to the mark (the pilcrow) ONLY: it is never
+  folded into the paragraph's runs (a bold mark over plain runs reads
+  plain runs). Issue #293 — its modeled children are `Paragraph::mark_style`
   (`schema::ct_rpr::mark_rpr_style`; `None` = not modeled, the bag is the
   truth): typing into an empty paragraph inherits it, `split_at` gives an
   EMPTY half the insertion formatting at the split point, `concat` keeps

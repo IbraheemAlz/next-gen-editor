@@ -47,12 +47,16 @@ impl<'a> StyleResolver<'a> {
     ///   direct `<w:pPr>`),
     /// - the **baseline** `SpanStyle` runs inherit from this paragraph (doc
     ///   defaults + para-style's `<w:rPr>` chain). Pass it into
-    ///   [`Self::resolve_run`] for every `<w:r>` inside the paragraph.
+    ///   [`Self::resolve_run`] for a run's full cascade.
+    ///
+    /// Issue #369 — the paragraph mark's `<w:pPr>/<w:rPr>` is deliberately
+    /// NOT an input: Word applies it to the mark (the pilcrow) only, never
+    /// to the paragraph's runs, so it cannot be part of their baseline.
+    /// The reader models it as `Paragraph::mark_style` instead.
     pub fn resolve_paragraph(
         &self,
         p_style: Option<&str>,
         direct_ppr: ParaProperties,
-        direct_rpr: SpanStyle,
     ) -> (ParaProperties, SpanStyle) {
         let mut para = self.table.defaults.para.clone();
         let mut run = self.table.defaults.run.clone();
@@ -66,10 +70,8 @@ impl<'a> StyleResolver<'a> {
             }
         }
         /* Direct `<w:pPr>` is the highest specificity for paragraph
-        properties; the paragraph-mark `<w:pPr>/<w:rPr>` (direct_rpr) drops
-        onto the inherited run baseline. */
+        properties. */
         para = para.merged_with(direct_ppr);
-        run = run.merged_with(direct_rpr);
         (para, run)
     }
 
@@ -161,7 +163,7 @@ mod tests {
         defaults.para.alignment = Some(Alignment::Center);
         let t = table_with(vec![], defaults);
         let r = StyleResolver::new(&t);
-        let (p, _) = r.resolve_paragraph(None, ParaProperties::default(), SpanStyle::default());
+        let (p, _) = r.resolve_paragraph(None, ParaProperties::default());
         assert_eq!(p.alignment, Some(Alignment::Center));
     }
 
@@ -187,11 +189,7 @@ mod tests {
         );
         let t = table_with(vec![base, child], DocDefaults::default());
         let r = StyleResolver::new(&t);
-        let (_, run) = r.resolve_paragraph(
-            Some("Child"),
-            ParaProperties::default(),
-            SpanStyle::default(),
-        );
+        let (_, run) = r.resolve_paragraph(Some("Child"), ParaProperties::default());
         assert_eq!(run.bold, Some(true));
         assert_eq!(run.italic, Some(true));
     }
@@ -216,11 +214,7 @@ mod tests {
         );
         let t = table_with(vec![base, child], DocDefaults::default());
         let r = StyleResolver::new(&t);
-        let (_, run) = r.resolve_paragraph(
-            Some("Child"),
-            ParaProperties::default(),
-            SpanStyle::default(),
-        );
+        let (_, run) = r.resolve_paragraph(Some("Child"), ParaProperties::default());
         assert_eq!(run.bold, Some(false));
     }
 
@@ -246,8 +240,7 @@ mod tests {
         );
         let t = table_with(vec![a, b], DocDefaults::default());
         let r = StyleResolver::new(&t);
-        let (_, run) =
-            r.resolve_paragraph(Some("A"), ParaProperties::default(), SpanStyle::default());
+        let (_, run) = r.resolve_paragraph(Some("A"), ParaProperties::default());
         assert_eq!(run.bold, Some(true));
         assert_eq!(run.italic, Some(true));
     }
@@ -264,8 +257,7 @@ mod tests {
         );
         let t = table_with(vec![self_ref], DocDefaults::default());
         let r = StyleResolver::new(&t);
-        let (_, run) =
-            r.resolve_paragraph(Some("X"), ParaProperties::default(), SpanStyle::default());
+        let (_, run) = r.resolve_paragraph(Some("X"), ParaProperties::default());
         assert_eq!(run.bold, Some(true));
     }
 
@@ -281,11 +273,7 @@ mod tests {
         );
         let t = table_with(vec![leaf], DocDefaults::default());
         let r = StyleResolver::new(&t);
-        let (_, run) = r.resolve_paragraph(
-            Some("Leaf"),
-            ParaProperties::default(),
-            SpanStyle::default(),
-        );
+        let (_, run) = r.resolve_paragraph(Some("Leaf"), ParaProperties::default());
         assert_eq!(run.italic, Some(true));
     }
 
@@ -305,8 +293,7 @@ mod tests {
             bold: Some(false),
             ..Default::default()
         };
-        let (_, baseline) =
-            r.resolve_paragraph(Some("S"), ParaProperties::default(), SpanStyle::default());
+        let (_, baseline) = r.resolve_paragraph(Some("S"), ParaProperties::default());
         let resolved = r.resolve_run(baseline, None, direct);
         assert_eq!(resolved.bold, Some(false));
     }
@@ -335,8 +322,7 @@ mod tests {
         };
         let t = table_with(vec![pstyle_def, cstyle], DocDefaults::default());
         let r = StyleResolver::new(&t);
-        let (_, baseline) =
-            r.resolve_paragraph(Some("P"), ParaProperties::default(), SpanStyle::default());
+        let (_, baseline) = r.resolve_paragraph(Some("P"), ParaProperties::default());
         let resolved = r.resolve_run(baseline, Some("Emph"), SpanStyle::default());
         assert_eq!(resolved.bold, Some(true));
         assert_eq!(resolved.italic, Some(true));
@@ -395,7 +381,7 @@ mod tests {
             keep_lines: Some(false),
             ..Default::default()
         };
-        let (para, _) = r.resolve_paragraph(Some("Heading"), direct_off, SpanStyle::default());
+        let (para, _) = r.resolve_paragraph(Some("Heading"), direct_off);
         assert_eq!(para.keep_next, Some(false));
         assert_eq!(para.keep_lines, Some(false));
         assert!(!para.keep_next_on());
@@ -403,11 +389,7 @@ mod tests {
 
         /* Control: no direct override at all still inherits the style's
         ON, proving the cascade (not just the default) is exercised. */
-        let (inherited, _) = r.resolve_paragraph(
-            Some("Heading"),
-            ParaProperties::default(),
-            SpanStyle::default(),
-        );
+        let (inherited, _) = r.resolve_paragraph(Some("Heading"), ParaProperties::default());
         assert!(inherited.keep_next_on());
         assert!(inherited.keep_lines_on());
     }

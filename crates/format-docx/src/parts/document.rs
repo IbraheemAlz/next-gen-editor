@@ -16,9 +16,7 @@ use crate::parts::table::parse_table_bytes_with_events;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
-use crate::schema::ct_rpr::{
-    apply_rpr, attr_val, fold_rpr_fragment, mark_rpr_style, rpr_child_is_modeled,
-};
+use crate::schema::ct_rpr::{apply_rpr, attr_val, mark_rpr_style, rpr_child_is_modeled};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
@@ -1427,13 +1425,13 @@ pub(crate) fn parse_document_xml_with_events(
     /* Per-paragraph parser state. */
     let mut p_style_id: Option<String> = None;
     let mut direct_ppr = ParaProperties::default();
-    let mut pmark_rpr = SpanStyle::default();
     /* Issues #262 / #303 — the tracked changes on the paragraph mark
     (`<w:pPr><w:rPr><w:ins/><w:del/>`), lifted out of the mark's rPr grab
     bag. */
     let mut para_mark_revisions: Vec<engine::Revision> = Vec::new();
     /* Issue #293 — the paragraph mark's modeled run properties (the
-    `<w:pPr><w:rPr>` fragment the bag carries, folded). */
+    `<w:pPr><w:rPr>` fragment the bag carries, folded). Issue #369 — they
+    format the pilcrow only: they never seed the paragraph's runs. */
     let mut para_mark_style: Option<Box<SpanStyle>> = None;
     /* Phase 4 — `<w:numPr>/<w:numId>` + `<w:ilvl>` accumulators. We don't
     inherit either field from a paragraph style here; that's a separate
@@ -1889,7 +1887,6 @@ pub(crate) fn parse_document_xml_with_events(
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pbdr_logical = PbdrLogical::default();
-                        pmark_rpr = SpanStyle::default();
                         para_mark_revisions.clear();
                         para_mark_style = None;
                     }
@@ -1904,15 +1901,14 @@ pub(crate) fn parse_document_xml_with_events(
                     }
                     b"w:rPr" if in_ppr && !in_run => {
                         /* Issue #84 — paragraph-mark run properties
-                        (`<w:pPr>/<w:rPr>`). The writer never regenerates
-                        this element, so the WHOLE subtree rides the
-                        paragraph's grab bag verbatim; its modeled children
-                        still seed the run baseline (`pmark_rpr`) exactly
-                        as before via `fold_rpr_fragment`, which also
-                        stops a nested `<w:rPrChange>/<w:rPr>` history from
-                        overriding the live formatting. */
+                        (`<w:pPr>/<w:rPr>`). The WHOLE subtree rides the
+                        paragraph's grab bag verbatim. Issue #369 — Word
+                        applies them to the paragraph mark (the pilcrow)
+                        only, never to the paragraph's runs, so they are
+                        modeled as `Paragraph::mark_style` alone (#293:
+                        typing into an EMPTY paragraph inherits them) and
+                        no longer folded into every run's span style. */
                         if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
-                            fold_rpr_fragment(&frag, &mut pmark_rpr);
                             /* Issues #262 / #303 — the mark's tracked
                             changes are modeled (`Paragraph::mark_revisions`,
                             all of them); the bag keeps the rest and the
@@ -2129,7 +2125,7 @@ pub(crate) fn parse_document_xml_with_events(
                             if n == b"w:rPrChange" {
                                 run_format_change =
                                     Some(crate::parts::format_change::format_change_revision(
-                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                        &e, &frag, &ns, resolver,
                                     ));
                             }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
@@ -2257,11 +2253,8 @@ pub(crate) fn parse_document_xml_with_events(
                         let end = reader.buffer_position() as usize;
                         envelopes.note_block_start(prev_pos);
                         let source_xml = slice_element(xml, prev_pos, end, b"w:p");
-                        let (props, _) = resolver.resolve_paragraph(
-                            None,
-                            ParaProperties::default(),
-                            SpanStyle::default(),
-                        );
+                        let (props, _) =
+                            resolver.resolve_paragraph(None, ParaProperties::default());
                         let list_item = props.list_item;
                         markup.open_paragraph(&e, &ns, end);
                         let source_markup = markup.finish(0, &props, &None, list_item);
@@ -2631,7 +2624,7 @@ pub(crate) fn parse_document_xml_with_events(
                             if n == b"w:rPrChange" {
                                 run_format_change =
                                     Some(crate::parts::format_change::format_change_revision(
-                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                        &e, &frag, &ns, resolver,
                                     ));
                             }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
@@ -3042,17 +3035,20 @@ pub(crate) fn parse_document_xml_with_events(
                             continue;
                         }
                         /* Issue #29 — spans carry only what the STYLE TABLE
-                        cannot re-derive: paragraph-mark rPr + character-style
-                        chain + direct rPr. The docDefaults <w:rPr> and the
-                        pStyle-chain <w:rPr> are deliberately NOT baked here —
-                        the engine folds them at span-materialize time
+                        cannot re-derive: character-style chain + direct
+                        rPr. The docDefaults <w:rPr> and the pStyle-chain
+                        <w:rPr> are deliberately NOT baked here — the engine
+                        folds them at span-materialize time
                         (`build_style_spans`), which is what lets ModifyStyle
                         re-cascade loaded documents and stops dirty-paragraph
                         saves from writing style-derived props as direct
-                        formatting. Final precedence is unchanged:
-                        defaults → pStyle chain → pmark → rStyle → direct. */
+                        formatting. Final precedence:
+                        defaults → pStyle chain → rStyle → direct. Issue
+                        #369 — the paragraph mark's `<w:pPr><w:rPr>` is NOT
+                        in this cascade: Word formats only the pilcrow with
+                        it (`Paragraph::mark_style`). */
                         let mut style = resolver.resolve_run(
-                            pmark_rpr.clone(),
+                            SpanStyle::default(),
                             r_style_id.as_deref(),
                             direct_rpr.clone(),
                         );
@@ -3113,12 +3109,10 @@ pub(crate) fn parse_document_xml_with_events(
                         let style_id_for_paragraph = p_style_id.clone();
                         let mut direct_overrides_for_paragraph = direct_ppr.clone();
                         /* Paragraph cascade: bake direct_ppr on top of doc
-                        defaults + pStyle chain. The baseline rPr we computed
-                        per-run is informational here. */
+                        defaults + pStyle chain. */
                         let (mut props, _) = resolver.resolve_paragraph(
                             p_style_id.take().as_deref(),
                             std::mem::take(&mut direct_ppr),
-                            std::mem::take(&mut pmark_rpr),
                         );
                         /* Issue #352 — logical `<w:start>` / `<w:end>`
                         border edges land on the physical side the
