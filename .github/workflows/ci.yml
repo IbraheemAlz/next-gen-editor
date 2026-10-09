@@ -17,6 +17,11 @@ jobs:
     # Issue #287 — explicit cap now that the job also runs the release-
     # profile shape-regression + roundtrip harnesses (~45 s warm).
     timeout-minutes: 30
+    # Issue #342 — `issues: read` lets the parity step ask `gh` whether the
+    # issues the command gaps cite are still open.
+    permissions:
+      contents: read
+      issues: read
     steps:
       - uses: actions/checkout@v6
 
@@ -68,6 +73,21 @@ jobs:
       # shape-regression ~4 s, roundtrip ~40 s, `--fixtures` <1 s.
       - name: shape-regression (rustybuzz snapshots)
         run: cargo run -p shape-regression --release
+
+      # Issue #342 — the Command parity matrix: `bridge::meta` joined with
+      # the @nge/core facade map, the UI's data-nge-command /
+      # data-nge-pending-issue badges, e2e usage and fuzz coverage. The
+      # Markdown report lands in this job's summary (GitHub Issues stays the
+      # backlog — no committed report file); a failed floor check fails the
+      # step (the same floor also runs as `parity`'s unit tests in the
+      # `cargo test` step above). `--verify-issues` checks every cited
+      # issue is still OPEN; a `gh` error is only a warning.
+      - name: Command parity matrix (issue #342)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cargo run -p parity --release -- --verify-issues | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: roundtrip harness (default + fixtures)
         run: |

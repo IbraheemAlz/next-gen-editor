@@ -223,6 +223,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                 class="nge-fm__item"
                                 type="button"
                                 role="menuitem"
+                                data-nge-command="OPEN_DOCUMENT"
                                 onClick={() => fileInput?.click()}
                             >
                                 <span>Open…</span>
@@ -234,6 +235,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                 class="nge-fm__item"
                                 type="button"
                                 role="menuitem"
+                                data-nge-command="SAVE_DOCUMENT"
                                 onClick={() => void onSave()}
                             >
                                 <span>Save</span>
@@ -275,6 +277,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                                             class="nge-fm__item nge-fm__item--stacked"
                                                             type="button"
                                                             role="menuitem"
+                                                            data-nge-command="EXPORT_PDF"
                                                             title={c.hint}
                                                             onClick={() => void onExportPdf(c.value)}
                                                         >
@@ -291,6 +294,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                             class="nge-fm__item"
                                             type="button"
                                             role="menuitem"
+                                            data-nge-command="SAVE_DOCUMENT"
                                             onClick={() => void onExportHtml()}
                                         >
                                             <span>HTML</span>
@@ -302,6 +306,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                             class="nge-fm__item"
                                             type="button"
                                             role="menuitem"
+                                            data-nge-command="SAVE_DOCUMENT"
                                             onClick={() => void onExportPlainText()}
                                         >
                                             <span>Plain Text</span>
