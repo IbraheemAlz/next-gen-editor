@@ -36,6 +36,11 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      # Issue #412 — `fuzz/` is its own workspace, so `--all` above does
+      # not reach it.
+      - name: cargo fmt --check (fuzz crate)
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

@@ -305,6 +305,8 @@ Engine backlog" references a real issue.
 ## Validation (CI gates, all -D warnings)
 
 - `cargo fmt --all -- --check` clean.
+- `cargo fmt --manifest-path fuzz/Cargo.toml -- --check` clean (issue #412 —
+  `fuzz/` is its own workspace, so `--all` does not reach it).
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo test --workspace` (native unit tests), **plus** `cargo test -p
   engine-wasm --features fuzz-native` (issue #321): the bridge-level tests
