@@ -18304,6 +18304,7 @@ fn bridge_to_engine_stroke(s: bridge::BridgeBorderStroke) -> engine::BorderStrok
         style,
         size_eighth_pt: s.size_eighth_pt,
         color: s.color.map(|c| [c.r, c.g, c.b, c.a]),
+        ..Default::default()
     }
 }
 
