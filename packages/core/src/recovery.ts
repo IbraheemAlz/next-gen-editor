@@ -172,12 +172,27 @@ export function checkpointNotices(failing: boolean, journalFailing = false): Rec
  * it for the next boot.
  */
 export function previousSessionNotice(
-    info: PreviousSessionInfo | undefined,
+    info: PreviousSessionInfo | readonly PreviousSessionInfo[] | undefined,
     options: RecoveryNoticeOptions = {},
 ): RecoveryNotice[] {
-    if (!info) return [];
+    const list: readonly PreviousSessionInfo[] =
+        info === undefined ? [] : 'archivedAt' in info ? [info] : info;
+    const newest = list[0];
+    if (!newest) return [];
     const formatTime = options.formatTime ?? defaultTime;
-    const when = formatTime(info.lastEditAt ?? info.archivedAt);
+    const when = formatTime(newest.lastEditAt ?? newest.archivedAt);
+    if (list.length > 1) {
+        return [
+            {
+                kind: 'previous-session',
+                title: 'Recover a previous document?',
+                detail:
+                    `${list.length} earlier sessions with unsaved changes were kept aside ` +
+                    `(the newest: last edit around ${when}). This new session starts from a blank document.`,
+                action: 'Recover the one you want to carry on with, or discard them.',
+            },
+        ];
+    }
     return [
         {
             kind: 'previous-session',

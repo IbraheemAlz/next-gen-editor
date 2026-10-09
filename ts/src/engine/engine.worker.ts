@@ -9,6 +9,7 @@ import type {
 import { commandMeta } from '@nge/core/command-meta';
 import {
     openEventLog,
+    setActiveLogDb,
     appendCommand,
     persistSnapshot,
     writeCleanMarker,
@@ -55,6 +56,8 @@ type ClientInitMsg = {
     type: 'INIT';
     canvas: OffscreenCanvas;
     documentId: string;
+    /** Issue #426 - the event-log database this tab owns (`tab-session.ts`). */
+    logDb?: string;
     /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
     mockBackend?: 'vello';
     /** Issue #240 — a crash loop on the GPU backend persisted across
@@ -65,6 +68,8 @@ type ClientRecoverMsg = {
     id: number;
     type: 'RECOVER';
     canvas: OffscreenCanvas;
+    /** Issue #426 - the event-log database this tab owns. */
+    logDb?: string;
     /** Issue #241 — bases to try, newest snapshot first, ending with the
      *  snapshot-less log base (see `event-log.ts` `loadRecoveryLog`). */
     candidates: RecoveryCandidate[];
@@ -1062,6 +1067,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         const renderer = probe.renderer;
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
+        if (msg.logDb) setActiveLogDb(msg.logDb);
         await openEventLog(msg.documentId);
         cleanState = true;
         committedPackageHash = undefined;
@@ -1104,6 +1110,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                 import.meta.url,
             ),
         });
+        if (msg.logDb) setActiveLogDb(msg.logDb);
         /* Issue #66 — re-probe the backend exactly as INIT does. The fresh
            canvas has taken no context yet, so Vello is available again
            whenever the GPU is. The engine reports what it ACTUALLY paints
