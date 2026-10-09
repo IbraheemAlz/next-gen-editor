@@ -104,8 +104,11 @@ export interface EngineClientLike {
      * Issue #240 — optional crash-loop renderer policy. The downgrade in
      * force (set at boot from a persisted streak, or by a recovery), a
      * change feed for it, and the "retry the GPU renderer" action (forgets
-     * the persisted streak and reloads). Implementations without a GPU
-     * policy omit all three; the Dev HUD then shows no retry action.
+     * the persisted streak and probes the GPU again). Issue #270 — the
+     * retry must keep the document: the reference client restarts its
+     * engine in place (a recovery generation without a trap), never a
+     * page reload. Implementations without a GPU policy omit all three;
+     * the Dev HUD then shows no retry action.
      */
     readonly rendererDowngrade?: RendererDowngrade | undefined;
     onRendererDowngrade?(fn: (d: RendererDowngrade | undefined) => void): () => void;
@@ -154,6 +157,9 @@ export interface RecoveryReport {
     tailDropped: boolean;
     /** When the restored base snapshot was taken (ms since the epoch). */
     baseSnapshotAt: number | undefined;
+    /** Issue #270 — why the recovery ran: a worker `trap`, or an in-place
+     *  `renderer-retry` (a planned respawn, no crash). Absent = `trap`. */
+    cause?: 'trap' | 'renderer-retry';
 }
 
 /** Read-only revision row consumed by the Track Changes sidebar. */

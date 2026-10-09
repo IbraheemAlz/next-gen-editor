@@ -91,6 +91,11 @@ type ArmTrapMsg = { id: number; type: 'ARM_TRAP'; after_commands: number };
 /* Issue #96 — DEV-only test hook: per-page opaque-ink counts read back
    from the surfaces this worker holds (see the handler). */
 type ProbePageInkMsg = { id: number; type: 'PROBE_PAGE_INK' };
+/* Issue #270 — planned retirement (the Dev HUD's in-place "retry Vello"):
+   finish everything already queued, snapshot the log head, flush the
+   event log, reply, close. The client then respawns a generation that
+   recovers from the log — the document survives, unlike a reload. */
+type RetireMsg = { id: number; type: 'RETIRE' };
 
 type Msg =
     | InitMsg
@@ -102,7 +107,8 @@ type Msg =
     | GetRevisionsMsg
     | RegisterPageCanvasMsg
     | ArmTrapMsg
-    | ProbePageInkMsg;
+    | ProbePageInkMsg
+    | RetireMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -1655,6 +1661,32 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
 
     if (msg.type === 'RECOVER') {
         void enqueue(() => handleClientRecover(msg));
+        return;
+    }
+
+    /* Issue #270 — planned retirement. Queued: every command posted
+       before it is applied (and logged) first; nothing posted after it
+       runs — the worker closes inside this task, and the client settles
+       those requests itself. */
+    if (msg.type === 'RETIRE') {
+        void enqueue(async () => {
+            if (idleSnapshotTimer !== undefined) {
+                clearTimeout(idleSnapshotTimer);
+                idleSnapshotTimer = undefined;
+            }
+            trapAfterCommands = null;
+            /* The respawned generation replays from here: snapshot the
+               log head so its tail is empty (the commands are logged
+               regardless — recovery would replay them without it). */
+            if (engine && logSequence > lastSnapshotAt) {
+                await takeSnapshot(logSequence);
+            }
+            /* Every event-log write issued so far has landed (or failed
+               and been accounted for) before the worker goes away. */
+            await pendingLogWrites;
+            self.postMessage({ id: msg.id, ok: true });
+            self.close();
+        });
         return;
     }
 

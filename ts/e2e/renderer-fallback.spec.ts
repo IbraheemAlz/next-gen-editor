@@ -231,13 +231,19 @@ test('a persisted crash loop boots Canvas2D without probing; the HUD retry re-pr
     const hud = page.locator('.nge-hud');
     await expect(hud.locator('.nge-hud__warn')).toHaveText('vello → canvas2d (2 traps)');
     const retry = hud.locator('.nge-hud__retry');
-    await expect(retry).toHaveText('Retry vello (reload)');
+    await expect(retry).toHaveText('Retry vello');
 
-    /* Retry: the record is forgotten and the reloaded page probes again. */
-    await Promise.all([page.waitForEvent('load'), retry.click()]);
-    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
-        timeout: 15_000,
-    });
+    /* Retry: the record is forgotten and the engine probes again — in
+       place (issue #270): a respawned generation, not a reload. */
+    await retry.click();
+    await page.waitForFunction(
+        () => {
+            const w = window as any;
+            return w.__engineClient.generation === 2 && w.__recovered === true;
+        },
+        undefined,
+        { timeout: 15_000 },
+    );
     const after = await page.evaluate(() => {
         const w = window as any;
         return {
@@ -250,6 +256,110 @@ test('a persisted crash loop boots Canvas2D without probing; the HUD retry re-pr
     await expect(page.locator('.nge-hud__warn')).toHaveCount(0);
     /* The fresh Vello generation is marked live (count reset). */
     await expect.poll(() => readStreak(page)).toMatchObject({ count: 0, live: true });
+});
+
+/* Issue #270 — "Retry vello" used to reload the page: a new session, whose
+   boot clears the event log, so an unsaved document was lost. The retry
+   now restarts the engine IN PLACE as a recovery generation without a
+   trap: the typed text, the zoom and the page lifetime itself survive. */
+test('Retry vello keeps the document and the zoom — no reload (#270)', async ({ page }) => {
+    test.setTimeout(90_000);
+    await plantStreak(page, { renderer: 'vello', count: 2, at: Date.now() - 60_000, live: false });
+    const boot = await bootMocked(page);
+    expect(boot.renderer).toBe('canvas2d');
+    expect(boot.downgrade?.consecutive_traps).toBe(2);
+
+    /* Only this page lifetime carries the marker: a reload drops it. */
+    await page.evaluate(() => {
+        (window as any).__sameLifetime = true;
+    });
+    const docText = (): Promise<string> =>
+        page.evaluate(async () => {
+            const dispatch = (window as any).__dispatch;
+            await dispatch({ type: 'SELECT_ALL' });
+            const p = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+            return p.type === 'CLIPBOARD_PAYLOAD' ? p.plain : `<${p.type}>`;
+        });
+    const pageHeight = (): Promise<number> =>
+        page.evaluate(async () => {
+            const evt = await (window as any).__dispatch({
+                type: 'REQUEST_PAINT',
+                viewport: { x: 0, y: 0, w: 0, h: 0 },
+                dirty: undefined,
+            });
+            return evt.type === 'PAINTED' ? (evt.page_heights[0] ?? -1) : -1;
+        });
+    const zoomValues = (): Promise<string[]> =>
+        page.$$eval('.nge-zoom__select', (els) =>
+            els.map((el) => (el as HTMLSelectElement).value),
+        );
+
+    /* Type through the real input path, then zoom to 150 %. */
+    await page.locator('textarea[data-nge-hidden-input]').focus();
+    await page.keyboard.type('Keep me ');
+    await expect.poll(docText).toContain('Keep me ');
+    const h100 = await pageHeight();
+    await page.locator('.nge-zoom__select').first().selectOption('1.5');
+    await expect.poll(zoomValues).toEqual(['1.5', '1.5']);
+    const h150 = await pageHeight();
+    expect(h150 / h100).toBeCloseTo(1.5, 3);
+    const before = await docText();
+
+    /* Retry from the Dev HUD. */
+    await page.evaluate(() => window.dispatchEvent(new Event('nge-toggle-hud')));
+    await page.locator('.nge-hud__retry').click();
+    await page.waitForFunction(
+        () => {
+            const w = window as any;
+            return w.__engineClient.generation === 2 && w.__recovered === true;
+        },
+        undefined,
+        { timeout: 15_000 },
+    );
+    const after = await page.evaluate(() => {
+        const w = window as any;
+        const info = w.__engineClient.lastRecovery;
+        return {
+            sameLifetime: w.__sameLifetime === true,
+            renderer: w.__renderer,
+            downgrade: w.__engineClient.rendererDowngrade,
+            cause: info?.cause,
+            restored: info?.restored,
+            appliedCommands: info?.appliedCommands,
+        };
+    });
+    expect(after.sameLifetime, 'no page reload').toBe(true);
+    expect(after.renderer).toBe('vello');
+    expect(after.downgrade).toBeUndefined();
+    expect(after.cause).toBe('renderer-retry');
+    /* The retired worker snapshotted the log head: nothing left to replay. */
+    expect(after.restored).toBe(true);
+    expect(after.appliedCommands).toBe(0);
+
+    /* The document and the zoom survived. */
+    expect(await docText()).toBe(before);
+    await expect.poll(zoomValues).toEqual(['1.5', '1.5']);
+    expect(await pageHeight()).toBeCloseTo(h150, 3);
+
+    /* A planned respawn is not a crash: no trap overlay, no loss banner;
+       the HUD's recovery row names the retry, and the fallback row is gone. */
+    await expect(page.locator('.nge-trap')).toHaveCount(0);
+    await expect(page.locator('.nge-recovery-banner')).toHaveCount(0);
+    await expect(page.locator('.nge-hud__recovery-base')).toContainText('renderer retry');
+    await expect(page.locator('.nge-hud__warn')).toHaveCount(0);
+
+    /* The retried engine keeps editing the same document. */
+    await page.evaluate(async () => {
+        const pos = { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 };
+        await (window as any).__dispatch({
+            type: 'SET_SELECTION',
+            range: { start: pos, end: pos },
+            caret: pos,
+        });
+    });
+    await page.locator('textarea[data-nge-hidden-input]').focus();
+    await page.keyboard.type('Still ');
+    await expect.poll(docText).toBe(`Still ${before}`);
 });
 
 test('a Vello generation that died with its tab counts toward the limit', async ({ page }) => {
