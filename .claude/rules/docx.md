@@ -229,18 +229,23 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   positioned verbatim markers. Untracked `insert_text` carries every
   revision with its text (shift at / after the start, grow strictly
   inside).
-- **Paragraph-mark revisions (issue #262).** `<w:pPr><w:rPr><w:ins/>`
-  (`<w:del/>`, `<w:moveFrom/>`, `<w:moveTo/>`) is lifted out of the
-  mark-rPr grab-bag fragment into `Paragraph::mark_revision`
-  (`parts::document::split_mark_revision`) and recorded on
-  `SourcePPr::mark_revision`; the verified pPr passthrough requires it
-  unchanged, a regenerated pPr re-injects it as the rPr's first child
-  (`writer::with_mark_revision`). The mark travels with the paragraph
-  END (split → right half, concat → tail's). `DocumentTree::
-  resolve_all_revisions` (`Command::AcceptAllRevisions` /
-  `RejectAllRevisions`, one undo step) resolves text revisions per
-  paragraph, then merges paragraphs for resolved marks per container
-  from the end — through `splice_text` + `remap_text_edit_record` /
+- **Paragraph-mark revisions (issues #262 / #303).** `<w:pPr><w:rPr><w:ins/>`
+  (`<w:del/>`, `<w:moveFrom/>`, `<w:moveTo/>`) — ALL of them, in source
+  order (a mark one reviewer inserted and another deleted carries two) —
+  is lifted out of the mark-rPr grab-bag fragment into
+  `Paragraph::mark_revisions` (`parts::document::split_mark_revisions`;
+  `Paragraph::mark_revision()` is the first-change accessor) and recorded
+  on `SourcePPr::mark_revisions`; the verified pPr passthrough requires
+  them unchanged, a regenerated pPr re-injects them as the rPr's first
+  children in schema order (`writer::with_mark_revisions`). Snapshots keep
+  the pre-#303 key: one change encodes as the bare revision, several as a
+  sequence. The mark travels with the paragraph END (split → right half,
+  concat → tail's). `DocumentTree::resolve_all_revisions`
+  (`Command::AcceptAllRevisions` / `RejectAllRevisions`, one undo step)
+  resolves text revisions per paragraph, then merges paragraphs for
+  resolved marks per container from the end — a mark's changes in order,
+  any one that removes the mark merges; a single Accept/Reject decides
+  the first — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is

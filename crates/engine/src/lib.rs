@@ -1515,11 +1515,17 @@ pub struct SourcePPr {
     pub props: ParaProperties,
     pub style_id: Option<String>,
     pub list_item: Option<ListItem>,
-    /// Issue #262 — the paragraph-mark revision `xml` spells (its
-    /// `<w:rPr><w:ins/>`): the bytes are re-emitted only while the
-    /// paragraph still carries exactly this one. Skipped when `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mark_revision: Option<Revision>,
+    /// Issues #262 / #303 — the paragraph-mark revisions `xml` spells
+    /// (its `<w:rPr><w:ins/><w:del/>`), in source order: the bytes are
+    /// re-emitted only while the paragraph still carries exactly these.
+    /// Encoded like [`Paragraph::mark_revisions`] (key `mark_revision`,
+    /// skipped when empty).
+    #[serde(
+        rename = "mark_revision",
+        with = "mark_revisions_serde",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub mark_revisions: Vec<Revision>,
 }
 
 /// Issues #199 / #106 — one source `<w:r>` covering the text bytes
@@ -3495,22 +3501,89 @@ pub struct Paragraph {
     /// paragraphs. Boxed: `Paragraph` clones constantly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_markup: Option<Box<SourceMarkup>>,
-    /// Issue #262 — a tracked change on the paragraph MARK
+    /// Issue #262 — the tracked changes on the paragraph MARK
     /// (`<w:pPr><w:rPr><w:ins/>` / `<w:del/>` / `<w:moveFrom/>` /
-    /// `<w:moveTo/>`): an inserted mark is a tracked paragraph SPLIT, a
-    /// deleted one a tracked MERGE with the following paragraph. Only
-    /// `kind` / `author` / `date` / `id` / `move_name` are meaningful —
-    /// `start` / `end` are unused (0). Accepting a deleted (or moved-
-    /// away) mark, or rejecting an inserted (or moved-in) one, merges
-    /// this paragraph with the next ([`DocumentTree::resolve_all_revisions`]).
+    /// `<w:moveTo/>`), in source order: an inserted mark is a tracked
+    /// paragraph SPLIT, a deleted one a tracked MERGE with the following
+    /// paragraph. Only `kind` / `author` / `date` / `id` / `move_name`
+    /// are meaningful — `start` / `end` are unused (0). Accepting a
+    /// deleted (or moved-away) mark, or rejecting an inserted (or
+    /// moved-in) one, merges this paragraph with the next
+    /// ([`DocumentTree::resolve_all_revisions`]).
+    ///
+    /// Issue #303 — a mark can carry more than one change (Word writes
+    /// `<w:ins/><w:del/>` for a mark one reviewer inserted and another
+    /// deleted). They resolve IN ORDER: the first one whose decision
+    /// removes the mark merges the paragraphs and the later ones go with
+    /// it. [`Paragraph::mark_revision`] is the single-change accessor
+    /// (the first one).
     ///
     /// Travel rules: the mark belongs to the paragraph END, so
     /// `split_at` gives it to the RIGHT half (the left half gets a fresh
     /// mark) and `concat` keeps the TAIL's (like `section_end`);
-    /// clipboard fragments clear it. Skipped when `None`, so a pre-#262
-    /// snapshot encodes unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mark_revision: Option<Revision>,
+    /// clipboard fragments clear it. Skipped when empty; one change
+    /// encodes exactly as the pre-#303 `mark_revision: Option<Revision>`
+    /// field did (two or more as a sequence under the same key), so a
+    /// pre-#262 / pre-#303 snapshot decodes and re-encodes unchanged.
+    #[serde(
+        rename = "mark_revision",
+        with = "mark_revisions_serde",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub mark_revisions: Vec<Revision>,
+}
+
+/// Issue #303 — snapshot encoding of a paragraph mark's tracked changes
+/// ([`Paragraph::mark_revisions`], [`SourcePPr::mark_revisions`]) under
+/// the pre-#303 key `mark_revision`: ONE change is written as the bare
+/// [`Revision`] (byte-identical to the old `Option<Revision>` field), two
+/// or more as a sequence. Reading accepts either shape, and a nil.
+mod mark_revisions_serde {
+    use super::Revision;
+    use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+    use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::{Deserialize, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(revs: &[Revision], s: S) -> Result<S::Ok, S::Error> {
+        match revs {
+            [one] => one.serialize(s),
+            many => many.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Revision>, D::Error> {
+        d.deserialize_any(OneOrMany)
+    }
+
+    struct OneOrMany;
+
+    impl<'de> Visitor<'de> for OneOrMany {
+        type Value = Vec<Revision>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a paragraph-mark revision or a sequence of them")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            Revision::deserialize(MapAccessDeserializer::new(map)).map(|r| vec![r])
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            Vec::<Revision>::deserialize(SeqAccessDeserializer::new(seq))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(OneOrMany)
+        }
+    }
 }
 
 /// Issue #81 — one paragraph-scoped bookmark. `id` is the source
@@ -3526,6 +3599,12 @@ pub struct Bookmark {
 }
 
 impl Paragraph {
+    /// Issue #262 — the (first) tracked change on the paragraph mark; see
+    /// [`Self::mark_revisions`] for a mark carrying several (issue #303).
+    pub fn mark_revision(&self) -> Option<&Revision> {
+        self.mark_revisions.first()
+    }
+
     /// Resolved style at byte offset `at` (default if no span covers it).
     pub fn style_at(&self, at: u32) -> SpanStyle {
         self.spans
@@ -3660,7 +3739,7 @@ impl Paragraph {
             /* Issues #199 / #106 — no offset moves; the writer verifies
             each run's recorded `<w:rPr>` against the new style. */
             source_markup: self.source_markup.clone(),
-            mark_revision: self.mark_revision.clone(),
+            mark_revisions: self.mark_revisions.clone(),
         }
     }
 
@@ -3849,7 +3928,7 @@ impl Paragraph {
             body_xml: self.body_xml.clone(),
             source_markup: markup,
             /* Issue #262 — the paragraph mark is untouched. */
-            mark_revision: self.mark_revision.clone(),
+            mark_revisions: self.mark_revisions.clone(),
         }
     }
 
@@ -3968,7 +4047,7 @@ impl Paragraph {
                 body_xml: BodyPassthrough::before_only(&self.body_xml),
                 source_markup: markup_left,
                 /* Issue #262 — a fresh mark for the left half. */
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -3992,7 +4071,7 @@ impl Paragraph {
                 body_xml: BodyPassthrough::after_only(&self.body_xml),
                 source_markup: markup_right,
                 /* Issue #262 — the original mark ends the right half. */
-                mark_revision: self.mark_revision.clone(),
+                mark_revisions: self.mark_revisions.clone(),
             },
         )
     }
@@ -4084,7 +4163,7 @@ impl Paragraph {
             ),
             /* Issue #262 — the head's mark is the one deleted: the
             surviving mark (and its tracked change) is the tail's. */
-            mark_revision: other.mark_revision.clone(),
+            mark_revisions: other.mark_revisions.clone(),
         }
     }
 
@@ -4974,7 +5053,7 @@ impl DocumentTree {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         }));
         Self {
             blocks,
@@ -5027,7 +5106,7 @@ impl DocumentTree {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             }));
         }
         Self {
@@ -6491,7 +6570,7 @@ impl DocumentTree {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             }));
             return Self {
                 blocks,
@@ -7244,7 +7323,7 @@ impl DocumentTree {
                 .blocks
                 .get(block as usize)
                 .and_then(Block::as_paragraph)
-            && p.mark_revision.is_some()
+            && !p.mark_revisions.is_empty()
             && start as usize == p.text.len()
             && !p.revisions.iter().any(|r| r.start == start && r.end == end)
         {
@@ -10880,7 +10959,7 @@ fn strip_section_marker(mut p: Paragraph) -> Paragraph {
     (`w14:paraId`) and rsids: a pasted copy is a new paragraph. */
     p.source_markup = None;
     /* Issue #262 — nor a tracked change on the source paragraph's mark. */
-    p.mark_revision = None;
+    p.mark_revisions.clear();
     p
 }
 
@@ -13578,7 +13657,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -13609,7 +13688,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -13637,7 +13716,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -13743,7 +13822,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -13785,7 +13864,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -14284,7 +14363,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -14332,7 +14411,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -14379,7 +14458,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             },
             Paragraph {
                 text: "two".into(),
@@ -14404,7 +14483,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             },
         ];
         let (out, caret) = doc.insert_rich(

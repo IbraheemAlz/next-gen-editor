@@ -1244,10 +1244,11 @@ impl Engine {
                         mark: false,
                     });
                 }
-                /* Issue #262 — the paragraph-mark revision, addressed as
+                /* Issue #262 — the paragraph-mark revisions, addressed as
                 the empty range at the paragraph end (what
-                `AcceptRevision` / `RejectRevision` resolve it by). */
-                if let Some(r) = &p.mark_revision {
+                `AcceptRevision` / `RejectRevision` resolve it by — the
+                FIRST of several, issue #303: one row each, in order). */
+                for r in &p.mark_revisions {
                     let end = p.text.len() as u32;
                     rows.push(RevisionOut {
                         block: block_idx as u32,
@@ -1966,9 +1967,11 @@ const REVISION_MOVE_COLOR: [u8; 4] = [0x6A, 0x1B, 0x9A, 0xFF];
 
 /// Issue #262 — the pilcrow colour of a paragraph whose MARK carries a
 /// tracked change (paint-only review decoration), in the same tint as
-/// the matching text revision.
+/// the matching text revision. Issue #303 — a mark carrying several
+/// changes shows its LATEST state (an inserted-then-deleted mark reads
+/// as deleted).
 fn review_mark_color(para: &engine::Paragraph) -> Option<[u8; 4]> {
-    para.mark_revision.as_ref().map(|r| match r.kind {
+    para.mark_revisions.last().map(|r| match r.kind {
         engine::RevisionKind::Insert => REVISION_INSERT_COLOR,
         engine::RevisionKind::Delete => REVISION_DELETE_COLOR,
         engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => REVISION_MOVE_COLOR,
@@ -17600,7 +17603,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -17755,7 +17758,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -17794,7 +17797,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -18969,7 +18972,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             })],
             source_markup: None,
         }

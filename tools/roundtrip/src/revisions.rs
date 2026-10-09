@@ -188,7 +188,7 @@ fn marks(doc: &DocumentTree) -> Vec<Option<(RevisionKind, Option<u32>)>> {
     doc.blocks
         .iter()
         .filter_map(engine::Block::as_paragraph)
-        .map(|p| p.mark_revision.as_ref().map(|r| (r.kind, r.id)))
+        .map(|p| p.mark_revision().map(|r| (r.kind, r.id)))
         .collect()
 }
 
@@ -292,5 +292,131 @@ pub(crate) fn run_paragraph_mark_revisions_roundtrip() -> Result<()> {
         }
     }
     println!("[roundtrip] step 32d OK — accept-all / reject-all resolve marks, save clean");
+    Ok(())
+}
+
+/// Issue #303 — a paragraph mark carrying TWO tracked changes: reviewer A
+/// inserted it (a split), reviewer B deleted it again, next to other mark
+/// formatting.
+const DOUBLE_MARK_BODY: &str = concat!(
+    r#"<w:p w:rsidR="00A1B2C3"><w:pPr><w:rPr><w:ins w:id="20" w:author="A" w:date="2026-01-01T00:00:00Z"/><w:del w:id="21" w:author="B" w:date="2026-01-02T00:00:00Z"/><w:b/></w:rPr></w:pPr>"#,
+    r#"<w:r><w:t xml:space="preserve">one </w:t></w:r></w:p>"#,
+    r#"<w:p><w:r><w:t>two</w:t></w:r></w:p>"#,
+);
+
+fn all_marks(doc: &DocumentTree) -> Vec<Vec<(RevisionKind, Option<u32>)>> {
+    doc.blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .map(|p| p.mark_revisions.iter().map(|r| (r.kind, r.id)).collect())
+        .collect()
+}
+
+/// Issue #303 — step 36: two tracked changes on one paragraph mark.
+///
+/// a. `<w:rPr><w:ins/><w:del/>` reads as BOTH `Paragraph::mark_revisions`
+///    (the second used to stay in the mark's property bytes); an untouched
+///    save is byte-identical.
+/// b. An edit in that paragraph is a pure insertion (the verified source
+///    `<w:pPr>` carries both changes).
+/// c. A regenerated `<w:pPr>` re-injects both, in order; they re-read.
+/// d. Accept-all and reject-all resolve both (in order — either way the
+///    mark goes): one paragraph, and no `<w:ins>` / `<w:del>` left in the
+///    saved file or on re-read.
+pub(crate) fn run_double_mark_revisions_roundtrip() -> Result<()> {
+    let xml = document(DOUBLE_MARK_BODY);
+    let bytes = build_styled_docx(STYLES_XML, &xml);
+    let archive = read_docx(&bytes).context("read double-mark fixture")?;
+    let doc = &archive.document;
+    let want = vec![
+        vec![
+            (RevisionKind::Insert, Some(20)),
+            (RevisionKind::Delete, Some(21)),
+        ],
+        vec![],
+    ];
+    if all_marks(doc) != want {
+        bail!("step 36a: marks read as {:?}", all_marks(doc));
+    }
+    let untouched = write_docx(&archive, doc).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != xml.as_bytes() {
+        bail!("step 36a: untouched double-mark document drifted");
+    }
+    println!("[roundtrip] step 36a OK — both mark changes modeled, untouched save byte-identical");
+
+    let edited = doc.insert_text(at(0, 2), INSERT_TEXT);
+    for (path, out) in [
+        (
+            "write_docx",
+            write_docx(&archive, &edited).context("write")?,
+        ),
+        (
+            "save_docx",
+            format_docx::save_docx(&edited).context("ui save")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&out).with_context(|| format!("step 36b {path}"))?;
+        let got = extract_doc_xml(&out)?;
+        let (_, rewritten, _) = rewritten_region(xml.as_bytes(), &got);
+        if rewritten != 0 {
+            bail!(
+                "step 36b {path}: the edit rewrote {rewritten} source bytes\n{}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+    }
+    println!("[roundtrip] step 36b OK — an edit in the double-mark paragraph is a pure insertion");
+
+    let realigned = doc.set_alignment(at(0, 0), at(0, 0), Alignment::End);
+    let out = write_docx(&archive, &realigned).context("realigned save")?;
+    assert_document_xml_well_formed(&out).context("step 36c")?;
+    let got = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
+    let needle = concat!(
+        r#"<w:rPr><w:ins w:id="20" w:author="A" w:date="2026-01-01T00:00:00Z"/>"#,
+        r#"<w:del w:id="21" w:author="B" w:date="2026-01-02T00:00:00Z"/><w:b/></w:rPr>"#,
+    );
+    if !got.contains(needle) {
+        bail!("step 36c: regenerated pPr lost {needle}\n{got}");
+    }
+    let reread = read_docx(&out).context("re-read realigned")?;
+    if all_marks(&reread.document) != want {
+        bail!(
+            "step 36c: marks re-read as {:?}",
+            all_marks(&reread.document)
+        );
+    }
+    println!("[roundtrip] step 36c OK — a regenerated pPr re-injects both mark changes");
+
+    for accept in [true, false] {
+        let resolved = doc.resolve_all_revisions(accept);
+        if texts(&resolved) != vec!["one two"] || resolved.has_revisions() {
+            bail!("step 36d (accept={accept}): {:?}", texts(&resolved));
+        }
+        for (path, out) in [
+            (
+                "write_docx",
+                write_docx(&archive, &resolved).context("write resolved")?,
+            ),
+            (
+                "save_docx",
+                format_docx::save_docx(&resolved).context("save resolved")?,
+            ),
+        ] {
+            assert_document_xml_well_formed(&out)
+                .with_context(|| format!("step 36d {path} {accept}"))?;
+            let got = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
+            if got.contains("<w:del ") || got.contains("<w:ins ") {
+                bail!("step 36d {path} (accept={accept}): a mark change survived\n{got}");
+            }
+            let reread = read_docx(&out).context("re-read resolved")?;
+            if reread.document.has_revisions() || texts(&reread.document) != vec!["one two"] {
+                bail!(
+                    "step 36d {path} (accept={accept}): re-read {:?}",
+                    texts(&reread.document)
+                );
+            }
+        }
+    }
+    println!("[roundtrip] step 36d OK — accept-all / reject-all resolve both mark changes");
     Ok(())
 }

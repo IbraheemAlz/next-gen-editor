@@ -1,7 +1,7 @@
 //! Issues #262 / #247 — resolving tracked changes structurally: the
 //! document-wide accept / reject ([`DocumentTree::resolve_all_revisions`])
-//! and the paragraph-MARK revision (a tracked paragraph split or merge,
-//! [`crate::Paragraph::mark_revision`]).
+//! and the paragraph-MARK revisions (a tracked paragraph split or merge,
+//! [`crate::Paragraph::mark_revisions`], several on one mark since #303).
 //!
 //! Every text removal goes through [`Paragraph::splice_text`] and the
 //! returned edit through [`DocumentTree::remap_text_edit_record`]; every
@@ -23,7 +23,7 @@ impl DocumentTree {
     pub fn has_revisions(&self) -> bool {
         let mut any = false;
         crate::fields::for_each_paragraph_deep(&self.blocks, &mut |_, p| {
-            any |= !p.revisions.is_empty() || p.mark_revision.is_some();
+            any |= !p.revisions.is_empty() || !p.mark_revisions.is_empty();
         });
         any
     }
@@ -42,7 +42,8 @@ impl DocumentTree {
     ///    the paragraph with the next one; otherwise the mark just loses
     ///    its revision. A mark in front of a table, at the end of its
     ///    container, or carrying a section break cannot merge and only
-    ///    loses its revision.
+    ///    loses its revision. A mark carrying several changes (issue #303)
+    ///    resolves them in order: any one that removes the mark merges.
     /// 3. With every move resolved, the orphaned in-paragraph move-range
     ///    markers (`<w:moveFromRangeStart/>` …) are dropped.
     pub fn resolve_all_revisions(&self, accept: bool) -> Self {
@@ -53,7 +54,7 @@ impl DocumentTree {
             had_move |= p
                 .revisions
                 .iter()
-                .chain(p.mark_revision.as_ref())
+                .chain(&p.mark_revisions)
                 .any(|r| matches!(r.kind, RevisionKind::MoveFrom | RevisionKind::MoveTo));
             if !p.revisions.is_empty() {
                 paths.push(path);
@@ -96,10 +97,13 @@ impl DocumentTree {
 
     /// Issue #262 — accept / reject the paragraph-mark revision of
     /// top-level paragraph `block` (the single-revision path; see
-    /// [`Self::resolve_all_revisions`] for the semantics).
+    /// [`Self::resolve_all_revisions`] for the semantics). Issue #303 —
+    /// on a mark carrying several changes this decides the FIRST one (a
+    /// single decision addresses the mark, and its changes resolve in
+    /// order).
     pub(crate) fn resolve_mark_revision_at(&self, block: u32, accept: bool) -> Self {
         let mut out = self.clone();
-        out.resolve_mark(&[], block, accept);
+        out.resolve_mark(&[], block, accept, false);
         out.with_list_markers_refreshed()
     }
 
@@ -128,55 +132,86 @@ impl DocumentTree {
                         self.resolve_marks_in(&inner, accept);
                     }
                 }
-                Some(Block::Paragraph(p)) if p.mark_revision.is_some() => {
-                    self.resolve_mark(container, i, accept);
+                Some(Block::Paragraph(p)) if !p.mark_revisions.is_empty() => {
+                    self.resolve_mark(container, i, accept, true);
                 }
                 _ => {}
             }
         }
     }
 
-    /// Resolve the mark revision of paragraph `i` of `container`.
-    fn resolve_mark(&mut self, container: &[PathStep], i: u32, accept: bool) {
+    /// Resolve the mark revisions of paragraph `i` of `container` — all of
+    /// them (`all`), or only the first. Issue #303 — they resolve in
+    /// order: the first decided change that removes the mark (an accepted
+    /// deletion / move source, a rejected insertion / move destination)
+    /// merges the paragraph with the next one, and every later change
+    /// goes with the mark it described; otherwise the decided changes are
+    /// dropped and the rest stay pending.
+    fn resolve_mark(&mut self, container: &[PathStep], i: u32, accept: bool, all: bool) {
         let Some(blocks) = container_blocks(self, container) else {
             return;
         };
         let Some(Block::Paragraph(head)) = blocks.get(i as usize) else {
             return;
         };
-        let Some(rev) = &head.mark_revision else {
+        let decided = if all {
+            head.mark_revisions.len()
+        } else {
+            head.mark_revisions.len().min(1)
+        };
+        if decided == 0 {
             return;
-        };
-        let next = match blocks.get(i as usize + 1) {
-            Some(Block::Paragraph(p)) => Some(p),
-            _ => None,
-        };
-        let path = child(container, i);
-        match next {
-            Some(tail) if rev.kind.removes_text(accept) && head.section_end.is_none() => {
-                let head_len = head.text.len() as u32;
-                let mut top = self.blocks.clone();
-                if vanishes_whole(head) {
-                    /* The whole paragraph was the change (a deleted
-                    paragraph, a rejected inserted one): the next one
-                    survives untouched — clean source bytes included. */
-                    let _ = delete_block_at_path(&mut top, &path);
-                    self.blocks = top;
-                    self.remap_block_splice(container, i, 1, 0);
-                } else {
-                    let merged = merge_pair(head, tail);
-                    let _ = delete_block_at_path(&mut top, &child(container, i + 1));
-                    let _ = replace_block_in_top(&mut top, &path, Block::Paragraph(merged));
-                    self.blocks = top;
-                    self.remap_paragraph_merge(&path, head_len, i + 1, 0);
-                }
-            }
-            _ => {
-                let mut top = self.blocks.clone();
-                let _ = mutate_paragraph_in_top(&mut top, &path, |p| p.mark_revision = None);
-                self.blocks = top;
-            }
         }
+        let removes = head.mark_revisions[..decided]
+            .iter()
+            .any(|r| r.kind.removes_text(accept));
+        if !(removes && self.merge_paragraph_with_next(container, i)) {
+            let mut top = self.blocks.clone();
+            let _ = mutate_paragraph_in_top(&mut top, &child(container, i), |p| {
+                p.mark_revisions
+                    .drain(..decided.min(p.mark_revisions.len()));
+            });
+            self.blocks = top;
+        }
+    }
+
+    /// Remove the MARK of paragraph `i` of `container`: merge it with the
+    /// paragraph after it (the merged paragraph ends with the tail's mark
+    /// and its revisions), remapping the comment anchors. `false` — and
+    /// nothing done — when that mark cannot go: the next block is not a
+    /// paragraph (a table, or the container's end) or the mark carries a
+    /// section break. Shared by the mark resolution above and the tracked
+    /// deletion of a reviewer's own inserted mark (issue #298).
+    pub(crate) fn merge_paragraph_with_next(&mut self, container: &[PathStep], i: u32) -> bool {
+        let Some(blocks) = container_blocks(self, container) else {
+            return false;
+        };
+        let (Some(Block::Paragraph(head)), Some(Block::Paragraph(tail))) =
+            (blocks.get(i as usize), blocks.get(i as usize + 1))
+        else {
+            return false;
+        };
+        if head.section_end.is_some() {
+            return false;
+        }
+        let path = child(container, i);
+        let head_len = head.text.len() as u32;
+        let mut top = self.blocks.clone();
+        if vanishes_whole(head) {
+            /* The whole paragraph was the change (a deleted paragraph, a
+            rejected inserted one): the next one survives untouched —
+            clean source bytes included. */
+            let _ = delete_block_at_path(&mut top, &path);
+            self.blocks = top;
+            self.remap_block_splice(container, i, 1, 0);
+        } else {
+            let merged = merge_pair(head, tail);
+            let _ = delete_block_at_path(&mut top, &child(container, i + 1));
+            let _ = replace_block_in_top(&mut top, &path, Block::Paragraph(merged));
+            self.blocks = top;
+            self.remap_paragraph_merge(&path, head_len, i + 1, 0);
+        }
+        true
     }
 }
 

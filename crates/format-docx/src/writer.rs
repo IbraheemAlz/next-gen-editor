@@ -839,10 +839,12 @@ fn serialize_paragraph(
     } else {
         std::borrow::Cow::Borrowed(&para.props)
     };
-    /* Issue #262 — the paragraph-mark revision re-enters the mark's rPr. */
-    let props = match &para.mark_revision {
-        Some(rev) => std::borrow::Cow::Owned(with_mark_revision(&props, rev)),
-        None => props,
+    /* Issues #262 / #303 — the paragraph-mark revisions re-enter the
+    mark's rPr, all of them, in order. */
+    let props = if para.mark_revisions.is_empty() {
+        props
+    } else {
+        std::borrow::Cow::Owned(with_mark_revisions(&props, &para.mark_revisions))
     };
     match source_ppr {
         /* Verified passthrough: the model still holds exactly what these
@@ -1022,20 +1024,36 @@ fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
         && sp.props == para.props
         && sp.style_id == para.style_id
         && sp.list_item == para.list_item
-        /* Issue #262 — the bytes spell the paragraph-mark revision. */
-        && sp.mark_revision == para.mark_revision
+        /* Issues #262 / #303 — the bytes spell the paragraph-mark
+        revisions. */
+        && sp.mark_revisions == para.mark_revisions
 }
 
-/// Issue #262 — `props` with the paragraph-mark revision `rev` put back
-/// into the mark's `<w:rPr>` (which rides the pPr grab bag): first child of
-/// the recorded rPr fragment (CT_ParaRPr opens with the track-change
-/// elements), or a fresh `<w:rPr>` fragment when the mark had none.
-fn with_mark_revision(props: &ParaProperties, rev: &Revision) -> ParaProperties {
+/// Issues #262 / #303 — `props` with the paragraph-mark revisions `revs`
+/// put back into the mark's `<w:rPr>` (which rides the pPr grab bag):
+/// the first children of the recorded rPr fragment (CT_ParaRPr opens
+/// with the track-change elements), or a fresh `<w:rPr>` fragment when
+/// the mark had none. Emitted in schema order (`EG_ParaRPrTrackChanges`:
+/// `ins`, `del`, `moveFrom`, `moveTo`) — a model order that differs (an
+/// engine-recorded deletion of a moved-in mark) is stably re-ranked.
+fn with_mark_revisions(props: &ParaProperties, revs: &[Revision]) -> ParaProperties {
+    let rank = |k: RevisionKind| match k {
+        RevisionKind::Insert | RevisionKind::FormatChange => 0,
+        RevisionKind::Delete => 1,
+        RevisionKind::MoveFrom => 2,
+        RevisionKind::MoveTo => 3,
+    };
+    let mut ordered: Vec<&Revision> = revs.iter().collect();
+    ordered.sort_by_key(|r| rank(r.kind));
     let mut el = String::new();
-    emit_revision_open(rev, 0, &mut el);
-    /* `<w:ins …>` → `<w:ins …/>`: the mark element is empty. */
-    el.pop();
-    el.push_str("/>");
+    for rev in ordered {
+        let mut one = String::new();
+        emit_revision_open(rev, 0, &mut one);
+        /* `<w:ins …>` → `<w:ins …/>`: the mark element is empty. */
+        one.pop();
+        one.push_str("/>");
+        el.push_str(&one);
+    }
     let mut p = props.clone();
     let bag = p.grab_bag.get_or_insert_with(Default::default);
     let rpr = bag
@@ -4816,7 +4834,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4859,7 +4877,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4906,7 +4924,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4967,7 +4985,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5014,7 +5032,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5121,7 +5139,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -6986,7 +7004,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -7047,7 +7065,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7175,7 +7193,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -7207,7 +7225,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7267,7 +7285,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -7948,7 +7966,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -8590,7 +8608,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
