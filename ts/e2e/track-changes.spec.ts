@@ -141,7 +141,9 @@ test('tracked Backspace at a paragraph start marks the break; Backspace over you
     /* A tracked Enter of your own, then Backspace: no change is left. */
     await run(page, [caret(0, 3), { type: 'SPLIT_PARAGRAPH', at: undefined }]);
     expect(await plain(page)).toBe('one\ntwo');
-    await run(page, [BACKSPACE]);
+    /* `plain()` selected everything — put the caret back at the start
+     * of the new paragraph first. */
+    await run(page, [caret(1, 0), BACKSPACE]);
     expect(await plain(page)).toBe('onetwo');
     const depth = (await run(page, [caret(0, 0)])).undo_depth as number;
     const nothing = await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
