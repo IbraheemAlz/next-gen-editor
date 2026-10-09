@@ -51,6 +51,9 @@ function recoveryLosses(r: RecoveryReport): string[] {
     if (r.logTruncated) losses.push('log truncated');
     if (r.tailDropped) losses.push('tail dropped');
     if (r.packageLost) losses.push('package lost');
+    if (r.journalGap !== undefined && r.journalGap > 0) {
+        losses.push(`journal gap (${r.journalGap} cmds)`);
+    }
     if (r.rendererDowngraded) losses.push('renderer downgraded');
     return losses;
 }
@@ -180,6 +183,24 @@ export const DevHud: Component<DevHudProps> = (props) => {
                             </>
                         )}
                     </Show>
+
+                    {/* Issue #390 - the event log's health (the typed
+                        `CheckpointState` event): checkpoints + the command
+                        journal. */}
+                    <dt>Event log</dt>
+                    <dd
+                        class="nge-hud__eventlog"
+                        classList={{ 'nge-hud__warn': !state.checkpointState().ok }}
+                        title={state.checkpointState().lastError ?? ''}
+                    >
+                        {state.checkpointState().ok
+                            ? state.checkpointState().failures > 0
+                                ? `retrying (${state.checkpointState().failures})`
+                                : 'ok'
+                            : state.checkpointState().journalFailing
+                              ? 'journal failing'
+                              : 'checkpoints failing'}
+                    </dd>
 
                     <dt>WASM heap</dt>
                     <dd>{fmtBytes(state.stats()?.wasm_heap_bytes)}</dd>

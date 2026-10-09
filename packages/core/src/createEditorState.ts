@@ -27,6 +27,7 @@ import type {
     BridgeIndent,
     BridgeSectionGeometry,
     BridgeTabStop,
+    CheckpointStatus,
     Direction,
     EngineStats,
     Event,
@@ -202,6 +203,16 @@ export interface EditorState {
      */
     checkpointFailing: Accessor<boolean>;
     /**
+     * Issue #390 - the event log's health as the bridge's
+     * `Event::CheckpointState` reports it (broadcast on `subscribe()`
+     * whenever it changes; seeded from `engine.checkpointStatus`).
+     * `ok: false` once the bounded retries of a failed checkpoint
+     * (snapshot dispatch / snapshot write) or of the command journal ran
+     * out; `journalFailing` marks the journal specifically (recovery would
+     * miss commands). Shared like `zoom`.
+     */
+    checkpointState: Accessor<CheckpointHealth>;
+    /**
      * Issue #388 - the previous page generation's unsaved session, set
      * aside at boot and waiting for Recover / Discard
      * (`engine.recoverPreviousSession` / `discardPreviousSession`);
@@ -219,12 +230,21 @@ export interface EditorState {
  * lazily under a detached root; the subscription lives as long as the
  * engine handle, which the shell keeps for the page lifetime.
  */
+/** Issue #390 - see `EditorState.checkpointState`. */
+export interface CheckpointHealth {
+    ok: boolean;
+    failures: number;
+    journalFailing: boolean;
+    lastError: string | undefined;
+}
+
 interface ViewState {
     zoom: Accessor<number>;
     deviceScale: Accessor<number | undefined>;
     rendererDowngrade: Accessor<RendererDowngrade | undefined>;
     lastRecovery: Accessor<RecoveryReport | undefined>;
     checkpointFailing: Accessor<boolean>;
+    checkpointState: Accessor<CheckpointHealth>;
     previousSession: Accessor<PreviousSessionInfo | undefined>;
 }
 
@@ -256,10 +276,19 @@ function viewStateFor(engine: EngineHandle): ViewState {
         );
         engine.onRecovery?.((report) => setLastRecovery(() => report));
         /* Issue #333 - checkpoint health, seeded then fed by the client. */
-        const [checkpointFailing, setCheckpointFailing] = createSignal(
-            engine.checkpointStatus?.failing === true,
+        const toHealth = (s: CheckpointStatus | undefined): CheckpointHealth => ({
+            ok: s?.failing !== true,
+            failures: s?.failures ?? 0,
+            journalFailing: s?.journalFailing === true,
+            lastError: s?.lastError,
+        });
+        const [checkpointState, setCheckpointState] = createSignal<CheckpointHealth>(
+            toHealth(engine.checkpointStatus),
         );
-        engine.onCheckpointStatus?.((s) => setCheckpointFailing(s.failing));
+        /* Issue #390 - fed by the client's status feed (it also resets on
+           a respawned worker) AND by the typed bridge event itself. */
+        engine.onCheckpointStatus?.((s) => setCheckpointState(toHealth(s)));
+        const checkpointFailing: Accessor<boolean> = () => !checkpointState().ok;
         /* Issue #388 - the unsaved previous session, seeded then fed. */
         const [previousSession, setPreviousSession] = createSignal<
             PreviousSessionInfo | undefined
@@ -278,6 +307,13 @@ function viewStateFor(engine: EngineHandle): ViewState {
                    boot `RENDER_PAGE` + its `SELECTION_CHANGED` land. */
                 setZoom(roundZoom(evt.zoom));
                 if (evt.device_scale !== undefined) setDeviceScale(evt.device_scale);
+            } else if (evt.type === 'CHECKPOINT_STATE') {
+                setCheckpointState({
+                    ok: evt.ok,
+                    failures: evt.failures,
+                    journalFailing: evt.journal_failing === true,
+                    lastError: evt.last_error,
+                });
             } else if (evt.type === 'RECOVERED') {
                 /* Issue #97 — the respawned engine folded the replayed
                    SET_ZOOM / SET_DEVICE_SCALE into its restored config (or
@@ -297,6 +333,7 @@ function viewStateFor(engine: EngineHandle): ViewState {
             rendererDowngrade,
             lastRecovery,
             checkpointFailing,
+            checkpointState,
             previousSession,
         };
     });
@@ -448,6 +485,7 @@ export function createEditorState(): EditorState {
         rendererDowngrade: view.rendererDowngrade,
         lastRecovery: view.lastRecovery,
         checkpointFailing: view.checkpointFailing,
+        checkpointState: view.checkpointState,
         previousSession: view.previousSession,
     };
 }

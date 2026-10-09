@@ -174,8 +174,13 @@ export interface PreviousSessionInfo {
 /** Issue #333 - see `EngineClientLike.checkpointStatus`. */
 export interface CheckpointStatus {
     failing: boolean;
-    /** Consecutive failed snapshot writes in the current run. */
+    /** Consecutive failed attempts in the current run. */
     failures: number;
+    /** Issue #390 - the command journal specifically is not being
+     *  written: a recovery now would miss the commands in the gap. */
+    journalFailing?: boolean | undefined;
+    /** Issue #390 - the most recent failure's message. */
+    lastError?: string | undefined;
 }
 
 /**
@@ -211,6 +216,10 @@ export interface RecoveryReport {
     tailDropped: boolean;
     /** When the restored base snapshot was taken (ms since the epoch). */
     baseSnapshotAt: number | undefined;
+    /** Issue #390 - logged commands after the restored base whose row was
+     *  never written (the journal failed): the recovery could not replay
+     *  them. Absent / `0` = none. */
+    journalGap?: number;
     /** Issue #270 — why the recovery ran: a worker `trap`, or an in-place
      *  `renderer-retry` (a planned respawn, no crash). Absent = `trap`. */
     cause?: 'trap' | 'renderer-retry' | 'engine-reload' | 'page-reload' | 'session-restore';

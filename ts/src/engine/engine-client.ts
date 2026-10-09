@@ -72,6 +72,8 @@ type WorkerReply = {
     tailDropped?: boolean;
     /** Issue #315 — RECOVER reply: see `RecoveryInfo.baseSnapshotAt`. */
     baseTakenAt?: number;
+    /** Issue #390 — RECOVER reply: see `RecoveryInfo.journalGap`. */
+    journalGap?: number;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -190,6 +192,10 @@ export interface RecoveryInfo {
      *  predates the timestamp. Lets the shell say since when edits were
      *  lost (`tailDropped`). */
     baseSnapshotAt: number | undefined;
+    /** Issue #390 — logged commands after the restored base whose row was
+     *  never written (the journal failed): the recovery replayed the
+     *  commands around them and could not replay these. `0` = none. */
+    journalGap: number;
     /** Issue #270 — why the recovery ran: a worker `trap`, or the Dev
      *  HUD's in-place `renderer-retry` (a planned respawn, no crash). */
     cause: RecoveryCause;
@@ -254,8 +260,13 @@ function takeCarryOver(documentId: string): boolean {
  *  and cleared by the next successful write. */
 export interface CheckpointStatus {
     failing: boolean;
-    /** Consecutive failed snapshot writes in the current run. */
+    /** Consecutive failed attempts in the current run. */
     failures: number;
+    /** Issue #390 — the command journal specifically is not being written
+     *  (a recovery now would miss the commands in the gap). */
+    journalFailing?: boolean;
+    /** Issue #390 — the most recent failure's message. */
+    lastError?: string;
 }
 
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
@@ -820,23 +831,34 @@ export class EngineClient {
     }
 
     private setCheckpoint(next: CheckpointStatus): void {
-        if (next.failing === this.checkpoint.failing && next.failures === this.checkpoint.failures) {
+        const prev = this.checkpoint;
+        if (
+            next.failing === prev.failing &&
+            next.failures === prev.failures &&
+            next.journalFailing === prev.journalFailing &&
+            next.lastError === prev.lastError
+        ) {
             return;
         }
         this.checkpoint = next;
         for (const fn of this.checkpointListeners) fn(next);
     }
 
-    private onCheckpointNotice(msg: { state?: string; failures?: number }): void {
-        const failures = typeof msg.failures === 'number' ? msg.failures : 0;
-        if (msg.state === 'failed') {
+    /** Issue #390 - every event with `failures > 0` reports exactly one
+     *  failed attempt (the worker sends the exhausting failure as a single
+     *  `ok: false` event); a `failures: 0` event ends the run. */
+    private onCheckpointState(evt: Extract<Event, { type: 'CHECKPOINT_STATE' }>): void {
+        if (evt.failures > 0) {
             this.checkpointFailureTotal += 1;
-            for (const fn of this.checkpointFailureListeners) fn(failures);
-        } else if (msg.state === 'exhausted') {
-            this.setCheckpoint({ failing: true, failures });
-        } else if (msg.state === 'ok') {
-            this.setCheckpoint({ failing: false, failures: 0 });
+            for (const fn of this.checkpointFailureListeners) fn(evt.failures);
         }
+        const next: CheckpointStatus = {
+            failing: !evt.ok,
+            failures: evt.failures,
+            journalFailing: evt.journal_failing === true,
+        };
+        if (evt.last_error !== undefined) next.lastError = evt.last_error;
+        this.setCheckpoint(next);
     }
 
     /** Worker generations spawned so far (1 = boot; +1 per recovery). */
@@ -936,6 +958,7 @@ export class EngineClient {
                 commands: [],
                 lastSeq: 0,
                 logComplete: false,
+                journalGapSeqs: [],
             };
         });
         /* Issue #99 — N traps in a row on Vello: stop re-probing the GPU
@@ -970,6 +993,7 @@ export class EngineClient {
                 commands: recoveryLog.commands,
                 lastSeq: recoveryLog.lastSeq,
                 logComplete: recoveryLog.logComplete,
+                journalGapSeqs: recoveryLog.journalGapSeqs,
                 ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
                 ...(this.downgrade
                     ? { forceRenderer: 'canvas2d', rendererDowngrade: this.downgrade }
@@ -1013,6 +1037,7 @@ export class EngineClient {
             tailDropped: r.tailDropped === true,
             rendererDowngraded: downgradedNow && recovered?.renderer_downgrade !== undefined,
             baseSnapshotAt: r.restored === true ? r.baseTakenAt : undefined,
+            journalGap: r.journalGap ?? 0,
             cause,
         };
         this.noteGenerationStart();
@@ -1222,10 +1247,11 @@ export class EngineClient {
     }
 
     private handle(msg: any): void {
-        /* Issue #333 — an unsolicited worker notice (no id, no reply). */
-        if (msg.notice === 'CHECKPOINT') {
-            this.onCheckpointNotice(msg);
-            return;
+        /* Issue #390 — the worker's unsolicited `Event::CheckpointState`
+           (id-less, like the a11y delta): fold it into the client's own
+           health view, then fan it out to subscribers like any event. */
+        if (msg.evt?.type === 'CHECKPOINT_STATE' && msg.id === undefined) {
+            this.onCheckpointState(msg.evt);
         }
         /* Issue #260 — the epoch moves before subscribers see the reply. */
         if (this.writeIds.delete(msg.id)) this.writeEpochCounter += 1;

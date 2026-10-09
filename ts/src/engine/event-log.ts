@@ -110,6 +110,12 @@ interface PinnedRow {
     seq: number;
 }
 const PINNED_ID = 'pinned';
+/** Issue #390 - `meta` row: seqs of commands whose row failed to write. */
+interface JournalGapRow {
+    id: 'journal-gap';
+    seqs: number[];
+}
+const JOURNAL_GAP_ID = 'journal-gap';
 /** Issue #268 — options of `persistSnapshot`. */
 export interface PersistSnapshotOptions {
     /** Make this snapshot the document's pinned base (see the header). */
@@ -163,6 +169,10 @@ export interface RecoveryLog {
      *  commands (the boot `RENDER_PAGE` among them): the snapshot-less
      *  candidate can then no longer rebuild the document. */
     logComplete: boolean;
+    /** Issue #390 — seqs of commands whose row could not be written (the
+     *  worker's best-effort `journal-gap` record); the worker counts the
+     *  ones that are still missing after the base it restores. */
+    journalGapSeqs: number[];
 }
 
 /** Resolve when an `IDBRequest` succeeds; reject on error. */
@@ -248,6 +258,7 @@ export async function openEventLog(documentId: string): Promise<void> {
     tx.objectStore('meta').put({ id: 'document', documentId, openedAt: Date.now() });
     tx.objectStore('meta').put({ id: PRUNED_ID, through: 0 } satisfies PrunedRow);
     tx.objectStore('meta').delete(PINNED_ID);
+    tx.objectStore('meta').delete(JOURNAL_GAP_ID);
     /* Issue #388 - a freshly opened log describes a document that equals
        what is on screen (nothing to lose yet). */
     tx.objectStore('meta').put({ id: CLEAN_ID, clean: true, at: Date.now() } satisfies CleanRow);
@@ -280,7 +291,7 @@ const ARCHIVE_STORE = 'archive';
 const ARCHIVE_ID = 'previous';
 
 /** The `meta` rows an archived session carries back with it. */
-const ARCHIVED_META_IDS = ['document', PRUNED_ID, PINNED_ID, CLEAN_ID];
+const ARCHIVED_META_IDS = ['document', PRUNED_ID, PINNED_ID, CLEAN_ID, 'journal-gap'];
 
 interface ArchiveRow {
     id: typeof ARCHIVE_ID;
@@ -441,6 +452,24 @@ export async function appendCommand(seq: number, cmd: Command): Promise<void> {
     await txDone(tx);
 }
 
+/** Issue #390 - best-effort record of the command seqs whose row could not
+ *  be written, so a later recovery can report the gap. Lives in `meta`,
+ *  which may keep working when the `commands` store does not. */
+export async function writeJournalGap(seqs: number[]): Promise<void> {
+    const db = await getDb();
+    const tx = db.transaction('meta', 'readwrite');
+    tx.objectStore('meta').put({ id: JOURNAL_GAP_ID, seqs } satisfies JournalGapRow);
+    await txDone(tx);
+}
+
+/** Issue #390 - every missing row landed after all: forget the gap. */
+export async function clearJournalGap(): Promise<void> {
+    const db = await getDb();
+    const tx = db.transaction('meta', 'readwrite');
+    tx.objectStore('meta').delete(JOURNAL_GAP_ID);
+    await txDone(tx);
+}
+
 /** Persist an engine snapshot, pruning all but the newest `SNAPSHOTS_KEPT`.
  *  Issue #212 — `pkg` names the detached source package the snapshot was
  *  taken without; its bytes (first snapshot of a document) go to the
@@ -563,6 +592,7 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
     const cmdReq = tx.objectStore('commands').getAll();
     const prunedReq = tx.objectStore('meta').get(PRUNED_ID);
     const pinnedReq = tx.objectStore('meta').get(PINNED_ID);
+    const gapReq = tx.objectStore('meta').get(JOURNAL_GAP_ID);
     const pkgReq = tx.objectStore('packages').getAll();
     await txDone(tx);
     const packages = new Map(
@@ -598,6 +628,7 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
         /* getAll() yields rows in ascending seq order. */
         lastSeq: Math.max(commands.at(-1)?.seq ?? 0, newestSnapshotSeq),
         logComplete: prunedThrough === 0,
+        journalGapSeqs: (gapReq.result as JournalGapRow | undefined)?.seqs ?? [],
     };
 }
 

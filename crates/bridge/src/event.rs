@@ -504,6 +504,33 @@ pub enum Event {
         priority: AnnouncementPriority,
         message: String,
     },
+
+    /// Issue #390 - health of the worker's durable event log, broadcast
+    /// unsolicited on `subscribe()` (like the accessibility deltas; never
+    /// a reply, never produced by `Engine::apply`) whenever it changes.
+    /// It replaces the ad-hoc untyped `CHECKPOINT` worker message: a
+    /// failed engine-side `SNAPSHOT`, a failed snapshot write and a
+    /// failed command-row append each count, are retried on a bounded
+    /// 2/4/8 s clock, and flip `ok` to `false` once the retries are
+    /// exhausted (the shell then tells the user their changes are not
+    /// being protected). Additive: no `Command` carries it.
+    CheckpointState {
+        /// `true` while checkpoints (snapshots) and the command journal
+        /// are landing; `false` once a failure's bounded retries ran out.
+        ok: bool,
+        /// Consecutive failed attempts in the current failure run
+        /// (snapshot dispatch + snapshot write + journal append);
+        /// `0` when healthy.
+        failures: u32,
+        /// The most recent failure's message, when one occurred.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        last_error: Option<String>,
+        /// The command journal specifically is not being written: a
+        /// recovery now would silently miss the commands in the gap.
+        #[serde(default)]
+        journal_failing: bool,
+    },
 }
 
 /// Issue #348 — the class of an [`Event::Error`] the shell can present
@@ -516,6 +543,11 @@ pub enum ErrorKind {
     /// open was refused before anything was allocated from the package's
     /// own size claims. The previous document stays open.
     PackageTooLarge,
+    /// Issue #364 - a tracked (review-mode) deletion the engine refuses
+    /// because it would cross a table-cell boundary or run over a table:
+    /// nothing changed. The shell shows a visible, non-modal refusal
+    /// instead of letting the key press appear to do nothing.
+    TrackedDeletionRefused,
 }
 
 impl Event {
@@ -1064,6 +1096,76 @@ mod a11y_note_wire_tests {
             typed,
             serde_json::json!({ "type": "ERROR", "message": "too big", "kind": "PackageTooLarge" })
         );
+    }
+
+    /// Issue #364 - the tracked-deletion refusal is a typed error kind.
+    #[test]
+    fn tracked_deletion_refused_kind_is_on_the_wire() {
+        let typed = serde_json::to_value(Event::Error {
+            message: "DeleteRange: table".into(),
+            kind: Some(ErrorKind::TrackedDeletionRefused),
+        })
+        .unwrap();
+        assert_eq!(
+            typed,
+            serde_json::json!({
+                "type": "ERROR",
+                "message": "DeleteRange: table",
+                "kind": "TrackedDeletionRefused"
+            })
+        );
+    }
+
+    /// Issue #390 - `CheckpointState` is an unsolicited, additive event:
+    /// a healthy state carries no `last_error` key, a failing one does.
+    #[test]
+    fn checkpoint_state_wire_shape() {
+        let ok = serde_json::to_value(Event::CheckpointState {
+            ok: true,
+            failures: 0,
+            last_error: None,
+            journal_failing: false,
+        })
+        .unwrap();
+        assert_eq!(
+            ok,
+            serde_json::json!({
+                "type": "CHECKPOINT_STATE",
+                "ok": true,
+                "failures": 0,
+                "journal_failing": false
+            })
+        );
+        let failing = serde_json::to_value(Event::CheckpointState {
+            ok: false,
+            failures: 4,
+            last_error: Some("QuotaExceededError".into()),
+            journal_failing: true,
+        })
+        .unwrap();
+        assert_eq!(
+            failing,
+            serde_json::json!({
+                "type": "CHECKPOINT_STATE",
+                "ok": false,
+                "failures": 4,
+                "last_error": "QuotaExceededError",
+                "journal_failing": true
+            })
+        );
+        // An older payload without `journal_failing` still decodes.
+        let back: Event = serde_json::from_value(
+            serde_json::json!({ "type": "CHECKPOINT_STATE", "ok": true, "failures": 0 }),
+        )
+        .unwrap();
+        assert!(matches!(
+            back,
+            Event::CheckpointState {
+                ok: true,
+                journal_failing: false,
+                ..
+            }
+        ));
     }
 
     fn run(text: &str, note_ref: Option<A11yNoteRef>) -> A11yRun {

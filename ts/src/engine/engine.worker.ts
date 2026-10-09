@@ -13,6 +13,8 @@ import {
     persistSnapshot,
     writeCleanMarker,
     loadCleanMarker,
+    writeJournalGap,
+    clearJournalGap,
 } from './event-log';
 import { nextCleanState } from './clean-state';
 import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
@@ -71,6 +73,9 @@ type ClientRecoverMsg = {
     lastSeq: number;
     /** Issue #241 — the log still reaches back to the first command. */
     logComplete: boolean;
+    /** Issue #390 — seqs whose command row failed to write (see
+     *  `RecoveryLog.journalGapSeqs`). */
+    journalGapSeqs?: number[];
     /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
     mockBackend?: 'vello';
     /** Issue #99 — crash-loop fallback: boot this generation on Canvas2D
@@ -162,6 +167,21 @@ const SNAPSHOT_RETRY_DELAYS_MS = [2000, 4000, 8000];
 let snapshotWriteFailures = 0;
 let snapshotRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let checkpointWarned = false;
+/* Issue #390 - the command journal (`appendCommand`) gets the same
+   bounded 2/4/8 s retry clock as the snapshot writes. A failed row waits
+   in `journalBacklog` (seq -> command) and is re-written by `drainJournal`;
+   a run of failures is counted in ROUNDS (a burst of keystrokes failing
+   together is one round, not one per key). After the last delay fails the
+   journal is `journalExhausted`: the shell is told commands are not being
+   journaled and a recovery would miss them (`Event::CheckpointState`). */
+const JOURNAL_BACKLOG_MAX = 5000;
+const journalBacklog = new Map<number, Command>();
+let journalFailures = 0;
+let journalRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let journalExhausted = false;
+let journalDraining = false;
+/* Issue #390 - the latest failure's message, carried on the event. */
+let lastCheckpointError: string | undefined;
 let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
 /* Issue #85 — every in-flight event-log write, chained so the fault-
    injection hook can flush before trapping. A REAL trap loses whatever
@@ -1184,6 +1204,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                 ? packageLostAttempts.filter((c) => c !== chosen).length
                 : 0;
         const tailDropped = base.tailComplete === false && base.snapshot.length > 0;
+        const journalGap = countJournalGap(base, msg);
         const packageLost = evt.type === 'RECOVERED' && evt.package_lost;
         if (packageLost) {
             console.warn(
@@ -1256,6 +1277,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             packageLost,
             pinnedBase: restored && base.pinned === true,
             tailDropped,
+            /* Issue #390 - replay-tail commands whose row was never written. */
+            journalGap,
             /* Issue #315 — when the restored snapshot was persisted, so
                the shell can say since when edits were lost. */
             ...(restored && base.takenAt !== undefined ? { baseTakenAt: base.takenAt } : {}),
@@ -1551,8 +1574,9 @@ function noteCleanState(cmd: Command, evt: Event): void {
  */
 function logCommand(cmd: Command): number {
     const seq = ++logSequence;
-    const write = appendCommand(seq, cmd).catch((e: unknown) =>
-        console.warn('[worker] event-log append failed', e),
+    const write = appendCommand(seq, cmd).then(
+        () => noteJournalWriteOk(),
+        (e: unknown) => noteJournalWriteFailed(seq, cmd, e),
     );
     pendingLogWrites = pendingLogWrites.then(() => write);
     return seq;
@@ -1587,6 +1611,9 @@ async function takeSnapshot(seq: number): Promise<void> {
         });
         if (evt.type !== 'SNAPSHOT') {
             console.warn('[worker] engine snapshot failed', evt);
+            /* Issue #390 - retried on the same clock as a failed write
+               (the replay tail keeps growing until a snapshot lands). */
+            noteSnapshotFailed(evt.type === 'ERROR' ? evt.message : `unexpected ${evt.type}`);
             return;
         }
         const previousSnapshotAt = lastSnapshotAt;
@@ -1626,7 +1653,7 @@ async function takeSnapshot(seq: number): Promise<void> {
                    retry (or the next command) snapshot this position
                    again instead of skipping it as "already taken". */
                 if (lastSnapshotAt === seq) lastSnapshotAt = previousSnapshotAt;
-                noteSnapshotWriteFailed();
+                noteSnapshotFailed(e);
                 /* Issue #314 — the package may not be stored (this write
                    carried it, or the store lost it: `PackageMissingError`):
                    forget it, so the next snapshot re-ships the bytes. */
@@ -1641,30 +1668,81 @@ async function takeSnapshot(seq: number): Promise<void> {
         pendingLogWrites = pendingLogWrites.then(() => write);
     } catch (e: unknown) {
         console.warn('[worker] snapshot dispatch failed', e);
+        noteSnapshotFailed(e);
     }
+}
+
+/** Issue #390 - how many logged commands after `base` could not be
+ *  replayed because their row was never written: seqs the best-effort
+ *  `journal-gap` record names that are still absent, plus holes inside the
+ *  retained tail. A base restored WITHOUT its pruned tail replays nothing,
+ *  so it has no journal gap to report (its loss is `tailDropped`). */
+function countJournalGap(base: RecoveryCandidate, msg: ClientRecoverMsg): number {
+    if (base.tailComplete === false) return 0;
+    const present = new Set(msg.commands.map((c) => c.seq));
+    const missing = new Set<number>();
+    for (const seq of msg.journalGapSeqs ?? []) {
+        if (seq > base.seq && !present.has(seq)) missing.add(seq);
+    }
+    let prev = base.seq;
+    for (const c of msg.commands) {
+        if (c.seq <= base.seq) continue;
+        /* Bounded: a hole this wide is a different failure (pruning). */
+        for (let s = prev + 1; s < c.seq && s - prev <= 10_000; s++) missing.add(s);
+        prev = c.seq;
+    }
+    return missing.size;
+}
+
+/** Issue #390 - a human-readable failure message (no document content:
+ *  IndexedDB / engine error text only). */
+function failureText(e: unknown): string {
+    if (e instanceof Error) return e.message || e.name;
+    return typeof e === 'string' ? e : 'unknown error';
+}
+
+/** Issue #390 - broadcast the event log's health as a typed
+ *  `Event::CheckpointState` (id-less, unsolicited, like the a11y delta).
+ *  Every event with `failures > 0` reports exactly one failed attempt. */
+function postCheckpointState(failures: number): void {
+    const ok = !checkpointWarned && !journalExhausted;
+    self.postMessage({
+        evt: {
+            type: 'CHECKPOINT_STATE',
+            ok,
+            failures,
+            journal_failing: journalExhausted,
+            ...(lastCheckpointError !== undefined && failures > 0
+                ? { last_error: lastCheckpointError }
+                : {}),
+        } satisfies Event,
+    });
 }
 
 /** Issue #333 — a snapshot write landed: the failure run is over. */
 function noteSnapshotWriteOk(): void {
+    const hadFailures = snapshotWriteFailures > 0;
     snapshotWriteFailures = 0;
     if (snapshotRetryTimer !== undefined) {
         clearTimeout(snapshotRetryTimer);
         snapshotRetryTimer = undefined;
     }
-    if (checkpointWarned) {
+    if (hadFailures || checkpointWarned) {
         checkpointWarned = false;
-        self.postMessage({ notice: 'CHECKPOINT', state: 'ok', failures: 0 });
+        postCheckpointState(0);
     }
 }
 
-/** Issue #333 — a snapshot write failed: schedule the next bounded retry,
+/** Issue #333 — a snapshot (the engine-side `SNAPSHOT` dispatch, issue
+ *  #390, or its IndexedDB write) failed: schedule the next bounded retry,
  *  or, once the last one failed too, tell the shell. Every failure is
- *  reported (`state: 'failed'`) so the shell can count it. */
-function noteSnapshotWriteFailed(): void {
+ *  reported so the shell can count it. */
+function noteSnapshotFailed(reason: unknown): void {
     snapshotWriteFailures += 1;
+    lastCheckpointError = failureText(reason);
     const delay = SNAPSHOT_RETRY_DELAYS_MS[snapshotWriteFailures - 1];
     if (delay !== undefined) {
-        self.postMessage({ notice: 'CHECKPOINT', state: 'failed', failures: snapshotWriteFailures });
+        postCheckpointState(snapshotWriteFailures);
         if (snapshotRetryTimer !== undefined) clearTimeout(snapshotRetryTimer);
         snapshotRetryTimer = setTimeout(() => {
             snapshotRetryTimer = undefined;
@@ -1675,11 +1753,81 @@ function noteSnapshotWriteFailed(): void {
     }
     /* Retries exhausted. A later command-driven snapshot may still land
        (and reset); until then the user must know the log is not
-       checkpointing. Warn once per failure run. */
-    self.postMessage({ notice: 'CHECKPOINT', state: 'failed', failures: snapshotWriteFailures });
-    if (!checkpointWarned) {
-        checkpointWarned = true;
-        self.postMessage({ notice: 'CHECKPOINT', state: 'exhausted', failures: snapshotWriteFailures });
+       checkpointing. The exhausting failure is ONE event (`ok: false`). */
+    checkpointWarned = true;
+    postCheckpointState(snapshotWriteFailures);
+}
+
+/** Issue #390 - a command row was written: if the journal had fallen
+ *  behind (exhausted), the store works again - drain what is missing. */
+function noteJournalWriteOk(): void {
+    if (journalExhausted && journalBacklog.size > 0 && !journalDraining) {
+        void drainJournal();
+    }
+}
+
+/** Issue #390 - a command row could not be written. The row waits in the
+ *  backlog; the first failure of a run starts the retry clock, later ones
+ *  (a burst) just join the backlog. */
+function noteJournalWriteFailed(seq: number, cmd: Command, e: unknown): void {
+    console.warn('[worker] event-log append failed', e);
+    journalBacklog.set(seq, cmd);
+    if (journalBacklog.size > JOURNAL_BACKLOG_MAX) {
+        const oldest = journalBacklog.keys().next();
+        if (!oldest.done) journalBacklog.delete(oldest.value);
+    }
+    lastCheckpointError = failureText(e);
+    /* Best effort, on the `meta` store (the `commands` store may be the
+       broken one): lets a later recovery report the gap. */
+    void writeJournalGap([...journalBacklog.keys()]).catch(() => undefined);
+    if (journalExhausted || journalRetryTimer !== undefined || journalDraining) return;
+    failJournalRound();
+}
+
+/** One round of journal attempts failed: retry later, or give up loudly. */
+function failJournalRound(): void {
+    if (journalExhausted) return;
+    journalFailures += 1;
+    const delay = SNAPSHOT_RETRY_DELAYS_MS[journalFailures - 1];
+    if (delay !== undefined) {
+        postCheckpointState(journalFailures);
+        journalRetryTimer = setTimeout(() => {
+            journalRetryTimer = undefined;
+            void drainJournal();
+        }, delay);
+        return;
+    }
+    journalExhausted = true;
+    postCheckpointState(journalFailures);
+}
+
+/** Issue #390 - re-write every backlogged command row; all landed =
+ *  healthy again, any failure = the next round. */
+async function drainJournal(): Promise<void> {
+    if (journalDraining) return;
+    journalDraining = true;
+    try {
+        if (journalRetryTimer !== undefined) {
+            clearTimeout(journalRetryTimer);
+            journalRetryTimer = undefined;
+        }
+        for (const [seq, cmd] of [...journalBacklog]) {
+            try {
+                await appendCommand(seq, cmd);
+                journalBacklog.delete(seq);
+            } catch (e: unknown) {
+                lastCheckpointError = failureText(e);
+                failJournalRound();
+                return;
+            }
+        }
+        const wasFailing = journalFailures > 0 || journalExhausted;
+        journalFailures = 0;
+        journalExhausted = false;
+        void clearJournalGap().catch(() => undefined);
+        if (wasFailing) postCheckpointState(0);
+    } finally {
+        journalDraining = false;
     }
 }
 
@@ -1848,6 +1996,10 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
             /* Every event-log write issued so far has landed (or failed
                and been accounted for) before the worker goes away. */
             await pendingLogWrites;
+            /* Issue #390 - one last attempt at rows still waiting for a
+               retry, so a planned restart does not leave a gap the store
+               would have accepted by now. */
+            if (journalBacklog.size > 0) await drainJournal();
             self.postMessage({ id: msg.id, ok: true });
             self.close();
         });

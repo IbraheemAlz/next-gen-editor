@@ -62,7 +62,7 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
        a recovery to "ok" and a later failure shows it again. */
     const [checkpointDismissed, setCheckpointDismissed] = createSignal(false);
     createEffect(() => {
-        if (!state.checkpointFailing()) setCheckpointDismissed(false);
+        if (state.checkpointState().ok) setCheckpointDismissed(false);
     });
     const notices = createMemo(() => {
         const options: RecoveryNoticeOptions = {};
@@ -71,7 +71,12 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
             dismissed() === state.lastRecovery() && state.lastRecovery() !== undefined
                 ? []
                 : recoveryNotices(state.lastRecovery(), options);
-        const checkpoint = checkpointDismissed() ? [] : checkpointNotices(state.checkpointFailing());
+        /* Issue #390 - the typed `CheckpointState`: a failed checkpoint, or
+           (worse) a failed command journal. */
+        const health = state.checkpointState();
+        const checkpoint = checkpointDismissed()
+            ? []
+            : checkpointNotices(!health.ok, health.journalFailing);
         const previous = previousDismissed()
             ? []
             : previousSessionNotice(state.previousSession(), options);

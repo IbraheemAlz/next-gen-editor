@@ -41,7 +41,7 @@ export {
 export type { EditorCommands, ParagraphStyleId } from './createEditorCommands';
 
 export { createEditorState } from './createEditorState';
-export type { EditorState } from './createEditorState';
+export type { EditorState, CheckpointHealth } from './createEditorState';
 
 export { createFontRegistry } from './createFontRegistry';
 export type {
