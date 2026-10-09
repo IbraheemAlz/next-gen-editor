@@ -732,3 +732,190 @@ fn without_core_properties_nothing_changes() {
         assert!(base == got, "{profile:?}: byte-identical");
     }
 }
+
+/* ================================================================
+Task 4 — tagging (PDF/UA-1).
+================================================================ */
+
+/// A heading, a list item ("1.") with an external link, an Arabic
+/// paragraph — and the side table describing them.
+fn tagged_doc(stack: &FontStack) -> (Vec<PageBox>, Vec<&'static str>, PdfSemantics) {
+    let texts = vec!["Title", "See the site now.", "مرحبا بالعالم"];
+    let pages = vec![page(vec![
+        LayoutBlock::Paragraph(para(stack, texts[0], 0, None, false)),
+        LayoutBlock::Paragraph(para(stack, texts[1], 1, Some("1."), false)),
+        LayoutBlock::Paragraph(para(stack, texts[2], 2, None, true)),
+    ])];
+    let sem = PdfSemantics {
+        paragraphs: vec![
+            heading(1, "Title"),
+            ParagraphSemantics {
+                links: vec![uri(8, 12, "https://example.com/")],
+                list: Some(ListSemantics {
+                    level: 0,
+                    marker: "1.".into(),
+                }),
+                ..Default::default()
+            },
+            ParagraphSemantics {
+                lang: Some("ar".into()),
+                ..Default::default()
+            },
+        ],
+        metadata: DocumentMetadata {
+            lang: Some("en-GB".into()),
+            ..Default::default()
+        },
+    };
+    (pages, texts, sem)
+}
+
+/// The page content streams, inflated and concatenated.
+fn contents(pdf: &[u8]) -> String {
+    test_support::content_streams(pdf)
+        .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+#[test]
+fn tagging_semantics_never_change_an_untagged_export() {
+    let stack = stack();
+    let (pages, texts, sem) = tagged_doc(&stack);
+    let mut bare = sem.clone();
+    for p in &mut bare.paragraphs {
+        p.list = None;
+        p.lang = None;
+    }
+    for profile in [
+        PdfProfile::Plain,
+        PdfProfile::A1b,
+        PdfProfile::A2u,
+        PdfProfile::X3,
+    ] {
+        let opts = PdfExportOptions::new(profile);
+        assert!(!opts.tagged, "{profile:?} is untagged by default");
+        let got = export_with(&pages, &stack, &texts, &sem, opts);
+        let base = export_with(&pages, &stack, &texts, &bare, opts);
+        assert!(got == base, "{profile:?}: byte-identical");
+        assert!(!contains(&got, b"/StructTreeRoot"), "{profile:?}");
+        assert!(!contents(&got).contains("BDC"), "{profile:?}");
+    }
+}
+
+#[test]
+fn ua1_tags_headings_lists_links_and_languages() {
+    let stack = stack();
+    let (pages, texts, sem) = tagged_doc(&stack);
+    let pdf = export_with(
+        &pages,
+        &stack,
+        &texts,
+        &sem,
+        PdfExportOptions::new(PdfProfile::Ua1),
+    );
+    let text = test_support::searchable_text(&pdf);
+    for marker in [
+        "/S /Document",
+        "/S /H1",
+        "/S /L\n",
+        "/S /LI",
+        "/S /Lbl",
+        "/S /LBody",
+        "/S /Link",
+        "/Type /OBJR",
+        "/S /P",
+        "/Lang (en-GB)",
+        "/Lang (ar)",
+        "/ListNumbering /Decimal",
+        "/Tabs /S",
+        "/DisplayDocTitle true",
+        "<pdfuaid:part>1</pdfuaid:part>",
+    ] {
+        assert!(text.contains(marker), "missing {marker}");
+    }
+    /* No core-properties title: the first heading's text. */
+    assert!(text.contains("/Title (Title)"));
+    assert!(text.contains("<rdf:li xml:lang=\"x-default\">Title</rdf:li>"));
+    /* The list item: label, body text before / inside / after the link —
+    four sequences, the link's its own. */
+    let c = contents(&pdf);
+    assert!(c.contains("/Lbl <<"), "{c}");
+    assert_eq!(c.matches("/LBody <<").count(), 2, "{c}");
+    assert_eq!(c.matches("/Link <<").count(), 1, "{c}");
+    assert_eq!(
+        c.matches(" BDC").count() + c.matches(" BMC").count(),
+        c.matches("EMC").count()
+    );
+    assert!(contains(&pdf, b"/Type /ObjStm"), "PDF 1.7: packed");
+}
+
+#[test]
+fn a_tagged_pdf_1_4_keeps_plain_objects() {
+    let stack = stack();
+    let (pages, texts, sem) = tagged_doc(&stack);
+    let pdf = export_with(
+        &pages,
+        &stack,
+        &texts,
+        &sem,
+        PdfExportOptions::new(PdfProfile::A1b).with_tagging(true),
+    );
+    assert!(pdf.starts_with(b"%PDF-1.4"));
+    assert!(contains(&pdf, b"/StructTreeRoot"));
+    assert!(contains(&pdf, b"/S /LBody"));
+    assert!(!contains(&pdf, b"/ObjStm"), "PDF 1.4 has no object streams");
+    assert!(!contains(&pdf, b"pdfuaid"), "only Ua1 claims PDF/UA");
+    /* `with_tagging(false)` cannot untag Ua1. */
+    assert!(
+        PdfExportOptions::new(PdfProfile::Ua1)
+            .with_tagging(false)
+            .tagged
+    );
+}
+
+#[test]
+fn highlights_and_decorations_are_artifacts() {
+    let stack = stack();
+    let text = "Marked words";
+    let spans = [StyleSpan {
+        bg_color: Some([255, 255, 0, 255]),
+        underline: engine::UnderlineStyle::Single,
+        ..span(text.len() as u32)
+    }];
+    let mut p = layout_paragraph(ParagraphConfig {
+        text,
+        fonts: &stack,
+        spans: &spans,
+        base_direction: ShapingDirection::Ltr,
+        max_width: 451.0,
+        line_height: 20.0,
+        line_height_exact: false,
+        alignment: Alignment::Start,
+        indent_start_px: 0.0,
+        indent_end_px: 0.0,
+        first_line_indent_px: 0.0,
+        hanging_indent_px: 0.0,
+        marker_text: None,
+        px_size_for_marker: 14.0,
+        inline_objects: &[],
+        tab_stops_px: &[],
+    });
+    p.source_paragraph_id = 0;
+    let pages = vec![page(vec![LayoutBlock::Paragraph(p)])];
+    let pdf = export_with(
+        &pages,
+        &stack,
+        &[text],
+        &PdfSemantics::default(),
+        PdfExportOptions::new(PdfProfile::Ua1),
+    );
+    let c = contents(&pdf);
+    /* Highlight before the text, underline after: two artifacts around
+    the paragraph's one sequence. */
+    assert_eq!(c.matches("/Artifact BMC").count(), 2, "{c}");
+    assert_eq!(c.matches("/P <<").count(), 1, "{c}");
+    let first_artifact = c.find("/Artifact BMC").unwrap();
+    let text_seq = c.find("/P <<").unwrap();
+    assert!(first_artifact < text_seq);
+}

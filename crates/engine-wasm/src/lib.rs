@@ -7680,6 +7680,7 @@ impl Engine {
                 PdfConformance::A1b => format_pdf::PdfProfile::A1b,
                 PdfConformance::A2u => format_pdf::PdfProfile::A2u,
                 PdfConformance::X3 => format_pdf::PdfProfile::X3,
+                PdfConformance::Ua1 => format_pdf::PdfProfile::Ua1,
             }),
             Command::CloseDocument => phase3_stub("CloseDocument"),
             Command::DeleteRange { range } => self.do_delete_range(range),

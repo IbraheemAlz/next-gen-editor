@@ -42,6 +42,62 @@ pub struct ParagraphSemantics {
     /// w:name>`) — the destinations of internal links. A bookmark resolves
     /// to the top-left of the paragraph's first laid-out fragment.
     pub bookmarks: Vec<String>,
+    /// Tagging — list membership (`L > LI > Lbl + LBody`). A heading
+    /// that is also numbered stays a heading (its label joins the `Hn`).
+    pub list: Option<ListSemantics>,
+    /// Tagging — the enclosing table cells, outermost first (`Table > TR
+    /// > TH/TD`); empty outside tables.
+    pub cells: Vec<CellSemantics>,
+    /// Tagging — the paragraph's natural language (BCP 47) when it
+    /// differs from the document's (e.g. an Arabic paragraph in an
+    /// English document) — the structure element's `/Lang`.
+    pub lang: Option<String>,
+    /// Tagging — the pictures anchored in this paragraph (inline and
+    /// floating), by sentinel offset — each one's `Figure /Alt`.
+    pub objects: Vec<ObjectSemantics>,
+}
+
+/// Issue #360 — a list paragraph (tagging).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListSemantics {
+    /// `w:ilvl` — nesting depth, 0 outermost.
+    pub level: u8,
+    /// The resolved marker text (`"1."`, `"•"`, `"iv)"`) — classifies the
+    /// list's `/ListNumbering` attribute.
+    pub marker: String,
+}
+
+/// Issue #360 — one table cell enclosing a paragraph (tagging).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CellSemantics {
+    /// Distinguishes this table from its siblings at the same nesting
+    /// depth (any value unique among them — the caller uses the side-table
+    /// index of the table's first paragraph).
+    pub table: u32,
+    /// Model row index.
+    pub row: u32,
+    /// Model cell index within the row (`VMergeRole::Continue` cells are
+    /// never anyone's enclosing cell).
+    pub cell: u32,
+    /// `<w:tblHeader/>` row: a `TH` with `/Scope /Column`, else `TD`.
+    pub header: bool,
+    /// Grid columns spanned (`w:gridSpan`, ≥ 1).
+    pub col_span: u32,
+    /// Rows spanned (`w:vMerge` restart + its continuations, ≥ 1).
+    pub row_span: u32,
+}
+
+/// Issue #360 — one picture anchored in a paragraph (tagging).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectSemantics {
+    /// Byte offset of the object's U+FFFC sentinel in the paragraph text
+    /// (an inline image glyph's cluster, a float's `FloatBox::at`).
+    pub at: u32,
+    /// The alternate description (`<wp:docPr descr>`, else its `name`).
+    pub alt: Option<String>,
+    /// Marked decorative (`<adec:decorative val="1"/>`): an artifact,
+    /// not a `Figure`.
+    pub decorative: bool,
 }
 
 /// Issue #360 — one hyperlink range: `[start, end)` byte offsets into the
@@ -159,35 +215,49 @@ pub(crate) struct LinkHit {
 }
 
 #[derive(Default)]
-struct State {
-    page: usize,
+pub(crate) struct State {
+    pub(crate) page: usize,
     page_h: f32,
     /// First placement of every heading / bookmarked paragraph, by
     /// source id.
     placements: HashMap<u32, Placement>,
     /// Every line × link rectangle, in paint order.
     links: Vec<LinkHit>,
+    /// Tagging — marked-content record (only written when tagged).
+    pub(crate) tag: crate::tagging::TagState,
 }
 
 /// Issue #360 — the collector the content emitters report into. One per
 /// content-building round (the issue #327 subset loop may rebuild the
 /// contents; a fresh context per round keeps the record exact).
 pub(crate) struct SemCtx<'s> {
-    sem: &'s PdfSemantics,
+    pub(crate) sem: &'s PdfSemantics,
     texts: &'s [&'s str],
     /// `false` for PDF/X-3 (no link annotations — see [`plan_links`]).
     ///
     /// [`plan_links`]: Collected::plan_links
     links: bool,
-    st: RefCell<State>,
+    /// Tagged export: the content emitters write marked content and the
+    /// structure tree is planned from what they recorded.
+    pub(crate) tagged: bool,
+    /// Tagging — each heading paragraph's structure level (`H1`–`H6`),
+    /// normalized so the first is `H1` and none skips a level.
+    pub(crate) heading_roles: HashMap<u32, u8>,
+    pub(crate) st: RefCell<State>,
 }
 
 impl<'s> SemCtx<'s> {
-    pub fn new(sem: &'s PdfSemantics, texts: &'s [&'s str], links: bool) -> Self {
+    pub fn new(sem: &'s PdfSemantics, texts: &'s [&'s str], links: bool, tagged: bool) -> Self {
         Self {
             sem,
             texts,
             links,
+            tagged,
+            heading_roles: if tagged {
+                crate::tagging::heading_roles(sem)
+            } else {
+                HashMap::new()
+            },
             st: RefCell::new(State::default()),
         }
     }
@@ -264,22 +334,30 @@ impl<'s> SemCtx<'s> {
             texts: self.texts,
             placements: st.placements,
             links: st.links,
+            heading_roles: self.heading_roles,
+            tag: st.tag,
         }
     }
 }
 
 /// What one content-building round collected, for the object writers.
 pub(crate) struct Collected<'s> {
-    sem: &'s PdfSemantics,
-    texts: &'s [&'s str],
+    pub(crate) sem: &'s PdfSemantics,
+    pub(crate) texts: &'s [&'s str],
     placements: HashMap<u32, Placement>,
     links: Vec<LinkHit>,
+    pub(crate) heading_roles: HashMap<u32, u8>,
+    pub(crate) tag: crate::tagging::TagState,
 }
 
 /// One planned `/Link` annotation.
 pub(crate) struct AnnotPlan {
     pub id: Ref,
     pub page: usize,
+    /// The source paragraph and link index it belongs to (tagging: the
+    /// annotation's `Link` structure element).
+    pub para: u32,
+    pub link: u32,
     pub rect: [f32; 4],
     /// `/Contents` — the link's visible text (the target when it has none).
     pub contents: String,
@@ -423,6 +501,8 @@ impl Collected<'_> {
             out.push(AnnotPlan {
                 id: alloc(),
                 page: hit.page,
+                para: hit.para,
+                link: hit.link as u32,
                 rect: hit.rect,
                 contents,
                 action,

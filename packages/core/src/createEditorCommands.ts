@@ -490,6 +490,9 @@ export interface EditorCommands {
     ): Promise<Event>;
     saveDocument(format: DocFormat): Promise<Event>;
     saveDocx(): Promise<Event>;
+    /** `A1b` / `A2u` / `X3`, or `Ua1` — issue #360: the tagged,
+     *  accessible PDF/UA-1 export (on a PDF/A-2u base; `A2u` itself stays
+     *  untagged). */
     exportPdf(conformance: PdfConformance): Promise<Event>;
     /** Engine-pending — dispatches but engine returns
      *  `Event::Error` until a Core Engine HTML serializer ships. */

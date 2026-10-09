@@ -7,10 +7,13 @@
  *   - **Open** → hidden file input → `Command::OpenDocument { format: Docx }`.
  *   - **Save** → `Command::SaveDocument { format: Docx }`. Bound to
  *     `Ctrl/Cmd+S` globally.
- *   - **Export PDF** → `Command::ExportPdf { conformance }`. All three
+ *   - **Export PDF** → `Command::ExportPdf { conformance }`. All four
  *     conformance targets are engine-real: `A1b` → PDF/A-1b, `A2u` →
  *     PDF/A-2u, `X3` → PDF/X-3:2003 (issue #28 closed the former
- *     `PdfProfile::Plain` fallback that kept A2u / X3 gated).
+ *     `PdfProfile::Plain` fallback that kept A2u / X3 gated), `Ua1` →
+ *     PDF/UA-1 (issue #360): the tagged, accessible export — structure
+ *     tree, reading order, `/Lang`, figure alt text — on a PDF/A-2u base.
+ *     `A2u` itself stays untagged.
  *   - **Export HTML / Plain Text** → `Command::SaveDocument { format }`
  *     with `html` / `plain_text`. Sprint 9 wired the engine
  *     serializers (`crates/format-html` + `DocumentTree::to_plain_text`);
@@ -44,6 +47,7 @@ const PDF_CONFORMANCES: {
     { value: 'A1b', label: 'PDF/A-1b', hint: 'Archival (default)' },
     { value: 'A2u', label: 'PDF/A-2u', hint: 'Archival, Unicode' },
     { value: 'X3', label: 'PDF/X-3', hint: 'Print-ready' },
+    { value: 'Ua1', label: 'PDF/UA-1', hint: 'Accessible (tagged), archival' },
 ];
 
 export interface FileMenuProps {

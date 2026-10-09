@@ -1224,13 +1224,18 @@ pub struct ClientCapabilities {
     pub device_pixel_ratio: f32,
 }
 
-/// Target PDF/A (or PDF/X) conformance level for `ExportPdf`.
+/// Target PDF/A (or PDF/X, PDF/UA) conformance level for `ExportPdf`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum PdfConformance {
     A1b,
     A2u,
     X3,
+    /// Issue #360 — PDF/UA-1 (ISO 14289-1) on a PDF/A-2u base: the
+    /// tagged (accessible) export — structure tree, marked content,
+    /// artifacts, `/Lang`, figure `/Alt`. Validates as both PDF/A-2u and
+    /// PDF/UA-1. The plain `A2u` export stays untagged (and smaller).
+    Ua1,
 }
 
 /// Issue #221 — the host-facing mirror of `engine::DefaultPageSize`
