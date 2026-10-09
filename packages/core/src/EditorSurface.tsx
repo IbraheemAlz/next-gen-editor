@@ -24,6 +24,9 @@ import {
     type JSX,
 } from 'solid-js';
 import { useEngine } from './EngineProvider';
+import { createCaretReveal } from './createCaretReveal';
+import { createEditorState } from './createEditorState';
+import { deviceRatioFor, offsetInViewport } from './caretReveal';
 
 export interface EditorSurfaceProps {
     /** Logical canvas size in CSS pixels. Backing store sizes itself
@@ -48,13 +51,47 @@ export interface EditorSurfaceProps {
      * default (100 %).
      */
     initialZoom?: number;
+    /**
+     * Issue #387 — the scrolling element the surface keeps the caret
+     * visible in after keyboard navigation and typing (never after a
+     * pointer click). Defaults to the nearest `.editor-viewport` ancestor;
+     * a host without one (and without this prop) gets no auto-scroll.
+     */
+    viewport?: () => HTMLElement | undefined;
+    /** Issue #387 — set `false` to opt out of the caret auto-scroll. */
+    revealCaret?: boolean;
 }
 
 export const EditorSurface: Component<EditorSurfaceProps> = (props) => {
     const engine = useEngine();
+    const state = createEditorState();
     const [canvasGen, setCanvasGen] = createSignal(0);
+    let rootEl: HTMLDivElement | undefined;
     let canvasEl: HTMLCanvasElement | undefined;
     let textareaEl: HTMLTextAreaElement | undefined;
+
+    /* Issue #387 — keep the caret inside the scrolling viewport after
+       keyboard navigation and typing. The surface is one canvas at its
+       top-left: the engine's device-px caret ÷ the zoom-aware device
+       ratio is the CSS offset inside it. */
+    createCaretReveal({
+        enabled: () => props.revealCaret !== false,
+        viewport: () =>
+            props.viewport?.() ??
+            rootEl?.closest<HTMLElement>('.editor-viewport') ??
+            undefined,
+        caretBox: (caret, viewport) => {
+            if (!rootEl) return undefined;
+            const ratio = deviceRatioFor(state.zoom(), window.devicePixelRatio || 1);
+            const origin = offsetInViewport(rootEl, viewport);
+            return {
+                top: origin.top + caret.y / ratio,
+                left: origin.left + caret.x / ratio,
+                width: Math.max(1, caret.w / ratio),
+                height: caret.h / ratio,
+            };
+        },
+    });
 
     const mount = async (el: HTMLCanvasElement) => {
         canvasEl = el;
@@ -91,7 +128,11 @@ export const EditorSurface: Component<EditorSurfaceProps> = (props) => {
     });
 
     return (
-        <div class={props.className ?? 'nge-editor-surface'} style={{ position: 'relative' }}>
+        <div
+            ref={(el) => (rootEl = el)}
+            class={props.className ?? 'nge-editor-surface'}
+            style={{ position: 'relative' }}
+        >
             <Show when={canvasGen() >= 0} keyed>
                 {/* The keyed Show guarantees a brand-new <canvas> element
                     every time canvasGen() bumps. Critical: do not reuse

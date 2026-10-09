@@ -1295,6 +1295,19 @@ impl Engine {
         serde_wasm_bindgen::to_value(&comment_rows(self.undo.current()))
             .map_err(|e| JsValue::from_str(&format!("encode comments: {e}")))
     }
+
+    /// Issue #387 — the `Event::CommentHighlights` broadcast for the
+    /// current document and geometry (per-line rects of every commented
+    /// range), or `undefined` when the document has no comments. The
+    /// worker calls this whenever the document or its painted geometry
+    /// moved and posts the event on the subscribe path.
+    pub fn comment_highlights(&self) -> Result<JsValue, JsValue> {
+        match self.comment_highlights_event() {
+            Some(evt) => serde_wasm_bindgen::to_value(&evt)
+                .map_err(|e| JsValue::from_str(&format!("encode comment highlights: {e}"))),
+            None => Ok(JsValue::UNDEFINED),
+        }
+    }
 }
 
 /// The [`Engine::comments_snapshot`] rows of `doc`, one per comment range
@@ -6973,6 +6986,62 @@ fn selection_rects_geom(
     rects
 }
 
+/// Issue #77 — while the field-code view is on, the layout (hence every
+/// `LineGeom` the display walk produces) is expressed in the derived code
+/// text of `doc`'s paragraphs: map it back to SOURCE offsets (see
+/// `Engine::geometry_to_source_offsets`, which passes the selection's
+/// tree; issue #387's comment highlights pass the body's).
+fn geometry_to_source_offsets_in(mut geom: Vec<LineGeom>, doc: &DocumentTree) -> Vec<LineGeom> {
+    for line in geom.iter_mut() {
+        let epath = bridge_to_engine_path(line.path.clone());
+        let Some(sp) = doc.paragraph_at_path(&epath) else {
+            continue;
+        };
+        if sp.fields.is_empty() {
+            continue;
+        }
+        let dp = sp.with_field_codes();
+        let inside = |o: u32| dp.code_span_strictly_containing(o).is_some();
+        let map = |o: u32| sp.code_view_offset_to_source(o);
+        line.start_byte = map(line.start_byte);
+        line.end_byte = map(line.end_byte);
+        line.slots.retain(|s| !inside(s.byte));
+        for slot in line.slots.iter_mut() {
+            slot.byte = map(slot.byte);
+        }
+        for run in line.runs.iter_mut() {
+            run.src_start = map(run.src_start);
+            run.src_end = map(run.src_end);
+            run.slots.retain(|s| !inside(s.byte));
+            for slot in run.slots.iter_mut() {
+                slot.byte = map(slot.byte);
+            }
+        }
+    }
+    geom
+}
+
+/// Issue #387 — width (layout pt, × the paint scale) of the marker a
+/// collapsed (point) comment gets: wide enough to hover.
+const COMMENT_POINT_MARK_W: f32 = 3.0;
+
+/// Issue #387 — the marker rect of a collapsed comment anchored at `pos`:
+/// `w` wide, centred on the caret slot, on the line holding `pos`; `None`
+/// when no laid-out line holds it (never the first line's fallback
+/// [`caret_rect_geom`] uses for the caret).
+fn point_comment_rect(geom: &[LineGeom], pos: &BridgeLogicalPos, w: f32) -> Option<BridgeRect> {
+    let line = geom
+        .iter()
+        .find(|l| l.path == pos.path && pos.offset >= l.start_byte && pos.offset <= l.end_byte)?;
+    let x = slot_x_for_byte_with_affinity(line, pos.offset, CaretAffinity::LeadingX);
+    Some(BridgeRect {
+        x: x - w / 2.0,
+        y: line.y_top,
+        w,
+        h: line.height,
+    })
+}
+
 /// Issue #276 — typing over (or replacing) a non-empty selection gives the
 /// new text the formatting of the FIRST replaced character, as Word does —
 /// and as the toolbar already reports for a range (`attrs_at` reads the
@@ -7943,18 +8012,24 @@ impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         let seq_before = self.mutation_seq;
         let revision_before = self.undo.revision();
+        /* Issue #387 — classified once, in `bridge::meta`. */
+        let reveals_caret = cmd.meta().reveals_caret;
         let mut evt = self.apply_command(cmd).await;
         if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
             self.mutation_seq += 1;
         }
         /* Issue #260 — a handler builds its `SelectionChanged` reply
         before the bump above lands, so stamp the revision the command
-        actually left the document at. */
+        actually left the document at. Issue #387 — and whether the
+        shell should scroll the caret it reports into view. */
         if let Event::SelectionChanged {
-            document_revision, ..
+            document_revision,
+            reveal_caret,
+            ..
         } = &mut evt
         {
             *document_revision = self.mutation_seq;
+            *reveal_caret = reveals_caret;
         }
         evt
     }
@@ -11903,39 +11978,67 @@ impl Engine {
     /// field's result boundaries, and line / run byte ranges map through
     /// the same function. Field-free paragraphs — and the whole result
     /// view — pass through untouched.
-    fn geometry_to_source_offsets(&self, mut geom: Vec<LineGeom>) -> Vec<LineGeom> {
+    fn geometry_to_source_offsets(&self, geom: Vec<LineGeom>) -> Vec<LineGeom> {
         if !self.field_code_view {
             return geom;
         }
-        self.with_selection_doc(|doc| {
-            for line in geom.iter_mut() {
-                let epath = bridge_to_engine_path(line.path.clone());
-                let Some(sp) = doc.paragraph_at_path(&epath) else {
-                    continue;
+        self.with_selection_doc(|doc| geometry_to_source_offsets_in(geom, doc))
+    }
+
+    /// Issue #387 — per-line highlight rectangles for every top-level
+    /// comment, built from the BODY's laid-out lines exactly like
+    /// selection rectangles ([`selection_rects_geom`]); `None` when the
+    /// document has no comment ranges (the worker then broadcasts nothing
+    /// — or one empty list when the last comment went). Replies ride
+    /// their root's range and are skipped. A collapsed (point) comment
+    /// gets one narrow marker at its anchor; an anchor past the laid-out
+    /// band gets no rects until layout reaches it.
+    fn comment_highlights_event(&self) -> Option<Event> {
+        let doc = self.undo.current();
+        if doc.comment_ranges.is_empty() {
+            return None;
+        }
+        let display = self.body_geometry_display().ok()?;
+        let geom = if self.field_code_view {
+            geometry_to_source_offsets_in(display, doc)
+        } else {
+            display
+        };
+        let scale = self.scale();
+        let highlights = doc
+            .comment_ranges
+            .iter()
+            .filter_map(|r| {
+                let def = doc.comment_defs.get(&r.id);
+                if def.and_then(|d| d.parent_id).is_some() {
+                    return None;
+                }
+                let (start, end) = ordered(
+                    BridgeLogicalPos {
+                        path: engine_to_bridge_path(r.start.path.clone()),
+                        offset: r.start.offset,
+                    },
+                    BridgeLogicalPos {
+                        path: engine_to_bridge_path(r.end.path.clone()),
+                        offset: r.end.offset,
+                    },
+                );
+                let rects = if start == end {
+                    point_comment_rect(&geom, &start, COMMENT_POINT_MARK_W * scale)
+                        .into_iter()
+                        .collect()
+                } else {
+                    selection_rects_geom(&geom, &start, &end)
                 };
-                if sp.fields.is_empty() {
-                    continue;
-                }
-                let dp = sp.with_field_codes();
-                let inside = |o: u32| dp.code_span_strictly_containing(o).is_some();
-                let map = |o: u32| sp.code_view_offset_to_source(o);
-                line.start_byte = map(line.start_byte);
-                line.end_byte = map(line.end_byte);
-                line.slots.retain(|s| !inside(s.byte));
-                for slot in line.slots.iter_mut() {
-                    slot.byte = map(slot.byte);
-                }
-                for run in line.runs.iter_mut() {
-                    run.src_start = map(run.src_start);
-                    run.src_end = map(run.src_end);
-                    run.slots.retain(|s| !inside(s.byte));
-                    for slot in run.slots.iter_mut() {
-                        slot.byte = map(slot.byte);
-                    }
-                }
-            }
-        });
-        geom
+                Some(bridge::CommentHighlight {
+                    id: r.id,
+                    author: def.map(|d| d.author.clone()).unwrap_or_default(),
+                    resolved: def.is_some_and(|d| d.resolved),
+                    rects,
+                })
+            })
+            .collect();
+        Some(Event::CommentHighlights { highlights })
     }
 
     /// The display-offset geometry walk (see [`Self::document_geometry`]
@@ -11957,6 +12060,13 @@ impl Engine {
             }
             StoryTarget::Body => {}
         }
+        self.body_geometry_display()
+    }
+
+    /// The BODY's display-offset line geometry, whatever story is active
+    /// (the body arm of [`Self::document_geometry_display`]; issue #387's
+    /// comment highlights always live in the body).
+    fn body_geometry_display(&self) -> Result<Vec<LineGeom>, Box<Event>> {
         /* `false` — hit-test + caret geometry run on committed document
         offsets, which `self.selection` is also expressed in. Audit gap
         C.H1 — geometry queries that need to resolve a deep caret /
@@ -13039,6 +13149,8 @@ impl Engine {
             caret_font_slot: fonts.caret_slot,
             /* Issue #345 — the body document's enforced restriction. */
             protection: self.protection_mode().map(bridge_protection_mode),
+            /* Issue #387 — `apply` stamps the command's classification. */
+            reveal_caret: false,
         }
     }
 
@@ -28834,6 +28946,10 @@ mod pbdr_style_cascade_tests;
 /// Issue #370 — an empty paragraph's line is sized by its mark.
 #[cfg(test)]
 mod empty_mark_tests;
+
+/// Issue #387 — comment highlights + the caret-reveal stamp.
+#[cfg(test)]
+mod comment_highlight_tests;
 
 #[cfg(test)]
 mod block_remap_tests;

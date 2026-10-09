@@ -1,0 +1,44 @@
+/* Issue #387 — on-canvas comment highlights (DOM overlay over one page).
+ * Click-through: the page element reads hover / click, so a click on
+ * commented text still reaches the canvas and places the caret. */
+.nge-comment-highlights {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    overflow: visible;
+}
+
+.nge-comment-highlight {
+    position: absolute;
+    pointer-events: none;
+    background: var(--nge-color-comment-highlight);
+    border-bottom: 1px solid var(--nge-color-comment-highlight-edge);
+    border-radius: 1px;
+    /* A highlighter: the tint darkens the paper, never the ink. */
+    mix-blend-mode: multiply;
+    transition: background var(--nge-transition-fast);
+}
+
+.nge-comment-highlight--resolved {
+    background: var(--nge-color-comment-highlight-resolved);
+    border-bottom-color: transparent;
+}
+
+.nge-comment-highlight--hover,
+.nge-comment-highlight--active {
+    background: var(--nge-color-comment-highlight-active);
+}
+
+.nge-comment-highlight__tip {
+    position: absolute;
+    z-index: var(--nge-z-popover);
+    transform: translate(-50%, calc(-100% - var(--nge-space-1)));
+    padding: 2px var(--nge-space-2);
+    background: var(--nge-color-text);
+    color: var(--nge-color-bg);
+    border-radius: var(--nge-radius-sm);
+    box-shadow: var(--nge-shadow-sm);
+    font: 500 var(--nge-font-size-xs)/1.4 var(--nge-font-ui);
+    white-space: nowrap;
+    pointer-events: none;
+}

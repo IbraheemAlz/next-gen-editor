@@ -87,6 +87,7 @@ export type {
     BridgeIndent,
     RendererDowngrade,
     RendererDowngradeReason,
+    CommentHighlight,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 import type {
