@@ -73,6 +73,10 @@ export interface SdkShelfProps {
     /** True once the worker has finished INIT. Defaults to true if omitted
      *  so callers without a boot signal still mount the rails. */
     engineReady?: () => boolean;
+    /** Issue #254 — scroll the engine caret into view (the comments rail
+     *  just moved the selection onto a comment's text). The host owns the
+     *  scrolling viewport. */
+    onRevealCaret?: () => void;
 }
 
 export const SdkShelf: Component<SdkShelfProps> = (props) => {
@@ -124,7 +128,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 <aside class="nge-shell__rails">
                     <Show when={ready()}>
                         <TrackChangesSidebar />
-                        <CommentsRail />
+                        <CommentsRail onNavigate={() => props.onRevealCaret?.()} />
                     </Show>
                 </aside>
                 <footer class="nge-shell__statusbar">

@@ -1271,29 +1271,36 @@ impl Engine {
     /// span. The TS shell renders these in a sidebar; no canvas
     /// drawing of comment overlays in this MVP.
     pub fn comments_snapshot(&self) -> Result<JsValue, JsValue> {
-        let doc = self.undo.current();
-        let comments: Vec<CommentOut> = doc
-            .comment_ranges
-            .iter()
-            .map(|r| {
-                let def = doc.comment_defs.get(&r.id).cloned().unwrap_or_default();
-                CommentOut {
-                    id: r.id,
-                    author: def.author,
-                    date: def.date,
-                    text: def.paragraphs.join("\n"),
-                    resolved: def.resolved,
-                    parent_id: def.parent_id,
-                    start_block: r.start.path.last_block_index().unwrap_or(0),
-                    start_offset: r.start.offset,
-                    end_block: r.end.path.last_block_index().unwrap_or(0),
-                    end_offset: r.end.offset,
-                }
-            })
-            .collect();
-        serde_wasm_bindgen::to_value(&comments)
+        serde_wasm_bindgen::to_value(&comment_rows(self.undo.current()))
             .map_err(|e| JsValue::from_str(&format!("encode comments: {e}")))
     }
+}
+
+/// The [`Engine::comments_snapshot`] rows of `doc`, one per comment range
+/// (`comment_ranges` order). Issue #254 — each carries its full anchor
+/// paths next to the flat `last_block_index` (a cell comment's flat index
+/// is its paragraph's index inside the cell, not a top-level block).
+fn comment_rows(doc: &engine::DocumentTree) -> Vec<CommentOut> {
+    doc.comment_ranges
+        .iter()
+        .map(|r| {
+            let def = doc.comment_defs.get(&r.id).cloned().unwrap_or_default();
+            CommentOut {
+                id: r.id,
+                author: def.author,
+                date: def.date,
+                text: def.paragraphs.join("\n"),
+                resolved: def.resolved,
+                parent_id: def.parent_id,
+                start_block: r.start.path.last_block_index().unwrap_or(0),
+                start_offset: r.start.offset,
+                end_block: r.end.path.last_block_index().unwrap_or(0),
+                end_offset: r.end.offset,
+                start_path: engine_to_bridge_path(r.start.path.clone()),
+                end_path: engine_to_bridge_path(r.end.path.clone()),
+            }
+        })
+        .collect()
 }
 
 #[derive(::serde::Serialize)]
@@ -1383,6 +1390,12 @@ struct CommentOut {
     start_offset: u32,
     end_block: u32,
     end_offset: u32,
+    /// Issue #254 — the full anchor paths (the `LogicalPos` wire shape a
+    /// `SET_SELECTION` takes), so a comment inside a table cell is listed
+    /// and navigated at its cell; `start_block` / `end_block` keep the
+    /// flat index for older consumers.
+    start_path: BridgeBlockPath,
+    end_path: BridgeBlockPath,
 }
 
 /// Serialization surface for [`Engine::media_entries`]. Mirrors
@@ -27725,6 +27738,44 @@ mod wire_validation_tests {
         let now = now_iso8601();
         assert_eq!(now.len(), 24, "{now}");
         assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
+    }
+
+    /// Issue #254 — the comments snapshot carries each anchor's full path:
+    /// a comment inside a table cell is addressed by its cell, not by the
+    /// cell paragraph's index masquerading as a top-level block.
+    #[test]
+    fn comment_rows_carry_full_anchor_paths() {
+        let doc =
+            engine::DocumentTree::from_text("intro").insert_table(engine::BlockPath::top(1), 2, 2);
+        let cell = engine::BlockPath {
+            steps: vec![
+                EnginePathStep::Block(1),
+                EnginePathStep::Cell { row: 1, col: 1 },
+                EnginePathStep::Block(0),
+            ],
+        };
+        let doc = doc.insert_text(engine::LogicalPos::new(cell.clone(), 0), "in cell");
+        let (doc, id) = doc.insert_comment(
+            engine::LogicalPos::new(cell.clone(), 3),
+            engine::LogicalPos::new(cell, 7),
+            "c".into(),
+            "A".into(),
+            String::new(),
+        );
+        let rows = comment_rows(&doc);
+        let row = rows.iter().find(|r| r.id == id).expect("row");
+        let want = BridgeBlockPath {
+            steps: vec![
+                BridgePathStep::Block { idx: 1 },
+                BridgePathStep::Cell { row: 1, col: 1 },
+                BridgePathStep::Block { idx: 0 },
+            ],
+        };
+        assert_eq!(row.start_path, want);
+        assert_eq!(row.end_path, want);
+        assert_eq!((row.start_offset, row.end_offset), (3, 7));
+        /* The flat index stays for compatibility. */
+        assert_eq!(row.start_block, 0);
     }
 
     #[test]
