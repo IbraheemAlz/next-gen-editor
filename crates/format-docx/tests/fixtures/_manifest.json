@@ -421,6 +421,38 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "theme_loaded_faces.docx": {
+      "generator": "build_minimal_docx + theme part",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 4,
+        "paragraph_texts": [
+          "Theme heading عنوان السمة",
+          "Body text in the minor font, explicit Amiri, then the theme again.",
+          "نص عربي بخط السمة بخط العناوين.",
+          "Accent two and soft text."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "theme_word_default.docx": {
+      "generator": "build_minimal_docx + theme part",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 4,
+        "paragraph_texts": [
+          "Theme heading عنوان السمة",
+          "Body text in the minor font, explicit Amiri, then the theme again.",
+          "نص عربي بخط السمة بخط العناوين.",
+          "Accent two and soft text."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "toc_word_shape.docx": {
       "generator": "handcrafted",
       "phase_introduced": 11,

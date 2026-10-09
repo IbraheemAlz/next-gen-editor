@@ -351,6 +351,92 @@ mod tests {
         );
     }
 
+    /// The shared default-template fixture reads back as authored: the
+    /// docDefaults / heading / run bindings, the theme colours and the
+    /// theme itself; a zero-edit save is byte-identical.
+    #[test]
+    fn the_default_template_fixture_reads_back_as_authored() {
+        use engine::{FontBinding, FontClass};
+        let bytes = crate::test_fixtures::theme_word_default_docx();
+        let archive = crate::read_docx(&bytes).expect("read");
+        let doc = &archive.document;
+        let entry = |b: &[u8], name: &str| {
+            let mut z = zip::ZipArchive::new(std::io::Cursor::new(b)).expect("zip");
+            let mut f = z.by_name(name).expect(name);
+            let mut out = String::new();
+            std::io::Read::read_to_string(&mut f, &mut out).expect("utf8");
+            out
+        };
+        let styles = entry(&bytes, "word/styles.xml");
+        assert!(
+            styles.contains(r#"<w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia" w:hAnsiTheme="minorHAnsi" w:cstheme="minorBidi"/>"#),
+            "{styles}"
+        );
+        let document = entry(&bytes, "word/document.xml");
+        assert!(
+            document.contains(r#"<w:rFonts w:cstheme="majorBidi"/>"#),
+            "{document}"
+        );
+        assert!(
+            document.contains(r#"<w:color w:val="595959" w:themeColor="text1" w:themeTint="A6"/>"#),
+            "{document}"
+        );
+        let theme = doc.theme.as_deref().expect("theme");
+        let texts: Vec<&str> = (0..4).map(|i| doc.paragraph_text(i).unwrap()).collect();
+        assert_eq!(texts, crate::test_fixtures::THEME_FIXTURE_TEXTS);
+        /* Body Latin + Arabic through the docDefaults. */
+        let base = doc.resolve_style_run_cascade(None);
+        let f = |s: &engine::SpanStyle, c| {
+            s.resolve_font(Some(theme), c, Some("Arab"))
+                .map(|r| r.family.display_name().to_string())
+        };
+        assert_eq!(f(&base, FontClass::Latin).as_deref(), Some("Calibri"));
+        assert_eq!(f(&base, FontClass::ComplexScript).as_deref(), Some("Arial"));
+        let heading = doc.resolve_style_run_cascade(Some("Heading1"));
+        assert_eq!(
+            f(&heading, FontClass::Latin).as_deref(),
+            Some("Calibri Light")
+        );
+        assert_eq!(
+            f(&heading, FontClass::ComplexScript).as_deref(),
+            Some("Times New Roman")
+        );
+        assert_eq!(
+            heading.resolve_color(Some(theme)),
+            Some([0x2F, 0x54, 0x96, 255])
+        );
+        /* The Arabic run rebinding only cs. */
+        let p2 = doc.nth_paragraph(2).unwrap();
+        let run = base.clone().merged_with(p2.spans[0].style.clone());
+        assert_eq!(
+            run.font_bindings.as_deref().unwrap().cs,
+            Some(FontBinding::Theme("majorBidi".into()))
+        );
+        assert_eq!(
+            f(&run, FontClass::ComplexScript).as_deref(),
+            Some("Times New Roman")
+        );
+        assert_eq!(f(&run, FontClass::Latin).as_deref(), Some("Calibri"));
+        /* The explicit run claims every slot its writer names. */
+        let p1 = doc.nth_paragraph(1).unwrap();
+        let amiri = base.clone().merged_with(p1.spans[0].style.clone());
+        assert_eq!(f(&amiri, FontClass::Latin).as_deref(), Some("Amiri"));
+        assert_eq!(
+            f(&amiri, FontClass::ComplexScript).as_deref(),
+            Some("Amiri")
+        );
+        /* Zero-edit save: every part byte-identical. */
+        let saved = crate::write_docx(&archive, doc).expect("write");
+        for name in [
+            "word/document.xml",
+            "word/styles.xml",
+            "word/settings.xml",
+            DEFAULT_THEME_PART,
+        ] {
+            assert_eq!(entry(&saved, name), entry(&bytes, name), "{name}");
+        }
+    }
+
     /// The relationship wins over the conventional path.
     #[test]
     fn the_theme_relationship_locates_the_part() {

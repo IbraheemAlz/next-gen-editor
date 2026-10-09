@@ -27775,6 +27775,10 @@ mod tracked_command_tests;
 #[cfg(test)]
 mod story_tab_tests;
 
+/// Issue #355 — theme fonts / colours through read → layout.
+#[cfg(test)]
+mod theme_layout_tests;
+
 #[cfg(test)]
 mod wire_validation_tests {
     use super::*;

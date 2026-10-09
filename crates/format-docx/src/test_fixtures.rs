@@ -315,3 +315,165 @@ pub fn with_theme_parts(docx: &[u8], theme_xml: &str, settings_xml: Option<&str>
     }
     out
 }
+
+/// Text of [`theme_fonts_docx`]'s paragraphs, in order.
+pub const THEME_FIXTURE_TEXTS: [&str; 4] = [
+    "Theme heading عنوان السمة",
+    "Body text in the minor font, explicit Amiri, then the theme again.",
+    "نص عربي بخط السمة بخط العناوين.",
+    "Accent two and soft text.",
+];
+
+/// Issue #355 — a Word default-template document over `theme_xml`, built
+/// with [`crate::writer::build_minimal_docx`] + [`with_theme_parts`]:
+///
+/// * docDefaults bind every slot to the body font (`minorHAnsi` ×
+///   ascii / hAnsi, `minorEastAsia`, `minorBidi`) at 11 pt — Word's own
+///   `w:rPrDefault`, so body text names no font at all;
+/// * `Heading1` rebinds them to the heading font (`major*`), bold 16 pt,
+///   coloured `accent1` shaded `BF` (cached `2F5496`);
+/// * paragraph 0 is a mixed Latin + Arabic heading; paragraph 1 Latin
+///   body text with one run naming Amiri explicitly (`w:ascii` / `w:hAnsi`
+///   / `w:cs`); paragraph 2 an RTL Arabic paragraph with one run rebinding
+///   only its complex-script slot (`w:cstheme="majorBidi"`); paragraph 3
+///   theme-coloured runs (`accent2`; `text1` tinted `A6`, cached
+///   `595959`).
+///
+/// Settings: `<w:themeFontLang w:bidi="ar-SA">` and the identity
+/// `<w:clrSchemeMapping>` ([`theme_settings_xml`]).
+pub fn theme_fonts_docx(theme_xml: &str) -> Vec<u8> {
+    use engine::{FontBinding, RunFontBindings, SpanStyle, StyleRun, ThemeColorRef};
+    let bind = |v: &str| Some(FontBinding::Theme(v.into()));
+    let slots = |latin: &str, ea: &str, cs: &str| {
+        Some(Box::new(RunFontBindings {
+            ascii: bind(latin),
+            h_ansi: bind(latin),
+            east_asia: bind(ea),
+            cs: bind(cs),
+        }))
+    };
+    let theme_color = |color: &str, tint: Option<&str>, shade: Option<&str>| {
+        Some(Box::new(ThemeColorRef {
+            color: color.into(),
+            tint: tint.map(Into::into),
+            shade: shade.map(Into::into),
+        }))
+    };
+    /* A run over the first occurrence of `needle` in `text`. */
+    let run = |text: &str, needle: &str, style: SpanStyle| {
+        let start = text.find(needle).expect("needle") as u32;
+        StyleRun {
+            start,
+            end: start + needle.len() as u32,
+            style,
+        }
+    };
+    let [heading, body, arabic, colours] = THEME_FIXTURE_TEXTS;
+    let paras = [
+        engine::Paragraph {
+            text: heading.into(),
+            style_id: Some("Heading1".into()),
+            ..Default::default()
+        },
+        engine::Paragraph {
+            text: body.into(),
+            spans: vec![run(
+                body,
+                "explicit Amiri",
+                SpanStyle {
+                    font_family: Some(engine::FontFamily::Amiri),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        },
+        engine::Paragraph {
+            text: arabic.into(),
+            props: engine::ParaProperties {
+                direction: Some(engine::TextDirection::Rtl),
+                ..Default::default()
+            },
+            spans: vec![run(
+                arabic,
+                "بخط العناوين",
+                SpanStyle {
+                    font_bindings: Some(Box::new(RunFontBindings {
+                        cs: bind("majorBidi"),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        },
+        engine::Paragraph {
+            text: colours.into(),
+            spans: vec![
+                run(
+                    colours,
+                    "Accent two",
+                    SpanStyle {
+                        color: Some([0xED, 0x7D, 0x31, 255]),
+                        color_theme: theme_color("accent2", None, None),
+                        ..Default::default()
+                    },
+                ),
+                run(
+                    colours,
+                    "soft text",
+                    SpanStyle {
+                        color: Some([0x59, 0x59, 0x59, 255]),
+                        color_theme: theme_color("text1", Some("A6"), None),
+                        ..Default::default()
+                    },
+                ),
+            ],
+            ..Default::default()
+        },
+    ];
+    let mut doc = engine::DocumentTree::from_rich_paragraphs(paras);
+    doc.style_run_defaults = SpanStyle {
+        font_size: Some(11.0),
+        font_theme: Some("minorHAnsi".into()),
+        font_bindings: slots("minorHAnsi", "minorEastAsia", "minorBidi"),
+        ..Default::default()
+    };
+    doc.styles.insert(
+        "Heading1".into(),
+        engine::ParagraphStyle {
+            id: "Heading1".into(),
+            name: "heading 1".into(),
+            run: SpanStyle {
+                bold: Some(true),
+                font_size: Some(16.0),
+                color: Some([0x2F, 0x54, 0x96, 255]),
+                color_theme: theme_color("accent1", None, Some("BF")),
+                font_theme: Some("majorHAnsi".into()),
+                font_bindings: slots("majorHAnsi", "majorEastAsia", "majorBidi"),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    /* `build_minimal_docx` writes `word/styles.xml` from the table only
+    for a dirty one. */
+    doc.styles_dirty = true;
+    let base = crate::writer::build_minimal_docx(&doc).expect("minimal package");
+    with_theme_parts(&base, theme_xml, Some(&theme_settings_xml()))
+}
+
+/// [`theme_fonts_docx`] over Word's stock theme ([`word_default_theme_xml`]):
+/// Calibri / Calibri Light, Arabic in Arial / Times New Roman.
+pub fn theme_word_default_docx() -> Vec<u8> {
+    theme_fonts_docx(&word_default_theme_xml())
+}
+
+/// [`theme_fonts_docx`] over a theme whose faces the editor ships, so the
+/// resolution is visible on canvas: body Latin in Liberation Sans, body
+/// Arabic in Noto Naskh Arabic, headings in Amiri (both scripts).
+pub fn theme_loaded_faces_docx() -> Vec<u8> {
+    theme_fonts_docx(&theme_xml(
+        ("Liberation Sans", "Noto Naskh Arabic"),
+        ("Amiri", "Amiri"),
+    ))
+}

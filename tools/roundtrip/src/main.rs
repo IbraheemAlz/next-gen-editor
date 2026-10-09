@@ -33,6 +33,7 @@ mod inline_spans;
 mod note_containers;
 mod revisions;
 mod table_markup;
+mod theme;
 
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
@@ -338,6 +339,7 @@ fn run_default() -> Result<()> {
     revisions::run_double_mark_revisions_roundtrip()?;
     revisions::run_tracked_split_roundtrip()?;
     revisions::run_tracked_cross_paragraph_delete_roundtrip()?;
+    theme::run_theme_fonts_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4932,7 +4934,39 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 },
             },
         },
+        /* Issue #355 — a Word default-template document (theme fonts via
+        docDefaults / a heading style / per-run slot rebinding, theme
+        colours) over Word's stock theme, and the same document over a
+        theme naming faces the editor ships (the visual-diff
+        `theme-fonts` golden loads it). Zero-edit drift 0; the default
+        harness's step 46 edits the first. */
+        PrebuiltFixture {
+            name: "theme_word_default.docx",
+            bytes: format_docx::test_fixtures::theme_word_default_docx(),
+            entry: theme_fixture_entry(),
+        },
+        PrebuiltFixture {
+            name: "theme_loaded_faces.docx",
+            bytes: format_docx::test_fixtures::theme_loaded_faces_docx(),
+            entry: theme_fixture_entry(),
+        },
     ]
+}
+
+/// Issue #355 — the manifest entry both theme fixtures share.
+fn theme_fixture_entry() -> FixtureEntry {
+    let texts = format_docx::test_fixtures::THEME_FIXTURE_TEXTS;
+    FixtureEntry {
+        generator: "build_minimal_docx + theme part".into(),
+        phase_introduced: 12,
+        asserts: FixtureAsserts {
+            paragraph_count: texts.len() as u32,
+            paragraph_texts: texts.iter().map(|t| t.to_string()).collect(),
+        },
+        roundtrip: RoundtripBounds {
+            document_xml_drift_bytes: 0,
+        },
+    }
 }
 
 /// Issue #173 — one fixed-width (2 × 2000 twips) 1 × 2 table: `tbl_pr`
