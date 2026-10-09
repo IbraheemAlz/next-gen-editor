@@ -31,6 +31,7 @@
 
 mod inline_spans;
 mod note_containers;
+mod reader_hardening;
 mod revisions;
 mod table_markup;
 
@@ -338,6 +339,7 @@ fn run_default() -> Result<()> {
     revisions::run_double_mark_revisions_roundtrip()?;
     revisions::run_tracked_split_roundtrip()?;
     revisions::run_tracked_cross_paragraph_delete_roundtrip()?;
+    reader_hardening::run_field_phases_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

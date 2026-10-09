@@ -58,6 +58,16 @@ pub enum DocxWarning {
         value: String,
         twips: i64,
     },
+    /// Issue #350 — complex fields still open in their instruction part
+    /// when their paragraph ended (`count` of them): closed there, so their
+    /// hidden instruction never swallows the following paragraphs.
+    UnclosedField { count: u32 },
+    /// Issue #350 — a `separate` / `end` field character with no open
+    /// field (`kind` is the `w:fldCharType`): ignored.
+    StrayFieldChar { kind: String },
+    /// Issue #350 — complex fields nested deeper than `limit`: the extra
+    /// levels are not modeled (their text stays hidden code).
+    FieldNestingTooDeep { limit: u32 },
 }
 
 /// Most reader warnings one read collects; later ones are dropped (a
@@ -65,7 +75,7 @@ pub enum DocxWarning {
 const MAX_READ_WARNINGS: usize = 1000;
 
 thread_local! {
-    /// Issue #349 — the warnings sink of the read in progress
+    /// Issues #349 / #350 — the warnings sink of the read in progress
     /// ([`collect_read_warnings`]); `None` outside a read, where [`warn`]
     /// is a no-op (the writer re-parses source bytes for its verified
     /// passthroughs and must not report anything).
@@ -74,7 +84,7 @@ thread_local! {
 }
 
 /// Report a non-fatal reader diagnostic to the read in progress. Deep
-/// helpers (`schema::measure`) have no warnings
+/// helpers (`schema::measure`, the field machinery) have no warnings
 /// vector in hand; this is their channel.
 pub(crate) fn warn(w: DocxWarning) {
     READ_WARNINGS.with(|c| {

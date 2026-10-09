@@ -300,6 +300,20 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   equals `FieldSource::instruction` and outside a `<w:del>`; a
   `<w:fldSimple>` only while its element nests with every regenerated
   wrapper (`simple_field_nests`), else the complex form.
+- **Field phases (issue #350).** Text (`<w:t>`, `<w:delText>`, tabs,
+  breaks) never enters the visible paragraph while any open field is in
+  its instruction part (`field_code_hidden`) — a nested field's RESULT
+  there is code too: `IF { MERGEFIELD x } = …` shows only the IF's
+  result, the inner field gets no overlay and joins the outer
+  `Field::instruction` as `{ MERGEFIELD x }` (Word's code-view spelling);
+  its bytes ride the outer field's source prologue. Nesting is capped at
+  32 (`FieldCap`; deeper fields are hidden code), a `separate` / `end`
+  with no open field is ignored (its run kept verbatim), and a field
+  still in its instruction part at `</w:p>` is closed there
+  (`close_open_field_code`) — a stray `begin` can no longer hide every
+  later paragraph — with the broken code kept as one content marker
+  (`MarkupCapture::close_field_spans`). Result-part fields still span
+  paragraphs (TOC). Each case is a `DocxWarning`.
 - Offsets are remapped by `delete_text`, `split_at`, `concat` and — for
   every in-place text change — `Paragraph::splice_text` (`engine::
   text_remap`, issues #250 / #252), which returns the `TextEdit` the

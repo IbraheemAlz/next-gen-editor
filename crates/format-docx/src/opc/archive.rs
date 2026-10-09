@@ -60,8 +60,9 @@ pub struct DocxArchive {
     /// Non-fatal reader diagnostics raised while parsing the package
     /// (issue #111 — a table nested past
     /// `parts::table::MAX_TABLE_NESTING_DEPTH` kept as an opaque block;
-    /// issue #349 — an unusable or clamped measure). Empty when every part
-    /// landed in the typed model as written.
+    /// issue #349 — an unusable or clamped measure; issue #350 — an
+    /// unbalanced or too deeply nested field). Empty when every part landed
+    /// in the typed model as written.
     pub warnings: Vec<DocxWarning>,
 }
 

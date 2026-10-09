@@ -223,6 +223,90 @@ struct FieldCursor<'a> {
     in_table: bool,
 }
 
+/// Issue #350 — deepest complex-field nesting the reader models. Deeper
+/// fields are kept as hidden field code (their bytes ride the paragraph);
+/// a stray `begin` can no longer grow the stack without bound.
+const MAX_FIELD_NESTING: usize = 32;
+
+/// Issue #350 — the field characters [`handle_fld_char`] never sees: those
+/// of fields nested past [`MAX_FIELD_NESTING`] (counted in `overflow`, so
+/// their `separate` / `end` pair with them and not with a modeled field)
+/// and `separate` / `end` with no open field at all. Interior mutability
+/// so it can sit in a match guard.
+#[derive(Default)]
+struct FieldCap {
+    overflow: std::cell::Cell<u32>,
+}
+
+impl FieldCap {
+    /// `true` when this `<w:fldChar>` is absorbed (not modeled); `depth`
+    /// is the open field stack's length.
+    fn absorb(&self, e: &BytesStart<'_>, depth: usize) -> bool {
+        let kind = attr_val(e, b"w:fldCharType").unwrap_or_default();
+        let overflow = self.overflow.get();
+        match kind.trim() {
+            "begin" if overflow > 0 || depth >= MAX_FIELD_NESTING => {
+                if overflow == 0 {
+                    crate::error::warn(DocxWarning::FieldNestingTooDeep {
+                        limit: MAX_FIELD_NESTING as u32,
+                    });
+                }
+                self.overflow.set(overflow + 1);
+                true
+            }
+            "separate" if overflow > 0 => true,
+            "end" if overflow > 0 => {
+                self.overflow.set(overflow - 1);
+                true
+            }
+            k @ ("separate" | "end") if depth == 0 => {
+                crate::error::warn(DocxWarning::StrayFieldChar {
+                    kind: k.to_string(),
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Issue #350 — `true` while the cursor is inside field CODE: some open
+/// field is still in its instruction part (between `begin` and
+/// `separate`) — a nested field's result there is part of the enclosing
+/// instruction — or a field past the nesting cap is open. Text there never
+/// enters the visible paragraph text.
+fn field_code_hidden(stack: &[FieldBuilder], cap: &FieldCap) -> bool {
+    cap.overflow.get() > 0 || stack.iter().any(|f| f.cached_start.is_none())
+}
+
+/// Issue #350 — `</w:p>` (whose `<` sits at byte `end`): a field still in
+/// its instruction part cannot continue into the next paragraph — close
+/// it (and everything nested in it), with a reader warning, so a stray
+/// `begin` can never hide the rest of the document. Fields already in
+/// their result part stay open (a TOC's result spans paragraphs). The
+/// closed range — the outermost unclosed field's `begin` run to the
+/// paragraph end — is kept whole as a content marker when its bytes allow
+/// (see `MarkupCapture::close_field_spans`), so a regenerated paragraph
+/// keeps the broken field code instead of dropping it.
+fn close_open_field_code(
+    stack: &mut Vec<FieldBuilder>,
+    cap: &FieldCap,
+    markup: &mut MarkupCapture,
+    xml: &[u8],
+    end: usize,
+    ns: &NamespaceScope,
+) {
+    let first = stack.iter().position(|f| f.cached_start.is_none());
+    let overflow = cap.overflow.replace(0);
+    let Some(first) = first.or((overflow > 0).then_some(stack.len())) else {
+        return;
+    };
+    let count = (stack.len() - first) as u32 + overflow;
+    stack.truncate(first);
+    crate::error::warn(DocxWarning::UnclosedField { count });
+    markup.close_field_spans(first + 1, xml, end, ns);
+}
+
 /// Apply one `<w:fldChar>` event to the field state machine.
 ///
 /// `fldCharType="begin"` pushes a fresh [`FieldBuilder`] onto the stack.
@@ -256,9 +340,25 @@ fn handle_fld_char(
             }
         }
         "end" => {
-            if let Some(top) = stack.pop()
-                && let Some(start) = top.cached_start
+            let Some(top) = stack.pop() else {
+                return;
+            };
+            /* Issue #350 — a field nested in an enclosing field's CODE
+            (`IF { MERGEFIELD x } = …`) is part of that code: it joins the
+            enclosing instruction the way Word's field-code view spells it,
+            and its result — hidden text — is no overlay. */
+            if let Some(parent) = stack.last_mut()
+                && parent.cached_start.is_none()
             {
+                parent.instruction.push_str("{ ");
+                parent.instruction.push_str(top.instruction.trim());
+                parent.instruction.push_str(" }");
+                return;
+            }
+            if stack.iter().any(|f| f.cached_start.is_none()) {
+                return;
+            }
+            if let Some(start) = top.cached_start {
                 let end = here;
                 let instruction = top.instruction.trim().to_string();
                 /* Issue #81 — a result that crossed into a later top-level
@@ -989,8 +1089,8 @@ pub fn parse_document_xml_with_warnings(
     warnings: &mut Vec<DocxWarning>,
     default_page_geometry: PageGeometry,
 ) -> Result<DocumentTree, DocxError> {
-    /* Issue #349 — the deep helpers' diagnostics (measures) reach
-    `warnings` through the read's sink. */
+    /* Issues #349 / #350 — the deep helpers' diagnostics (measures, the
+    field machinery) reach `warnings` through the read's sink. */
     crate::error::collect_read_warnings(warnings, |warnings| {
         parse_document_xml_inner(xml, resolver, warnings, default_page_geometry)
     })
@@ -1048,6 +1148,8 @@ fn parse_document_xml_inner(
     text begins (set when `separate` arrives) and the accumulating
     instruction string. `cached_start: None` before `separate`. */
     let mut field_stack: Vec<FieldBuilder> = Vec::new();
+    /* Issue #350 — fields past the nesting cap, stray field characters. */
+    let field_cap = FieldCap::default();
     /* Issue #43 — `<w:fldSimple w:instr="…">cached runs</w:fldSimple>`,
     the compact single-element field form Word emits for simple PAGE /
     DATE fields. Stack of (instruction, cached-start); the close tag
@@ -1558,6 +1660,12 @@ fn parse_document_xml_inner(
                         markup.run_text_elt(&e, &ns);
                     }
                     b"w:instrText" => in_instr_text = true,
+                    /* Issue #350 — a field character past the nesting cap,
+                    or one with no open field: not modeled, its run is kept
+                    verbatim. */
+                    b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
+                        markup.run_keep_verbatim();
+                    }
                     b"w:fldChar" => {
                         /* fldChar drives the field state machine. The
                         attribute value lives on the start tag's `w:fldCharType`
@@ -1854,6 +1962,9 @@ fn parse_document_xml_inner(
                     b"w:ilvl" if in_num_pr => {
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
+                    /* Issue #350 — inside field code: not visible. */
+                    b"w:tab" | b"w:br" if in_run && field_code_hidden(&field_stack, &field_cap) => {
+                    }
                     b"w:tab" if in_run => {
                         /* Audit gap A.M5 — `<w:tab/>` inside a `<w:r>`.
                         Stored as the literal U+0009 TAB byte so the
@@ -2057,6 +2168,9 @@ fn parse_document_xml_inner(
                             markup.run_comment_reference(id);
                         }
                     }
+                    b"w:fldChar" if field_cap.absorb(&e, field_stack.len()) => {
+                        markup.run_keep_verbatim();
+                    }
                     b"w:fldChar" => {
                         let depth_before = field_stack.len();
                         let fields_before = para_fields.len();
@@ -2174,6 +2288,13 @@ fn parse_document_xml_inner(
                     _ => {}
                 }
             }
+            /* Issue #350 — field code (an instruction part, a nested
+            field's result inside one) is never visible text; its runs
+            ride the source markup / the field's source prologue. */
+            Event::Text(_)
+                if (in_text_elt || in_del_text_elt)
+                    && in_tbl == 0
+                    && field_code_hidden(&field_stack, &field_cap) => {}
             Event::Text(t) if (in_text_elt || in_del_text_elt) && in_tbl == 0 => {
                 run_text.push_str(&t.unescape()?);
             }
@@ -2243,7 +2364,9 @@ fn parse_document_xml_inner(
                 runs is exactly the point of the stack-based state
                 machine, otherwise a `PAGE \* MERGEFORMAT` split across
                 `PAGE` and ` \* MERGEFORMAT` runs would lose its switch. */
-                if let Some(top) = field_stack.last_mut() {
+                if field_cap.overflow.get() == 0
+                    && let Some(top) = field_stack.last_mut()
+                {
                     top.instruction.push_str(&t.unescape()?);
                 }
             }
@@ -2528,6 +2651,15 @@ fn parse_document_xml_inner(
                         }
                     }
                     b"w:p" => {
+                        /* Issue #350 — unbalanced field code ends here. */
+                        close_open_field_code(
+                            &mut field_stack,
+                            &field_cap,
+                            &mut markup,
+                            xml,
+                            prev_pos,
+                            &ns,
+                        );
                         /* Read position after `</w:p>` — that's where the `>`
                         closes — gives us the end byte. */
                         let p_end_byte = reader.buffer_position() as usize;
