@@ -2214,13 +2214,14 @@ fn emit_inline_object(
             `<w:object>`): byte-for-byte while the model agrees with it.
             An object without a picture (a text box, shape, chart, OLE
             object) has no typed regeneration and is ALWAYS written from
-            its bytes — never dropped. */
+            its bytes — never dropped. Issue #358 — bytes that are not
+            UTF-8 (junk the reader never decoded) are written lossily
+            instead of dropping the object. */
             if let Some(bytes) = obj.source_xml.as_deref()
-                && let Ok(verbatim) = std::str::from_utf8(bytes)
                 && (rel_id.is_empty() || preserved_drawing_is_current(obj, bytes))
             {
                 open_source_run(style, src, out);
-                out.push_str(verbatim);
+                out.push_str(&String::from_utf8_lossy(bytes));
                 out.push_str("</w:r>");
                 return;
             }
@@ -3264,12 +3265,16 @@ fn emit_trailing_sect_pr(doc: &DocumentTree, captured: bool, out: &mut String) {
     }
 }
 
-/// Append raw source bytes (valid UTF-8 by construction — they were
-/// sliced out of a part quick-xml decoded); anything else is skipped.
+/// Append raw source bytes. They are sliced out of a part quick-xml
+/// parsed, but quick-xml only decodes what the reader asks it to (`<w:t>`
+/// text, attribute values): character data the reader never decodes — junk
+/// inside an unselected `mc:Fallback`, say — may be invalid UTF-8. Issue
+/// #358 — such bytes used to be SKIPPED, which dropped a whole marker (an
+/// `mc:AlternateContent` closer) and wrote an ill-formed part the reader
+/// then refused; they are now written lossily (U+FFFD per invalid
+/// sequence), so the structure always survives.
 fn push_utf8(bytes: &[u8], out: &mut String) {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        out.push_str(s);
-    }
+    out.push_str(&String::from_utf8_lossy(bytes));
 }
 
 /// Issue #112 — `true` when a re-parse of the section's source bytes
