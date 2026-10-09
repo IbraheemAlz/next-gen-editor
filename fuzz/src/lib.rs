@@ -556,6 +556,42 @@ pub fn run_format_pdf_image_decode(data: &[u8]) {
     }
 }
 
+/// Issue #348 — the hostile `.docx` seeds of `corpus/docx_reader/`: `(file
+/// name, package bytes, the limit [`read_raw_package`] must refuse it with
+/// — `None` when it must read)`. Built by `format_docx::test_fixtures`, so
+/// no blob is hand-maintained; `examples/regen-seeds` writes them.
+pub fn hostile_docx_seeds() -> Vec<(&'static str, Vec<u8>, Option<format_docx::PackageLimit>)> {
+    use format_docx::PackageLimit;
+    use format_docx::test_fixtures as fx;
+    vec![
+        (
+            "hostile_declared_4gib_part.docx",
+            fx::lying_size_docx(4 * 1024 * 1024 * 1024),
+            None,
+        ),
+        (
+            "hostile_declared_u64_max_part.docx",
+            fx::lying_size_docx(u64::MAX - 1),
+            None,
+        ),
+        (
+            "hostile_bomb_16mib_zeros.docx",
+            fx::compressible_bomb_docx(16 * 1024 * 1024),
+            Some(PackageLimit::PartBytes),
+        ),
+        (
+            "hostile_sdt_5000_nested.docx",
+            fx::nested_sdt_docx(5000),
+            Some(PackageLimit::XmlDepth),
+        ),
+        (
+            "table_nested_60_deep.docx",
+            fx::nested_tables_docx(60),
+            None,
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,7 +657,7 @@ mod tests {
                 "line {}: unterminated",
                 n + 1
             );
-            let inner = body[1..body.len() - 1].as_bytes();
+            let inner = &body.as_bytes()[1..body.len() - 1];
             let mut word = Vec::new();
             let mut i = 0;
             while i < inner.len() {
@@ -796,40 +832,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Issue #348 — the hostile `.docx` seeds of `corpus/docx_reader/`: `(file
-/// name, package bytes, the limit [`read_raw_package`] must refuse it with
-/// — `None` when it must read)`. Built by `format_docx::test_fixtures`, so
-/// no blob is hand-maintained; `examples/regen-seeds` writes them.
-pub fn hostile_docx_seeds() -> Vec<(&'static str, Vec<u8>, Option<format_docx::PackageLimit>)> {
-    use format_docx::PackageLimit;
-    use format_docx::test_fixtures as fx;
-    vec![
-        (
-            "hostile_declared_4gib_part.docx",
-            fx::lying_size_docx(4 * 1024 * 1024 * 1024),
-            None,
-        ),
-        (
-            "hostile_declared_u64_max_part.docx",
-            fx::lying_size_docx(u64::MAX - 1),
-            None,
-        ),
-        (
-            "hostile_bomb_16mib_zeros.docx",
-            fx::compressible_bomb_docx(16 * 1024 * 1024),
-            Some(PackageLimit::PartBytes),
-        ),
-        (
-            "hostile_sdt_5000_nested.docx",
-            fx::nested_sdt_docx(5000),
-            Some(PackageLimit::XmlDepth),
-        ),
-        (
-            "table_nested_60_deep.docx",
-            fx::nested_tables_docx(60),
-            None,
-        ),
-    ]
 }

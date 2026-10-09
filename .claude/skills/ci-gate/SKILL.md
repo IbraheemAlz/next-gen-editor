@@ -26,6 +26,8 @@ cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
 echo "=== 2. clippy ==="
 cargo clippy --workspace --all-targets -- -D warnings
+# fuzz/ is its own workspace: --workspace does not lint it (issue #437)
+cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
 echo "=== 3. native tests ==="
 $CAP cargo test --workspace --lib

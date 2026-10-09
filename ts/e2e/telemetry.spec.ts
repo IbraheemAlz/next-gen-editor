@@ -118,6 +118,7 @@ test.describe('D5.7 telemetry transport (Issue #86)', () => {
         const kinds = await crashKinds();
         const recovered = kinds.find((k) => k.recovery_outcome === 'RECOVERED')!;
         expect(Object.keys(recovered.recovery ?? {}).sort()).toEqual([
+            'journal_gap',
             'log_truncated',
             'package_fallbacks',
             'package_lost',
