@@ -116,6 +116,25 @@ export interface EngineClientLike {
     onRendererDowngrade?(fn: (d: RendererDowngrade | undefined) => void): () => void;
     retryGpuRenderer?(): Promise<void>;
     /**
+     * Issue #330 - optional in-place engine restart for the crash overlay:
+     * `restartInPlace` re-spawns the engine from the event log (joining a
+     * recovery already under way), `prepareCarryOver` makes the next page
+     * reload carry the document. A page reload without it starts a new
+     * session and clears the log, so the overlay offers these buttons
+     * only when the client supplies them.
+     */
+    /**
+     * Issue #333 - optional checkpoint health: whether the worker's
+     * snapshot writes are landing. `failing` is set once the bounded
+     * retries of a failed write are exhausted (the replay tail is then
+     * growing) and cleared by the next successful write. The recovery
+     * banner turns it into a "save your work" warning.
+     */
+    readonly checkpointStatus?: CheckpointStatus;
+    onCheckpointStatus?(fn: (s: CheckpointStatus) => void): () => void;
+    restartInPlace?(): Promise<void>;
+    prepareCarryOver?(): Promise<void>;
+    /**
      * Issue #315 — optional crash-recovery report. The outcome of the most
      * recent recovery (`undefined` before any), and a feed that fires once
      * per completed recovery with its final report. Implementations
@@ -124,6 +143,13 @@ export interface EngineClientLike {
      */
     readonly lastRecovery?: RecoveryReport | undefined;
     onRecovery?(fn: (report: RecoveryReport) => void): () => void;
+}
+
+/** Issue #333 - see `EngineClientLike.checkpointStatus`. */
+export interface CheckpointStatus {
+    failing: boolean;
+    /** Consecutive failed snapshot writes in the current run. */
+    failures: number;
 }
 
 /**
@@ -161,7 +187,7 @@ export interface RecoveryReport {
     baseSnapshotAt: number | undefined;
     /** Issue #270 — why the recovery ran: a worker `trap`, or an in-place
      *  `renderer-retry` (a planned respawn, no crash). Absent = `trap`. */
-    cause?: 'trap' | 'renderer-retry';
+    cause?: 'trap' | 'renderer-retry' | 'engine-reload' | 'page-reload';
 }
 
 /** Read-only revision row consumed by the Track Changes sidebar. */
@@ -179,6 +205,11 @@ export interface RevisionSnapshot {
     /** Issue #262 — a paragraph-MARK revision (a tracked paragraph split
      *  or merge), addressed by the empty range at the paragraph end. */
     mark?: boolean;
+    /** Issue #304 — the revision's stable id: unique per row, unchanged
+     *  by edits elsewhere (two wrappers over one range are two ids).
+     *  Pass it to `acceptRevision` / `rejectRevision`. Optional so
+     *  engines that pre-date it still satisfy the contract. */
+    revision_id?: number;
 }
 
 /** Read-only comment row consumed by the Comments rail. Sprint 7

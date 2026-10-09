@@ -25,8 +25,18 @@ const EngineContext = createContext<EngineHandle | undefined>(undefined);
  */
 const DocumentDefaultsContext = createContext<DocumentDefaults | undefined>(undefined);
 
+/**
+ * Issue #340 - the host's telemetry collector endpoint. Telemetry has no
+ * URL-parameter or global configuration in the SDK: a host passes the
+ * endpoint here (or bakes it in at build time) and reads it back with
+ * `useTelemetryEndpoint()`. `undefined` = no collector (console only).
+ */
+const TelemetryEndpointContext = createContext<string | undefined>(undefined);
+
 export interface EngineProviderProps {
     client: EngineHandle;
+    /** Issue #340 - see [`TelemetryEndpointContext`]. */
+    telemetryEndpoint?: string | undefined;
     /** Issue #221 — see [`DocumentDefaultsContext`]'s doc comment above. */
     documentDefaults?: DocumentDefaults;
 }
@@ -35,7 +45,9 @@ export const EngineProvider: ParentComponent<EngineProviderProps> = (props) => {
     return (
         <EngineContext.Provider value={props.client}>
             <DocumentDefaultsContext.Provider value={props.documentDefaults}>
-                {props.children}
+                <TelemetryEndpointContext.Provider value={props.telemetryEndpoint}>
+                    {props.children}
+                </TelemetryEndpointContext.Provider>
             </DocumentDefaultsContext.Provider>
         </EngineContext.Provider>
     );
@@ -65,4 +77,10 @@ export function useEngine(): EngineHandle {
  */
 export function useDocumentDefaults(): DocumentDefaults | undefined {
     return useContext(DocumentDefaultsContext);
+}
+
+/** Issue #340 - the telemetry collector endpoint the host configured on
+ *  `<EngineProvider telemetryEndpoint={...}>`; `undefined` when none. */
+export function useTelemetryEndpoint(): string | undefined {
+    return useContext(TelemetryEndpointContext);
 }

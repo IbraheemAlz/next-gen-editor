@@ -131,6 +131,127 @@ fn gen_block(u: &mut Unstructured, allow_table: bool) -> Block {
     }
 }
 
+/// Issue #318 — leading bytes that switch `layout_paginate` into the
+/// nested-table shape ([`gen_nested_tower`]). A prefix, not a generator
+/// arm, so every pre-existing seed (and its libFuzzer descendants)
+/// decodes exactly as before; mutations of a `NEST` seed keep exploring
+/// deep nesting.
+pub const NESTING_MAGIC: &[u8; 4] = b"NEST";
+
+/// Issue #318 — deepest tower [`gen_nested_tower`] builds: far past the
+/// engine's layout cap (`MAX_TABLE_LAYOUT_DEPTH`, 32) and the reader's
+/// typed cap (64) — this tree bypasses the reader, so nothing but the
+/// layout bounds it.
+pub const MAX_FUZZ_NESTING: usize = 256;
+
+/// Issue #318 — the document `layout_paginate` lays out for `data`: a
+/// [`NESTING_MAGIC`]-prefixed input is a nested tower, anything else
+/// [`gen_document_tree`].
+pub fn gen_layout_document(data: &[u8]) -> DocumentTree {
+    match data.strip_prefix(NESTING_MAGIC.as_slice()) {
+        Some(rest) => gen_nested_tower(&mut Unstructured::new(rest)),
+        None => gen_document_tree(&mut Unstructured::new(data)),
+    }
+}
+
+/// Issue #318 — the committed seed for a `depth`-level tower: the magic
+/// and the depth (u16 LE). Every level's knobs then decode from exhausted
+/// entropy: a one-column autofit table whose cell holds `"level i"` and
+/// the next level — the shape of the corpus's `table_nested_200_deep.docx`.
+pub fn nesting_seed(depth: u16) -> Vec<u8> {
+    let mut seed = NESTING_MAGIC.to_vec();
+    seed.extend_from_slice(&depth.to_le_bytes());
+    seed
+}
+
+/// Issue #318 — a document holding one tower of `depth` nested tables
+/// (u16 LE, clamped to `1..=MAX_FUZZ_NESTING`), each level's column
+/// count, grid, autofit / fixed layout and text drawn from the rest of
+/// the input. The nested table rides cell 0 after the level's paragraph.
+/// Built bottom-up: no recursion here, whatever the depth.
+pub fn gen_nested_tower(u: &mut Unstructured) -> DocumentTree {
+    let depth = match u.bytes(2) {
+        Ok(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
+        Err(_) => 1,
+    }
+    .clamp(1, MAX_FUZZ_NESTING);
+    struct Level {
+        cols: u32,
+        grid: Vec<i32>,
+        fixed: bool,
+        text: String,
+    }
+    let levels: Vec<Level> = (0..depth)
+        .map(|i| {
+            /* One knob byte per level; exhausted entropy reads 0 — the
+            plain one-column autofit level (`Unstructured::ratio` would
+            read `true` there, so it is not used for these switches). */
+            let knobs: u8 = u.arbitrary().unwrap_or(0);
+            let cols = 1 + u32::from(knobs >> 3) % 3;
+            let grid = if knobs & 1 != 0 {
+                (0..cols).map(|_| small_i32(u, 8_000)).collect()
+            } else {
+                Vec::new()
+            };
+            Level {
+                cols,
+                grid,
+                fixed: (knobs >> 1) & 3 == 3,
+                text: format!("level {i} {}", gen_text(u)).trim_end().to_string(),
+            }
+        })
+        .collect();
+    let mut inner: Option<Table> = None;
+    for level in levels.into_iter().rev() {
+        let mut first = vec![Block::Paragraph(Paragraph {
+            text: level.text,
+            ..Default::default()
+        })];
+        if let Some(t) = inner.take() {
+            first.push(Block::Table(t));
+        }
+        let mut cells = vec![TableCell {
+            props: Default::default(),
+            blocks: first,
+            source_markup: None,
+        }];
+        for _ in 1..level.cols {
+            cells.push(TableCell {
+                props: Default::default(),
+                blocks: vec![Block::Paragraph(Paragraph::default())],
+                source_markup: None,
+            });
+        }
+        let mut table = Table {
+            grid: level.grid,
+            props: Default::default(),
+            rows: vec![TableRow {
+                props: Default::default(),
+                cells,
+                source_markup: None,
+            }],
+            dirty: false,
+            source_xml: None,
+            body_xml: None,
+            source_markup: None,
+        };
+        if level.fixed {
+            table.props.layout = engine::TableLayout::Fixed;
+        }
+        inner = Some(table);
+    }
+    let mut doc = DocumentTree::new();
+    doc.blocks.clear();
+    doc.blocks.push_back(Block::Paragraph(Paragraph {
+        text: "intro".to_string(),
+        ..Default::default()
+    }));
+    if let Some(t) = inner {
+        doc.blocks.push_back(Block::Table(t));
+    }
+    doc
+}
+
 /// Build a `DocumentTree` with a random top-level block sequence
 /// (paragraphs and at-most-one-level-deep tables) and, some of the time,
 /// degenerate page geometry (near-zero or negative content area) — exactly
@@ -160,4 +281,92 @@ pub fn gen_document_tree(u: &mut Unstructured) -> DocumentTree {
         doc.body_section.geometry = geometry;
     }
     doc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// libFuzzer's per-input `-timeout` in `fuzz-nightly.yml`.
+    const PER_INPUT_BUDGET: Duration = Duration::from_secs(30);
+
+    fn seed_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("corpus/layout_paginate/seed_nested_200")
+    }
+
+    /// Nesting levels of the tower `doc` holds (0 = no table).
+    fn tower_depth(doc: &DocumentTree) -> usize {
+        let mut depth = 0;
+        let mut table = doc.blocks.iter().find_map(|b| match b {
+            Block::Table(t) => Some(t),
+            Block::Paragraph(_) => None,
+        });
+        while let Some(t) = table {
+            depth += 1;
+            table = t.rows[0].cells[0].blocks.iter().find_map(|b| match b {
+                Block::Table(t) => Some(t),
+                Block::Paragraph(_) => None,
+            });
+        }
+        depth
+    }
+
+    /// Issue #318 — the committed seed is `nesting_seed(200)` and decodes
+    /// to a 200-deep tower of plain one-column autofit tables (the corpus
+    /// `table_nested_200_deep.docx` shape, without the reader's 64-level
+    /// cap). Regenerate with `cargo run --manifest-path fuzz/Cargo.toml
+    /// --example regen-seeds`.
+    #[test]
+    fn committed_nesting_seed_decodes_to_a_200_deep_tower() {
+        let committed = std::fs::read(seed_path()).expect("seed_nested_200");
+        assert_eq!(committed, nesting_seed(200), "seed_nested_200 is stale");
+        let doc = gen_layout_document(&committed);
+        assert_eq!(tower_depth(&doc), 200);
+        let Some(Block::Table(top)) = doc.blocks.get(1) else {
+            panic!("intro, then the tower");
+        };
+        assert!(top.grid.is_empty() && top.rows[0].cells.len() == 1);
+        assert!(matches!(top.props.layout, engine::TableLayout::Autofit));
+        /* Pre-existing seeds keep their decoding (no magic → the plain
+        generator, byte for byte). */
+        let mixed = [0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 3, 3, 3, 3];
+        let (a, b) = (
+            gen_layout_document(&mixed),
+            gen_document_tree(&mut Unstructured::new(&mixed)),
+        );
+        assert_eq!(a.blocks.len(), b.blocks.len());
+        assert_eq!(a.to_plain_text(), b.to_plain_text());
+        assert_eq!(
+            tower_depth(&gen_layout_document(&nesting_seed(u16::MAX))),
+            MAX_FUZZ_NESTING
+        );
+    }
+
+    /// Issue #318 acceptance — the 200-deep seed lays out (the layout used
+    /// to cost `F(400)` grid layouts: it never returned) inside the
+    /// per-input budget, degraded with a reported `NestingCapped`, and the
+    /// `layout_paginate` invariants hold.
+    #[test]
+    fn nesting_seed_lays_out_under_the_budget_with_nesting_capped() {
+        let seed = std::fs::read(seed_path()).expect("seed_nested_200");
+        let t0 = Instant::now();
+        let mut engine = engine_wasm::Engine::new_headless(gen_layout_document(&seed));
+        engine.ensure_layout_for_fuzzing().expect("layout");
+        let took = t0.elapsed();
+        let probe = engine.layout_probe_for_fuzzing().expect("a snapshot");
+        eprintln!("[#318] seed_nested_200: {took:?}, {probe:?}");
+        assert!(
+            took < PER_INPUT_BUDGET,
+            "{took:?} over the per-input budget"
+        );
+        assert!(
+            probe.degradations.iter().any(|d| d == "NestingCapped"),
+            "{:?}",
+            probe.degradations
+        );
+        assert!(probe.page_count >= 1);
+        crate::run_layout_paginate(&seed);
+    }
 }
