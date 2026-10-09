@@ -17,7 +17,8 @@
  * an opaque per-session id; the crash sample's `recent_commands` carries only
  * dispatched `Command.type` tags (e.g. `"INSERT_TEXT"`), never a command's
  * payload (which, for `InsertText`, IS document content). */
-import type { Command, Event, ReadWarning, ReadWarningKind } from '../engine/types';
+import type { Command, Event } from '../engine/types';
+import { readWarningCounts, type ReadWarningCount } from './read-warning-counts';
 import { installDevHook } from '../dev-hooks';
 
 type ErrorCode =
@@ -117,40 +118,7 @@ type TelemetryKind =
           read_warnings?: ReadWarningCount[];
       };
 
-/** Issue #406 — mirrors `bridge::ReadWarningCount`. */
-interface ReadWarningCount {
-    kind: ReadWarningKind;
-    count: number;
-}
 
-/** Issue #406 — `bridge::read_warning_counts`: fold an open's coalesced
- *  warnings by kind, kinds in ascending (declaration) order. */
-const READ_WARNING_KIND_ORDER: readonly ReadWarningKind[] = [
-    'TableNestingTooDeep',
-    'InvalidMeasure',
-    'MeasureClamped',
-    'UnclosedField',
-    'StrayFieldChar',
-    'FieldNestingTooDeep',
-    'NonCanonicalNamespaces',
-    'NotWordprocessingMl',
-    'MainPartFallback',
-    'UnsafeRelationshipTarget',
-];
-
-export function readWarningCounts(warnings: readonly ReadWarning[]): ReadWarningCount[] {
-    const byKind = new Map<ReadWarningKind, number>();
-    for (const w of warnings) {
-        byKind.set(w.kind, (byKind.get(w.kind) ?? 0) + Math.max(1, w.count ?? 1));
-    }
-    const rank = (k: ReadWarningKind): number => {
-        const i = READ_WARNING_KIND_ORDER.indexOf(k);
-        return i < 0 ? READ_WARNING_KIND_ORDER.length : i;
-    };
-    return [...byKind]
-        .sort(([a], [b]) => rank(a) - rank(b))
-        .map(([kind, count]) => ({ kind, count }));
-}
 
 interface TelemetryEvent {
     doc_id: string;
