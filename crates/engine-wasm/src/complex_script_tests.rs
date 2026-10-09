@@ -524,3 +524,84 @@ fn apply_formatting_routes_the_family_by_font_slot() {
     assert_eq!(s.font_family, Some(engine::FontFamily::Amiri));
     assert_eq!(s.font_family_cs, Some(engine::FontFamily::Amiri));
 }
+
+/* ================================================================
+Issue #424 — a family the font registry lacks claims exactly the slot
+the pick targeted.
+================================================================ */
+
+/// Paragraph 0's run style after a UI save and a reread: `(w:ascii, w:cs)`
+/// as the reader models them (`font_family` / `font_family_cs`) — the
+/// byte-level spelling is pinned by `tools/roundtrip`'s step 47.
+fn saved_slots(e: &Engine) -> (Option<String>, Option<String>) {
+    let saved = format_docx::save_docx(e.undo.current()).expect("save");
+    let back = format_docx::read_docx(&saved).expect("reread").document;
+    let s = back.nth_paragraph(0).unwrap().style_at(0);
+    let name = |f: Option<engine::FontFamily>| f.map(|f| f.display_name().to_string());
+    (name(s.font_family), name(s.font_family_cs))
+}
+
+/// Acceptance (#424): `ApplyFormatting { font_family: "Sakkal Majalla",
+/// font_slot: ComplexScript }` on mixed Latin + Arabic text — a face no
+/// registry ships — writes `w:cs="Sakkal Majalla"` and leaves the Latin
+/// slot's `w:ascii` / `w:hAnsi` alone; layout shapes the Arabic with the
+/// stack's Arabic fallback (no `.notdef`), the Latin with its own face.
+/// The Latin-slot pick is the mirror image.
+#[test]
+fn an_unregistered_family_claims_only_the_targeted_slot() {
+    let rpr = r#"<w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:cs="Noto Naskh Arabic"/>"#;
+    let len = BCS_TEXT.len() as u32;
+    let family = |slot: FontSlot| TextAttrsPatch {
+        font_family: Some("Sakkal Majalla".into()),
+        font_size: None,
+        ..patch(0.0, Some(slot))
+    };
+
+    let mut e = seed_font_engine(rpr);
+    select(&mut e, 0, 0, len);
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: family(FontSlot::ComplexScript),
+        },
+    );
+    let s = e.undo.current().nth_paragraph(0).unwrap().style_at(0);
+    assert_eq!(s.font_family, Some(engine::FontFamily::LiberationSans));
+    assert_eq!(
+        s.font_family_cs.as_ref().map(|f| f.display_name()),
+        Some("Sakkal Majalla")
+    );
+    for (arabic, font, notdef) in run_fonts(&e) {
+        assert_eq!(font, if arabic { "amiri" } else { "liberation" });
+        assert!(!notdef, "every glyph has a face");
+    }
+    assert_eq!(
+        saved_slots(&e),
+        (
+            Some("Liberation Sans".to_string()),
+            Some("Sakkal Majalla".to_string())
+        )
+    );
+
+    let mut e = seed_font_engine(rpr);
+    select(&mut e, 0, 0, len);
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: family(FontSlot::Latin),
+        },
+    );
+    assert_eq!(
+        saved_slots(&e),
+        (
+            Some("Sakkal Majalla".to_string()),
+            Some("Noto Naskh Arabic".to_string())
+        )
+    );
+    for (arabic, font, notdef) in run_fonts(&e) {
+        assert_eq!(font, if arabic { "noto-naskh" } else { "amiri" });
+        assert!(!notdef);
+    }
+}
