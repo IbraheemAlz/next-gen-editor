@@ -56,6 +56,19 @@ export type {
 } from './types';
 
 export { recoveryNotices, recoveryDegraded } from './recovery';
+
+/* Issue #342 — per-command metadata generated from `bridge::meta` (also
+ * importable on its own as `@nge/core/command-meta`, which the worker and
+ * `EngineClient` use so they never pull Solid into the worker bundle). */
+export { COMMAND_META, commandMeta } from './commandMeta.generated';
+export type {
+    CommandMeta,
+    CommandStatus,
+    CommandType,
+    StoryPolicy,
+    StubCommandType,
+    PartialCommandType,
+} from './commandMeta.generated';
 export type { RecoveryNotice, RecoveryNoticeKind, RecoveryNoticeOptions } from './recovery';
 
 export type {

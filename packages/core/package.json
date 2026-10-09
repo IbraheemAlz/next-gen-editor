@@ -10,6 +10,10 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"
+    },
+    "./command-meta": {
+      "types": "./src/commandMeta.generated.ts",
+      "import": "./src/commandMeta.generated.ts"
     }
   },
   "files": ["src"],

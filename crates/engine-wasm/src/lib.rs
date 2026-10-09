@@ -6885,168 +6885,63 @@ fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
 
 impl Engine {
     /// Phase 3 (#39) — story-mode command firewall. While a
-    /// header/footer story is active, commands split three ways:
-    /// - STORY-SCOPED (typing, deletes, splits, formatting, plain
-    ///   paste, selection/caret/hit-test) — handled by their normal
-    ///   arms; the handlers themselves branch into the story twins,
-    ///   and the geometry + selection-doc adapters re-root the rest.
-    /// - GLOBAL (paint, viewport, zoom, stats, undo/redo, save/export,
-    ///   fonts, a11y, enter/exit) — fall through unchanged.
-    /// - EVERYTHING ELSE (tables, images, comments, hyperlinks,
-    ///   sections, page setup, styles, lists, track-changes, IME
-    ///   composition, rich clipboard) — rejected loudly. The UI
-    ///   disables these controls in story mode (Honest UX); this is
-    ///   the engine-side backstop, never the primary affordance.
+    /// header/footer, note or text-box story is active, every command's
+    /// [`bridge::StoryPolicy`] (issue #342 — `crates/bridge/src/meta.rs`,
+    /// the single source of truth that replaced this match's hand list)
+    /// decides:
+    /// - `Allowed` — STORY-SCOPED commands (typing, deletes, splits,
+    ///   formatting, paragraph/list/style/table edits, fields, IME,
+    ///   selection/caret/hit-test, rich copy) whose handlers branch into
+    ///   the story twins or re-root through the geometry + selection-doc
+    ///   adapters (#72), and GLOBAL ones (paint, viewport, zoom, stats,
+    ///   undo/redo, save/export, fonts, a11y, enter/exit, snapshot /
+    ///   recover) — fall through unchanged.
+    /// - `TextBoxOnly` — picture edits carry an explicit, body-rooted
+    ///   address and never move a text byte, so they are allowed while a
+    ///   text box is open (#206), rejected in other stories.
+    /// - `ExitsStory` — document loads / close tear the story's ground
+    ///   away: exit to the body first, then handle normally.
+    /// - `BodyOnly` — everything else (images, comments, sections, page
+    ///   setup, track-changes, notes, rich paste, …) is rejected loudly.
+    ///   The UI disables these controls in story mode (Honest UX); this
+    ///   is the engine-side backstop, never the primary affordance.
     ///
     /// Returns `Some(Event::Error)` for a rejected command; `None`
-    /// lets `apply`'s normal dispatch proceed. Document loads exit the
-    /// story first (their ground is being torn away) and proceed.
+    /// lets `apply`'s normal dispatch proceed.
     fn story_gate(&mut self, cmd: &Command) -> Option<Event> {
         if !self.story_active() {
             return None;
         }
-        match cmd {
-            Command::Ping
-            | Command::LoadFont { .. }
-            | Command::InsertText { .. }
-            | Command::DeleteAtCaret { .. }
-            | Command::SplitParagraph { .. }
-            | Command::ApplyFormatting { .. }
-            | Command::ToggleFormatting { .. }
-            | Command::PastePlain { .. }
-            | Command::SetSelection { .. }
-            | Command::ExtendSelection { .. }
-            | Command::SelectAll
-            | Command::SelectWordAt { .. }
-            | Command::SelectParagraphAt { .. }
-            | Command::MoveCaret { .. }
-            | Command::HitTest { .. }
-            | Command::HitTestInPage { .. }
-            | Command::PlaceCaretAtPoint { .. }
-            | Command::ExtendSelectionToPoint { .. }
-            | Command::Undo
-            | Command::Redo
-            | Command::SetViewport { .. }
-            | Command::SetZoom { .. }
-            | Command::SetDeviceScale { .. }
-            | Command::RequestPaint { .. }
-            | Command::ExpandLayout { .. }
-            | Command::RequestStats
-            | Command::RequestAccessibilityDelta
-            | Command::SaveDocx
-            | Command::SaveDocument { .. }
-            | Command::ExportPdf { .. }
-            | Command::EnterHeaderFooter { .. }
-            | Command::ExitHeaderFooter
-            /* Issue #70/#74/#43 — story-scoped by design (link toggle)
-            or story-safe (section toggles re-anchor; field authoring
-            routes through the story adapter; the render date is
-            global state). */
-            | Command::SetHeaderFooterLink { .. }
-            | Command::SetTitlePage { .. }
-            | Command::SetEvenOddHeaders { .. }
-            | Command::InsertField { .. }
-            | Command::SetRenderDate { .. }
-            /* Issue #77 — F9 is document-wide (the active part
-            included), the code view is display state, and the
-            instruction edit routes through the story adapter. */
-            | Command::UpdateFields
-            | Command::SetFieldCodeView { .. }
-            | Command::SetFieldInstruction { .. }
-            /* Issue #72 — paragraph-property family. Each handler below
-            routes through `story_mutate` against the synthetic story
-            tree when a story is active. */
-            | Command::SetParagraphAlign { .. }
-            | Command::SetParagraphDirection { .. }
-            | Command::SetParagraphIndent { .. }
-            | Command::SetLineSpacing { .. }
-            | Command::SetParagraphShading { .. }
-            | Command::SetParagraphBorders { .. }
-            | Command::SetTabStops { .. }
-            /* Issue #72 — styles. `ApplyStyle` sets a paragraph's
-            `style_id` and routes through `story_mutate`. `ModifyStyle`
-            mutates the style TABLE, which is doc-global (shared by body
-            + every story) and already carried into the story tree by
-            `story_doc()`/merged back by `story_mutate`'s callers — but
-            `do_modify_style` itself writes straight to the real
-            `self.undo` tree, which is correct as-is in story mode (the
-            style table lives there, not in the story's block list), so
-            no handler change is needed for it. */
-            | Command::ApplyStyle { .. }
-            | Command::ModifyStyle { .. }
-            /* Issue #72 — lists. */
-            | Command::ToggleList { .. }
-            | Command::ChangeListLevel { .. }
-            /* Issue #72 — tables. Headers/footers can now hold tables
-            (`story_blocks` widened to `Vec<Block>`), so every table
-            mutation command routes through `story_mutate` the same way. */
-            | Command::InsertTable { .. }
-            | Command::DeleteTable { .. }
-            | Command::InsertRow { .. }
-            | Command::DeleteRow { .. }
-            | Command::InsertColumn { .. }
-            | Command::DeleteColumn { .. }
-            | Command::MergeCells { .. }
-            | Command::SplitCell { .. }
-            | Command::SetCellShading { .. }
-            | Command::SetCellBorders { .. }
-            /* Issue #79 — routes through `story_mutate` like the cell
-            property family above. */
-            | Command::SetTableProperties { .. }
-            /* Issue #72 — `SelectCellAt` resolves through
-            `document_geometry` (already story-aware) plus
-            `cell_content_span`, which now reads `self.selection_doc()`
-            instead of the body tree. */
-            | Command::SelectCellAt { .. }
-            /* Issue #72 — IME. The commit path already routes through
-            `do_insert_text_interactive`, which is story-aware; the
-            in-progress preview never touches the document tree. */
-            | Command::BeginComposition { .. }
-            | Command::UpdateComposition { .. }
-            | Command::EndComposition { .. }
-            /* Issue #72 — rich copy. `do_get_selection_as_clipboard` now
-            reads `self.selection_doc()` so a copy from inside a story
-            serializes the story's paragraphs, not the body's. */
-            | Command::GetSelectionAsClipboard { .. }
-            /* Issue #85 — a snapshot is a read of the whole session (the
-            active story included) and recovery rebuilds it wholesale. */
-            | Command::Snapshot { .. }
-            | Command::Recover { .. }
-            /* Issue #206 — the image-geometry query is a pure read of the
-            whole layout (text-box pictures included). */
-            | Command::GetImageRects => None,
-            /* Issue #206 — picture edits carry an explicit, body-rooted
-            address (`story` chain + path) and never move a text byte, so
-            the open box's `(host, at)` and its selection stay valid:
-            a picture in a box is edited while that box is open. */
-            Command::ResizeImage { .. } | Command::MoveImage { .. } | Command::SetImageWrap { .. }
+        match cmd.meta().story {
+            bridge::StoryPolicy::Allowed => None,
+            bridge::StoryPolicy::TextBoxOnly
                 if matches!(self.active_story, StoryTarget::TextBox { .. }) =>
             {
                 None
             }
-            /* Loading a document tears the story's ground away —
-            exit first, then handle normally. */
-            Command::LoadDocx { .. } | Command::OpenDocument { .. } => {
+            bridge::StoryPolicy::ExitsStory => {
                 self.exit_story_to_body();
                 None
             }
-            _ => Some(Event::Error {
-                message: match &self.active_story {
-                    StoryTarget::Note { .. } => {
-                        "This action isn't available while editing a footnote or endnote \
-                         — click back into the document body first."
+            bridge::StoryPolicy::BodyOnly | bridge::StoryPolicy::TextBoxOnly => {
+                Some(Event::Error {
+                    message: match &self.active_story {
+                        StoryTarget::Note { .. } => {
+                            "This action isn't available while editing a footnote or endnote \
+                             — click back into the document body first."
+                        }
+                        StoryTarget::TextBox { .. } => {
+                            "This action isn't available while editing a text box \
+                             — click outside the box first."
+                        }
+                        _ => {
+                            "This action isn't available while editing a header or footer \
+                             — exit the header/footer first."
+                        }
                     }
-                    StoryTarget::TextBox { .. } => {
-                        "This action isn't available while editing a text box \
-                         — click outside the box first."
-                    }
-                    _ => {
-                        "This action isn't available while editing a header or footer \
-                         — exit the header/footer first."
-                    }
-                }
-                .into(),
-            }),
+                    .into(),
+                })
+            }
         }
     }
 
@@ -7058,9 +6953,18 @@ impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         let seq_before = self.mutation_seq;
         let revision_before = self.undo.revision();
-        let evt = self.apply_command(cmd).await;
+        let mut evt = self.apply_command(cmd).await;
         if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
             self.mutation_seq += 1;
+        }
+        /* Issue #260 — a handler builds its `SelectionChanged` reply
+        before the bump above lands, so stamp the revision the command
+        actually left the document at. */
+        if let Event::SelectionChanged {
+            document_revision, ..
+        } = &mut evt
+        {
+            *document_revision = self.mutation_seq;
         }
         evt
     }
@@ -12073,6 +11977,9 @@ impl Engine {
             field_code_view: self.field_code_view,
             field_at_caret: self.field_ref_at_selection(&sel),
             zoom: self.user_zoom(),
+            /* Issue #260 — `apply` re-stamps this after the command's own
+            mutation bump; outside `apply` (replay) it is already final. */
+            document_revision: self.mutation_seq,
         }
     }
 
