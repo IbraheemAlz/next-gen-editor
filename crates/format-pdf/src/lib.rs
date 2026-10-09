@@ -2376,6 +2376,14 @@ fn collect_to_unicode_pages(
                     add_kashida_mappings(run, fonts, map);
                 }
             }
+            /* Issue #360 (found by veraPDF on a tagged list) — the list
+            marker's glyphs map through the marker's own text. After the
+            line runs, so a glyph the body already mapped keeps its entry
+            and a marker whose glyphs all show elsewhere changes nothing. */
+            if let Some(marker) = &para.marker {
+                let map = out.entry(marker.run.font.clone()).or_default();
+                add_marker_mappings(marker, map);
+            }
         };
         for_each_paragraph(&page.blocks, &mut collect);
         /* Issue #71 — band + footnote glyphs need /ToUnicode coverage
@@ -2445,6 +2453,39 @@ fn add_run_mappings(run: &VisualRun, text: &str, map: &mut BTreeMap<u16, Vec<cha
         if !chars.is_empty() {
             map.entry(g.id).or_insert(chars);
         }
+    }
+}
+
+/// Issue #360 — a list marker's glyph→Unicode mappings. The marker run
+/// is shaped from [`layout::MarkerBox::text`] (its `source_range` is
+/// empty), so its clusters partition that text the way a body run's
+/// partition the paragraph's. Without this a marker glyph that shows
+/// nowhere else ("2." in a list whose body never types a 2) had no
+/// `/ToUnicode` entry — a PDF/A-2u §6.2.11.7.2 / PDF/UA-1 §7.21.7
+/// failure.
+fn add_marker_mappings(marker: &layout::MarkerBox, map: &mut BTreeMap<u16, Vec<char>>) {
+    let text = marker.text.as_str();
+    let mut bounds: Vec<usize> = marker
+        .run
+        .glyphs
+        .iter()
+        .map(|g| g.cluster as usize)
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    for g in &marker.run.glyphs {
+        let start = g.cluster as usize;
+        let end = bounds
+            .iter()
+            .copied()
+            .find(|&b| b > start)
+            .unwrap_or(text.len())
+            .min(text.len());
+        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        map.entry(g.id)
+            .or_insert_with(|| text[start..end].chars().collect());
     }
 }
 
@@ -4080,6 +4121,24 @@ mod tests {
         );
     }
 
+    /// Issue #360 — a marker glyph that shows nowhere else ("7)" over a
+    /// body without a 7 or a parenthesis) still maps to Unicode: the
+    /// `/ToUnicode` CMap decodes the marker's own text.
+    #[test]
+    fn list_marker_glyphs_map_to_unicode() {
+        let stack = liberation_stack();
+        let page = page_with(&stack, "item", &[plain_span(4)], Some("7)"));
+        let mut out = Vec::new();
+        export_pdf(&[page], &stack, &["item"], PdfProfile::A2u, &mut out).expect("export");
+        let cmaps = test_support::to_unicode_cmaps(&out);
+        let mapped: String = cmaps.iter().flat_map(|m| m.values()).cloned().collect();
+        assert!(mapped.contains('7'), "marker digit unmapped: {mapped:?}");
+        assert!(
+            mapped.contains(')'),
+            "marker punctuation unmapped: {mapped:?}"
+        );
+    }
+
     /// The used-font collection must see the marker run — a marker-only
     /// paragraph (no line runs) still embeds its font.
     #[test]
@@ -4128,6 +4187,7 @@ mod tests {
                 baseline: 14.0,
                 run,
                 width: 10.0,
+                text: "1.".to_string(),
             }),
             source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
             fields: vec![],
