@@ -429,8 +429,15 @@ pub(crate) fn merge_font_bindings(
 /// applies (§17.3.2.26).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FontClass {
-    /// `ascii`, then `hAnsi`.
+    /// ASCII text (U+0000–U+007F): `ascii`, then `hAnsi` when the
+    /// cascade never binds `ascii`.
     Latin,
+    /// Every other non-complex, non-East-Asian character (accented
+    /// Latin, Greek, Cyrillic, symbol-font code points): `hAnsi`, then
+    /// `ascii`. A run naming a symbol face only in `w:hAnsi` over
+    /// theme-bound docDefaults shows its private-use symbols in that face
+    /// while its ASCII stays on the theme font.
+    HighAnsi,
     /// `eastAsia`.
     EastAsian,
     /// `cs`.
@@ -444,6 +451,26 @@ pub struct ResolvedFont {
     /// `true` when a theme binding produced it — before issue #355 the
     /// run had no family for this class and fell to the font stack.
     pub from_theme: bool,
+}
+
+impl FontClass {
+    /// The Latin-slot class for a run of `text`: [`FontClass::HighAnsi`]
+    /// when it holds any non-ASCII character outside the complex scripts
+    /// (Arabic, which the complex-script slot serves), else
+    /// [`FontClass::Latin`]. Layout segments by script, not by the ASCII
+    /// boundary, so a run mixing both takes one slot — they only differ
+    /// when a level binds `ascii` and `hAnsi` apart.
+    pub fn latin_for(text: &str) -> FontClass {
+        let high = text.chars().any(|c| {
+            !c.is_ascii()
+                && !matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}')
+        });
+        if high {
+            FontClass::HighAnsi
+        } else {
+            FontClass::Latin
+        }
+    }
 }
 
 impl crate::SpanStyle {
@@ -468,6 +495,7 @@ impl crate::SpanStyle {
     ) -> Option<ResolvedFont> {
         let binding = self.font_bindings.as_deref().and_then(|b| match class {
             FontClass::Latin => b.ascii.as_ref().or(b.h_ansi.as_ref()),
+            FontClass::HighAnsi => b.h_ansi.as_ref().or(b.ascii.as_ref()),
             FontClass::EastAsian => b.east_asia.as_ref(),
             FontClass::ComplexScript => b.cs.as_ref(),
         });

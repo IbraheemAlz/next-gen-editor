@@ -52,15 +52,29 @@ fn the_reader_records_each_slot_binding() {
     );
 }
 
-/// The canonical engine shape (names on ascii / hAnsi / cs, no theme)
-/// carries no bindings, so an engine-authored family round-trips equal;
-/// any other shape records the slots it mentions.
+/// The canonical engine shape (names on ascii / hAnsi / cs, an eastAsia
+/// name or not, no theme) carries no bindings, so an engine-authored
+/// family round-trips equal; any other shape records the slots it
+/// mentions (a missing hAnsi name leaves that slot to the cascade).
 #[test]
 fn the_canonical_name_shape_records_no_bindings() {
     for (rfonts, expect) in [
         (
             r#"<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>"#,
             None,
+        ),
+        (
+            r#"<w:rFonts w:ascii="Arial" w:eastAsia="SimSun" w:hAnsi="Arial" w:cs="Arial"/>"#,
+            None,
+        ),
+        (
+            r#"<w:rFonts w:ascii="Symbol" w:eastAsia="SimSun" w:cs="Arial"/>"#,
+            Some([
+                Some(FontBinding::Name),
+                None,
+                Some(FontBinding::Name),
+                Some(FontBinding::Name),
+            ]),
         ),
         (r#"<w:rFonts w:hint="cs"/>"#, None),
         (

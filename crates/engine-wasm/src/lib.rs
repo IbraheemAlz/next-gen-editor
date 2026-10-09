@@ -2775,14 +2775,21 @@ impl<'a> StyleContext<'a> {
     /// through the document theme (`SpanStyle::resolve_font`). The
     /// complex-script slot is resolved for Arabic text — the only
     /// complex script `layout` segments (`text_pipeline::Script`).
-    fn run_font_ids(&self, style: &engine::SpanStyle) -> (Option<String>, Option<String>) {
+    ///
+    /// `text` (the run's own characters) picks the Latin slot: `ascii`
+    /// for ASCII text, `hAnsi` for anything else (`FontClass::latin_for`).
+    fn run_font_ids(
+        &self,
+        style: &engine::SpanStyle,
+        text: &str,
+    ) -> (Option<String>, Option<String>) {
         let id = |class, hint| {
             style
                 .resolve_font(self.theme, class, hint)
                 .map(|r| font_family_id(&r.family).to_string())
         };
         (
-            id(engine::FontClass::Latin, None),
+            id(engine::FontClass::latin_for(text), None),
             id(engine::FontClass::ComplexScript, Some("Arab")),
         )
     }
@@ -2829,7 +2836,8 @@ fn build_style_spans(
     empty in fresh documents — byte-identical to the old flat gap. */
     let run_base = sctx.run_base(para.style_id.as_deref());
     let emit = |style: &engine::SpanStyle, start: u32, end: u32, out: &mut Vec<StyleSpan>| {
-        let (font_family, font_family_cs) = sctx.run_font_ids(style);
+        let text = para.text.get(start as usize..end as usize).unwrap_or("");
+        let (font_family, font_family_cs) = sctx.run_font_ids(style, text);
         let raw_base_px = style.font_size.unwrap_or(default_size) * scale;
         let vert = style.vert_align.unwrap_or(engine::VertAlign::Baseline);
         let (px_factor, shift_factor) = match vert {
@@ -3044,6 +3052,8 @@ fn composition_layout_spans(
         &sctx
             .run_base(para.style_id.as_deref())
             .merged_with(st.clone()),
+        /* The preview's own text is not in `para.text`. */
+        "",
     );
     out.push(StyleSpan {
         start: off,

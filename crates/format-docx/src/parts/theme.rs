@@ -82,11 +82,15 @@ pub fn read_document_theme(
 /// the slot is named, else nothing.
 ///
 /// `None` when the element binds no slot (a bare `w:hint`) and for the
-/// canonical shape — no theme attribute, names on exactly `ascii`, `hAnsi`
-/// and `cs` (what the engine's own writer spells for a family): a family
-/// without bindings claims precisely those slots in
-/// [`engine::SpanStyle::merged_with`], so the two are the same statement
-/// and an engine-authored family round-trips to an equal style.
+/// canonical shape — no theme attribute, names on `ascii`, `hAnsi` and
+/// `cs` (what the engine's own writer spells for a family), with or
+/// without an `eastAsia` name: a family without bindings claims exactly
+/// those three slots in [`engine::SpanStyle::merged_with`], so the two are
+/// the same statement for everything layout resolves (it has no East
+/// Asian class), an engine-authored family round-trips to an equal style,
+/// and Word's common all-four-names spelling keeps coalescing with an
+/// equally formatted neighbour instead of splitting a shaping run over a
+/// slot nothing reads.
 pub fn rfonts_bindings(e: &BytesStart) -> Option<Box<RunFontBindings>> {
     let w_attr = |key: &[u8]| crate::schema::ct_rpr::attr_val(e, key);
     let slot = |name: &[u8], theme: &[u8]| match w_attr(theme) {
@@ -100,7 +104,10 @@ pub fn rfonts_bindings(e: &BytesStart) -> Option<Box<RunFontBindings>> {
         cs: slot(b"w:cs", b"w:cstheme"),
     };
     let named = Some(FontBinding::Name);
-    let canonical = b.ascii == named && b.h_ansi == named && b.cs == named && b.east_asia.is_none();
+    let canonical = b.ascii == named
+        && b.h_ansi == named
+        && b.cs == named
+        && matches!(b.east_asia, None | Some(FontBinding::Name));
     (!b.is_empty() && !canonical).then(|| Box::new(b))
 }
 
