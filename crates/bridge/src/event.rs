@@ -896,6 +896,11 @@ pub enum LayoutDegradeReason {
     /// flattened to its paragraphs (stacked, in document order, in the
     /// cell holding it) instead of laid out as a grid.
     NestingCapped,
+    /// Issue #379 — a TABLE layout-cache entry (the nested-table memo or
+    /// the content-keyed table cache that survives between paints) failed
+    /// its post-conditions and the table was re-laid from scratch.
+    /// Distinct from `CacheMismatch` (the paragraph cache).
+    TableCacheMismatch,
 }
 
 /// Issue #87 — one degradation note on `Event::Painted`. `page` is the

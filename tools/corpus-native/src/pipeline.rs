@@ -562,6 +562,16 @@ pub struct DocResult {
     /// reported (`Event::Painted.layout_degraded`), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engine_degradations: Vec<String>,
+    /// Issue #379 — ms a second full production layout took with every
+    /// cross-paint layout cache warm (paragraph LRU + content-keyed table
+    /// cache): the repaint an edit elsewhere triggers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_repaint_ms: Option<u128>,
+    /// Issue #379 — whether that warm repaint reproduced the cold layout
+    /// exactly (page count, geometry fingerprint, degradations). `false`
+    /// is a cache bug — `tools/corpus/report.mjs` flags it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_repaint_consistent: Option<bool>,
     /// Issue #355 — how the document's runs resolve theme fonts. Absent
     /// when the read failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -726,6 +736,8 @@ impl DocResult {
             engine_fingerprint: None,
             theme_fonts: None,
             engine_degradations: Vec::new(),
+            engine_repaint_ms: None,
+            engine_repaint_consistent: None,
         }
     }
 
@@ -1081,8 +1093,14 @@ pub fn run_one(
 /// below what the worker's main thread gets, so ask for plenty.
 const ENGINE_LAYOUT_STACK_BYTES: usize = 256 << 20;
 
-/// What the production-layout thread reports back.
-type EngineLayoutReport = Result<Result<engine_wasm::LayoutProbe, String>, CaughtPanic>;
+/// What the production-layout thread reports back: the cold layout's
+/// probe and, issue #379, the warm repaint's probe + duration.
+type EngineLayoutReport =
+    Result<Result<(engine_wasm::LayoutProbe, WarmRepaint), String>, CaughtPanic>;
+
+/// Issue #379 — the warm repaint's probe and how long it took (`Err`
+/// when it failed outright).
+type WarmRepaint = Result<(engine_wasm::LayoutProbe, Duration), String>;
 
 /// Issue #418 — the wall-clock backstop is this many times the (CPU)
 /// budget: generous enough that a machine at load 8x its core count still
@@ -1112,16 +1130,31 @@ fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Durati
         .stack_size(ENGINE_LAYOUT_STACK_BYTES)
         .spawn(move || {
             let t0 = Instant::now();
-            let report = panics::catch(move || {
-                let mut engine = engine_wasm::Engine::new_headless(doc);
-                match engine.ensure_layout_for_fuzzing() {
-                    Ok(()) => engine
-                        .layout_probe_for_fuzzing()
-                        .ok_or_else(|| "no layout snapshot after layout".to_string()),
-                    Err(e) => Err(format!("{e:?}")),
-                }
-            });
-            let _ = tx.send((report, t0.elapsed()));
+            let cold_took = std::cell::Cell::new(Duration::ZERO);
+            let report = panics::catch(
+                || -> Result<(engine_wasm::LayoutProbe, WarmRepaint), String> {
+                    let mut engine = engine_wasm::Engine::new_headless(doc);
+                    let probe = |engine: &engine_wasm::Engine| {
+                        engine
+                            .layout_probe_for_fuzzing()
+                            .ok_or_else(|| "no layout snapshot after layout".to_string())
+                    };
+                    engine
+                        .ensure_layout_for_fuzzing()
+                        .map_err(|e| format!("{e:?}"))?;
+                    cold_took.set(t0.elapsed());
+                    let cold = probe(&engine)?;
+                    /* Issue #379 — the same layout again, caches warm. */
+                    let t1 = Instant::now();
+                    let warm = engine
+                        .relayout_warm_for_fuzzing()
+                        .map_err(|e| format!("{e:?}"))
+                        .and_then(|()| probe(&engine))
+                        .map(|p| (p, t1.elapsed()));
+                    Ok((cold, warm))
+                },
+            );
+            let _ = tx.send((report, cold_took.get()));
         });
     if let Err(e) = spawned {
         rec.mark_error("engine_layout", &format!("spawn failed: {e}"));
@@ -1156,8 +1189,15 @@ fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Durati
     rec.engine_layout_cpu_ms = cpu_ms;
     rec.engine_layout_wall_ms = Some(wall_ms);
     match received {
-        Some((Ok(Ok(probe)), took)) => {
+        Some((Ok(Ok((probe, warm))), took)) => {
             rec.engine_layout_ms = Some(took.as_millis());
+            match warm {
+                Ok((warm, warm_took)) => {
+                    rec.engine_repaint_ms = Some(warm_took.as_millis());
+                    rec.engine_repaint_consistent = Some(warm == probe);
+                }
+                Err(_) => rec.engine_repaint_consistent = Some(false),
+            }
             rec.engine_page_count = Some(probe.page_count);
             rec.engine_fingerprint = Some(format!("{:#018x}", probe.fingerprint));
             rec.engine_degradations = probe.degradations;

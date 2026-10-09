@@ -7,6 +7,12 @@
  *   - insert char @ caret, p95 over 100 keystrokes (one-page seeded document)
  *   - open a 50-page .docx
  *
+ * plus, issue #379, the table-heavy repaint (report only, ungated): open
+ * `tests/perf/tables-30p.docx` (22 three-deep nested autofit tables,
+ * `tools/perf-fixtures`) and time one-character body edits — each one a
+ * repaint that re-lays (or, with the cross-paint table cache, reuses)
+ * every table in the viewport band.
+ *
  * Usage:
  *   node run.mjs                    — report only, Tier-2 budgets
  *   node run.mjs --hardware tier-1  — Tier-1 (stricter) budgets
@@ -28,6 +34,8 @@ import { chromium } from 'playwright';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PERF_DOC = join(HERE, '..', '..', 'tests', 'perf', '50p.docx');
+/* Issue #379 — the table-heavy repaint fixture. */
+const TABLES_DOC = join(HERE, '..', '..', 'tests', 'perf', 'tables-30p.docx');
 const ORIGIN = process.env.URL ?? 'http://localhost:5173';
 
 const argv = process.argv.slice(2);
@@ -50,6 +58,8 @@ if (!budget) {
 }
 
 const INSERT_KEYSTROKES = 100;
+/* Issue #379 — body edits timed on the table-heavy fixture. */
+const TABLE_REPAINT_KEYSTROKES = 40;
 
 function percentile(samples, p) {
     const sorted = [...samples].sort((a, b) => a - b);
@@ -63,6 +73,7 @@ const browser = await chromium.launch({ headless: true, channel: 'chrome' });
 let coldStartMs = 0;
 let samples = [];
 let openDocMs = null;
+let tables = null;
 try {
     const page = await (await browser.newContext()).newPage();
 
@@ -105,6 +116,39 @@ try {
     } else {
         console.warn(`[perf] ${PERF_DOC} missing — skipping open-doc metric`);
     }
+
+    /* --- Issue #379: repaint on a table-heavy document --- */
+    if (existsSync(TABLES_DOC)) {
+        const docxBytes = Array.from(readFileSync(TABLES_DOC));
+        tables = await page.evaluate(
+            async ({ bytes, n }) => {
+                const start = performance.now();
+                const evt = await window.__dispatch({
+                    type: 'LOAD_DOCX',
+                    bytes: new Uint8Array(bytes),
+                });
+                const openMs = performance.now() - start;
+                if (evt.type !== 'DOCUMENT_LOADED') return { openMs: -1, samples: [] };
+                /* One-character edits in the intro paragraph, above every
+                   table: the engine's reply follows its auto-repaint, so the
+                   round trip is the repaint an edit elsewhere triggers. */
+                const samples = [];
+                for (let i = 0; i < n; i++) {
+                    const t = performance.now();
+                    await window.__dispatch({
+                        type: 'INSERT_TEXT',
+                        at: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 },
+                        text: 'x',
+                    });
+                    samples.push(performance.now() - t);
+                }
+                return { openMs, samples };
+            },
+            { bytes: docxBytes, n: TABLE_REPAINT_KEYSTROKES },
+        );
+    } else {
+        console.warn(`[perf] ${TABLES_DOC} missing — skipping table repaint metric (run tools/perf-fixtures)`);
+    }
 } finally {
     await browser.close();
 }
@@ -122,6 +166,20 @@ console.log(
 if (openDocMs !== null) {
     const shown = openDocMs < 0 ? 'LOAD_DOCX failed' : `${openDocMs.toFixed(0)} ms`;
     console.log(`[perf] open 50-page document     : ${shown} (budget ${budget.openDocMs} ms)`);
+}
+
+if (tables !== null) {
+    if (tables.openMs < 0) {
+        console.log('[perf] table-heavy document      : LOAD_DOCX failed');
+    } else {
+        const tp50 = percentile(tables.samples, 50);
+        const tp95 = percentile(tables.samples, 95);
+        console.log(
+            `[perf] table-heavy doc (#379)    : open ${tables.openMs.toFixed(0)} ms · ` +
+                `repaint after body edit x${tables.samples.length} p50 ${tp50.toFixed(2)} ms · ` +
+                `p95 ${tp95.toFixed(2)} ms (report only)`,
+        );
+    }
 }
 
 /* Gated budgets: cold start + insert p95 — the achievable §6 numbers a

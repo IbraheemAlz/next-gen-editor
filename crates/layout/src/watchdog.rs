@@ -139,6 +139,12 @@ pub enum DegradeReason {
     /// pathologically deep (hostile or corrupt) nesting — a paint, never
     /// a hang.
     NestingCapped,
+    /// Issue #379 — a table layout-cache entry (the per-call nested-table
+    /// memo, or the content-keyed cache that survives between paints)
+    /// failed its post-conditions and the table was re-laid from scratch.
+    /// Distinct from [`DegradeReason::CacheMismatch`] (the paragraph LRU)
+    /// so telemetry tells the two cache tiers apart.
+    TableCacheMismatch,
 }
 
 impl DegradeReason {
@@ -164,6 +170,7 @@ impl DegradeReason {
             DegradeReason::NoteRestartCap => "NOTE_RESTART_CAP",
             DegradeReason::FloatClampedByNotes => "FLOAT_CLAMPED_BY_NOTES",
             DegradeReason::NestingCapped => "NESTING_CAPPED",
+            DegradeReason::TableCacheMismatch => "TABLE_CACHE_MISMATCH",
         }
     }
 }
