@@ -188,7 +188,7 @@ fn marks(doc: &DocumentTree) -> Vec<Option<(RevisionKind, Option<u32>)>> {
     doc.blocks
         .iter()
         .filter_map(engine::Block::as_paragraph)
-        .map(|p| p.mark_revision.as_ref().map(|r| (r.kind, r.id)))
+        .map(|p| p.mark_revision().map(|r| (r.kind, r.id)))
         .collect()
 }
 
@@ -292,5 +292,323 @@ pub(crate) fn run_paragraph_mark_revisions_roundtrip() -> Result<()> {
         }
     }
     println!("[roundtrip] step 32d OK — accept-all / reject-all resolve marks, save clean");
+    Ok(())
+}
+
+/// Issue #303 — a paragraph mark carrying TWO tracked changes: reviewer A
+/// inserted it (a split), reviewer B deleted it again, next to other mark
+/// formatting.
+const DOUBLE_MARK_BODY: &str = concat!(
+    r#"<w:p w:rsidR="00A1B2C3"><w:pPr><w:rPr><w:ins w:id="20" w:author="A" w:date="2026-01-01T00:00:00Z"/><w:del w:id="21" w:author="B" w:date="2026-01-02T00:00:00Z"/><w:b/></w:rPr></w:pPr>"#,
+    r#"<w:r><w:t xml:space="preserve">one </w:t></w:r></w:p>"#,
+    r#"<w:p><w:r><w:t>two</w:t></w:r></w:p>"#,
+);
+
+fn all_marks(doc: &DocumentTree) -> Vec<Vec<(RevisionKind, Option<u32>)>> {
+    doc.blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .map(|p| p.mark_revisions.iter().map(|r| (r.kind, r.id)).collect())
+        .collect()
+}
+
+/// Issue #303 — step 36: two tracked changes on one paragraph mark.
+///
+/// a. `<w:rPr><w:ins/><w:del/>` reads as BOTH `Paragraph::mark_revisions`
+///    (the second used to stay in the mark's property bytes); an untouched
+///    save is byte-identical.
+/// b. An edit in that paragraph is a pure insertion (the verified source
+///    `<w:pPr>` carries both changes).
+/// c. A regenerated `<w:pPr>` re-injects both, in order; they re-read.
+/// d. Accept-all and reject-all resolve both (in order — either way the
+///    mark goes): one paragraph, and no `<w:ins>` / `<w:del>` left in the
+///    saved file or on re-read.
+pub(crate) fn run_double_mark_revisions_roundtrip() -> Result<()> {
+    let xml = document(DOUBLE_MARK_BODY);
+    let bytes = build_styled_docx(STYLES_XML, &xml);
+    let archive = read_docx(&bytes).context("read double-mark fixture")?;
+    let doc = &archive.document;
+    let want = vec![
+        vec![
+            (RevisionKind::Insert, Some(20)),
+            (RevisionKind::Delete, Some(21)),
+        ],
+        vec![],
+    ];
+    if all_marks(doc) != want {
+        bail!("step 36a: marks read as {:?}", all_marks(doc));
+    }
+    let untouched = write_docx(&archive, doc).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != xml.as_bytes() {
+        bail!("step 36a: untouched double-mark document drifted");
+    }
+    println!("[roundtrip] step 36a OK — both mark changes modeled, untouched save byte-identical");
+
+    let edited = doc.insert_text(at(0, 2), INSERT_TEXT);
+    for (path, out) in [
+        (
+            "write_docx",
+            write_docx(&archive, &edited).context("write")?,
+        ),
+        (
+            "save_docx",
+            format_docx::save_docx(&edited).context("ui save")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&out).with_context(|| format!("step 36b {path}"))?;
+        let got = extract_doc_xml(&out)?;
+        let (_, rewritten, _) = rewritten_region(xml.as_bytes(), &got);
+        if rewritten != 0 {
+            bail!(
+                "step 36b {path}: the edit rewrote {rewritten} source bytes\n{}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+    }
+    println!("[roundtrip] step 36b OK — an edit in the double-mark paragraph is a pure insertion");
+
+    let realigned = doc.set_alignment(at(0, 0), at(0, 0), Alignment::End);
+    let out = write_docx(&archive, &realigned).context("realigned save")?;
+    assert_document_xml_well_formed(&out).context("step 36c")?;
+    let got = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
+    let needle = concat!(
+        r#"<w:rPr><w:ins w:id="20" w:author="A" w:date="2026-01-01T00:00:00Z"/>"#,
+        r#"<w:del w:id="21" w:author="B" w:date="2026-01-02T00:00:00Z"/><w:b/></w:rPr>"#,
+    );
+    if !got.contains(needle) {
+        bail!("step 36c: regenerated pPr lost {needle}\n{got}");
+    }
+    let reread = read_docx(&out).context("re-read realigned")?;
+    if all_marks(&reread.document) != want {
+        bail!(
+            "step 36c: marks re-read as {:?}",
+            all_marks(&reread.document)
+        );
+    }
+    println!("[roundtrip] step 36c OK — a regenerated pPr re-injects both mark changes");
+
+    for accept in [true, false] {
+        let resolved = doc.resolve_all_revisions(accept);
+        if texts(&resolved) != vec!["one two"] || resolved.has_revisions() {
+            bail!("step 36d (accept={accept}): {:?}", texts(&resolved));
+        }
+        for (path, out) in [
+            (
+                "write_docx",
+                write_docx(&archive, &resolved).context("write resolved")?,
+            ),
+            (
+                "save_docx",
+                format_docx::save_docx(&resolved).context("save resolved")?,
+            ),
+        ] {
+            assert_document_xml_well_formed(&out)
+                .with_context(|| format!("step 36d {path} {accept}"))?;
+            let got = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
+            if got.contains("<w:del ") || got.contains("<w:ins ") {
+                bail!("step 36d {path} (accept={accept}): a mark change survived\n{got}");
+            }
+            let reread = read_docx(&out).context("re-read resolved")?;
+            if reread.document.has_revisions() || texts(&reread.document) != vec!["one two"] {
+                bail!(
+                    "step 36d {path} (accept={accept}): re-read {:?}",
+                    texts(&reread.document)
+                );
+            }
+        }
+    }
+    println!("[roundtrip] step 36d OK — accept-all / reject-all resolve both mark changes");
+    Ok(())
+}
+
+/// Issues #301 / #298 — a plain source paragraph pair the tracked
+/// structural edits run on.
+const TRACKED_EDIT_BODY: &str = concat!(
+    r#"<w:p w:rsidR="00C0FFEE"><w:r><w:t>alpha beta</w:t></w:r></w:p>"#,
+    r#"<w:p><w:r><w:t>gamma delta</w:t></w:r></w:p>"#,
+);
+
+const REVIEWER: &str = "Reviewer";
+const REVIEW_DATE: &str = "2026-10-09T00:00:00Z";
+
+/// Save `doc` on both paths; each output well-formed, re-read.
+fn save_and_reread(
+    step: &str,
+    archive: &format_docx::DocxArchive,
+    doc: &DocumentTree,
+) -> Result<Vec<(String, DocumentTree)>> {
+    let mut out = Vec::new();
+    for (path, bytes) in [
+        ("write_docx", write_docx(archive, doc).context("write")?),
+        ("save_docx", format_docx::save_docx(doc).context("ui save")?),
+    ] {
+        assert_document_xml_well_formed(&bytes).with_context(|| format!("{step} {path}"))?;
+        let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+        let reread = read_docx(&bytes).with_context(|| format!("{step} {path} re-read"))?;
+        out.push((xml, reread.document));
+    }
+    Ok(out)
+}
+
+/// `got` carries the reviewer's paragraph-mark revision element `tag`
+/// (`<w:pPr><w:rPr><w:ins …/>`) under a numeric, non-zero id: an
+/// engine-made mark has no source id and is minted a package-unique one
+/// at save (issue #295 — it used to be written `w:id="0"`).
+fn has_minted_mark(got: &str, tag: &str) -> bool {
+    let head = format!(r#"<w:pPr><w:rPr><{tag} w:id=""#);
+    let tail = format!(r#"" w:author="{REVIEWER}" w:date="{REVIEW_DATE}"/></w:rPr></w:pPr>"#);
+    got.match_indices(&head).any(|(at, _)| {
+        let rest = &got[at + head.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && &rest[..digits] != "0" && rest[digits..].starts_with(&tail)
+    })
+}
+
+/// Issue #301 — step 37: a paragraph break typed with track changes on.
+///
+/// a. `tracked_split_paragraph` records the new mark (ending the left
+///    half) as inserted by the reviewer; both save paths write it as
+///    `<w:pPr><w:rPr><w:ins …/>` and it re-reads as such.
+/// b. Reject-all on the re-read document merges the halves back; the
+///    save carries no `<w:ins>`.
+/// c. Accept-all keeps the break, clean.
+pub(crate) fn run_tracked_split_roundtrip() -> Result<()> {
+    let xml = document(TRACKED_EDIT_BODY);
+    let bytes = build_styled_docx(STYLES_XML, &xml);
+    let archive = read_docx(&bytes).context("read tracked-edit fixture")?;
+    let split = archive
+        .document
+        .tracked_split_paragraph(at(0, 5), REVIEWER, REVIEW_DATE);
+    let want_marks = vec![vec![(RevisionKind::Insert, None)], vec![], vec![]];
+    let mut reread_split = None;
+    for (got, reread) in save_and_reread("step 37a", &archive, &split)? {
+        if !has_minted_mark(&got, "w:ins") {
+            bail!("step 37a: the inserted mark was not written\n{got}");
+        }
+        let marks: Vec<Vec<(RevisionKind, Option<u32>)>> = reread
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| p.mark_revisions.iter().map(|r| (r.kind, None)).collect())
+            .collect();
+        if texts(&reread) != vec!["alpha", " beta", "gamma delta"] || marks != want_marks {
+            bail!("step 37a: re-read {:?} / {marks:?}", texts(&reread));
+        }
+        reread_split = Some(reread);
+    }
+    println!("[roundtrip] step 37a OK — a tracked Enter writes and re-reads an inserted mark");
+
+    let reread_split = reread_split.context("no re-read")?;
+    for (accept, want) in [
+        (false, vec!["alpha beta", "gamma delta"]),
+        (true, vec!["alpha", " beta", "gamma delta"]),
+    ] {
+        let step = if accept { "step 37c" } else { "step 37b" };
+        let resolved = reread_split.resolve_all_revisions(accept);
+        if texts(&resolved) != want || resolved.has_revisions() {
+            bail!("{step}: resolved to {:?}", texts(&resolved));
+        }
+        for (got, reread) in save_and_reread(step, &archive, &resolved)? {
+            if got.contains("<w:ins ") || reread.has_revisions() || texts(&reread) != want {
+                bail!("{step}: saved {:?}\n{got}", texts(&reread));
+            }
+        }
+    }
+    println!(
+        "[roundtrip] step 37b/c OK — reject-all merges the tracked break back, accept-all keeps it"
+    );
+    Ok(())
+}
+
+/// Issue #298 — step 38: a deletion across a paragraph mark with track
+/// changes on.
+///
+/// a. `try_tracked_delete_range` marks the first paragraph's tail, the
+///    swallowed mark and the second paragraph's head deleted; both save
+///    paths write `<w:del>` / `<w:delText>` and the mark's
+///    `<w:pPr><w:rPr><w:del …/>`, which re-read as such.
+/// b. Accept-all on the re-read document merges the survivors; the save
+///    carries no revision.
+/// c. Reject-all restores both paragraphs; the save carries no revision
+///    and rewrites no source byte (`write_docx`).
+pub(crate) fn run_tracked_cross_paragraph_delete_roundtrip() -> Result<()> {
+    let xml = document(TRACKED_EDIT_BODY);
+    let bytes = build_styled_docx(STYLES_XML, &xml);
+    let archive = read_docx(&bytes).context("read tracked-edit fixture")?;
+    let deleted = archive
+        .document
+        .try_tracked_delete_range(at(0, 6), at(1, 6), REVIEWER, REVIEW_DATE)
+        .map_err(|e| anyhow::anyhow!("step 38a: refused: {e}"))?
+        .doc;
+    let mut reread_deleted = None;
+    for (got, reread) in save_and_reread("step 38a", &archive, &deleted)? {
+        if !has_minted_mark(&got, "w:del") || !got.contains("<w:delText") {
+            bail!("step 38a: the deleted mark / text was not written\n{got}");
+        }
+        let kinds: Vec<Vec<RevisionKind>> = reread
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| p.mark_revisions.iter().map(|r| r.kind).collect())
+            .collect();
+        let text_revs: Vec<Vec<(RevisionKind, u32, u32)>> = reread
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| {
+                p.revisions
+                    .iter()
+                    .map(|r| (r.kind, r.start, r.end))
+                    .collect()
+            })
+            .collect();
+        if texts(&reread) != vec!["alpha beta", "gamma delta"]
+            || kinds != vec![vec![RevisionKind::Delete], vec![]]
+            || text_revs
+                != vec![
+                    vec![(RevisionKind::Delete, 6, 10)],
+                    vec![(RevisionKind::Delete, 0, 6)],
+                ]
+        {
+            bail!(
+                "step 38a: re-read {:?} / {kinds:?} / {text_revs:?}",
+                texts(&reread)
+            );
+        }
+        reread_deleted = Some(reread);
+    }
+    println!("[roundtrip] step 38a OK — a cross-paragraph tracked delete writes and re-reads");
+
+    let reread_deleted = reread_deleted.context("no re-read")?;
+    for (accept, want) in [
+        (true, vec!["alpha delta"]),
+        (false, vec!["alpha beta", "gamma delta"]),
+    ] {
+        let step = if accept { "step 38b" } else { "step 38c" };
+        let resolved = reread_deleted.resolve_all_revisions(accept);
+        if texts(&resolved) != want || resolved.has_revisions() {
+            bail!("{step}: resolved to {:?}", texts(&resolved));
+        }
+        for (got, reread) in save_and_reread(step, &archive, &resolved)? {
+            if got.contains("<w:del ") || reread.has_revisions() || texts(&reread) != want {
+                bail!("{step}: saved {:?}\n{got}", texts(&reread));
+            }
+        }
+    }
+    /* Rejecting on the in-memory tree (source markup intact) gives the
+    source bytes back. */
+    let rejected = deleted.resolve_all_revisions(false);
+    let out = write_docx(&archive, &rejected).context("write rejected")?;
+    let got = extract_doc_xml(&out)?;
+    let (_, rewritten, _) = rewritten_region(xml.as_bytes(), &got);
+    if rewritten != 0 {
+        bail!(
+            "step 38c: the reject rewrote {rewritten} source bytes\n{}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+    println!(
+        "[roundtrip] step 38b/c OK — accept-all merges, reject-all restores (no source byte rewritten)"
+    );
     Ok(())
 }

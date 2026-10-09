@@ -815,7 +815,7 @@ impl MarkupCapture {
             style_id: style_id.clone(),
             list_item,
             /* Issue #262 — stamped by the part parser. */
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         });
         Some(Box::new(SourceMarkup {
             text_len,
