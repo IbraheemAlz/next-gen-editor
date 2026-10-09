@@ -61,6 +61,7 @@ mod fonts;
 mod nativelayout;
 mod panics;
 mod pipeline;
+mod regen;
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -85,6 +86,9 @@ struct Args {
     /// Issue #318 — `--time`: one timing line per document on stderr and
     /// the slowest production layouts in the summary.
     time: bool,
+    /// Issue #384 — `--regen-check`: regenerate every clean paragraph
+    /// with no edit and histogram the mismatches by class.
+    regen_check: bool,
 }
 
 /// Issue #318 — default per-document production-layout budget. Every
@@ -106,6 +110,7 @@ fn parse_args() -> Args {
         budget: Duration::from_millis(DEFAULT_LAYOUT_BUDGET_MS),
     };
     let mut time = false;
+    let mut regen_check = false;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -158,6 +163,7 @@ fn parse_args() -> Args {
                 }
             }
             "--time" => time = true,
+            "--regen-check" => regen_check = true,
             other => {
                 eprintln!("[corpus-native] warning: unrecognized arg `{other}`");
             }
@@ -175,6 +181,7 @@ fn parse_args() -> Args {
         dump_drift,
         engine,
         time,
+        regen_check,
     }
 }
 
@@ -187,6 +194,7 @@ fn run_worker(
     with_edit: bool,
     dump_drift: Option<&Path>,
     engine: pipeline::EngineLayoutOpts,
+    regen_check: bool,
 ) -> ExitCode {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -200,7 +208,15 @@ fn run_worker(
     };
     let fonts = fonts::bundled_stack();
     let label = path.to_string_lossy();
-    let rec = pipeline::run_one(&label, &bytes, &fonts, with_edit, dump_drift, engine);
+    let rec = pipeline::run_one(
+        &label,
+        &bytes,
+        &fonts,
+        with_edit,
+        dump_drift,
+        engine,
+        regen_check,
+    );
     match serde_json::to_string(&rec) {
         Ok(json) => {
             println!("{json}");
@@ -235,6 +251,9 @@ fn run_in_subprocess(
     }
     if let Some(dir) = &args.dump_drift {
         cmd.arg("--dump-drift").arg(dir);
+    }
+    if args.regen_check {
+        cmd.arg("--regen-check");
     }
     if args.engine.enabled {
         cmd.arg("--layout-budget-ms")
@@ -364,6 +383,7 @@ fn main() -> ExitCode {
             args.with_edit,
             args.dump_drift.as_deref(),
             args.engine,
+            args.regen_check,
         );
     }
 
@@ -478,6 +498,17 @@ fn main() -> ExitCode {
     let mut theme_runs = 0u64;
     let mut theme_faces: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    /* Issue #384 — `--regen-check`: paragraphs regenerated / mismatching
+    (all, and those with text), documents with a mismatch, and the
+    mismatching paragraphs per class. */
+    let mut regen_docs = 0usize;
+    let mut regen_docs_mismatched = 0usize;
+    let mut regen_checked = 0u64;
+    let mut regen_nonempty_checked = 0u64;
+    let mut regen_mismatched = 0u64;
+    let mut regen_nonempty_mismatched = 0u64;
+    let mut regen_classes: std::collections::BTreeMap<String, (u64, String)> =
+        std::collections::BTreeMap::new();
     for (i, path) in files.iter().enumerate() {
         let label = path
             .strip_prefix(&args.corpus_dir)
@@ -564,6 +595,21 @@ fn main() -> ExitCode {
             theme_runs += t.runs;
             for face in &t.faces {
                 *theme_faces.entry(face.clone()).or_insert(0) += 1;
+            }
+        }
+
+        if let Some(rc) = &rec.regen_check {
+            regen_docs += 1;
+            regen_docs_mismatched += usize::from(rc.mismatched > 0);
+            regen_checked += u64::from(rc.checked);
+            regen_nonempty_checked += u64::from(rc.nonempty_checked);
+            regen_mismatched += u64::from(rc.mismatched);
+            regen_nonempty_mismatched += u64::from(rc.nonempty_mismatched);
+            for (class, n) in &rc.classes {
+                regen_classes
+                    .entry(class.clone())
+                    .or_insert((0, label.clone()))
+                    .0 += u64::from(*n);
             }
         }
 
@@ -671,6 +717,18 @@ fn main() -> ExitCode {
             println!(
                 "[corpus-native]   {count:5}  {cause:<14} e.g. {example_path} ({example_bytes} B)"
             );
+        }
+    }
+    if args.regen_check {
+        println!(
+            "[corpus-native] regen-check (#384): {regen_mismatched}/{regen_checked} clean paragraphs \
+             do not regenerate byte-identically ({regen_nonempty_mismatched}/{regen_nonempty_checked} \
+             with text) in {regen_docs_mismatched}/{regen_docs} documents"
+        );
+        let mut classes: Vec<(&String, &(u64, String))> = regen_classes.iter().collect();
+        classes.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
+        for (class, (n, example)) in classes {
+            println!("[corpus-native]   {n:5}  {class:<16} e.g. {example}");
         }
     }
     println!(

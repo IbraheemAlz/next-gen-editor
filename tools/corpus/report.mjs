@@ -184,6 +184,30 @@ function main() {
         }
     }
 
+    /* --- Issue #384 — `--regen-check`: clean paragraphs that do not
+    regenerate byte-identically, by class. --- */
+    const regenChecked = records.filter((r) => r.regen_check);
+    const regenClasses = new Map();
+    let regenParagraphs = 0;
+    let regenMismatched = 0;
+    for (const r of regenChecked) {
+        regenParagraphs += r.regen_check.checked;
+        regenMismatched += r.regen_check.mismatched;
+        for (const [cls, n] of Object.entries(r.regen_check.classes ?? {})) {
+            regenClasses.set(cls, (regenClasses.get(cls) || 0) + n);
+        }
+    }
+    const sortedRegenClasses = [...regenClasses.entries()].sort((a, b) => b[1] - a[1]);
+    if (regenChecked.length > 0) {
+        console.log(
+            `\n=== Paragraph regeneration (#384): ${regenMismatched}/${regenParagraphs} clean paragraphs differ, ` +
+                `${regenChecked.filter((r) => r.regen_check.mismatched > 0).length}/${regenChecked.length} documents ===`,
+        );
+        for (const [cls, count] of sortedRegenClasses) {
+            console.log(`  ${String(count).padStart(4)}  ${cls}`);
+        }
+    }
+
     /* --- Layout-time outliers. --- */
     const withLayoutTime = records.filter((r) => typeof r.layout_ms === 'number').sort((a, b) => b.layout_ms - a.layout_ms);
     console.log(`\n=== Layout-time outliers (top ${Math.min(10, withLayoutTime.length)}) ===`);
@@ -213,6 +237,13 @@ function main() {
             edit_bound_exceeded_informational: editOutOfBoundInformational.map((r) => r.path),
         },
         edit_rewrite_root_causes: Object.fromEntries(sortedCauses),
+        /* Issue #384 — `--regen-check` mismatch classes (paragraphs). */
+        regen_check: {
+            documents: regenChecked.length,
+            paragraphs: regenParagraphs,
+            mismatched: regenMismatched,
+            classes: Object.fromEntries(sortedRegenClasses),
+        },
         layout_time_outliers: withLayoutTime.slice(0, 10).map((r) => ({
             path: r.path,
             layout_ms: r.layout_ms,

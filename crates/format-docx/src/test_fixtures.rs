@@ -791,3 +791,93 @@ pub fn theme_loaded_faces_docx() -> Vec<u8> {
         ("Amiri", "Amiri"),
     ))
 }
+
+/* ============================== issue #384 — regeneration classes ==== */
+
+/// `proofErr` at both ends of a link (inside it), and around a field's
+/// result (inside the field).
+pub const REGEN_PROOF_ERR: &str = concat!(
+    r#"<w:p w:rsidR="00A1"><w:r><w:t xml:space="preserve">see </w:t></w:r>"#,
+    r#"<w:hyperlink w:anchor="target" w:history="1"><w:proofErr w:type="spellStart"/>"#,
+    r#"<w:r><w:t>Tilaka</w:t></w:r><w:proofErr w:type="spellEnd"/></w:hyperlink>"#,
+    r#"<w:r><w:t xml:space="preserve"> by </w:t></w:r>"#,
+    r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#,
+    r#"<w:r><w:instrText xml:space="preserve"> DOCPROPERTY  Author  \* MERGEFORMAT </w:instrText></w:r>"#,
+    r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:proofErr w:type="spellStart"/>"#,
+    r#"<w:r w:rsidR="00B2"><w:t>jharrop</w:t></w:r><w:proofErr w:type="spellEnd"/>"#,
+    r#"<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
+);
+
+/// A pretty-printed tracked insertion: whitespace before and after its
+/// start and end tags.
+pub const REGEN_PRETTY_INS: &str = "<w:p w:rsidR=\"00A2\">\n      <w:pPr>\n        <w:jc w:val=\"center\"/>\n      </w:pPr>\n      <w:ins w:id=\"2\" w:author=\"jharrop\" w:date=\"2012-06-27T21:14:00Z\">\n        <w:r>\n          <w:t xml:space=\"preserve\">This contains </w:t>\n        </w:r>\n        <w:proofErr w:type=\"spellStart\"/>\n        <w:r>\n          <w:t>etc</w:t>\n        </w:r>\n        <w:proofErr w:type=\"spellEnd\"/>\n      </w:ins>\n    </w:p>";
+
+/// A heading whose `_Toc*` bookmark covers only part of its text, in a
+/// pretty-printed part.
+pub const REGEN_TOC_HEADING: &str = "<w:p w:rsidR=\"00A3\">\n      <w:pPr>\n        <w:jc w:val=\"left\"/>\n      </w:pPr>\n      <w:bookmarkStart w:id=\"2\" w:name=\"_Toc467580795\"/>\n      <w:r w:rsidRPr=\"00C33400\">\n        <w:t>Article 1</w:t>\n      </w:r>\n      <w:bookmarkEnd w:id=\"2\"/>\n      <w:r w:rsidRPr=\"00C33400\">\n        <w:t xml:space=\"preserve\"> </w:t>\n      </w:r>\n    </w:p>";
+
+/// An in-paragraph smart tag (with its property child) and custom-XML
+/// wrapper.
+pub const REGEN_WRAPPERS: &str = concat!(
+    r#"<w:p w:rsidR="00A4"><w:r><w:t xml:space="preserve">in </w:t></w:r>"#,
+    r#"<w:smartTag w:uri="urn:schemas-microsoft-com:office:smarttags" w:element="place">"#,
+    r#"<w:smartTagPr><w:attr w:name="country-region" w:val="RU"/></w:smartTagPr>"#,
+    r#"<w:r><w:t>Moscow</w:t></w:r></w:smartTag>"#,
+    r#"<w:r><w:t xml:space="preserve"> and </w:t></w:r>"#,
+    r#"<w:customXml w:uri="urn:x" w:element="city"><w:r><w:t>Kyiv</w:t></w:r></w:customXml>"#,
+    r#"</w:p>"#,
+);
+
+/// A hyperlink field inside a tracked deletion (`<w:delInstrText>`).
+pub const REGEN_DELETED_FIELD: &str = concat!(
+    r#"<w:p w:rsidR="00A5"><w:r><w:t xml:space="preserve">kept </w:t></w:r>"#,
+    r#"<w:del w:id="4" w:author="pavel" w:date="2009-07-24T15:05:00Z">"#,
+    r#"<w:r w:rsidDel="00950B03"><w:fldChar w:fldCharType="begin"/></w:r>"#,
+    r#"<w:r w:rsidDel="00950B03"><w:delInstrText xml:space="preserve"> HYPERLINK "http://example.com/" </w:delInstrText></w:r>"#,
+    r#"<w:r w:rsidDel="00950B03"><w:fldChar w:fldCharType="separate"/></w:r>"#,
+    r#"<w:r w:rsidDel="00950B03"><w:delText>gone</w:delText></w:r>"#,
+    r#"<w:r w:rsidDel="00950B03"><w:fldChar w:fldCharType="end"/></w:r>"#,
+    r#"</w:del></w:p>"#,
+);
+
+/// Whitespace between a run's children (after a leading
+/// `<w:lastRenderedPageBreak/>`, after a `<w:br/>`), an empty `<w:pict/>`
+/// run and an empty paragraph.
+pub const REGEN_RUN_CHILDREN: &str = concat!(
+    "<w:p w:rsidR=\"00A6\">\n  <w:r>\n    <w:lastRenderedPageBreak/>\n    <w:t>after break</w:t>\n  </w:r>\n",
+    "  <w:r>\n    <w:br/>\n    <w:t xml:space=\"preserve\">line two</w:t>\n  </w:r>\n</w:p>",
+    r#"<w:p w:rsidR="00A7"><w:r><w:t>pict</w:t></w:r><w:r><w:rPr><w:sz w:val="26"/></w:rPr><w:lastRenderedPageBreak/><w:pict/></w:r></w:p>"#,
+    r#"<w:p w:rsidR="00A8" w:rsidRDefault="00A8"/>"#,
+);
+
+/// A TOC across two paragraphs: the untrimmed instruction and run
+/// properties of its prologue, its end run in the last paragraph.
+pub const REGEN_TOC_FIELD: &str = concat!(
+    r#"<w:p w:rsidR="00A9"><w:r><w:rPr><w:b/></w:rPr><w:fldChar w:fldCharType="begin"/></w:r>"#,
+    r#"<w:r><w:instrText xml:space="preserve"> TOC \o "1-3" \h \z \u </w:instrText></w:r>"#,
+    r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r>"#,
+    r#"<w:hyperlink w:anchor="_Toc467580795" w:history="1"><w:r><w:t>Article 1</w:t></w:r></w:hyperlink></w:p>"#,
+    r#"<w:p w:rsidR="00AA"><w:r><w:rPr><w:b/><w:bCs/><w:noProof/></w:rPr><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
+);
+
+/// Issue #384 — every regeneration class, one paragraph (or two) each:
+/// [`REGEN_PROOF_ERR`], [`REGEN_PRETTY_INS`], [`REGEN_TOC_HEADING`],
+/// [`REGEN_WRAPPERS`], [`REGEN_DELETED_FIELD`], [`REGEN_RUN_CHILDREN`]
+/// (three paragraphs), [`REGEN_TOC_FIELD`] (two) — ten paragraphs.
+pub fn regen_classes_body() -> String {
+    [
+        REGEN_PROOF_ERR,
+        REGEN_PRETTY_INS,
+        REGEN_TOC_HEADING,
+        REGEN_WRAPPERS,
+        REGEN_DELETED_FIELD,
+        REGEN_RUN_CHILDREN,
+        REGEN_TOC_FIELD,
+    ]
+    .concat()
+}
+
+/// Issue #384 — [`regen_classes_body`] in a minimal package.
+pub fn regen_classes_docx() -> Vec<u8> {
+    docx_with_body(&regen_classes_body())
+}

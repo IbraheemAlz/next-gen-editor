@@ -77,7 +77,8 @@ jobs:
           cargo run -p corpus-native --release -- \
             --corpus-dir ~/corpus-cache/files \
             --out ~/corpus-cache/results.jsonl \
-            --timeout-secs 90
+            --timeout-secs 90 \
+            --regen-check
 
       - name: Triage report
         if: always()

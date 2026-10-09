@@ -368,6 +368,9 @@ fn classify_rewrite(orig: &[u8], region_start: usize, region_len: u64) -> &'stat
     if let Some(shape) = classify_one_byte_rewrite(orig, region_start, region_len) {
         return shape;
     }
+    if let Some(shape) = classify_regen_shape(orig, region_start, region_len) {
+        return shape;
+    }
     let win_start = region_start.saturating_sub(REWRITE_CAUSE_WINDOW);
     let win_end = (region_start + region_len as usize + REWRITE_CAUSE_WINDOW).min(orig.len());
     let window = orig.get(win_start..win_end.max(win_start)).unwrap_or(&[]);
@@ -410,6 +413,36 @@ fn classify_one_byte_rewrite(
         b'>' if before.ends_with(b"<w:t") => Some("t preserve"),
         _ => None,
     }
+}
+
+/// Issue #384 — the regeneration classes of `--regen-check`
+/// ([`crate::regen`]), recognised by the shape of the rewritten region of
+/// the ORIGINAL itself (never by a nearby construct, which would blame
+/// every paragraph with a `<w:proofErr/>`): inside an `<w:instrText>`
+/// (`instrText-space`), only whitespace (`whitespace`), holding a
+/// `<w:proofErr/>` (`proofErr-order`) or an inline `<w:smartTag>` /
+/// `<w:customXml>` tag (`smartTag`, issue #272).
+fn classify_regen_shape(orig: &[u8], region_start: usize, region_len: u64) -> Option<&'static str> {
+    let end = region_start.checked_add(region_len as usize)?;
+    let region = orig.get(region_start..end)?;
+    if region.is_empty() {
+        return None;
+    }
+    let has = |needle: &[u8]| region.windows(needle.len()).any(|w| w == needle);
+    if has(b"<w:smartTag") || has(b"</w:smartTag") || has(b"<w:customXml ") {
+        return Some("smartTag");
+    }
+    let before = orig.get(..region_start)?;
+    let last = |needle: &[u8]| before.windows(needle.len()).rposition(|w| w == needle);
+    if let Some(open) = last(b"<w:instrText")
+        && last(b"</w:instrText>").is_none_or(|close| close < open)
+    {
+        return Some("instrText-space");
+    }
+    if region.iter().all(u8::is_ascii_whitespace) {
+        return Some("whitespace");
+    }
+    has(b"<w:proofErr").then_some("proofErr-order")
 }
 
 /// Issue #199 / #251 — `(prefix_len, original_span, edited_span)`: the
@@ -528,6 +561,10 @@ pub struct DocResult {
     /// when the read failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme_fonts: Option<ThemeFontCensus>,
+    /// Issue #384 — `--regen-check`: every clean paragraph regenerated
+    /// with no edit and compared with its source bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regen_check: Option<crate::regen::RegenCheck>,
 }
 
 /// Issue #355 — theme-font resolution over every paragraph (body, table
@@ -682,6 +719,7 @@ impl DocResult {
             engine_fingerprint: None,
             theme_fonts: None,
             engine_degradations: Vec::new(),
+            regen_check: None,
         }
     }
 
@@ -778,6 +816,7 @@ pub fn run_one(
     with_edit: bool,
     dump_drift: Option<&std::path::Path>,
     engine_opts: EngineLayoutOpts,
+    regen_check: bool,
 ) -> DocResult {
     let mut rec = DocResult::new(path_label, bytes.len() as u64);
     let overall_start = Instant::now();
@@ -1020,6 +1059,24 @@ pub fn run_one(
         }
     }
 
+    /* 7b. Issue #384 — `--regen-check`: regenerate every clean paragraph
+    with no edit; `--dump-drift DIR` also writes each mismatching pair. */
+    if regen_check {
+        let report = stage!(
+            "regen_check",
+            format_docx::writer::regen_check::regen_check(&archive_a, &archive_a.document)
+        );
+        for (i, m) in report.mismatches.iter().enumerate() {
+            let class = crate::regen::classify(&m.source, &m.regenerated);
+            dump(&format!("regen-{i}-{class}.orig"), m.source.as_bytes());
+            dump(
+                &format!("regen-{i}-{class}.regen"),
+                m.regenerated.as_bytes(),
+            );
+        }
+        rec.regen_check = Some(crate::regen::RegenCheck::of(&report));
+    }
+
     /* 8. Issue #318 — the production layout, timed under the budget.
     Last, so a document that blows the budget still reports every
     round-trip column above. */
@@ -1179,6 +1236,22 @@ mod tests {
         let pr = br#"<w:tbl><w:tblPr/></w:tbl>"#;
         let slash = pr.windows(2).position(|w| w == b"/>").unwrap();
         assert_eq!(classify_rewrite(pr, slash, 1), "table");
+    }
+
+    /// Issue #384 — the regeneration classes, by the rewritten region's
+    /// own shape.
+    #[test]
+    fn classify_rewrite_tags_regeneration_shapes() {
+        let pretty = b"<w:p>\n  <w:r><w:t>x</w:t></w:r>\n</w:p>";
+        assert_eq!(classify_rewrite(pretty, 5, 3), "whitespace");
+        let instr = br#"<w:r><w:instrText> PAGE </w:instrText></w:r>"#;
+        let space = instr.windows(5).position(|w| w == b" PAGE").unwrap();
+        assert_eq!(classify_rewrite(instr, space, 1), "instrText-space");
+        let proof = br#"<w:r><w:t>x</w:t></w:r><w:proofErr w:type="spellEnd"/></w:hyperlink>"#;
+        let at = proof.windows(11).position(|w| w == b"<w:proofErr").unwrap();
+        assert_eq!(classify_rewrite(proof, at, 20), "proofErr-order");
+        let tag = br#"<w:smartTag w:uri="u"><w:r><w:t>x</w:t></w:r></w:smartTag>"#;
+        assert_eq!(classify_rewrite(tag, 0, 12), "smartTag");
     }
 
     #[test]

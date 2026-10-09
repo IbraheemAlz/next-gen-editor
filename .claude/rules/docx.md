@@ -446,6 +446,39 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   self-closing paragraph rewrites its `/`) and `t preserve` (a bare
   `<w:t>` gaining `xml:space="preserve"` — two insertions the
   single-region metric reports as one rewritten `>`).
+- **The regenerator is measured on its own (issue #384).**
+  `format_docx::writer::regen_check` runs one ordinary `write_docx` with a
+  probe on: every clean paragraph (body and cells, any depth) is also
+  regenerated in the exact write context and compared with its source
+  bytes; `tools/corpus-native --regen-check` histograms the mismatches by
+  class (`proofErr-order` / `whitespace` / `instrText-space` / `smartTag` /
+  `mixed` / `other`, the same shapes `classify_rewrite` now tags). The
+  classes it found are fixed by construction:
+  - **Marker slots.** Every unpaired marker records where it sat among
+    the wrapper boundaries at its offset (`SourceMarker::closes_after` /
+    `opens_before`, counted by `MarkupCapture` from `wrapper_open` /
+    `wrapper_close` / the field `separate` / `end` — a run holding a field
+    character is a boundary, any other run ends the stretch). The writer
+    builds the ends (field, revision, hyperlink, span tails) and starts
+    (span heads, hyperlink, revision, field) at an offset as pieces and
+    interleaves the markers by slot (`emit_boundaries`), clamped to what
+    is there — a `<w:proofErr/>` before `</w:hyperlink>` stays inside the
+    link, an edit that moved a marker can never make it cross a wrapper.
+    Content-control openers / closers always sit between.
+  - `_Toc*` bookmarks keep their source position as *verified* markers
+    (`SourceMarker::toc_bookmark`): replayed while the paragraph still owns
+    the bookmark (then it does not wrap the content there), dropped
+    otherwise (a split's right half).
+  - A TOC's Head / Tail carry `Field::source` too (the verbatim prologue —
+    untrimmed instruction, run properties, whitespace — and the end run);
+    `emit_span_event` writes them while the instruction is unchanged.
+  - In-paragraph `<w:smartTag>` / `<w:customXml>` are opener / closer
+    pairs like a run-level `<w:sdt>` (#272); `<w:delInstrText>` is read as
+    the instruction of a field inside a deletion (a source prologue is
+    reused where its `del`-ness matches); `RunPad::inner` / the lead keep
+    whitespace between a run's children; an empty `<w:pict/>` run is kept
+    verbatim; a source paragraph with no text mints no empty run and stays
+    self-closing when nothing is inside.
 
 ## Table source markup (issue #248)
 

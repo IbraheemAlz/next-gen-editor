@@ -41,6 +41,10 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 #[path = "writer_revision_ids.rs"]
 mod revision_ids;
 
+/// Issue #384 — the paragraph regenerator measured on clean paragraphs.
+#[path = "writer_regen_check.rs"]
+pub mod regen_check;
+
 /// Standard OOXML document namespace boilerplate (matches what Word emits).
 const DOC_XML_HEADER: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
@@ -961,6 +965,7 @@ fn serialize_paragraph_body(
         attrs_xml(&m.attrs, out);
     }
     out.push('>');
+    let body_from = out.len();
     let source_ppr = markup.and_then(|m| m.ppr.as_ref());
     let inherited_bidi = direction_is_inherited(para);
     let props = if para.props.outline_level.is_some()
@@ -1004,8 +1009,13 @@ fn serialize_paragraph_body(
             out,
         ),
     }
-    /* Issue #81 — paragraph-scoped `_Toc*` bookmarks wrap the content. */
-    for b in &para.bookmarks {
+    /* Issue #81 — paragraph-scoped `_Toc*` bookmarks wrap the content
+    (issue #384: unless a verified source marker carries that end). */
+    for b in para
+        .bookmarks
+        .iter()
+        .filter(|b| !toc_bookmark_carried(para, &b.name, false))
+    {
         out.push_str(&format!(
             "<w:bookmarkStart w:id=\"{}\" w:name=\"",
             b.id.unwrap_or_else(|| bookmark_id(&b.name))
@@ -1039,17 +1049,51 @@ fn serialize_paragraph_body(
             .synthesize
             .is_empty()
     {
-        serialize_run(&para.text, &SpanStyle::default(), out);
+        /* Issue #384 — a paragraph read from `.docx` with no text has no
+        run in its source either: no empty `<w:r>` is minted for it. */
+        if !(markup.is_some() && para.text.is_empty()) {
+            serialize_run(&para.text, &SpanStyle::default(), out);
+        }
     } else {
         emit_styled_runs_with_objects(para, out, hyperlink_rel_map);
     }
-    for b in para.bookmarks.iter().rev() {
+    for b in para
+        .bookmarks
+        .iter()
+        .rev()
+        .filter(|b| !toc_bookmark_carried(para, &b.name, true))
+    {
         out.push_str(&format!(
             "<w:bookmarkEnd w:id=\"{}\"/>",
             b.id.unwrap_or_else(|| bookmark_id(&b.name))
         ));
     }
+    /* Issue #384 — nothing inside a source paragraph: Word's (and every
+    corpus producer's) self-closing `<w:p …/>`. */
+    if markup.is_some() && out.len() == body_from {
+        out.pop();
+        out.push_str("/>");
+        return;
+    }
     out.push_str("</w:p>");
+}
+
+/// Issue #384 — the start (`end == false`) or end of the paragraph's
+/// `_Toc*` bookmark `name` rides a verified source marker
+/// ([`engine::SourceMarker::toc_bookmark`]) that the run walk replays at
+/// its source position, so the bookmark does not wrap the content there.
+fn toc_bookmark_carried(para: &Paragraph, name: &str, end: bool) -> bool {
+    let tag: &[u8] = if end {
+        b"<w:bookmarkEnd"
+    } else {
+        b"<w:bookmarkStart"
+    };
+    para.source_markup.as_deref().is_some_and(|m| {
+        m.offsets_valid(para.text.len())
+            && m.markers
+                .iter()
+                .any(|mk| mk.toc_bookmark.as_deref() == Some(name) && mk.xml.starts_with(tag))
+    })
 }
 
 /// Issue #202 — the paragraph direction every style id resolves to
@@ -1399,9 +1443,9 @@ fn emit_styled_runs_with_objects(
     /* One positioned piece: a verbatim marker (an END of a comment may
     need its reference run synthesized right behind it) or a synthesized
     tree endpoint. */
-    let push_marker = |xml: &[u8], comment: Option<engine::CommentAnchor>, out: &mut String| {
-        push_utf8(xml, out);
-        if let Some(c) = comment
+    let push_marker = |m: &OutMarker<'_>, out: &mut String| {
+        push_utf8(m.xml, out);
+        if let Some(c) = m.comment
             && c.kind == engine::CommentAnchorKind::RangeEnd
         {
             comment_anchors::after_range_end(c.id, false, out);
@@ -1420,9 +1464,9 @@ fn emit_styled_runs_with_objects(
             }
         }
     }
-    for (at, _, _) in &markers {
-        if para.text.is_char_boundary(*at) {
-            cuts.insert(*at);
+    for m in &markers {
+        if para.text.is_char_boundary(m.at) {
+            cuts.insert(m.at);
         }
     }
     let run_source = |lo: usize| -> Option<RunSource<'_>> {
@@ -1571,13 +1615,18 @@ fn emit_styled_runs_with_objects(
         }
         let mut window = String::new();
         let out = &mut window;
+        /* Issue #384 — the wrapper boundaries at `lo`, each its own
+        piece: the ends (innermost first), then the starts (outermost
+        first). The source markers and comment endpoints due here are
+        interleaved with them by slot ([`emit_boundaries`]). */
+        let mut bounds = Boundaries::default();
 
         /* Close any fields ending at or before `lo` first — field
         wrappers nest *inside* revision wrappers, so the field's `end`
         fldChar run emits before the surrounding `</w:ins>` close. */
         while let Some(top) = field_stack.last() {
             if (top.end as usize) <= lo {
-                close_field(field_close.pop().flatten(), out);
+                close_field(field_close.pop().flatten(), bounds.close());
                 field_stack.pop();
             } else {
                 break;
@@ -1587,7 +1636,7 @@ fn emit_styled_runs_with_objects(
         emits inner closes first, preserving well-formed nesting. */
         while let Some(top) = rev_stack.last() {
             if (top.end as usize) <= lo {
-                emit_revision_close(top.kind, out);
+                emit_revision_close(top.kind, bounds.close());
                 rev_stack.pop();
             } else {
                 break;
@@ -1598,39 +1647,22 @@ fn emit_styled_runs_with_objects(
         close above. */
         while let Some(top) = hyperlink_stack.last() {
             if (top.end as usize) <= lo {
-                out.push_str("</w:hyperlink>");
+                bounds.close().push_str("</w:hyperlink>");
                 hyperlink_stack.pop();
             } else {
                 break;
             }
         }
-        /* Issue #81 — multi-paragraph field ends due at `lo`, between
-        the closes above and the opens below. */
-        while let Some((at, _, f)) = span_events.get(span_cursor) {
-            if *at > lo {
-                break;
-            }
-            emit_span_event(f, out);
+        /* Issue #81 — multi-paragraph field ends due at `lo`: tails after
+        the ends above, heads before the starts below. */
+        let span_from = span_cursor;
+        while span_events
+            .get(span_cursor)
+            .is_some_and(|(at, _, _)| *at <= lo)
+        {
             span_cursor += 1;
         }
-        /* Issues #199 / #106 — in-paragraph source markers due at `lo`
-        (`<w:proofErr/>`, bookmarks, whitespace), between the closes above
-        and the opens below: always a legal run-level position. Issue #243
-        — synthesized comment endpoints first. */
-        while let Some(a) = synth.get(synth_cursor) {
-            if a.at as usize > lo {
-                break;
-            }
-            push_synth(a, out);
-            synth_cursor += 1;
-        }
-        while let Some((at, xml, comment)) = markers.get(marker_cursor) {
-            if *at > lo {
-                break;
-            }
-            push_marker(xml, *comment, out);
-            marker_cursor += 1;
-        }
+        bounds.span_events(&span_events[span_from..span_cursor]);
         /* Open any hyperlinks that should be active at `lo`. A target the
         pre-pass didn't find a rel id for (should not happen — the pre-pass
         walks the same `dirty` paragraphs this function is called for —
@@ -1644,9 +1676,12 @@ fn emit_styled_runs_with_objects(
                 && !hyperlink_stack
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *h as *const _))
-                && open_hyperlink(h, hyperlink_rel_map, out)
             {
-                hyperlink_stack.push(h);
+                let mut piece = String::new();
+                if open_hyperlink(h, hyperlink_rel_map, &mut piece) {
+                    bounds.opens.push(piece);
+                    hyperlink_stack.push(h);
+                }
             }
         }
         /* Open any revisions that should be active at `lo` but are not
@@ -1660,7 +1695,7 @@ fn emit_styled_runs_with_objects(
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *r as *const _))
             {
-                emit_revision_open(r, out);
+                emit_revision_open(r, bounds.open());
                 rev_stack.push(r);
             }
         }
@@ -1676,10 +1711,32 @@ fn emit_styled_runs_with_objects(
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *f as *const _))
             {
-                field_close.push(open_field(f, para, in_del, out));
+                field_close.push(open_field(f, para, in_del, bounds.open()));
                 field_stack.push(f);
             }
         }
+        /* Issues #199 / #106 / #384 — in-paragraph source markers due at
+        `lo` (`<w:proofErr/>`, bookmarks, whitespace), each at its source
+        slot among the boundaries above (default: between the ends and
+        the starts — always a legal run-level position). Issue #243 —
+        synthesized comment endpoints first, between the ends and the
+        starts. */
+        let synth_from = synth_cursor;
+        while synth.get(synth_cursor).is_some_and(|a| a.at as usize <= lo) {
+            synth_cursor += 1;
+        }
+        let marker_from = marker_cursor;
+        while markers.get(marker_cursor).is_some_and(|m| m.at <= lo) {
+            marker_cursor += 1;
+        }
+        emit_boundaries(
+            &bounds,
+            &synth[synth_from..synth_cursor],
+            &markers[marker_from..marker_cursor],
+            &push_synth,
+            &push_marker,
+            out,
+        );
 
         let src = run_source(lo);
         if let Some(obj) = obj_at.get(&lo) {
@@ -1695,7 +1752,14 @@ fn emit_styled_runs_with_objects(
             let style = style_at(lo);
             let key = (src.run as *const SourceRun, style, in_del);
             let continues = window.is_empty() && open_run.as_ref() == Some(&key);
-            if !continues {
+            if continues {
+                /* Issue #384 — the source whitespace between the run's
+                content children. */
+                push_utf8(
+                    src.run.pad.as_ref().map_or(&[], |p| p.inner.as_slice()),
+                    sink,
+                );
+            } else {
                 close_open_run(&mut open_run, open_run_pad, sink);
                 sink.push_str(&window);
                 open_source_run(&key.1, Some(src), sink);
@@ -1735,25 +1799,114 @@ fn emit_styled_runs_with_objects(
     /* Drain whatever is still open. Field epilogues fire before
     revision closes (field wrappers nest inside revision wrappers), and
     hyperlinks — the outermost wrapper — drain last. */
+    let mut bounds = Boundaries::default();
     while field_stack.pop().is_some() {
-        close_field(field_close.pop().flatten(), out);
+        close_field(field_close.pop().flatten(), bounds.close());
     }
     while let Some(top) = rev_stack.pop() {
-        emit_revision_close(top.kind, out);
+        emit_revision_close(top.kind, bounds.close());
     }
     while hyperlink_stack.pop().is_some() {
-        out.push_str("</w:hyperlink>");
+        bounds.close().push_str("</w:hyperlink>");
     }
-    for (_, _, f) in span_events.iter().skip(span_cursor) {
-        emit_span_event(f, out);
-    }
+    bounds.span_events(&span_events[span_cursor.min(span_events.len())..]);
     /* Markers at the paragraph end (a trailing `_GoBack` bookmark, the
-    whitespace before `</w:p>`), synthesized comment endpoints first. */
-    for a in synth.iter().skip(synth_cursor) {
-        push_synth(a, out);
+    whitespace before `</w:p>`), synthesized comment endpoints first —
+    each at its slot among the boundaries above (issue #384). */
+    emit_boundaries(
+        &bounds,
+        &synth[synth_cursor.min(synth.len())..],
+        &markers[marker_cursor.min(markers.len())..],
+        &push_synth,
+        &push_marker,
+        out,
+    );
+}
+
+/// Issue #384 — the wrapper boundaries the writer emits at one text
+/// offset: `closes` (field ends, revision ends, hyperlink ends, then
+/// multi-paragraph field tails — innermost first) and `opens`
+/// (multi-paragraph field heads, then hyperlink, revision and field
+/// starts — outermost first), each one piece.
+#[derive(Default)]
+struct Boundaries {
+    closes: Vec<String>,
+    opens: Vec<String>,
+}
+
+impl Boundaries {
+    /// A fresh end piece to write into.
+    fn close(&mut self) -> &mut String {
+        self.closes.push(String::new());
+        self.closes.last_mut().expect("just pushed")
     }
-    for (_, xml, comment) in markers.iter().skip(marker_cursor) {
-        push_marker(xml, *comment, out);
+
+    /// A fresh start piece to write into.
+    fn open(&mut self) -> &mut String {
+        self.opens.push(String::new());
+        self.opens.last_mut().expect("just pushed")
+    }
+
+    /// Issue #81 — the multi-paragraph field events due here: tails are
+    /// ends (after the hyperlink ends), heads are starts (before the
+    /// hyperlink starts). Both at one offset (a one-paragraph TOC with
+    /// no result) keep their pre-#384 order among the ends.
+    fn span_events(&mut self, due: &[(usize, u8, &Field)]) {
+        let is_head = |f: &Field| f.span == Some(engine::FieldSpan::Head);
+        if !due.is_empty() && due.iter().all(|(_, _, f)| is_head(f)) {
+            let mut heads: Vec<String> = Vec::with_capacity(due.len() + self.opens.len());
+            for (_, _, f) in due {
+                let mut piece = String::new();
+                emit_span_event(f, &mut piece);
+                heads.push(piece);
+            }
+            heads.append(&mut self.opens);
+            self.opens = heads;
+        } else {
+            for (_, _, f) in due {
+                emit_span_event(f, self.close());
+            }
+        }
+    }
+}
+
+/// Issue #384 — write the boundaries at one offset with the comment
+/// endpoints (`synth`) and source markers due there interleaved: a
+/// marker after `opens_before` starts when that is non-zero, else before
+/// the last `closes_after` ends (each clamped to what is there); the
+/// synthesized endpoints, and every marker at the default slot, between
+/// the ends and the starts — always a legal run-level position.
+fn emit_boundaries(
+    bounds: &Boundaries,
+    synth: &[comment_anchors::TreeAnchor],
+    markers: &[OutMarker<'_>],
+    push_synth: &impl Fn(&comment_anchors::TreeAnchor, &mut String),
+    push_marker: &impl Fn(&OutMarker<'_>, &mut String),
+    out: &mut String,
+) {
+    let n_c = bounds.closes.len();
+    let total = n_c + bounds.opens.len();
+    let slot = |m: &OutMarker<'_>| {
+        if m.opens_before > 0 {
+            n_c + (m.opens_before as usize).min(bounds.opens.len())
+        } else {
+            n_c - (m.closes_after as usize).min(n_c)
+        }
+    };
+    for i in 0..=total {
+        if i == n_c {
+            for a in synth {
+                push_synth(a, out);
+            }
+        }
+        for m in markers.iter().filter(|m| slot(m) == i) {
+            push_marker(m, out);
+        }
+        if i < n_c {
+            out.push_str(&bounds.closes[i]);
+        } else if i < total {
+            out.push_str(&bounds.opens[i - n_c]);
+        }
     }
 }
 
@@ -1790,6 +1943,33 @@ struct PlacedMarker<'a> {
     kind: PlacedKind,
     /// Issue #243 — set on a comment-anchor marker.
     comment: Option<engine::CommentAnchor>,
+    /// Issue #384 — `(closes_after, opens_before)` of a plain marker.
+    slot: (u8, u8),
+}
+
+/// One source marker to re-emit, from [`positioned_markers`].
+#[derive(Clone, Copy)]
+struct OutMarker<'a> {
+    at: usize,
+    xml: &'a [u8],
+    /// Issue #243 — set on a comment-anchor marker.
+    comment: Option<engine::CommentAnchor>,
+    /// Issue #384 — the marker's slot among the wrapper boundaries at
+    /// `at` ([`engine::SourceMarker::closes_after`] / `opens_before`).
+    closes_after: u8,
+    opens_before: u8,
+}
+
+impl<'a> From<PlacedMarker<'a>> for OutMarker<'a> {
+    fn from(p: PlacedMarker<'a>) -> Self {
+        OutMarker {
+            at: p.at,
+            xml: p.xml,
+            comment: p.comment,
+            closes_after: p.slot.0,
+            opens_before: p.slot.1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1828,10 +2008,7 @@ fn nests_with(s: usize, e: usize, (ws, we): (usize, usize)) -> bool {
 ///   constructed order (closes innermost first, plain markers, opens
 ///   outermost first) — the control keeps its content, at a slightly wider
 ///   range, noted as [`WriteNote::InlineWrapperWidened`].
-fn positioned_markers<'a>(
-    para: &'a Paragraph,
-    wrappers: &[(usize, usize)],
-) -> Vec<(usize, &'a [u8], Option<engine::CommentAnchor>)> {
+fn positioned_markers<'a>(para: &'a Paragraph, wrappers: &[(usize, usize)]) -> Vec<OutMarker<'a>> {
     let len = para.text.len();
     let Some(m) = para.source_markup.as_deref() else {
         return Vec::new();
@@ -1850,6 +2027,13 @@ fn positioned_markers<'a>(
         .filter(|mk| valid || mk.role.must_survive())
         /* Issue #243 — a comment anchor only while the tree agrees. */
         .filter(|mk| comment_anchors::keep_marker(para, mk))
+        /* Issue #384 — a `_Toc*` bookmark end only while the paragraph
+        still owns the bookmark. */
+        .filter(|mk| {
+            mk.toc_bookmark
+                .as_deref()
+                .is_none_or(|n| para.bookmarks.iter().any(|b| b.name == n))
+        })
         .collect();
     if !valid && !kept.is_empty() {
         note(WriteNote::StaleMarkupClamped {
@@ -1873,6 +2057,7 @@ fn positioned_markers<'a>(
                     xml: &mk.xml,
                     kind: PlacedKind::Open(pairs.len() - 1),
                     comment: None,
+                    slot: (0, 0),
                 });
             }
             engine::MarkerRole::Close { id } => {
@@ -1887,17 +2072,25 @@ fn positioned_markers<'a>(
                         xml: if own { &mk.xml } else { close_xml },
                         kind: PlacedKind::Close(pi),
                         comment: None,
+                        slot: (0, 0),
                     });
                     if own {
                         break;
                     }
                 }
             }
+            /* Issue #384 — a stale marker's slot no longer means anything:
+            between the ends and the starts. */
             _ => placed.push(PlacedMarker {
                 at,
                 xml: &mk.xml,
                 kind: PlacedKind::Plain,
                 comment: mk.comment,
+                slot: if valid {
+                    (mk.closes_after, mk.opens_before)
+                } else {
+                    (0, 0)
+                },
             }),
         }
     }
@@ -1907,6 +2100,7 @@ fn positioned_markers<'a>(
             xml: close_xml,
             kind: PlacedKind::Close(pi),
             comment: None,
+            slot: (0, 0),
         });
     }
     let conflict = |pairs: &[(u32, usize, usize)]| {
@@ -1917,10 +2111,7 @@ fn positioned_markers<'a>(
     if !conflict(&pairs) {
         /* Natural source order: stack-balanced, and monotone in offset. */
         placed.sort_by_key(|p| p.at);
-        return placed
-            .into_iter()
-            .map(|p| (p.at, p.xml, p.comment))
-            .collect();
+        return placed.into_iter().map(OutMarker::from).collect();
     }
     /* Widen to a fixpoint (ranges only grow, bounded by [0, len]; the
     round cap is a backstop — at worst every pair spans the paragraph,
@@ -1997,10 +2188,7 @@ fn positioned_markers<'a>(
         })
         .collect();
     keyed.sort_by_key(|(k, _)| *k);
-    keyed
-        .into_iter()
-        .map(|(_, p)| (p.at, p.xml, p.comment))
-        .collect()
+    keyed.into_iter().map(|(_, p)| OutMarker::from(p)).collect()
 }
 
 thread_local! {
@@ -2032,10 +2220,13 @@ fn open_field<'a>(
     in_del: bool,
     out: &mut String,
 ) -> Option<&'a [u8]> {
-    let src = f
-        .source
-        .as_deref()
-        .filter(|s| !in_del && s.is_current(&f.instruction) && !s.open.is_empty());
+    /* Issue #384 — a prologue read inside a `<w:del>` spells its code
+    `<w:delInstrText>`: usable exactly where it was read. */
+    let src = f.source.as_deref().filter(|s| {
+        const DEL: &[u8] = b"<w:delInstrText";
+        let del_form = s.open.windows(DEL.len()).any(|w| w == DEL);
+        in_del == del_form && s.is_current(&f.instruction) && !s.open.is_empty()
+    });
     let simple = |s: &engine::FieldSource| s.open.starts_with(b"<w:fldSimple");
     match src {
         Some(s) if simple(s) && simple_field_nests(f, para) => {
@@ -2089,11 +2280,22 @@ fn simple_field_nests(f: &Field, para: &Paragraph) -> bool {
         })
 }
 
-/// Issue #81 — one end of a multi-paragraph field.
+/// Issue #81 — one end of a multi-paragraph field. Issue #384 — in its
+/// source form when it has one: a Head's verbatim prologue while the
+/// instruction is unchanged, a Tail's end run.
 fn emit_span_event(f: &Field, out: &mut String) {
+    let src = f.source.as_deref();
     match f.span {
-        Some(engine::FieldSpan::Head) => emit_field_prologue(&f.instruction, false, out),
-        Some(engine::FieldSpan::Tail) => emit_field_epilogue(out),
+        Some(engine::FieldSpan::Head) => match src {
+            Some(s) if s.is_current(&f.instruction) && !s.open.is_empty() => {
+                push_utf8(&s.open, out)
+            }
+            _ => emit_field_prologue(&f.instruction, false, out),
+        },
+        Some(engine::FieldSpan::Tail) => match src {
+            Some(s) if !s.close.is_empty() => push_utf8(&s.close, out),
+            _ => emit_field_epilogue(out),
+        },
         None => {}
     }
 }
@@ -2393,6 +2595,16 @@ fn emit_paragraph(para: &Paragraph, out: &mut String, hyperlink_rel_map: &HashMa
         XML document that the reader already round-tripped through
         `quick_xml`'s decoder. Defensively fall back on regenerate if the
         bytes aren't UTF-8. */
+        /* Issue #384 — the regeneration probe (off outside
+        `regen_check`): a paragraph replayed as-is is also regenerated
+        and compared with its bytes. */
+        if regen_check::active()
+            && let Ok(s) = std::str::from_utf8(raw)
+            && !crate::parts::textbox::has_dirty_text_box(para)
+            && !comment_anchors::needs_patch(para)
+        {
+            regen_check::check_paragraph(para, s, hyperlink_rel_map);
+        }
         match std::str::from_utf8(raw) {
             /* Issue #83 — a text-box story edit leaves the host clean:
             splice the regenerated container(s) into the passthrough
@@ -2599,6 +2811,18 @@ fn emit_table(t: &Table, out: &mut String, hyperlink_rel_map: &HashMap<String, S
                 return;
             }
             Ok(s) => {
+                /* Issue #384 — the regeneration probe: every clean cell
+                paragraph, at any depth. */
+                if regen_check::active() {
+                    for (_, p) in table_paragraphs(t) {
+                        if !p.dirty
+                            && let Some(Ok(ps)) = p.source_xml.as_deref().map(std::str::from_utf8)
+                            && !crate::parts::textbox::has_dirty_text_box(p)
+                        {
+                            regen_check::check_paragraph(p, ps, hyperlink_rel_map);
+                        }
+                    }
+                }
                 out.push_str(s);
                 return;
             }
@@ -5464,7 +5688,13 @@ fn collect_dirty_hyperlinks(doc: &DocumentTree) -> Vec<&Hyperlink> {
     ) {
         for b in blocks {
             match b {
-                Block::Paragraph(p) if p.dirty || plan.is_some_and(|plan| plan.needs_patch(p)) => {
+                /* Issue #384 — the regeneration probe regenerates every
+                paragraph. */
+                Block::Paragraph(p)
+                    if p.dirty
+                        || plan.is_some_and(|plan| plan.needs_patch(p))
+                        || regen_check::active() =>
+                {
                     out.extend(p.hyperlinks.iter().filter(|h| !h.target.starts_with('#')));
                 }
                 Block::Paragraph(_) => {}
@@ -11108,3 +11338,8 @@ mod complex_script_tests;
 #[cfg(test)]
 #[path = "writer_theme_tests.rs"]
 mod theme_tests;
+
+/// Issue #384 — every paragraph regenerates byte-identically.
+#[cfg(test)]
+#[path = "writer_regen_tests.rs"]
+mod regen_tests;

@@ -36,6 +36,7 @@ mod note_containers;
 mod package_families;
 mod paragraph_format;
 mod reader_hardening;
+mod regen;
 mod revision_ids;
 mod revisions;
 mod table_markup;
@@ -353,6 +354,7 @@ fn run_default() -> Result<()> {
     comments::run_comment_patch_roundtrip()?;
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
+    regen::run_regen_classes_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

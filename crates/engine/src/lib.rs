@@ -1666,6 +1666,12 @@ pub struct RunPad {
     pub after_rpr: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub close: Vec<u8>,
+    /// Issue #384 — the whitespace between two content children of the
+    /// run (`<w:br/>`, the text that follows it), re-emitted between the
+    /// regenerated pieces that share the run. Skipped when empty, so a
+    /// pre-#384 snapshot encodes unchanged.
+    #[serde(with = "serde_bytes", skip_serializing_if = "Vec::is_empty")]
+    pub inner: Vec<u8>,
 }
 
 /// Issues #199 / #106 — unmodeled in-paragraph markup at text offset `at`:
@@ -1692,6 +1698,40 @@ pub struct SourceMarker {
     /// where the tree says).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<CommentAnchor>,
+    /// Issue #384 — where the marker sat among the wrapper boundaries the
+    /// source wrote at its offset (the ends and starts of hyperlinks,
+    /// tracked changes, `<w:fldSimple>` and complex fields — everything
+    /// the writer regenerates around runs). `closes_after` = how many
+    /// wrapper ENDS followed it there (a `<w:proofErr/>` right before a
+    /// `</w:hyperlink>` is inside the link: it belongs to the run before
+    /// it); `opens_before` = how many wrapper STARTS preceded it there
+    /// (a bookmark right after `<w:hyperlink>` belongs to the run after
+    /// it). Both 0 (the pre-#384 default) = between the ends and the
+    /// starts. The writer re-emits the marker at the same slot among the
+    /// boundaries it writes at that offset, clamped to what is there —
+    /// so an edit that moved the marker or a wrapper can never make it
+    /// cross one. Only meaningful on unpaired markers (a content
+    /// control's opener / closer pair always sits between). Skipped when
+    /// 0, so a pre-#384 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub closes_after: u8,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub opens_before: u8,
+    /// Issue #384 — `Some(name)` when the marker is the
+    /// `<w:bookmarkStart/>` / `<w:bookmarkEnd/>` of a paragraph-scoped
+    /// `_Toc*` bookmark the model owns ([`Paragraph::bookmarks`]). Like a
+    /// comment anchor it is *verified*: replayed at its source position
+    /// only while the paragraph still holds a bookmark of that name (the
+    /// writer then does not wrap the content with it); otherwise dropped
+    /// (a split's right half), and a bookmark with no carried end is
+    /// closed at the paragraph end as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toc_bookmark: Option<String>,
+}
+
+/// Issue #384 — serde skip helper for [`SourceMarker`]'s slot counters.
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl SourceMarker {
@@ -1702,6 +1742,9 @@ impl SourceMarker {
             xml,
             role: MarkerRole::Verbatim,
             comment: None,
+            closes_after: 0,
+            opens_before: 0,
+            toc_bookmark: None,
         }
     }
 }
