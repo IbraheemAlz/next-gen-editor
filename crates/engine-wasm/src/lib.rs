@@ -5776,8 +5776,9 @@ fn collect_paragraph_line_geom(
 }
 
 /// Walk a table's rows/cells and emit `LineGeom`s for every paragraph
-/// inside a cell. Continue cells are skipped — their visual content
-/// is owned by the Restart cell above them.
+/// inside a cell — and, issue #377, inside every table nested in a
+/// cell. Continue cells are skipped — their visual content is owned by
+/// the Restart cell above them.
 fn collect_table_line_geom(
     table_box: &TableBox,
     table_block_idx: u32,
@@ -5785,6 +5786,47 @@ fn collect_table_line_geom(
     table_origin_y: f32,
     out: &mut Vec<LineGeom>,
 ) {
+    collect_table_line_geom_at(
+        table_box,
+        &[BridgePathStep::Block {
+            idx: table_block_idx,
+        }],
+        table_origin_x,
+        table_origin_y,
+        0,
+        out,
+    );
+}
+
+/// Issue #377 — [`collect_table_line_geom`] for a table at nesting
+/// `level` (0 = the outermost table of its story) whose path is
+/// `table_path`. A table nested in a cell recurses with its origin
+/// accumulated onto the cell's (the renderer's own walk: cell origin +
+/// the inner table's `origin`, which carries its cell-local stacking
+/// and `place_table` offset) and its path extended by
+/// `[Cell{r,c}, Block(b)]`, so a click inside it resolves to the inner
+/// paragraph instead of the nearest outer-cell line.
+///
+/// Bounded by the layout's nesting cap: only tables at a level below
+/// [`MAX_TABLE_LAYOUT_DEPTH`] are grids, so the recursion is at most
+/// that deep. The cells of a table at the LAST grid level
+/// (`MAX_TABLE_LAYOUT_DEPTH - 1`) are not mapped: their content may hold
+/// the paragraphs of a flattened deeper table (#318, `NestingCapped`),
+/// which are not 1:1 with the cell's model blocks, so a `Block(b)` step
+/// derived from the box index could name the wrong paragraph. A click
+/// there resolves to the nearest mapped line instead — the pre-#377
+/// behaviour, on a document the layout already reported as degraded.
+fn collect_table_line_geom_at(
+    table_box: &TableBox,
+    table_path: &[BridgePathStep],
+    table_origin_x: f32,
+    table_origin_y: f32,
+    level: u32,
+    out: &mut Vec<LineGeom>,
+) {
+    if level + 1 >= MAX_TABLE_LAYOUT_DEPTH {
+        return;
+    }
     for row in &table_box.rows {
         let row_x = table_origin_x + row.origin.x;
         let row_y = table_origin_y + row.origin.y;
@@ -5794,41 +5836,51 @@ fn collect_table_line_geom(
             }
             let cell_x = row_x + cell.origin.x;
             let cell_y = row_y + cell.origin.y;
+            /* The renderer paints a cell's content from its padded
+            content origin (`render::scene::paint_table`: `<w:tcMar>` /
+            `<w:tblCellMar>`, resolved by the layout); the hit map must
+            invert exactly that walk. Before #377 it used the cell's
+            border-box origin, so every caret, highlight and click in a
+            cell sat one left padding (Word's stock 5.4 pt) off its
+            glyphs — and a nested table would compound that per level. */
+            let content_x = cell_x + cell.padding_left;
+            let content_y = cell_y + cell.padding_top;
             for (block_idx, content) in cell.content.iter().enumerate() {
-                let LayoutBlock::Paragraph(para_box) = content else {
-                    continue;
-                };
-                let path = BridgeBlockPath {
-                    steps: vec![
-                        BridgePathStep::Block {
-                            idx: table_block_idx,
-                        },
-                        /* Issue #91 — a split table's fragments re-base
-                        their rows (and a row split inside its cells
-                        re-bases the cell content): map back to the
-                        model row / cell block. */
-                        BridgePathStep::Cell {
-                            row: row.source_row,
-                            col: c as u32,
-                        },
-                        BridgePathStep::Block {
-                            idx: cell.content_offset + block_idx as u32,
-                        },
-                    ],
-                };
-                collect_paragraph_line_geom(
-                    para_box,
-                    cell_x,
-                    cell_y,
-                    /* Hit-target = the entire cell rectangle, so a
-                    click anywhere in the cell lands on this
-                    paragraph's lines — not the leftmost cell that
-                    happens to share `y_top`. */
-                    cell_x,
-                    cell.size.width,
-                    &path,
-                    out,
-                );
+                let mut steps = Vec::with_capacity(table_path.len() + 2);
+                steps.extend_from_slice(table_path);
+                /* Issue #91 — a split table's fragments re-base their
+                rows (and a row split inside its cells re-bases the cell
+                content): map back to the model row / cell block. */
+                steps.push(BridgePathStep::Cell {
+                    row: row.source_row,
+                    col: c as u32,
+                });
+                steps.push(BridgePathStep::Block {
+                    idx: cell.content_offset + block_idx as u32,
+                });
+                match content {
+                    LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
+                        para_box,
+                        content_x,
+                        content_y,
+                        /* Hit-target = the entire cell rectangle, so a
+                        click anywhere in the cell lands on this
+                        paragraph's lines — not the leftmost cell that
+                        happens to share `y_top`. */
+                        cell_x,
+                        cell.size.width,
+                        &BridgeBlockPath { steps },
+                        out,
+                    ),
+                    LayoutBlock::Table(inner) => collect_table_line_geom_at(
+                        inner,
+                        &steps,
+                        content_x + inner.origin.x,
+                        content_y + inner.origin.y,
+                        level + 1,
+                        out,
+                    ),
+                }
             }
         }
     }
@@ -6024,7 +6076,15 @@ fn collect_table_image_rects(
                         },
                     ],
                 };
-                collect_paragraph_image_rects(para_box, cell_x, cell_y, &path, out);
+                /* Issue #377 — from the padded content origin, where the
+                renderer paints the picture (see `collect_table_line_geom_at`). */
+                collect_paragraph_image_rects(
+                    para_box,
+                    cell_x + cell.padding_left,
+                    cell_y + cell.padding_top,
+                    &path,
+                    out,
+                );
             }
         }
     }
@@ -28338,6 +28398,11 @@ mod note_band_tests;
 /// (linear in nesting depth, verified hits) and the nesting cap.
 #[cfg(test)]
 mod nested_table_tests;
+
+/// Issue #377 — hit-testing, caret / selection rects, word selection and
+/// drags inside tables nested in table cells.
+#[cfg(test)]
+mod nested_table_hit_tests;
 
 #[cfg(test)]
 mod part_media_tests;
