@@ -61,6 +61,20 @@ paths:
   `error::warn` into the read's sink (`collect_read_warnings`; a no-op in
   the writer's re-parses). Verified-reuse equality never uses float `==`:
   `writer::same_section_props` compares geometry by bits.
+- **Namespace prefixes (issues #325 / #394).** The parsers match literal
+  qnames (`w:p`), so every WordprocessingML part the reader walks — the
+  main part, `styles.xml`, `numbering.xml`, `settings.xml`, the note
+  parts, `comments.xml` and every header / footer the main part's rels
+  name — has its root classified first (`NamespaceScope::classify_root`).
+  A part binding WordprocessingML to another prefix (or as the default
+  namespace) is rewritten by `schema::ns_normalize::canonicalize_prefixes`
+  and reported as `DocxWarning::NonCanonicalNamespaces { part, .. }`; a
+  sibling's normalised bytes REPLACE its `other_entries` row, so the
+  parsers, the verbatim passthrough, in-place patches (`comments.xml`)
+  and the tree's source package all see one spelling. Such a part is
+  regenerate-only (its zero-edit save is not byte-identical to the
+  source — `tools/corpus-native`'s `normalized_parts`); canonical parts
+  and parts the reader never walks stay verbatim.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:

@@ -355,6 +355,7 @@ fn run_default() -> Result<()> {
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
     reader_cascade::run_mark_formatting_roundtrip()?;
+    reader_cascade::run_sibling_prefix_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

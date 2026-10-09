@@ -463,6 +463,10 @@ fn main() -> ExitCode {
     let mut comment_delete_clean = 0usize;
     let mut rewrite_causes: std::collections::BTreeMap<String, (usize, String, u64)> =
         std::collections::BTreeMap::new();
+    /* Issues #325 / #394 — documents / parts read through the namespace
+    prefix normaliser (regenerate-only parts). */
+    let mut normalized_docs = 0usize;
+    let mut normalized_parts = 0usize;
     /* Issue #318 — production-layout timings `(ms, label)`, the
     documents that blew the budget, and a degradation-reason histogram. */
     let mut engine_times: Vec<(u128, String)> = Vec::new();
@@ -555,6 +559,12 @@ fn main() -> ExitCode {
                 comment_delete_clean +=
                     usize::from(cc.delete_anchors_left == Some(0) && cc.delete_gone == Some(true));
             }
+        }
+
+        /* Issues #325 / #394 — regenerate-only (normalised) parts. */
+        if !rec.normalized_parts.is_empty() {
+            normalized_docs += 1;
+            normalized_parts += rec.normalized_parts.len();
         }
 
         if let Some(t) = &rec.theme_fonts {
@@ -678,6 +688,11 @@ fn main() -> ExitCode {
          font where they previously fell back ({theme_resolved_runs}/{theme_runs} runs); \
          {themed_docs} carry a theme part",
         files.len()
+    );
+    println!(
+        "[corpus-native] non-canonical namespace prefixes (#325/#394): {normalized_docs} documents, \
+         {normalized_parts} parts normalised (regenerate-only: their zero-edit save is not \
+         byte-identical to the source)"
     );
     if !theme_faces.is_empty() {
         let mut faces: Vec<(&String, &usize)> = theme_faces.iter().collect();
