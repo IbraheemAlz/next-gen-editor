@@ -8,10 +8,12 @@
  * error reply; this component turns the errors it has copy for into a
  * transient, non-modal, screen-reader-announced toast.
  *
- * - `.nge-toast` is a PERSISTENT `role="status"` live region (a region
- *   inserted together with its text is announced unreliably, one whose
- *   text changes is announced), holding the message card only while a
- *   message is showing.
+ * - `.nge-toast` is a PERSISTENT `role="status"` live region (implicitly
+ *   polite - the explicit `aria-live` is left off so the engine's own
+ *   `Announcements` region stays the only `[aria-live="polite"]` element a
+ *   spec / host can select; a region inserted together with its text is
+ *   announced unreliably, one whose text changes is announced), holding
+ *   the message card only while a message is showing.
  * - Auto-dismisses after `durationMs` (4 s); a newer error replaces the
  *   message and restarts the timer; Escape-free, never steals focus.
  * - Copy comes from a table keyed by `ErrorKind` (`ERROR_TOAST_COPY`); a
@@ -67,7 +69,7 @@ export const ErrorToast: Component<ErrorToastProps> = (props) => {
     });
 
     return (
-        <div class="nge-toast" role="status" aria-live="polite" aria-atomic="true">
+        <div class="nge-toast" role="status" aria-atomic="true">
             <Show when={message()}>
                 {(text) => (
                     <div class="nge-toast__message" data-nge-toast="error">

@@ -75,8 +75,9 @@ test('Backspace across a table in review mode shows a toast and leaves the docum
 
     await expect(toast).toContainText('Tracked deletion cannot cross a table cell');
     await expect(toast).toContainText('turn off Track Changes');
-    /* The toast lives in a persistent live region (announced on change). */
-    await expect(toast).toHaveAttribute('aria-live', 'polite');
+    /* The toast lives in a persistent `role="status"` live region
+       (implicitly polite, announced when its text changes). */
+    await expect(toast).toHaveAttribute('aria-atomic', 'true');
 
     /* The refusal changed nothing: no revisions, same text. */
     expect(await documentText(page)).toBe(before);
