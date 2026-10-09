@@ -115,6 +115,28 @@
     text-align: right;
 }
 
+/* Issue #254 — the location doubles as "go to the commented text". */
+.nge-cm__goto {
+    padding: 2px var(--nge-space-1);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: var(--nge-radius-sm);
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+}
+
+.nge-cm__goto:hover,
+.nge-cm__goto:focus-visible {
+    border-color: var(--nge-color-border);
+    color: var(--nge-color-primary);
+}
+
+.nge-cm__card--active {
+    border-color: var(--nge-color-primary);
+    box-shadow: var(--nge-shadow-md);
+}
+
 .nge-cm__card--resolved {
     opacity: 0.55;
     background: var(--nge-color-surface-alt);

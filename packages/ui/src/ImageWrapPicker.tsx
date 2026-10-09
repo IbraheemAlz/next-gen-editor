@@ -14,7 +14,10 @@
  * has no wrap mode: converting inline ↔ floating is not implemented in
  * the engine (it answers `ERROR`), so for an inline image the picker is
  * visibly gated — disabled, with the amber "Engine pending" badge (Honest
- * UX; the conversion is a tracked gap of the #82 follow-up).
+ * UX; the conversion is tracked by issue #137). Issue #342 — the badge
+ * carries `data-nge-command` + `data-nge-pending-issue`, which
+ * `tools/parity` cross-checks against `bridge::meta`
+ * (`SetImageWrap` is `Partial { issue: 137 }`).
  *
  * Issue #206 — a picture inside a text-box story carries its `story`
  * chain; the picker hands it back so the wrap applies inside the box.
@@ -93,6 +96,7 @@ export const ImageWrapPicker: Component<ImageWrapPickerProps> = (props) => {
                             class="nge-btn nge-image-wrap__btn"
                             classList={{ 'nge-image-wrap__btn--on': target()?.wrap === m.mode }}
                             type="button"
+                            data-nge-command="SET_IMAGE_WRAP"
                             role="radio"
                             aria-checked={target()?.wrap === m.mode}
                             aria-label={m.label}
@@ -111,7 +115,13 @@ export const ImageWrapPicker: Component<ImageWrapPickerProps> = (props) => {
                     )}
                 </For>
                 <Show when={!floating()}>
-                    <span class="nge-image-wrap__badge">Engine pending</span>
+                    <span
+                        class="nge-image-wrap__badge"
+                        data-nge-command="SET_IMAGE_WRAP"
+                        data-nge-pending-issue="137"
+                    >
+                        Engine pending
+                    </span>
                 </Show>
             </div>
         </Show>

@@ -10,6 +10,8 @@
 //! - [`command`] — the `Command` enum + command-only payload types.
 //! - [`event`] — the `Event` enum + event-only payload types.
 //! - [`telemetry`] — the D5.7 telemetry schema (§11).
+//! - [`meta`] — issue #342 per-`Command` metadata (`CommandMeta`), the one
+//!   source of truth for logged / read-only / story-safe / status.
 //!
 //! `tsify-next` notes: `Option<T>` renders as `T | undefined` in the generated
 //! `.d.ts` — TS callers MUST pass `undefined`, not `null`. Binary `Vec<u8>`
@@ -19,9 +21,11 @@
 mod command;
 mod common;
 mod event;
+mod meta;
 mod telemetry;
 
 pub use command::*;
 pub use common::*;
 pub use event::*;
+pub use meta::*;
 pub use telemetry::*;

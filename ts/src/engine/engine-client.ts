@@ -11,12 +11,14 @@
  * (via `tsify-next`) into the `engine-wasm` wasm-pack package, so that is the
  * real import site. */
 import type {
+    BlockPath,
     Command,
     DocFormat,
     DocumentDefaults,
     Event,
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import { commandMeta } from '@nge/core/command-meta';
 import {
     clearRendererStreak,
     loadRendererStreak,
@@ -80,6 +82,9 @@ export interface CommentSnapshot {
     start_offset: number;
     end_block: number;
     end_offset: number;
+    /** Issue #254 — full anchor paths (cell comments address their cell). */
+    start_path: BlockPath;
+    end_path: BlockPath;
     resolved: boolean;
     /** Issue #27 — parent comment `w:id` when this row is a threaded
      *  reply; `undefined` on top-level comments. */
@@ -304,22 +309,15 @@ export function crashLoopBootPolicy(
 
 type Resolver = (v: WorkerReply) => void;
 
-/** Issue #57 — commands that can never move the selection or change the
- *  document (pure read-backs + view probes). Everything else counts toward
- *  `EngineClient.writesInFlight`, conservatively: a command missing here
- *  only costs the synchronous clipboard path a cache miss, never a stale
- *  copy. */
-const READ_ONLY_COMMANDS: ReadonlySet<Command['type']> = new Set<Command['type']>([
-    'PING',
-    'HIT_TEST',
-    'HIT_TEST_IN_PAGE',
-    'REQUEST_PAINT',
-    'REQUEST_ACCESSIBILITY_DELTA',
-    'GET_SELECTION_AS_CLIPBOARD',
-    'GET_IMAGE_RECTS',
-    'REQUEST_STATS',
-    'SNAPSHOT',
-]);
+/** Issue #57 — whether a command can move the selection or change the
+ *  document. Pure read-backs + view probes are excluded from
+ *  `EngineClient.writesInFlight`; everything else counts, conservatively (a
+ *  command wrongly counted only costs the synchronous clipboard path a cache
+ *  miss, never a stale copy — and an unknown wire type counts).
+ *  Issue #342 — `CommandMeta.read_only`, generated from the single list in
+ *  `crates/bridge/src/meta.rs`, replaces the hand-kept `READ_ONLY_COMMANDS`
+ *  set (which had drifted from the worker's log filter on GET_IMAGE_RECTS). */
+const isWrite = (cmd: Command): boolean => !commandMeta(cmd.type).read_only;
 
 export class EngineClient {
     private worker!: Worker;
@@ -327,6 +325,12 @@ export class EngineClient {
     private pending = new Map<number, Resolver>();
     private subscribers = new Set<(e: Event) => void>();
     private pendingWrites = 0;
+    /** Issue #260 — request ids of in-flight write commands (`isWrite`). */
+    private writeIds = new Set<number>();
+    /** Issue #260 — bumped as each write's reply arrives (before the reply
+     *  event fans out to subscribers) and whenever in-flight writes are
+     *  abandoned (trap / respawn / retire). See `writeEpoch`. */
+    private writeEpochCounter = 0;
     private documentId: string;
     private onCrash: () => void;
     private recovering = false;
@@ -446,6 +450,7 @@ export class EngineClient {
             resolve({ ok: false, error: 'engine worker respawned; request abandoned' });
         }
         this.pending.clear();
+        this.abandonWrites();
         this.generations += 1;
         this.setCheckpoint({ failing: false, failures: 0 });
         this.worker = new Worker(new URL('./engine.worker.ts', import.meta.url), {
@@ -640,6 +645,7 @@ export class EngineClient {
             resolve({ ok: false, error: 'engine worker restarted in place' });
         }
         this.pending.clear();
+        this.abandonWrites();
         this.pendingCause = cause;
         this.onCrash();
     }
@@ -861,6 +867,8 @@ export class EngineClient {
                     ),
                 ),
             ],
+            /* Issue #260 — RECOVER rebuilds the whole engine: a write. */
+            true,
         );
         if (!r.ok) throw new Error(r.error);
         this.activeRenderer = r.renderer ?? 'canvas2d';
@@ -952,11 +960,11 @@ export class EngineClient {
     }
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {
-        const write = !READ_ONLY_COMMANDS.has(cmd.type);
+        const write = isWrite(cmd);
         if (write) this.pendingWrites += 1;
         let r: WorkerReply;
         try {
-            r = await this.send({ cmd }, transfer);
+            r = await this.send({ cmd }, transfer, write);
         } finally {
             if (write) this.pendingWrites -= 1;
         }
@@ -970,6 +978,21 @@ export class EngineClient {
      *  the synchronous clipboard cache must not be trusted. */
     get writesInFlight(): number {
         return this.pendingWrites;
+    }
+
+    /** Issue #260 — a counter that moves whenever a write command (any
+     *  command whose `CommandMeta.read_only` is false — generated from
+     *  `bridge::meta`, no hand list) has been answered, and whenever
+     *  in-flight writes are abandoned. It moves BEFORE the reply event
+     *  reaches subscribers, so a cache keyed on it can never serve a value
+     *  captured before a write the main thread has already observed. */
+    get writeEpoch(): number {
+        return this.writeEpochCounter;
+    }
+
+    private abandonWrites(): void {
+        this.writeIds.clear();
+        this.writeEpochCounter += 1;
     }
 
     /**
@@ -1057,7 +1080,7 @@ export class EngineClient {
         this.onTrap('forced trap (test hook)');
     }
 
-    private send(payload: any, transfer: Transferable[] = []) {
+    private send(payload: any, transfer: Transferable[] = [], write = false) {
         if (this.recovering) {
             /* The worker is dead and the respawn has not completed yet — a
                postMessage would hang forever. Settle immediately instead. */
@@ -1071,6 +1094,7 @@ export class EngineClient {
             (resolve) => {
                 const id = this.nextId++;
                 this.pending.set(id, resolve);
+                if (write) this.writeIds.add(id);
                 this.worker.postMessage({ id, ...payload }, transfer);
             },
         );
@@ -1082,6 +1106,8 @@ export class EngineClient {
             this.onCheckpointNotice(msg);
             return;
         }
+        /* Issue #260 — the epoch moves before subscribers see the reply. */
+        if (this.writeIds.delete(msg.id)) this.writeEpochCounter += 1;
         const cb = this.pending.get(msg.id);
         if (cb) {
             this.pending.delete(msg.id);
@@ -1129,6 +1155,7 @@ export class EngineClient {
             resolve({ ok: false, error: 'engine worker trapped; recovering', trap: true });
         }
         this.pending.clear();
+        this.abandonWrites();
         /* The worker dies before it can emit `Event::Trap` itself, so
            synthesize the bridge-shaped event (crates/bridge/src/event.rs) —
            subscribers (TrapOverlay, telemetry ENGINE_TRAP) see the crash. */

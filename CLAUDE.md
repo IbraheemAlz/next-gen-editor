@@ -88,6 +88,7 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **`unicode-bidi`**, not `icu_bidi` (icu_bidi is not on crates.io at version 1.5).
 - **`serde_bytes`** + `#[tsify(type = "Uint8Array")]` for `Vec<u8>` fields that must travel as binary. Without this, serde-wasm-bindgen rejects `Uint8Array` with `invalid type: byte array, expected a sequence` and falls back to a 4-8× heap-inflated number array.
 - Bridge command/event enums **always** carry `#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]`. TS sees `{ type: "INSERT_TEXT", ... }`.
+- **Every `Command` variant is classified once, in `crates/bridge/src/meta.rs`** (issue #342 — `command_meta!`, no wildcard, pinned to `EXPECTED_VARIANT_COUNT`): `logged` (the worker's event-log filter), `read_only` (`EngineClient.writesInFlight` / `writeEpoch`), `new_document` (the #268 pinned-snapshot set), `story` (the engine's `story_gate`), `status` (`Implemented` / `Partial { issue }` / `Stub { issue }`). Never re-add a hand-kept command list in the worker, the client or the engine. A bridge change regenerates `packages/core/src/commandMeta.generated.ts` (`NGE_UPDATE_COMMAND_META=1 cargo test -p bridge`; `cargo test` fails while it is stale) and classifies the variant in `packages/core/src/facadeMap.ts` (tsc refuses a facade method that dispatches a `Stub`).
 - Workspace member `Cargo.toml`s inherit via `.workspace = true` for `version`, `edition`, `license`, `rust-version`. Don't duplicate.
 - **let-chains** (`if let X && let Y`) are available (Rust ≥ 1.88; toolchain 1.95).
 
@@ -277,8 +278,14 @@ gate** the affordance. Three discipline rules, in priority order:
 
 1. **No silent dead buttons.** A button that dispatches into a
    `phase3_stub` / `Event::Error` path must render `disabled` with an
-   amber **"Engine pending"** badge (the canonical pattern is in
-   `@nge/ui` `ListButtons.tsx` / `FileMenu.tsx`).
+   amber **"Engine pending"** badge (the live instance is `@nge/ui`
+   `ImageWrapPicker.tsx`; the snippet is in `.claude/rules/
+   sdk-architecture.md`). The badge element carries
+   `data-nge-command="<WIRE_NAME>"` + `data-nge-pending-issue="<n>"`
+   matching the command's `bridge::meta` status — `tools/parity`
+   (issue #342) fails CI on a badge without them, a badge that
+   disagrees with meta, a `Partial` with no badge, or a `Stub` exposed
+   on the facade or in the UI.
 2. **Log the gap immediately.** When you discover a missing core
    feature, a pragmatic workaround, or tech debt outside the current
    sprint's scope, use the `gh-issue-logger` skill (`/gh-issue-logger`)
@@ -328,6 +335,10 @@ Engine backlog" references a real issue.
   sets `retries: process.env.CI ? 1 : 0` — a rare cold-Vite-dep-cache flake
   observed once locally ("Execution context was destroyed" mid-`evaluate`),
   not a mask for a repeatable failure; local runs stay retry-free.
+- `cargo run -p parity --release -- --verify-issues` (issue #342) — the
+  Command parity matrix (`bridge::meta` × facade map × UI badges × e2e ×
+  fuzz) into the `rust-native` job summary; its floor also runs as
+  `parity`'s unit tests in `cargo test --workspace`.
 - `cargo check --manifest-path fuzz/Cargo.toml` — the D5.5 fuzz crate
   compiles. `cargo test --manifest-path fuzz/Cargo.toml` (issue #229) — the
   fuzz crate's own unit tests, including the #186/#187 regression-seed

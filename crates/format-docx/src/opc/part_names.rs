@@ -19,8 +19,8 @@
 
 use crate::error::{DocxError, DocxWarning};
 use crate::opc::archive::{
-    COMMENTS_EXTENDED_XML, COMMENTS_XML, CORE_PROPS_XML, DOC_XML, ENDNOTES_XML, FOOTNOTES_XML,
-    NUMBERING_XML, SETTINGS_XML, STYLES_XML,
+    COMMENTS_EXTENDED_XML, COMMENTS_EXTENSIBLE_XML, COMMENTS_IDS_XML, COMMENTS_XML, CORE_PROPS_XML,
+    DOC_XML, ENDNOTES_XML, FOOTNOTES_XML, NUMBERING_XML, SETTINGS_XML, STYLES_XML,
 };
 use crate::opc::relationships::{TargetMode, parse_relationships};
 
@@ -29,6 +29,12 @@ const REL_CORE_PROPS: &str =
     "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
 const REL_COMMENTS_EXTENDED: &str =
     "http://schemas.microsoft.com/office/2011/relationships/commentsExtended";
+/// Issue #282 — Word 2016+ comment side parts (rows keyed by paraId /
+/// durable id; a deleted comment's rows are removed from them).
+const REL_COMMENTS_IDS: &str =
+    "http://schemas.microsoft.com/office/2016/09/relationships/commentsIds";
+const REL_COMMENTS_EXTENSIBLE: &str =
+    "http://schemas.microsoft.com/office/2018/08/relationships/commentsExtensible";
 
 /// The archive entry names of the main part and the siblings the reader
 /// and writer treat specially. Every field is an archive entry name (no
@@ -44,6 +50,9 @@ pub struct PartNames {
     pub endnotes: String,
     pub comments: String,
     pub comments_extended: String,
+    /// Issue #282 — `word/commentsIds.xml` / `word/commentsExtensible.xml`.
+    pub comments_ids: String,
+    pub comments_extensible: String,
     pub core_props: String,
 }
 
@@ -89,6 +98,8 @@ impl PartNames {
             endnotes: next_to_main("endnotes.xml", ENDNOTES_XML),
             comments: next_to_main("comments.xml", COMMENTS_XML),
             comments_extended: next_to_main("commentsExtended.xml", COMMENTS_EXTENDED_XML),
+            comments_ids: next_to_main("commentsIds.xml", COMMENTS_IDS_XML),
+            comments_extensible: next_to_main("commentsExtensible.xml", COMMENTS_EXTENSIBLE_XML),
             core_props: CORE_PROPS_XML.to_string(),
         }
     }
@@ -168,6 +179,8 @@ impl PartNames {
             pick(&format!("{REL_BASE}endnotes"), &mut names.endnotes);
             pick(&format!("{REL_BASE}comments"), &mut names.comments);
             pick(REL_COMMENTS_EXTENDED, &mut names.comments_extended);
+            pick(REL_COMMENTS_IDS, &mut names.comments_ids);
+            pick(REL_COMMENTS_EXTENSIBLE, &mut names.comments_extensible);
         }
         /* 3. Core properties hang off the package root, not the main part. */
         if let Some(rels) = &root_rels {

@@ -397,6 +397,16 @@ pub enum Event {
         /// to build this event around).
         #[serde(default = "default_zoom")]
         zoom: f32,
+        /// Issue #260 — the engine's document revision (the issue-#194
+        /// `mutation_seq`, the same counter `Event::Painted.mutation_seq`
+        /// carries) AFTER the command this event answers: bumped once per
+        /// command that changed the document, never on a pure selection
+        /// move. Together with `range` + `editing_story` it keys the
+        /// shell's synchronous clipboard cache, replacing the hand-kept
+        /// "which events invalidate" list. Additive — `0` from producers
+        /// that predate it.
+        #[serde(default)]
+        document_revision: u64,
     },
     /// Issue #239 — reply to `SetZoom` / `SetDeviceScale` when no
     /// `RenderPage` has run yet: there is no layout config to fold the

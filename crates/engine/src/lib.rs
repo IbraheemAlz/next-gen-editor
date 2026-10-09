@@ -246,6 +246,20 @@ pub struct DocumentTree {
     /// expressed in `LogicalPos` so a comment can span across paragraph
     /// (and table-cell) boundaries.
     pub comment_ranges: Vec<CommentRange>,
+    /// Issue #282 — tombstones: the `w:id` of every comment
+    /// [`Self::delete_comment`] removed (whole threads), sorted. A
+    /// document read from `.docx` keeps untouched paragraphs as their
+    /// source bytes, which still carry a deleted comment's anchors (and
+    /// `word/comments.xml` still carries its body); the writer strips
+    /// exactly these ids from every replayed byte and part, so a dangling
+    /// anchor the SOURCE already had (no tombstone) still round-trips
+    /// byte-identical. New ids are minted above every tombstone
+    /// ([`Self::next_comment_id`]) so a stale source anchor can never be
+    /// mistaken for a new comment's. Rides the tree, so undo restores
+    /// the comment and drops its tombstone together. Skipped when empty:
+    /// a pre-#282 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_comments: Vec<u32>,
     /// Phase 2 audit — typed `word/settings.xml` flags. Currently only
     /// `even_and_odd_headers`; grows as more settings get modelled.
     pub settings: DocumentSettings,
@@ -5355,6 +5369,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5408,6 +5423,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5463,6 +5479,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5498,6 +5515,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5533,6 +5551,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -5621,6 +5640,7 @@ impl DocumentTree {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -6745,6 +6765,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -6806,6 +6827,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -6944,6 +6966,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7043,6 +7066,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7095,6 +7119,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7154,6 +7179,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7219,6 +7245,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7289,6 +7316,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7429,6 +7457,7 @@ impl DocumentTree {
             notes_dirty: split.notes_dirty.clone(),
             comment_defs: split.comment_defs.clone(),
             comment_ranges: split.comment_ranges.clone(),
+            deleted_comments: split.deleted_comments.clone(),
             settings: split.settings.clone(),
             styles: split.styles.clone(),
             style_defaults: split.style_defaults.clone(),
@@ -7537,6 +7566,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7566,8 +7596,25 @@ impl DocumentTree {
     `revision_refs` and runs through the same resolver as accept-all
     (`revisions::DocumentTree::resolve_revisions`). */
 
+    /// Issue #282 — the `w:id` the next new comment / reply gets: one
+    /// above every id the document knows — `comment_defs`, every range
+    /// (an anchor whose body is missing still owns its id) and every
+    /// [`Self::deleted_comments`] tombstone (a deleted comment's source
+    /// anchors may still sit in replayed bytes until the writer strips
+    /// them; a reused id would let them stand in for the new comment's).
+    pub fn next_comment_id(&self) -> u32 {
+        self.comment_defs
+            .keys()
+            .copied()
+            .chain(self.comment_ranges.iter().map(|r| r.id))
+            .chain(self.deleted_comments.iter().copied())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
     /// Sprint 7 (UI Edition) — append a new comment anchored to a
-    /// logical range. Picks a fresh `id` (max existing + 1) and
+    /// logical range. Picks a fresh `id` ([`Self::next_comment_id`]) and
     /// installs both a `CommentDef` (with `paragraphs = [text]`)
     /// and a matching `CommentRange`. Returns `(new_doc, id)`.
     pub fn insert_comment(
@@ -7579,13 +7626,7 @@ impl DocumentTree {
         date: String,
     ) -> (Self, u32) {
         let (start, end) = order_positions(self.snap_pos(start), self.snap_pos(end));
-        let new_id = self
-            .comment_defs
-            .keys()
-            .max()
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let new_id = self.next_comment_id();
         let mut comment_defs = self.comment_defs.clone();
         comment_defs.insert(
             new_id,
@@ -7620,6 +7661,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7637,8 +7679,8 @@ impl DocumentTree {
     }
 
     /// Issue #27 — append a threaded reply to an existing comment.
-    /// Mints the next `w:id` (max existing + 1, same discipline as
-    /// [`Self::insert_comment`]) and installs a `CommentDef` with
+    /// Mints the next `w:id` ([`Self::next_comment_id`], same discipline
+    /// as [`Self::insert_comment`]) and installs a `CommentDef` with
     /// `parent_id = Some(parent_id)`. The reply's `CommentRange` is
     /// CLONED from the parent's range (same `start` / `end`) — Word
     /// anchors replies on the parent's span, and the snapshot loop
@@ -7659,13 +7701,7 @@ impl DocumentTree {
         if !self.comment_defs.contains_key(&parent_id) {
             return None;
         }
-        let new_id = self
-            .comment_defs
-            .keys()
-            .max()
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let new_id = self.next_comment_id();
         let mut comment_defs = self.comment_defs.clone();
         comment_defs.insert(
             new_id,
@@ -7701,6 +7737,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7724,6 +7761,10 @@ impl DocumentTree {
     /// comment whose `parent_id` chain (walked transitively) reaches
     /// the deleted id is removed too, along with its ranges. Deleting
     /// a reply leaves its parent untouched.
+    ///
+    /// Issue #282 — every removed id is tombstoned in
+    /// [`Self::deleted_comments`] (the writer strips its anchors from
+    /// replayed source bytes and its body from `comments.xml`).
     pub fn delete_comment(&self, id: u32) -> Self {
         /* Transitive closure of the thread rooted at `id`. Fixpoint
         loop — reply chains are short (Word nests one level, but a
@@ -7744,6 +7785,15 @@ impl DocumentTree {
                 break;
             }
         }
+        /* Issue #282 — tombstone every id that existed (a def or a
+        range), so the writer strips its anchors from replayed source
+        bytes and its body from `comments.xml`. */
+        let mut deleted_comments = self.deleted_comments.clone();
+        deleted_comments.extend(doomed.iter().copied().filter(|cid| {
+            self.comment_defs.contains_key(cid) || self.comment_ranges.iter().any(|r| r.id == *cid)
+        }));
+        deleted_comments.sort_unstable();
+        deleted_comments.dedup();
         let mut comment_defs = self.comment_defs.clone();
         comment_defs.retain(|cid, _| !doomed.contains(cid));
         let mut comment_ranges = self.comment_ranges.clone();
@@ -7761,6 +7811,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
+            deleted_comments,
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7797,6 +7848,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7886,6 +7938,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -7997,6 +8050,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8106,6 +8160,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles,
             style_defaults: self.style_defaults.clone(),
@@ -8191,6 +8246,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8252,6 +8308,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8310,6 +8367,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8436,6 +8494,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8511,6 +8570,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8565,6 +8625,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8684,6 +8745,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -8745,6 +8807,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -9077,6 +9140,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -9130,6 +9194,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -9271,6 +9336,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -9312,6 +9378,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -9361,6 +9428,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -9565,6 +9633,7 @@ impl DocumentTree {
                     notes_dirty: self.notes_dirty.clone(),
                     comment_defs: self.comment_defs.clone(),
                     comment_ranges: self.comment_ranges.clone(),
+                    deleted_comments: self.deleted_comments.clone(),
                     settings: self.settings.clone(),
                     styles: self.styles.clone(),
                     style_defaults: self.style_defaults.clone(),
@@ -9617,6 +9686,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -9856,6 +9926,7 @@ impl DocumentTree {
                 notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                deleted_comments: self.deleted_comments.clone(),
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
@@ -10033,6 +10104,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -10076,6 +10148,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -10661,6 +10734,7 @@ impl DocumentTree {
             notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            deleted_comments: self.deleted_comments.clone(),
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
@@ -15289,6 +15363,7 @@ mod tests {
             notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            deleted_comments: Vec::new(),
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
@@ -15428,6 +15503,46 @@ mod tests {
         assert!(!doc.comment_defs.contains_key(&reply));
         assert!(doc.comment_ranges.iter().any(|r| r.id == parent));
         assert!(!doc.comment_ranges.iter().any(|r| r.id == reply));
+    }
+
+    /// Issue #282 — deleting a thread tombstones every id it removed (the
+    /// writer strips their source anchors), a new comment never reuses a
+    /// tombstoned id, and undo — the previous tree — has no tombstone.
+    #[test]
+    fn delete_comment_tombstones_the_thread_and_ids_are_never_reused() {
+        let (doc, parent) = doc_with_comment();
+        let (doc, reply) = doc
+            .reply_to_comment(parent, "reply".into(), "Bob".into(), "d".into())
+            .expect("parent exists");
+        let before = doc.clone();
+        let doc = doc.delete_comment(parent);
+        assert_eq!(doc.deleted_comments, vec![parent, reply]);
+        assert!(before.deleted_comments.is_empty(), "the undo state");
+        /* Deleting an unknown id tombstones nothing. */
+        assert_eq!(
+            doc.delete_comment(999).deleted_comments,
+            vec![parent, reply]
+        );
+        let (doc, fresh) = doc.insert_comment(
+            LogicalPos::new(BlockPath::top(0), 0),
+            LogicalPos::new(BlockPath::top(0), 1),
+            "x".into(),
+            "C".into(),
+            "d".into(),
+        );
+        assert_eq!(fresh, reply + 1, "above every tombstone");
+        let (_, again) = doc
+            .reply_to_comment(fresh, "y".into(), "D".into(), "d".into())
+            .expect("parent exists");
+        assert_eq!(again, fresh + 1);
+        /* A range whose body is missing still owns its id. */
+        let mut orphan = DocumentTree::from_text("ab");
+        orphan.comment_ranges.push(CommentRange {
+            id: 7,
+            start: LogicalPos::new(BlockPath::top(0), 0),
+            end: LogicalPos::new(BlockPath::top(0), 1),
+        });
+        assert_eq!(orphan.next_comment_id(), 8);
     }
 
     /* ================================================================

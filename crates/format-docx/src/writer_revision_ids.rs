@@ -83,6 +83,30 @@ pub(super) fn token(id: Option<u32>) -> String {
     }
 }
 
+/// Issue #282 — `xml` with every token written as the number it stands
+/// for (a KEEP `n` as `n`, a FRESH one as `0`): what a re-read of
+/// not-yet-finalized content sees, for verification only.
+pub(super) fn detokenize(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut in_token = false;
+    let mut digits = String::new();
+    for c in xml.chars() {
+        match c {
+            OPEN => {
+                in_token = true;
+                digits.clear();
+            }
+            CLOSE if in_token => {
+                in_token = false;
+                out.push_str(if digits.is_empty() { "0" } else { &digits });
+            }
+            c if in_token => digits.push(c),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Every annotation start tag in `xml[from..]` whose `w:id` is a literal
 /// number: rewrite the number into a KEEP token. Range markers and
 /// already-tokenized ids are left alone.

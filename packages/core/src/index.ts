@@ -31,6 +31,7 @@ export type { EngineProviderProps, EngineHandle } from './EngineProvider';
 
 export {
     createEditorCommands,
+    docFormatForFileName,
     DEFAULT_TOC_SWITCHES,
     STYLE_PRESETS,
     emptyPatch,
@@ -70,6 +71,26 @@ export type {
 } from './types';
 
 export { recoveryNotices, recoveryDegraded, checkpointNotices } from './recovery';
+
+/* Issue #342 — per-command metadata generated from `bridge::meta` (also
+ * importable on its own as `@nge/core/command-meta`, which the worker and
+ * `EngineClient` use so they never pull Solid into the worker bundle). */
+export { COMMAND_META, commandMeta } from './commandMeta.generated';
+export { COMMAND_FACADE, FACADE_METHOD_COMMANDS } from './facadeMap';
+export type {
+    FacadeTarget,
+    FacadeMemberTarget,
+    LiveCommand,
+    LiveCommandType,
+} from './facadeMap';
+export type {
+    CommandMeta,
+    CommandStatus,
+    CommandType,
+    StoryPolicy,
+    StubCommandType,
+    PartialCommandType,
+} from './commandMeta.generated';
 export type { RecoveryNotice, RecoveryNoticeKind, RecoveryNoticeOptions } from './recovery';
 
 export type {
