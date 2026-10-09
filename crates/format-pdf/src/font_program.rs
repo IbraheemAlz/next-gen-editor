@@ -25,9 +25,42 @@
 //! When a face cannot be subset it falls back to the pre-#327 full
 //! embedding: codes are the shaped glyph ids unchanged and the whole font
 //! file is embedded — byte-identical to the old output for that face.
+//!
+//! # Outline flavours (issue #361)
+//!
+//! [`Outlines`] picks the PDF font type from the face's tables: `glyf`
+//! outlines embed as `CIDFontType2` + `FontFile2` (an sfnt), `CFF ` outlines
+//! (an `OTTO` `.otf`) as `CIDFontType0` + `FontFile3 /Subtype
+//! /CIDFontType0C` carrying the bare CFF program. The subsetter rewrites
+//! every CFF subset CID-keyed with an identity charset, so CID == new glyph
+//! id there too — the same codes, without a `CIDToGIDMap` (which ISO
+//! 32000-1 allows only on `CIDFontType2`).
 
 use std::collections::BTreeMap;
 use subsetter::GlyphRemapper;
+
+/// Outline flavour of an sfnt font program — decides the PDF font type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outlines {
+    /// `glyf` outlines: `CIDFontType2` + `FontFile2`.
+    TrueType,
+    /// Issue #361 — `CFF ` outlines: `CIDFontType0` + `FontFile3 /Subtype
+    /// /CIDFontType0C` (the bare CFF program).
+    Cff,
+}
+
+impl Outlines {
+    /// Detect the flavour from table presence (`glyf` wins, as in the
+    /// subsetter itself). Anything else — a `CFF2` variable font, a
+    /// bitmap-only face — keeps the TrueType path it has always taken.
+    pub(crate) fn detect(data: &[u8]) -> Self {
+        if sfnt_table(data, *b"glyf").is_none() && sfnt_table(data, *b"CFF ").is_some() {
+            Self::Cff
+        } else {
+            Self::TrueType
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -85,7 +118,10 @@ impl GlyphCodes {
 /// The program embedded for one face, plus what the font dictionaries need
 /// to describe it.
 pub(crate) struct FontProgram {
-    /// The `FontFile2` payload (an sfnt).
+    /// Which PDF font type / font-file stream describes `data`.
+    pub(crate) outlines: Outlines,
+    /// The `FontFile2` payload (an sfnt) or, for [`Outlines::Cff`], the
+    /// `FontFile3` one (a bare CFF program).
     pub(crate) data: Vec<u8>,
     /// Glyph count of the embedded program. For a subset this is what the
     /// `/CIDSet` must cover: the requested glyphs plus every composite
@@ -107,12 +143,22 @@ pub(crate) fn subset_program(
     if REJECT_SUBSET.with(std::cell::Cell::get) {
         return Err(subsetter::Error::Unimplemented);
     }
-    let data = subsetter::subset(face_data, 0, remapper)?;
-    let num_glyphs = sfnt_table(&data, *b"maxp")
+    let sfnt = subsetter::subset(face_data, 0, remapper)?;
+    let num_glyphs = sfnt_table(&sfnt, *b"maxp")
         .and_then(|maxp| maxp.get(4..6))
         .map(|b| u16::from_be_bytes([b[0], b[1]]))
         .ok_or(subsetter::Error::SubsetError)?;
+    let outlines = Outlines::detect(face_data);
+    let data = match outlines {
+        Outlines::TrueType => sfnt,
+        /* `CIDFontType0C` is the bare CFF program — already CID-keyed with
+        an identity charset (CID == new GID) by the subsetter. */
+        Outlines::Cff => sfnt_table(&sfnt, *b"CFF ")
+            .ok_or(subsetter::Error::SubsetError)?
+            .to_vec(),
+    };
     Ok(FontProgram {
+        outlines,
         data,
         num_glyphs,
         subset_tag: Some(subset_tag(id, remapper)),
@@ -120,10 +166,20 @@ pub(crate) fn subset_program(
 }
 
 /// The pre-#327 full embedding: the whole font file, byte-identical to the
-/// old output.
+/// old output for a TrueType face. A CFF face embeds its bare `CFF `
+/// program; with the identity codes this mode emits that is exact for a
+/// name-keyed CFF (ISO 32000-1 §9.7.4.2: its CIDs are used as GIDs) — the
+/// `.otf` norm. A CID-keyed CFF (CJK `.otf`) would need its charset's CIDs
+/// as codes; only reachable when the subsetter rejects such a face.
 pub(crate) fn full_program(face_data: &[u8]) -> FontProgram {
+    let outlines = Outlines::detect(face_data);
+    let data = match outlines {
+        Outlines::TrueType => face_data,
+        Outlines::Cff => sfnt_table(face_data, *b"CFF ").unwrap_or(face_data),
+    };
     FontProgram {
-        data: face_data.to_vec(),
+        outlines,
+        data: data.to_vec(),
         num_glyphs: 0,
         subset_tag: None,
     }
@@ -187,6 +243,51 @@ mod tests {
 
     fn liberation() -> &'static [u8] {
         include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf")
+    }
+
+    #[test]
+    fn detects_the_outline_flavour() {
+        assert_eq!(Outlines::detect(liberation()), Outlines::TrueType);
+        let otf = crate::cff_test_font::cff_from_truetype(liberation(), "NGE Synth Sans");
+        assert_eq!(Outlines::detect(&otf), Outlines::Cff);
+        /* Neither table: the historical TrueType path. */
+        assert_eq!(Outlines::detect(b"junk"), Outlines::TrueType);
+    }
+
+    #[test]
+    fn cff_subset_is_a_bare_cid_keyed_cff_program() {
+        let otf = crate::cff_test_font::cff_from_truetype(liberation(), "NGE Synth Sans");
+        let face = rustybuzz::ttf_parser::Face::parse(&otf, 0).expect("otf");
+        let mut codes = GlyphCodes::subset();
+        let gids: Vec<u16> = "Hello"
+            .chars()
+            .map(|c| face.glyph_index(c).expect("glyph").0)
+            .collect();
+        for &g in &gids {
+            codes.code_for_show(g);
+        }
+        let GlyphCodes::Subset(r) = &codes else {
+            unreachable!("built as a subset")
+        };
+        let p = subset_program("synth", &otf, r).expect("CFF subsets");
+        assert_eq!(p.outlines, Outlines::Cff);
+        assert_eq!(&p.data[..4], &[1, 0, 4, 4], "bare CFF header, not an sfnt");
+        assert!(p.data.len() * 20 < otf.len(), "{} B", p.data.len());
+        /* .notdef + H e l o; CID-keyed with CID == GID throughout. */
+        assert_eq!(p.num_glyphs, 5);
+        let cff = rustybuzz::ttf_parser::cff::Table::parse(&p.data).expect("CFF parses");
+        assert_eq!(cff.number_of_glyphs(), 5);
+        for g in 0..5u16 {
+            assert_eq!(
+                cff.glyph_cid(rustybuzz::ttf_parser::GlyphId(g)),
+                Some(g),
+                "identity charset"
+            );
+        }
+        /* The full-embedding fallback carries the bare original CFF. */
+        let full = full_program(&otf);
+        assert_eq!(full.outlines, Outlines::Cff);
+        assert_eq!(full.data, sfnt_table(&otf, *b"CFF ").expect("CFF "));
     }
 
     #[test]

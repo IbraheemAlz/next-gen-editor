@@ -481,7 +481,10 @@ conformance shipped after that (GitHub issue #28, closed).
 PDF font subsetting shipped too (issue #327: the `subsetter` crate, glyph
 ids renumbered through content codes / `/W` / `/ToUnicode` / `/CIDSet`,
 +67 KB raw wasm; `tools/pdf-validate` gates one-page exports at < 10 % of
-their fonts' raw size).
+their fonts' raw size), as did the CFF font type (issue #361: an `.otf`
+with CFF outlines embeds as `CIDFontType0` + `FontFile3 /CIDFontType0C`;
+`tools/pdf-validate --native` veraPDF-checks a test-time-synthesized CFF
+font, no browser needed).
 
 Still open, tracked in `gh issue list`: Vello as the
 *default* renderer (issue #1 — the harness has a `--renderer vello` mode

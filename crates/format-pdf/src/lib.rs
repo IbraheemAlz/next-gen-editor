@@ -4,7 +4,9 @@
 //! Each used face goes into the PDF as a `Type0` / `CIDFontType2` font with
 //! `Identity-H` encoding, so the shaped glyphs map straight into the content
 //! stream — no re-encoding through a character map, and Arabic shaping is
-//! preserved exactly.
+//! preserved exactly. A face with CFF outlines (an `OTTO` `.otf`, issue
+//! #361) becomes a `CIDFontType0` instead, its bare CFF program in a
+//! `FontFile3 /Subtype /CIDFontType0C` stream.
 //!
 //! Coordinate spaces differ. The layout engine puts its origin at the page
 //! top-left with y growing **down**; PDF user space puts its origin at the
@@ -100,7 +102,7 @@
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use font_program::{FontProgram, GlyphCodes};
+use font_program::{FontProgram, GlyphCodes, Outlines};
 use layout::{LayoutBlock, PageBox, ParagraphBox, TabLeaderKind, TableBox, VisualRun};
 use pdf_writer::types::{
     CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, TextRenderingMode, TrappingStatus,
@@ -112,6 +114,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use text_pipeline::{FontStack, LoadedFont};
 
+#[cfg(test)]
+mod cff_test_font;
 mod font_program;
 mod image;
 #[cfg(test)]
@@ -1977,9 +1981,12 @@ fn stroke_border_edge(
 }
 
 /// Embed one face as a `Type0` / `CIDFontType2` font with the TrueType bytes in
-/// a FlateDecode-compressed `FontFile2` stream. The `/ToUnicode` reference is
-/// wired into the `Type0` dict here; the CMap stream itself is a separate
-/// object written by the caller.
+/// a FlateDecode-compressed `FontFile2` stream — or (issue #361), for a CFF
+/// face, a `CIDFontType0` with the bare CFF program in a `FontFile3`
+/// stream of `/Subtype /CIDFontType0C` and no `CIDToGIDMap` (which only a
+/// `CIDFontType2` may carry; the subset's identity charset already makes
+/// CID == GID). The `/ToUnicode` reference is wired into the `Type0` dict
+/// here; the CMap stream itself is a separate object written by the caller.
 ///
 /// Issue #327 — `program` is the subset (or, on fallback, the whole face):
 /// a subset is named `TAG+id`, its `/W` covers the subset's codes, and —
@@ -2009,16 +2016,21 @@ fn embed_font(
 
     {
         let mut cid = pdf.cid_font(fo.cid);
-        cid.subtype(CidFontType::Type2)
-            .base_font(base)
-            .system_info(SystemInfo {
-                registry: Str(b"Adobe"),
-                ordering: Str(b"Identity"),
-                supplement: 0,
-            })
-            .font_descriptor(fo.descriptor)
-            .default_width(0.0);
-        cid.cid_to_gid_map_predefined(Name(b"Identity"));
+        cid.subtype(match program.outlines {
+            Outlines::TrueType => CidFontType::Type2,
+            Outlines::Cff => CidFontType::Type0,
+        })
+        .base_font(base)
+        .system_info(SystemInfo {
+            registry: Str(b"Adobe"),
+            ordering: Str(b"Identity"),
+            supplement: 0,
+        })
+        .font_descriptor(fo.descriptor)
+        .default_width(0.0);
+        if program.outlines == Outlines::TrueType {
+            cid.cid_to_gid_map_predefined(Name(b"Identity"));
+        }
         /* PDF/A-1b §6.3.5: per-CID widths in /W must match the font program's
         glyph advances. Use the font's own hmtx values in 1000-em units —
         for a subset, CID `c` is the original glyph the remapper put at
@@ -2045,8 +2057,11 @@ fn embed_font(
             .ascent(m.ascent)
             .descent(-m.descent.abs())
             .cap_height(m.cap_height)
-            .stem_v(80.0)
-            .font_file2(fo.file);
+            .stem_v(80.0);
+        match program.outlines {
+            Outlines::TrueType => descriptor.font_file2(fo.file),
+            Outlines::Cff => descriptor.font_file3(fo.file),
+        };
         if let Some(cid_set) = cid_set {
             descriptor.cid_set(cid_set);
         }
@@ -2055,11 +2070,15 @@ fn embed_font(
         pdf.stream(cid_set, &font_program::cid_set_bytes(program.num_glyphs));
     }
 
-    /* Compress the font program; `/Length1` keeps the *uncompressed* length. */
+    /* Compress the font program; a `FontFile2`'s `/Length1` keeps the
+     *uncompressed* length, a `FontFile3` names its program format instead. */
     let file_z = deflate(data);
-    pdf.stream(fo.file, &file_z)
-        .filter(Filter::FlateDecode)
-        .pair(Name(b"Length1"), data.len() as i32);
+    let mut file = pdf.stream(fo.file, &file_z);
+    file.filter(Filter::FlateDecode);
+    match program.outlines {
+        Outlines::TrueType => file.pair(Name(b"Length1"), data.len() as i32),
+        Outlines::Cff => file.pair(Name(b"Subtype"), Name(b"CIDFontType0C")),
+    };
 }
 
 /// zlib-compress `data` for a PDF `/FlateDecode` stream. Deterministic for a
@@ -3177,19 +3196,28 @@ mod tests {
     /// One page: a Latin sentence in Liberation Sans, then an Arabic one
     /// in Amiri (explicit families, so each script embeds its own face).
     fn mixed_script_page(stack: &FontStack) -> (PageBox, String) {
+        mixed_script_page_with(stack, "liberation", "amiri")
+    }
+
+    /// [`mixed_script_page`] with the Latin / Arabic face ids chosen.
+    fn mixed_script_page_with(
+        stack: &FontStack,
+        latin_id: &str,
+        arabic_id: &str,
+    ) -> (PageBox, String) {
         let latin = "Subset fonts keep a one-page PDF small. ";
         let arabic = "الخط العربي جميل ومتصل.";
         let text = format!("{latin}{arabic}");
         let split = latin.len() as u32;
         let spans = [
             StyleSpan {
-                font_family: Some("liberation".into()),
+                font_family: Some(latin_id.into()),
                 ..plain_span(split)
             },
             StyleSpan {
                 start: split,
                 end: text.len() as u32,
-                font_family: Some("amiri".into()),
+                font_family: Some(arabic_id.into()),
                 ..plain_span(0)
             },
         ];
@@ -3398,6 +3426,223 @@ mod tests {
             .filter(|&g| Some(g) != face.glyph_id(' '))
             .collect();
         assert_eq!(shown, expected, "codes are the shaped glyph ids");
+    }
+
+    /* ================================================================
+    Issue #361 — a CFF-flavoured OpenType face embeds as `CIDFontType0`
+    with its bare CFF program in a `FontFile3 /Subtype /CIDFontType0C`.
+    ================================================================ */
+
+    const LIBERATION_TTF: &[u8] = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf");
+    const NASKH_TTF: &[u8] = include_bytes!("../../../ts/fonts/NotoNaskhArabic-Regular.ttf");
+
+    /// A Latin + Arabic stack under ids `{prefix}-latin` / `{prefix}-arabic`:
+    /// the shipped OFL TrueType faces (Liberation Sans, Noto Naskh Arabic),
+    /// or — `cff` — their CFF twins synthesized at test time. Returns the
+    /// stack and the summed raw size of its two font files.
+    fn script_stack(prefix: &str, cff: bool) -> (FontStack, usize) {
+        let mut faces: HashMap<String, Arc<LoadedFont>> = HashMap::new();
+        let mut raw = 0;
+        for (script, ttf, family) in [
+            ("latin", LIBERATION_TTF, "NGE Synth Sans"),
+            ("arabic", NASKH_TTF, "NGE Synth Naskh"),
+        ] {
+            let bytes = if cff {
+                cff_test_font::cff_from_truetype(ttf, family)
+            } else {
+                ttf.to_vec()
+            };
+            raw += bytes.len();
+            let id = format!("{prefix}-{script}");
+            let face = LoadedFont::parse(id.clone(), bytes).expect("parse font");
+            faces.insert(id, Arc::new(face));
+        }
+        (
+            FontStack::from_faces(faces, &format!("{prefix}-latin")),
+            raw,
+        )
+    }
+
+    /// Every `FontFile3` program in `pdf`, inflated, in file order.
+    fn font_file3_programs(pdf: &[u8]) -> Vec<Vec<u8>> {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(p) = find(&pdf[from..], b"/Subtype /CIDFontType0C").map(|p| p + from) {
+            let start = find(&pdf[p..], b"stream\n").expect("stream body") + p + 7;
+            let end = find(&pdf[start..], b"endstream").expect("endstream") + start;
+            let mut program = Vec::new();
+            ZlibDecoder::new(&pdf[start..end])
+                .read_to_end(&mut program)
+                .expect("inflate CFF program");
+            out.push(program);
+            from = end;
+        }
+        out
+    }
+
+    #[test]
+    fn cff_faces_embed_as_cid_font_type0_with_bare_cff_programs() {
+        let (stack, raw) = script_stack("cff", true);
+        let (page, text) = mixed_script_page_with(&stack, "cff-latin", "cff-arabic");
+        for profile in [
+            PdfProfile::Plain,
+            PdfProfile::A1b,
+            PdfProfile::A2u,
+            PdfProfile::X3,
+        ] {
+            let out = export_bytes(&page, &stack, &text, profile);
+            let count = |n: &[u8]| out.windows(n.len()).filter(|w| w == &n).count();
+            assert_eq!(
+                test_support::embedded_font_names(&out),
+                ["cff-latin", "cff-arabic"],
+                "{profile:?}"
+            );
+            assert_eq!(
+                count(b"/Subtype /CIDFontType0\n"),
+                2,
+                "{profile:?}: CIDFont type"
+            );
+            assert_eq!(count(b"/FontFile3"), 2, "{profile:?}: descriptor key");
+            assert_eq!(count(b"/Subtype /CIDFontType0C"), 2, "{profile:?}");
+            for absent in [
+                &b"/CIDFontType2"[..],
+                b"/FontFile2",
+                b"/Length1",
+                b"/CIDToGIDMap",
+            ] {
+                assert_eq!(
+                    count(absent),
+                    0,
+                    "{profile:?}: {}",
+                    String::from_utf8_lossy(absent)
+                );
+            }
+            assert!(
+                out.len() * 10 < raw,
+                "{profile:?}: {} B vs {raw} B of raw CFF font data",
+                out.len()
+            );
+
+            /* Each program is a CID-keyed bare CFF whose glyphs are exactly
+            CIDs 0..n (identity charset) — what the /CIDSet must list. */
+            let programs = font_file3_programs(&out);
+            assert_eq!(programs.len(), 2, "{profile:?}");
+            for program in &programs {
+                assert_eq!(&program[..4], &[1, 0, 4, 4], "{profile:?}: CFF header");
+                let cff =
+                    rustybuzz::ttf_parser::cff::Table::parse(program).expect("CFF program parses");
+                let n = cff.number_of_glyphs();
+                assert!(n > 2, "{profile:?}");
+                for g in 0..n {
+                    assert_eq!(
+                        cff.glyph_cid(rustybuzz::ttf_parser::GlyphId(g)),
+                        Some(g),
+                        "{profile:?}"
+                    );
+                }
+                if profile == PdfProfile::A1b {
+                    let bits = font_program::cid_set_bytes(n);
+                    assert!(find(&out, &bits).is_some(), "CIDSet covers 0..{n}");
+                }
+            }
+            assert_eq!(
+                count(b"/CIDSet"),
+                2 * usize::from(profile == PdfProfile::A1b)
+            );
+
+            /* /ToUnicode follows the subset codes: the Latin face maps back
+            to the Latin sentence's characters, the Arabic one to Arabic. */
+            let cmaps = test_support::to_unicode_cmaps(&out);
+            assert_eq!(cmaps.len(), 2, "{profile:?}");
+            let latin: String = cmaps[0].values().map(String::as_str).collect();
+            for ch in "SubsetfonkpaPDFml.".chars() {
+                assert!(latin.contains(ch), "{profile:?}: Latin CMap lacks {ch:?}");
+            }
+            assert!(
+                cmaps[1]
+                    .values()
+                    .flat_map(|s| s.chars())
+                    .any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)),
+                "{profile:?}: Arabic CMap"
+            );
+            assert_eq!(
+                cmaps[0].keys().copied().collect::<Vec<_>>(),
+                (1..=cmaps[0].len() as u16).collect::<Vec<_>>(),
+                "{profile:?}: codes are the subset's dense ids"
+            );
+        }
+    }
+
+    /// The CFF branch leaves TrueType output alone: a TrueType face still
+    /// embeds as `CIDFontType2` + `FontFile2` (+ `/Length1`, Identity map).
+    #[test]
+    fn truetype_faces_keep_cid_font_type2() {
+        let (stack, _) = script_stack("tt", false);
+        let (page, text) = mixed_script_page_with(&stack, "tt-latin", "tt-arabic");
+        let out = export_bytes(&page, &stack, &text, PdfProfile::A2u);
+        let count = |n: &[u8]| out.windows(n.len()).filter(|w| w == &n).count();
+        assert_eq!(count(b"/Subtype /CIDFontType2"), 2);
+        assert_eq!(count(b"/FontFile2"), 2);
+        assert_eq!(count(b"/Length1"), 2);
+        assert_eq!(count(b"/CIDToGIDMap /Identity"), 2);
+        assert_eq!(count(b"/FontFile3"), 0);
+    }
+
+    /// `tools/pdf-validate --native` (issue #361): write the CFF fixture —
+    /// and its TrueType twin, for the visual comparison — under every
+    /// profile, to `$PDF_VALIDATE_NATIVE_OUT/<profile>/` (default
+    /// `<repo>/tmp/pdf-validate/native`), for veraPDF. Each `<name>.pdf`
+    /// gets a `<name>.font-sizes.json` sidecar (face id → raw font-file
+    /// bytes) so the harness's one-page size gate covers these faces too.
+    /// `#[ignore]`d: it writes files rather than asserting, like the
+    /// fixture regenerators.
+    #[test]
+    #[ignore = "writes tmp/pdf-validate/native/*.pdf for tools/pdf-validate --native"]
+    fn write_native_pdf_validate_outputs() {
+        let root = std::env::var_os("PDF_VALIDATE_NATIVE_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tmp/pdf-validate/native")
+            });
+        let (cff, _) = script_stack("cff", true);
+        let (tt, _) = script_stack("tt", false);
+        let sizes = |stack: &FontStack, prefix: &str| {
+            let entry = |script: &str| {
+                let id = format!("{prefix}-{script}");
+                let len = stack.face(&id).expect("face").data().len();
+                format!("\"{id}\": {len}")
+            };
+            format!("{{ {}, {} }}\n", entry("latin"), entry("arabic"))
+        };
+        for (profile, dir) in [
+            (PdfProfile::Plain, "plain"),
+            (PdfProfile::A1b, "1b"),
+            (PdfProfile::A2u, "2u"),
+            (PdfProfile::X3, "x3"),
+        ] {
+            let dir = root.join(dir);
+            std::fs::create_dir_all(&dir).expect("create output dir");
+            for (name, stack, prefix) in [("cff-mixed", &cff, "cff"), ("truetype-mixed", &tt, "tt")]
+            {
+                let (page, text) = mixed_script_page_with(
+                    stack,
+                    &format!("{prefix}-latin"),
+                    &format!("{prefix}-arabic"),
+                );
+                let path = dir.join(format!("{name}.pdf"));
+                std::fs::write(&path, export_bytes(&page, stack, &text, profile))
+                    .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+                std::fs::write(
+                    dir.join(format!("{name}.font-sizes.json")),
+                    sizes(stack, prefix),
+                )
+                .expect("write font-size sidecar");
+                eprintln!("wrote {}", path.display());
+            }
+        }
     }
 
     /* ================================================================

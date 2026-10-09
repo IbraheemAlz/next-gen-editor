@@ -14,6 +14,8 @@
  *   node run.mjs --strict                     — fail if veraPDF is unavailable
  *   node run.mjs --regen                      — regenerate tests/corpus/tier-a
  *   node run.mjs --check-fixtures             — CI gate: fail if stale
+ *   node run.mjs --native --profile 2u        — natively exported fixtures
+ *                                               (no browser / dev server)
  *
  * Requires the Vite dev server (`pnpm dev`, http://localhost:5173). Override
  * with the URL env var. Uses Playwright with the system Chrome
@@ -63,6 +65,17 @@
  * `--regen` / `--check-fixtures` generators (`assert_exports_cleanly` in
  * `crates/engine-wasm/src/pdf_validate_fixtures_tests.rs`), so a
  * subsetting regression fails there too, without a browser.
+ *
+ * Issue #361 — `--native` validates PDFs the Rust exporter writes directly
+ * instead of exporting the corpus through the browser: the `#[ignore]`d
+ * `write_native_pdf_validate_outputs` test in `crates/format-pdf` exports a
+ * mixed Latin + Arabic page set in CFF-flavoured OpenType faces (OFL
+ * TrueType faces from `ts/fonts/` converted to CFF at test time — no
+ * binary font fixture in the tree) plus its TrueType twin, into
+ * `tmp/pdf-validate/native/<profile>/`. The same structural, size and
+ * veraPDF checks then run on those files; a `cff-*` document must also
+ * embed `CIDFontType0` + `FontFile3 /Subtype /CIDFontType0C` and no
+ * `FontFile2`. No dev server is needed — it is the CI-friendly path.
  */
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, basename } from 'node:path';
@@ -135,6 +148,7 @@ if (hasFlag('--regen') || hasFlag('--check-fixtures')) {
 const corpus = argValue('--corpus', 'tier-a');
 const profile = argValue('--profile', '1b');
 const strict = hasFlag('--strict');
+const native = hasFlag('--native');
 const serverUrl = process.env.URL ?? 'http://localhost:5173';
 
 /* Engine `PdfConformance` value per harness profile (issue #28 added the
@@ -160,95 +174,129 @@ const { conformance, veraFlavour } = profileSpec;
 const OUT_DIR = join(REPO, 'tmp', 'pdf-validate');
 mkdirSync(OUT_DIR, { recursive: true });
 
-let chromium;
-try {
-    ({ chromium } = await import('playwright'));
-} catch {
-    console.error('[pdf-validate] playwright is not installed.');
-    console.error('[pdf-validate] run: pnpm install --dir tools/pdf-validate');
-    process.exit(2);
+const exported = native ? exportNative() : await exportViaBrowser();
+
+/* ---- Issue #361 — natively exported fixtures (no browser) ------------- */
+
+function exportNative() {
+    const nativeRoot = join(OUT_DIR, 'native');
+    console.log(
+        `[pdf-validate] profile=${profile} native: ` +
+            "'cargo test -p format-pdf --lib -- --ignored write_native_pdf_validate_outputs'",
+    );
+    const run = spawnSync(
+        'cargo',
+        ['test', '-p', 'format-pdf', '--lib', '--', '--ignored', 'write_native_pdf_validate_outputs', '--test-threads=1'],
+        { cwd: REPO, stdio: 'inherit', env: { ...process.env, PDF_VALIDATE_NATIVE_OUT: nativeRoot } },
+    );
+    if (run.status !== 0) {
+        console.error('[pdf-validate] FAIL: the native export did not complete cleanly');
+        process.exit(run.status ?? 1);
+    }
+    const dir = join(nativeRoot, profile);
+    const docs = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.pdf')).sort() : [];
+    return docs.map((f) => {
+        const path = join(dir, f);
+        const bytes = readFileSync(path);
+        const count = /\/Type \/Pages[^]*?\/Count (\d+)/.exec(bytes.toString('latin1'));
+        const doc = { name: basename(f, '.pdf'), path, size: bytes.length, pages: count ? Number(count[1]) : 0 };
+        console.log(`[pdf-validate] native ${doc.name} -> ${path} (${doc.size} B, ${doc.pages}p)`);
+        return doc;
+    });
 }
 
-/* Build the case list. Each case is a name + an optional .docx to load first;
-   a null docx means "export whatever the editor already shows". */
-const corpusDir = join(REPO, 'tests', 'corpus', corpus);
-const fixtures = existsSync(corpusDir)
-    ? readdirSync(corpusDir).filter((f) => f.toLowerCase().endsWith('.docx'))
-    : [];
-const cases = fixtures.length
-    ? fixtures.map((f) => ({ name: basename(f, '.docx'), docx: join(corpusDir, f) }))
-    : [{ name: 'seeded-default', docx: null }];
-if (!fixtures.length) {
-    console.warn(`[pdf-validate] no .docx fixtures in ${corpusDir}`);
-    console.warn("[pdf-validate] falling back to the editor's seeded document");
-}
+/* ---- Export every corpus case through the live engine ----------------- */
 
-console.log(
-    `[pdf-validate] profile=${profile} conformance=${conformance} ` +
-        `url=${serverUrl} cases=${cases.length}`,
-);
-
-/* ---- Export every case through the live engine ----------------------- */
-
-const exported = [];
-const browser = await chromium.launch({ headless: true, channel: 'chrome' });
-try {
-    const page = await (await browser.newContext()).newPage();
-
+async function exportViaBrowser() {
+    let chromium;
     try {
-        await page.goto(serverUrl, { waitUntil: 'load', timeout: 20000 });
-        await page.waitForFunction(() => window.__paintIdle === true, { timeout: 30000 });
-    } catch (e) {
-        console.error(`[pdf-validate] cannot reach a ready editor at ${serverUrl}`);
-        console.error(`[pdf-validate] is \`pnpm dev\` running? (${e.message})`);
-        await browser.close();
+        ({ chromium } = await import('playwright'));
+    } catch {
+        console.error('[pdf-validate] playwright is not installed.');
+        console.error('[pdf-validate] run: pnpm install --dir tools/pdf-validate');
         process.exit(2);
     }
 
-    for (const testCase of cases) {
-        if (testCase.docx) {
-            const docxBytes = Array.from(readFileSync(testCase.docx));
-            const loaded = await page.evaluate(async (bytes) => {
-                const evt = await window.__dispatch({
-                    type: 'LOAD_DOCX',
-                    bytes: new Uint8Array(bytes),
-                });
-                return evt.type;
-            }, docxBytes);
-            if (loaded === 'ERROR') {
-                console.error(`[pdf-validate] ${testCase.name}: LOAD_DOCX failed — skipping`);
+    /* Build the case list. Each case is a name + an optional .docx to load first;
+       a null docx means "export whatever the editor already shows". */
+    const corpusDir = join(REPO, 'tests', 'corpus', corpus);
+    const fixtures = existsSync(corpusDir)
+        ? readdirSync(corpusDir).filter((f) => f.toLowerCase().endsWith('.docx'))
+        : [];
+    const cases = fixtures.length
+        ? fixtures.map((f) => ({ name: basename(f, '.docx'), docx: join(corpusDir, f) }))
+        : [{ name: 'seeded-default', docx: null }];
+    if (!fixtures.length) {
+        console.warn(`[pdf-validate] no .docx fixtures in ${corpusDir}`);
+        console.warn("[pdf-validate] falling back to the editor's seeded document");
+    }
+
+    console.log(
+        `[pdf-validate] profile=${profile} conformance=${conformance} ` +
+            `url=${serverUrl} cases=${cases.length}`,
+    );
+
+    const exported = [];
+    const browser = await chromium.launch({ headless: true, channel: 'chrome' });
+    try {
+        const page = await (await browser.newContext()).newPage();
+
+        try {
+            await page.goto(serverUrl, { waitUntil: 'load', timeout: 20000 });
+            await page.waitForFunction(() => window.__paintIdle === true, { timeout: 30000 });
+        } catch (e) {
+            console.error(`[pdf-validate] cannot reach a ready editor at ${serverUrl}`);
+            console.error(`[pdf-validate] is \`pnpm dev\` running? (${e.message})`);
+            await browser.close();
+            process.exit(2);
+        }
+
+        for (const testCase of cases) {
+            if (testCase.docx) {
+                const docxBytes = Array.from(readFileSync(testCase.docx));
+                const loaded = await page.evaluate(async (bytes) => {
+                    const evt = await window.__dispatch({
+                        type: 'LOAD_DOCX',
+                        bytes: new Uint8Array(bytes),
+                    });
+                    return evt.type;
+                }, docxBytes);
+                if (loaded === 'ERROR') {
+                    console.error(`[pdf-validate] ${testCase.name}: LOAD_DOCX failed — skipping`);
+                    continue;
+                }
+            }
+
+            const result = await page.evaluate(async (conf) => {
+                const evt = await window.__dispatch({ type: 'EXPORT_PDF', conformance: conf });
+                if (evt.type !== 'PDF_EXPORTED') {
+                    return { ok: false, error: evt.type === 'ERROR' ? evt.message : evt.type };
+                }
+                return { ok: true, bytes: Array.from(evt.bytes), pages: evt.pages };
+            }, conformance);
+
+            if (!result.ok) {
+                console.error(`[pdf-validate] ${testCase.name}: EXPORT_PDF failed — ${result.error}`);
                 continue;
             }
+
+            const pdfPath = join(OUT_DIR, `${testCase.name}.pdf`);
+            writeFileSync(pdfPath, Buffer.from(result.bytes));
+            exported.push({
+                name: testCase.name,
+                path: pdfPath,
+                size: result.bytes.length,
+                pages: result.pages,
+            });
+            console.log(
+                `[pdf-validate] exported ${testCase.name} -> ${pdfPath} ` +
+                    `(${result.bytes.length} B, ${result.pages}p)`,
+            );
         }
-
-        const result = await page.evaluate(async (conf) => {
-            const evt = await window.__dispatch({ type: 'EXPORT_PDF', conformance: conf });
-            if (evt.type !== 'PDF_EXPORTED') {
-                return { ok: false, error: evt.type === 'ERROR' ? evt.message : evt.type };
-            }
-            return { ok: true, bytes: Array.from(evt.bytes), pages: evt.pages };
-        }, conformance);
-
-        if (!result.ok) {
-            console.error(`[pdf-validate] ${testCase.name}: EXPORT_PDF failed — ${result.error}`);
-            continue;
-        }
-
-        const pdfPath = join(OUT_DIR, `${testCase.name}.pdf`);
-        writeFileSync(pdfPath, Buffer.from(result.bytes));
-        exported.push({
-            name: testCase.name,
-            path: pdfPath,
-            size: result.bytes.length,
-            pages: result.pages,
-        });
-        console.log(
-            `[pdf-validate] exported ${testCase.name} -> ${pdfPath} ` +
-                `(${result.bytes.length} B, ${result.pages}p)`,
-        );
+    } finally {
+        await browser.close();
     }
-} finally {
-    await browser.close();
+    return exported;
 }
 
 if (!exported.length) {
@@ -314,9 +362,25 @@ function structuralMarkers(pdf) {
     }
 }
 
+/* Issue #361 — a CFF-flavoured face must embed as CIDFontType0 with its
+   bare CFF program (`FontFile3 /Subtype /CIDFontType0C`), never the
+   TrueType font type. Applies to the `--native` `cff-*` documents. */
+function cffMarkers(pdf) {
+    const body = pdf.toString('latin1');
+    return {
+        'CIDFontType0 descendant font': /\/Subtype \/CIDFontType0\s/.test(body),
+        'FontFile3 /CIDFontType0C program': body.includes('/FontFile3') && body.includes('/Subtype /CIDFontType0C'),
+        'no FontFile2 (TrueType) program': !body.includes('/FontFile2'),
+    };
+}
+
 let structuralOk = true;
 for (const doc of exported) {
-    const markers = structuralMarkers(readFileSync(doc.path));
+    const bytes = readFileSync(doc.path);
+    const markers = {
+        ...structuralMarkers(bytes),
+        ...(doc.name.startsWith('cff-') ? cffMarkers(bytes) : {}),
+    };
     const missing = Object.entries(markers)
         .filter(([, present]) => !present)
         .map(([name]) => name);
@@ -358,13 +422,19 @@ function embeddedFontIds(pdf) {
 }
 
 const SIZE_GATE_RATIO = 0.1;
-const fontSizes = registryFontSizes();
+const registrySizes = registryFontSizes();
 let sizeOk = true;
 for (const doc of exported) {
     if (doc.pages !== 1) {
         console.log(`[pdf-validate] ${doc.name}: size gate n/a (${doc.pages} pages; one-page documents only)`);
         continue;
     }
+    /* `--native` documents name their faces' raw sizes in a sidecar (their
+       faces are test-time fonts, not registry entries). */
+    const sidecar = doc.path.replace(/\.pdf$/, '.font-sizes.json');
+    const fontSizes = existsSync(sidecar)
+        ? new Map([...registrySizes, ...Object.entries(JSON.parse(readFileSync(sidecar, 'utf8')))])
+        : registrySizes;
     const ids = embeddedFontIds(readFileSync(doc.path));
     const unknown = ids.filter((id) => !fontSizes.has(id));
     if (!ids.length || unknown.length) {

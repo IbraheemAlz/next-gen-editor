@@ -83,6 +83,16 @@ hard failure so CI catches a new loop instead of a silent recovery.
   PDF/A-1b `/CIDSet` by code. Subset names carry a deterministic six-letter
   `ABCDEF+` tag. A face the subsetter rejects falls back to full embedding
   with codes == shaped glyph ids (the pre-#327 output).
+- A CFF-outline face (`OTTO` `.otf`, `CFF ` table, no `glyf`) embeds as
+  `CIDFontType0` + `FontFile3 /Subtype /CIDFontType0C` (the bare CFF program
+  the subsetter rewrote CID-keyed with an identity charset) and **no**
+  `CIDToGIDMap` (only `CIDFontType2` may carry one) — issue #361,
+  `font_program::Outlines`. TrueType output must stay byte-identical when
+  touching the CFF branch.
+- CFF test fonts are synthesized at test time from the shipped OFL `.ttf`s
+  (`format-pdf/src/cff_test_font.rs`) — never commit a font binary. Keep a
+  `Notice`/`Copyright` in any synthesized Top DICT: veraPDF 1.30 mis-scales
+  CFF widths when the subset's `FontMatrix` directly follows `ROS`.
 - Tests that inspect content-stream text decode codes through the font's
   own `/ToUnicode` (`format_pdf::test_support::{to_unicode_cmaps,
   decode_codes}`) — comparing them against `LoadedFont::glyph_id` is wrong

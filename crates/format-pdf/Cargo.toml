@@ -18,6 +18,13 @@ gif = { workspace = true, optional = true }
 image-webp = { workspace = true, optional = true }
 tiff = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Issue #361 — `src/cff_test_font.rs` reads TrueType outlines through
+# rustybuzz's `ttf_parser` re-export to synthesize a CFF test font at test
+# time (no binary fixture in the tree). Same version text-pipeline already
+# links, so no new crate.
+rustybuzz = { workspace = true }
+
 [features]
 # Issue #189 — pure-Rust GIF / WebP decoders for PDF image XObjects. Issue
 # #207 adds TIFF the same way (BMP is hand-written, no feature needed — see
