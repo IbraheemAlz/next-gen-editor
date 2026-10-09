@@ -77,6 +77,7 @@ fn lay(
         marker_text: None,
         px_size_for_marker: PX,
         tab_stops_px: &[],
+        hyphenation: None,
     })
 }
 

@@ -358,6 +358,7 @@ fn run_default() -> Result<()> {
     complex_script::run_font_dialog_slots_roundtrip()?;
     run_content::run_soft_hyphen_roundtrip()?;
     run_content::run_run_content_roundtrip()?;
+    run_content::run_hyphenation_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4994,7 +4995,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #335 — `<w:softHyphen/>` / `<w:noBreakHyphen/>` (the
         visual-diff `soft-hyphen` golden loads it). Zero-edit drift 0;
-        the default harness's step 49 edits it. */
+        the default harness's step 55 edits it. */
         PrebuiltFixture {
             name: "soft_hyphen.docx",
             bytes: format_docx::test_fixtures::soft_hyphen_docx(),
@@ -5015,7 +5016,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #357 — `<w:sym>`, `<w:cr/>`, `<w:ptab>`, `<w:bdo>` /
         `<w:dir>` (the visual-diff `run-content` golden loads it).
-        Zero-edit drift 0; the default harness's step 50 edits it. */
+        Zero-edit drift 0; the default harness's step 56 edits it. */
         PrebuiltFixture {
             name: "run_content.docx",
             bytes: format_docx::test_fixtures::run_content_docx(),
@@ -5034,7 +5035,36 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 },
             },
         },
+        /* Issue #326 — automatic hyphenation on / off (the visual-diff
+        `hyphenation` / `hyphenation-off` goldens load them). Zero-edit
+        drift 0; the default harness's step 57 edits both. */
+        PrebuiltFixture {
+            name: "hyphenation_on.docx",
+            bytes: format_docx::test_fixtures::hyphenation_docx(true),
+            entry: hyphenation_fixture_entry(),
+        },
+        PrebuiltFixture {
+            name: "hyphenation_off.docx",
+            bytes: format_docx::test_fixtures::hyphenation_docx(false),
+            entry: hyphenation_fixture_entry(),
+        },
     ]
+}
+
+/// Issue #326 — the manifest entry both hyphenation fixtures share.
+fn hyphenation_fixture_entry() -> FixtureEntry {
+    let texts = format_docx::test_fixtures::HYPHENATION_TEXTS;
+    FixtureEntry {
+        generator: "handcrafted".into(),
+        phase_introduced: 12,
+        asserts: FixtureAsserts {
+            paragraph_count: texts.len() as u32,
+            paragraph_texts: texts.iter().map(|t| t.to_string()).collect(),
+        },
+        roundtrip: RoundtripBounds {
+            document_xml_drift_bytes: 0,
+        },
+    }
 }
 
 /// Issue #355 — the manifest entry both theme fixtures share.

@@ -2798,12 +2798,16 @@ struct StyleContext<'a> {
     /// into every paragraph layout key: the same text and bindings under
     /// another theme must never hit a cached box.
     theme_key: u64,
+    /// Issue #326 — the document's hyphenation settings (`None`: a
+    /// layout outside a document — automatic hyphenation off).
+    settings: Option<&'a engine::DocumentSettings>,
 }
 
 impl<'a> StyleContext<'a> {
     fn of(doc: &'a engine::DocumentTree) -> StyleContext<'a> {
         let theme = doc.theme.as_deref();
         StyleContext {
+            settings: Some(&doc.settings),
             styles: &doc.styles,
             run_defaults: &doc.style_run_defaults,
             note_markers: None,
@@ -3476,6 +3480,21 @@ fn paragraph_layout_key(
     cfg.line_height.to_bits().hash(&mut h);
     tp_align_disc(cfg.alignment).hash(&mut h);
     scale.to_bits().hash(&mut h);
+    /* Issue #326 — automatic hyphenation is a layout input: the settings
+    and the hyphenatable ranges (the resolved run languages). Mixed in
+    only when it applies, so every other key is unchanged. */
+    let hy_ranges = auto_hyphenation_ranges(para, sctx);
+    if let Some(s) = sctx.settings.filter(|_| !hy_ranges.is_empty()) {
+        0x326_u16.hash(&mut h);
+        s.hyphenation_zone_twips().hash(&mut h);
+        s.consecutive_hyphen_limit.hash(&mut h);
+        s.do_not_hyphenate_caps.hash(&mut h);
+        for (r, hy) in &hy_ranges {
+            r.start.hash(&mut h);
+            r.end.hash(&mut h);
+            (*hy as *const text_pipeline::Hyphenator as usize).hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -3716,6 +3735,7 @@ fn layout_note_paragraph_with_composition(
         px_size_for_marker: cfg.px_size * scale,
         inline_objects: &infos,
         tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+        hyphenation: None,
     })
 }
 
@@ -4154,6 +4174,7 @@ fn build_header_footer_box(
                     px_size_for_marker: cfg.px_size * scale,
                     inline_objects: &inline_infos,
                     tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+                    hyphenation: None,
                 });
                 /* Phase 2 audit (gap D.1) — propagate field overlays so
                 the paginator can re-evaluate PAGE / NUMPAGES per page.
@@ -5531,6 +5552,18 @@ fn layout_paragraph_wrapped_uncached(
     let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
     let inline_infos = build_inline_object_infos(para, cfg, scale, sctx);
     let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    /* Issue #326 — automatic hyphenation (document setting, paragraph
+    not suppressing it, text in a language with patterns). */
+    let hy_ranges = auto_hyphenation_ranges(para, sctx);
+    let hyphenation =
+        sctx.settings
+            .filter(|_| !hy_ranges.is_empty())
+            .map(|s| layout::hyphen::AutoHyphenation {
+                ranges: &hy_ranges,
+                zone_px: twips_to_layout_px(s.hyphenation_zone_twips() as i32, scale),
+                consecutive_limit: s.consecutive_hyphen_limit.unwrap_or(0),
+                no_caps: s.do_not_hyphenate_caps,
+            });
     let para_cfg = ParagraphConfig {
         text: &para.text,
         fonts,
@@ -5548,8 +5581,61 @@ fn layout_paragraph_wrapped_uncached(
         px_size_for_marker: cfg.px_size * scale,
         inline_objects: &inline_infos,
         tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+        hyphenation: hyphenation.as_ref(),
     };
     layout::layout_paragraph_wrapped(para_cfg, cuts)
+}
+
+/// Issue #326 — the byte ranges of `para` automatic hyphenation may break
+/// words in, each with its language's hyphenator: empty unless the
+/// document turns `<w:autoHyphenation/>` on and the paragraph's cascade
+/// does not `<w:suppressAutoHyphens/>`. A range's language is its run's
+/// `<w:lang w:val>` resolved through docDefaults → paragraph style →
+/// direct formatting, else the theme's `<w:themeFontLang w:val>` (the
+/// document's declared main language); only languages with registered
+/// patterns (`text_pipeline::Hyphenator::for_language` — en-US in this
+/// cut) yield a range. Complex-script text is skipped by the composer
+/// itself (Arabic never hyphenates).
+fn auto_hyphenation_ranges(
+    para: &engine::Paragraph,
+    sctx: StyleContext,
+) -> Vec<(std::ops::Range<u32>, &'static text_pipeline::Hyphenator)> {
+    let mut out: Vec<(std::ops::Range<u32>, &'static text_pipeline::Hyphenator)> = Vec::new();
+    if !sctx.settings.is_some_and(|s| s.auto_hyphenation)
+        || para.props.suppress_auto_hyphens == Some(true)
+        || para.text.is_empty()
+    {
+        return out;
+    }
+    let run_base = sctx.run_base(para.style_id.as_deref());
+    let fallback = sctx.theme.and_then(|t| t.font_lang.latin.as_deref());
+    let mut push = |style: &engine::SpanStyle, start: u32, end: u32| {
+        if start >= end {
+            return;
+        }
+        let tag = style
+            .lang
+            .as_ref()
+            .and_then(|l| l.val.as_deref())
+            .or(fallback);
+        let Some(h) = tag.and_then(text_pipeline::Hyphenator::for_language) else {
+            return;
+        };
+        match out.last_mut() {
+            Some((r, last)) if r.end == start && std::ptr::eq(*last, h) => r.end = end,
+            _ => out.push((start..end, h)),
+        }
+    };
+    let len = para.text.len() as u32;
+    let mut cursor = 0_u32;
+    for sr in &para.spans {
+        push(&run_base, cursor, sr.start.min(len));
+        let style = run_base.clone().merged_with(sr.style.clone());
+        push(&style, sr.start.min(len), sr.end.min(len));
+        cursor = sr.end.min(len);
+    }
+    push(&run_base, cursor, len);
+    out
 }
 
 /// Issue #87 — post-conditions a cached `ParagraphBox` must satisfy for
@@ -7771,6 +7857,7 @@ fn patch_to_latin_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
         (`SpanStyle::merged_with`). */
         font_bindings: None,
         color_theme: None,
+        lang: None,
         /* Issues #359 / #104 / #249 — the complex-script twins and the
         character style are filled by the slot routing
         (`patch_to_span_style`); a patch never names a character style. */
@@ -10302,6 +10389,7 @@ impl Engine {
                                     px_size_for_marker: cfg.px_size * scale,
                                     inline_objects: &[],
                                     tab_stops_px: &tab_stops_px,
+                                    hyphenation: None,
                                 },
                                 cuts,
                             )
@@ -16463,6 +16551,7 @@ impl Engine {
                 grab_bag: None,
                 font_bindings: None,
                 color_theme: None,
+                lang: None,
                 font_size_cs: None,
                 bold_cs: None,
                 italic_cs: None,
@@ -19456,6 +19545,7 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
+            settings: None,
         }
     }
 
@@ -19488,6 +19578,7 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
+            settings: None,
         };
         let mut para = engine::Paragraph {
             text: "hello world".into(),
@@ -19553,6 +19644,7 @@ mod tests {
             note_self_mark: None,
             theme,
             theme_key: key,
+            settings: None,
         };
         let theme: &'static engine::DocumentTheme = Box::leak(Box::new(theme));
         let mut para = engine::Paragraph {
@@ -19677,6 +19769,7 @@ mod tests {
                 px_size_for_marker: 12.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                hyphenation: None,
             })
             .size
             .height
@@ -19741,6 +19834,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert!(
@@ -19785,6 +19879,7 @@ mod tests {
             px_size_for_marker: 16.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert!(
@@ -19830,6 +19925,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         let trailing_edge = marker.origin.x + marker.width;
@@ -19898,6 +19994,7 @@ mod tests {
                 px_size_for_marker: 12.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                hyphenation: None,
             });
             let marker = para.marker.as_ref().expect("marker box");
             assert!(
@@ -19959,6 +20056,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert_eq!(

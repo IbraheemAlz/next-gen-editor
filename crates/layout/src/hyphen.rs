@@ -10,7 +10,119 @@
 
 use crate::boxes::{LineBox, LineHyphen, PositionedGlyph};
 use crate::paragraph::ParagraphConfig;
-use text_pipeline::{FontStack, LoadedFont, ShapingDirection, segment_by_script_class};
+use std::ops::Range;
+use text_pipeline::{
+    FontStack, Hyphenator, LoadedFont, ShapingDirection, is_complex_script, segment_by_script_class,
+};
+
+/// Issue #326 — automatic hyphenation for one paragraph
+/// (`<w:autoHyphenation/>` on, `<w:suppressAutoHyphens/>` off).
+///
+/// The composer consults it only when a word overflows the line: hyphenation
+/// points never join the normal break opportunities (their width sums would
+/// cut through kerning), they are offered for the overflowing word alone.
+#[derive(Debug, Clone)]
+pub struct AutoHyphenation<'a> {
+    /// Byte ranges of the paragraph text in a language with patterns
+    /// (sorted, disjoint), each with its hyphenator. Text outside every
+    /// range is never hyphenated.
+    pub ranges: &'a [(Range<u32>, &'static Hyphenator)],
+    /// `<w:hyphenationZone>` in layout px: a word is hyphenated only when
+    /// moving it to the next line would leave a wider gap than this.
+    pub zone_px: f32,
+    /// `<w:consecutiveHyphenLimit>`: the most consecutive hyphenated lines;
+    /// `0` = no limit.
+    pub consecutive_limit: u32,
+    /// `<w:doNotHyphenateCaps/>`: words in all capitals stay whole.
+    pub no_caps: bool,
+}
+
+/// Issue #326 — where to hyphenate the word overflowing the line
+/// `[line_start, …)` at the segment `[seg_from, seg_end)` (the text after
+/// the last break opportunity that fit, `line_width` wide so far), or
+/// `None` to leave it to the ordinary greedy break.
+///
+/// Rules, in order: the consecutive-hyphen limit (every hyphenated line
+/// counts, author soft hyphens included); the segment's first word must be
+/// letters only (leading / trailing punctuation allowed, never an inner
+/// apostrophe, digit or hyphen), not the paragraph's last word, not complex
+/// script (Arabic never hyphenates), not all capitals under
+/// `doNotHyphenateCaps`, and inside one hyphenation range; the gap the
+/// word would leave if it moved down must exceed the hyphenation zone;
+/// then the LATEST pattern point whose prefix + the drawn hyphen still
+/// fits wins.
+pub(crate) fn auto_hyphen_point(
+    cfg: &ParagraphConfig<'_>,
+    hy: &AutoHyphenation<'_>,
+    previous: &[(LineBox, bool)],
+    line_start: usize,
+    seg_from: usize,
+    seg_end: usize,
+    line_width: f32,
+) -> Option<usize> {
+    if hy.consecutive_limit > 0 {
+        let run = previous
+            .iter()
+            .rev()
+            .take_while(|(l, _)| !l.hyphen.is_none())
+            .count();
+        if run >= hy.consecutive_limit as usize {
+            return None;
+        }
+    }
+    if cfg.max_width - line_width <= hy.zone_px {
+        return None;
+    }
+    let seg = cfg.text.get(seg_from..seg_end)?;
+    let lead = seg.find(|c: char| c.is_alphabetic())?;
+    let word_start = seg_from + lead;
+    let word_len = cfg.text[word_start..seg_end]
+        .find(|c: char| !c.is_alphabetic())
+        .unwrap_or(seg_end - word_start);
+    let word_end = word_start + word_len;
+    let word = &cfg.text[word_start..word_end];
+    /* Only trailing punctuation / spaces after the word inside its
+    segment: an apostrophe, digit or hyphen joins a compound. */
+    let tail = &cfg.text[word_end..seg_end];
+    let tail_word = tail.split(char::is_whitespace).next().unwrap_or("");
+    if tail_word
+        .chars()
+        .any(|c| c.is_alphanumeric() || c == '\'' || c == '\u{2019}')
+    {
+        return None;
+    }
+    /* Never the paragraph's last word. */
+    if !cfg.text[word_end..].chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    if word.chars().any(is_complex_script) {
+        return None;
+    }
+    if hy.no_caps && !word.chars().any(char::is_lowercase) {
+        return None;
+    }
+    let (_, hyphenator) = hy
+        .ranges
+        .iter()
+        .find(|(r, _)| r.start as usize <= word_start && word_end <= r.end as usize)?;
+    let char_starts: Vec<usize> = word.char_indices().map(|(i, _)| i).collect();
+    for &ci in hyphenator.hyphenate(word).iter().rev() {
+        let at = word_start + *char_starts.get(ci)?;
+        let prefix = crate::paragraph::measure_text(
+            cfg.fonts,
+            &cfg.text[seg_from..at],
+            seg_from as u32,
+            cfg.spans,
+            cfg.base_direction,
+            cfg.inline_objects,
+        );
+        let hyphen = break_hyphen_advance(cfg, line_start, at);
+        if line_width + prefix + hyphen <= cfg.max_width {
+            return Some(at);
+        }
+    }
+    None
+}
 
 /// The characters a break hyphen may draw, in preference order: U+002D
 /// HYPHEN-MINUS (what Word draws), else U+2010 HYPHEN (a face such as

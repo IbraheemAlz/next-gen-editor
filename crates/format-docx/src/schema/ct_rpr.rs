@@ -370,6 +370,18 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
                 style.font_size_cs = Some(pt);
             }
         }
+        /* Issue #326 — READ-ONLY: `<w:lang>` stays an unmodeled child
+        (`rpr_child_is_modeled`), so the element rides the grab bag and is
+        never regenerated; the typed copy feeds hyphenation and cascades
+        through docDefaults → styles → runs. */
+        b"w:lang" => {
+            let attr = |k: &[u8]| attr_val(e, k).filter(|v| !v.trim().is_empty());
+            let lang = engine::Lang {
+                val: attr(b"w:val"),
+                bidi: attr(b"w:bidi"),
+            };
+            style.lang = (lang != engine::Lang::default()).then(|| Box::new(lang));
+        }
         _ => {}
     }
 }

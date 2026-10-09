@@ -293,3 +293,73 @@ fn bidi_controls_write_as_balanced_wrappers() {
         );
     }
 }
+
+/* ---- issue #326: read-only hyphenation properties ------------------ */
+
+/// `<w:suppressAutoHyphens>` follows the `widowControl` contract: a
+/// regenerated `styles.xml` writes a style's value, a paragraph never
+/// bakes a (style-inherited) value in — its own element rides the bag.
+#[test]
+fn suppress_auto_hyphens_emits_on_styles_not_on_paragraphs() {
+    let mut doc = engine::DocumentTree::default();
+    doc.styles.insert(
+        "Body".into(),
+        engine::ParagraphStyle {
+            id: "Body".into(),
+            name: "Body".into(),
+            para: ParaProperties {
+                suppress_auto_hyphens: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let xml = String::from_utf8(build_styles_xml(&doc)).expect("utf8");
+    assert!(xml.contains("<w:suppressAutoHyphens/>"), "{xml}");
+    let para = Paragraph {
+        text: "x".into(),
+        props: ParaProperties {
+            suppress_auto_hyphens: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut out = String::new();
+    serialize_paragraph(&para, &mut out, &HashMap::new());
+    assert!(!out.contains("suppressAutoHyphens"), "{out}");
+    assert!(!out.contains("<w:pPr>"), "no empty pPr: {out}");
+}
+
+/// A run style that differs from the default only in its (read-only)
+/// language writes no `<w:rPr>` at all — text typed into an empty
+/// paragraph inherits the mark's `<w:lang>` but never an empty element.
+#[test]
+fn a_language_only_style_writes_no_run_properties() {
+    let style = SpanStyle {
+        lang: Some(Box::new(engine::Lang {
+            val: Some("es-ES".into()),
+            bidi: None,
+        })),
+        ..Default::default()
+    };
+    let mut out = String::new();
+    emit_rpr(&style, &mut out);
+    assert_eq!(out, "");
+    /* The reader models `<w:lang>` typed AND keeps its bytes in the bag. */
+    let (_, archive) = open(
+        r#"<w:p><w:r><w:rPr><w:lang w:val="fr-FR" w:bidi="ar-SA"/></w:rPr><w:t>x</w:t></w:r></w:p>"#,
+    );
+    let s = archive.document.nth_paragraph(0).unwrap().style_at(0);
+    assert_eq!(
+        s.lang.as_deref(),
+        Some(&engine::Lang {
+            val: Some("fr-FR".into()),
+            bidi: Some("ar-SA".into()),
+        })
+    );
+    assert!(
+        engine::GrabBag::fragments_of(&s.grab_bag)
+            .iter()
+            .any(|f| f.starts_with(b"<w:lang"))
+    );
+}

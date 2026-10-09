@@ -31,6 +31,9 @@ import THEME_DOCX_URL from '../../../crates/format-docx/tests/fixtures/theme_loa
 import SOFT_HYPHEN_DOCX_URL from '../../../crates/format-docx/tests/fixtures/soft_hyphen.docx?url';
 /* Issue #357 — the `run-content` golden (sym, cr, ptab, bdo / dir). */
 import RUN_CONTENT_DOCX_URL from '../../../crates/format-docx/tests/fixtures/run_content.docx?url';
+/* Issue #326 — the `hyphenation` / `hyphenation-off` goldens. */
+import HYPHENATION_ON_DOCX_URL from '../../../crates/format-docx/tests/fixtures/hyphenation_on.docx?url';
+import HYPHENATION_OFF_DOCX_URL from '../../../crates/format-docx/tests/fixtures/hyphenation_off.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -423,7 +426,9 @@ async function handleInit(msg: InitMsg): Promise<void> {
     } else if (
         testCase === 'a4-justified-mixed' ||
         testCase === 'rich-text' ||
-        testCase === 'rich-text-cs-size'
+        testCase === 'rich-text-cs-size' ||
+        testCase === 'hyphenation' ||
+        testCase === 'hyphenation-off'
     ) {
         const arabic = await dispatch({
             type: 'LOAD_FONT',
@@ -1022,6 +1027,35 @@ async function handleInit(msg: InitMsg): Promise<void> {
             paintEvt = await dispatch({
                 type: 'LOAD_DOCX',
                 bytes: await fetchBytes(RUN_CONTENT_DOCX_URL),
+            } as Command);
+            break;
+        }
+
+        case 'hyphenation':
+        case 'hyphenation-off': {
+            /* Issue #326 — the same five justified paragraphs with
+               `<w:autoHyphenation/>` on / off: on, the English prose breaks
+               long words at their en-US patterns (at most two hyphenated
+               lines in a row, never its last word); the
+               `<w:suppressAutoHyphens/>` copy, the capitals
+               (`doNotHyphenateCaps`), the Arabic (Kashida) and the French
+               (no patterns) paragraphs lay out identically in both. Zoom 2
+               for legibility. */
+            await dispatch({ type: 'SET_ZOOM', scale: 2 } as Command);
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 15,
+                line_height: 22,
+                align: 'START',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'LOAD_DOCX',
+                bytes: await fetchBytes(
+                    testCase === 'hyphenation' ? HYPHENATION_ON_DOCX_URL : HYPHENATION_OFF_DOCX_URL,
+                ),
             } as Command);
             break;
         }

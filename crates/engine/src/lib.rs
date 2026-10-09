@@ -1023,6 +1023,38 @@ pub struct DocumentSettings {
     /// and only a host calling `format_docx::read_docx_with_settings`
     /// with the strict ECMA-376 reading sets it `false`.
     pub widow_control_default: bool,
+    /// Issue #326 — `<w:autoHyphenation/>` (ECMA-376 §17.15.1.10): break
+    /// overflowing words at their language's hyphenation points.
+    /// READ-ONLY like every field below: `word/settings.xml` rides the
+    /// package passthrough, the writer never regenerates these elements.
+    /// Absent from snapshots while off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub auto_hyphenation: bool,
+    /// Issue #326 — `<w:hyphenationZone w:val>` (§17.15.1.53), twips: the
+    /// widest gap a line may leave at its end before the next word is
+    /// hyphenated instead. `None` = Word's default, 360 twips (¼ inch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hyphenation_zone: Option<u32>,
+    /// Issue #326 — `<w:consecutiveHyphenLimit w:val>` (§17.15.1.21): the
+    /// most consecutive lines that may end in a hyphen. `None` / `0` = no
+    /// limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consecutive_hyphen_limit: Option<u32>,
+    /// Issue #326 — `<w:doNotHyphenateCaps/>` (§17.15.1.37): words in all
+    /// capitals are never hyphenated.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub do_not_hyphenate_caps: bool,
+}
+
+impl DocumentSettings {
+    /// Issue #326 — Word's default hyphenation zone: 360 twips (¼ inch).
+    pub const DEFAULT_HYPHENATION_ZONE: u32 = 360;
+
+    /// Issue #326 — the effective hyphenation zone, in twips.
+    pub fn hyphenation_zone_twips(&self) -> u32 {
+        self.hyphenation_zone
+            .unwrap_or(Self::DEFAULT_HYPHENATION_ZONE)
+    }
 }
 
 impl Default for DocumentSettings {
@@ -1032,6 +1064,10 @@ impl Default for DocumentSettings {
             author: None,
             default_page_size: DefaultPageSize::default(),
             widow_control_default: true,
+            auto_hyphenation: false,
+            hyphenation_zone: None,
+            consecutive_hyphen_limit: None,
+            do_not_hyphenate_caps: false,
         }
     }
 }
@@ -2260,6 +2296,41 @@ pub struct SpanStyle {
     /// replaces both. Skipped when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color_theme: Option<Box<ThemeColorRef>>,
+    /// Issue #326 — `<w:lang w:val w:bidi>`: the language of the run's
+    /// Latin and complex-script text (which hyphenation patterns apply).
+    /// READ-ONLY, like `ParaProperties::outline_level`: the element rides
+    /// the grab bag verbatim (`rpr_child_is_modeled` stays false) and the
+    /// writer never regenerates it; this typed copy cascades docDefaults →
+    /// styles → run attribute by attribute. Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<Box<Lang>>,
+}
+
+/// Issue #326 — the languages one `<w:lang>` names (`w:eastAsia` is not
+/// modeled). Each attribute cascades on its own ([`Lang::merged_with`]):
+/// a run naming only `w:val` keeps the inherited `w:bidi`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[serde(default)]
+pub struct Lang {
+    /// `w:val` — the language of Latin text (`en-US`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val: Option<String>,
+    /// `w:bidi` — the language of complex-script text (`ar-SA`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bidi: Option<String>,
+}
+
+impl Lang {
+    /// `patch`'s set attributes over `base`'s (`None` when neither names
+    /// anything).
+    pub fn merged_with(base: Option<Box<Lang>>, patch: Option<Box<Lang>>) -> Option<Box<Lang>> {
+        let (base, patch) = (base.unwrap_or_default(), patch.unwrap_or_default());
+        let out = Lang {
+            val: patch.val.or(base.val),
+            bidi: patch.bidi.or(base.bidi),
+        };
+        (out != Lang::default()).then(|| Box::new(out))
+    }
 }
 
 impl SpanStyle {
@@ -2465,6 +2536,8 @@ impl SpanStyle {
                 claims,
             ),
             color_theme,
+            /* Issue #326 — attribute by attribute. */
+            lang: Lang::merged_with(self.lang, patch.lang),
         }
     }
 }
@@ -3618,6 +3691,12 @@ pub struct ParaProperties {
     /// emit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub widow_control: Option<bool>,
+    /// Issue #326 — `<w:suppressAutoHyphens>` resolved through the style
+    /// cascade (tri-state like [`Self::widow_control`]: an explicit
+    /// `w:val="0"` switches an inherited ON off). READ-ONLY on the model:
+    /// the direct element rides the grab bag verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppress_auto_hyphens: Option<bool>,
 }
 
 impl ParaProperties {
@@ -3700,6 +3779,7 @@ impl ParaProperties {
             grab_bag: patch.grab_bag.or(self.grab_bag),
             outline_level: patch.outline_level.or(self.outline_level),
             widow_control: patch.widow_control.or(self.widow_control),
+            suppress_auto_hyphens: patch.suppress_auto_hyphens.or(self.suppress_auto_hyphens),
         }
     }
 }

@@ -2155,6 +2155,12 @@ pub(crate) fn parse_document_xml_with_events(
                                         &e, &frag, &ns, resolver, &pmark_rpr,
                                     ));
                             }
+                            /* Issue #326 — `<w:lang>` is also read
+                            (hyphenation); the bag stays the writer's
+                            source. */
+                            if n == b"w:lang" {
+                                apply_rpr(n, &e, &mut direct_rpr);
+                            }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
                         }
                     }
@@ -2700,6 +2706,12 @@ pub(crate) fn parse_document_xml_with_events(
                                         &e, &frag, &ns, resolver, &pmark_rpr,
                                     ));
                             }
+                            /* Issue #326 — `<w:lang>` is also read
+                            (hyphenation); the bag stays the writer's
+                            source. */
+                            if n == b"w:lang" {
+                                apply_rpr(n, &e, &mut direct_rpr);
+                            }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
                         }
                     }
@@ -2725,9 +2737,10 @@ pub(crate) fn parse_document_xml_with_events(
                         /* Issue #84 — unmodeled `<w:pPr>` leaf child
                         (`<w:framePr>`, `<w:cnfStyle>`, `<w:widowControl>`,
                         `<w:outlineLvl>`, …) → the paragraph's grab bag. */
-                        if n == b"w:outlineLvl" {
+                        if n == b"w:outlineLvl" || n == b"w:suppressAutoHyphens" {
                             /* Issue #81 — also read it (TOC `\u`); the
-                            grab bag stays the writer's source. */
+                            grab bag stays the writer's source. Issue #326
+                            — likewise the hyphenation switch. */
                             apply_ppr(n, &e, &mut direct_ppr);
                         }
                         let end = reader.buffer_position() as usize;

@@ -46,6 +46,16 @@ fn word_runs(text: &str) -> String {
 /// `<w:sectPr>`, plus a styles part whose docDefaults set `w:sz="22"`
 /// (11 pt) and `settings_xml` when given.
 pub fn package_with_body(body: &str, settings_xml: Option<&str>) -> Vec<u8> {
+    package_with_body_and_defaults(body, settings_xml, "")
+}
+
+/// [`package_with_body`] with `rpr_default_extra` appended to the
+/// docDefaults `<w:rPr>` (issue #326: the document language).
+pub fn package_with_body_and_defaults(
+    body: &str,
+    settings_xml: Option<&str>,
+    rpr_default_extra: &str,
+) -> Vec<u8> {
     let document = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:document xmlns:w=\"{W_NS}\"><w:body>{body}\
@@ -57,7 +67,7 @@ pub fn package_with_body(body: &str, settings_xml: Option<&str>) -> Vec<u8> {
     let styles = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:styles xmlns:w=\"{W_NS}\"><w:docDefaults><w:rPrDefault><w:rPr>\
-         <w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/></w:rPr></w:rPrDefault>\
+         <w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/>{rpr_default_extra}</w:rPr></w:rPrDefault>\
          </w:docDefaults></w:styles>"
     );
     let settings_override = if settings_xml.is_some() {
@@ -193,4 +203,64 @@ pub fn run_content_docx() -> Vec<u8> {
     );
     let body = format!("<w:p>{p0}</w:p><w:p>{p1}</w:p><w:p>{p2}</w:p><w:p>{p3}</w:p>");
     package_with_body(&body, None)
+}
+
+/// Issue #326 — the paragraphs of [`hyphenation_docx`], in order: English
+/// prose with long words (justified; hyphenates when the document turns
+/// automatic hyphenation on), the same prose under
+/// `<w:suppressAutoHyphens/>`, prose in capitals (`doNotHyphenateCaps`),
+/// justified Arabic (never hyphenated — Kashida stretches it), and French
+/// (`<w:lang w:val="fr-FR"/>`: no patterns in this cut).
+pub const HYPHENATION_TEXTS: [&str; 5] = [
+    "Hyphenation lets justified text keep an even colour: characteristically long words such \
+     as internationalization, representational, incomprehensibilities and counterrevolutionary \
+     break at their patterns instead of stretching the spaces between them, while the last word \
+     of the paragraph stays whole.",
+    "Hyphenation lets justified text keep an even colour: characteristically long words such \
+     as internationalization, representational, incomprehensibilities and counterrevolutionary \
+     break at their patterns instead of stretching the spaces between them, while the last word \
+     of the paragraph stays whole.",
+    "CAPITALIZED INTERNATIONALIZATION REQUIREMENTS NEVER HYPHENATE WHEN THE DOCUMENT SAYS SO, \
+     WHATEVER THE MEASURE.",
+    "تتمدد السطور العربية المضبوطة بالكشيدة ولا تقطع الكلمات أبدا في نهاية السطر مهما طال \
+     النص واستمرت الفقرة إلى سطور كثيرة متتالية.",
+    "Les mots extraordinairement longs ne sont pas coupés: aucune table de motifs française \
+     n'accompagne cette version, internationalisation comprise.",
+];
+
+/// Issue #326 — automatic hyphenation: the five [`HYPHENATION_TEXTS`]
+/// paragraphs (all justified; the docDefaults language is `en-US` /
+/// `ar-SA`) with `word/settings.xml` carrying a 0.25" hyphenation zone, a
+/// consecutive-hyphen limit of 2, `<w:doNotHyphenateCaps/>` and — when
+/// `auto` — `<w:autoHyphenation/>`. A4, 1-inch margins, 11 pt. The source
+/// of `tools/roundtrip`'s `hyphenation_on.docx` / `hyphenation_off.docx`,
+/// the engine-wasm layout pins and the visual-diff `hyphenation` golden.
+pub fn hyphenation_docx(auto: bool) -> Vec<u8> {
+    let jc = "<w:pPr><w:jc w:val=\"both\"/></w:pPr>";
+    let [en, suppressed, caps, ar, fr] = HYPHENATION_TEXTS;
+    let body = format!(
+        "<w:p>{jc}{}</w:p>\
+         <w:p><w:pPr><w:suppressAutoHyphens/><w:jc w:val=\"both\"/></w:pPr>{}</w:p>\
+         <w:p>{jc}{}</w:p>\
+         <w:p><w:pPr><w:bidi/><w:jc w:val=\"both\"/></w:pPr><w:r><w:rPr><w:rtl/></w:rPr>\
+         <w:t xml:space=\"preserve\">{ar}</w:t></w:r></w:p>\
+         <w:p>{jc}<w:r><w:rPr><w:lang w:val=\"fr-FR\"/></w:rPr>\
+         <w:t xml:space=\"preserve\">{fr}</w:t></w:r></w:p>",
+        text_run(en),
+        text_run(suppressed),
+        text_run(caps),
+    );
+    let settings = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+         <w:settings xmlns:w=\"{W_NS}\"><w:zoom w:percent=\"100\"/>{}\
+         <w:defaultTabStop w:val=\"720\"/><w:hyphenationZone w:val=\"360\"/>\
+         <w:consecutiveHyphenLimit w:val=\"2\"/><w:doNotHyphenateCaps/>\
+         <w:characterSpacingControl w:val=\"doNotCompress\"/></w:settings>",
+        if auto { "<w:autoHyphenation/>" } else { "" },
+    );
+    package_with_body_and_defaults(
+        &body,
+        Some(&settings),
+        "<w:lang w:val=\"en-US\" w:eastAsia=\"en-US\" w:bidi=\"ar-SA\"/>",
+    )
 }

@@ -306,7 +306,17 @@ fn rfonts_theme_attrs(style: &SpanStyle) -> Vec<(&'static str, &str)> {
 /// regenerated children keep the source spelling of an unchanged element
 /// (issue #106, [`PrChildren::adopt`]).
 fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String) {
-    if *style == SpanStyle::default() {
+    /* Issue #326 — `lang` is read-only (the `<w:lang>` bytes ride the
+    grab bag): a style that differs from the default only there has
+    nothing to write (text typed into an empty paragraph inherits the
+    mark's language). */
+    if *style == SpanStyle::default()
+        || (style.lang.is_some()
+            && SpanStyle {
+                lang: None,
+                ..style.clone()
+            } == SpanStyle::default())
+    {
         return;
     }
     let rank = rpr_child_rank;
@@ -917,6 +927,22 @@ fn emit_ppr(
             },
         );
     }
+    /* Issue #326 — a style's `<w:suppressAutoHyphens>`; same contract as
+    `widowControl` above. */
+    if let Some(on) = props.suppress_auto_hyphens
+        && !engine::GrabBag::fragments_of(&props.grab_bag)
+            .iter()
+            .any(|f| f.starts_with(b"<w:suppressAutoHyphens"))
+    {
+        ch.push(
+            rank(b"w:suppressAutoHyphens"),
+            if on {
+                "<w:suppressAutoHyphens/>".into()
+            } else {
+                "<w:suppressAutoHyphens w:val=\"0\"/>".into()
+            },
+        );
+    }
     /* Phase 3 (#40) — a marker paragraph's interior `<w:sectPr>`: the
     genuinely-last CT_PPr content child (only the never-emitted
     pPrChange follows it in the schema). */
@@ -965,11 +991,15 @@ fn serialize_paragraph_body(
     let inherited_bidi = direction_is_inherited(para);
     let props = if para.props.outline_level.is_some()
         || para.props.widow_control.is_some()
+        || para.props.suppress_auto_hyphens.is_some()
         || inherited_bidi
     {
         let mut p = para.props.clone();
         p.outline_level = None;
         p.widow_control = None;
+        /* Issue #326 — read-only like the two above (the direct element
+        rides the grab bag; a style-inherited value is not baked in). */
+        p.suppress_auto_hyphens = None;
         if inherited_bidi {
             p.direction = None;
         }
@@ -8154,6 +8184,7 @@ mod tests {
             grab_bag: None,
             outline_level: None,
             widow_control: None,
+            suppress_auto_hyphens: None,
         };
         let para = Paragraph {
             text: "hello world".into(),

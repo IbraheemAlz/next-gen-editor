@@ -193,6 +193,10 @@ pub fn apply_ppr(name: &[u8], e: &BytesStart, props: &mut ParaProperties) {
         rides the grab bag verbatim (it is not in `ppr_child_is_modeled`),
         the model value feeds layout's widow / orphan control. */
         b"w:widowControl" => props.widow_control = Some(toggle_on(e)),
+        /* Issue #326 — read-only like `widowControl`: the direct element
+        rides the grab bag; the cascaded value switches automatic
+        hyphenation off for the paragraph. */
+        b"w:suppressAutoHyphens" => props.suppress_auto_hyphens = Some(toggle_on(e)),
         _ => {}
     }
 }

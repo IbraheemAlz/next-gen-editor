@@ -105,6 +105,40 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "hyphenation_off.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 5,
+        "paragraph_texts": [
+          "Hyphenation lets justified text keep an even colour: characteristically long words such as internationalization, representational, incomprehensibilities and counterrevolutionary break at their patterns instead of stretching the spaces between them, while the last word of the paragraph stays whole.",
+          "Hyphenation lets justified text keep an even colour: characteristically long words such as internationalization, representational, incomprehensibilities and counterrevolutionary break at their patterns instead of stretching the spaces between them, while the last word of the paragraph stays whole.",
+          "CAPITALIZED INTERNATIONALIZATION REQUIREMENTS NEVER HYPHENATE WHEN THE DOCUMENT SAYS SO, WHATEVER THE MEASURE.",
+          "تتمدد السطور العربية المضبوطة بالكشيدة ولا تقطع الكلمات أبدا في نهاية السطر مهما طال النص واستمرت الفقرة إلى سطور كثيرة متتالية.",
+          "Les mots extraordinairement longs ne sont pas coupés: aucune table de motifs française n'accompagne cette version, internationalisation comprise."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "hyphenation_on.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 5,
+        "paragraph_texts": [
+          "Hyphenation lets justified text keep an even colour: characteristically long words such as internationalization, representational, incomprehensibilities and counterrevolutionary break at their patterns instead of stretching the spaces between them, while the last word of the paragraph stays whole.",
+          "Hyphenation lets justified text keep an even colour: characteristically long words such as internationalization, representational, incomprehensibilities and counterrevolutionary break at their patterns instead of stretching the spaces between them, while the last word of the paragraph stays whole.",
+          "CAPITALIZED INTERNATIONALIZATION REQUIREMENTS NEVER HYPHENATE WHEN THE DOCUMENT SAYS SO, WHATEVER THE MEASURE.",
+          "تتمدد السطور العربية المضبوطة بالكشيدة ولا تقطع الكلمات أبدا في نهاية السطر مهما طال النص واستمرت الفقرة إلى سطور كثيرة متتالية.",
+          "Les mots extraordinairement longs ne sont pas coupés: aucune table de motifs française n'accompagne cette version, internationalisation comprise."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "image_wrap_modes.docx": {
       "generator": "handcrafted",
       "phase_introduced": 11,

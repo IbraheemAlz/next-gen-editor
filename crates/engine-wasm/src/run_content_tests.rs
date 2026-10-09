@@ -297,3 +297,129 @@ fn the_accessibility_mirror_reads_symbols_and_tabs() {
     assert!(texts[3].contains("\u{202E}ABC def\u{202C}"));
     assert!(texts.iter().all(|t| !t.contains('\u{FFFC}')));
 }
+
+/* ---- issue #326: automatic hyphenation ---------------------------- */
+
+fn hyphenation_engine(auto: bool) -> Engine {
+    let bytes = format_docx::test_fixtures::hyphenation_docx(auto);
+    let archive = format_docx::read_docx(&bytes).expect("fixture");
+    tests::test_engine_with_doc(archive.document)
+}
+
+/// The hyphen flags of every line of top-level paragraph `para`.
+fn hyphens(pages: &[PageBox], para: u32) -> Vec<LineHyphen> {
+    paragraph_lines(pages, para)
+        .iter()
+        .map(|l| l.hyphen)
+        .collect()
+}
+
+/// Acceptance (#326): with `<w:autoHyphenation/>` the English prose
+/// hyphenates (each hyphenated line ends between two letters, at most two
+/// in a row — `consecutiveHyphenLimit` 2 — and never on its last word);
+/// the `<w:suppressAutoHyphens/>` copy, the capitals under
+/// `doNotHyphenateCaps`, the Arabic and the French paragraphs never do.
+/// Geometry pinned.
+#[test]
+fn automatic_hyphenation_follows_the_settings_and_languages() {
+    use format_docx::test_fixtures::HYPHENATION_TEXTS;
+    let engine = hyphenation_engine(true);
+    let doc = engine.undo.current().clone();
+    let s = &doc.settings;
+    assert!(s.auto_hyphenation && s.do_not_hyphenate_caps);
+    assert_eq!(s.hyphenation_zone, Some(360));
+    assert_eq!(s.consecutive_hyphen_limit, Some(2));
+    assert_eq!(
+        doc.style_run_defaults.lang.as_deref(),
+        Some(&engine::Lang {
+            val: Some("en-US".into()),
+            bidi: Some("ar-SA".into()),
+        })
+    );
+    assert_eq!(
+        doc.nth_paragraph(1).unwrap().props.suppress_auto_hyphens,
+        Some(true)
+    );
+    let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+    assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+
+    let text0 = HYPHENATION_TEXTS[0];
+    let lines0 = paragraph_lines(&pages, 0);
+    let auto: Vec<&&LineBox> = lines0
+        .iter()
+        .filter(|l| l.hyphen == LineHyphen::Auto)
+        .collect();
+    assert!(!auto.is_empty(), "the English prose hyphenates");
+    let mut run = 0;
+    for l in &lines0 {
+        run = if l.hyphen.is_none() { 0 } else { run + 1 };
+        assert!(run <= 2, "consecutiveHyphenLimit 2");
+    }
+    for l in &auto {
+        let end = line_end(l);
+        let (before, after) = (
+            text0[..end].chars().last().unwrap(),
+            text0[end..].chars().next().unwrap(),
+        );
+        assert!(before.is_alphabetic() && after.is_alphabetic(), "{end}");
+        assert!(text0[end..].contains(' '), "never the last word");
+    }
+    for para in 1..5 {
+        assert!(
+            hyphens(&pages, para).iter().all(|h| h.is_none()),
+            "paragraph {para} must not hyphenate"
+        );
+    }
+    /* The ranges behind it: the English paragraph is en-US throughout;
+    the suppressed paragraph and the French run offer none. */
+    let sctx = StyleContext::of(&doc);
+    let ranges = |i: u32| auto_hyphenation_ranges(doc.nth_paragraph(i).unwrap(), sctx);
+    assert_eq!(ranges(0).len(), 1);
+    assert_eq!(ranges(0)[0].0, 0..text0.len() as u32);
+    assert!(ranges(1).is_empty(), "suppressAutoHyphens");
+    assert!(ranges(4).is_empty(), "fr-FR has no patterns");
+    let fp = layout::geometry_fingerprint(&pages);
+    eprintln!("HYPHENATION ON FINGERPRINT = {fp:#x}");
+    assert_eq!(
+        fp, PINNED_HYPHENATION_ON,
+        "hyphenation-on fixture geometry changed"
+    );
+}
+
+/// Without `<w:autoHyphenation/>` nothing hyphenates, and the paragraphs
+/// automatic hyphenation never touches (suppressed, capitals, Arabic,
+/// French) lay out exactly as with it on. Geometry pinned.
+#[test]
+fn without_auto_hyphenation_nothing_moves() {
+    let off = hyphenation_engine(false);
+    assert!(!off.undo.current().settings.auto_hyphenation);
+    let (pages_off, _, _, _) = off.build_pages(1.0, false, None).expect("layout");
+    for para in 0..5 {
+        assert!(hyphens(&pages_off, para).iter().all(|h| h.is_none()));
+    }
+    let on = hyphenation_engine(true);
+    let (pages_on, _, _, _) = on.build_pages(1.0, false, None).expect("layout");
+    let geometry = |pages: &[PageBox], para: u32| -> Vec<(u32, u32, u32)> {
+        paragraph_lines(pages, para)
+            .iter()
+            .map(|l| (l.source_start, l.width.to_bits(), l.origin.x.to_bits()))
+            .collect()
+    };
+    for para in 1..5 {
+        assert_eq!(
+            geometry(&pages_off, para),
+            geometry(&pages_on, para),
+            "paragraph {para} moved"
+        );
+    }
+    let fp = layout::geometry_fingerprint(&pages_off);
+    eprintln!("HYPHENATION OFF FINGERPRINT = {fp:#x}");
+    assert_eq!(
+        fp, PINNED_HYPHENATION_OFF,
+        "hyphenation-off fixture geometry changed"
+    );
+}
+
+/// Recorded on this change via `--nocapture` (issue #326).
+const PINNED_HYPHENATION_ON: u64 = 0xf0e2a651dd4f7436;
+const PINNED_HYPHENATION_OFF: u64 = 0xf73ce07da5151bbf;

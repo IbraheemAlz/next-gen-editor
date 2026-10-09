@@ -213,6 +213,11 @@ pub struct ParagraphConfig<'a> {
     /// L2.1 (#6) — non-`Left` kinds (Center/Right/Decimal) trigger the
     /// shape-then-place pass in `apply_tab_advances`.
     pub tab_stops_px: &'a [TabStopPx],
+    /// Issue #326 — automatic hyphenation for this paragraph (`None`: off —
+    /// `<w:autoHyphenation/>` unset, `<w:suppressAutoHyphens/>`, or no text
+    /// in a language with patterns). Off is byte-identical to the
+    /// pre-#326 composer.
+    pub hyphenation: Option<&'a crate::hyphen::AutoHyphenation<'a>>,
 }
 
 /// L2.1 (#6) — geometric kind of a single custom tab stop. Mirrors
@@ -951,6 +956,7 @@ fn compose_lines_with_width<'a>(
         px_size_for_marker: cfg.px_size_for_marker,
         inline_objects: cfg.inline_objects,
         tab_stops_px: cfg.tab_stops_px,
+        hyphenation: cfg.hyphenation,
     };
     compose_lines(&scoped)
 }
@@ -1555,6 +1561,43 @@ fn compose_width_lines(
                 last_fit_end = b;
             }
         } else {
+            /* Issue #326 — the overflowing word may hyphenate: the line
+            ends inside it with a drawn hyphen and the rest of the word
+            opens the next line. */
+            if let Some(hy) = cfg.hyphenation
+                && let Some(at) = crate::hyphen::auto_hyphen_point(
+                    cfg, hy, &lines, start, seg_from, b, line_width,
+                )
+            {
+                let mut line = build_line(cfg, start, at);
+                append_break_hyphen(&mut line, cfg.fonts, at, LineHyphen::Auto);
+                lines.push((line, true));
+                start = at;
+                let rest = measure_text(
+                    cfg.fonts,
+                    &cfg.text[at..b],
+                    at as u32,
+                    cfg.spans,
+                    cfg.base_direction,
+                    cfg.inline_objects,
+                );
+                if rest <= cfg.max_width {
+                    line_width = rest;
+                    seg_from = b;
+                    last_fit_end = if !ends_at_soft_hyphen(cfg.text, b)
+                        || rest + break_hyphen_advance(cfg, start, b) <= cfg.max_width
+                    {
+                        b
+                    } else {
+                        start
+                    };
+                } else {
+                    line_width = 0.0;
+                    seg_from = at;
+                    last_fit_end = at;
+                }
+                continue;
+            }
             /* Overflow. Commit whatever fit so far. */
             if last_fit_end > start {
                 lines.push((broken_line(cfg, start, last_fit_end), true));
@@ -2236,7 +2279,7 @@ fn style_at(spans: &[StyleSpan], offset: u32) -> Option<StyleSpan> {
 /// the greedy probe's width estimate. `abs_start` is `text`'s byte offset in
 /// the paragraph. Mirrors [`build_line`]'s segmentation so a fitted candidate
 /// measures consistently with the line eventually built.
-fn measure_text(
+pub(crate) fn measure_text(
     fonts: &FontStack,
     text: &str,
     abs_start: u32,
@@ -3139,6 +3182,7 @@ mod tests {
             marker_text: None,
             px_size_for_marker: 10.0,
             tab_stops_px: &[],
+            hyphenation: None,
         })
     }
 

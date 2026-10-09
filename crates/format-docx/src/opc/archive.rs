@@ -676,6 +676,11 @@ fn read_docx_scoped(
         .and_then(|(_, b)| crate::parts::settings::parse_settings_xml(b).ok());
     if let Some(settings) = &settings_part {
         document.settings.even_and_odd_headers = settings.even_and_odd_headers;
+        /* Issue #326 — hyphenation (read-only: the part passes through). */
+        document.settings.auto_hyphenation = settings.auto_hyphenation;
+        document.settings.hyphenation_zone = settings.hyphenation_zone;
+        document.settings.consecutive_hyphen_limit = settings.consecutive_hyphen_limit;
+        document.settings.do_not_hyphenate_caps = settings.do_not_hyphenate_caps;
         /* Issue #80 — document-level note properties. */
         document.footnote_props = settings.footnote_props;
         document.endnote_props = settings.endnote_props;
