@@ -243,7 +243,7 @@ describe('clean marker and archived session (#388)', () => {
             hasContent: false,
             at: undefined,
         });
-        expect(await fresh.loadArchiveInfo()).toBeUndefined();
+        expect(await fresh.listArchive()).toEqual([]);
     });
 
     async function dirtySession(): Promise<void> {
@@ -255,11 +255,11 @@ describe('clean marker and archived session (#388)', () => {
 
     it('archive survives the next openEventLog, which then starts clean and empty', async () => {
         await dirtySession();
-        await log.archiveActiveLog();
+        await log.archiveLog();
         await log.openEventLog('doc-2');
         expect(await log.loadCleanMarker()).toBe(true);
         expect((await log.loadRecoveryLog()).commands).toEqual([]);
-        const info = await log.loadArchiveInfo();
+        const info = (await log.listArchive())[0];
         expect(info?.commandCount).toBe(2);
         expect(info?.archivedAt).toBeTypeOf('number');
         expect(info?.lastEditAt).toBeTypeOf('number');
@@ -267,7 +267,7 @@ describe('clean marker and archived session (#388)', () => {
 
     it('restoreArchive swaps the session back (commands, snapshots, package, pin), marks it unclean and consumes the archive', async () => {
         await dirtySession();
-        await log.archiveActiveLog();
+        await log.archiveLog();
         await log.openEventLog('doc-2');
         await log.appendCommand(1, insert('other session'));
         expect(await log.restoreArchive()).toBe(true);
@@ -275,19 +275,61 @@ describe('clean marker and archived session (#388)', () => {
         expect(r.commands.map((c) => c.cmd)).toEqual([insert('one'), insert('two')]);
         expect(r.candidates[0]).toMatchObject({ seq: 1, pinned: true, package: bytes(4) });
         expect(await log.loadCleanMarker()).toBe(false);
-        expect(await log.loadArchiveInfo()).toBeUndefined();
+        expect(await log.listArchive()).toEqual([]);
         expect(await log.restoreArchive()).toBe(false);
     });
 
-    it('discardArchive removes it; a second archive replaces an older one', async () => {
+    it('discardArchive removes an entry; a second archive adds one (ring, #426)', async () => {
         await dirtySession();
-        await log.archiveActiveLog();
+        await log.archiveLog();
         await log.openEventLog('doc-2');
         await log.appendCommand(1, insert('x'));
-        await log.archiveActiveLog();
-        expect((await log.loadArchiveInfo())?.commandCount).toBe(1);
+        await new Promise((r) => setTimeout(r, 2)); // distinct archivedAt
+        await log.archiveLog();
+        const entries = await log.listArchive();
+        expect(entries.map((e) => e.commandCount)).toEqual([1, 2]); // newest first
+        await log.discardArchive(entries[1]!.id);
+        expect((await log.listArchive()).map((e) => e.commandCount)).toEqual([1]);
         await log.discardArchive();
-        expect(await log.loadArchiveInfo()).toBeUndefined();
+        expect(await log.listArchive()).toEqual([]);
+    });
+
+    it('the ring keeps the newest 3; a seen entry is evicted before an undecided one (#426)', async () => {
+        for (let n = 1; n <= 3; n++) {
+            await log.openEventLog(`doc-${n}`);
+            for (let i = 1; i <= n; i++) await log.appendCommand(i, insert(`c${n}.${i}`));
+            await log.writeCleanMarker(false);
+            await log.archiveLog();
+            await new Promise((r) => setTimeout(r, 2)); // distinct archivedAt
+        }
+        let entries = await log.listArchive();
+        expect(entries.map((e) => e.commandCount)).toEqual([3, 2, 1]);
+        /* Mark the NEWEST seen: it is the one evicted by the next archive. */
+        await log.markArchiveSeen([entries[0]!.id]);
+        await log.openEventLog('doc-4');
+        await log.appendCommand(1, insert('c4'));
+        await log.writeCleanMarker(false);
+        await log.archiveLog();
+        entries = await log.listArchive();
+        expect(entries.map((e) => e.commandCount)).toEqual([1, 2, 1]);
+        expect(entries.every((e) => e.decision === 'undecided')).toBe(true);
+    });
+
+    it('restoreArchive(id) restores that entry and leaves the others (#426)', async () => {
+        await dirtySession();
+        await log.archiveLog();
+        await log.openEventLog('doc-2');
+        await log.appendCommand(1, insert('only one'));
+        await log.writeCleanMarker(false);
+        await new Promise((r) => setTimeout(r, 2)); // distinct archivedAt
+        await log.archiveLog();
+        const [newest, older] = await log.listArchive();
+        expect(await log.restoreArchive(older!.id)).toBe(true);
+        expect((await log.loadRecoveryLog()).commands.map((c) => c.cmd)).toEqual([
+            insert('one'),
+            insert('two'),
+        ]);
+        expect((await log.listArchive()).map((e) => e.id)).toEqual([newest!.id]);
     });
 
     it('restoreArchive with no archive leaves the active log alone', async () => {

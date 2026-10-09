@@ -178,6 +178,7 @@ describe('checkpointNotices (#333 / #390)', () => {
 
 describe('previousSessionNotice (#388)', () => {
     const info = (o: Partial<PreviousSessionInfo>): PreviousSessionInfo => ({
+        id: 'a-1',
         archivedAt: 100,
         lastEditAt: 50,
         commandCount: 3,
