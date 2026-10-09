@@ -208,7 +208,16 @@ fn build_paragraph_box(
     content_width_pt: f32,
 ) -> layout::ParagraphBox {
     let text_len = p.text.len() as u32;
-    let spans = resolve_style_spans(text_len, &p.spans);
+    let mut spans = resolve_style_spans(text_len, &p.spans);
+    /* Issue #370 — an empty paragraph's one zero-width span is its
+    paragraph MARK (`<w:pPr><w:rPr>`): it sizes the line (`base_px`
+    below, then `layout::empty_line_extents`), as in engine-wasm. */
+    if text_len == 0 {
+        spans.push(match p.mark_style.as_deref() {
+            Some(mark) => style_span(0, 0, mark),
+            None => default_span(0, 0),
+        });
+    }
     let direction = convert_direction(p.props.direction, &p.text);
     let alignment = convert_alignment(p.props.alignment);
     let base_px = spans.first().map_or(DEFAULT_PX_SIZE, |s| s.px_size);

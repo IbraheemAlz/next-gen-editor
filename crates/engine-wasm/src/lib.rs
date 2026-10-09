@@ -2871,6 +2871,66 @@ impl<'a> StyleContext<'a> {
     }
 }
 
+/// One layout span for `style` over `[start, end)` of `para_text`: the
+/// size (with the `<w:vertAlign>` shrink), colour, flags, resolved font
+/// ids and complex-script twins — before any caps split
+/// ([`push_caps_spans`]). Returns the span and its Latin base px (the
+/// caps split's reference size).
+#[allow(clippy::too_many_arguments)]
+fn materialize_span(
+    para_text: &str,
+    style: &engine::SpanStyle,
+    start: u32,
+    end: u32,
+    sctx: StyleContext,
+    default_size: f32,
+    default_color: [u8; 4],
+    scale: f32,
+) -> (StyleSpan, f32) {
+    let text = para_text.get(start as usize..end as usize).unwrap_or("");
+    let (font_family, font_family_cs) = sctx.run_font_ids(style, text);
+    let raw_base_px = style.font_size.unwrap_or(default_size) * scale;
+    let vert = style.vert_align.unwrap_or(engine::VertAlign::Baseline);
+    let (px_factor, shift_factor) = match vert {
+        engine::VertAlign::Baseline => (1.0_f32, 0.0_f32),
+        engine::VertAlign::Superscript => (0.65, 0.33),
+        engine::VertAlign::Subscript => (0.65, -0.15),
+    };
+    let base_px = (raw_base_px * px_factor).max(1.0);
+    let baseline_shift_px = raw_base_px * shift_factor;
+    let template = StyleSpan {
+        start,
+        end,
+        px_size: base_px,
+        /* Issue #355 — a theme colour supersedes the cached `w:val`. */
+        color: style.resolve_color(sctx.theme).unwrap_or(default_color),
+        bold: style.bold.unwrap_or(false),
+        italic: style.italic.unwrap_or(false),
+        underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
+        strike: style.strike.unwrap_or(false),
+        bg_color: style.bg_color,
+        font_family,
+        caps_transform: false,
+        baseline_shift_px,
+        cs: None,
+    };
+    /* Issues #359 / #104 / #249 — the complex-script twins, resolved
+    through the same cascade (an unset twin takes the document
+    default, never the Latin value — Word's rule); the family is the
+    `cs` slot as `run_font_ids` resolved it (theme binding incl. the
+    script's supplemental face, else `w:cs`). */
+    let raw_cs_px = style.font_size_cs.unwrap_or(default_size) * scale;
+    let cs = ComplexScriptAttrs {
+        px_size: (raw_cs_px * px_factor).max(1.0),
+        baseline_shift_px: raw_cs_px * shift_factor,
+        bold: style.bold_cs.unwrap_or(false),
+        italic: style.italic_cs.unwrap_or(false),
+        font_family: font_family_cs,
+        whole_span: style.forces_complex_script(),
+    };
+    (template.with_cs(cs), base_px)
+}
+
 fn build_style_spans(
     para: &engine::Paragraph,
     sctx: StyleContext,
@@ -2888,48 +2948,16 @@ fn build_style_spans(
     empty in fresh documents — byte-identical to the old flat gap. */
     let run_base = sctx.run_base(para.style_id.as_deref());
     let emit = |style: &engine::SpanStyle, start: u32, end: u32, out: &mut Vec<StyleSpan>| {
-        let text = para.text.get(start as usize..end as usize).unwrap_or("");
-        let (font_family, font_family_cs) = sctx.run_font_ids(style, text);
-        let raw_base_px = style.font_size.unwrap_or(default_size) * scale;
-        let vert = style.vert_align.unwrap_or(engine::VertAlign::Baseline);
-        let (px_factor, shift_factor) = match vert {
-            engine::VertAlign::Baseline => (1.0_f32, 0.0_f32),
-            engine::VertAlign::Superscript => (0.65, 0.33),
-            engine::VertAlign::Subscript => (0.65, -0.15),
-        };
-        let base_px = (raw_base_px * px_factor).max(1.0);
-        let baseline_shift_px = raw_base_px * shift_factor;
-        let template = StyleSpan {
+        let (template, base_px) = materialize_span(
+            &para.text,
+            style,
             start,
             end,
-            px_size: base_px,
-            /* Issue #355 — a theme colour supersedes the cached `w:val`. */
-            color: style.resolve_color(sctx.theme).unwrap_or(default_color),
-            bold: style.bold.unwrap_or(false),
-            italic: style.italic.unwrap_or(false),
-            underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
-            strike: style.strike.unwrap_or(false),
-            bg_color: style.bg_color,
-            font_family,
-            caps_transform: false,
-            baseline_shift_px,
-            cs: None,
-        };
-        /* Issues #359 / #104 / #249 — the complex-script twins, resolved
-        through the same cascade (an unset twin takes the document
-        default, never the Latin value — Word's rule); the family is the
-        `cs` slot as `run_font_ids` resolved it (theme binding incl. the
-        script's supplemental face, else `w:cs`). */
-        let raw_cs_px = style.font_size_cs.unwrap_or(default_size) * scale;
-        let cs = ComplexScriptAttrs {
-            px_size: (raw_cs_px * px_factor).max(1.0),
-            baseline_shift_px: raw_cs_px * shift_factor,
-            bold: style.bold_cs.unwrap_or(false),
-            italic: style.italic_cs.unwrap_or(false),
-            font_family: font_family_cs,
-            whole_span: style.forces_complex_script(),
-        };
-        let template = template.with_cs(cs);
+            sctx,
+            default_size,
+            default_color,
+            scale,
+        );
         push_caps_spans(&para.text, style, &template, base_px, out);
     };
     for run in &para.spans {
@@ -3202,6 +3230,27 @@ fn paragraph_layout_key(
     run_base.caps.hash(&mut h);
     run_base.small_caps.hash(&mut h);
     hash_complex_script_slots(&run_base, &mut h);
+    /* Issue #370 — an EMPTY paragraph's line is sized by its mark (the
+    pilcrow's size / face). Mixed in only for empty paragraphs, so every
+    paragraph with text keeps its key. */
+    if para.text.is_empty()
+        && let Some(mark) = para.mark_style.as_deref()
+    {
+        0x70_u8.hash(&mut h);
+        mark.font_size.map(f32::to_bits).hash(&mut h);
+        mark.bold.hash(&mut h);
+        mark.italic.hash(&mut h);
+        mark.font_family.hash(&mut h);
+        mark.raw_font_family.hash(&mut h);
+        mark.font_bindings.hash(&mut h);
+        hash_complex_script_slots(mark, &mut h);
+        match mark.vert_align {
+            None => 0u8.hash(&mut h),
+            Some(engine::VertAlign::Baseline) => 1u8.hash(&mut h),
+            Some(engine::VertAlign::Superscript) => 2u8.hash(&mut h),
+            Some(engine::VertAlign::Subscript) => 3u8.hash(&mut h),
+        }
+    }
     /* Audit gap A.H2 — the cache key now folds the laid-out max width
     in. Same paragraph laid out at page-wide vs column-narrow widths
     produces different line breaks; without the mix-in a doc that
@@ -4055,7 +4104,7 @@ fn build_header_footer_box(
                 let base_direction = resolve_base_direction(para, cfg);
                 let (ind_s, ind_e, ind_fl, ind_h) =
                     effective_layout_indents(para, base_direction, scale);
-                let (lh_px, lh_exact) =
+                let (mut lh_px, lh_exact) =
                     resolve_line_height(para.props.line_height, cfg.line_height, scale);
                 let (text, spans) = if let Some(c) = comp {
                     let off = c.at.offset as usize;
@@ -4083,15 +4132,18 @@ fn build_header_footer_box(
                     );
                     (text, spans)
                 } else {
-                    let spans = apply_revision_overlay(
-                        apply_hyperlink_overlay(
-                            build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
-                            &para.hyperlinks,
-                            [0, 0, 0, 255],
-                        ),
-                        &para.revisions,
-                        [0, 0, 0, 255],
+                    /* Issue #370 — an empty band paragraph is sized by
+                    its mark, like the body's. */
+                    let (spans, mark_lh) = paragraph_layout_spans(
+                        para,
+                        sctx,
+                        fonts,
+                        cfg,
+                        scale,
+                        base_direction,
+                        lh_px,
                     );
+                    lh_px = mark_lh;
                     (para.text.clone(), spans)
                 };
                 /* Issue #78 / #188 — band pictures (and every other inline
@@ -5472,6 +5524,99 @@ fn layout_paragraph_cached(
     laid
 }
 
+/// The layout spans of a paragraph laid out as it stands (no IME
+/// preview) and its line pitch: the style spans with the hyperlink /
+/// revision overlays for text, or — issue #370 — for an EMPTY paragraph
+/// its paragraph MARK ([`empty_paragraph_mark`]), which sizes its line.
+#[allow(clippy::too_many_arguments)]
+fn paragraph_layout_spans(
+    para: &engine::Paragraph,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    base_direction: ShapingDirection,
+    line_height_px: f32,
+) -> (Vec<StyleSpan>, f32) {
+    if let Some((mark, lh)) = empty_paragraph_mark(
+        para,
+        sctx,
+        fonts,
+        cfg.px_size,
+        scale,
+        base_direction,
+        line_height_px,
+    ) {
+        return (vec![mark], lh);
+    }
+    let spans = apply_revision_overlay(
+        apply_hyperlink_overlay(
+            build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
+            &para.hyperlinks,
+            [0, 0, 0, 255],
+        ),
+        &para.revisions,
+        [0, 0, 0, 255],
+    );
+    (spans, line_height_px)
+}
+
+/// Issue #370 — an EMPTY paragraph's line is its paragraph MARK's: Word
+/// sizes it from the mark's run properties (`Paragraph::mark_style`,
+/// `<w:pPr><w:rPr>`) folded over the paragraph style, not from the
+/// document default. Returns the zero-width mark span `[0, 0)` the
+/// layout sizes the placeholder line from (`layout::empty_line_extents`)
+/// and the line pitch for it: `line_height_px` (the paragraph's resolved
+/// pitch — derived from the config's document-wide line height, the
+/// floor every line of text gets whatever its style) through
+/// `layout::empty_mark_pitch` against the DOCUMENT default run
+/// (`docDefaults <w:rPr>`, what unstyled text is set in) when the line
+/// rule is font-relative (no `w:line` override, or an `auto` multiple):
+/// a mark smaller than the default scales the floor down, a larger one
+/// grows the line only by its glyph extents, like a line of text.
+/// `exact` / `atLeast` are absolute and stay as resolved. The
+/// complex-script twins measure an RTL paragraph's mark. `None` for a
+/// paragraph with text.
+///
+/// A mark formatted like the document default (an unstyled paragraph
+/// with no mark properties — the common case) keeps the resolved pitch:
+/// the pre-#370 line, bit for bit, while the mark glyph fits it.
+fn empty_paragraph_mark(
+    para: &engine::Paragraph,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    default_size: f32,
+    scale: f32,
+    base_direction: ShapingDirection,
+    line_height_px: f32,
+) -> Option<(StyleSpan, f32)> {
+    if !para.text.is_empty() {
+        return None;
+    }
+    let run_base = sctx.run_base(para.style_id.as_deref());
+    let mark = match para.mark_style.as_deref() {
+        Some(m) => run_base.merged_with(SpanStyle {
+            grab_bag: None,
+            ..m.clone()
+        }),
+        None => run_base,
+    };
+    let black = [0, 0, 0, 255];
+    let doc_default = sctx.run_base(None);
+    let (base_span, _) = materialize_span("", &doc_default, 0, 0, sctx, default_size, black, scale);
+    let (mark_span, _) = materialize_span("", &mark, 0, 0, sctx, default_size, black, scale);
+    let rtl = matches!(base_direction, ShapingDirection::Rtl);
+    let pitch = match para.props.line_height {
+        None | Some(engine::LineHeight::Auto { .. }) => {
+            layout::empty_mark_pitch(fonts, line_height_px, &base_span, &mark_span, rtl)
+        }
+        Some(engine::LineHeight::Exact { .. } | engine::LineHeight::AtLeast { .. }) => {
+            line_height_px
+        }
+    };
+    Some((mark_span, pitch))
+}
+
 /// Lay out one engine paragraph from scratch (no cache), cut by the
 /// issue #82 wrap `cuts` (paragraph-box space; empty ⇒ the plain
 /// composer, byte-identical to the pre-#82 path). The body build calls
@@ -5487,19 +5632,12 @@ fn layout_paragraph_wrapped_uncached(
     sctx: StyleContext,
     cuts: &[layout::WrapCutout],
 ) -> ParagraphBox {
-    let spans = apply_revision_overlay(
-        apply_hyperlink_overlay(
-            build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
-            &para.hyperlinks,
-            [0, 0, 0, 255],
-        ),
-        &para.revisions,
-        [0, 0, 0, 255],
-    );
     let base_direction = resolve_base_direction(para, cfg);
     let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
     let inline_infos = build_inline_object_infos(para, cfg, scale, sctx);
     let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    let (spans, lh_px) =
+        paragraph_layout_spans(para, sctx, fonts, cfg, scale, base_direction, lh_px);
     let para_cfg = ParagraphConfig {
         text: &para.text,
         fonts,
@@ -28692,6 +28830,10 @@ mod pbdr_start_end_tests;
 /// Issue #395 — paragraph borders defined on styles, on canvas.
 #[cfg(test)]
 mod pbdr_style_cascade_tests;
+
+/// Issue #370 — an empty paragraph's line is sized by its mark.
+#[cfg(test)]
+mod empty_mark_tests;
 
 #[cfg(test)]
 mod block_remap_tests;

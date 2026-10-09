@@ -228,9 +228,45 @@ fn build_style_spans(p: &Paragraph, doc: &DocumentTree) -> Vec<StyleSpan> {
         cursor = end;
     }
     if cursor < text_len || out.is_empty() {
-        out.push(span_from_style(&base, cursor, text_len));
+        /* Issue #370 — an empty paragraph's one zero-width span is its
+        paragraph MARK (`<w:pPr><w:rPr>` over the style), which sizes its
+        line (`layout::empty_line_extents`), as in engine-wasm. */
+        let style = match p.mark_style.as_deref() {
+            Some(mark) if text_len == 0 => base.clone().merged_with(SpanStyle {
+                grab_bag: None,
+                ..mark.clone()
+            }),
+            _ => base.clone(),
+        };
+        out.push(span_from_style(&style, cursor, text_len));
     }
     out
+}
+
+/// Issue #370 — an empty paragraph's line pitch: a font-relative rule
+/// (no `w:line`, or an `auto` multiple) follows `layout::empty_mark_pitch`
+/// against the document default run, exactly as engine-wasm's
+/// `empty_paragraph_mark`; `exact` / `atLeast` stay absolute.
+fn empty_paragraph_pitch(
+    p: &Paragraph,
+    doc: &DocumentTree,
+    fonts: &FontStack,
+    props: &ParaProperties,
+    spans: &[StyleSpan],
+    direction: ShapingDirection,
+    line_height: f32,
+) -> f32 {
+    let (true, Some(mark)) = (p.text.is_empty(), spans.first()) else {
+        return line_height;
+    };
+    match props.line_height {
+        None | Some(engine::LineHeight::Auto { .. }) => {
+            let base = span_from_style(&doc.resolve_style_run_cascade(None), 0, 0);
+            let rtl = matches!(direction, ShapingDirection::Rtl);
+            layout::empty_mark_pitch(fonts, line_height, &base, mark, rtl)
+        }
+        Some(_) => line_height,
+    }
 }
 
 fn build_paragraph_box(
@@ -249,6 +285,7 @@ fn build_paragraph_box(
         .unwrap_or(TpAlignment::Start);
     let direction = resolve_direction(&p.text, &props);
     let (line_height, line_height_exact) = resolve_line_height(props.line_height);
+    let line_height = empty_paragraph_pitch(p, doc, fonts, &props, &spans, direction, line_height);
 
     // Issue #50 — a list paragraph with no direct `<w:ind>` falls back to
     // the numbering level's indent (the resolver stamped it alongside the
