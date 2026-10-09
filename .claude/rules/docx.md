@@ -242,6 +242,12 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   paragraph, then merges paragraphs for resolved marks per container
   from the end — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
+  Issue #305 — the single `AcceptRevision` / `RejectRevision` is the
+  SAME resolver (`DocumentTree::resolve_revisions` with a
+  `RevisionPick::Only`, addressed by `engine::RevisionRef`); text leaves
+  a paragraph only through `revisions::remove_text` (one overlay-shift
+  rule: an inline object whose sentinel was removed goes with it), and
+  `markup-assert` checks every inline object still anchors on a U+FFFC.
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

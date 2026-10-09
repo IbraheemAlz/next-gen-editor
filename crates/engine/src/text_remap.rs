@@ -167,6 +167,21 @@ pub(crate) fn debug_assert_tree_in_step(doc: &DocumentTree) {
                 p.text.len()
             );
         }
+        /* Issue #305 — every inline object still anchors on its own
+        U+FFFC sentinel: an edit that removed the sentinel removed the
+        object (`revisions::remove_text`, `Paragraph::delete_text`). */
+        for o in &p.inline_objects {
+            assert!(
+                p.text
+                    .get(o.at as usize..)
+                    .is_some_and(|t| t.starts_with('\u{FFFC}')),
+                "issue #305: paragraph {path:?} carries an inline object at byte {} \
+                 that no longer anchors on a U+FFFC sentinel (text {:?}) — an edit \
+                 removed or moved its sentinel without remapping the object",
+                o.at,
+                p.text
+            );
+        }
     });
 }
 

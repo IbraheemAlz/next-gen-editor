@@ -61,6 +61,8 @@ use serde::{Deserialize, Serialize};
 mod block_remap;
 pub use block_remap::CellMove;
 pub mod fields;
+mod revision_refs;
+pub use revision_refs::{RevisionPick, RevisionRef, RevisionSlot};
 #[cfg(test)]
 mod revision_tests;
 mod revisions;
@@ -7219,107 +7221,10 @@ impl DocumentTree {
     `DocumentTree`.
     =========================================================== */
 
-    /// Accept a tracked-change revision identified by (top-level
-    /// `block`, byte `start`, byte `end`). Semantics:
-    ///   - `Insert + Accept` → keep the inserted text, drop the overlay
-    ///   - `Delete + Accept` → drop the deleted text + drop the overlay
-    pub fn accept_revision_at(&self, block: u32, start: u32, end: u32) -> Self {
-        self.apply_revision_decision(block, start, end, /* accept = */ true)
-    }
-
-    /// Reject a tracked-change revision identified by (top-level
-    /// `block`, byte `start`, byte `end`). Semantics:
-    ///   - `Insert + Reject` → drop the inserted text + drop the overlay
-    ///   - `Delete + Reject` → keep the original text, drop the overlay
-    pub fn reject_revision_at(&self, block: u32, start: u32, end: u32) -> Self {
-        self.apply_revision_decision(block, start, end, /* accept = */ false)
-    }
-
-    fn apply_revision_decision(&self, block: u32, start: u32, end: u32, accept: bool) -> Self {
-        /* Issue #262 — a paragraph-MARK revision is addressed as the
-        empty range at the paragraph end (`revisions_snapshot` lists it
-        so); text revisions are never empty. */
-        if start == end
-            && let Some(p) = self
-                .blocks
-                .get(block as usize)
-                .and_then(Block::as_paragraph)
-            && p.mark_revision.is_some()
-            && start as usize == p.text.len()
-            && !p.revisions.iter().any(|r| r.start == start && r.end == end)
-        {
-            return self.resolve_mark_revision_at(block, accept);
-        }
-        let mut blocks = self.blocks.clone();
-        let path = BlockPath::top(block);
-        let mut removed_edit = None;
-        let _ = mutate_paragraph_in_top(&mut blocks, &path, |para| {
-            let Some(idx) = para
-                .revisions
-                .iter()
-                .position(|r| r.start == start && r.end == end)
-            else {
-                return;
-            };
-            /* Remove the matched revision FIRST so the offset-shift
-             * helper does not also `retain`-drop it (which would make
-             * any post-shift index lookup brittle). */
-            let rev = para.revisions.remove(idx);
-            /* Issue #262 — a rejected formatting change restores the
-            recorded style. */
-            if !accept
-                && rev.kind == RevisionKind::FormatChange
-                && let Some(prev) = &rev.prev_attrs
-            {
-                revisions::restyle(para, rev.start, rev.end, prev);
-            }
-            /* Reject Insert / MoveTo, accept Delete / MoveFrom (issue
-            #247): the text goes; otherwise it stays live. */
-            let delete_text = rev.kind.removes_text(accept);
-            if delete_text {
-                let s = para.snap_offset(rev.start);
-                let e = para.snap_offset(rev.end);
-                if s < e {
-                    /* Issues #250 / #252 — one splice drives the source
-                    markup and (below) the comment anchors. */
-                    let edit = para.splice_text(s, e - s, "");
-                    shift_paragraph_offsets_after(para, edit.at, edit.removed);
-                    removed_edit = Some(edit);
-                }
-            }
-            para.dirty = true;
-        });
-        let mut out = Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-        };
-        if let Some(e) = removed_edit {
-            out.remap_text_edit_record(&path, e);
-        }
-        out
-    }
+    /* Issue #305 — the single-revision accept / reject
+    (`accept_revision_at` / `reject_revision_at`) lives in
+    `revision_refs` and runs through the same resolver as accept-all
+    (`revisions::DocumentTree::resolve_revisions`). */
 
     /// Sprint 7 (UI Edition) — append a new comment anchored to a
     /// logical range. Picks a fresh `id` (max existing + 1) and
@@ -10813,57 +10718,15 @@ fn walk_paragraphs<F: FnMut(&Paragraph)>(blocks: &Vector<Block>, f: &mut F) {
     }
 }
 
-/// Sprint 7 (UI Edition) helper — shift every byte-offset-bearing
-/// field on `para` LEFT by `removed_len`, for every value at or
-/// after `from`. Mirrors the rightward shift performed by
-/// `insert_inline_image_at` in reverse. Used when a tracked-change
-/// revision is rejected (Insert) or accepted (Delete) — and (issue
-/// #265) when the reviewer's own pending insertion is removed by
-/// `tracked_delete_range` — and the covered text range is sliced out.
+/// Issue #265 — shift every byte-offset-bearing overlay of `para` across
+/// the removal of `removed_len` bytes at `from` (the reviewer's own
+/// pending insertion removed by `tracked_delete_range`; the caller's
+/// `Paragraph::splice_text` already remapped the text and the source
+/// markup). Issue #305 — a delegate: the one rule lives with
+/// `revisions::remove_text`, the text removal every revision resolution
+/// (single or all) goes through.
 fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u32) {
-    let to = from + removed_len;
-    let shift = |v: &mut u32| {
-        if *v >= to {
-            *v -= removed_len;
-        } else if *v > from {
-            *v = from;
-        }
-    };
-    for s in &mut para.spans {
-        shift(&mut s.start);
-        shift(&mut s.end);
-    }
-    para.spans.retain(|s| s.start < s.end);
-    /* Issue #265 — an inline object is a single sentinel byte, not a
-    range: one whose sentinel lies inside the removed gap has nothing
-    left to clamp onto (unlike a span/field/hyperlink, which can be
-    clipped to the gap's edge) and is dropped, exactly like
-    `Paragraph::delete_text`'s rule for the same case. */
-    para.inline_objects.retain_mut(|io| {
-        if io.at >= to {
-            io.at -= removed_len;
-            true
-        } else {
-            io.at < from
-        }
-    });
-    for h in &mut para.hyperlinks {
-        shift(&mut h.start);
-        shift(&mut h.end);
-    }
-    para.hyperlinks.retain(|h| h.start < h.end);
-    for r in &mut para.revisions {
-        shift(&mut r.start);
-        shift(&mut r.end);
-    }
-    para.revisions.retain(|r| r.start < r.end);
-    for f in &mut para.fields {
-        shift(&mut f.start);
-        shift(&mut f.end);
-    }
-    para.fields.retain(|f| f.start < f.end);
-    /* Issues #199 / #106 / #250 — the source markup was remapped by the
-    caller's `Paragraph::splice_text`, together with the text. */
+    revisions::shift_overlays_after_removal(para, from, removed_len);
 }
 
 /// Phase 3 (#40) — clipboard fragments are never section-marker

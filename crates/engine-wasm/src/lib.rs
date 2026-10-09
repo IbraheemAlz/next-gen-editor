@@ -7447,10 +7447,10 @@ impl Engine {
                 self.do_set_review_identity(author, date)
             }
             Command::AcceptRevision { block, start, end } => {
-                self.do_accept_revision(block, start, end)
+                self.do_resolve_revision(block, start, end, true)
             }
             Command::RejectRevision { block, start, end } => {
-                self.do_reject_revision(block, start, end)
+                self.do_resolve_revision(block, start, end, false)
             }
             Command::AcceptAllRevisions => self.do_resolve_all_revisions(true),
             Command::RejectAllRevisions => self.do_resolve_all_revisions(false),
@@ -14997,7 +14997,6 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::AcceptRevision` (Sprint 7 UI Edition).
     /// Sprint 14 (#14) — best-effort current review date stamp.
     /// Prefers the explicit value `Command::SetReviewIdentity` set;
     /// otherwise falls back to the engine clock (`now_iso8601`, issue
@@ -15044,36 +15043,34 @@ impl Engine {
         self.selection_changed()
     }
 
-    fn do_accept_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
-        let new_doc = self.undo.current().accept_revision_at(block, start, end);
-        self.undo.push(new_doc);
-        self.layout_cache.get_mut().clear();
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
-        }
-        self.announce(AnnouncementPriority::Polite, "Revision accepted");
-        self.selection_changed()
-    }
-
-    /// `Command::RejectRevision` (Sprint 7 UI Edition).
-    fn do_reject_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
-        let new_doc = self.undo.current().reject_revision_at(block, start, end);
-        self.undo.push(new_doc);
-        self.layout_cache.get_mut().clear();
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
-        }
-        self.announce(AnnouncementPriority::Polite, "Revision rejected");
-        self.selection_changed()
+    /// `Command::AcceptRevision` / `RejectRevision` (Sprint 7 UI
+    /// Edition). Issue #305 — the single revision resolves through the
+    /// accept-all resolver (`DocumentTree::resolve_revision`), as one
+    /// undo step with the selection clamped like accept-all's; an
+    /// address that names no revision pushes nothing.
+    fn do_resolve_revision(&mut self, block: u32, start: u32, end: u32, accept: bool) -> Event {
+        let doc = self.undo.current();
+        let resolved = doc
+            .revision_at_range(block, start, end)
+            .and_then(|at| doc.resolve_revision(&at, accept));
+        let Some(new_doc) = resolved else {
+            self.announce(AnnouncementPriority::Polite, "No such tracked change");
+            return self.selection_changed();
+        };
+        self.commit_resolved_revisions(
+            new_doc,
+            if accept {
+                "Revision accepted"
+            } else {
+                "Revision rejected"
+            },
+        )
     }
 
     /// Issue #262 — `Command::AcceptAllRevisions` /
     /// `RejectAllRevisions`: every tracked change of the body resolved in
     /// one tree edit, pushed as ONE undo step. Nothing to resolve → no
-    /// undo step. The selection is clamped back into the (possibly
-    /// merged / shortened) paragraphs.
+    /// undo step.
     fn do_resolve_all_revisions(&mut self, accept: bool) -> Event {
         let doc = self.undo.current();
         if !doc.has_revisions() {
@@ -15081,6 +15078,20 @@ impl Engine {
             return self.selection_changed();
         }
         let new_doc = doc.resolve_all_revisions(accept);
+        self.commit_resolved_revisions(
+            new_doc,
+            if accept {
+                "All tracked changes accepted"
+            } else {
+                "All tracked changes rejected"
+            },
+        )
+    }
+
+    /// Push a revision resolution (single or all) as ONE undo step and
+    /// repaint. The selection is clamped back into the (possibly merged /
+    /// shortened) paragraphs.
+    fn commit_resolved_revisions(&mut self, new_doc: DocumentTree, announcement: &str) -> Event {
         self.undo.push(new_doc);
         /* Merged / shortened paragraphs: keep the caret on real text. */
         if let Some(sel) = self.selection.clone() {
@@ -15097,14 +15108,7 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
-        self.announce(
-            AnnouncementPriority::Polite,
-            if accept {
-                "All tracked changes accepted"
-            } else {
-                "All tracked changes rejected"
-            },
-        );
+        self.announce(AnnouncementPriority::Polite, announcement);
         self.selection_changed()
     }
 
@@ -27013,6 +27017,9 @@ mod text_remap_tests;
 
 #[cfg(test)]
 mod revision_command_tests;
+
+#[cfg(test)]
+mod revision_address_tests;
 
 #[cfg(test)]
 mod story_tab_tests;

@@ -3,18 +3,27 @@
 //! and the paragraph-MARK revision (a tracked paragraph split or merge,
 //! [`crate::Paragraph::mark_revision`]).
 //!
-//! Every text removal goes through [`Paragraph::splice_text`] and the
+//! Issue #305 — ONE implementation: accept-all / reject-all and the
+//! single-revision path ([`DocumentTree::accept_revision_at`], the
+//! `revision_refs` addressing) are both [`DocumentTree::resolve_revisions`]
+//! with a different [`RevisionPick`].
+//!
+//! Every text removal goes through [`remove_text`] —
+//! [`Paragraph::splice_text`] plus the one overlay-shift rule — and the
 //! returned edit through [`DocumentTree::remap_text_edit_record`]; every
 //! merge through [`DocumentTree::remap_paragraph_merge`] (or, for a head
 //! that vanishes whole, [`DocumentTree::remap_block_splice`]) — so the
 //! source markup and the comment anchors stay in step with the text
 //! (issues #250 / #252 / #253).
 
+use std::collections::HashSet;
+
+use crate::revision_refs::RevisionPick;
 use crate::text_remap::TextEdit;
 use crate::{
     Block, BlockPath, DocumentTree, Hyperlink, Paragraph, PathStep, Revision, RevisionKind,
     SpanStyle, StyleRun, delete_block_at_path, mutate_paragraph_in_top, parent_container_snapshot,
-    replace_block_in_top, shift_paragraph_offsets_after,
+    replace_block_in_top,
 };
 
 impl DocumentTree {
@@ -46,16 +55,36 @@ impl DocumentTree {
     /// 3. With every move resolved, the orphaned in-paragraph move-range
     ///    markers (`<w:moveFromRangeStart/>` …) are dropped.
     pub fn resolve_all_revisions(&self, accept: bool) -> Self {
+        self.resolve_revisions(accept, &RevisionPick::All)
+    }
+
+    /// Issues #262 / #305 — accept (`accept == true`) or reject the
+    /// tracked changes `pick` selects, as ONE new tree (one undo step).
+    /// The single implementation behind accept-all / reject-all
+    /// ([`RevisionPick::All`], steps 1–3 of
+    /// [`Self::resolve_all_revisions`]) and the single-revision path
+    /// ([`RevisionPick::Only`]): a revision the pick leaves out stays
+    /// pending and travels with its text like every other overlay
+    /// ([`remove_text`]); a resolved move drops only its own range
+    /// markers.
+    pub fn resolve_revisions(&self, accept: bool, pick: &RevisionPick) -> Self {
         let mut out = self.clone();
-        let mut had_move = false;
+        let mut moves = ResolvedMoves::default();
         let mut paths = Vec::new();
         crate::fields::for_each_paragraph_deep(&out.blocks, &mut |path, p| {
-            had_move |= p
-                .revisions
-                .iter()
-                .chain(p.mark_revision.as_ref())
-                .any(|r| matches!(r.kind, RevisionKind::MoveFrom | RevisionKind::MoveTo));
-            if !p.revisions.is_empty() {
+            let mut picked_text = false;
+            for (i, r) in p.revisions.iter().enumerate() {
+                if pick.text(&path, i) {
+                    picked_text = true;
+                    moves.note(r);
+                }
+            }
+            if let Some(r) = &p.mark_revision
+                && pick.mark(&path)
+            {
+                moves.note(r);
+            }
+            if picked_text {
                 paths.push(path);
             }
         });
@@ -63,50 +92,79 @@ impl DocumentTree {
             let mut edits = Vec::new();
             let mut blocks = out.blocks.clone();
             let _ = mutate_paragraph_in_top(&mut blocks, &path, |para| {
-                edits = resolve_text_revisions(para, accept);
+                edits = resolve_text_revisions(para, accept, |i| pick.text(&path, i));
             });
             out.blocks = blocks;
             for e in edits {
                 out.remap_text_edit_record(&path, e);
             }
         }
-        out.resolve_marks_in(&[], accept);
-        if had_move {
-            let mut marked = Vec::new();
-            crate::fields::for_each_paragraph_deep(&out.blocks, &mut |path, p| {
-                if p.source_markup
-                    .as_deref()
-                    .is_some_and(|m| m.markers.iter().any(|mk| is_move_range(&mk.xml)))
-                {
-                    marked.push(path);
+        out.resolve_marks_in(&[], accept, pick);
+        out.drop_move_range_markers(&moves, pick);
+        out.with_list_markers_refreshed()
+    }
+
+    /// Step 3: drop the in-paragraph range markers of the moves this pass
+    /// resolved — every move-range marker when everything was resolved,
+    /// otherwise the `w:name`d starts of the resolved moves and the ends
+    /// sharing their `w:id`.
+    fn drop_move_range_markers(&mut self, moves: &ResolvedMoves, pick: &RevisionPick) {
+        if !moves.any {
+            return;
+        }
+        let names = match pick {
+            RevisionPick::All => None,
+            RevisionPick::Only(_) => Some(&moves.names),
+        };
+        /* The ends carry only `w:id`: pair them through their starts. */
+        let mut ends: HashSet<(bool, String)> = HashSet::new();
+        if let Some(names) = names {
+            crate::fields::for_each_paragraph_deep(&self.blocks, &mut |_, p| {
+                for mk in p.source_markup.iter().flat_map(|m| m.markers.iter()) {
+                    if let Some((from, true)) = move_range_role(&mk.xml)
+                        && xml_attr(&mk.xml, b"w:name").is_some_and(|n| names.contains(&n))
+                        && let Some(id) = xml_attr(&mk.xml, b"w:id")
+                    {
+                        ends.insert((from, id));
+                    }
                 }
             });
-            let mut blocks = out.blocks.clone();
-            for path in marked {
-                let _ = mutate_paragraph_in_top(&mut blocks, &path, |para| {
-                    if let Some(m) = para.source_markup.as_deref_mut() {
-                        m.markers.retain(|mk| !is_move_range(&mk.xml));
-                    }
-                });
-            }
-            out.blocks = blocks;
         }
-        out.with_list_markers_refreshed()
+        let drops = |xml: &[u8]| match (move_range_role(xml), names) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some((_, true)), Some(names)) => {
+                xml_attr(xml, b"w:name").is_some_and(|n| names.contains(&n))
+            }
+            (Some((from, false)), Some(_)) => {
+                xml_attr(xml, b"w:id").is_some_and(|id| ends.contains(&(from, id)))
+            }
+        };
+        let mut marked = Vec::new();
+        crate::fields::for_each_paragraph_deep(&self.blocks, &mut |path, p| {
+            if p.source_markup
+                .as_deref()
+                .is_some_and(|m| m.markers.iter().any(|mk| drops(&mk.xml)))
+            {
+                marked.push(path);
+            }
+        });
+        let mut blocks = self.blocks.clone();
+        for path in marked {
+            let _ = mutate_paragraph_in_top(&mut blocks, &path, |para| {
+                if let Some(m) = para.source_markup.as_deref_mut() {
+                    m.markers.retain(|mk| !drops(&mk.xml));
+                }
+            });
+        }
+        self.blocks = blocks;
     }
 
-    /// Issue #262 — accept / reject the paragraph-mark revision of
-    /// top-level paragraph `block` (the single-revision path; see
-    /// [`Self::resolve_all_revisions`] for the semantics).
-    pub(crate) fn resolve_mark_revision_at(&self, block: u32, accept: bool) -> Self {
-        let mut out = self.clone();
-        out.resolve_mark(&[], block, accept);
-        out.with_list_markers_refreshed()
-    }
-
-    /// Resolve every paragraph-mark revision in the container `container`
-    /// (the steps leading INTO a block list: empty = the body), deepest
-    /// first, from the container's end.
-    fn resolve_marks_in(&mut self, container: &[PathStep], accept: bool) {
+    /// Resolve every paragraph-mark revision `pick` selects in the
+    /// container `container` (the steps leading INTO a block list: empty
+    /// = the body), deepest first, from the container's end — so a merge
+    /// never moves a block this walk has still to visit.
+    fn resolve_marks_in(&mut self, container: &[PathStep], accept: bool, pick: &RevisionPick) {
         let Some(blocks) = container_blocks(self, container) else {
             return;
         };
@@ -125,10 +183,10 @@ impl DocumentTree {
                     for (row, col) in cells {
                         let mut inner = path.steps.clone();
                         inner.push(PathStep::Cell { row, col });
-                        self.resolve_marks_in(&inner, accept);
+                        self.resolve_marks_in(&inner, accept, pick);
                     }
                 }
-                Some(Block::Paragraph(p)) if p.mark_revision.is_some() => {
+                Some(Block::Paragraph(p)) if p.mark_revision.is_some() && pick.mark(&path) => {
                     self.resolve_mark(container, i, accept);
                 }
                 _ => {}
@@ -244,11 +302,23 @@ fn merge_pair(head: &Paragraph, tail: &Paragraph) -> Paragraph {
     m
 }
 
-/// Resolve every text revision of `para` (see
-/// [`DocumentTree::resolve_all_revisions`] step 1); returns the text
-/// edits performed, in order, for the caller's anchor remap.
-fn resolve_text_revisions(para: &mut Paragraph, accept: bool) -> Vec<TextEdit> {
-    let revs = std::mem::take(&mut para.revisions);
+/// Resolve the text revisions of `para` whose index `pick` selects (see
+/// [`DocumentTree::resolve_all_revisions`] step 1); the others stay
+/// pending and shift with the removed text. Returns the text edits
+/// performed, in order, for the caller's anchor remap.
+fn resolve_text_revisions(
+    para: &mut Paragraph,
+    accept: bool,
+    pick: impl Fn(usize) -> bool,
+) -> Vec<TextEdit> {
+    let mut revs = Vec::new();
+    for (i, r) in std::mem::take(&mut para.revisions).into_iter().enumerate() {
+        if pick(i) {
+            revs.push(r);
+        } else {
+            para.revisions.push(r);
+        }
+    }
     if !accept {
         for r in &revs {
             if r.kind == RevisionKind::FormatChange
@@ -279,14 +349,66 @@ fn resolve_text_revisions(para: &mut Paragraph, accept: bool) -> Vec<TextEdit> {
         .collect()
 }
 
-/// Remove bytes `[s, e)` of `para` with every overlay: inline objects
-/// whose anchor was removed go with it, the rest shift.
+/// Issue #305 — THE way a resolved revision (and a reviewer's own
+/// removed insertion, `tracked_delete_range`) takes bytes `[s, e)` out of
+/// `para`: one [`Paragraph::splice_text`] (text + source markup) and one
+/// overlay-shift rule ([`shift_overlays_after_removal`]) for everything
+/// else, so the single-revision path and accept-all cannot disagree. The
+/// returned edit is what the caller hands to
+/// [`DocumentTree::remap_text_edit_record`].
 pub(crate) fn remove_text(para: &mut Paragraph, s: u32, e: u32) -> TextEdit {
-    para.inline_objects.retain(|o| o.at < s || o.at >= e);
-    let edit = para.splice_text(s, e - s, "");
-    shift_paragraph_offsets_after(para, edit.at, edit.removed);
+    let edit = para.splice_text(s, e.saturating_sub(s), "");
+    shift_overlays_after_removal(para, edit.at, edit.removed);
     para.dirty = true;
     edit
+}
+
+/// Shift every byte-offset-bearing overlay of `para` across the removal
+/// of `removed_len` bytes at `from` (the text and the source markup were
+/// already spliced by [`Paragraph::splice_text`]): offsets at or past the
+/// gap's end move left; a range boundary inside the gap clamps to its
+/// start and a range left empty is dropped (spans, hyperlinks, fields,
+/// pending revisions); an inline object — a single U+FFFC sentinel byte,
+/// nothing to clamp onto — whose sentinel lay inside the gap is dropped
+/// with it (issue #265, the `Paragraph::delete_text` rule), so no object
+/// is left pointing at removed text (issue #305).
+pub(crate) fn shift_overlays_after_removal(para: &mut Paragraph, from: u32, removed_len: u32) {
+    let to = from + removed_len;
+    let shift = |v: &mut u32| {
+        if *v >= to {
+            *v -= removed_len;
+        } else if *v > from {
+            *v = from;
+        }
+    };
+    for s in &mut para.spans {
+        shift(&mut s.start);
+        shift(&mut s.end);
+    }
+    para.spans.retain(|s| s.start < s.end);
+    para.inline_objects.retain_mut(|io| {
+        if io.at >= to {
+            io.at -= removed_len;
+            true
+        } else {
+            io.at < from
+        }
+    });
+    for h in &mut para.hyperlinks {
+        shift(&mut h.start);
+        shift(&mut h.end);
+    }
+    para.hyperlinks.retain(|h| h.start < h.end);
+    for r in &mut para.revisions {
+        shift(&mut r.start);
+        shift(&mut r.end);
+    }
+    para.revisions.retain(|r| r.start < r.end);
+    for f in &mut para.fields {
+        shift(&mut f.start);
+        shift(&mut f.end);
+    }
+    para.fields.retain(|f| f.start < f.end);
 }
 
 /// Give bytes `[s, e)` of `para` the style `style` (a rejected
@@ -327,6 +449,72 @@ pub(crate) fn restyle(para: &mut Paragraph, s: u32, e: u32, style: &SpanStyle) {
     para.dirty = true;
 }
 
-fn is_move_range(xml: &[u8]) -> bool {
-    xml.starts_with(b"<w:moveFromRange") || xml.starts_with(b"<w:moveToRange")
+/// The moves one resolution pass resolved: whether any, and their
+/// `move_name`s (a single resolution resolves whole moves — both halves —
+/// so its names are complete).
+#[derive(Default)]
+struct ResolvedMoves {
+    any: bool,
+    names: HashSet<String>,
+}
+
+impl ResolvedMoves {
+    fn note(&mut self, r: &Revision) {
+        if matches!(r.kind, RevisionKind::MoveFrom | RevisionKind::MoveTo) {
+            self.any = true;
+            if let Some(n) = &r.move_name {
+                self.names.insert(n.clone());
+            }
+        }
+    }
+}
+
+/// A positioned move-range marker: `(is moveFrom, is the range start)`.
+fn move_range_role(xml: &[u8]) -> Option<(bool, bool)> {
+    let tag = xml.strip_prefix(b"<w:move")?;
+    let (from, rest) = if let Some(r) = tag.strip_prefix(b"FromRange") {
+        (true, r)
+    } else {
+        (false, tag.strip_prefix(b"ToRange")?)
+    };
+    if rest.starts_with(b"Start") {
+        Some((from, true))
+    } else if rest.starts_with(b"End") {
+        Some((from, false))
+    } else {
+        None
+    }
+}
+
+/// The (entity-decoded) value of attribute `name` on the start tag `xml`
+/// opens with.
+fn xml_attr(xml: &[u8], name: &[u8]) -> Option<String> {
+    let tag_end = xml.iter().position(|&b| b == b'>').unwrap_or(xml.len());
+    let tag = &xml[..tag_end];
+    let mut i = 0;
+    while let Some(at) = tag[i..].windows(name.len()).position(|w| w == name) {
+        let start = i + at;
+        i = start + name.len();
+        /* A whole attribute name: preceded by whitespace, followed by `=`. */
+        if !tag[..start].last().is_some_and(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let rest = &tag[i..];
+        let rest = rest.strip_prefix(b"=")?;
+        let quote = *rest.first()?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        let value = &rest[1..];
+        let close = value.iter().position(|&b| b == quote)?;
+        let raw = String::from_utf8_lossy(&value[..close]);
+        return Some(
+            raw.replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&"),
+        );
+    }
+    None
 }
