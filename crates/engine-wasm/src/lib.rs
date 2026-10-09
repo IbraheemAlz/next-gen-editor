@@ -16806,11 +16806,26 @@ impl Engine {
     /// the very first mutating command, no separate `LoadFont` +
     /// `RenderPage` dance required in every corpus entry.
     pub fn new_headless(doc: DocumentTree) -> Engine {
-        let bytes_font = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
-        let font = LoadedFont::parse("fuzz-latin".to_string(), bytes_font)
-            .expect("bundled LiberationSans-Regular.ttf must parse");
+        /* Parsed ONCE per process and shared. `LoadedFont::parse`
+        intentionally `Vec::leak`s the font bytes (the cached rustybuzz
+        face borrows them for `'static`), so parsing per engine leaked
+        ~400 KB on EVERY fuzz iteration: LeakSanitizer flagged the very
+        first (empty) input as a "crash" and the nightly lane filed
+        content-free issues (#323 / #324). A process-wide static keeps
+        the allocation reachable, which LSan does not report. */
+        static FUZZ_FONT: std::sync::OnceLock<Arc<LoadedFont>> = std::sync::OnceLock::new();
+        let font = FUZZ_FONT
+            .get_or_init(|| {
+                let bytes_font =
+                    include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+                Arc::new(
+                    LoadedFont::parse("fuzz-latin".to_string(), bytes_font)
+                        .expect("bundled LiberationSans-Regular.ttf must parse"),
+                )
+            })
+            .clone();
         let mut fonts: HashMap<String, Arc<LoadedFont>> = HashMap::new();
-        fonts.insert("fuzz-latin".to_string(), Arc::new(font));
+        fonts.insert("fuzz-latin".to_string(), font);
         let mut engine = assemble_engine(None, None);
         engine.fonts = fonts;
         engine.layout_cfg = Some(RenderConfig {

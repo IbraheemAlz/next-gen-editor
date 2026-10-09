@@ -256,3 +256,25 @@ pub fn run_format_pdf_image_decode(data: &[u8]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// libFuzzer always executes the zero-length input first, and under
+    /// `-fork` every worker attributes an exit-time failure to it (that is
+    /// how the nightly lane produced the empty reproducers of issues 323
+    /// and 324). Every target body must take it without panicking. The
+    /// leak that actually tripped LeakSanitizer is only observable under
+    /// the nightly sanitizer runtime; its stable guards are
+    /// `LoadedFont::parse`'s unit test and the process-wide font shared by
+    /// `Engine::new_headless`.
+    #[test]
+    fn every_target_body_accepts_the_empty_input() {
+        run_docx_reader(&[]);
+        run_docx_roundtrip(&[]);
+        run_rpc_command(&[]);
+        run_layout_paginate(&[]);
+        run_format_pdf_image_decode(&[]);
+    }
+}
