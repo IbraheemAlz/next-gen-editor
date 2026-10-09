@@ -381,62 +381,6 @@ fn collect_docx_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Issue #421 — a corpus dir made of symlinks (to files, to a
-    /// directory, a loop back up the tree, a dangling link) yields the
-    /// `.docx` files, each once per link, and terminates.
-    #[cfg(unix)]
-    #[test]
-    fn collect_docx_files_follows_symlinks_with_a_loop_guard() {
-        use std::os::unix::fs::symlink;
-        let base = std::env::temp_dir().join(format!(
-            "corpus-native-symlinks-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        let real = base.join("real");
-        let sub = real.join("sub");
-        let corpus = base.join("corpus");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::create_dir_all(&corpus).unwrap();
-        std::fs::write(real.join("a.docx"), b"a").unwrap();
-        std::fs::write(sub.join("b.DOCX"), b"b").unwrap();
-        std::fs::write(real.join("notes.txt"), b"x").unwrap();
-        // File symlinks, one with a non-docx target name but docx link name.
-        symlink(real.join("a.docx"), corpus.join("link-a.docx")).unwrap();
-        symlink(sub.join("b.DOCX"), corpus.join("link-b.docx")).unwrap();
-        // A link to a .txt named .docx still counts by the link's name.
-        symlink(real.join("notes.txt"), corpus.join("not-a-doc.txt")).unwrap();
-        // A directory symlink, and a loop back to the corpus root.
-        symlink(&sub, corpus.join("dirlink")).unwrap();
-        symlink(&corpus, sub.join("loop")).unwrap();
-        symlink(&corpus, corpus.join("self")).unwrap();
-        // Dangling.
-        symlink(base.join("missing.docx"), corpus.join("dangling.docx")).unwrap();
-
-        let found = collect_docx_files(&corpus).unwrap();
-        let names: Vec<String> = found
-            .iter()
-            .map(|p| {
-                p.strip_prefix(&corpus)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        assert_eq!(
-            names,
-            vec!["dirlink/b.DOCX", "link-a.docx", "link-b.docx"],
-            "found {names:?}"
-        );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-}
-
 fn main() -> ExitCode {
     panics::install();
     let args = parse_args();
@@ -822,4 +766,60 @@ fn main() -> ExitCode {
     println!("[corpus-native] timeouts cleared by the lone retry (#418): {timeouts_recovered}");
     println!("[corpus-native] JSONL written to {}", args.out.display());
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #421 — a corpus dir made of symlinks (to files, to a
+    /// directory, a loop back up the tree, a dangling link) yields the
+    /// `.docx` files, each once per link, and terminates.
+    #[cfg(unix)]
+    #[test]
+    fn collect_docx_files_follows_symlinks_with_a_loop_guard() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "corpus-native-symlinks-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let sub = real.join("sub");
+        let corpus = base.join("corpus");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(real.join("a.docx"), b"a").unwrap();
+        std::fs::write(sub.join("b.DOCX"), b"b").unwrap();
+        std::fs::write(real.join("notes.txt"), b"x").unwrap();
+        // File symlinks, one with a non-docx target name but docx link name.
+        symlink(real.join("a.docx"), corpus.join("link-a.docx")).unwrap();
+        symlink(sub.join("b.DOCX"), corpus.join("link-b.docx")).unwrap();
+        // A link to a .txt named .docx still counts by the link's name.
+        symlink(real.join("notes.txt"), corpus.join("not-a-doc.txt")).unwrap();
+        // A directory symlink, and a loop back to the corpus root.
+        symlink(&sub, corpus.join("dirlink")).unwrap();
+        symlink(&corpus, sub.join("loop")).unwrap();
+        symlink(&corpus, corpus.join("self")).unwrap();
+        // Dangling.
+        symlink(base.join("missing.docx"), corpus.join("dangling.docx")).unwrap();
+
+        let found = collect_docx_files(&corpus).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&corpus)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["dirlink/b.DOCX", "link-a.docx", "link-b.docx"],
+            "found {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
