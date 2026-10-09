@@ -557,6 +557,33 @@ pub struct LineBox {
     /// Issue #82 — index into [`Self::segments`] (0 when `segments` is
     /// empty).
     pub segment: usize,
+    /// Issues #335 / #326 — the line broke inside a word and ends with a
+    /// drawn hyphen: a `synthetic` glyph at the line's logical end (not
+    /// in the source text — caret slots, the accessibility mirror and
+    /// text extraction skip it). [`LineHyphen::None`] for every other
+    /// line; the geometry fingerprint hashes the flag only when set.
+    pub hyphen: LineHyphen,
+}
+
+/// Issues #335 / #326 — why a line ends with a drawn hyphen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LineHyphen {
+    /// No hyphen: the line ended at a space, a hard break, the paragraph
+    /// end, or a forced character break.
+    #[default]
+    None,
+    /// The line broke right after a U+00AD SOFT HYPHEN
+    /// (`<w:softHyphen/>`, an optional hyphen the author placed).
+    Soft,
+    /// The line broke at an automatic hyphenation point
+    /// (`<w:autoHyphenation/>`, issue #326).
+    Auto,
+}
+
+impl LineHyphen {
+    pub fn is_none(self) -> bool {
+        self == LineHyphen::None
+    }
 }
 
 impl LineBox {

@@ -362,6 +362,7 @@ fn empty_sctx() -> StyleContext<'static> {
         theme: None,
         theme_key: 0,
         word_line_metrics: false,
+        settings: None,
     }
 }
 
@@ -392,7 +393,7 @@ fn page_with(table: TableBox) -> PageBox {
 
 /// Issue #318 / #87 — a memo hit is a prediction, verified before use: a
 /// poisoned entry (a box that does not fit the table it stands in for)
-/// is re-laid from scratch with a `CacheMismatch` note, and the result
+/// is re-laid from scratch with a `TableCacheMismatch` note (issue #379), and the result
 /// is the clean layout.
 #[test]
 fn a_poisoned_memo_entry_is_relaid_and_reported() {
@@ -433,7 +434,7 @@ fn a_poisoned_memo_entry_is_relaid_and_reported() {
             .iter()
             .map(|d| d.reason)
             .collect::<Vec<_>>(),
-        vec![LayoutDegradeReason::CacheMismatch]
+        vec![LayoutDegradeReason::TableCacheMismatch]
     );
     /* The healed entry serves the next hit silently. */
     let _strict = StrictLayoutNotes::on();

@@ -37,8 +37,6 @@ jobs:
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - name: Build engine-wasm (release)
         run: wasm-pack build --target web --release crates/engine-wasm

@@ -18,6 +18,7 @@
  * dispatched `Command.type` tags (e.g. `"INSERT_TEXT"`), never a command's
  * payload (which, for `InsertText`, IS document content). */
 import type { Command, Event } from '../engine/types';
+import { readWarningCounts, type ReadWarningCount } from './read-warning-counts';
 import { installDevHook } from '../dev-hooks';
 
 type ErrorCode =
@@ -46,6 +47,8 @@ interface RecoveryFlags {
     log_truncated: boolean;
     snapshot_fallbacks: number;
     package_fallbacks: number;
+    /** Issue #427 - journal rows that never landed (#390). */
+    journal_gap: number;
 }
 /** Issue #315 — the recovery-report fields the CRASH sample reads (a
  *  structural subset of `EngineClient`'s `RecoveryInfo` and of
@@ -58,6 +61,8 @@ export interface TelemetryRecoveryReport {
     logTruncated: boolean;
     snapshotFallbacks: number;
     packageFallbacks: number;
+    /** Issue #390 - absent = 0. */
+    journalGap?: number;
     rendererDowngrade: RendererDowngrade | undefined;
 }
 
@@ -70,6 +75,7 @@ function recoveryFlags(r: TelemetryRecoveryReport): RecoveryFlags {
         log_truncated: r.logTruncated,
         snapshot_fallbacks: r.snapshotFallbacks,
         package_fallbacks: r.packageFallbacks,
+        journal_gap: r.journalGap ?? 0,
     };
 }
 
@@ -112,9 +118,17 @@ type TelemetryKind =
           backend: string;
           /** Issue #329 — how many (family, slot) font substitutions the
            *  opened document's layout makes (`DOCUMENT_LOADED.substituted`);
-           *  a count, never the family names. */
+           *  a count, never the family names. Omitted when none, like the
+           *  Rust `skip_serializing_if`. */
           font_substitutions?: number;
+          /** Issue #406 — per-kind reader-warning counts of a degraded open
+           *  (kinds ascending, like the Rust `read_warning_counts`); omitted
+           *  on a clean open, like the Rust `skip_serializing_if`. Codes and
+           *  counts only — never a warning's detail. */
+          read_warnings?: ReadWarningCount[];
       };
+
+
 
 interface TelemetryEvent {
     doc_id: string;
@@ -257,6 +271,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
         openMs: number;
         deadlineMs: number;
         substitutions: number;
+        readWarnings: ReadWarningCount[];
     } | null = null;
 
     const sample = (kind: TelemetryKind): TelemetryEvent => ({
@@ -355,7 +370,12 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                             page_count: e.page_count,
                             open_ms: pendingDocOpen.openMs,
                             backend: client.renderer,
-                            font_substitutions: pendingDocOpen.substitutions,
+                            ...(pendingDocOpen.substitutions > 0
+                                ? { font_substitutions: pendingDocOpen.substitutions }
+                                : {}),
+                            ...(pendingDocOpen.readWarnings.length > 0
+                                ? { read_warnings: pendingDocOpen.readWarnings }
+                                : {}),
                         }),
                     );
                 }
@@ -415,6 +435,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                 openMs: performance.now() - openStart,
                 deadlineMs: performance.now() + DOC_OPEN_CORRELATION_MS,
                 substitutions: result.substituted?.length ?? 0,
+                readWarnings: readWarningCounts(result.warnings ?? []),
             };
         }
         return result;

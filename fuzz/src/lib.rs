@@ -210,6 +210,9 @@ pub fn run_rpc_command(data: &[u8]) {
         dedup) tells triage WHICH command broke an invariant. Formatted
         lazily — `assert!`'s message arguments run only on failure. */
         let keep = cmd.clone();
+        /* Issue #407 — a command carrying a NaN / ±inf number anywhere
+        must be refused by the dispatcher's finite() guard. */
+        let non_finite = cmd.first_non_finite();
         /* Issue #341 — "error => no mutation": the document, selection,
         active story and undo depth before the command. */
         let before = engine.state_fingerprint_for_fuzzing();
@@ -220,6 +223,21 @@ pub fn run_rpc_command(data: &[u8]) {
                 "[rpc_command]   -> {} in {} ms",
                 format!("{evt:?}").chars().take(80).collect::<String>(),
                 t.elapsed().as_millis()
+            );
+        }
+        if let Some(bad) = &non_finite {
+            assert!(
+                matches!(
+                    &evt,
+                    bridge::Event::Error {
+                        kind: Some(bridge::ErrorKind::InvalidArgument),
+                        ..
+                    }
+                ),
+                "{} carried a non-finite {} but was not refused: {}",
+                variant_name(&keep),
+                bad.field,
+                format!("{evt:?}").chars().take(160).collect::<String>()
             );
         }
         if let bridge::Event::Error { message, .. } = &evt
@@ -556,6 +574,42 @@ pub fn run_format_pdf_image_decode(data: &[u8]) {
     }
 }
 
+/// Issue #348 — the hostile `.docx` seeds of `corpus/docx_reader/`: `(file
+/// name, package bytes, the limit [`read_raw_package`] must refuse it with
+/// — `None` when it must read)`. Built by `format_docx::test_fixtures`, so
+/// no blob is hand-maintained; `examples/regen-seeds` writes them.
+pub fn hostile_docx_seeds() -> Vec<(&'static str, Vec<u8>, Option<format_docx::PackageLimit>)> {
+    use format_docx::PackageLimit;
+    use format_docx::test_fixtures as fx;
+    vec![
+        (
+            "hostile_declared_4gib_part.docx",
+            fx::lying_size_docx(4 * 1024 * 1024 * 1024),
+            None,
+        ),
+        (
+            "hostile_declared_u64_max_part.docx",
+            fx::lying_size_docx(u64::MAX - 1),
+            None,
+        ),
+        (
+            "hostile_bomb_16mib_zeros.docx",
+            fx::compressible_bomb_docx(16 * 1024 * 1024),
+            Some(PackageLimit::PartBytes),
+        ),
+        (
+            "hostile_sdt_5000_nested.docx",
+            fx::nested_sdt_docx(5000),
+            Some(PackageLimit::XmlDepth),
+        ),
+        (
+            "table_nested_60_deep.docx",
+            fx::nested_tables_docx(60),
+            None,
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,7 +675,7 @@ mod tests {
                 "line {}: unterminated",
                 n + 1
             );
-            let inner = body[1..body.len() - 1].as_bytes();
+            let inner = &body.as_bytes()[1..body.len() - 1];
             let mut word = Vec::new();
             let mut i = 0;
             while i < inner.len() {
@@ -796,40 +850,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Issue #348 — the hostile `.docx` seeds of `corpus/docx_reader/`: `(file
-/// name, package bytes, the limit [`read_raw_package`] must refuse it with
-/// — `None` when it must read)`. Built by `format_docx::test_fixtures`, so
-/// no blob is hand-maintained; `examples/regen-seeds` writes them.
-pub fn hostile_docx_seeds() -> Vec<(&'static str, Vec<u8>, Option<format_docx::PackageLimit>)> {
-    use format_docx::PackageLimit;
-    use format_docx::test_fixtures as fx;
-    vec![
-        (
-            "hostile_declared_4gib_part.docx",
-            fx::lying_size_docx(4 * 1024 * 1024 * 1024),
-            None,
-        ),
-        (
-            "hostile_declared_u64_max_part.docx",
-            fx::lying_size_docx(u64::MAX - 1),
-            None,
-        ),
-        (
-            "hostile_bomb_16mib_zeros.docx",
-            fx::compressible_bomb_docx(16 * 1024 * 1024),
-            Some(PackageLimit::PartBytes),
-        ),
-        (
-            "hostile_sdt_5000_nested.docx",
-            fx::nested_sdt_docx(5000),
-            Some(PackageLimit::XmlDepth),
-        ),
-        (
-            "table_nested_60_deep.docx",
-            fx::nested_tables_docx(60),
-            None,
-        ),
-    ]
 }

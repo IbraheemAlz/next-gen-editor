@@ -1,0 +1,77 @@
+/* Issue #406 — "Opened with N issues" notice for a degraded document open.
+   Informational (primary accent, not the warning amber of the recovery
+   banner); fixed bottom-left, clear of the status bar and of the
+   bottom-centre error toast; dismissible. */
+.nge-open-warnings {
+    position: fixed;
+    left: var(--nge-space-4);
+    bottom: calc(var(--nge-space-5) * 2);
+    z-index: var(--nge-z-popover);
+    display: flex;
+    align-items: flex-start;
+    gap: var(--nge-space-3);
+    width: min(440px, calc(100vw - var(--nge-space-4) * 2));
+    max-height: 50vh;
+    padding: var(--nge-space-3) var(--nge-space-4);
+    background: var(--nge-color-bg);
+    border: 1px solid var(--nge-color-primary);
+    border-left-width: 4px;
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-lg);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-md)/1.45 var(--nge-font-ui);
+}
+
+.nge-open-warnings__icon {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--nge-color-primary);
+    color: var(--nge-color-bg);
+    font: 700 var(--nge-font-size-md)/1 var(--nge-font-mono);
+}
+
+.nge-open-warnings__body {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--nge-space-1);
+    min-width: 0;
+    max-height: calc(50vh - var(--nge-space-3) * 2);
+    overflow-y: auto;
+}
+
+.nge-open-warnings__title {
+    display: block;
+    font-weight: 700;
+}
+
+.nge-open-warnings__summary {
+    margin: 0;
+    color: var(--nge-color-text-muted);
+}
+
+.nge-open-warnings__toggle {
+    cursor: pointer;
+    color: var(--nge-color-primary);
+    font-weight: 600;
+}
+
+.nge-open-warnings__list {
+    margin: var(--nge-space-1) 0 0;
+    padding-left: var(--nge-space-4);
+    font-size: var(--nge-font-size-sm);
+}
+
+.nge-open-warnings__item + .nge-open-warnings__item {
+    margin-top: var(--nge-space-1);
+}
+
+.nge-open-warnings__dismiss {
+    flex: none;
+    align-self: flex-start;
+}

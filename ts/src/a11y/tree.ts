@@ -133,9 +133,54 @@ function buildRun(run: A11yRun): HTMLElement {
 function buildParagraph(p: A11yParagraph): HTMLParagraphElement {
     const el = document.createElement('p');
     el.dir = p.resolved_direction === 'Rtl' ? 'rtl' : 'ltr';
-    for (const run of p.runs) el.appendChild(buildRun(run));
+    /* Issue #357 — `<w:bdo>` / `<w:dir>` wrappers reach the mirror as the
+       UAX #9 controls the engine encodes them with: each opens a
+       `<bdo dir>` (override) / `<span dir>` (embedding) that the following
+       runs nest in until its U+202C, and the controls themselves are not
+       mirrored as text. */
+    const stack: HTMLElement[] = [el];
+    const top = (): HTMLElement => stack[stack.length - 1] ?? el;
+    for (const run of p.runs) {
+        if (run.object !== undefined || run.note_ref !== undefined || !BIDI_CONTROL.test(run.text)) {
+            top().appendChild(buildRun(run));
+            continue;
+        }
+        let piece = '';
+        const flush = (): void => {
+            if (piece) top().appendChild(buildRun({ ...run, text: piece }));
+            piece = '';
+        };
+        for (const ch of run.text) {
+            const open = BIDI_OPENERS[ch];
+            if (open !== undefined) {
+                flush();
+                const wrapper = document.createElement(open.override ? 'bdo' : 'span');
+                wrapper.dir = open.dir;
+                top().appendChild(wrapper);
+                stack.push(wrapper);
+            } else if (ch === BIDI_POP) {
+                flush();
+                if (stack.length > 1) stack.pop();
+            } else {
+                piece += ch;
+            }
+        }
+        flush();
+    }
     return el;
 }
+
+/** Issue #357 — the embedding / override openers (`engine::run_content`):
+ *  LRE / RLE for `<w:dir>`, LRO / RLO for `<w:bdo>`. */
+const BIDI_OPENERS: Record<string, { override: boolean; dir: 'ltr' | 'rtl' }> = {
+    '‪': { override: false, dir: 'ltr' },
+    '‫': { override: false, dir: 'rtl' },
+    '‭': { override: true, dir: 'ltr' },
+    '‮': { override: true, dir: 'rtl' },
+};
+/** U+202C POP DIRECTIONAL FORMATTING — closes the innermost wrapper. */
+const BIDI_POP = '‬';
+const BIDI_CONTROL = /[‪-‮]/;
 
 /** Build a `<td role="gridcell">` for one cell, recursing on nested nodes. */
 function buildCell(cell: A11yCell): HTMLTableCellElement {

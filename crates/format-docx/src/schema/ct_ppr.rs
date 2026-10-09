@@ -118,7 +118,8 @@ fn attr_utwips(e: &BytesStart, key: &[u8]) -> Option<i32> {
 }
 
 /// `<w:ind w:start|left="…" w:end|right="…" w:firstLine="…" w:hanging="…"/>`.
-fn apply_ind(e: &BytesStart, ind: &mut Indent) {
+/// Also the numbering-level `<w:ind>` reader (`parts::numbering`).
+pub(crate) fn apply_ind(e: &BytesStart, ind: &mut Indent) {
     if let Some(v) = attr_twips(e, b"w:start").or_else(|| attr_twips(e, b"w:left")) {
         ind.start_twips = v;
     }
@@ -207,6 +208,10 @@ pub fn apply_ppr(name: &[u8], e: &BytesStart, props: &mut ParaProperties) {
         rides the grab bag verbatim (it is not in `ppr_child_is_modeled`),
         the model value feeds layout's widow / orphan control. */
         b"w:widowControl" => props.widow_control = Some(toggle_on(e)),
+        /* Issue #326 — read-only like `widowControl`: the direct element
+        rides the grab bag; the cascaded value switches automatic
+        hyphenation off for the paragraph. */
+        b"w:suppressAutoHyphens" => props.suppress_auto_hyphens = Some(toggle_on(e)),
         _ => {}
     }
 }

@@ -10,9 +10,10 @@
 //! opportunities. Acceptable for the PoC; Phase 3 will cache widths.
 
 use crate::boxes::{
-    LineBox, LineSegment, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, SpanFace,
-    StyleSpan, TabLeaderKind, TextAttrs, VisualRun,
+    LineBox, LineHyphen, LineSegment, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size,
+    SpanFace, StyleSpan, TabLeaderKind, TextAttrs, VisualRun,
 };
+use crate::hyphen::{append_break_hyphen, break_hyphen_advance, ends_at_soft_hyphen};
 use std::borrow::Cow;
 use std::mem::take;
 use text_pipeline::{
@@ -75,6 +76,21 @@ pub enum InlineObjectInfoKind {
         wrap: crate::boxes::FloatWrap,
         text_box: Box<crate::boxes::TextBoxGlyph>,
     },
+    /// Issue #357 — a `<w:sym>`: the sentinel shapes as `text` (the
+    /// symbol's Unicode equivalent, `engine::run_content::symbol_char`)
+    /// at the run's size, in the run's face when it covers the character,
+    /// else in the first loaded face that does. One caret stop.
+    Symbol {
+        text: String,
+    },
+    /// Issue #357 — a `<w:ptab>`: the sentinel is a tab whose stop is
+    /// fixed by the margins / indents (`apply_tab_advances` resolves it),
+    /// never by the paragraph's tab stops.
+    PositionalTab {
+        alignment: engine::run_content::PTabAlignment,
+        relative_to: engine::run_content::PTabRelativeTo,
+        leader: engine::run_content::PTabLeader,
+    },
 }
 
 /// Issue #80 — note markers shape at this fraction of the span size…
@@ -85,25 +101,69 @@ pub const NOTE_MARK_RAISE: f32 = 0.33;
 /// UTF-8 length of the U+FFFC anchor sentinel.
 const SENTINEL_LEN: u32 = 3;
 
-/// The note marker anchored exactly at paragraph byte `at`.
-fn note_marker_at(objects: &[InlineObjectInfo], at: u32) -> Option<&InlineObjectInfo> {
-    objects
-        .iter()
-        .find(|o| o.at == at && matches!(o.kind, InlineObjectInfoKind::NoteMarker { .. }))
+/// `true` for the objects whose sentinel shapes as a piece of its own:
+/// note markers (issue #80), symbols and positional tabs (issue #357).
+fn is_own_piece(kind: &InlineObjectInfoKind) -> bool {
+    matches!(
+        kind,
+        InlineObjectInfoKind::NoteMarker { .. }
+            | InlineObjectInfoKind::Symbol { .. }
+            | InlineObjectInfoKind::PositionalTab { .. }
+    )
 }
 
-/// Byte offset of the first note-marker anchor strictly inside
+/// The note marker / symbol anchored exactly at paragraph byte `at`.
+fn note_marker_at(objects: &[InlineObjectInfo], at: u32) -> Option<&InlineObjectInfo> {
+    objects.iter().find(|o| o.at == at && is_own_piece(&o.kind))
+}
+
+/// Byte offset of the first note-marker / symbol anchor strictly inside
 /// `(from, before)`, so a text piece can be cut in front of it.
 fn next_note_marker_start(objects: &[InlineObjectInfo], from: u32, before: u32) -> Option<u32> {
     objects
         .iter()
-        .filter(|o| {
-            matches!(o.kind, InlineObjectInfoKind::NoteMarker { .. })
-                && o.at > from
-                && o.at < before
-        })
+        .filter(|o| is_own_piece(&o.kind) && o.at > from && o.at < before)
         .map(|o| o.at)
         .min()
+}
+
+/// Issue #357 — the positional tab anchored exactly at paragraph byte `at`.
+fn positional_tab_at(objects: &[InlineObjectInfo], at: usize) -> Option<&InlineObjectInfo> {
+    objects.iter().find(|o| {
+        o.at as usize == at && matches!(o.kind, InlineObjectInfoKind::PositionalTab { .. })
+    })
+}
+
+/// Issue #357 — the face a symbol draws in (the span's own face when it
+/// covers the character, else the first loaded face that does) and its
+/// font id, with the text it draws: a character no loaded face has draws
+/// [`engine::run_content::UNKNOWN_SYMBOL`] instead (a visible stand-in,
+/// never an invisible missing glyph).
+fn symbol_face<'f>(
+    fonts: &'f FontStack,
+    text: &str,
+    run_face: (&'f text_pipeline::FontId, &'f text_pipeline::LoadedFont),
+) -> (
+    &'f text_pipeline::FontId,
+    &'f text_pipeline::LoadedFont,
+    Cow<'static, str>,
+) {
+    let covering = |ch: char| {
+        if run_face.1.covers(ch) {
+            Some(run_face)
+        } else {
+            fonts.resolve_covering(ch)
+        }
+    };
+    let Some(ch) = text.chars().next() else {
+        return (run_face.0, run_face.1, Cow::Borrowed(""));
+    };
+    if let Some((id, face)) = covering(ch) {
+        return (id, face, Cow::Owned(text.to_string()));
+    }
+    let stand_in = engine::run_content::UNKNOWN_SYMBOL;
+    let (id, face) = covering(stand_in).unwrap_or(run_face);
+    (id, face, Cow::Owned(stand_in.to_string()))
 }
 
 pub struct ParagraphConfig<'a> {
@@ -161,6 +221,11 @@ pub struct ParagraphConfig<'a> {
     /// [`Self::line_height_exact`] is set. `None` is the configured-pitch
     /// model every engine-authored document uses.
     pub font_line: Option<FontLinePitch>,
+    /// Issue #326 — automatic hyphenation for this paragraph (`None`: off —
+    /// `<w:autoHyphenation/>` unset, `<w:suppressAutoHyphens/>`, or no text
+    /// in a language with patterns). Off is byte-identical to the
+    /// pre-#326 composer.
+    pub hyphenation: Option<&'a crate::hyphen::AutoHyphenation<'a>>,
 }
 
 /// Issue #329 — Word's line pitch for a paragraph of a `.docx` document
@@ -256,12 +321,13 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     with `leading_off` when the indents were symmetric. */
     let pre_alignment_leading_off = cfg.indent_start_px;
     for (line, _) in composed.iter_mut() {
-        apply_tab_advances(
+        apply_tab_advances_in(
             line,
             cfg.text,
             cfg.tab_stops_px,
             pre_alignment_leading_off,
             cfg.base_direction,
+            PTabFrame::of(&cfg),
         );
     }
 
@@ -375,6 +441,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             source_start: 0,
             segments: Vec::new(),
             segment: 0,
+            hyphen: crate::boxes::LineHyphen::None,
         };
         /* Issue #329 — under the font-derived pitch the empty line takes
         the paragraph mark's face (`FontLinePitch::empty`). */
@@ -627,17 +694,21 @@ fn compose_band(
     let mut ended_paragraph = false;
     for &(si, seg) in &usable {
         let (_, hi) = soft[soft_idx];
-        let (end, broke) = if start >= hi {
+        let (end, broke, hyphen) = if start >= hi {
             /* An empty hard segment (doubled / edge soft break): one
             zero-width placeholder line for the caret. */
-            (hi, false)
+            (hi, false, LineHyphen::None)
         } else {
             match fit_segment_line(cfg, breaks, start, hi, seg.width(), full) {
                 Some(fit) => fit,
                 None => continue,
             }
         };
-        band.push((build_line(cfg, start, end), broke, si, seg));
+        let mut line = build_line(cfg, start, end);
+        if !hyphen.is_none() {
+            append_break_hyphen(&mut line, cfg.fonts, end, hyphen);
+        }
+        band.push((line, broke, si, seg));
         start = end;
         if start >= hi {
             /* The hard segment is exhausted: the next one (after a U+2028
@@ -659,12 +730,13 @@ fn compose_band(
     let mut descent = 0.0_f32;
     let mut laid: Vec<LineBox> = Vec::with_capacity(band.len());
     for (k, (mut line, broke, si, seg)) in band.into_iter().enumerate() {
-        apply_tab_advances(
+        apply_tab_advances_in(
             &mut line,
             cfg.text,
             cfg.tab_stops_px,
             cfg.indent_start_px,
             cfg.base_direction,
+            PTabFrame::of(cfg),
         );
         let paragraph_last = ended_paragraph && k == last_in_band;
         if cfg.alignment == Alignment::Justify && broke && !paragraph_last {
@@ -707,11 +779,13 @@ fn compose_band(
 
 /// Issue #82 — greedy fit of ONE line starting at `start` into a segment
 /// `width` px wide, never past the hard-segment end `hi`. Returns the
-/// line end and whether it ended at a break opportunity (`true`, the
-/// justify-eligible case) rather than at `hi`. `None` when not even the
-/// first word fits and `force` is off (a cut band: the caller tries the
-/// next segment / band). With `force` (a full-width band) an overlong
-/// word is broken at a character boundary, like [`compose_width_lines`].
+/// line end, whether it ended at a break opportunity (`true`, the
+/// justify-eligible case) rather than at `hi`, and the break hyphen the
+/// line draws (issue #335: a break right after a U+00AD). `None` when not
+/// even the first word fits and `force` is off (a cut band: the caller
+/// tries the next segment / band). With `force` (a full-width band) an
+/// overlong word is broken at a character boundary, like
+/// [`compose_width_lines`].
 fn fit_segment_line(
     cfg: &ParagraphConfig<'_>,
     breaks: &[usize],
@@ -719,7 +793,7 @@ fn fit_segment_line(
     hi: usize,
     width: f32,
     force: bool,
-) -> Option<(usize, bool)> {
+) -> Option<(usize, bool, LineHyphen)> {
     let mut last_fit = start;
     let mut seg_from = start;
     let mut acc = 0.0_f32;
@@ -738,8 +812,13 @@ fn fit_segment_line(
         );
         if acc + w <= width {
             acc += w;
-            last_fit = b;
             seg_from = b;
+            /* Issue #335 — see `compose_width_lines`. */
+            if !ends_at_soft_hyphen(cfg.text, b)
+                || acc + break_hyphen_advance(cfg, start, b) <= width
+            {
+                last_fit = b;
+            }
         } else {
             overflow = true;
             break;
@@ -759,10 +838,15 @@ fn fit_segment_line(
         }
     }
     if last_fit >= hi {
-        return Some((hi, false));
+        return Some((hi, false, LineHyphen::None));
     }
     if last_fit > start {
-        return Some((last_fit, true));
+        let hyphen = if ends_at_soft_hyphen(cfg.text, last_fit) {
+            LineHyphen::Soft
+        } else {
+            LineHyphen::None
+        };
+        return Some((last_fit, true, hyphen));
     }
     if force {
         let next_break = breaks
@@ -770,7 +854,11 @@ fn fit_segment_line(
             .copied()
             .find(|&b| b > start && b <= hi)
             .unwrap_or(hi);
-        return Some((char_break_fit_width(cfg, start, next_break, width), true));
+        return Some((
+            char_break_fit_width(cfg, start, next_break, width),
+            true,
+            LineHyphen::None,
+        ));
     }
     None
 }
@@ -917,6 +1005,7 @@ fn compose_lines_with_width<'a>(
         inline_objects: cfg.inline_objects,
         tab_stops_px: cfg.tab_stops_px,
         font_line: cfg.font_line,
+        hyphenation: cfg.hyphenation,
     };
     compose_lines(&scoped)
 }
@@ -974,6 +1063,7 @@ const MIN_TAB_FILL_PX: f32 = 4.0;
 // for RTL (`compute_tab_advance`) — without that the `.` of an LTR number
 // embedded in RTL text landed ~1 glyph-width short of the stop. `base_dir`
 // is the paragraph base direction (threaded from `cfg.base_direction`).
+#[cfg(test)]
 fn apply_tab_advances(
     line: &mut LineBox,
     para_text: &str,
@@ -981,10 +1071,44 @@ fn apply_tab_advances(
     leading_off_px: f32,
     base_dir: ShapingDirection,
 ) {
-    if !para_text.contains('\u{0009}') {
+    let none = PTabFrame {
+        objects: &[],
+        margin_end: 0.0,
+        indent_start: 0.0,
+        indent_end: 0.0,
+    };
+    apply_tab_advances_in(
+        line,
+        para_text,
+        tab_stops_px,
+        leading_off_px,
+        base_dir,
+        none,
+    );
+}
+
+/// [`apply_tab_advances`] (the doc comment above) with the paragraph's
+/// positional tabs (issue #357) resolved against `ptab`.
+fn apply_tab_advances_in(
+    line: &mut LineBox,
+    para_text: &str,
+    tab_stops_px: &[TabStopPx],
+    leading_off_px: f32,
+    base_dir: ShapingDirection,
+    ptab: PTabFrame<'_>,
+) {
+    /* Issue #357 — the positional tabs of the paragraph, by anchor. */
+    let mut ptabs: Vec<usize> = ptab
+        .objects
+        .iter()
+        .filter(|o| matches!(o.kind, InlineObjectInfoKind::PositionalTab { .. }))
+        .map(|o| o.at as usize)
+        .collect();
+    if !para_text.contains('\u{0009}') && ptabs.is_empty() {
         line.width = line_advance(&line.runs);
         return;
     }
+    ptabs.sort_unstable();
     let bytes = para_text.as_bytes();
     let is_tab = |abs_cluster: usize| bytes.get(abs_cluster).copied() == Some(b'\t');
 
@@ -1010,11 +1134,20 @@ fn apply_tab_advances(
         order: &order,
         bytes,
         base_dir,
+        ptabs: &ptabs,
     };
     let mut pen = leading_off_px;
     for (k, &(ri, gi, abs)) in order.iter().enumerate() {
+        let positional = ptabs.binary_search(&abs).is_ok() && line.runs[ri].glyphs[gi].id == 0;
         if is_tab(abs) {
             let (stop_pos, stop_kind, leader) = next_tab_stop_after(pen, tab_stops_px);
+            let advance = compute_tab_advance(pen, stop_pos, stop_kind, line, k, &ctx);
+            line.runs[ri].glyphs[gi].x_advance = advance;
+            line.runs[ri].glyphs[gi].leader = leader;
+            pen += advance;
+        } else if positional && let Some((stop_pos, stop_kind, leader)) = ptab.stop(abs) {
+            /* Issue #357 — a positional tab: the stop is fixed by the
+            margins / indents, the alignment by the element. */
             let advance = compute_tab_advance(pen, stop_pos, stop_kind, line, k, &ctx);
             line.runs[ri].glyphs[gi].x_advance = advance;
             line.runs[ri].glyphs[gi].leader = leader;
@@ -1026,6 +1159,64 @@ fn apply_tab_advances(
     line.width = (pen - leading_off_px).max(0.0);
 }
 
+/// Issue #357 — what a positional tab (`<w:ptab>`) aligns against, in the
+/// tab pen's frame (0 = the leading margin, the pen starts at the leading
+/// indent): the paragraph's inline objects (the tabs themselves) and its
+/// edges.
+#[derive(Clone, Copy)]
+struct PTabFrame<'a> {
+    objects: &'a [InlineObjectInfo],
+    /// The trailing margin — the full width the paragraph is laid out in.
+    margin_end: f32,
+    indent_start: f32,
+    indent_end: f32,
+}
+
+impl<'a> PTabFrame<'a> {
+    fn of(cfg: &'a ParagraphConfig<'a>) -> Self {
+        PTabFrame {
+            objects: cfg.inline_objects,
+            margin_end: cfg.max_width,
+            indent_start: cfg.indent_start_px,
+            indent_end: cfg.indent_end_px,
+        }
+    }
+
+    /// The stop of the positional tab anchored at `abs`: `left` / `right`
+    /// are the leading / trailing edge (logical, so an RTL paragraph
+    /// mirrors them), `center` their midpoint; between the margins or the
+    /// indents (`w:relativeTo`).
+    fn stop(&self, abs: usize) -> Option<TabStopPx> {
+        use engine::run_content::{PTabAlignment, PTabLeader, PTabRelativeTo};
+        let info = positional_tab_at(self.objects, abs)?;
+        let InlineObjectInfoKind::PositionalTab {
+            alignment,
+            relative_to,
+            leader,
+        } = &info.kind
+        else {
+            return None;
+        };
+        let (lo, hi) = match relative_to {
+            PTabRelativeTo::Margin => (0.0, self.margin_end),
+            PTabRelativeTo::Indent => (self.indent_start, self.margin_end - self.indent_end),
+        };
+        let (pos, kind) = match alignment {
+            PTabAlignment::Left => (lo, TabKind::Left),
+            PTabAlignment::Center => ((lo + hi) / 2.0, TabKind::Center),
+            PTabAlignment::Right => (hi, TabKind::Right),
+        };
+        let leader = match leader {
+            PTabLeader::None => None,
+            PTabLeader::Dot => Some(TabLeaderKind::Dot),
+            PTabLeader::Hyphen => Some(TabLeaderKind::Hyphen),
+            PTabLeader::Underscore => Some(TabLeaderKind::Underscore),
+            PTabLeader::MiddleDot => Some(TabLeaderKind::MiddleDot),
+        };
+        Some((pos, kind, leader))
+    }
+}
+
 /// Read-only context threaded into [`compute_tab_advance`]: the logical-order
 /// glyph index, the paragraph byte buffer, and the base direction. Bundled so
 /// the helper stays within the argument-count lint while the (mutable) line
@@ -1034,6 +1225,9 @@ struct TabCtx<'a> {
     order: &'a [(usize, usize, usize)],
     bytes: &'a [u8],
     base_dir: ShapingDirection,
+    /// Issue #357 — positional-tab anchors (sorted): a tab segment ends
+    /// at the next one too.
+    ptabs: &'a [usize],
 }
 
 /// L2.1 (#6) / issue #20 — compute the `x_advance` for the tab glyph at
@@ -1092,7 +1286,7 @@ fn compute_tab_advance(
     correct logical segment — the visually-next tab is the logically-PREVIOUS
     one in RTL. */
     for &(ri, gi, abs) in &ctx.order[tab_k + 1..] {
-        if ctx.bytes.get(abs).copied() == Some(b'\t') {
+        if ctx.bytes.get(abs).copied() == Some(b'\t') || ctx.ptabs.binary_search(&abs).is_ok() {
             break;
         }
         let adv = line.runs[ri].glyphs[gi].x_advance;
@@ -1397,9 +1591,10 @@ fn soft_break_segments(text: &str) -> Vec<(usize, usize)> {
     let mut seg_start = 0_usize;
     for (pos, c) in text.char_indices() {
         match c {
-            LINE_SEP => {
+            /* Issue #357 — `<w:cr/>` (U+000D) is the same line break. */
+            LINE_SEP | engine::run_content::CARRIAGE_RETURN => {
                 out.push((seg_start, pos));
-                seg_start = pos + LINE_SEP.len_utf8();
+                seg_start = pos + c.len_utf8();
             }
             FORM_FEED if pos + FORM_FEED.len_utf8() < text.len() => {
                 out.push((seg_start, pos + FORM_FEED.len_utf8()));
@@ -1459,13 +1654,57 @@ fn compose_width_lines(
         );
 
         if line_width + seg_width <= cfg.max_width {
-            last_fit_end = b;
             line_width += seg_width;
             seg_from = b;
+            /* Issue #335 — a line may END right after a U+00AD only when
+            the hyphen it then draws fits too; the text still continues
+            past it at its natural (invisible) width. */
+            if !ends_at_soft_hyphen(cfg.text, b)
+                || line_width + break_hyphen_advance(cfg, start, b) <= cfg.max_width
+            {
+                last_fit_end = b;
+            }
         } else {
+            /* Issue #326 — the overflowing word may hyphenate: the line
+            ends inside it with a drawn hyphen and the rest of the word
+            opens the next line. */
+            if let Some(hy) = cfg.hyphenation
+                && let Some(at) = crate::hyphen::auto_hyphen_point(
+                    cfg, hy, &lines, start, seg_from, b, line_width,
+                )
+            {
+                let mut line = build_line(cfg, start, at);
+                append_break_hyphen(&mut line, cfg.fonts, at, LineHyphen::Auto);
+                lines.push((line, true));
+                start = at;
+                let rest = measure_text(
+                    cfg.fonts,
+                    &cfg.text[at..b],
+                    at as u32,
+                    cfg.spans,
+                    cfg.base_direction,
+                    cfg.inline_objects,
+                );
+                if rest <= cfg.max_width {
+                    line_width = rest;
+                    seg_from = b;
+                    last_fit_end = if !ends_at_soft_hyphen(cfg.text, b)
+                        || rest + break_hyphen_advance(cfg, start, b) <= cfg.max_width
+                    {
+                        b
+                    } else {
+                        start
+                    };
+                } else {
+                    line_width = 0.0;
+                    seg_from = at;
+                    last_fit_end = at;
+                }
+                continue;
+            }
             /* Overflow. Commit whatever fit so far. */
             if last_fit_end > start {
-                lines.push((build_line(cfg, start, last_fit_end), true));
+                lines.push((broken_line(cfg, start, last_fit_end), true));
                 start = last_fit_end;
                 seg_from = start;
                 line_width = 0.0;
@@ -1510,6 +1749,66 @@ fn compose_width_lines(
         }
     }
     lines
+}
+
+/// UAX #9 for the line `text[start..end]`. Issue #357 — a `<w:dir>` /
+/// `<w:bdo>` wrapper (an embedding / override control in the text) may
+/// open on an earlier line: the controls still open at `start` are
+/// re-applied in front of the line, so every line of the wrapper resolves
+/// inside it, and the runs are mapped back to the line's own bytes. A
+/// paragraph without wrapper controls takes the plain per-line analysis.
+fn analyze_line_bidi(
+    text: &str,
+    start: usize,
+    end: usize,
+    base: ShapingDirection,
+) -> text_pipeline::BidiAnalysis {
+    use engine::run_content::{BidiWrapper, POP_DIRECTIONAL};
+    let line_text = &text[start..end];
+    /* U+202A..U+202E encode as E2 80 AA..AE. */
+    let has_control = |s: &str| {
+        s.as_bytes()
+            .windows(3)
+            .any(|w| w[0] == 0xE2 && w[1] == 0x80 && (0xAA..=0xAE).contains(&w[2]))
+    };
+    if start == 0 || !has_control(&text[..start]) {
+        return analyze_bidi(line_text, base);
+    }
+    let mut open: Vec<char> = Vec::new();
+    for ch in text[..start].chars() {
+        if BidiWrapper::of_opener(ch).is_some() {
+            open.push(ch);
+        } else if ch == POP_DIRECTIONAL {
+            open.pop();
+        }
+    }
+    if open.is_empty() {
+        return analyze_bidi(line_text, base);
+    }
+    let prefix: String = open.into_iter().collect();
+    let shift = prefix.len();
+    let mut analysis = analyze_bidi(&format!("{prefix}{line_text}"), base);
+    analysis.visual_runs = analysis
+        .visual_runs
+        .into_iter()
+        .filter(|r| r.range.end > shift)
+        .map(|mut r| {
+            r.range = r.range.start.max(shift) - shift..r.range.end - shift;
+            r
+        })
+        .collect();
+    analysis
+}
+
+/// Issue #335 — [`build_line`] for a line that ended at a break
+/// opportunity: one ending right after a U+00AD SOFT HYPHEN draws the
+/// synthetic break hyphen ([`crate::hyphen::append_break_hyphen`]).
+fn broken_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
+    let mut line = build_line(cfg, start, end);
+    if ends_at_soft_hyphen(cfg.text, end) {
+        append_break_hyphen(&mut line, cfg.fonts, end, LineHyphen::Soft);
+    }
+    line
 }
 
 /// Largest character-boundary position in `[start..hard_end]` whose
@@ -1569,7 +1868,7 @@ fn char_break_fit_width(
 /// zeroed for [`layout_paragraph`] to fill.
 fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
     let line_text = &cfg.text[start..end];
-    let bidi = analyze_bidi(line_text, cfg.base_direction);
+    let bidi = analyze_line_bidi(cfg.text, start, end, cfg.base_direction);
 
     let mut runs: Vec<VisualRun> = Vec::new();
     for brun in &bidi.visual_runs {
@@ -1645,6 +1944,62 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     synth.faux_italic,
                     brun_abs + rel_start as u32..brun_abs + rel_end as u32,
                 ));
+                continue;
+            }
+            if let Some(info) = marker
+                && let InlineObjectInfoKind::Symbol { text } = &info.kind
+            {
+                let (sym_id, sym_face, sym_text) = symbol_face(cfg.fonts, text, (font_id, face));
+                runs.push(shape_symbol(
+                    sym_face,
+                    sym_id.clone(),
+                    &sym_text,
+                    brun.direction,
+                    &span,
+                    sf,
+                    synth.faux_bold,
+                    synth.faux_italic,
+                    brun_abs + rel_start as u32..brun_abs + rel_end as u32,
+                ));
+                continue;
+            }
+            if let Some(info) = marker
+                && matches!(info.kind, InlineObjectInfoKind::PositionalTab { .. })
+            {
+                /* Issue #357 — a positional tab: one glyph that draws
+                nothing (id 0 is never painted) and takes its advance
+                (and leader) from `apply_tab_advances`. */
+                runs.push(VisualRun {
+                    glyphs: vec![PositionedGlyph {
+                        id: 0,
+                        cluster: 0,
+                        x_advance: 0.0,
+                        y_advance: 0.0,
+                        x_offset: 0.0,
+                        y_offset: 0.0,
+                        synthetic: false,
+                        inline_image_rel_id: None,
+                        inline_footnote_marker: None,
+                        inline_note_anchor: None,
+                        inline_object_height: 0.0,
+                        float: None,
+                        leader: None,
+                    }],
+                    font: font_id.clone(),
+                    direction: brun.direction,
+                    source_range: brun_abs + rel_start as u32..brun_abs + rel_end as u32,
+                    attrs: TextAttrs {
+                        px_size: sf.px_size,
+                        color: span.color,
+                        faux_bold: synth.faux_bold,
+                        faux_italic: synth.faux_italic,
+                        underline: span.underline,
+                        strike: span.strike,
+                        bg_color: span.bg_color,
+                        baseline_shift_px: sf.baseline_shift_px,
+                    },
+                    metrics_font: metrics_font.clone(),
+                });
                 continue;
             }
             let sub_text_raw = &brun_text[rel_start..rel_end];
@@ -1798,6 +2153,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
         source_start: start as u32,
         segments: Vec::new(),
         segment: 0,
+        hyphen: crate::boxes::LineHyphen::None,
     }
 }
 
@@ -1886,6 +2242,80 @@ fn shape_note_marker(
     }
 }
 
+/// Issue #357 — shape a `<w:sym>` (its Unicode equivalent `text`) into one
+/// [`VisualRun`] standing in for its U+FFFC anchor, at the run's own size
+/// and baseline. Like a note marker: every glyph maps to cluster 0, the
+/// first is the caret stop and the rest are `synthetic`; an empty shape
+/// yields one zero-advance carrier glyph.
+#[allow(clippy::too_many_arguments)]
+fn shape_symbol(
+    face: &text_pipeline::LoadedFont,
+    font_id: String,
+    text: &str,
+    direction: ShapingDirection,
+    span: &StyleSpan,
+    sf: SpanFace<'_>,
+    faux_bold: bool,
+    faux_italic: bool,
+    source_range: std::ops::Range<u32>,
+) -> VisualRun {
+    let shaped = shape_text(face, text, ShapingDirection::Ltr, sf.px_size);
+    let mut glyphs: Vec<PositionedGlyph> = shaped
+        .glyphs
+        .iter()
+        .enumerate()
+        .map(|(i, g)| PositionedGlyph {
+            id: g.glyph_id as u16,
+            cluster: 0,
+            x_advance: g.x_advance,
+            y_advance: g.y_advance,
+            x_offset: g.x_offset,
+            y_offset: g.y_offset,
+            synthetic: i > 0,
+            inline_image_rel_id: None,
+            inline_footnote_marker: None,
+            inline_note_anchor: None,
+            inline_object_height: 0.0,
+            float: None,
+            leader: None,
+        })
+        .collect();
+    if glyphs.is_empty() {
+        glyphs.push(PositionedGlyph {
+            id: 0,
+            cluster: 0,
+            x_advance: 0.0,
+            y_advance: 0.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            synthetic: false,
+            inline_image_rel_id: None,
+            inline_footnote_marker: None,
+            inline_note_anchor: None,
+            inline_object_height: 0.0,
+            float: None,
+            leader: None,
+        });
+    }
+    VisualRun {
+        glyphs,
+        font: font_id,
+        direction,
+        source_range,
+        attrs: TextAttrs {
+            px_size: sf.px_size,
+            color: span.color,
+            faux_bold,
+            faux_italic,
+            underline: span.underline,
+            strike: span.strike,
+            bg_color: span.bg_color,
+            baseline_shift_px: sf.baseline_shift_px,
+        },
+        metrics_font: None,
+    }
+}
+
 /// Issue #80 — advance a note marker contributes to a line, measured the
 /// way [`shape_note_marker`] will shape it.
 fn measure_note_marker(face: &text_pipeline::LoadedFont, text: &str, px_size: f32) -> f32 {
@@ -1961,7 +2391,7 @@ fn style_at(spans: &[StyleSpan], offset: u32) -> Option<StyleSpan> {
 /// the greedy probe's width estimate. `abs_start` is `text`'s byte offset in
 /// the paragraph. Mirrors [`build_line`]'s segmentation so a fitted candidate
 /// measures consistently with the line eventually built.
-fn measure_text(
+pub(crate) fn measure_text(
     fonts: &FontStack,
     text: &str,
     abs_start: u32,
@@ -1984,15 +2414,27 @@ fn measure_text(
             let sf = span.face_for(complex);
             /* Resolve per span: an explicit font family changes shaping (and
             width); faux bold/italic do not, so weight/slant stay `false`. */
-            let Some((_, face, _)) = fonts.resolve(script, sf.font_family, false, false) else {
+            let Some((face_id, face, _)) = fonts.resolve(script, sf.font_family, false, false)
+            else {
                 break;
             };
             /* Issue #80 — mirror `build_line`'s marker pieces so the
-            greedy probe measures what the line will shape. */
-            if let Some(info) = note_marker_at(inline_objects, cursor)
-                && let InlineObjectInfoKind::NoteMarker { text: mark, .. } = &info.kind
-            {
-                total += measure_note_marker(face, mark, sf.px_size);
+            greedy probe measures what the line will shape. Issue #357 —
+            a symbol measures its Unicode equivalent in the face it will
+            draw in; a positional tab measures nothing (its advance is
+            resolved on the laid-out line). */
+            if let Some(info) = note_marker_at(inline_objects, cursor) {
+                total += match &info.kind {
+                    InlineObjectInfoKind::NoteMarker { text: mark, .. } => {
+                        measure_note_marker(face, mark, sf.px_size)
+                    }
+                    InlineObjectInfoKind::Symbol { text: sym } => {
+                        let (_, sym_face, sym_text) = symbol_face(fonts, sym, (face_id, face));
+                        shape_text(sym_face, &sym_text, ShapingDirection::Ltr, sf.px_size)
+                            .total_advance
+                    }
+                    _ => 0.0,
+                };
                 cursor += SENTINEL_LEN;
                 continue;
             }
@@ -2447,6 +2889,7 @@ mod tests {
             source_start: 0,
             segments: Vec::new(),
             segment: 0,
+            hyphen: crate::boxes::LineHyphen::None,
         }
     }
 
@@ -2853,6 +3296,7 @@ mod tests {
             px_size_for_marker: 10.0,
             tab_stops_px: &[],
             font_line: None,
+            hyphenation: None,
         })
     }
 
@@ -2968,6 +3412,7 @@ mod tests {
             px_size_for_marker: 10.0,
             tab_stops_px: &[],
             font_line,
+            hyphenation: None,
         })
     }
 
@@ -3091,3 +3536,8 @@ mod tests {
         assert!((para.lines[0].height - 20.0 * 1.703).abs() < 1e-2);
     }
 }
+
+/// Issue #357 — run-content elements in the composer.
+#[cfg(test)]
+#[path = "run_content_layout_tests.rs"]
+mod run_content_layout_tests;

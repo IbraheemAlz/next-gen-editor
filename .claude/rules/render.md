@@ -114,6 +114,21 @@ hard failure so CI catches a new loop instead of a silent recovery.
   that only needs a size takes it from the size's own computation
   (a nested table's width is its column sum) — never from a full
   layout at a width the final pass will not use.
+- **Caches that outlive a paint are keyed by CONTENT (issue #379).**
+  Beneath the per-call `TableLayout` memo sits the content-keyed table
+  cache (`engine-wasm/src/table_cache.rs`, inside `LayoutCache` with the
+  paragraph LRU; `LayoutCache::clear` drops both). Its key is a
+  fingerprint of every layout input — cell paragraphs by their
+  `paragraph_layout_key`, the table / row / cell / `RenderConfig`
+  structs by **exhaustive destructuring** (no `..`), so a new model
+  field fails to compile there until it is hashed or shown
+  layout-inert. The hit check is structural, not a re-layout: a field
+  missing from the key is a stale paint the check can miss, so the key
+  is the real guard. A failed hit notes `TableCacheMismatch` (the
+  paragraph tier keeps `CacheMismatch`); notes a layout emitted are
+  stored with the entry and replayed on a hit, so a cached paint reports
+  what a fresh one would. `tools/corpus-native` re-lays every document
+  warm (`engine_repaint_consistent`) to prove warm == cold.
 
 ## PDF export
 

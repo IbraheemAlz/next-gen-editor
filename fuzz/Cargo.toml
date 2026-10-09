@@ -62,6 +62,10 @@ engine-wasm = { path = "../crates/engine-wasm", features = ["fuzz-native"] }
 layout = { path = "../crates/layout" }
 render = { path = "../crates/render" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Issue #407 — `command_gen::poison_one_float` round-trips a generated
+# `Command` through MessagePack to swap one float for NaN / ±inf, in any
+# variant at any depth. Already in the lock file through `engine`.
+rmp-serde = "1"
 
 # Issue #422 — `examples/smoke.rs` caps its own address space
 # (`setrlimit(RLIMIT_AS)`) so a runaway input aborts the driver, not the

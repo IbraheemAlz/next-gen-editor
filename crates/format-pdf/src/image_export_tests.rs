@@ -145,6 +145,7 @@ fn image_page(stack: &FontStack) -> PageBox {
         inline_objects: &objects,
         tab_stops_px: &[],
         font_line: None,
+        hyphenation: None,
     });
     para.source_paragraph_id = 0;
     PageBox {
@@ -609,6 +610,7 @@ fn image_free_documents_are_byte_identical() {
             inline_objects: &[],
             tab_stops_px: &[],
             font_line: None,
+            hyphenation: None,
         });
         p.blocks = vec![LayoutBlock::Paragraph(para)];
         p

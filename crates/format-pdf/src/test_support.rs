@@ -372,6 +372,7 @@ mod tests {
             inline_objects: &[],
             tab_stops_px: &[],
             font_line: None,
+            hyphenation: None,
         });
         para.source_paragraph_id = 0;
         let page = PageBox {

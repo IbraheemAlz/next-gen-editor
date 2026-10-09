@@ -139,6 +139,12 @@ pub enum DegradeReason {
     /// pathologically deep (hostile or corrupt) nesting — a paint, never
     /// a hang.
     NestingCapped,
+    /// Issue #379 — a table layout-cache entry (the per-call nested-table
+    /// memo, or the content-keyed cache that survives between paints)
+    /// failed its post-conditions and the table was re-laid from scratch.
+    /// Distinct from [`DegradeReason::CacheMismatch`] (the paragraph LRU)
+    /// so telemetry tells the two cache tiers apart.
+    TableCacheMismatch,
 }
 
 impl DegradeReason {
@@ -164,6 +170,7 @@ impl DegradeReason {
             DegradeReason::NoteRestartCap => "NOTE_RESTART_CAP",
             DegradeReason::FloatClampedByNotes => "FLOAT_CLAMPED_BY_NOTES",
             DegradeReason::NestingCapped => "NESTING_CAPPED",
+            DegradeReason::TableCacheMismatch => "TABLE_CACHE_MISMATCH",
         }
     }
 }
@@ -762,6 +769,14 @@ fn hash_paragraph(h: &mut impl Hasher, p: &ParagraphBox) {
             }
             l.segment.hash(h);
         }
+        /* Issues #335 / #326 — the break-hyphen flag joins the
+        fingerprint ONLY when set, so every unhyphenated pinned value is
+        unchanged by construction (the drawn glyph itself is hashed with
+        the run's glyphs below). */
+        if !l.hyphen.is_none() {
+            0x2d_u8.hash(h);
+            l.hyphen.hash(h);
+        }
         (l.runs.len() as u64).hash(h);
         for r in &l.runs {
             r.source_range.start.hash(h);
@@ -965,6 +980,7 @@ mod tests {
                     source_start: 0,
                     segments: Vec::new(),
                     segment: 0,
+                    hyphen: crate::boxes::LineHyphen::None,
                 })
                 .collect(),
             direction: ShapingDirection::Ltr,

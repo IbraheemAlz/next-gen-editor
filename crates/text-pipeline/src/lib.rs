@@ -9,6 +9,7 @@
 
 pub mod bidi;
 pub mod fonts;
+pub mod hyphenate;
 pub mod justify;
 pub mod justify_kashida;
 pub mod line_break;
@@ -19,8 +20,10 @@ pub mod substitution;
 pub use bidi::{BidiAnalysis, VisualRun, analyze_bidi, first_strong_direction};
 pub use fonts::{
     FamilyMatch, FamilyResolution, FontError, FontId, FontMetrics, FontStack, GlyphMetrics,
-    LineMetrics, LoadedFont, RasterizedGlyph, Resolved, Synthesis,
+    LineMetrics, LoadedFont, MAX_OUTLINE_PX, MAX_RASTER_PX, OutlineCmd, RasterizedGlyph, Resolved,
+    Synthesis,
 };
+pub use hyphenate::Hyphenator;
 pub use justify::{Alignment, JustifyMode};
 pub use line_break::break_opportunities;
 pub use script::{

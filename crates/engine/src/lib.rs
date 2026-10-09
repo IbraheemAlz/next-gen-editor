@@ -90,6 +90,7 @@ pub mod numbering;
 pub mod package;
 /// Issue #345 — `w:documentProtection` model + form-region predicates.
 pub mod protection;
+pub mod run_content;
 pub mod snapshot;
 pub mod theme;
 
@@ -1036,6 +1037,27 @@ pub struct DocumentSettings {
     /// and only a host calling `format_docx::read_docx_with_settings`
     /// with the strict ECMA-376 reading sets it `false`.
     pub widow_control_default: bool,
+    /// Issue #326 — `<w:autoHyphenation/>` (ECMA-376 §17.15.1.10): break
+    /// overflowing words at their language's hyphenation points.
+    /// READ-ONLY like every field below: `word/settings.xml` rides the
+    /// package passthrough, the writer never regenerates these elements.
+    /// Absent from snapshots while off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub auto_hyphenation: bool,
+    /// Issue #326 — `<w:hyphenationZone w:val>` (§17.15.1.53), twips: the
+    /// widest gap a line may leave at its end before the next word is
+    /// hyphenated instead. `None` = Word's default, 360 twips (¼ inch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hyphenation_zone: Option<u32>,
+    /// Issue #326 — `<w:consecutiveHyphenLimit w:val>` (§17.15.1.21): the
+    /// most consecutive lines that may end in a hyphen. `None` / `0` = no
+    /// limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consecutive_hyphen_limit: Option<u32>,
+    /// Issue #326 — `<w:doNotHyphenateCaps/>` (§17.15.1.37): words in all
+    /// capitals are never hyphenated.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub do_not_hyphenate_caps: bool,
     /// Issue #345 — `<w:documentProtection>` as read (`None` when the
     /// part has none). Read-only ingest: `settings.xml` passes through
     /// byte-identical, hash and salt included. The engine enforces
@@ -1045,6 +1067,17 @@ pub struct DocumentSettings {
     pub protection: Option<DocumentProtection>,
 }
 
+impl DocumentSettings {
+    /// Issue #326 — Word's default hyphenation zone: 360 twips (¼ inch).
+    pub const DEFAULT_HYPHENATION_ZONE: u32 = 360;
+
+    /// Issue #326 — the effective hyphenation zone, in twips.
+    pub fn hyphenation_zone_twips(&self) -> u32 {
+        self.hyphenation_zone
+            .unwrap_or(Self::DEFAULT_HYPHENATION_ZONE)
+    }
+}
+
 impl Default for DocumentSettings {
     fn default() -> Self {
         Self {
@@ -1052,6 +1085,10 @@ impl Default for DocumentSettings {
             author: None,
             default_page_size: DefaultPageSize::default(),
             widow_control_default: true,
+            auto_hyphenation: false,
+            hyphenation_zone: None,
+            consecutive_hyphen_limit: None,
+            do_not_hyphenate_caps: false,
             protection: None,
         }
     }
@@ -1672,6 +1709,18 @@ pub struct SourceRun {
     /// `xml:space="preserve"` to text it did not change the meaning of.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub bare_edge_ws: bool,
+    /// Issue #335 — the source spelled this run's U+00AD / U+2011 as
+    /// literal characters inside its `<w:t>` (not as `<w:softHyphen/>` /
+    /// `<w:noBreakHyphen/>` elements, which the reader maps onto the same
+    /// characters): a regenerated piece of the run keeps them as text, so
+    /// an edit elsewhere does not respell them. Set only when the run held
+    /// no hyphen element (a mixed run writes elements). Text typed into the
+    /// run travels with it and is spelled the same way (Word reads a
+    /// literal U+00AD / U+2011 in `<w:t>` as the same optional /
+    /// non-breaking hyphen). Skipped when `false`, so a pre-#335 snapshot
+    /// encodes unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub literal_hyphens: bool,
 }
 
 /// Issue #245 — whitespace between the children of a pretty-printed
@@ -2324,6 +2373,41 @@ pub struct SpanStyle {
     /// replaces both. Skipped when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color_theme: Option<Box<ThemeColorRef>>,
+    /// Issue #326 — `<w:lang w:val w:bidi>`: the language of the run's
+    /// Latin and complex-script text (which hyphenation patterns apply).
+    /// READ-ONLY, like `ParaProperties::outline_level`: the element rides
+    /// the grab bag verbatim (`rpr_child_is_modeled` stays false) and the
+    /// writer never regenerates it; this typed copy cascades docDefaults →
+    /// styles → run attribute by attribute. Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<Box<Lang>>,
+}
+
+/// Issue #326 — the languages one `<w:lang>` names (`w:eastAsia` is not
+/// modeled). Each attribute cascades on its own ([`Lang::merged_with`]):
+/// a run naming only `w:val` keeps the inherited `w:bidi`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[serde(default)]
+pub struct Lang {
+    /// `w:val` — the language of Latin text (`en-US`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val: Option<String>,
+    /// `w:bidi` — the language of complex-script text (`ar-SA`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bidi: Option<String>,
+}
+
+impl Lang {
+    /// `patch`'s set attributes over `base`'s (`None` when neither names
+    /// anything).
+    pub fn merged_with(base: Option<Box<Lang>>, patch: Option<Box<Lang>>) -> Option<Box<Lang>> {
+        let (base, patch) = (base.unwrap_or_default(), patch.unwrap_or_default());
+        let out = Lang {
+            val: patch.val.or(base.val),
+            bidi: patch.bidi.or(base.bidi),
+        };
+        (out != Lang::default()).then(|| Box::new(out))
+    }
 }
 
 impl SpanStyle {
@@ -2529,6 +2613,8 @@ impl SpanStyle {
                 claims,
             ),
             color_theme,
+            /* Issue #326 — attribute by attribute. */
+            lang: Lang::merged_with(self.lang, patch.lang),
         }
     }
 }
@@ -2615,6 +2701,20 @@ pub enum InlineKind {
         width_emu: i64,
         height_emu: i64,
         story: Box<TextBoxStory>,
+    },
+    /// Issue #357 — `<w:sym w:font="Wingdings" w:char="F0FC"/>`: one glyph
+    /// of a symbol font. `font` / `char` are the source attribute values,
+    /// verbatim (the writer re-emits them); layout draws the character
+    /// through its Unicode equivalent ([`run_content::symbol_char`]).
+    Symbol { font: String, char: String },
+    /// Issue #357 — `<w:ptab/>`: an absolute-position tab. The text that
+    /// follows is aligned at a fixed position of the margins (or indents)
+    /// whatever the paragraph's tab stops — Word's header / footer
+    /// "left · centre · right" layout.
+    PositionalTab {
+        alignment: run_content::PTabAlignment,
+        relative_to: run_content::PTabRelativeTo,
+        leader: run_content::PTabLeader,
     },
 }
 
@@ -3675,6 +3775,12 @@ pub struct ParaProperties {
     /// emit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub widow_control: Option<bool>,
+    /// Issue #326 — `<w:suppressAutoHyphens>` resolved through the style
+    /// cascade (tri-state like [`Self::widow_control`]: an explicit
+    /// `w:val="0"` switches an inherited ON off). READ-ONLY on the model:
+    /// the direct element rides the grab bag verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppress_auto_hyphens: Option<bool>,
 }
 
 impl ParaProperties {
@@ -3770,6 +3876,7 @@ impl ParaProperties {
             grab_bag: patch.grab_bag.or(self.grab_bag),
             outline_level: patch.outline_level.or(self.outline_level),
             widow_control: patch.widow_control.or(self.widow_control),
+            suppress_auto_hyphens: patch.suppress_auto_hyphens.or(self.suppress_auto_hyphens),
         }
     }
 
@@ -11245,6 +11352,10 @@ fn push_paragraph_plain(p: &Paragraph, out: &mut String) {
                     }
                 }
             }
+            /* Issue #357 — a symbol flattens to its Unicode equivalent, a
+            positional tab to a tab. */
+            InlineKind::Symbol { font, char } => out.push(run_content::symbol_char(font, char)),
+            InlineKind::PositionalTab { .. } => out.push('\t'),
         }
         /* Skip the 3-byte U+FFFC sentinel. Snapped (issue #115): an
         object offset that does not sit on its sentinel must not leave the
@@ -11734,7 +11845,10 @@ fn walk_block_note_refs(
                         }
                         continue;
                     }
-                    InlineKind::Image { .. } | InlineKind::NoteSelfRef { .. } => continue,
+                    InlineKind::Image { .. }
+                    | InlineKind::NoteSelfRef { .. }
+                    | InlineKind::Symbol { .. }
+                    | InlineKind::PositionalTab { .. } => continue,
                 };
                 out.push(NoteReference {
                     top_block: top,

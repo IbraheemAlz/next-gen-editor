@@ -80,6 +80,7 @@ pub(crate) fn para(
         inline_objects: &[],
         tab_stops_px: &[],
         font_line: None,
+        hyphenation: None,
     });
     p.source_paragraph_id = id;
     p
@@ -906,6 +907,7 @@ fn highlights_and_decorations_are_artifacts() {
         inline_objects: &[],
         tab_stops_px: &[],
         font_line: None,
+        hyphenation: None,
     });
     p.source_paragraph_id = 0;
     let pages = vec![page(vec![LayoutBlock::Paragraph(p)])];

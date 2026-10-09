@@ -182,6 +182,7 @@ fn pass(d: &Doc, fonts: &FontStack, plan: &WrapPlan) -> Vec<PageBox> {
             inline_objects: &infos,
             tab_stops_px: &[],
             font_line: None,
+            hyphenation: None,
         };
         let cuts: &[WrapCutout] = plan.get(&(id as u32)).map_or(&[], |v| v.as_slice());
         let mut p = layout_paragraph_wrapped(cfg, cuts);
@@ -421,6 +422,7 @@ fn empty_cutouts_are_the_unwrapped_composer_byte_for_byte() {
             inline_objects: &[],
             tab_stops_px: &[],
             font_line: None,
+            hyphenation: None,
         };
         let a = layout_paragraph(cfg());
         let b = layout_paragraph_wrapped(cfg(), &[]);

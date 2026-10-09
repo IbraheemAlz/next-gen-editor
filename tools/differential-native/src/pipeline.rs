@@ -380,6 +380,7 @@ fn build_paragraph_box(
         px_size_for_marker: marker_px,
         tab_stops_px: &[],
         font_line,
+        hyphenation: None,
     };
 
     let mut pbox = layout_paragraph(cfg);

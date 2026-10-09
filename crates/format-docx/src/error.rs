@@ -87,6 +87,15 @@ pub enum DocxWarning {
         value: String,
         twips: i64,
     },
+    /// Issue #407 — a DrawingML / VML EMU coordinate (`wp:extent/@cx`,
+    /// `wp:posOffset`, a VML `style` length) held a finite `value` outside
+    /// its range (±22 in); the model uses it clamped to `emu`. The source
+    /// bytes are kept.
+    EmuClamped {
+        attr: String,
+        value: String,
+        emu: i64,
+    },
     /// Issue #350 — complex fields still open in their instruction part
     /// when their paragraph ended (`count` of them): closed there, so their
     /// hidden instruction never swallows the following paragraphs.
@@ -121,6 +130,66 @@ pub enum DocxWarning {
     /// Issue #353 — a relationship target of a sibling part escapes the
     /// package; it was ignored (the fixed sibling name applies).
     UnsafeRelationshipTarget { target: String },
+}
+
+impl DocxWarning {
+    /// Issue #406 — the archive entry this warning concerns, when the
+    /// reader knows it (`None` for diagnostics raised deep inside a part
+    /// walk — measures, fields, table nesting).
+    pub fn part(&self) -> Option<&str> {
+        match self {
+            DocxWarning::NonCanonicalNamespaces { part, .. } => Some(part),
+            DocxWarning::MainPartFallback { .. } => Some("_rels/.rels"),
+            DocxWarning::TableNestingTooDeep { .. }
+            | DocxWarning::InvalidMeasure { .. }
+            | DocxWarning::MeasureClamped { .. }
+            | DocxWarning::EmuClamped { .. }
+            | DocxWarning::UnclosedField { .. }
+            | DocxWarning::StrayFieldChar { .. }
+            | DocxWarning::FieldNestingTooDeep { .. }
+            | DocxWarning::NotWordprocessingMl
+            | DocxWarning::UnsafeRelationshipTarget { .. } => None,
+        }
+    }
+
+    /// Issue #406 — the specifics of this warning in one line, for the
+    /// shell's details list (the attribute and its raw value, the limit
+    /// that was hit, the relationship target). Never document text.
+    pub fn detail(&self) -> String {
+        match self {
+            DocxWarning::TableNestingTooDeep { limit } => {
+                format!("tables nested {limit} or more levels deep kept as-is")
+            }
+            DocxWarning::InvalidMeasure { attr, value } => format!("{attr} = \"{value}\""),
+            DocxWarning::MeasureClamped { attr, value, twips } => {
+                format!("{attr} = \"{value}\" → {twips} twips")
+            }
+            DocxWarning::EmuClamped { attr, value, emu } => {
+                format!("{attr} = \"{value}\" → {emu} EMU")
+            }
+            DocxWarning::UnclosedField { count } => {
+                format!("{count} field(s) closed at the end of their paragraph")
+            }
+            DocxWarning::StrayFieldChar { kind } => format!("fldCharType=\"{kind}\""),
+            DocxWarning::FieldNestingTooDeep { limit } => {
+                format!("fields nested deeper than {limit} levels")
+            }
+            DocxWarning::NonCanonicalNamespaces {
+                detail, normalized, ..
+            } => {
+                if *normalized {
+                    detail.clone()
+                } else {
+                    format!("{detail} (normalisation failed; read as-is)")
+                }
+            }
+            DocxWarning::NotWordprocessingMl => {
+                "the main part's root is not a WordprocessingML element".to_string()
+            }
+            DocxWarning::MainPartFallback { target }
+            | DocxWarning::UnsafeRelationshipTarget { target } => target.clone(),
+        }
+    }
 }
 
 /// Most reader warnings one read collects; later ones are dropped (a

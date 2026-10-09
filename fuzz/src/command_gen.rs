@@ -1072,7 +1072,14 @@ pub fn gen_command_sequence(u: &mut Unstructured, max_len: usize) -> Vec<Command
             // entropy left for further loop iterations afterward.
             _ => Command::arbitrary(u).ok(),
         };
-        let Some(cmd) = cmd else { break };
+        let Some(mut cmd) = cmd else { break };
+        /* Issue #407 — any numeric field of any command, curated or blind,
+        sometimes arrives NaN / ±inf (a JS `NaN` crosses the wasm boundary
+        into an `f32` unchanged); the dispatcher's finite() guard must
+        refuse it (`run_rpc_command` asserts the typed `InvalidArgument`). */
+        if u.ratio(1, 16).unwrap_or(false) {
+            cmd = poison_one_float(u, cmd);
+        }
         record_coverage(&cmd);
         out.push(cmd);
         if u.is_empty() {
@@ -1080,6 +1087,69 @@ pub fn gen_command_sequence(u: &mut Unstructured, max_len: usize) -> Vec<Command
         }
     }
     out
+}
+
+/// Issue #407 — `cmd` with ONE of its `f32` / `f64` fields (chosen by `u`,
+/// at any nesting depth, in any variant — `Option<f32>`s that are `Some`,
+/// sequence elements, `Recover.log_tail` commands included) replaced by
+/// `NaN`, `+inf` or `-inf`. The command round-trips through MessagePack
+/// (`rmp_serde`, named fields) and [`crate::snapshot_gen::Mp`], so no
+/// hand-kept list of float fields can fall behind the bridge schema.
+/// A command with no float — or one that does not survive the round
+/// trip — comes back unchanged.
+pub fn poison_one_float(u: &mut Unstructured, cmd: Command) -> Command {
+    use crate::snapshot_gen::Mp;
+    /// Index paths to every float node, depth first.
+    fn floats(node: &Mp, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        match node {
+            Mp::F32(_) | Mp::F64(_) => out.push(path.clone()),
+            Mp::Arr(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    path.push(i);
+                    floats(item, path, out);
+                    path.pop();
+                }
+            }
+            Mp::Map(entries) => {
+                for (i, (_, value)) in entries.iter().enumerate() {
+                    path.push(i);
+                    floats(value, path, out);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let Ok(bytes) = rmp_serde::to_vec_named(&cmd) else {
+        return cmd;
+    };
+    let Some(mut tree) = Mp::parse(&bytes) else {
+        return cmd;
+    };
+    let mut paths = Vec::new();
+    floats(&tree, &mut Vec::new(), &mut paths);
+    if paths.is_empty() {
+        return cmd;
+    }
+    let pick = u.choose_index(paths.len()).unwrap_or(0);
+    let bad = *u
+        .choose(&[f64::NAN, f64::INFINITY, f64::NEG_INFINITY])
+        .unwrap_or(&f64::NAN);
+    let mut node = &mut tree;
+    for &i in &paths[pick] {
+        node = match node {
+            Mp::Arr(items) => &mut items[i],
+            Mp::Map(entries) => &mut entries[i].1,
+            _ => unreachable!("the path was collected over containers"),
+        };
+    }
+    *node = match node {
+        Mp::F32(_) => Mp::F32(bad as f32),
+        _ => Mp::F64(bad),
+    };
+    let mut poisoned = Vec::new();
+    tree.encode(&mut poisoned);
+    rmp_serde::from_slice(&poisoned).unwrap_or(cmd)
 }
 
 /* ====================================================================
@@ -1572,6 +1642,147 @@ mod tests {
                     if engine::validate_render_date(*year, *month, *day, *hour, *minute).is_err()
             )),
             "repro_187_bad_render_date must still generate an invalid SetRenderDate"
+        );
+    }
+
+    /// Issue #407 — the poison pass reaches every float shape the bridge
+    /// has (top-level, nested struct, `Option<f32>`, sequence element,
+    /// `f64`, a nested `log_tail` command), and the engine refuses every
+    /// poisoned command with the typed `InvalidArgument`.
+    #[test]
+    fn poison_one_float_reaches_every_float_shape_and_the_engine_refuses_it() {
+        use bridge::{
+            BridgeParaPropertiesPatch, BridgeStyleProperties, BridgeTabKind, BridgeTabStop, Point,
+            Rect,
+        };
+        let at = LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        };
+        let cmds = vec![
+            Command::SetZoom { scale: 1.0 },
+            Command::Tick { now_ms: 5.0 },
+            Command::SetPageMargins {
+                at: at.clone(),
+                top_pt: 72.0,
+                right_pt: 72.0,
+                bottom_pt: 72.0,
+                left_pt: 72.0,
+            },
+            Command::SetTabStops {
+                range: LogicalRange {
+                    start: at.clone(),
+                    end: at.clone(),
+                },
+                stops: vec![BridgeTabStop {
+                    position_pt: 36.0,
+                    kind: BridgeTabKind::Left,
+                    leader: None,
+                }],
+            },
+            Command::RequestPaint {
+                viewport: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+                dirty: None,
+            },
+            Command::HitTest {
+                at: Point { x: 1.0, y: 2.0 },
+            },
+            Command::ModifyStyle {
+                style_id: "Normal".into(),
+                properties: BridgeStyleProperties {
+                    para_props: Some(BridgeParaPropertiesPatch {
+                        line_spacing_multiplier: Some(1.5),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            },
+        ];
+        for cmd in cmds {
+            /* Every byte value picks some float and some bad value; try a
+            spread so each command's every float gets hit at least once. */
+            let mut hit = std::collections::BTreeSet::new();
+            for seed in 0u8..=255 {
+                let data = [seed, seed.wrapping_mul(7), 3];
+                let mut u = Unstructured::new(&data);
+                let poisoned = poison_one_float(&mut u, cmd.clone());
+                let bad = poisoned
+                    .first_non_finite()
+                    .unwrap_or_else(|| panic!("{cmd:?} was not poisoned: {poisoned:?}"));
+                hit.insert(bad.field.clone());
+                let mut engine =
+                    engine_wasm::Engine::new_headless(engine::DocumentTree::from_text("x"));
+                let evt = engine.apply_sync(poisoned);
+                assert!(
+                    matches!(
+                        evt,
+                        Event::Error {
+                            kind: Some(bridge::ErrorKind::InvalidArgument),
+                            ..
+                        }
+                    ),
+                    "{evt:?}"
+                );
+            }
+            assert!(!hit.is_empty());
+        }
+
+        /* A command with no float comes back unchanged. */
+        let text = Command::InsertText {
+            at: None,
+            text: "abc".into(),
+        };
+        let mut u = Unstructured::new(&[1, 2, 3]);
+        let same = poison_one_float(&mut u, text.clone());
+        assert_eq!(format!("{same:?}"), format!("{text:?}"));
+
+        /* The recovery tail is reachable too, and the guard leaves the
+        Recover itself alone (each replayed command meets it). */
+        let recover = Command::Recover {
+            snapshot: Vec::new(),
+            log_tail: vec![Command::SetZoom { scale: 2.0 }],
+            renderer_downgrade: None,
+            package: None,
+        };
+        let mut u = Unstructured::new(&[0, 0]);
+        let poisoned = poison_one_float(&mut u, recover);
+        let Command::Recover { log_tail, .. } = &poisoned else {
+            panic!("{poisoned:?}");
+        };
+        assert!(matches!(log_tail[0], Command::SetZoom { scale } if !scale.is_finite()));
+        assert_eq!(poisoned.first_non_finite(), None);
+    }
+
+    /// Issue #407 — every committed `rpc_command` corpus seed (and a sweep
+    /// of pseudo-random inputs) still runs through `run_rpc_command`, whose
+    /// non-finite-is-refused invariant now holds for poisoned commands.
+    #[test]
+    fn poisoned_sequences_satisfy_the_rpc_invariants() {
+        let mut state: u32 = 0x4071_0407;
+        let mut poisoned = 0usize;
+        for _ in 0..64 {
+            let data: Vec<u8> = (0..96)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect();
+            let mut u = Unstructured::new(&data);
+            let _ = gen_seed_text(&mut u);
+            poisoned += gen_command_sequence(&mut u, 16)
+                .iter()
+                .filter(|c| c.first_non_finite().is_some())
+                .count();
+            crate::run_rpc_command(&data);
+        }
+        assert!(
+            poisoned > 0,
+            "the sweep never produced a non-finite command"
         );
     }
 
