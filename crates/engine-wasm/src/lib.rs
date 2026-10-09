@@ -2405,6 +2405,31 @@ fn build_inline_object_infos(
                     },
                 }
             }
+            /* Issue #357 — a `<w:sym>` shapes its Unicode equivalent; a
+            `<w:ptab>` is a tab whose stop the margins fix. Neither
+            reserves an extent of its own. */
+            engine::InlineKind::Symbol { font, char } => layout::paragraph::InlineObjectInfo {
+                at: obj.at,
+                width_px: 0.0,
+                height_px: 0.0,
+                kind: layout::paragraph::InlineObjectInfoKind::Symbol {
+                    text: engine::run_content::symbol_char(font, char).to_string(),
+                },
+            },
+            engine::InlineKind::PositionalTab {
+                alignment,
+                relative_to,
+                leader,
+            } => layout::paragraph::InlineObjectInfo {
+                at: obj.at,
+                width_px: 0.0,
+                height_px: 0.0,
+                kind: layout::paragraph::InlineObjectInfoKind::PositionalTab {
+                    alignment: *alignment,
+                    relative_to: *relative_to,
+                    leader: *leader,
+                },
+            },
         })
         .collect()
 }
@@ -3282,6 +3307,22 @@ fn paragraph_layout_key(
                 5u8.hash(&mut h);
                 text_box_key(story, *width_emu, *height_emu).hash(&mut h);
             }
+            /* Issue #357. */
+            engine::InlineKind::Symbol { font, char } => {
+                6u8.hash(&mut h);
+                font.hash(&mut h);
+                char.hash(&mut h);
+            }
+            engine::InlineKind::PositionalTab {
+                alignment,
+                relative_to,
+                leader,
+            } => {
+                7u8.hash(&mut h);
+                alignment.hash(&mut h);
+                relative_to.hash(&mut h);
+                leader.hash(&mut h);
+            }
         }
         match io.anchor.as_deref() {
             None => 0u8.hash(&mut h),
@@ -3424,7 +3465,9 @@ fn paragraph_layout_key(
                     mark.hash(&mut h);
                 }
             }
-            engine::InlineKind::Image { .. } => {}
+            engine::InlineKind::Image { .. }
+            | engine::InlineKind::Symbol { .. }
+            | engine::InlineKind::PositionalTab { .. } => {}
         }
     }
     cfg.font_id.hash(&mut h);
@@ -7087,8 +7130,9 @@ const A11Y_PLACEHOLDER_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
 /// Issue #203 / #215 — one U+FFFC sentinel's replacement inside a
 /// paragraph, for [`a11y_runs`]: a note reference / self-mark (`note_ref`
 /// or bare marker `text`), or (issue #215) an inline image / text box
-/// (`object`, `text` empty — the object IS the run). Exactly one of
-/// `note_ref` / `object` is ever set.
+/// (`object`, `text` empty — the object IS the run), or (issue #357) a
+/// symbol / positional tab (plain `text`: its Unicode equivalent, a tab).
+/// At most one of `note_ref` / `object` is ever set.
 struct A11ySentinelMark {
     at: u32,
     text: String,
@@ -7187,6 +7231,20 @@ fn a11y_inline_marks(
                     }),
                 });
             }
+            /* Issue #357 — a symbol reads as its Unicode equivalent, a
+            positional tab as a tab: never the U+FFFC placeholder. */
+            engine::InlineKind::Symbol { font, char } => marks.push(A11ySentinelMark {
+                at: io.at,
+                text: engine::run_content::symbol_char(font, char).to_string(),
+                note_ref: None,
+                object: None,
+            }),
+            engine::InlineKind::PositionalTab { .. } => marks.push(A11ySentinelMark {
+                at: io.at,
+                text: "\t".to_string(),
+                note_ref: None,
+                object: None,
+            }),
             _ => {
                 if let Some(notes) = scope.notes
                     && let Some(anchor) = note_ref_anchor(&io.kind)

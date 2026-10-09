@@ -1494,6 +1494,9 @@ pub(crate) fn parse_document_xml_with_events(
     closes. `target` is the rId at this stage — the archive resolver
     swaps it to a URL via the rels map in a second pass. */
     let mut hyperlink_stack: Vec<(String, u32, Vec<engine::SourceAttr>)> = Vec::new();
+    /* Issue #357 — `<w:dir>` / `<w:bdo>` wrappers open in the current
+    paragraph (each pushed its control into the text). */
+    let mut bidi_wrappers_open: u32 = 0;
 
     /* Phase 6 — `<w:sectPr>` accumulators. A sectPr can live in two places:
     inside a paragraph's `<w:pPr>` (ends a section *at* that paragraph,
@@ -1886,6 +1889,7 @@ pub(crate) fn parse_document_xml_with_events(
                         p_start_byte = Some(prev_pos);
                         envelopes.note_block_start(prev_pos);
                         markup.open_paragraph(&e, &ns, reader.buffer_position() as usize);
+                        bidi_wrappers_open = 0;
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pbdr_logical = PbdrLogical::default();
@@ -1981,6 +1985,25 @@ pub(crate) fn parse_document_xml_with_events(
                         `w:tooltip`, …) ride the link for regeneration. */
                         let attrs = crate::schema::source_markup::raw_attrs(&e, &ns);
                         hyperlink_stack.push((target, start, attrs));
+                    }
+                    /* Issue #357 — `<w:dir>` (§17.3.2.8, an embedding) and
+                    `<w:bdo>` (§17.3.2.3, an override) wrap runs: their
+                    UAX #9 control opens in the text here and U+202C closes
+                    it at the end tag, so BiDi resolution applies them; the
+                    writer turns each balanced pair back into the wrapper. */
+                    b"w:dir" | b"w:bdo"
+                        if p_start_byte.is_some()
+                            && !in_run
+                            && !field_code_hidden(&field_stack, &field_cap) =>
+                    {
+                        let rtl = attr_val(&e, b"w:val").is_some_and(|v| v.trim() == "rtl");
+                        let wrapper = if name.as_ref() == b"w:dir" {
+                            engine::run_content::BidiWrapper::Dir { rtl }
+                        } else {
+                            engine::run_content::BidiWrapper::Bdo { rtl }
+                        };
+                        para_text.push(wrapper.opener());
+                        bidi_wrappers_open += 1;
                     }
                     b"w:t" => {
                         in_text_elt = true;
@@ -2330,8 +2353,40 @@ pub(crate) fn parse_document_xml_with_events(
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
                     /* Issue #350 — inside field code: not visible. */
-                    b"w:tab" | b"w:br" | b"w:softHyphen" | b"w:noBreakHyphen"
+                    b"w:tab" | b"w:br" | b"w:softHyphen" | b"w:noBreakHyphen" | b"w:cr"
+                    | b"w:sym" | b"w:ptab"
                         if in_run && field_code_hidden(&field_stack, &field_cap) => {}
+                    /* Issue #357 — `<w:cr/>` (§17.3.3.4) is a line break:
+                    U+000D, laid out like `<w:br/>`, written back as itself. */
+                    b"w:cr" if in_run => run_text.push(engine::run_content::CARRIAGE_RETURN),
+                    /* Issue #357 — `<w:sym w:font w:char/>` (§17.3.3.30) and
+                    `<w:ptab/>` (§17.3.3.23): a U+FFFC anchor and the typed
+                    object (the symbol's attributes verbatim; the positional
+                    tab's alignment / reference edges / leader). */
+                    b"w:sym" | b"w:ptab" if in_run => {
+                        let kind = if name.as_ref() == b"w:sym" {
+                            engine::InlineKind::Symbol {
+                                font: attr_val(&e, b"w:font").unwrap_or_default(),
+                                char: attr_val(&e, b"w:char").unwrap_or_default(),
+                            }
+                        } else {
+                            use engine::run_content::{PTabAlignment, PTabLeader, PTabRelativeTo};
+                            let attr = |k: &[u8]| attr_val(&e, k).unwrap_or_default();
+                            engine::InlineKind::PositionalTab {
+                                alignment: PTabAlignment::parse(&attr(b"w:alignment")),
+                                relative_to: PTabRelativeTo::parse(&attr(b"w:relativeTo")),
+                                leader: PTabLeader::parse(&attr(b"w:leader")),
+                            }
+                        };
+                        let at = (para_text.len() + run_text.len()) as u32;
+                        run_text.push('\u{FFFC}');
+                        para_inline_objects.push(engine::InlineObject {
+                            at,
+                            kind,
+                            anchor: None,
+                            source_xml: None,
+                        });
+                    }
                     /* Issue #335 — `<w:softHyphen/>` (ECMA-376 §17.3.3.29,
                     an optional hyphen: a break opportunity that shows a
                     hyphen only when the line breaks there) and
@@ -2972,6 +3027,11 @@ pub(crate) fn parse_document_xml_with_events(
                                 });
                             }
                         }
+                    }
+                    /* Issue #357 — the wrapper's end pops its control. */
+                    b"w:dir" | b"w:bdo" if bidi_wrappers_open > 0 && !in_run => {
+                        para_text.push(engine::run_content::POP_DIRECTIONAL);
+                        bidi_wrappers_open -= 1;
                     }
                     b"w:footnotePr" | b"w:endnotePr" if in_sect_pr => {
                         /* Issue #80 — close the note-props scope. */

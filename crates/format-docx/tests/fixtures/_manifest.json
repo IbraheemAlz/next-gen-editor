@@ -206,6 +206,22 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "run_content.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 4,
+        "paragraph_texts": [
+          "Symbol font: ￼ ￼ ￼ ￼ ￼; Wingdings: ￼ ￼ ￼ ￼ (a check).",
+          "First line of the paragraph\rand a second line after a carriage return.",
+          "Left￼Centre￼Right",
+          "Override: ‮ABC def‬; embedding: ‫abc 123‬ done."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "simple_arabic.docx": {
       "generator": "build_minimal_docx",
       "phase_introduced": 1,

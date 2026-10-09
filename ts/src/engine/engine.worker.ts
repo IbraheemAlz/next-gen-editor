@@ -20,6 +20,8 @@ import DUAL_URL from '../../fonts/Amiri-Regular.ttf?url';
 import THEME_DOCX_URL from '../../../crates/format-docx/tests/fixtures/theme_loaded_faces.docx?url';
 /* Issue #335 — the `soft-hyphen` golden (soft + non-breaking hyphens). */
 import SOFT_HYPHEN_DOCX_URL from '../../../crates/format-docx/tests/fixtures/soft_hyphen.docx?url';
+/* Issue #357 — the `run-content` golden (sym, cr, ptab, bdo / dir). */
+import RUN_CONTENT_DOCX_URL from '../../../crates/format-docx/tests/fixtures/run_content.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -965,6 +967,30 @@ async function handleInit(msg: InitMsg): Promise<void> {
             paintEvt = await dispatch({
                 type: 'LOAD_DOCX',
                 bytes: await fetchBytes(SOFT_HYPHEN_DOCX_URL),
+            } as Command);
+            break;
+        }
+
+        case 'run-content': {
+            /* Issue #357 — Symbol / Wingdings `<w:sym>` glyphs drawn
+               through their Unicode equivalents (the ✓ no shipped face has
+               draws the □ stand-in), a `<w:cr/>` line break, a header-style
+               line of two `<w:ptab>`s (centre; right with a dot leader),
+               and a `<w:bdo w:val="rtl">` override beside a `<w:dir>`
+               embedding. Zoom 2 for legibility. */
+            await dispatch({ type: 'SET_ZOOM', scale: 2 } as Command);
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 15,
+                line_height: 22,
+                align: 'START',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'LOAD_DOCX',
+                bytes: await fetchBytes(RUN_CONTENT_DOCX_URL),
             } as Command);
             break;
         }

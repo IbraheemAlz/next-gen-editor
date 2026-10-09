@@ -115,3 +115,82 @@ pub fn soft_hyphen_docx() -> Vec<u8> {
     );
     package_with_body(&body, None)
 }
+
+/// One `<w:r>` holding `<w:sym w:font w:char/>`, in Word's shape (the
+/// run's own fonts name the symbol face).
+fn sym_run(font: &str, code: &str) -> String {
+    format!(
+        "<w:r><w:rPr><w:rFonts w:ascii=\"{font}\" w:hAnsi=\"{font}\"/></w:rPr>\
+         <w:sym w:font=\"{font}\" w:char=\"{code}\"/></w:r>"
+    )
+}
+
+fn text_run(text: &str) -> String {
+    format!("<w:r><w:t xml:space=\"preserve\">{text}</w:t></w:r>")
+}
+
+/// Issue #357 — the text of each [`run_content_docx`] paragraph as the
+/// reader models it: U+FFFC for each `<w:sym>` / `<w:ptab>`, U+000D for
+/// `<w:cr/>`, the UAX #9 controls for `<w:bdo>` / `<w:dir>`.
+pub const RUN_CONTENT_TEXTS: [&str; 4] = [
+    "Symbol font: \u{FFFC} \u{FFFC} \u{FFFC} \u{FFFC} \u{FFFC}; Wingdings: \u{FFFC} \u{FFFC} \
+     \u{FFFC} \u{FFFC} (a check).",
+    "First line of the paragraph\rand a second line after a carriage return.",
+    "Left\u{FFFC}Centre\u{FFFC}Right",
+    "Override: \u{202E}ABC def\u{202C}; embedding: \u{202B}abc 123\u{202C} done.",
+];
+
+/// Issue #357 — one paragraph per run-content element: `<w:sym>` from
+/// Symbol (α β π ∑ ∞) and Wingdings (● ■ □ and a ✓ the shipped faces do
+/// not cover), a `<w:cr/>` line break, two `<w:ptab>`s (centre, right
+/// with a dot leader) laying out a header-style line, and a `<w:bdo
+/// w:val="rtl">` override next to a `<w:dir w:val="rtl">` embedding. A4,
+/// 1-inch margins, 11 pt. The source of `tools/roundtrip`'s
+/// `run_content.docx`, the engine-wasm layout pin and the visual-diff
+/// `run-content` golden.
+pub fn run_content_docx() -> Vec<u8> {
+    let p0 = [
+        text_run("Symbol font: "),
+        sym_run("Symbol", "F061"),
+        text_run(" "),
+        sym_run("Symbol", "F062"),
+        text_run(" "),
+        sym_run("Symbol", "F070"),
+        text_run(" "),
+        sym_run("Symbol", "F0E5"),
+        text_run(" "),
+        sym_run("Symbol", "F0A5"),
+        text_run("; Wingdings: "),
+        sym_run("Wingdings", "F06C"),
+        text_run(" "),
+        sym_run("Wingdings", "F06E"),
+        text_run(" "),
+        sym_run("Wingdings", "F06F"),
+        text_run(" "),
+        sym_run("Wingdings", "F0FC"),
+        text_run(" (a check)."),
+    ]
+    .concat();
+    let p1 = "<w:r><w:t>First line of the paragraph</w:t><w:cr/>\
+              <w:t>and a second line after a carriage return.</w:t></w:r>";
+    let p2 = [
+        text_run("Left"),
+        "<w:r><w:ptab w:relativeTo=\"margin\" w:alignment=\"center\" w:leader=\"none\"/></w:r>"
+            .to_string(),
+        text_run("Centre"),
+        "<w:r><w:ptab w:relativeTo=\"margin\" w:alignment=\"right\" w:leader=\"dot\"/></w:r>"
+            .to_string(),
+        text_run("Right"),
+    ]
+    .concat();
+    let p3 = format!(
+        "{}<w:bdo w:val=\"rtl\">{}</w:bdo>{}<w:dir w:val=\"rtl\">{}</w:dir>{}",
+        text_run("Override: "),
+        text_run("ABC def"),
+        text_run("; embedding: "),
+        text_run("abc 123"),
+        text_run(" done."),
+    );
+    let body = format!("<w:p>{p0}</w:p><w:p>{p1}</w:p><w:p>{p2}</w:p><w:p>{p3}</w:p>");
+    package_with_body(&body, None)
+}

@@ -67,6 +67,7 @@ const VIEWPORTS = {
     'rich-text-cs-size': { width: 595, height: 842 },
     'theme-fonts': { width: 1190, height: 360 },
     'soft-hyphen': { width: 1190, height: 400 },
+    'run-content': { width: 1190, height: 440 },
 };
 function viewportFor(name) {
     if (process.env.VIEWPORT) {

@@ -2819,8 +2819,9 @@ fn add_run_mappings(run: &VisualRun, text: &str, map: &mut BTreeMap<u16, Vec<cha
 
 /// Issue #335 — `true` when every character of a glyph's decode is
 /// invisible formatting (soft hyphen, bidi controls, zero-width
-/// joiners / spaces, word joiner, BOM): such a decode yields to any
-/// visible one for the same glyph id.
+/// joiners / spaces, word joiner, BOM) or (issue #357) the U+FFFC object
+/// placeholder a `<w:sym>` glyph's cluster points at: such a decode yields
+/// to any real one for the same glyph id.
 fn is_weak_decode(chars: &[char]) -> bool {
     chars.iter().all(|&c| {
         matches!(
@@ -2832,6 +2833,7 @@ fn is_weak_decode(chars: &[char]) -> bool {
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{2069}'
                 | '\u{FEFF}'
+                | '\u{FFFC}'
         )
     })
 }

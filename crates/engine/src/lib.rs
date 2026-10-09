@@ -2508,6 +2508,20 @@ pub enum InlineKind {
         height_emu: i64,
         story: Box<TextBoxStory>,
     },
+    /// Issue #357 — `<w:sym w:font="Wingdings" w:char="F0FC"/>`: one glyph
+    /// of a symbol font. `font` / `char` are the source attribute values,
+    /// verbatim (the writer re-emits them); layout draws the character
+    /// through its Unicode equivalent ([`run_content::symbol_char`]).
+    Symbol { font: String, char: String },
+    /// Issue #357 — `<w:ptab/>`: an absolute-position tab. The text that
+    /// follows is aligned at a fixed position of the margins (or indents)
+    /// whatever the paragraph's tab stops — Word's header / footer
+    /// "left · centre · right" layout.
+    PositionalTab {
+        alignment: run_content::PTabAlignment,
+        relative_to: run_content::PTabRelativeTo,
+        leader: run_content::PTabLeader,
+    },
 }
 
 impl InlineKind {
@@ -10938,6 +10952,10 @@ fn push_paragraph_plain(p: &Paragraph, out: &mut String) {
                     }
                 }
             }
+            /* Issue #357 — a symbol flattens to its Unicode equivalent, a
+            positional tab to a tab. */
+            InlineKind::Symbol { font, char } => out.push(run_content::symbol_char(font, char)),
+            InlineKind::PositionalTab { .. } => out.push('\t'),
         }
         /* Skip the 3-byte U+FFFC sentinel. Snapped (issue #115): an
         object offset that does not sit on its sentinel must not leave the
@@ -11421,7 +11439,10 @@ fn walk_block_note_refs(
                         }
                         continue;
                     }
-                    InlineKind::Image { .. } | InlineKind::NoteSelfRef { .. } => continue,
+                    InlineKind::Image { .. }
+                    | InlineKind::NoteSelfRef { .. }
+                    | InlineKind::Symbol { .. }
+                    | InlineKind::PositionalTab { .. } => continue,
                 };
                 out.push(NoteReference {
                     top_block: top,

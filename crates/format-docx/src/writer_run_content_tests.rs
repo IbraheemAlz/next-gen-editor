@@ -128,3 +128,168 @@ fn a_hyphen_element_in_field_code_stays_hidden() {
     ));
     assert_eq!(archive.document.nth_paragraph(0).unwrap().text, "av");
 }
+
+/* ---- issue #357: w:sym, w:cr, w:ptab, w:bdo / w:dir ---------------- */
+
+/// Word's shapes: a Symbol-font α in a run of its own, a Wingdings check
+/// in a run carrying the symbol font, a `<w:cr/>` inside a text run.
+const SYM_CR_P: &str = concat!(
+    r#"<w:p><w:r><w:t xml:space="preserve">Greek </w:t></w:r>"#,
+    r#"<w:r><w:sym w:font="Symbol" w:char="F061"/></w:r>"#,
+    r#"<w:r><w:t xml:space="preserve"> and a check </w:t></w:r>"#,
+    r#"<w:r><w:rPr><w:rFonts w:ascii="Wingdings" w:hAnsi="Wingdings"/></w:rPr><w:sym w:font="Wingdings" w:char="F0FC"/></w:r>"#,
+    r#"<w:r><w:t>line one</w:t><w:cr/><w:t>line two</w:t></w:r></w:p>"#,
+);
+
+/// A header-style three-column line: two positional tabs.
+const PTAB_P: &str = concat!(
+    r#"<w:p><w:r><w:t>Left</w:t></w:r>"#,
+    r#"<w:r><w:ptab w:relativeTo="margin" w:alignment="center" w:leader="none"/></w:r>"#,
+    r#"<w:r><w:t>Middle</w:t></w:r>"#,
+    r#"<w:r><w:ptab w:relativeTo="margin" w:alignment="right" w:leader="dot"/></w:r>"#,
+    r#"<w:r><w:t>Right</w:t></w:r></w:p>"#,
+);
+
+/// An override and an embedding.
+const BDO_DIR_P: &str = concat!(
+    r#"<w:p><w:r><w:t xml:space="preserve">Forced: </w:t></w:r>"#,
+    r#"<w:bdo w:val="rtl"><w:r><w:t>abc</w:t></w:r></w:bdo>"#,
+    r#"<w:r><w:t xml:space="preserve"> embedded: </w:t></w:r>"#,
+    r#"<w:dir w:val="rtl"><w:r><w:t>XYZ 123</w:t></w:r></w:dir></w:p>"#,
+);
+
+#[test]
+fn the_reader_models_sym_cr_ptab_bdo_and_dir() {
+    use engine::run_content::{
+        CARRIAGE_RETURN, POP_DIRECTIONAL, PTabAlignment, PTabLeader, PTabRelativeTo, RLE, RLO,
+    };
+    let (_, archive) = open(&format!("{SYM_CR_P}{PTAB_P}{BDO_DIR_P}"));
+    let doc = &archive.document;
+    let p0 = doc.nth_paragraph(0).unwrap();
+    assert_eq!(
+        p0.text,
+        format!("Greek \u{FFFC} and a check \u{FFFC}line one{CARRIAGE_RETURN}line two")
+    );
+    let kinds: Vec<_> = p0.inline_objects.iter().map(|o| o.kind.clone()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            engine::InlineKind::Symbol {
+                font: "Symbol".into(),
+                char: "F061".into()
+            },
+            engine::InlineKind::Symbol {
+                font: "Wingdings".into(),
+                char: "F0FC".into()
+            },
+        ]
+    );
+    let p1 = doc.nth_paragraph(1).unwrap();
+    assert_eq!(p1.text, "Left\u{FFFC}Middle\u{FFFC}Right");
+    assert_eq!(
+        p1.inline_objects[1].kind,
+        engine::InlineKind::PositionalTab {
+            alignment: PTabAlignment::Right,
+            relative_to: PTabRelativeTo::Margin,
+            leader: PTabLeader::Dot,
+        }
+    );
+    let p2 = doc.nth_paragraph(2).unwrap();
+    assert_eq!(
+        p2.text,
+        format!("Forced: {RLO}abc{POP_DIRECTIONAL} embedded: {RLE}XYZ 123{POP_DIRECTIONAL}")
+    );
+}
+
+#[test]
+fn a_zero_edit_save_of_every_element_is_byte_identical() {
+    let (xml, archive) = open(&format!("{SYM_CR_P}{PTAB_P}{BDO_DIR_P}"));
+    let out = document_xml_of(&write_docx(&archive, &archive.document).expect("write"));
+    assert_eq!(out, xml);
+}
+
+/// Typing at the end of each paragraph regenerates it: every element
+/// comes back as itself (never a U+FFFC, a raw CR or a bidi control), in
+/// its source run, as a pure insertion of the typed text.
+#[test]
+fn regenerated_paragraphs_re_emit_every_element() {
+    for (i, p) in [SYM_CR_P, PTAB_P, BDO_DIR_P].into_iter().enumerate() {
+        let (xml, archive) = open(p);
+        let len = archive.document.nth_paragraph(0).unwrap().text.len();
+        let edited = archive.document.insert_text(at(len), "!");
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        for raw in [
+            '\u{FFFC}', '\r', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}',
+        ] {
+            assert!(
+                !out.contains(raw),
+                "paragraph {i}: raw {raw:?} written:\n{out}"
+            );
+        }
+        /* A pure insertion: the source bytes survive around one inserted
+        region (the typed `!` — in the last `<w:t>`, or, after the
+        `<w:dir>`'s pop, in a run of its own outside the wrapper). */
+        let prefix = xml
+            .bytes()
+            .zip(out.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let suffix = xml
+            .bytes()
+            .rev()
+            .zip(out.bytes().rev())
+            .take(xml.len().min(out.len()) - prefix)
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert_eq!(
+            prefix + suffix,
+            xml.len(),
+            "paragraph {i}: source bytes rewritten:\n{out}"
+        );
+        assert!(out[prefix..out.len() - suffix].contains('!'));
+        let back = read_docx(&write_docx(&archive, &edited).expect("write")).expect("reread");
+        let b = back.document.nth_paragraph(0).unwrap();
+        let e = edited.nth_paragraph(0).unwrap();
+        assert_eq!(b.text, e.text, "paragraph {i}");
+        assert_eq!(b.inline_objects.len(), e.inline_objects.len());
+    }
+}
+
+/// Engine-authored bidi controls (a paste) write as the wrappers; an
+/// orphaned pop is dropped and an unclosed opener closes at the
+/// paragraph end — the output is always balanced.
+#[test]
+fn bidi_controls_write_as_balanced_wrappers() {
+    for (text, want) in [
+        (
+            "a\u{202E}bc\u{202C}d",
+            r#"<w:bdo w:val="rtl"><w:r><w:t xml:space="preserve">bc</w:t></w:r></w:bdo>"#,
+        ),
+        (
+            "a\u{202B}b\u{202D}c\u{202C}d\u{202C}",
+            r#"<w:dir w:val="rtl"><w:r><w:t xml:space="preserve">b</w:t></w:r><w:bdo w:val="ltr"><w:r><w:t xml:space="preserve">c</w:t></w:r></w:bdo><w:r><w:t xml:space="preserve">d</w:t></w:r></w:dir>"#,
+        ),
+        (
+            "x\u{202C}y",
+            r#"<w:r><w:t xml:space="preserve">y</w:t></w:r>"#,
+        ),
+        (
+            "x\u{202A}y",
+            r#"<w:dir w:val="ltr"><w:r><w:t xml:space="preserve">y</w:t></w:r></w:dir>"#,
+        ),
+    ] {
+        let doc = engine::DocumentTree::from_text(text);
+        let bytes = build_minimal_docx(&doc).expect("write");
+        let out = document_xml_of(&bytes);
+        assert!(out.contains(want), "{text:?}:\n{out}");
+        crate::check_document_xml_well_formed(&bytes).expect("balanced");
+        assert_eq!(
+            out.matches("<w:dir").count(),
+            out.matches("</w:dir>").count()
+        );
+        assert_eq!(
+            out.matches("<w:bdo").count(),
+            out.matches("</w:bdo>").count()
+        );
+    }
+}

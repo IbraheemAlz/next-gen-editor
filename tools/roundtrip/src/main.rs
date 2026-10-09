@@ -355,6 +355,7 @@ fn run_default() -> Result<()> {
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
     run_content::run_soft_hyphen_roundtrip()?;
+    run_content::run_run_content_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4991,7 +4992,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #335 — `<w:softHyphen/>` / `<w:noBreakHyphen/>` (the
         visual-diff `soft-hyphen` golden loads it). Zero-edit drift 0;
-        the default harness's step 47 edits it. */
+        the default harness's step 49 edits it. */
         PrebuiltFixture {
             name: "soft_hyphen.docx",
             bytes: format_docx::test_fixtures::soft_hyphen_docx(),
@@ -5004,6 +5005,27 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         format_docx::test_fixtures::SOFT_HYPHEN_TEXT.into(),
                         format_docx::test_fixtures::NB_HYPHEN_TEXT.into(),
                     ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #357 — `<w:sym>`, `<w:cr/>`, `<w:ptab>`, `<w:bdo>` /
+        `<w:dir>` (the visual-diff `run-content` golden loads it).
+        Zero-edit drift 0; the default harness's step 50 edits it. */
+        PrebuiltFixture {
+            name: "run_content.docx",
+            bytes: format_docx::test_fixtures::run_content_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 4,
+                    paragraph_texts: format_docx::test_fixtures::RUN_CONTENT_TEXTS
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect(),
                 },
                 roundtrip: RoundtripBounds {
                     document_xml_drift_bytes: 0,
