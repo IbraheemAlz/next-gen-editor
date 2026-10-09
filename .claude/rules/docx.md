@@ -45,9 +45,10 @@ paths:
   `PackageLimits` (64 MiB part / 128 MiB package / 10k entries / XML depth
   256 / 4M elements per part; `read_docx_with_limits`, overridable from
   `Command::OpenDocument.limits`) is checked before any typed walk — the
-  XML shape caps run over every part the reader walks (`word/**/*.xml`,
-  `*.rels`, `docProps/core.xml`), and depth inside a table nested past the
-  #111 cap is not counted (it is opaque bytes). Overflow is
+  XML shape caps run over every part the reader may walk (every `.xml` /
+  `.rels` entry but custom XML data and `docProps/*` other than
+  `core.xml` — the #353 main part can live anywhere), and depth inside a
+  table nested past the #111 cap is not counted (it is opaque bytes). Overflow is
   `DocxError::PackageTooLarge` → `Event::Error { kind: PackageTooLarge }`
   (the shell's File-menu banner), never a trap.
 - **Measures (issue #349).** Page geometry, `<w:ind>`, `<w:spacing>` and

@@ -32,10 +32,6 @@ test('OPEN_DOCUMENT refuses a 5000-deep package with a typed error, then opens a
     page,
 }) => {
     test.setTimeout(30_000);
-    const traps: string[] = [];
-    page.on('console', (m) => {
-        if (/trap|RuntimeError|unreachable/i.test(m.text())) traps.push(m.text());
-    });
     await page.goto('/');
     await page.waitForFunction(() => window.__paintIdle === true, undefined, {
         timeout: 20_000,
@@ -79,5 +75,7 @@ test('OPEN_DOCUMENT refuses a 5000-deep package with a typed error, then opens a
         }),
     );
     expect(sel.type).toBe('SELECTION_CHANGED');
-    expect(traps).toEqual([]);
+    /* No crash overlay: the worker never trapped (a trap would also have
+       rejected the dispatches above). */
+    await expect(page.locator('.nge-trap')).toHaveCount(0);
 });
