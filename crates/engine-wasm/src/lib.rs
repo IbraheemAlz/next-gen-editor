@@ -27552,6 +27552,8 @@ mod nested_table_tests;
 
 #[cfg(test)]
 mod part_media_tests;
+#[cfg(test)]
+mod pbdr_start_end_tests;
 
 #[cfg(test)]
 mod block_remap_tests;

@@ -26,6 +26,20 @@ impl Paint {
             brush: Brush::Solid(color),
         }
     }
+
+    /// The `[r, g, b, a]` channels of a solid paint (`None` for any other
+    /// brush). Lets a caller inspect a display list without naming
+    /// `peniko`.
+    pub fn solid_rgba8(&self) -> Option<[u8; 4]> {
+        match &self.brush {
+            Brush::Solid(color) => {
+                let [r, g, b, a] = color.components;
+                let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                Some([q(r), q(g), q(b), q(a)])
+            }
+            _ => None,
+        }
+    }
 }
 
 /// One positioned glyph in a run. `x`/`y` is the baseline pen position; the

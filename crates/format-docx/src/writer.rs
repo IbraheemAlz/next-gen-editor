@@ -662,10 +662,39 @@ fn emit_ppr(
     populated stroke emits as a child; absent edges silently omit. */
     if let Some(b) = props.borders.as_ref() {
         let mut s = String::from("<w:pBdr>");
-        emit_border_edge("w:top", &b.top, &mut s);
-        emit_border_edge("w:left", &b.left, &mut s);
-        emit_border_edge("w:bottom", &b.bottom, &mut s);
-        emit_border_edge("w:right", &b.right, &mut s);
+        /* Issue #352 — an edge the source spelled `<w:start>` / `<w:end>`
+        keeps that spelling: the leading edge (left in LTR, right in RTL)
+        is `start`, the trailing one `end`. */
+        let rtl = props.direction == Some(engine::TextDirection::Rtl);
+        let sp = props.border_spelling;
+        let (left_name, right_name) = match (rtl, sp.start, sp.end) {
+            (false, start, end) => (
+                if start { "w:start" } else { "w:left" },
+                if end { "w:end" } else { "w:right" },
+            ),
+            (true, start, end) => (
+                if end { "w:end" } else { "w:left" },
+                if start { "w:start" } else { "w:right" },
+            ),
+        };
+        /* CT_PBdr is a sequence: top, start|left, bottom, end|right — rank
+        by the NAME written, not the physical slot (an RTL `start` edge
+        sits in the right slot but must precede `bottom`). */
+        let name_rank = |n: &str| match n {
+            "w:start" | "w:left" => 1,
+            "w:end" | "w:right" => 3,
+            _ => 0,
+        };
+        let mut edges = [
+            (0, "w:top", &b.top),
+            (name_rank(left_name), left_name, &b.left),
+            (2, "w:bottom", &b.bottom),
+            (name_rank(right_name), right_name, &b.right),
+        ];
+        edges.sort_by_key(|(rank, _, _)| *rank);
+        for (_, name, stroke) in edges {
+            emit_border_edge(name, stroke, &mut s);
+        }
         emit_border_edge("w:between", &b.inside_h, &mut s);
         s.push_str("</w:pBdr>");
         ch.push(rank(b"w:pBdr"), s);
@@ -7279,6 +7308,7 @@ mod tests {
             keep_lines: Some(false),
             page_break_before: false,
             borders: None,
+            border_spelling: Default::default(),
             tab_stops: Vec::new(),
             list_item: None,
             shading: Some([0x33, 0x66, 0x99, 0xFF]),
