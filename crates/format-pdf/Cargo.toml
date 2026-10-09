@@ -11,6 +11,7 @@ engine = { path = "../engine" }
 layout = { path = "../layout" }
 text-pipeline = { path = "../text-pipeline" }
 pdf-writer = { workspace = true }
+subsetter = { workspace = true }
 flate2 = { workspace = true }
 png = { workspace = true }
 gif = { workspace = true, optional = true }

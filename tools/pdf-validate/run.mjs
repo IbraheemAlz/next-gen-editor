@@ -50,8 +50,21 @@
  * multi-image documents serialize in a different byte order every run), so
  * two regenerations of an unchanged generator produce byte-identical files
  * and `--check-fixtures` never false-fails on its own re-run.
+ *
+ * Issue #327 — font subsetting size gate. Every exported ONE-PAGE document
+ * must be smaller than 10 % of the raw size of the font files it embeds: a
+ * subset embeds only the glyphs the page shows, so a page of text costs a
+ * few KB of font program, never the multi-hundred-KB face. The embedded
+ * faces are read back from the PDF's `/BaseFont` names (minus the
+ * `ABCDEF+` subset tag) and sized from the editor's own font registry
+ * (`ts/public/fonts.json` → `ts/public/fonts/*`). A full (unsubset)
+ * embedding of any registry face fails this gate on its own. The same
+ * bound is asserted natively on every regenerated fixture by the
+ * `--regen` / `--check-fixtures` generators (`assert_exports_cleanly` in
+ * `crates/engine-wasm/src/pdf_validate_fixtures_tests.rs`), so a
+ * subsetting regression fails there too, without a browser.
  */
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -223,7 +236,12 @@ try {
 
         const pdfPath = join(OUT_DIR, `${testCase.name}.pdf`);
         writeFileSync(pdfPath, Buffer.from(result.bytes));
-        exported.push({ name: testCase.name, path: pdfPath, size: result.bytes.length });
+        exported.push({
+            name: testCase.name,
+            path: pdfPath,
+            size: result.bytes.length,
+            pages: result.pages,
+        });
         console.log(
             `[pdf-validate] exported ${testCase.name} -> ${pdfPath} ` +
                 `(${result.bytes.length} B, ${result.pages}p)`,
@@ -313,6 +331,59 @@ for (const doc of exported) {
     }
 }
 
+/* ---- Issue #327 — one-page size gate (font subsetting) --------------- */
+
+/* Font id → raw file size, from the editor's font registry. */
+function registryFontSizes() {
+    const publicDir = join(REPO, 'ts', 'public');
+    const registry = JSON.parse(readFileSync(join(publicDir, 'fonts.json'), 'utf8'));
+    const sizes = new Map();
+    for (const font of registry.fonts ?? []) {
+        const file = join(publicDir, font.url);
+        if (existsSync(file)) sizes.set(font.id, statSync(file).size);
+    }
+    return sizes;
+}
+
+/* The distinct faces a PDF embeds: every `/BaseFont` name with its
+   `ABCDEF+` subset tag stripped (the Type0 and CIDFont dictionaries both
+   carry it — deduplicated). */
+function embeddedFontIds(pdf) {
+    const body = pdf.toString('latin1');
+    const ids = new Set();
+    for (const m of body.matchAll(/\/BaseFont\s*\/(?:[A-Z]{6}\+)?([^\s/<>()[\]{}%]+)/g)) {
+        ids.add(m[1]);
+    }
+    return [...ids];
+}
+
+const SIZE_GATE_RATIO = 0.1;
+const fontSizes = registryFontSizes();
+let sizeOk = true;
+for (const doc of exported) {
+    if (doc.pages !== 1) {
+        console.log(`[pdf-validate] ${doc.name}: size gate n/a (${doc.pages} pages; one-page documents only)`);
+        continue;
+    }
+    const ids = embeddedFontIds(readFileSync(doc.path));
+    const unknown = ids.filter((id) => !fontSizes.has(id));
+    if (!ids.length || unknown.length) {
+        console.warn(
+            `[pdf-validate] ${doc.name}: size gate skipped — ` +
+                (ids.length ? `font(s) not in the registry: ${unknown.join(', ')}` : 'no embedded fonts'),
+        );
+        continue;
+    }
+    const raw = ids.reduce((sum, id) => sum + fontSizes.get(id), 0);
+    const pct = ((100 * doc.size) / raw).toFixed(1);
+    const pass = doc.size < SIZE_GATE_RATIO * raw;
+    if (!pass) sizeOk = false;
+    console.log(
+        `[pdf-validate] ${doc.name}: size ${pass ? 'PASS' : 'FAIL'} — ${doc.size} B = ${pct} % ` +
+            `of ${raw} B raw font data (${ids.join(', ')}); bound < ${SIZE_GATE_RATIO * 100} %`,
+    );
+}
+
 /* ---- External veraPDF validation ------------------------------------- */
 
 function findVeraPdf() {
@@ -328,7 +399,7 @@ if (veraFlavour === null) {
         `[pdf-validate] veraPDF has no '${profile}' flavour (it validates PDF/A + ` +
             'PDF/UA only) — the structural check above is the final result.',
     );
-    process.exit(structuralOk ? 0 : 1);
+    process.exit(structuralOk && sizeOk ? 0 : 1);
 }
 
 const veraPdf = findVeraPdf();
@@ -339,7 +410,7 @@ if (!veraPdf) {
         console.error('[pdf-validate] FAIL: --strict set and veraPDF is unavailable');
         process.exit(1);
     }
-    process.exit(structuralOk ? 0 : 1);
+    process.exit(structuralOk && sizeOk ? 0 : 1);
 }
 
 console.log(`[pdf-validate] validating with ${veraPdf} --flavour ${veraFlavour}`);
@@ -359,7 +430,7 @@ for (const doc of exported) {
     }
 }
 
-if (!structuralOk || !veraOk) {
+if (!structuralOk || !veraOk || !sizeOk) {
     console.error('[pdf-validate] FAIL');
     process.exit(1);
 }

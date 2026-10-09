@@ -74,8 +74,19 @@ hard failure so CI catches a new loop instead of a silent recovery.
   **top-left, y-down**. Invert every glyph: `pdf_y = page_height - layout_y`.
   X needs no inversion.
 - Fonts embed as `Type0` / `CIDFontType2` with `Identity-H` encoding and
-  `CIDToGIDMap /Identity` — the 2-byte codes in the content stream are the
-  shaped glyph ids directly.
+  `CIDToGIDMap /Identity`, **subset** to the glyphs the document shows (issue
+  #327, the `subsetter` crate — `format-pdf/src/font_program.rs`). The
+  subset renumbers glyph ids, so the 2-byte content-stream codes are the
+  SUBSET's ids, never the shaped ones: always emit a shown glyph through
+  `FontObj::show_code` (it assigns the id on first use — that is how the
+  subset learns which glyphs it needs), and key `/W`, `/ToUnicode` and the
+  PDF/A-1b `/CIDSet` by code. Subset names carry a deterministic six-letter
+  `ABCDEF+` tag. A face the subsetter rejects falls back to full embedding
+  with codes == shaped glyph ids (the pre-#327 output).
+- Tests that inspect content-stream text decode codes through the font's
+  own `/ToUnicode` (`format_pdf::test_support::{to_unicode_cmaps,
+  decode_codes}`) — comparing them against `LoadedFont::glyph_id` is wrong
+  for a subset font.
 - Position every glyph with an explicit text matrix, not the PDF font's
   advances: our `x_advance` carries justification + Kashida adjustments the
   font's intrinsic widths do not.

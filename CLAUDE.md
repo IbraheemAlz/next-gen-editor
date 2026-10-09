@@ -66,7 +66,7 @@ crates/
   layout/         hierarchical box model (PageBox→ParagraphBox→LineBox→VisualRun)
   render/         backend-agnostic DisplayList; Canvas2D + Vello backends; DirtyTracker
   format-docx/    .docx reader (zip + quick-xml) + writer (preserves siblings)
-  format-pdf/     PDF export (pdf-writer) — box tree + full font embedding
+  format-pdf/     PDF export (pdf-writer) — box tree + subset font embedding
 ts/               Vite + TS shell, worker, EngineClient, event log, e2e suite
 packages/         pnpm workspace — Monaco Standard SDK split (post-beta.3)
   core/           @nge/core — Locked Surface + Headless API (Solid.js primitives)
@@ -478,7 +478,12 @@ shelf and viewport-culled lazy pagination (`LazyLayoutState` +
 `Command::ExpandLayout`). The cut is `v0.6.0-beta.2`. PDF/A-2u and PDF/X-3
 conformance shipped after that (GitHub issue #28, closed).
 
-Still open, tracked in `gh issue list`: PDF font subsetting; Vello as the
+PDF font subsetting shipped too (issue #327: the `subsetter` crate, glyph
+ids renumbered through content codes / `/W` / `/ToUnicode` / `/CIDSet`,
++67 KB raw wasm; `tools/pdf-validate` gates one-page exports at < 10 % of
+their fonts' raw size).
+
+Still open, tracked in `gh issue list`: Vello as the
 *default* renderer (issue #1 — the harness has a `--renderer vello` mode
 with committed `golden/vello/` goldens, and runtime activation is verified
 on real GPU hardware; the remaining gap is a GPU CI runner + default

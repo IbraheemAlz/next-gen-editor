@@ -29,7 +29,7 @@ use super::*;
 /// now lives in `format_pdf::test_support` (shared with `format-pdf`'s own
 /// tests and the tier-a corpus fixture regenerators), rather than being
 /// hand-rolled in this file.
-use format_pdf::test_support::{content_streams, text_blocks};
+use format_pdf::test_support::{content_streams, decode_codes, text_blocks, to_unicode_cmaps};
 
 /// Shared scaffold: a native `Engine` over `doc` with a real Latin font and
 /// a cached layout config — mirrors `mod tests::test_engine_with_doc` /
@@ -171,7 +171,7 @@ fn toc_survives_regenerate_layout_and_pdf_export() {
     let face = font_stack
         .face("test-latin")
         .expect("test-latin face loaded");
-    let dot_gid = face.glyph_id('.').expect("liberation shapes '.'");
+    assert!(face.glyph_id('.').is_some(), "liberation shapes '.'");
 
     let mut expected_dot_counts = Vec::with_capacity(expected_entries.len());
     {
@@ -238,15 +238,25 @@ fn toc_survives_regenerate_layout_and_pdf_export() {
         let streams = content_streams(&bytes);
         assert!(!streams.is_empty(), "{profile:?}: no content stream found");
         let all_blocks: Vec<Vec<u16>> = streams.iter().flat_map(|s| text_blocks(s)).collect();
+        /* Issue #327 — the embedded font is a SUBSET, so content codes are
+        its renumbered glyph ids, not the shaper's: decode them back to
+        text through the font's own `/ToUnicode` (what a viewer's text
+        extraction does). The fixture uses one face. */
+        let cmaps = to_unicode_cmaps(&bytes);
+        assert_eq!(cmaps.len(), 1, "{profile:?}: one font, one /ToUnicode");
+        let texts: Vec<String> = all_blocks
+            .iter()
+            .map(|b| decode_codes(b, &cmaps[0]))
+            .collect();
 
         /* Pair up (main, leader) blocks: a leader block is a nonempty run
-        of the SAME glyph id (the dot) — `emit_tab_leader_glyphs` shows
+        of the SAME glyph (the dot) — `emit_tab_leader_glyphs` shows
         nothing else. Its immediate predecessor is the entry's own text. */
-        let mut pairs: Vec<(&[u16], &[u16])> = Vec::new();
-        for w in all_blocks.windows(2) {
+        let mut pairs: Vec<(&str, &[u16])> = Vec::new();
+        for (w, t) in all_blocks.windows(2).zip(texts.windows(2)) {
             let leader = &w[1];
-            if !leader.is_empty() && leader.iter().all(|&g| g == dot_gid) {
-                pairs.push((&w[0], leader));
+            if !leader.is_empty() && t[1].chars().all(|c| c == '.') {
+                pairs.push((t[0].as_str(), leader));
             }
         }
         assert_eq!(
@@ -257,17 +267,9 @@ fn toc_survives_regenerate_layout_and_pdf_export() {
 
         for (i, (main, leader)) in pairs.iter().enumerate() {
             let (heading, page_num) = expected_entries[i];
-            let expected_codes: Vec<u16> = heading
-                .chars()
-                .chain(page_num.chars())
-                .map(|c| {
-                    face.glyph_id(c)
-                        .unwrap_or_else(|| panic!("no glyph for {c:?}"))
-                })
-                .collect();
             assert_eq!(
-                main.to_vec(),
-                expected_codes,
+                *main,
+                format!("{heading}{page_num}"),
                 "{profile:?} entry {i} (\"{heading}\") text + page number glyphs"
             );
             assert_eq!(
