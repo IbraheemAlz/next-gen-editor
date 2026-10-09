@@ -43,7 +43,13 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
     }
     /* Issue #355 — an A4 page at zoom 2 (the fixture's 11 pt body text
        stays legible); `run.mjs` screenshots only its top band. */
-    if (testCase === 'theme-fonts') {
+    if (
+        testCase === 'theme-fonts' ||
+        testCase === 'soft-hyphen' ||
+        testCase === 'run-content' ||
+        testCase === 'hyphenation' ||
+        testCase === 'hyphenation-off'
+    ) {
         return { w: 1190, h: 1684 };
     }
     return { w: 400, h: 400 };

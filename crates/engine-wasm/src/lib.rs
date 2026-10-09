@@ -45,6 +45,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod pdf_semantics;
+mod read_report;
 /// Issue #379 — the content-keyed table layout cache that survives
 /// between paints.
 mod table_cache;
@@ -2439,6 +2440,31 @@ fn build_inline_object_infos(
                     },
                 }
             }
+            /* Issue #357 — a `<w:sym>` shapes its Unicode equivalent; a
+            `<w:ptab>` is a tab whose stop the margins fix. Neither
+            reserves an extent of its own. */
+            engine::InlineKind::Symbol { font, char } => layout::paragraph::InlineObjectInfo {
+                at: obj.at,
+                width_px: 0.0,
+                height_px: 0.0,
+                kind: layout::paragraph::InlineObjectInfoKind::Symbol {
+                    text: engine::run_content::symbol_char(font, char).to_string(),
+                },
+            },
+            engine::InlineKind::PositionalTab {
+                alignment,
+                relative_to,
+                leader,
+            } => layout::paragraph::InlineObjectInfo {
+                at: obj.at,
+                width_px: 0.0,
+                height_px: 0.0,
+                kind: layout::paragraph::InlineObjectInfoKind::PositionalTab {
+                    alignment: *alignment,
+                    relative_to: *relative_to,
+                    leader: *leader,
+                },
+            },
         })
         .collect()
 }
@@ -2807,12 +2833,16 @@ struct StyleContext<'a> {
     /// into every paragraph layout key: the same text and bindings under
     /// another theme must never hit a cached box.
     theme_key: u64,
+    /// Issue #326 — the document's hyphenation settings (`None`: a
+    /// layout outside a document — automatic hyphenation off).
+    settings: Option<&'a engine::DocumentSettings>,
 }
 
 impl<'a> StyleContext<'a> {
     fn of(doc: &'a engine::DocumentTree) -> StyleContext<'a> {
         let theme = doc.theme.as_deref();
         StyleContext {
+            settings: Some(&doc.settings),
             styles: &doc.styles,
             run_defaults: &doc.style_run_defaults,
             note_markers: None,
@@ -3365,6 +3395,22 @@ fn paragraph_layout_key(
                 5u8.hash(&mut h);
                 text_box_key(story, *width_emu, *height_emu).hash(&mut h);
             }
+            /* Issue #357. */
+            engine::InlineKind::Symbol { font, char } => {
+                6u8.hash(&mut h);
+                font.hash(&mut h);
+                char.hash(&mut h);
+            }
+            engine::InlineKind::PositionalTab {
+                alignment,
+                relative_to,
+                leader,
+            } => {
+                7u8.hash(&mut h);
+                alignment.hash(&mut h);
+                relative_to.hash(&mut h);
+                leader.hash(&mut h);
+            }
         }
         match io.anchor.as_deref() {
             None => 0u8.hash(&mut h),
@@ -3507,7 +3553,9 @@ fn paragraph_layout_key(
                     mark.hash(&mut h);
                 }
             }
-            engine::InlineKind::Image { .. } => {}
+            engine::InlineKind::Image { .. }
+            | engine::InlineKind::Symbol { .. }
+            | engine::InlineKind::PositionalTab { .. } => {}
         }
     }
     cfg.font_id.hash(&mut h);
@@ -3516,6 +3564,21 @@ fn paragraph_layout_key(
     cfg.line_height.to_bits().hash(&mut h);
     tp_align_disc(cfg.alignment).hash(&mut h);
     scale.to_bits().hash(&mut h);
+    /* Issue #326 — automatic hyphenation is a layout input: the settings
+    and the hyphenatable ranges (the resolved run languages). Mixed in
+    only when it applies, so every other key is unchanged. */
+    let hy_ranges = auto_hyphenation_ranges(para, sctx);
+    if let Some(s) = sctx.settings.filter(|_| !hy_ranges.is_empty()) {
+        0x326_u16.hash(&mut h);
+        s.hyphenation_zone_twips().hash(&mut h);
+        s.consecutive_hyphen_limit.hash(&mut h);
+        s.do_not_hyphenate_caps.hash(&mut h);
+        for (r, hy) in &hy_ranges {
+            r.start.hash(&mut h);
+            r.end.hash(&mut h);
+            (*hy as *const text_pipeline::Hyphenator as usize).hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -3756,6 +3819,7 @@ fn layout_note_paragraph_with_composition(
         px_size_for_marker: cfg.px_size * scale,
         inline_objects: &infos,
         tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+        hyphenation: None,
     })
 }
 
@@ -4197,6 +4261,7 @@ fn build_header_footer_box(
                     px_size_for_marker: cfg.px_size * scale,
                     inline_objects: &inline_infos,
                     tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+                    hyphenation: None,
                 });
                 /* Phase 2 audit (gap D.1) — propagate field overlays so
                 the paginator can re-evaluate PAGE / NUMPAGES per page.
@@ -5679,6 +5744,18 @@ fn layout_paragraph_wrapped_uncached(
     let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
     let (spans, lh_px) =
         paragraph_layout_spans(para, sctx, fonts, cfg, scale, base_direction, lh_px);
+    /* Issue #326 — automatic hyphenation (document setting, paragraph
+    not suppressing it, text in a language with patterns). */
+    let hy_ranges = auto_hyphenation_ranges(para, sctx);
+    let hyphenation =
+        sctx.settings
+            .filter(|_| !hy_ranges.is_empty())
+            .map(|s| layout::hyphen::AutoHyphenation {
+                ranges: &hy_ranges,
+                zone_px: twips_to_layout_px(s.hyphenation_zone_twips() as i32, scale),
+                consecutive_limit: s.consecutive_hyphen_limit.unwrap_or(0),
+                no_caps: s.do_not_hyphenate_caps,
+            });
     let para_cfg = ParagraphConfig {
         text: &para.text,
         fonts,
@@ -5696,8 +5773,61 @@ fn layout_paragraph_wrapped_uncached(
         px_size_for_marker: cfg.px_size * scale,
         inline_objects: &inline_infos,
         tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+        hyphenation: hyphenation.as_ref(),
     };
     layout::layout_paragraph_wrapped(para_cfg, cuts)
+}
+
+/// Issue #326 — the byte ranges of `para` automatic hyphenation may break
+/// words in, each with its language's hyphenator: empty unless the
+/// document turns `<w:autoHyphenation/>` on and the paragraph's cascade
+/// does not `<w:suppressAutoHyphens/>`. A range's language is its run's
+/// `<w:lang w:val>` resolved through docDefaults → paragraph style →
+/// direct formatting, else the theme's `<w:themeFontLang w:val>` (the
+/// document's declared main language); only languages with registered
+/// patterns (`text_pipeline::Hyphenator::for_language` — en-US in this
+/// cut) yield a range. Complex-script text is skipped by the composer
+/// itself (Arabic never hyphenates).
+fn auto_hyphenation_ranges(
+    para: &engine::Paragraph,
+    sctx: StyleContext,
+) -> Vec<(std::ops::Range<u32>, &'static text_pipeline::Hyphenator)> {
+    let mut out: Vec<(std::ops::Range<u32>, &'static text_pipeline::Hyphenator)> = Vec::new();
+    if !sctx.settings.is_some_and(|s| s.auto_hyphenation)
+        || para.props.suppress_auto_hyphens == Some(true)
+        || para.text.is_empty()
+    {
+        return out;
+    }
+    let run_base = sctx.run_base(para.style_id.as_deref());
+    let fallback = sctx.theme.and_then(|t| t.font_lang.latin.as_deref());
+    let mut push = |style: &engine::SpanStyle, start: u32, end: u32| {
+        if start >= end {
+            return;
+        }
+        let tag = style
+            .lang
+            .as_ref()
+            .and_then(|l| l.val.as_deref())
+            .or(fallback);
+        let Some(h) = tag.and_then(text_pipeline::Hyphenator::for_language) else {
+            return;
+        };
+        match out.last_mut() {
+            Some((r, last)) if r.end == start && std::ptr::eq(*last, h) => r.end = end,
+            _ => out.push((start..end, h)),
+        }
+    };
+    let len = para.text.len() as u32;
+    let mut cursor = 0_u32;
+    for sr in &para.spans {
+        push(&run_base, cursor, sr.start.min(len));
+        let style = run_base.clone().merged_with(sr.style.clone());
+        push(&style, sr.start.min(len), sr.end.min(len));
+        cursor = sr.end.min(len);
+    }
+    push(&run_base, cursor, len);
+    out
 }
 
 /// Issue #87 — post-conditions a cached `ParagraphBox` must satisfy for
@@ -5812,6 +5942,19 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
     for run in &line.runs {
         let run_start_x = line_abs_x + pen;
         let run_advance: f32 = run.glyphs.iter().map(|g| g.x_advance).sum();
+        /* Issues #335 / #326 — a hyphenated line's drawn hyphen sits at its
+        logical end (the trailing glyph of an LTR run, the leading one of an
+        RTL run): the end-of-run caret stops BEFORE it, at the last
+        character, not past ink that is not text. */
+        let hyphen_adv = |glyphs: &mut dyn Iterator<Item = &layout::PositionedGlyph>| -> f32 {
+            if line.hyphen.is_none() {
+                return 0.0;
+            }
+            glyphs
+                .take_while(|g| g.synthetic)
+                .map(|g| g.x_advance)
+                .sum()
+        };
         let mut slots: Vec<CaretSlot> = Vec::new();
         match run.direction {
             ShapingDirection::Ltr => {
@@ -5828,7 +5971,7 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
                     cum += g.x_advance;
                 }
                 slots.push(CaretSlot {
-                    x: run_start_x + run_advance,
+                    x: run_start_x + run_advance - hyphen_adv(&mut run.glyphs.iter().rev()),
                     byte: run.source_range.end,
                 });
             }
@@ -5846,7 +5989,7 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
                     cum += g.x_advance;
                 }
                 slots.push(CaretSlot {
-                    x: run_start_x,
+                    x: run_start_x + hyphen_adv(&mut run.glyphs.iter()),
                     byte: run.source_range.end,
                 });
             }
@@ -7447,8 +7590,9 @@ const A11Y_PLACEHOLDER_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
 /// Issue #203 / #215 — one U+FFFC sentinel's replacement inside a
 /// paragraph, for [`a11y_runs`]: a note reference / self-mark (`note_ref`
 /// or bare marker `text`), or (issue #215) an inline image / text box
-/// (`object`, `text` empty — the object IS the run). Exactly one of
-/// `note_ref` / `object` is ever set.
+/// (`object`, `text` empty — the object IS the run), or (issue #357) a
+/// symbol / positional tab (plain `text`: its Unicode equivalent, a tab).
+/// At most one of `note_ref` / `object` is ever set.
 struct A11ySentinelMark {
     at: u32,
     text: String,
@@ -7547,6 +7691,20 @@ fn a11y_inline_marks(
                     }),
                 });
             }
+            /* Issue #357 — a symbol reads as its Unicode equivalent, a
+            positional tab as a tab: never the U+FFFC placeholder. */
+            engine::InlineKind::Symbol { font, char } => marks.push(A11ySentinelMark {
+                at: io.at,
+                text: engine::run_content::symbol_char(font, char).to_string(),
+                note_ref: None,
+                object: None,
+            }),
+            engine::InlineKind::PositionalTab { .. } => marks.push(A11ySentinelMark {
+                at: io.at,
+                text: "\t".to_string(),
+                note_ref: None,
+                object: None,
+            }),
             _ => {
                 if let Some(notes) = scope.notes
                     && let Some(anchor) = note_ref_anchor(&io.kind)
@@ -8020,6 +8178,7 @@ fn patch_to_latin_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
         (`SpanStyle::merged_with`). */
         font_bindings: None,
         color_theme: None,
+        lang: None,
         /* Issues #359 / #104 / #249 — the complex-script twins and the
         character style are filled by the slot routing
         (`patch_to_span_style`); a patch never names a character style. */
@@ -8134,6 +8293,16 @@ impl Engine {
     }
 
     async fn apply_command(&mut self, cmd: Command) -> Event {
+        /* Issue #407 — argument validation first: a NaN / infinite number
+        anywhere in the command (a JS `NaN` crosses `serde-wasm-bindgen`
+        into an `f32` unchanged, and `f32::clamp` passes it through) is
+        refused before any gate or handler can act on it. */
+        if let Some(bad) = cmd.first_non_finite() {
+            return Event::Error {
+                message: format!("{}: {bad}", cmd.kind().name()),
+                kind: Some(bridge::ErrorKind::InvalidArgument),
+            };
+        }
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
         }
@@ -9183,9 +9352,14 @@ impl Engine {
         let mut pending_zoom: Option<f32> = None;
         let mut applied_commands: u32 = 0;
         for cmd in log_tail {
+            /* Issue #407 — a logged non-finite scale is refused by the
+            replayed `apply` below; never let it reach the stashed config
+            (`f32::clamp` keeps NaN). */
             match &cmd {
-                Command::SetDeviceScale { scale } => pending_base_scale = Some(*scale),
-                Command::SetZoom { scale } => pending_zoom = Some(*scale),
+                Command::SetDeviceScale { scale } if scale.is_finite() => {
+                    pending_base_scale = Some(*scale)
+                }
+                Command::SetZoom { scale } if scale.is_finite() => pending_zoom = Some(*scale),
                 _ => {}
             }
             /* Replayed events are not observable: the shell rebuilds its
@@ -10601,6 +10775,7 @@ impl Engine {
                                     px_size_for_marker: cfg.px_size * scale,
                                     inline_objects: &[],
                                     tab_stops_px: &tab_stops_px,
+                                    hyphenation: None,
                                 },
                                 cuts,
                             )
@@ -16916,6 +17091,7 @@ impl Engine {
                 grab_bag: None,
                 font_bindings: None,
                 color_theme: None,
+                lang: None,
                 font_size_cs: None,
                 bold_cs: None,
                 italic_cs: None,
@@ -17245,7 +17421,10 @@ impl Engine {
         if let Err(e) = self.install_new_document(doc) {
             return *e;
         }
-        Event::DocumentLoaded { paragraph_count }
+        Event::DocumentLoaded {
+            paragraph_count,
+            warnings: Vec::new(),
+        }
     }
 
     /// Issue #338 — `Command::CloseDocument`: back to the seeded empty
@@ -17343,10 +17522,18 @@ impl Engine {
                 the status bar reported the new one. Surface the error; the
                 document itself is loaded, and the shell decides how to
                 present the failure. */
+                /* Issue #406 — the reader's warning report rides the
+                reply: an open that clamped a margin or normalised a part
+                is visibly degraded, never indistinguishable from a clean
+                one. */
+                let warnings = read_report::bridge_read_warnings(&archive.warnings);
                 if let Err(e) = self.install_new_document(archive.document) {
                     return *e;
                 }
-                Event::DocumentLoaded { paragraph_count }
+                Event::DocumentLoaded {
+                    paragraph_count,
+                    warnings,
+                }
             }
             Err(e) => {
                 let kind = match e {
@@ -17443,8 +17630,10 @@ impl Engine {
     /// leaves NaN untouched). A finite value outside `[0.25, 4.0]` is
     /// still silently clamped, same as before.
     fn do_set_zoom(&mut self, zoom: f32) -> Event {
+        /* Unreachable through `apply` since #407 (the finite() guard
+        refuses first, with the same kind); kept for direct callers. */
         if let Err(e) = engine::validate_finite_scale(zoom) {
-            return Event::error_kind(bridge::ErrorKind::OutOfRange, format!("SetZoom: {e}"));
+            return Event::error_kind(bridge::ErrorKind::InvalidArgument, format!("SetZoom: {e}"));
         }
         let zoom = zoom.clamp(0.25, 4.0);
         let Some(cfg) = self.layout_cfg.as_mut() else {
@@ -17476,7 +17665,7 @@ impl Engine {
     fn do_set_device_scale(&mut self, scale: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(scale) {
             return Event::error_kind(
-                bridge::ErrorKind::OutOfRange,
+                bridge::ErrorKind::InvalidArgument,
                 format!("SetDeviceScale: {e}"),
             );
         }
@@ -19338,6 +19527,7 @@ mod tests {
             source_start: 0,
             segments: Vec::new(),
             segment: 0,
+            hyphen: layout::LineHyphen::None,
         };
         let geom = build_line_run_geom(&line, 0.0);
         assert_eq!(geom.len(), 1);
@@ -20061,6 +20251,7 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
+            settings: None,
         }
     }
 
@@ -20093,6 +20284,7 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
+            settings: None,
         };
         let mut para = engine::Paragraph {
             text: "hello world".into(),
@@ -20158,6 +20350,7 @@ mod tests {
             note_self_mark: None,
             theme,
             theme_key: key,
+            settings: None,
         };
         let theme: &'static engine::DocumentTheme = Box::leak(Box::new(theme));
         let mut para = engine::Paragraph {
@@ -20282,6 +20475,7 @@ mod tests {
                 px_size_for_marker: 12.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                hyphenation: None,
             })
             .size
             .height
@@ -20346,6 +20540,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert!(
@@ -20390,6 +20585,7 @@ mod tests {
             px_size_for_marker: 16.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert!(
@@ -20435,6 +20631,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         let trailing_edge = marker.origin.x + marker.width;
@@ -20503,6 +20700,7 @@ mod tests {
                 px_size_for_marker: 12.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                hyphenation: None,
             });
             let marker = para.marker.as_ref().expect("marker box");
             assert!(
@@ -20564,6 +20762,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         let marker = para.marker.as_ref().expect("marker box");
         assert_eq!(
@@ -29160,6 +29359,10 @@ mod toggle_formatting_tests;
 #[cfg(test)]
 mod complex_script_tests;
 
+/// Issues #335 / #357 / #326 — run-content elements and hyphenation.
+#[cfg(test)]
+mod run_content_tests;
+
 /// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
 /// `format_pdf::export_pdf` path, end to end (not the #144 acceptance
 /// test's `layout_paragraph`-simulated TOC-entry-shaped paragraph).
@@ -29263,6 +29466,10 @@ mod document_protection_tests;
 
 /// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
 mod protection_gate;
+
+/// Issue #407 — the command-boundary finiteness guard (`InvalidArgument`).
+#[cfg(test)]
+mod finite_guard_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

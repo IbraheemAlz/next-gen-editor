@@ -874,6 +874,8 @@ mod tests {
                     inner: b"\n  ".to_vec(),
                 })),
                 bare_edge_ws: true,
+                /* Issue #335 — literal hyphen characters in the `<w:t>`. */
+                literal_hyphens: true,
             }],
             markers: vec![
                 SourceMarker {

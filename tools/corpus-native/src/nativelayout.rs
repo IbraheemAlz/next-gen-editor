@@ -244,6 +244,7 @@ fn build_paragraph_box(
         marker_text: p.resolved_marker.clone(),
         px_size_for_marker: base_px,
         tab_stops_px: &[],
+        hyphenation: None,
     });
     para_box.borders = p.props.borders.clone();
     para_box.shading = p.props.shading;

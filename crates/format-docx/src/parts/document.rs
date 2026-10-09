@@ -23,7 +23,7 @@ use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
 use crate::schema::mce;
-use crate::schema::measure::{PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt};
+use crate::schema::measure::{PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt, attr_measure_twips};
 use crate::schema::source_markup::{
     MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_empty_run_child,
     is_modeled_textless_run_child,
@@ -871,12 +871,14 @@ fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
 }
 
 /// Audit gap A.M3 — parse one `<w:tab w:val w:pos/>` child.
-/// `w:val` defaults to `left`; `w:pos` is twips (signed integer per
-/// spec). Returns `None` for malformed entries (missing pos) so they
-/// don't pollute the stop list with NaNs.
+/// `w:val` defaults to `left`; `w:pos` is `ST_SignedTwipsMeasure`.
+/// Returns `None` for malformed entries (missing or unusable pos) so they
+/// don't pollute the stop list with NaNs. Issue #407 — through the
+/// measure reader: unit suffixes honoured, NaN / infinite rejected and
+/// reported, clamped to ±22 in.
 pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine::TabStop> {
     use crate::schema::ct_rpr::attr_val;
-    let pos_twips: i32 = attr_val(e, b"w:pos")?.trim().parse().ok()?;
+    let position_pt = attr_measure_pt(e, b"w:pos", SIGNED_TWIPS)?;
     let kind = match attr_val(e, b"w:val").as_deref().map(str::trim) {
         Some("center") => engine::TabKind::Center,
         Some("right") | Some("end") => engine::TabKind::Right,
@@ -885,7 +887,7 @@ pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine
         _ => engine::TabKind::Left,
     };
     Some(engine::TabStop {
-        position_pt: (pos_twips as f32) / 20.0,
+        position_pt,
         kind,
         /* Issue #81 — `w:leader` (TOC dot leaders). */
         leader: attr_val(e, b"w:leader")
@@ -975,9 +977,10 @@ impl SectPrAccum {
                 let num = attr_val(e, b"w:num")
                     .and_then(|v| v.trim().parse::<u8>().ok())
                     .unwrap_or(1);
-                let space = attr_val(e, b"w:space")
-                    .and_then(|v| v.trim().parse::<i32>().ok())
-                    .unwrap_or(720);
+                /* Issue #407 — `ST_TwipsMeasure` through the measure
+                reader (an unusable gutter keeps the 720 default and is
+                reported). */
+                let space = attr_measure_twips(e, b"w:space", TWIPS).unwrap_or(720);
                 if num > 1 {
                     self.columns = Some(engine::ColumnSpec::from_twips(num, space));
                 }
@@ -1447,6 +1450,9 @@ pub(crate) fn parse_document_xml_with_events(
     closes. `target` is the rId at this stage — the archive resolver
     swaps it to a URL via the rels map in a second pass. */
     let mut hyperlink_stack: Vec<(String, u32, Vec<engine::SourceAttr>)> = Vec::new();
+    /* Issue #357 — `<w:dir>` / `<w:bdo>` wrappers open in the current
+    paragraph (each pushed its control into the text). */
+    let mut bidi_wrappers_open: u32 = 0;
 
     /* Phase 6 — `<w:sectPr>` accumulators. A sectPr can live in two places:
     inside a paragraph's `<w:pPr>` (ends a section *at* that paragraph,
@@ -1869,6 +1875,7 @@ pub(crate) fn parse_document_xml_with_events(
                         p_start_byte = Some(prev_pos);
                         envelopes.note_block_start(prev_pos);
                         markup.open_paragraph(&e, &ns, reader.buffer_position() as usize);
+                        bidi_wrappers_open = 0;
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pbdr_logical = PbdrLogical::default();
@@ -1964,6 +1971,25 @@ pub(crate) fn parse_document_xml_with_events(
                         hyperlink_stack.push((target, start, attrs));
                         /* Issue #384 — a wrapper start for marker slots. */
                         markup.wrapper_open(start);
+                    }
+                    /* Issue #357 — `<w:dir>` (§17.3.2.8, an embedding) and
+                    `<w:bdo>` (§17.3.2.3, an override) wrap runs: their
+                    UAX #9 control opens in the text here and U+202C closes
+                    it at the end tag, so BiDi resolution applies them; the
+                    writer turns each balanced pair back into the wrapper. */
+                    b"w:dir" | b"w:bdo"
+                        if p_start_byte.is_some()
+                            && !in_run
+                            && !field_code_hidden(&field_stack, &field_cap) =>
+                    {
+                        let rtl = attr_val(&e, b"w:val").is_some_and(|v| v.trim() == "rtl");
+                        let wrapper = if name.as_ref() == b"w:dir" {
+                            engine::run_content::BidiWrapper::Dir { rtl }
+                        } else {
+                            engine::run_content::BidiWrapper::Bdo { rtl }
+                        };
+                        para_text.push(wrapper.opener());
+                        bidi_wrappers_open += 1;
                     }
                     b"w:t" => {
                         in_text_elt = true;
@@ -2139,6 +2165,12 @@ pub(crate) fn parse_document_xml_with_events(
                                     Some(crate::parts::format_change::format_change_revision(
                                         &e, &frag, &ns, resolver,
                                     ));
+                            }
+                            /* Issue #326 — `<w:lang>` is also read
+                            (hyphenation); the bag stays the writer's
+                            source. */
+                            if n == b"w:lang" {
+                                apply_rpr(n, &e, &mut direct_rpr);
                             }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
                         }
@@ -2358,7 +2390,54 @@ pub(crate) fn parse_document_xml_with_events(
                     as text too doubled it on every save. */
                     b"w:tab" | b"w:br" if in_rpr => {}
                     /* Issue #350 — inside field code: not visible. */
-                    b"w:tab" | b"w:br" if in_run && field_code_hidden(&field_stack, &field_cap) => {
+                    b"w:tab" | b"w:br" | b"w:softHyphen" | b"w:noBreakHyphen" | b"w:cr"
+                    | b"w:sym" | b"w:ptab"
+                        if in_run && field_code_hidden(&field_stack, &field_cap) => {}
+                    /* Issue #357 — `<w:cr/>` (§17.3.3.4) is a line break:
+                    U+000D, laid out like `<w:br/>`, written back as itself. */
+                    b"w:cr" if in_run => run_text.push(engine::run_content::CARRIAGE_RETURN),
+                    /* Issue #357 — `<w:sym w:font w:char/>` (§17.3.3.30) and
+                    `<w:ptab/>` (§17.3.3.23): a U+FFFC anchor and the typed
+                    object (the symbol's attributes verbatim; the positional
+                    tab's alignment / reference edges / leader). */
+                    b"w:sym" | b"w:ptab" if in_run => {
+                        let kind = if name.as_ref() == b"w:sym" {
+                            engine::InlineKind::Symbol {
+                                font: attr_val(&e, b"w:font").unwrap_or_default(),
+                                char: attr_val(&e, b"w:char").unwrap_or_default(),
+                            }
+                        } else {
+                            use engine::run_content::{PTabAlignment, PTabLeader, PTabRelativeTo};
+                            let attr = |k: &[u8]| attr_val(&e, k).unwrap_or_default();
+                            engine::InlineKind::PositionalTab {
+                                alignment: PTabAlignment::parse(&attr(b"w:alignment")),
+                                relative_to: PTabRelativeTo::parse(&attr(b"w:relativeTo")),
+                                leader: PTabLeader::parse(&attr(b"w:leader")),
+                            }
+                        };
+                        let at = (para_text.len() + run_text.len()) as u32;
+                        run_text.push('\u{FFFC}');
+                        para_inline_objects.push(engine::InlineObject {
+                            at,
+                            kind,
+                            anchor: None,
+                            source_xml: None,
+                        });
+                    }
+                    /* Issue #335 — `<w:softHyphen/>` (ECMA-376 §17.3.3.29,
+                    an optional hyphen: a break opportunity that shows a
+                    hyphen only when the line breaks there) and
+                    `<w:noBreakHyphen/>` (§17.3.3.18, a hyphen that never
+                    breaks) enter the text as U+00AD SOFT HYPHEN / U+2011
+                    NON-BREAKING HYPHEN. The writer turns both characters
+                    back into the elements (never the raw characters). */
+                    b"w:softHyphen" if in_run => {
+                        run_text.push(engine::run_content::SOFT_HYPHEN);
+                        markup.run_hyphen_element();
+                    }
+                    b"w:noBreakHyphen" if in_run => {
+                        run_text.push(engine::run_content::NON_BREAKING_HYPHEN);
+                        markup.run_hyphen_element();
                     }
                     b"w:tab" if in_run => {
                         /* Audit gap A.M5 — `<w:tab/>` inside a `<w:r>`.
@@ -2697,6 +2776,12 @@ pub(crate) fn parse_document_xml_with_events(
                                         &e, &frag, &ns, resolver,
                                     ));
                             }
+                            /* Issue #326 — `<w:lang>` is also read
+                            (hyphenation); the bag stays the writer's
+                            source. */
+                            if n == b"w:lang" {
+                                apply_rpr(n, &e, &mut direct_rpr);
+                            }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
                         }
                     }
@@ -2722,9 +2807,10 @@ pub(crate) fn parse_document_xml_with_events(
                         /* Issue #84 — unmodeled `<w:pPr>` leaf child
                         (`<w:framePr>`, `<w:cnfStyle>`, `<w:widowControl>`,
                         `<w:outlineLvl>`, …) → the paragraph's grab bag. */
-                        if n == b"w:outlineLvl" {
+                        if n == b"w:outlineLvl" || n == b"w:suppressAutoHyphens" {
                             /* Issue #81 — also read it (TOC `\u`); the
-                            grab bag stays the writer's source. */
+                            grab bag stays the writer's source. Issue #326
+                            — likewise the hyphenation switch. */
                             apply_ppr(n, &e, &mut direct_ppr);
                         }
                         let end = reader.buffer_position() as usize;
@@ -3039,6 +3125,11 @@ pub(crate) fn parse_document_xml_with_events(
                                 });
                             }
                         }
+                    }
+                    /* Issue #357 — the wrapper's end pops its control. */
+                    b"w:dir" | b"w:bdo" if bidi_wrappers_open > 0 && !in_run => {
+                        para_text.push(engine::run_content::POP_DIRECTIONAL);
+                        bidi_wrappers_open -= 1;
                     }
                     b"w:footnotePr" | b"w:endnotePr" if in_sect_pr => {
                         /* Issue #80 — close the note-props scope. */

@@ -300,6 +300,9 @@ struct RunCapture {
     /// Issue #384 — the last child read was leading content (`lead`):
     /// whitespace after it belongs to the lead bytes.
     lead_last: bool,
+    /// Issue #335 — the run held a `<w:softHyphen/>` / `<w:noBreakHyphen/>`
+    /// element (see [`SourceRun::literal_hyphens`]).
+    hyphen_element: bool,
 }
 
 /// Issue #384 — the wrapper boundaries (starts and ends of hyperlinks,
@@ -921,6 +924,15 @@ impl MarkupCapture {
         }
     }
 
+    /// Issue #335 — the open run holds a `<w:softHyphen/>` /
+    /// `<w:noBreakHyphen/>` element (its character in the text is that
+    /// element's, not a literal one).
+    pub fn run_hyphen_element(&mut self) {
+        if let Some(r) = self.run.as_mut() {
+            r.hyphen_element = true;
+        }
+    }
+
     /// The open run holds modeled text-less content
     /// ([`is_modeled_textless_run_child`]).
     pub fn run_modeled(&mut self) {
@@ -942,6 +954,12 @@ impl MarkupCapture {
                 .as_ref()
                 .is_some_and(|a| !a.iter().any(|a| a.name == "xml:space"))
                 && text_needs_preserve(text);
+            /* Issue #335 — hyphen characters the source wrote literally. */
+            let literal_hyphens = !r.hyphen_element
+                && text.contains([
+                    engine::run_content::SOFT_HYPHEN,
+                    engine::run_content::NON_BREAKING_HYPHEN,
+                ]);
             self.runs.push(SourceRun {
                 start,
                 end,
@@ -952,6 +970,7 @@ impl MarkupCapture {
                 t_attrs: r.t_attrs,
                 pad,
                 bare_edge_ws,
+                literal_hyphens,
             });
         }
         self.boundary_barrier();

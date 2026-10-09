@@ -318,6 +318,7 @@ fn build_paragraph_box(
         marker_text: p.resolved_marker.clone(),
         px_size_for_marker: marker_px,
         tab_stops_px: &[],
+        hyphenation: None,
     };
 
     let mut pbox = layout_paragraph(cfg);

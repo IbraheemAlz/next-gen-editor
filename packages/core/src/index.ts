@@ -124,6 +124,9 @@ export type {
 } from './commandMeta.generated';
 export type { RecoveryNotice, RecoveryNoticeKind, RecoveryNoticeOptions } from './recovery';
 
+/* Issue #406 — the reader's warning report for the open document. */
+export { READ_WARNING_LABELS, openWarningCount, describeReadWarning } from './openWarnings';
+
 export type {
     Command,
     Event,
@@ -131,6 +134,8 @@ export type {
     DocumentDefaults,
     DefaultPageSize,
     ErrorKind,
+    ReadWarning,
+    ReadWarningKind,
     ProtectionMode,
     PackageLimitsOverride,
     TextAttrsPatch,

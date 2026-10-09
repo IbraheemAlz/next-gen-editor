@@ -371,6 +371,7 @@ mod tests {
             px_size_for_marker: 12.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            hyphenation: None,
         });
         para.source_paragraph_id = 0;
         let page = PageBox {

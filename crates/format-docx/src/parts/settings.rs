@@ -31,6 +31,14 @@ pub struct SettingsPart {
     /// Issue #355 — `<w:clrSchemeMapping>`: logical theme colour → scheme
     /// slot, attribute local name → value, verbatim.
     pub clr_scheme_mapping: engine::ColorSchemeMapping,
+    /// Issue #326 — `<w:autoHyphenation/>`.
+    pub auto_hyphenation: bool,
+    /// Issue #326 — `<w:hyphenationZone w:val>`, twips.
+    pub hyphenation_zone: Option<u32>,
+    /// Issue #326 — `<w:consecutiveHyphenLimit w:val>`.
+    pub consecutive_hyphen_limit: Option<u32>,
+    /// Issue #326 — `<w:doNotHyphenateCaps/>`.
+    pub do_not_hyphenate_caps: bool,
     /// Issue #345 — `<w:documentProtection>`, `None` when absent.
     pub protection: Option<engine::DocumentProtection>,
 }
@@ -117,18 +125,45 @@ pub fn parse_settings_xml(xml: &[u8]) -> Result<SettingsPart, DocxError> {
                 crate::parts::footnotes::apply_note_pr_child(name.as_ref(), &e, props);
             }
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:defaultTabStop" => {
-                out.default_tab_stop_twips = e
-                    .attributes()
-                    .flatten()
-                    .find(|a| a.key.as_ref() == b"w:val")
-                    .and_then(|a| a.unescape_value().ok())
-                    .and_then(|v| v.parse().ok());
+                /* Issue #407 — `ST_TwipsMeasure` through the measure
+                reader (NaN / negative rejected and reported, clamped). */
+                out.default_tab_stop_twips = crate::schema::measure::attr_measure_twips(
+                    &e,
+                    b"w:val",
+                    crate::schema::measure::TWIPS,
+                )
+                .and_then(|t| u32::try_from(t).ok());
             }
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:documentProtection" => {
                 out.protection = Some(document_protection(e.attributes()));
             }
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:evenAndOddHeaders" => {
                 out.even_and_odd_headers = toggle_attr(e.attributes());
+            }
+            /* Issue #326 — the hyphenation settings. */
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:autoHyphenation" => {
+                out.auto_hyphenation = toggle_attr(e.attributes());
+            }
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:doNotHyphenateCaps" => {
+                out.do_not_hyphenate_caps = toggle_attr(e.attributes());
+            }
+            Event::Empty(e) | Event::Start(e)
+                if matches!(
+                    e.name().as_ref(),
+                    b"w:hyphenationZone" | b"w:consecutiveHyphenLimit"
+                ) =>
+            {
+                let val = e
+                    .attributes()
+                    .flatten()
+                    .find(|a| a.key.as_ref() == b"w:val")
+                    .and_then(|a| a.unescape_value().ok())
+                    .and_then(|v| v.trim().parse::<u32>().ok());
+                if e.name().as_ref() == b"w:hyphenationZone" {
+                    out.hyphenation_zone = val;
+                } else {
+                    out.consecutive_hyphen_limit = val;
+                }
             }
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:themeFontLang" => {
                 for a in e.attributes().flatten() {
@@ -244,5 +279,25 @@ mod tests {
         assert_eq!(s.clr_scheme_mapping.entries["t1"], "dark1");
         assert_eq!(s.clr_scheme_mapping.entries["hyperlink"], "hyperlink");
         assert_eq!(s.clr_scheme_mapping.entries.len(), 6);
+    }
+
+    /// Issue #326 — the hyphenation settings Word writes.
+    #[test]
+    fn reads_the_hyphenation_settings() {
+        let xml = concat!(
+            r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:autoHyphenation/><w:consecutiveHyphenLimit w:val="2"/>"#,
+            r#"<w:hyphenationZone w:val="425"/><w:doNotHyphenateCaps/></w:settings>"#,
+        );
+        let s = parse_settings_xml(xml.as_bytes()).expect("parse");
+        assert!(s.auto_hyphenation && s.do_not_hyphenate_caps);
+        assert_eq!(s.hyphenation_zone, Some(425));
+        assert_eq!(s.consecutive_hyphen_limit, Some(2));
+        let off = parse_settings_xml(
+            br#"<w:settings xmlns:w="x"><w:autoHyphenation w:val="false"/></w:settings>"#,
+        )
+        .expect("parse");
+        assert!(!off.auto_hyphenation);
+        assert_eq!(off.hyphenation_zone, None);
     }
 }

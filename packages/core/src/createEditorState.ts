@@ -41,6 +41,7 @@ import type {
     LayoutDegraded,
     PreviousSessionInfo,
     LogicalRange,
+    ReadWarning,
     ProtectionMode,
     RecoveryReport,
     Rect,
@@ -283,6 +284,18 @@ export interface EditorState {
      */
     previousSession: Accessor<PreviousSessionInfo | undefined>;
     /**
+     * Issue #406 - the reader's warning report for the document that is
+     * open (`DOCUMENT_LOADED.warnings`, coalesced: an entry's `count` says
+     * how many identical warnings it stands for). Empty after a clean
+     * open, a `.txt` / `.html` open, a `closeDocument()` or a restored
+     * previous session; non-empty means the file opened DEGRADED (a
+     * clamped page margin, a part read through namespace normalisation,
+     * ...) and the UI must say so (`@nge/ui` `OpenWarningsBanner`; feed
+     * entries to `describeReadWarning()`). Survives a crash recovery of
+     * the same document. Shared like `zoom`.
+     */
+    openWarnings: Accessor<ReadWarning[]>;
+    /**
      * Issue #426 - every previous session still waiting for a decision
      * (the archive ring, newest first); `previousSession` is the first.
      */
@@ -346,10 +359,23 @@ interface ViewState {
     checkpointState: Accessor<CheckpointHealth>;
     lastError: Accessor<EditorError | undefined>;
     previousSession: Accessor<PreviousSessionInfo | undefined>;
+    openWarnings: Accessor<ReadWarning[]>;
+    clearOpenWarnings: () => void;
     previousSessions: Accessor<PreviousSessionInfo[]>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
+
+/**
+ * Issue #406 - forget the open document's reader warnings (the document
+ * they describe is gone). `createEditorCommands().closeDocument()` calls
+ * this once the engine confirmed the close; the CLOSE_DOCUMENT reply is a
+ * plain `SELECTION_CHANGED`, which the shared subscription cannot tell
+ * apart from any other. Internal to `@nge/core`.
+ */
+export function clearOpenWarnings(engine: EngineHandle): void {
+    viewStateFor(engine).clearOpenWarnings();
+}
 
 /** f32 → f64 noise (`1.100000023841858`) would defeat the `<select>`'s
  *  preset matching; four decimals is far below any zoom step. */
@@ -375,7 +401,15 @@ function viewStateFor(engine: EngineHandle): ViewState {
         const [lastRecovery, setLastRecovery] = createSignal<RecoveryReport | undefined>(
             engine.lastRecovery,
         );
-        engine.onRecovery?.((report) => setLastRecovery(() => report));
+        /* Issue #406 - the open document's reader warnings. A crash
+           recovery of the SAME document keeps them (the degraded read is
+           what the restored model holds); restoring the previous session
+           swaps the document, so its open's warnings no longer apply. */
+        const [openWarnings, setOpenWarnings] = createSignal<ReadWarning[]>([]);
+        engine.onRecovery?.((report) => {
+            setLastRecovery(() => report);
+            if (report.cause === 'session-restore') setOpenWarnings([]);
+        });
         /* Issue #333 - checkpoint health, seeded then fed by the client. */
         const toHealth = (s: CheckpointStatus | undefined): CheckpointHealth => ({
             ok: s?.failing !== true,
@@ -435,7 +469,11 @@ function viewStateFor(engine: EngineHandle): ViewState {
                     at: Date.now(),
                 });
             }
-            if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
+            if (evt.type === 'DOCUMENT_LOADED') {
+                /* Issue #406 - every open replaces the report (a clean
+                   open, `.txt` / `.html`, sends none). */
+                setOpenWarnings(evt.warnings ?? []);
+            } else if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
             } else if (evt.type === 'ZOOM_PENDING') {
                 /* Issue #239 — a `SET_ZOOM` / `SET_DEVICE_SCALE` sent
@@ -478,6 +516,8 @@ function viewStateFor(engine: EngineHandle): ViewState {
             checkpointState,
             lastError,
             previousSession,
+            openWarnings,
+            clearOpenWarnings: () => setOpenWarnings([]),
             previousSessions,
         };
     });
@@ -645,6 +685,7 @@ export function createEditorState(): EditorState {
         checkpointState: view.checkpointState,
         lastError: view.lastError,
         previousSession: view.previousSession,
+        openWarnings: view.openWarnings,
         previousSessions: view.previousSessions,
         commentHighlights: view.commentHighlights,
     };
