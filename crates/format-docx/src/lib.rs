@@ -22,6 +22,8 @@ pub mod numbering_resolver;
 pub mod opc;
 pub mod parts;
 pub mod reader;
+#[cfg(test)]
+mod reader_hardening_tests;
 pub mod schema;
 pub mod style_resolver;
 #[doc(hidden)]

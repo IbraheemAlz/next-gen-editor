@@ -2804,10 +2804,65 @@ fn sect_pr_source_is_current(props: &engine::SectionProps) -> bool {
     for this write), so an untouched section compares equal and an edited
     one does not. */
     let default_geometry = WRITE_DEFAULT_GEOMETRY.with(|g| g.get());
-    props
-        .source_xml
-        .as_deref()
-        .is_some_and(|src| parse_sect_pr_fragment(src, default_geometry) == props.without_source())
+    props.source_xml.as_deref().is_some_and(|src| {
+        same_section_props(&parse_sect_pr_fragment(src, default_geometry), props)
+    })
+}
+
+/// Issue #349 — verified-reuse equality of two sections' properties
+/// (`source_xml` ignored). Floats compare by their bits, never with `==`:
+/// a re-parse of the same bytes yields the same bits, and a `NaN` (which
+/// `==` never equals — it regenerated the section on every save) or a
+/// `-0.0` can neither defeat nor fool the check. Destructured so a new
+/// field cannot be silently left out.
+fn same_section_props(a: &engine::SectionProps, b: &engine::SectionProps) -> bool {
+    let engine::SectionProps {
+        geometry: ga,
+        header_refs,
+        footer_refs,
+        title_pg,
+        columns,
+        page_num,
+        section_type,
+        footnote_props,
+        endnote_props,
+        source_xml: _,
+    } = a;
+    let same = |x: f32, y: f32| x.to_bits() == y.to_bits();
+    let geometry_bits = |g: &engine::PageGeometry| {
+        let engine::PageGeometry {
+            width,
+            height,
+            margin_top,
+            margin_right,
+            margin_bottom,
+            margin_left,
+            header_offset,
+            footer_offset,
+        } = *g;
+        [
+            width,
+            height,
+            margin_top,
+            margin_right,
+            margin_bottom,
+            margin_left,
+            header_offset,
+            footer_offset,
+        ]
+        .map(f32::to_bits)
+    };
+    let engine::ColumnSpec { count, gutter_pt } = *columns;
+    geometry_bits(ga) == geometry_bits(&b.geometry)
+        && *header_refs == b.header_refs
+        && *footer_refs == b.footer_refs
+        && *title_pg == b.title_pg
+        && count == b.columns.count
+        && same(gutter_pt, b.columns.gutter_pt)
+        && *page_num == b.page_num
+        && *section_type == b.section_type
+        && *footnote_props == b.footnote_props
+        && *endnote_props == b.endnote_props
 }
 
 thread_local! {

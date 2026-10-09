@@ -21,6 +21,7 @@ use crate::schema::ct_tbl;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::measure::{SIGNED_TWIPS, TWIPS, attr_measure_twips, attr_pct};
 use crate::schema::source_markup::raw_attrs;
 use engine::{
     Block, BorderStroke, BorderStyle, CellBorders, CellMargins, CellSourceMarkup, CellWidth,
@@ -769,7 +770,8 @@ fn handle_property_start(
     let parent = stack.last().map(|n| n.as_slice()).unwrap_or(b"");
     match name {
         b"w:gridCol" => {
-            if let Some(w) = attr_val(e, b"w:w").and_then(|v| v.parse().ok()) {
+            /* Issue #349 — `ST_TwipsMeasure` through the measure reader. */
+            if let Some(w) = attr_measure_twips(e, b"w:w", TWIPS) {
                 grid.push(w);
             }
         }
@@ -811,7 +813,8 @@ fn handle_property_empty(
     let parent = stack.last().map(|n| n.as_slice()).unwrap_or(b"");
     match name {
         b"w:gridCol" => {
-            if let Some(w) = attr_val(e, b"w:w").and_then(|v| v.parse().ok()) {
+            /* Issue #349 — `ST_TwipsMeasure` through the measure reader. */
+            if let Some(w) = attr_measure_twips(e, b"w:w", TWIPS) {
                 grid.push(w);
             }
         }
@@ -952,7 +955,8 @@ fn handle_property_inner(
         match name {
             b"w:tblW" => props.width = parse_cell_width(e),
             b"w:tblInd" => {
-                if let Some(v) = attr_val(e, b"w:w").and_then(|v| v.parse().ok()) {
+                /* Issue #349 — signed (a table may hang into the margin). */
+                if let Some(v) = attr_measure_twips(e, b"w:w", SIGNED_TWIPS) {
                     props.indent_twips = v;
                 }
             }
@@ -1000,14 +1004,17 @@ fn handle_property_inner(
     }
 }
 
+/// `<w:tblW>` / `<w:tcW>` (`CT_TblWidth`). Issue #349 — the value goes
+/// through the measure reader: `dxa` as `ST_TwipsMeasure` (unit suffixes
+/// honoured, clamped), `pct` as fiftieths of a percent or a `50%` string
+/// (it used to wrap through `as u16`).
 fn parse_cell_width(e: &BytesStart) -> Option<CellWidth> {
     let typ = attr_val(e, b"w:type").unwrap_or_else(|| "dxa".into());
-    let val: Option<i32> = attr_val(e, b"w:w").and_then(|v| v.parse().ok());
     match typ.as_str() {
         "auto" => Some(CellWidth::Auto),
         "nil" => Some(CellWidth::Nil),
-        "pct" => val.map(|v| CellWidth::Pct(v as u16)),
-        _ => val.map(CellWidth::Dxa),
+        "pct" => attr_pct(e, b"w:w").map(CellWidth::Pct),
+        _ => attr_measure_twips(e, b"w:w", TWIPS).map(CellWidth::Dxa),
     }
 }
 

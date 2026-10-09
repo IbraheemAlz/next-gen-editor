@@ -21,6 +21,7 @@ use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::measure::{PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt};
 use crate::schema::source_markup::{
     MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_textless_run_child,
 };
@@ -31,11 +32,6 @@ use engine::{
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
-
-/// Twips (1/20 pt) → layout pt. OOXML page geometry is encoded in twips.
-fn twips_to_pt(s: &str) -> Option<f32> {
-    s.trim().parse::<f32>().ok().map(|v| v / 20.0)
-}
 
 /// Accumulator for one `<w:sectPr>` while the parser is inside it. Folded into
 /// a [`PageGeometry`] + header/footer refs when `</w:sectPr>` closes.
@@ -771,31 +767,34 @@ impl SectPrAccum {
             }
         }
         match name {
+            /* Issue #349 — one lenient measure reader: finite, in
+            range, unit suffixes honoured; an unusable value keeps the
+            default and is reported (the bytes ride `source_xml`). */
             b"w:pgSz" => {
-                if let Some(v) = attr_val(e, b"w:w").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:w", PAGE_SIZE) {
                     self.width = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:h").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:h", PAGE_SIZE) {
                     self.height = Some(v);
                 }
             }
             b"w:pgMar" => {
-                if let Some(v) = attr_val(e, b"w:top").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:top", SIGNED_TWIPS) {
                     self.margin_top = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:right").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:right", TWIPS) {
                     self.margin_right = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:bottom").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:bottom", SIGNED_TWIPS) {
                     self.margin_bottom = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:left").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:left", TWIPS) {
                     self.margin_left = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:header").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:header", TWIPS) {
                     self.header_offset = Some(v);
                 }
-                if let Some(v) = attr_val(e, b"w:footer").as_deref().and_then(twips_to_pt) {
+                if let Some(v) = attr_measure_pt(e, b"w:footer", TWIPS) {
                     self.footer_offset = Some(v);
                 }
             }
@@ -958,7 +957,7 @@ pub fn parse_document_xml(
     resolver: &StyleResolver<'_>,
 ) -> Result<DocumentTree, DocxError> {
     let mut warnings = Vec::new();
-    parse_document_xml_with_warnings(xml, resolver, &mut warnings, PageGeometry::default())
+    parse_document_xml_inner(xml, resolver, &mut warnings, PageGeometry::default())
 }
 
 /// Strip a leading UTF-8 byte-order mark (`EF BB BF`).
@@ -985,6 +984,23 @@ pub(crate) fn strip_utf8_bom(xml: &[u8]) -> &[u8] {
 /// (`opc::archive`) is the host-facing entry point that threads a
 /// `DefaultPageSize::Letter` geometry down to this parameter instead.
 pub fn parse_document_xml_with_warnings(
+    xml: &[u8],
+    resolver: &StyleResolver<'_>,
+    warnings: &mut Vec<DocxWarning>,
+    default_page_geometry: PageGeometry,
+) -> Result<DocumentTree, DocxError> {
+    /* Issue #349 — the deep helpers' diagnostics (measures) reach
+    `warnings` through the read's sink. */
+    crate::error::collect_read_warnings(warnings, |warnings| {
+        parse_document_xml_inner(xml, resolver, warnings, default_page_geometry)
+    })
+}
+
+/// [`parse_document_xml_with_warnings`] without opening a warnings scope:
+/// diagnostics raised through `crate::error::warn` go to the enclosing
+/// read (a cell paragraph, a text-box story or a header part reports into
+/// the package read that is parsing it).
+fn parse_document_xml_inner(
     xml: &[u8],
     resolver: &StyleResolver<'_>,
     warnings: &mut Vec<DocxWarning>,

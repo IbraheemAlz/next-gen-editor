@@ -50,6 +50,16 @@ paths:
   #111 cap is not counted (it is opaque bytes). Overflow is
   `DocxError::PackageTooLarge` → `Event::Error { kind: PackageTooLarge }`
   (the shell's File-menu banner), never a trap.
+- **Measures (issue #349).** Page geometry, `<w:ind>`, `<w:spacing>` and
+  table widths go through `schema::measure` (`attr_measure*`): integer or
+  decimal twips, ECMA universal-measure units (`in` / `cm` / `mm` / `pt` /
+  `pc` / `pi`), never `NaN` / infinite (unusable → the default +
+  `DocxWarning::InvalidMeasure`), clamped to ±31 680 twips (Word's 22 in;
+  pages ≥ 144) with `DocxWarning::MeasureClamped`. Never parse a measure
+  with `f32::from_str` (it accepts `NaN`). Deep helpers report through
+  `error::warn` into the read's sink (`collect_read_warnings`; a no-op in
+  the writer's re-parses). Verified-reuse equality never uses float `==`:
+  `writer::same_section_props` compares geometry by bits.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:

@@ -57,10 +57,11 @@ pub struct DocxArchive {
     /// on every Word-authored `<w:p>`) and preserved grab-bag fragments
     /// stay namespace-well-formed. Empty for engine-authored archives.
     pub document_root_attrs: Vec<(String, String)>,
-    /// Non-fatal reader diagnostics raised while parsing
-    /// `word/document.xml` (issue #111 — a table nested past
-    /// `parts::table::MAX_TABLE_NESTING_DEPTH` kept as an opaque block).
-    /// Empty when the whole part landed in the typed model.
+    /// Non-fatal reader diagnostics raised while parsing the package
+    /// (issue #111 — a table nested past
+    /// `parts::table::MAX_TABLE_NESTING_DEPTH` kept as an opaque block;
+    /// issue #349 — an unusable or clamped measure). Empty when every part
+    /// landed in the typed model as written.
     pub warnings: Vec<DocxWarning>,
 }
 
@@ -268,6 +269,23 @@ pub fn read_docx_with_settings(
 /// or holds more than `limits.max_xml_elements` elements. The other
 /// entry points use [`PackageLimits::DEFAULT`].
 pub fn read_docx_with_limits(
+    bytes: &[u8],
+    default_page_size: engine::DefaultPageSize,
+    widow_control_default: bool,
+    limits: &PackageLimits,
+) -> Result<DocxArchive, DocxError> {
+    /* Issue #349 — every part's non-fatal diagnostics (styles,
+    headers, notes included) land on `DocxArchive::warnings`. */
+    let mut part_warnings = Vec::new();
+    let mut archive = crate::error::collect_read_warnings(&mut part_warnings, |_| {
+        read_docx_scoped(bytes, default_page_size, widow_control_default, limits)
+    })?;
+    archive.warnings.extend(part_warnings);
+    Ok(archive)
+}
+
+/// [`read_docx_with_limits`]'s body, run inside the warnings scope.
+fn read_docx_scoped(
     bytes: &[u8],
     default_page_size: engine::DefaultPageSize,
     widow_control_default: bool,
