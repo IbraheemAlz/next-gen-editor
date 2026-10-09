@@ -561,9 +561,14 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
         let def = &doc.styles[id];
         out.push_str("<w:style w:type=\"paragraph\" w:styleId=\"");
         push_escaped_attr(id, &mut out);
-        out.push_str("\"><w:name w:val=\"");
-        push_escaped_attr(&def.name, &mut out);
-        out.push_str("\"/>");
+        out.push_str("\">");
+        /* Issue #297 — the display name as read (`heading 1`), not the
+        id; a style read without `<w:name>` (empty name) stays without. */
+        if !def.name.is_empty() {
+            out.push_str("<w:name w:val=\"");
+            push_escaped_attr(&def.name, &mut out);
+            out.push_str("\"/>");
+        }
         if let Some(parent) = &def.based_on {
             out.push_str("<w:basedOn w:val=\"");
             push_escaped_attr(parent, &mut out);

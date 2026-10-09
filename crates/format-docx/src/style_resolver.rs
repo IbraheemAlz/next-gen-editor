@@ -135,6 +135,7 @@ mod tests {
     fn pstyle(id: &str, based_on: Option<&str>, run: SpanStyle) -> StyleDef {
         StyleDef {
             id: id.into(),
+            name: None,
             kind: StyleKind::Paragraph,
             based_on: based_on.map(String::from),
             next: None,
@@ -322,6 +323,7 @@ mod tests {
         );
         let cstyle = StyleDef {
             id: "Emph".into(),
+            name: None,
             kind: StyleKind::Character,
             based_on: None,
             next: None,
@@ -351,6 +353,7 @@ mod tests {
             };
             styles.push(StyleDef {
                 id: format!("S{i}"),
+                name: None,
                 kind: StyleKind::Paragraph,
                 based_on: parent,
                 next: None,
@@ -374,6 +377,7 @@ mod tests {
     fn direct_keep_next_and_keep_lines_off_override_style_on() {
         let heading = StyleDef {
             id: "Heading".into(),
+            name: None,
             kind: StyleKind::Paragraph,
             based_on: None,
             next: None,

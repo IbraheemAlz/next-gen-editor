@@ -327,9 +327,14 @@ pub struct DocumentTree {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct ParagraphStyle {
+    /// `w:styleId` — what `<w:pStyle w:val>` / `<w:basedOn>` /
+    /// `<w:next>` reference (`Heading1`).
     pub id: String,
-    /// Human-readable name from `<w:name w:val>`. Drives the styles
-    /// dropdown label; falls back to `id` when absent.
+    /// Human-readable name from `<w:name w:val>` (`heading 1`, a localized
+    /// or custom name) — issue #297: read separately from the id and
+    /// written back as read, so a regenerated `styles.xml` never renames a
+    /// style. Empty when the source style has no `<w:name>` (the writer
+    /// then omits the element; a display label falls back to `id`).
     pub name: String,
     /// `<w:basedOn w:val>` — parent style id. The cascade walker
     /// folds the chain root-first.

@@ -1,7 +1,8 @@
 //! Paragraph formatting through edits and saves: issue #292 (a paragraph
 //! merge keeps the head's style and source identity and carries the
-//! tail's hyperlinks / tracked changes into the saved file) and issue #293
-//! (the paragraph mark's run properties, `<w:pPr><w:rPr>`).
+//! tail's hyperlinks / tracked changes into the saved file), issue #293
+//! (the paragraph mark's run properties, `<w:pPr><w:rPr>`) and issue #297
+//! (a regenerated `styles.xml` keeps every style's display name).
 
 use super::tests::document_xml_of;
 use super::*;
@@ -282,3 +283,77 @@ fn minimal_package_writes_the_mark_and_an_empty_mark_rpr_round_trips() {
     assert_eq!(out, xml.replacen(">z<", ">zz<", 1));
 }
 
+/* ---- Issue #297 — style ids and display names are distinct ---- */
+
+fn styles_xml_of(bytes: &[u8]) -> String {
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let mut f = z.by_name("word/styles.xml").unwrap();
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+    s
+}
+
+/// `Heading1` named `heading 1`, a localized custom name, and a style
+/// with no `<w:name>` at all.
+const NAMED_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:rPr><w:b/></w:rPr></w:style><w:style w:type="paragraph" w:customStyle="1" w:styleId="Zitat2"><w:name w:val="Zitat &amp; Quelle"/></w:style><w:style w:type="paragraph" w:customStyle="1" w:styleId="Nameless"><w:rPr><w:i/></w:rPr></w:style></w:styles>"#;
+
+/// The reader keeps `w:styleId` and `<w:name>` apart, and a `ModifyStyle`
+/// (which regenerates `styles.xml`) writes every name back exactly as it
+/// was read — `<w:name w:val="heading 1"/>` stays, it used to become
+/// `Heading1` — and invents none for a style that had none.
+#[test]
+fn modify_style_keeps_every_style_name() {
+    let xml = document(
+        r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>T</w:t></w:r></w:p>"#,
+    );
+    let parsed = read_docx(&package(NAMED_STYLES_XML, &xml)).expect("read");
+    let styles = &parsed.document.styles;
+    assert_eq!(styles["Heading1"].id, "Heading1");
+    assert_eq!(styles["Heading1"].name, "heading 1");
+    assert_eq!(styles["Zitat2"].name, "Zitat & Quelle");
+    assert_eq!(styles["Nameless"].name, "", "no <w:name> in the source");
+
+    let bigger = SpanStyle {
+        font_size: Some(20.0),
+        ..Default::default()
+    };
+    let modified = parsed
+        .document
+        .modify_style("Heading1", None, Some(bigger), None, None);
+    assert!(modified.styles_dirty);
+    let bytes = write_docx(&parsed, &modified).expect("write");
+    let out = styles_xml_of(&bytes);
+    assert!(
+        out.contains(
+            r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>"#
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"<w:name w:val="Zitat &amp; Quelle"/>"#),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"<w:style w:type="paragraph" w:styleId="Nameless"><w:rPr>"#),
+        "a nameless style stays nameless: {out}"
+    );
+    assert!(!out.contains(r#"<w:name w:val="Heading1"/>"#), "{out}");
+
+    let back = read_docx(&bytes).expect("re-read");
+    assert_eq!(back.document.styles["Heading1"].name, "heading 1");
+    assert_eq!(back.document.styles["Zitat2"].name, "Zitat & Quelle");
+    assert_eq!(
+        back.document
+            .resolve_style_run_cascade(Some("Heading1"))
+            .font_size,
+        Some(20.0)
+    );
+    /* An explicit rename (`ModifyStyle.display_name`) is still a rename. */
+    let renamed =
+        parsed
+            .document
+            .modify_style("Heading1", None, None, None, Some("Chapter title".into()));
+    let out = styles_xml_of(&write_docx(&parsed, &renamed).expect("write renamed"));
+    assert!(out.contains(r#"<w:name w:val="Chapter title"/>"#), "{out}");
+}
