@@ -7764,6 +7764,12 @@ impl Engine {
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
         }
+        /* Issue #345 — the open document's enforced protection
+        (`protection_gate.rs`): refuses what the mode does not allow, and
+        performs the form-field edits the generic handlers cannot. */
+        if let Some(handled) = self.protection_gate(&cmd) {
+            return handled;
+        }
         match cmd {
             Command::Ping => Event::Pong,
 
@@ -16443,6 +16449,15 @@ impl Engine {
     /// `a11y_cache` would diff against the old tree. (`do_recover` resets
     /// the same set for the same reason.)
     fn install_new_document(&mut self, doc: DocumentTree) -> Result<(), Box<Event>> {
+        /* Issue #345 — a document protected for tracked changes opens
+        with review mode on (and `protection_gate` keeps it on); leaving
+        one releases the review mode it forced. */
+        let tracked = Some(engine::ProtectionEdit::TrackedChanges);
+        if doc.protection_mode() == tracked {
+            self.tracking_changes = true;
+        } else if self.protection_mode() == tracked {
+            self.tracking_changes = false;
+        }
         self.install_undo_stack(UndoStack::new(doc, UNDO_CAP));
         self.selection = Some(SelectionState {
             anchor: bpos_top(0, 0),
@@ -28160,6 +28175,9 @@ mod document_lifecycle_tests;
 /// Issue #345 — encrypted packages + document protection enforcement.
 #[cfg(test)]
 mod document_protection_tests;
+
+/// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
+mod protection_gate;
 
 #[cfg(test)]
 mod wire_validation_tests {

@@ -1,4 +1,9 @@
-/* Issue #345 — the enforced-protection status chip. */
+/* Issue #345 — the enforced-protection status chip + its refusal toast. */
+.nge-protection-wrap {
+    position: relative;
+    display: inline-flex;
+}
+
 .nge-protection {
     display: inline-flex;
     align-items: center;
@@ -14,4 +19,22 @@
 
 .nge-protection__icon {
     font-size: 11px;
+}
+
+.nge-protection__toast {
+    position: absolute;
+    bottom: calc(100% + var(--nge-space-2));
+    left: 0;
+    z-index: var(--nge-z-popover);
+    width: max-content;
+    max-width: 360px;
+    padding: var(--nge-space-2) var(--nge-space-3);
+    background: var(--nge-color-bg);
+    border: 1px solid var(--nge-color-warning);
+    border-left: 4px solid var(--nge-color-warning);
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-md);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm)/1.4 var(--nge-font-ui);
+    white-space: normal;
 }

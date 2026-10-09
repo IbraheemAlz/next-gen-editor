@@ -40,6 +40,13 @@ import type {
     TextAttrs,
 } from './types';
 
+/** Issue #345 — one refused command (`EditorState.protectionRefusal`). */
+export interface ProtectionRefusal {
+    message: string;
+    command: string;
+    seq: number;
+}
+
 export interface EditorState {
     /** Current selection (anchor + caret), `undefined` before first SELECTION_CHANGED. */
     selection: Accessor<LogicalRange | undefined>;
@@ -131,6 +138,14 @@ export interface EditorState {
      * badge; the engine refuses whatever the mode does not allow.
      */
     protection: Accessor<ProtectionMode | undefined>;
+    /**
+     * Issue #345 — the latest command the document's protection refused
+     * (`ERROR { kind: 'Protected' }`): the engine's explanation (without
+     * its trailing `[Variant]` tag), the refused command's variant and a
+     * sequence number that moves on every refusal (so a repeated refusal
+     * re-triggers a toast). `undefined` until the first refusal.
+     */
+    protectionRefusal: Accessor<ProtectionRefusal | undefined>;
     /**
      * Sprint 14 (#14) — engine track-changes recording state.
      * `ReviewControls`'s Track toggle binds its active state to
@@ -326,6 +341,8 @@ export function createEditorState(): EditorState {
     const [paragraphIndent, setParagraphIndent] = createSignal<BridgeIndent>(ZERO_INDENT);
     const [isTrackingChanges, setIsTrackingChanges] = createSignal(false);
     const [protection, setProtection] = createSignal<ProtectionMode | undefined>(undefined);
+    const [protectionRefusal, setProtectionRefusal] =
+        createSignal<ProtectionRefusal | undefined>(undefined);
     const [paragraphBorders, setParagraphBorders] =
         createSignal<BridgeCellBorders | undefined>(undefined);
     const [editingStory, setEditingStory] =
@@ -358,6 +375,17 @@ export function createEditorState(): EditorState {
                 setEditingStory(evt.editing_story);
                 setFieldCodeView(evt.field_code_view);
                 setFieldAtCaret(evt.field_at_caret);
+                break;
+            }
+            case 'ERROR': {
+                if (evt.kind === 'Protected') {
+                    const tag = /\s*\[([A-Za-z]+)\]$/.exec(evt.message);
+                    setProtectionRefusal((prev) => ({
+                        message: tag ? evt.message.slice(0, tag.index) : evt.message,
+                        command: tag?.[1] ?? '',
+                        seq: (prev?.seq ?? 0) + 1,
+                    }));
+                }
                 break;
             }
             case 'UNDO_STATE_CHANGED': {
@@ -429,6 +457,7 @@ export function createEditorState(): EditorState {
         paragraphIndent,
         isTrackingChanges,
         protection,
+        protectionRefusal,
         paragraphBorders,
         editingStory,
         fieldCodeView,

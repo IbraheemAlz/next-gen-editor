@@ -83,6 +83,68 @@ pub enum StoryPolicy {
     ExitsStory,
 }
 
+/// Issue #345 — what an enforced `w:documentProtection` lets a command
+/// do. The engine's `protection_gate` refuses everything a mode does not
+/// admit ([`ProtectionClass::admitted_by`]) with
+/// `Event::Error { kind: Protected }`; the conditional classes are
+/// refined there (form-field content under `forms`, the direction of a
+/// review-mode toggle, only edits the engine can record as revisions
+/// under `trackedChanges`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtectionClass {
+    /// Never refused: changes nothing in the document (queries, view,
+    /// selection), replaces the document wholesale (loads, close,
+    /// recovery — a new document brings its own protection), or replays
+    /// history the protection already admitted (undo / redo).
+    Exempt,
+    /// Comment threads (insert / reply / resolve / delete): admitted by
+    /// `comments` and `trackedChanges`.
+    Comment,
+    /// Caret-relative text edits (typing, deletion, plain paste, Enter,
+    /// the IME commit): admitted by `trackedChanges` (recorded as
+    /// revisions — the engine refuses the shapes it cannot record) and,
+    /// inside form-field content only, by `forms`.
+    Text,
+    /// Run formatting (recorded as a format revision while review mode is
+    /// on): admitted by `trackedChanges` only.
+    Formatting,
+    /// Toggling review mode: admitted by `trackedChanges`, which forces it
+    /// on — only turning it ON passes.
+    ReviewToggle,
+    /// Every other document change (structure, paragraph formatting,
+    /// styles, sections, tables, pictures, fields, notes, accepting /
+    /// rejecting revisions, rich paste): refused under every enforced
+    /// mode.
+    Other,
+}
+
+impl ProtectionClass {
+    /// Every class, in declaration order.
+    pub const ALL: &'static [ProtectionClass] = &[
+        ProtectionClass::Exempt,
+        ProtectionClass::Comment,
+        ProtectionClass::Text,
+        ProtectionClass::Formatting,
+        ProtectionClass::ReviewToggle,
+        ProtectionClass::Other,
+    ];
+
+    /// Whether an enforced `mode` can admit this class at all (the engine
+    /// refines `Text` / `ReviewToggle` further).
+    pub const fn admitted_by(self, mode: crate::ProtectionMode) -> bool {
+        use crate::ProtectionMode as P;
+        match self {
+            ProtectionClass::Exempt => true,
+            ProtectionClass::Comment => matches!(mode, P::Comments | P::TrackedChanges),
+            ProtectionClass::Text => matches!(mode, P::TrackedChanges | P::Forms),
+            ProtectionClass::Formatting | ProtectionClass::ReviewToggle => {
+                matches!(mode, P::TrackedChanges)
+            }
+            ProtectionClass::Other => false,
+        }
+    }
+}
+
 /// One `Command` variant's dispatch metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandMeta {
@@ -109,6 +171,8 @@ pub struct CommandMeta {
     pub story: StoryPolicy,
     /// How real the engine behaviour is.
     pub status: CommandStatus,
+    /// Issue #345 — what an enforced document protection lets through.
+    pub protection: ProtectionClass,
 }
 
 impl CommandMeta {
@@ -126,6 +190,7 @@ impl CommandMeta {
         new_document: false,
         story: StoryPolicy::Allowed,
         status: CommandStatus::Implemented,
+        protection: ProtectionClass::Exempt,
     };
 
     /// View / session state (fonts, zoom, viewport, render clock):
@@ -143,15 +208,19 @@ impl CommandMeta {
     };
 
     /// Property edits: change the document, leave the selection alone.
+    /// Refused under document protection unless reclassified.
     const FORMAT: CommandMeta = CommandMeta {
         mutates_doc: true,
+        protection: ProtectionClass::Other,
         ..Self::VIEW
     };
 
-    /// Content edits: change the document and move the caret.
+    /// Content edits: change the document and move the caret. Refused
+    /// under document protection unless reclassified.
     const EDIT: CommandMeta = CommandMeta {
         mutates_doc: true,
         moves_selection: true,
+        protection: ProtectionClass::Other,
         ..Self::VIEW
     };
 
@@ -176,11 +245,18 @@ impl CommandMeta {
         }
     }
 
+    /// A document replacement: never refused by the outgoing document's
+    /// protection (the new document brings its own).
     const fn new_document(self) -> Self {
         CommandMeta {
             new_document: true,
+            protection: ProtectionClass::Exempt,
             ..self
         }
+    }
+
+    const fn protection(self, protection: ProtectionClass) -> Self {
+        CommandMeta { protection, ..self }
     }
 
     const fn logged(self) -> Self {
@@ -255,6 +331,7 @@ macro_rules! command_meta {
 }
 
 use CommandMeta as M;
+use ProtectionClass as P;
 
 command_meta! {
     // ---- Phase 1 PoC -------------------------------------------------------
@@ -263,9 +340,10 @@ command_meta! {
     RasterizeGlyph { .. } => M::VIEW.body_only(),
     ShapeAndRasterize { .. } => M::VIEW.body_only(),
     RenderPage { .. } => M::EDIT.new_document().body_only(),
-    InsertText { .. } => M::EDIT,
-    Undo => M::EDIT,
-    Redo => M::EDIT,
+    InsertText { .. } => M::EDIT.protection(P::Text),
+    // Issue #345 — history replays states the protection admitted.
+    Undo => M::EDIT.protection(P::Exempt),
+    Redo => M::EDIT.protection(P::Exempt),
     LoadDocx { .. } => M::EDIT.new_document().exits_story(),
     SaveDocx => M::QUERY,
     // ---- Phase 2 §4 ----------------------------------------------------------
@@ -274,7 +352,7 @@ command_meta! {
     Init { .. } => M::VIEW.body_only().stub(397),
     // Issue #85 — recovery primitives are never part of the history they
     // persist / restore.
-    Recover { .. } => M::EDIT.unlogged(),
+    Recover { .. } => M::EDIT.unlogged().protection(P::Exempt),
     Snapshot { .. } => M::QUERY,
     Dispose => M::VIEW.body_only().stub(397),
     Tick { .. } => M::VIEW.body_only().stub(397),
@@ -285,11 +363,11 @@ command_meta! {
     ExportPdf { .. } => M::QUERY,
     // Issue #338 — back to the seeded empty document.
     CloseDocument => M::EDIT.new_document().exits_story(),
-    DeleteRange { .. } => M::EDIT.body_only(),
-    ReplaceRange { .. } => M::EDIT.body_only(),
-    ApplyFormatting { .. } => M::FORMAT,
-    ToggleFormatting { .. } => M::FORMAT,
-    SplitParagraph { .. } => M::EDIT,
+    DeleteRange { .. } => M::EDIT.body_only().protection(P::Text),
+    ReplaceRange { .. } => M::EDIT.body_only().protection(P::Text),
+    ApplyFormatting { .. } => M::FORMAT.protection(P::Formatting),
+    ToggleFormatting { .. } => M::FORMAT.protection(P::Formatting),
+    SplitParagraph { .. } => M::EDIT.protection(P::Text),
     // Issue #396 — stable paragraph ids do not exist yet; Backspace/Delete
     // across a boundary (`DeleteAtCaret`) is the interactive merge.
     MergeParagraph { .. } => M::EDIT.body_only().stub(396),
@@ -305,7 +383,7 @@ command_meta! {
     MoveCaret { .. } => M::SELECT,
     BeginComposition { .. } => M::SELECT,
     UpdateComposition { .. } => M::SELECT,
-    EndComposition { .. } => M::EDIT,
+    EndComposition { .. } => M::EDIT.protection(P::Text),
     SetViewport { .. } => M::VIEW,
     SetZoom { .. } => M::VIEW,
     SetDeviceScale { .. } => M::VIEW,
@@ -325,10 +403,10 @@ command_meta! {
     SelectWordAt { .. } => M::SELECT,
     SelectParagraphAt { .. } => M::SELECT,
     SelectCellAt { .. } => M::SELECT,
-    DeleteAtCaret { .. } => M::EDIT,
+    DeleteAtCaret { .. } => M::EDIT.protection(P::Text),
     RequestAccessibilityDelta => M::QUERY,
     GetSelectionAsClipboard { .. } => M::QUERY,
-    PastePlain { .. } => M::EDIT,
+    PastePlain { .. } => M::EDIT.protection(P::Text),
     // ---- Backlog sprint 1 ------------------------------------------------------
     SetParagraphAlign { .. } => M::FORMAT,
     SetParagraphDirection { .. } => M::FORMAT,
@@ -371,18 +449,18 @@ command_meta! {
     SetParagraphIndent { .. } => M::FORMAT,
     SetLineSpacing { .. } => M::FORMAT,
     SetParagraphShading { .. } => M::FORMAT,
-    ToggleTrackChanges { .. } => M::FORMAT.body_only(),
+    ToggleTrackChanges { .. } => M::FORMAT.body_only().protection(P::ReviewToggle),
     AcceptRevision { .. } => M::EDIT.body_only(),
     RejectRevision { .. } => M::EDIT.body_only(),
     AcceptAllRevisions => M::EDIT.body_only(),
     RejectAllRevisions => M::EDIT.body_only(),
-    InsertComment { .. } => M::FORMAT.body_only(),
-    DeleteComment { .. } => M::FORMAT.body_only(),
+    InsertComment { .. } => M::FORMAT.body_only().protection(P::Comment),
+    DeleteComment { .. } => M::FORMAT.body_only().protection(P::Comment),
     SetTabStops { .. } => M::FORMAT,
     SetReviewIdentity { .. } => M::VIEW.body_only(),
     ApplyStyle { .. } => M::FORMAT,
-    ResolveComment { .. } => M::FORMAT.body_only(),
-    ReplyToComment { .. } => M::FORMAT.body_only(),
+    ResolveComment { .. } => M::FORMAT.body_only().protection(P::Comment),
+    ReplyToComment { .. } => M::FORMAT.body_only().protection(P::Comment),
     ModifyStyle { .. } => M::FORMAT,
 }
 
@@ -447,6 +525,17 @@ fn ts_story(story: StoryPolicy) -> &'static str {
     }
 }
 
+fn ts_protection(class: ProtectionClass) -> &'static str {
+    match class {
+        ProtectionClass::Exempt => "exempt",
+        ProtectionClass::Comment => "comment",
+        ProtectionClass::Text => "text",
+        ProtectionClass::Formatting => "formatting",
+        ProtectionClass::ReviewToggle => "review_toggle",
+        ProtectionClass::Other => "other",
+    }
+}
+
 fn ts_union(kinds: impl Iterator<Item = CommandKind>) -> String {
     let names: Vec<String> = kinds.map(|k| format!("'{}'", k.wire_name())).collect();
     if names.is_empty() {
@@ -479,6 +568,16 @@ pub fn render_ts_module() -> String {
          /** Story-mode behaviour (`bridge::StoryPolicy`, `Engine::story_gate`). */\n\
          export type StoryPolicy = 'allowed' | 'body_only' | 'text_box_only' | 'exits_story';\n\
          \n\
+         /** What an enforced document protection lets through\n\
+         \x20*  (`bridge::ProtectionClass`, issue #345). */\n\
+         export type ProtectionClass =\n\
+         \x20   | 'exempt'\n\
+         \x20   | 'comment'\n\
+         \x20   | 'text'\n\
+         \x20   | 'formatting'\n\
+         \x20   | 'review_toggle'\n\
+         \x20   | 'other';\n\
+         \n\
          /** One command's dispatch metadata (`bridge::CommandMeta`). */\n\
          export interface CommandMeta {\n\
          \x20   /** The Rust `Command` variant identifier. */\n\
@@ -493,6 +592,8 @@ pub fn render_ts_module() -> String {
          \x20   readonly new_document: boolean;\n\
          \x20   readonly story: StoryPolicy;\n\
          \x20   readonly status: CommandStatus;\n\
+         \x20   /** Issue #345 — what document protection lets through. */\n\
+         \x20   readonly protection: ProtectionClass;\n\
          }\n\n",
     );
     let stubs = CommandKind::ALL
@@ -520,7 +621,7 @@ pub fn render_ts_module() -> String {
         let m = kind.meta();
         out.push_str(&format!(
             "    {}: {{ variant: '{}', mutates_doc: {}, moves_selection: {}, logged: {}, \
-             read_only: {}, new_document: {}, story: '{}', status: {} }},\n",
+             read_only: {}, new_document: {}, story: '{}', status: {}, protection: '{}' }},\n",
             kind.wire_name(),
             kind.name(),
             m.mutates_doc,
@@ -530,6 +631,29 @@ pub fn render_ts_module() -> String {
             m.new_document,
             ts_story(m.story),
             ts_status(m.status),
+            ts_protection(m.protection),
+        ));
+    }
+    out.push_str("};\n\n");
+    /* Issue #345 — the admission table, so a UI can gate controls the
+    open document's protection will refuse. */
+    out.push_str(
+        "/** Issue #345 — the protection classes each enforced mode admits\n\
+         \x20*  (`bridge::ProtectionClass::admitted_by`); the engine refines\n\
+         \x20*  `text` (form-field content only under `forms`, recordable edits\n\
+         \x20*  only under `trackedChanges`) and `review_toggle` (only ON). */\n\
+         export const PROTECTION_ADMITS: { readonly [mode: string]: readonly ProtectionClass[] } = {\n",
+    );
+    for mode in crate::ProtectionMode::ALL {
+        let classes: Vec<String> = ProtectionClass::ALL
+            .iter()
+            .filter(|c| c.admitted_by(*mode))
+            .map(|c| format!("'{}'", ts_protection(*c)))
+            .collect();
+        out.push_str(&format!(
+            "    {}: [{}],\n",
+            mode.wire_name(),
+            classes.join(", ")
         ));
     }
     out.push_str("};\n\n");
@@ -545,6 +669,7 @@ pub fn render_ts_module() -> String {
          \x20   new_document: false,\n\
          \x20   story: 'body_only',\n\
          \x20   status: { kind: 'implemented' },\n\
+         \x20   protection: 'other',\n\
          };\n\
          \n\
          /** Metadata for a runtime command type — `UNKNOWN_COMMAND_META` when\n\
@@ -553,6 +678,16 @@ pub fn render_ts_module() -> String {
          \x20   return Object.prototype.hasOwnProperty.call(COMMAND_META, type)\n\
          \x20       ? COMMAND_META[type as CommandType]\n\
          \x20       : UNKNOWN_COMMAND_META;\n\
+         }\n\
+         \n\
+         /** Issue #345 — whether an enforced protection `mode` (the\n\
+         \x20*  `SELECTION_CHANGED.protection` value) can admit command `type` at\n\
+         \x20*  all; `true` for an unprotected document. A `true` for a `text` /\n\
+         \x20*  `review_toggle` command is not a promise: the engine refines it. */\n\
+         export function protectionAdmits(mode: string | undefined, type: string): boolean {\n\
+         \x20   if (mode === undefined) return true;\n\
+         \x20   const admitted = PROTECTION_ADMITS[mode];\n\
+         \x20   return admitted === undefined || admitted.includes(commandMeta(type).protection);\n\
          }\n",
     );
     out
@@ -645,7 +780,82 @@ mod tests {
             if m.new_document {
                 assert!(m.mutates_doc && m.moves_selection && m.logged, "{kind:?}");
             }
+            /* Issue #345 — protection classes. */
+            if !m.mutates_doc {
+                assert_eq!(
+                    m.protection,
+                    ProtectionClass::Exempt,
+                    "{kind:?}: a command that cannot change the document is never refused"
+                );
+            }
+            if m.new_document {
+                assert_eq!(m.protection, ProtectionClass::Exempt, "{kind:?}");
+            }
+            if m.mutates_doc && m.protection == ProtectionClass::Exempt {
+                assert!(
+                    m.new_document
+                        || matches!(
+                            kind,
+                            CommandKind::Undo | CommandKind::Redo | CommandKind::Recover
+                        ),
+                    "{kind:?}: only document replacements and history are exempt"
+                );
+            }
         }
+    }
+
+    /// Issue #345 — what each enforced mode admits.
+    #[test]
+    fn protection_admission_table() {
+        use crate::ProtectionMode as Mode;
+        use ProtectionClass as C;
+        let admitted = |mode: Mode| -> Vec<ProtectionClass> {
+            [
+                C::Exempt,
+                C::Comment,
+                C::Text,
+                C::Formatting,
+                C::ReviewToggle,
+                C::Other,
+            ]
+            .into_iter()
+            .filter(|c| c.admitted_by(mode))
+            .collect()
+        };
+        assert_eq!(admitted(Mode::ReadOnly), [C::Exempt]);
+        assert_eq!(admitted(Mode::Comments), [C::Exempt, C::Comment]);
+        assert_eq!(admitted(Mode::Forms), [C::Exempt, C::Text]);
+        assert_eq!(
+            admitted(Mode::TrackedChanges),
+            [
+                C::Exempt,
+                C::Comment,
+                C::Text,
+                C::Formatting,
+                C::ReviewToggle
+            ]
+        );
+        /* The comment commands are exactly the Comment class. */
+        let comments: Vec<_> = CommandKind::ALL
+            .iter()
+            .filter(|k| k.meta().protection == C::Comment)
+            .map(|k| k.name())
+            .collect();
+        assert_eq!(
+            comments,
+            [
+                "InsertComment",
+                "DeleteComment",
+                "ResolveComment",
+                "ReplyToComment"
+            ]
+        );
+        assert_eq!(CommandKind::InsertText.meta().protection, C::Text);
+        assert_eq!(
+            CommandKind::ToggleTrackChanges.meta().protection,
+            C::ReviewToggle
+        );
+        assert_eq!(CommandKind::AcceptAllRevisions.meta().protection, C::Other);
     }
 
     /// Floor (issue #342): every gap names its tracking issue — the

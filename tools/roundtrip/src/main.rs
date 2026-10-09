@@ -35,6 +35,7 @@ mod inline_spans;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod protection;
 mod reader_hardening;
 mod revision_ids;
 mod revisions;
@@ -353,6 +354,7 @@ fn run_default() -> Result<()> {
     comments::run_comment_patch_roundtrip()?;
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
+    protection::run_document_protection_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

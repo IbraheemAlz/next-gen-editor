@@ -550,6 +550,26 @@ pub enum ProtectionMode {
     Forms,
 }
 
+impl ProtectionMode {
+    /// Every mode, in declaration order.
+    pub const ALL: &'static [ProtectionMode] = &[
+        ProtectionMode::ReadOnly,
+        ProtectionMode::Comments,
+        ProtectionMode::TrackedChanges,
+        ProtectionMode::Forms,
+    ];
+
+    /// The serde wire spelling (`w:edit`), e.g. `"trackedChanges"`.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            ProtectionMode::ReadOnly => "readOnly",
+            ProtectionMode::Comments => "comments",
+            ProtectionMode::TrackedChanges => "trackedChanges",
+            ProtectionMode::Forms => "forms",
+        }
+    }
+}
+
 impl Event {
     /// A plain [`Event::Error`] (no [`ErrorKind`]).
     pub fn error(message: impl Into<String>) -> Self {
@@ -1115,7 +1135,9 @@ mod a11y_note_wire_tests {
             (ProtectionMode::Forms, "forms"),
         ] {
             assert_eq!(serde_json::to_value(mode).unwrap(), wire);
+            assert_eq!(mode.wire_name(), wire);
         }
+        assert_eq!(ProtectionMode::ALL.len(), 4);
         let refused = serde_json::to_value(Event::Error {
             message: "protected".into(),
             kind: Some(ErrorKind::Protected),
