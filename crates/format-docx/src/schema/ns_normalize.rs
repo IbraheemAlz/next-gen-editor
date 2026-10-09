@@ -208,11 +208,7 @@ pub fn canonicalize_prefixes(input: &[u8]) -> Result<Vec<u8>, DocxError> {
     }
     let prolog_end = prolog_end
         .ok_or_else(|| DocxError::MalformedXml("part has no root element".to_string()))?;
-    if let Some(clash) = pass
-        .used
-        .keys()
-        .find(|p| pass.foreign.contains(**p))
-    {
+    if let Some(clash) = pass.used.keys().find(|p| pass.foreign.contains(**p)) {
         return Err(DocxError::MalformedXml(format!(
             "prefix `{clash}` is used for both a schema namespace and a foreign one"
         )));
