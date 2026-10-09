@@ -1,4 +1,4 @@
-//! Issues #439 / #434 — strict well-formedness of the WordprocessingML parts
+//! Issues #439 / #434 / #435 — strict well-formedness of the WordprocessingML parts
 //! the reader walks, and the up-front repair that keeps a malformed part
 //! readable while every save of it stays well-formed.
 //!
@@ -38,7 +38,13 @@
 //!   or repeated attribute is dropped (the parsers skip it already); text
 //!   outside the root element and a misplaced XML declaration are dropped;
 //!   `--` inside a comment is split; elements still open at the end of the
-//!   part (a truncated part) are closed. The part is reported as
+//!   part (a truncated part) are closed; a namespace prefix used where no
+//!   `xmlns:` binds it (issue #435 — the reader skipped such an element,
+//!   the writer then bound the conventional URI, and the second read saw
+//!   content the first had not) is bound on the root: to the URI it
+//!   conventionally names (`mc`, `wp`, `w14`, … in the part's namespace
+//!   family) or to a placeholder URN that names no real namespace, so the
+//!   first read already sees what every later read will. The part is reported as
 //!   [`DocxWarning::MalformedPart`] `{ repaired: true }` and is then
 //!   **regenerate-only**, exactly like a #325 namespace-normalised part:
 //!   the repaired bytes REPLACE the source bytes before any capture, so
@@ -58,9 +64,10 @@
 //! well-formedness gate agree on what "well-formed" means.
 //!
 //! Not checked (known gaps): the XML `Name` production (a byte flip that
-//! turns a name character into `;` or `"` stays a name to quick-xml), and
-//! entity / attribute-list declarations inside a DOCTYPE (left as they
-//! are; OPC forbids DTDs and nothing is ever expanded).
+//! turns a name character into `;` or `=` stays a name to quick-xml, and a
+//! prefix that is no `NCName` cannot be bound, so it is not reported
+//! either), and entity / attribute-list declarations inside a DOCTYPE
+//! (left as they are; OPC forbids DTDs and nothing is ever expanded).
 
 use crate::error::{DocxError, DocxWarning};
 use crate::opc::limits::{PackageLimit, PackageLimits};
@@ -113,6 +120,9 @@ struct Tally {
     comments: u64,
     /// Elements still open at the end of the part.
     unclosed: u64,
+    /// Issue #435 — namespace prefixes used where no `xmlns:` binds them,
+    /// first use first (bound on the root by the repair).
+    unbound: Vec<String>,
 }
 
 impl Tally {
@@ -120,6 +130,13 @@ impl Tally {
         let mut parts = Vec::new();
         if let Some(at) = self.not_utf8 {
             parts.push(format!("not UTF-8 (first invalid byte at offset {at})"));
+        }
+        if !self.unbound.is_empty() {
+            parts.push(format!(
+                "{} undeclared namespace prefixes ({})",
+                self.unbound.len(),
+                self.unbound.join(", ")
+            ));
         }
         for (n, what) in [
             (self.escapes, "unescaped `&` / `<` / `]]>`"),
@@ -359,6 +376,161 @@ fn lossy(b: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(b)
 }
 
+/// Most distinct undeclared prefixes one part may bind on its root; past
+/// it the part is beyond a faithful repair.
+const MAX_UNBOUND_PREFIXES: usize = 256;
+
+/// Issue #435 — `true` for a prefix the scan never reports: `xml` /
+/// `xmlns` are bound by the Namespaces spec itself, and a `w:` part with no
+/// `xmlns:w` is the reader's documented Transitional fast path (fragments,
+/// hand-written parts).
+fn is_implicit_prefix(p: &[u8]) -> bool {
+    matches!(p, b"xml" | b"xmlns" | b"w")
+}
+
+/// `true` for an `NCName`-shaped prefix (ASCII letters, digits, `-`, `.`,
+/// `_`, any non-ASCII character; not starting with a digit, `-` or `.`).
+/// Only such a prefix can be bound by an `xmlns:` attribute; a "name"
+/// holding `"` or `=` is an XML `Name` defect, which the scan does not
+/// judge (see the module docs).
+fn is_ncname(p: &[u8]) -> bool {
+    let ok = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_') || b >= 0x80;
+    match p.first() {
+        Some(&b) => (b.is_ascii_alphabetic() || b == b'_' || b >= 0x80) && p.iter().all(|&b| ok(b)),
+        None => false,
+    }
+}
+
+/// The prefix of a qualified name (`wp:inline` → `wp`), when it is one an
+/// `xmlns:` declaration could bind.
+fn bindable_prefix(qname: &[u8]) -> Option<&[u8]> {
+    let colon = qname.iter().position(|&b| b == b':')?;
+    let p = &qname[..colon];
+    (is_ncname(p) && !is_implicit_prefix(p)).then_some(p)
+}
+
+/// Issue #435 — record the `xmlns:` declarations of tag `e` (scoped to
+/// its nesting `level`) on `decls`, and every prefix the tag's name or
+/// attributes use that nothing in scope binds on `unbound` (first use
+/// first, deduplicated).
+fn check_prefixes(
+    e: &BytesStart<'_>,
+    level: usize,
+    decls: &mut Vec<(usize, Vec<u8>)>,
+    unbound: &mut Vec<String>,
+) {
+    for a in e.attributes().with_checks(false).flatten() {
+        if let Some(p) = a.key.as_ref().strip_prefix(b"xmlns:") {
+            decls.push((level, p.to_vec()));
+        }
+    }
+    let mut note = |p: &[u8], decls: &[(usize, Vec<u8>)]| {
+        if !decls.iter().any(|(_, d)| d == p) {
+            let p = lossy(p);
+            if !unbound.iter().any(|u| *u == p) {
+                unbound.push(p.into_owned());
+            }
+        }
+    };
+    if let Some(p) = bindable_prefix(e.name().as_ref()) {
+        note(p, decls);
+    }
+    for a in e.attributes().with_checks(false).flatten() {
+        let key = a.key.as_ref();
+        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+            continue;
+        }
+        if let Some(p) = bindable_prefix(key) {
+            note(p, decls);
+        }
+    }
+}
+
+/// Issue #435 — the namespace an undeclared `prefix` is bound to on the
+/// root: the URI it conventionally names (in the part's `family` when the
+/// family table owns it — `r`, `wp`, `a`, … — else among the namespaces
+/// the reader understands: `mc`, `wps`, `w14`, `v`, …), or a placeholder
+/// URN that names no real namespace (`urn:x-nge-undeclared:<prefix>`), so
+/// an unknown element stays unknown to every consumer.
+fn binding_for(prefix: &str, family: crate::schema::NsFamily) -> Cow<'static, str> {
+    if let Some(uri) = crate::schema::family::uri_for_prefix(prefix, family)
+        .or_else(|| crate::schema::mce::conventional_uri(prefix))
+    {
+        return Cow::Borrowed(uri);
+    }
+    let mut urn = String::from("urn:x-nge-undeclared:");
+    for b in prefix.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_') {
+            urn.push(char::from(b));
+        } else {
+            urn.push_str(&format!("%{b:02X}"));
+        }
+    }
+    Cow::Owned(urn)
+}
+
+/// The part's root start tag, as [`scan`] met it.
+struct RootTag {
+    start: usize,
+    end: usize,
+    empty: bool,
+    /// Index of the patch rewriting the tag (a lexical repair), if any.
+    patch: Option<usize>,
+    /// The namespace family the root's `xmlns:w` names.
+    family: crate::schema::NsFamily,
+}
+
+/// The family of the root's `w` binding (Transitional when unbound or
+/// foreign).
+fn root_family(e: &BytesStart<'_>) -> crate::schema::NsFamily {
+    e.attributes()
+        .with_checks(false)
+        .flatten()
+        .find(|a| a.key.as_ref() == b"xmlns:w")
+        .and_then(|a| {
+            std::str::from_utf8(&a.value)
+                .ok()
+                .and_then(crate::schema::family::family_of_w_uri)
+        })
+        .unwrap_or_default()
+}
+
+/// Issue #435 — bind every undeclared prefix on the root start tag
+/// ([`binding_for`]): the declarations go right before the tag's closing
+/// `>` / `/>`, into the patch already rewriting the tag or as an insertion
+/// of their own (kept in position order).
+fn bind_on_root(body: &[u8], root: &RootTag, unbound: &[String], patches: &mut Vec<Patch>) {
+    let mut decls = Vec::new();
+    for prefix in unbound {
+        decls.extend_from_slice(b" xmlns:");
+        decls.extend_from_slice(prefix.as_bytes());
+        decls.extend_from_slice(b"=\"");
+        decls.extend_from_slice(binding_for(prefix, root.family).as_bytes());
+        decls.push(b'"');
+    }
+    let close = if root.empty { 2 } else { 1 };
+    match root.patch {
+        Some(i) => {
+            let with = &mut patches[i].with;
+            let at = with.len() - close;
+            with.splice(at..at, decls);
+        }
+        None => {
+            let at = root.end - close;
+            debug_assert!(root.start < at && body[at..root.end].ends_with(b">"));
+            let idx = patches.partition_point(|p| p.start <= at);
+            patches.insert(
+                idx,
+                Patch {
+                    start: at,
+                    end: at,
+                    with: decls,
+                },
+            );
+        }
+    }
+}
+
 /// The strict scan of one part body (BOM split off, valid UTF-8). See the
 /// module docs for what is lexical and what is structural.
 fn scan(body: &[u8]) -> Scan {
@@ -374,6 +546,13 @@ fn scan(body: &[u8]) -> Scan {
     let mut patches: Vec<Patch> = Vec::new();
     /* `(offset, len)` of every open element's name in `body`. */
     let mut open: Vec<(usize, usize)> = Vec::new();
+    /* Issue #435 — `(nesting level, prefix)` of every `xmlns:` declaration
+    in scope, innermost last. */
+    let mut decls: Vec<(usize, Vec<u8>)> = Vec::new();
+    /* The root start tag: its range, whether it is empty, the index of
+    the patch rewriting it (if any), and the namespace family its `w`
+    binding names. */
+    let mut root_tag: Option<RootTag> = None;
     let mut root_seen = false;
     let mut root_closed = false;
     let mut prev = 0usize;
@@ -396,7 +575,24 @@ fn scan(body: &[u8]) -> Scan {
                 }
                 root_seen = true;
                 let empty = matches!(event, Event::Empty(_));
-                if let Some(fixed) = repair_tag(e, empty, &mut tally) {
+                let level = open.len() + 1;
+                check_prefixes(e, level, &mut decls, &mut tally.unbound);
+                if tally.unbound.len() > MAX_UNBOUND_PREFIXES {
+                    return Scan::Structural(format!(
+                        "more than {MAX_UNBOUND_PREFIXES} undeclared namespace prefixes"
+                    ));
+                }
+                let repaired = repair_tag(e, empty, &mut tally);
+                if root_tag.is_none() {
+                    root_tag = Some(RootTag {
+                        start: prev,
+                        end: pos,
+                        empty,
+                        patch: repaired.is_some().then_some(patches.len()),
+                        family: root_family(e),
+                    });
+                }
+                if let Some(fixed) = repaired {
                     patches.push(Patch {
                         start: prev,
                         end: pos,
@@ -405,12 +601,19 @@ fn scan(body: &[u8]) -> Scan {
                 }
                 if !empty {
                     open.push((prev + 1, e.name().as_ref().len()));
-                } else if open.is_empty() {
-                    root_closed = true;
+                } else {
+                    /* An empty element's declarations scope itself only. */
+                    while decls.last().is_some_and(|(l, _)| *l >= level) {
+                        decls.pop();
+                    }
+                    root_closed = open.is_empty();
                 }
             }
             Event::End(e) => {
                 let name = e.name();
+                while decls.last().is_some_and(|(l, _)| *l >= open.len()) {
+                    decls.pop();
+                }
                 match open.pop() {
                     Some((at, len)) if body[at..at + len] == *name.as_ref() => {}
                     Some((at, len)) => {
@@ -518,6 +721,11 @@ fn scan(body: &[u8]) -> Scan {
     if !root_seen {
         return Scan::Structural("no root element".to_string());
     }
+    if let Some(root) = root_tag
+        && !tally.unbound.is_empty()
+    {
+        bind_on_root(body, &root, &tally.unbound, &mut patches);
+    }
     let mut closers = Vec::new();
     for &(at, len) in open.iter().rev() {
         closers.extend_from_slice(b"</");
@@ -586,6 +794,41 @@ pub(crate) fn defects(xml: &[u8]) -> Option<String> {
         Health::WellFormed => None,
         Health::Repairable { tally, .. } => Some(tally.detail()),
         Health::Unrepairable(detail) => Some(detail),
+    }
+}
+
+/// Issue #435 — a main part whose root element is no `document` (markup
+/// spliced in front of the real root now wraps it — `<w:t><w:document …>`)
+/// is beyond a faithful repair: the reader walks it leniently, but the
+/// writer synthesizes a `<w:document>` root that re-declares the FIRST
+/// element's bindings only, so whatever the wrapped root declared is lost
+/// on save. Reported (`repaired: false`) — the part reads as before. A
+/// root that is no WordprocessingML at all is `NotWordprocessingMl`'s
+/// business, not this check's.
+pub(crate) fn check_main_root(name: &str, xml: &[u8], warnings: &mut Vec<DocxWarning>) {
+    use crate::schema::family::RootBinding;
+    let (_, body) = split_bom(xml);
+    let mut reader = Reader::from_reader(body);
+    let qname = loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if e.local_name().as_ref() == b"document" {
+                    return;
+                }
+                break lossy(e.name().as_ref()).into_owned();
+            }
+            Ok(Event::Eof) | Err(_) => return,
+            Ok(_) => {}
+        }
+    };
+    if crate::schema::ns_normalize::inspect_root(xml) != RootBinding::NotWordprocessingMl {
+        warnings.push(DocxWarning::MalformedPart {
+            part: name.to_string(),
+            detail: format!(
+                "the root element is `{qname}`, not a WordprocessingML `document` (its own namespace bindings are not re-declared on save)"
+            ),
+            repaired: false,
+        });
     }
 }
 
@@ -787,6 +1030,74 @@ mod tests {
                 lossy(xml)
             );
             assert!(defects(xml).is_some_and(|d| d.contains(what)));
+        }
+    }
+
+    const NS_W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+    #[test]
+    fn undeclared_prefixes_are_bound_on_the_root() {
+        let xml = format!(
+            r#"<w:document xmlns:w="{NS_W}"><w:body><mc:AlternateContent/><wp:inline/><foo:bar x:y="1"/><a:graphic xmlns:a="urn:local"><a:blip/></a:graphic><a:x/></w:body></w:document>"#
+        );
+        let (out, detail) = repaired(xml.as_bytes());
+        let root = format!(
+            concat!(
+                r#"<w:document xmlns:w="{}""#,
+                r#" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#,
+                r#" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing""#,
+                r#" xmlns:foo="urn:x-nge-undeclared:foo" xmlns:x="urn:x-nge-undeclared:x""#,
+                r#" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#
+            ),
+            NS_W
+        );
+        assert_eq!(
+            out,
+            xml.replacen(&format!(r#"<w:document xmlns:w="{NS_W}">"#), &root, 1)
+        );
+        assert!(
+            detail.contains("5 undeclared namespace prefixes (mc, wp, foo, x, a)"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_strict_root_binds_family_prefixes_in_its_own_spelling() {
+        let strict = crate::schema::NS_W_STRICT;
+        let (out, _) = repaired(
+            format!(r#"<w:document xmlns:w="{strict}"><w:hyperlink r:id="rId1"/></w:document>"#)
+                .as_bytes(),
+        );
+        assert!(
+            out.contains(r#" xmlns:r="http://purl.oclc.org/ooxml/officeDocument/relationships">"#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn bindings_join_a_rewritten_or_empty_root_tag() {
+        let (out, _) = repaired(b"<w:document a=\"&\"><mc:x/></w:document>");
+        assert_eq!(
+            out,
+            "<w:document a=\"&amp;\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:x/></w:document>"
+        );
+        let (out, _) = repaired("<x:root \u{FFFD}:a='1'/>".as_bytes());
+        assert_eq!(
+            out,
+            "<x:root \u{FFFD}:a='1' xmlns:x=\"urn:x-nge-undeclared:x\" xmlns:\u{FFFD}=\"urn:x-nge-undeclared:%EF%BF%BD\"/>"
+        );
+    }
+
+    #[test]
+    fn implicit_and_unbindable_prefixes_are_never_reported() {
+        for xml in [
+            &br#"<w:document><w:p xml:space="preserve"/></w:document>"#[..],
+            br#"<r xmlns:p="u"><p:a/><s xmlns:q="v"><q:b p:c="1"/></s></r>"#,
+            b"<r><a=b:c/><d e;f:g=\"1\"/></r>",
+        ] {
+            let (out, w) = run(xml);
+            assert_eq!(out, xml);
+            assert!(w.is_empty(), "{}: {w:?}", lossy(xml));
         }
     }
 

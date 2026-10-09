@@ -346,3 +346,120 @@ fn a_structurally_broken_sibling_is_reported_and_kept() {
     assert_eq!(a.part_by_name("word/styles.xml"), Some(styles));
     assert_eq!(a.document.to_plain_text(), "a");
 }
+
+/* ------------------------------------------------------------------ */
+/* Issue #435 — prefixes no `xmlns:` declares                           */
+/* ------------------------------------------------------------------ */
+
+/// A `word/document.xml` whose root binds `w` only, around `body`.
+fn w_only_document(body: &str) -> Vec<u8> {
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            "<w:body>{}<w:sectPr/></w:body></w:document>"
+        ),
+        body
+    )
+    .into_bytes()
+}
+
+/// Issue #435 — a drawing whose `wp` / `a` / `pic` prefixes the root never
+/// declares: the first read skipped it (unknown binding), the writer then
+/// bound the conventional URIs on save, and the second read showed a
+/// picture the first had not. The prefixes are now bound on the root up
+/// front, so every read sees the picture.
+#[test]
+fn an_undeclared_drawing_prefix_is_bound_before_the_first_read() {
+    let xml = w_only_document(concat!(
+        r#"<w:p><w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>"#,
+        r#"<a:graphic><a:graphicData><pic:pic/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#,
+        r#"<w:r><w:t>x</w:t></w:r></w:p>"#
+    ));
+    assert_eq!(assert_repaired_round_trip(&xml), "[image]x");
+    let saved = saved_document_xml(&xml);
+    for decl in [
+        r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing""#,
+        r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#,
+        r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture""#,
+    ] {
+        assert!(
+            saved.contains(decl),
+            "{decl} not on the saved root: {saved}"
+        );
+    }
+}
+
+/// Issue #435 — `mc:AlternateContent`, a `w14:` attribute and an unknown
+/// `foo:` element, none of them declared: bound on the root (`mc` / `w14`
+/// to their URIs, `foo` to a placeholder URN that names no namespace), so
+/// the zero-edit save is namespace-well-formed (it used to be refused by
+/// the save-side gate) and reads back the same text.
+#[test]
+fn undeclared_prefixes_save_namespace_well_formed() {
+    let xml = w_only_document(concat!(
+        r#"<w:p w14:paraId="1A2B3C4D"><mc:AlternateContent><mc:Choice Requires="w14"><w:r><w:t>choice</w:t></w:r></mc:Choice>"#,
+        r#"<mc:Fallback><w:r><w:t>fallback</w:t></w:r></mc:Fallback></mc:AlternateContent>"#,
+        r#"<foo:bar><w:r><w:t>!</w:t></w:r></foo:bar></w:p>"#
+    ));
+    assert_eq!(assert_repaired_round_trip(&xml), "choice!");
+    let saved = saved_document_xml(&xml);
+    for decl in [
+        r#"xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml""#,
+        r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#,
+        r#"xmlns:foo="urn:x-nge-undeclared:foo""#,
+    ] {
+        assert!(
+            saved.contains(decl),
+            "{decl} not on the saved root: {saved}"
+        );
+    }
+}
+
+/// Issue #435 (a 50k-sweep finding) — markup spliced in front of the real
+/// root wraps it (`<w:t><w:document xmlns:…>`): the reader walks it
+/// leniently, but the writer's synthesized root re-declares only the
+/// first element's bindings, so the wrapped root's declarations cannot
+/// survive a save. Reported beyond repair; the document still opens.
+#[test]
+fn a_wrapped_main_root_is_reported_beyond_repair() {
+    let (decl, root) = prolog_and_root();
+    let xml = [
+        decl,
+        b"<w:t>",
+        root,
+        b"<w:body><w:p><w:r><w:t>a</w:t></w:r></w:p><w:sectPr/></w:body></w:document></w:t>",
+    ]
+    .concat();
+    let a = read_docx(&package_with_document_xml_bytes(&xml, &[])).expect("opens");
+    assert!(
+        a.warnings.iter().any(|w| matches!(
+            w,
+            DocxWarning::MalformedPart { part, detail, repaired: false }
+                if part == "word/document.xml" && detail.contains("`w:t`")
+        )),
+        "{:?}",
+        a.warnings
+    );
+}
+
+/// Issue #435 — the same in a sibling part: an undeclared `w14:` attribute
+/// in `styles.xml` is bound on the part's root, in place.
+#[test]
+fn an_undeclared_prefix_in_a_sibling_is_bound_on_its_root() {
+    let styles: &[u8] = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="A" w14:x="1"><w:name w:val="A"/></w:style></w:styles>"#;
+    let xml = document(b"<w:p><w:r><w:t>a</w:t></w:r></w:p>");
+    let docx = package_with_document_xml_bytes(&xml, &[("word/styles.xml", styles)]);
+    let a = read_docx(&docx).expect("read");
+    assert_eq!(
+        malformed_parts(&a.warnings),
+        vec![("word/styles.xml", true)]
+    );
+    let part = String::from_utf8_lossy(a.part_by_name("word/styles.xml").expect("styles"));
+    assert!(
+        part.starts_with(r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">"#),
+        "{part}"
+    );
+    let saved = write_docx(&a, &a.document).expect("write");
+    crate::check_part_xml_well_formed(&saved, "word/styles.xml").expect("well-formed styles");
+}

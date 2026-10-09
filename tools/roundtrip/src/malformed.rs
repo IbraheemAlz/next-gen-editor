@@ -1,4 +1,4 @@
-//! Malformed WordprocessingML parts (issues #439 / #434): the reader
+//! Malformed WordprocessingML parts (issues #439 / #434 / #435): the reader
 //! repairs every lexical defect up front (`DocxWarning::MalformedPart`),
 //! the part is regenerate-only, and from the repaired spelling on the
 //! usual fidelity holds — the zero-edit save is well-formed and stable,
@@ -69,7 +69,7 @@ fn source_bytes_rewritten(a: &[u8], b: &[u8]) -> usize {
     a.len() - prefix - suffix
 }
 
-/// Issues #439 / #434 — step 60.
+/// Issues #439 / #434 / #435 — step 60.
 pub fn run_malformed_parts_roundtrip() -> Result<()> {
     const TEXT: &str = "result\namp\nnul\u{FFFD}ref\ncut";
     let source = package_with_document_xml_bytes(&malformed_document(), &[]);
@@ -160,6 +160,43 @@ pub fn run_malformed_parts_roundtrip() -> Result<()> {
     }
     println!(
         "[roundtrip] step 60c OK — a malformed styles.xml is repaired in place and saved well-formed"
+    );
+
+    /* Issue #435 — prefixes no `xmlns:` declares: bound on the root up
+    front, so the first read already sees the picture the save would
+    otherwise reveal, and the save is namespace-well-formed. */
+    let document = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p w14:paraId="1A2B3C4D"><w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>"#,
+        r#"<a:graphic><a:graphicData><pic:pic/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#,
+        r#"<mc:AlternateContent><mc:Choice Requires="w14"><w:r><w:t>choice</w:t></w:r></mc:Choice>"#,
+        r#"<mc:Fallback><w:r><w:t>fallback</w:t></w:r></mc:Fallback></mc:AlternateContent>"#,
+        r#"<foo:bar><w:r><w:t>!</w:t></w:r></foo:bar></w:p><w:sectPr/></w:body></w:document>"#
+    );
+    let source = package_with_document_xml_bytes(document.as_bytes(), &[]);
+    let a = read_docx(&source).context("step 60d: read")?;
+    if repaired_parts(&a.warnings) != ["word/document.xml"] {
+        bail!(
+            "step 60d: expected the prefixes bound up front, got {:?}",
+            a.warnings
+        );
+    }
+    if a.document.to_plain_text() != "[image]choice!" {
+        bail!("step 60d: visible text {:?}", a.document.to_plain_text());
+    }
+    let saved = write_docx(&a, &a.document).context("step 60d: save")?;
+    assert_document_xml_well_formed(&saved).context("step 60d")?;
+    let b = read_docx(&saved).context("step 60d: re-read")?;
+    if has_malformed(&b.warnings) || b.document.to_plain_text() != a.document.to_plain_text() {
+        bail!(
+            "step 60d: the save re-read as {:?} with {:?}",
+            b.document.to_plain_text(),
+            b.warnings
+        );
+    }
+    println!(
+        "[roundtrip] step 60d OK — undeclared prefixes are bound on the root before the first read; the save is namespace-well-formed and reads back the same text"
     );
     Ok(())
 }

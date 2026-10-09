@@ -138,14 +138,6 @@ pub fn check_part_xml_well_formed(docx: &[u8], part_name: &str) -> Result<(), Do
         .map_err(|_| DocxError::MissingEntry(part_name.into()))?;
     /* Issue #348 — never allocate from the declared size. */
     let xml = read_entry_bounded(part, part_name, &PackageLimits::DEFAULT, &mut 0)?;
-    /* Issue #434 — the reader's strict scan, so the save side and the read
-    side agree: anything the reader would have to repair (bytes that are
-    not UTF-8, a raw `&`, an excluded character, a malformed attribute,
-    junk outside the root, a truncated part) fails the gate too. */
-    if let Some(defects) = crate::opc::well_formed::defects(&xml) {
-        return Err(DocxError::MalformedXml(format!("{part_name}: {defects}")));
-    }
-
     let mut reader = NsReader::from_reader(xml.as_slice());
     let config = reader.config_mut();
     config.trim_text(false);
@@ -215,6 +207,13 @@ pub fn check_part_xml_well_formed(docx: &[u8], part_name: &str) -> Result<(), Do
         return Err(DocxError::MalformedXml(format!(
             "{part_name} has {roots} root elements, expected exactly 1"
         )));
+    }
+    /* Issue #434 — then the reader's strict scan, so the save side and the
+    read side agree: anything the reader would have to repair (bytes that
+    are not UTF-8, a raw `&`, an excluded character, a malformed
+    attribute, junk outside the root) fails the gate too. */
+    if let Some(defects) = crate::opc::well_formed::defects(&xml) {
+        return Err(DocxError::MalformedXml(format!("{part_name}: {defects}")));
     }
     Ok(())
 }
@@ -408,6 +407,7 @@ fn read_docx_scoped(
     /* Issues #439 / #434 — a part that is not well-formed XML is repaired
     up front (regenerate-only) before anything captures its bytes. */
     let xml = repair_part(&part_names.main, xml, limits, &mut warnings)?;
+    crate::opc::well_formed::check_main_root(&part_names.main, &xml, &mut warnings);
     /* Issue #325 — validate the root's namespace bindings; a non-canonical
     spelling is normalised (regenerate-only) instead of reading empty. */
     let xml = canonical_main_part(&part_names.main, xml, &mut warnings);
