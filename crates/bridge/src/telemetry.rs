@@ -159,6 +159,11 @@ pub struct RecoveryFlags {
     /// Readable snapshots passed over for an older base that still had
     /// its package (#268).
     pub package_fallbacks: u32,
+    /// Issue #390 / #427 - logged commands after the restored base whose
+    /// journal row was never written, so the recovery could not replay
+    /// them (a count, `0` = none). Additive: a sender that predates it
+    /// decodes as `0`.
+    pub journal_gap: u32,
 }
 
 /// Coarse error classification for telemetry — carries no PII.
@@ -320,6 +325,7 @@ mod tests {
                 log_truncated: false,
                 snapshot_fallbacks: 3,
                 package_fallbacks: 0,
+                journal_gap: 2,
             }),
         };
         let json = roundtrip(&kind);
@@ -333,6 +339,7 @@ mod tests {
                 "log_truncated": false,
                 "snapshot_fallbacks": 3,
                 "package_fallbacks": 0,
+                "journal_gap": 2,
             })
         );
         assert!(json.get("renderer_downgrade").is_none());

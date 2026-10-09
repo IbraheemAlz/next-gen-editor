@@ -10,9 +10,9 @@ import { boot, documentText } from './helpers/editor';
  * #407 only the zoom pair (#186) rejected it, and `f32::clamp` passes NaN
  * straight through, so e.g. `APPLY_FORMATTING { font_size: NaN }` reached
  * the model. Now every such command answers `ERROR { kind:
- * "InvalidArgument" }` naming the field, nothing changes, no user toast is
- * shown (a host bug, not a user action) and the Dev HUD's last-error row
- * records it.
+ * "InvalidArgument" }` naming the field, nothing changes, and — like every
+ * typed refusal since #427 — the toast says so and the Dev HUD's
+ * last-error row records it.
  */
 
 test('NaN / infinite numeric arguments are refused as InvalidArgument and change nothing', async ({
@@ -45,8 +45,10 @@ test('NaN / infinite numeric arguments are refused as InvalidArgument and change
     expect(replies[2].message).toMatch(/^RequestPaint: viewport\.h is NaN /);
     expect(replies[3].message).toMatch(/^ExpandLayout: target_y is -inf /);
 
-    /* The Dev HUD records the last one; no user-facing toast. */
-    await expect(page.locator('.nge-toast__message')).toHaveCount(0);
+    /* The refusal is visible (#427), and the Dev HUD records the last one. */
+    await expect(page.locator('.nge-toast__message')).toContainText(
+        'A value was not a valid number, so nothing was changed',
+    );
     await page.locator('textarea[data-nge-hidden-input]').focus();
     await page.keyboard.press('Control+Shift+D');
     const row = page.locator('.nge-hud__lasterror');

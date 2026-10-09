@@ -191,6 +191,29 @@ pub fn render_canvas2d(
                 } else {
                     None
                 };
+                /* Issue #436 — past the mask rasterizer's cap the glyph is
+                filled from its outline instead of being skipped. */
+                if crate::outline::use_outline(run.px_size) {
+                    for g in &run.glyphs {
+                        match crate::outline::glyph_path(
+                            &font,
+                            g.glyph_id,
+                            run.px_size,
+                            (g.x, g.y),
+                            run.faux_italic,
+                        ) {
+                            Ok(path) => fill_outline(
+                                ctx,
+                                &path,
+                                &css_color(&run.paint),
+                                run.faux_bold
+                                    .then(|| crate::outline::faux_bold_stroke(run.px_size)),
+                            ),
+                            Err(_) => atlas.note_refused(),
+                        }
+                    }
+                    continue;
+                }
                 for g in &run.glyphs {
                     let key = GlyphKey::new(
                         run.font.clone(),
@@ -266,6 +289,42 @@ pub fn render_canvas2d(
 
     ctx.restore();
     Ok(())
+}
+
+/// Fill a glyph outline on the canvas (issue #436). Fills respect the canvas
+/// clip (unlike `put_image_data`), so no manual crop is needed. Faux bold
+/// strokes the outline `radius` wide after shifting half a radius down and
+/// right, matching the mask path's down-right dilation.
+fn fill_outline(
+    ctx: &web_sys::OffscreenCanvasRenderingContext2d,
+    path: &kurbo::BezPath,
+    color: &str,
+    bold_radius: Option<f64>,
+) {
+    use kurbo::PathEl;
+    ctx.save();
+    if let Some(r) = bold_radius {
+        let _ = ctx.translate(r / 2.0, r / 2.0);
+    }
+    ctx.begin_path();
+    for el in path.elements() {
+        match *el {
+            PathEl::MoveTo(p) => ctx.move_to(p.x, p.y),
+            PathEl::LineTo(p) => ctx.line_to(p.x, p.y),
+            PathEl::QuadTo(a, b) => ctx.quadratic_curve_to(a.x, a.y, b.x, b.y),
+            PathEl::CurveTo(a, b, c) => ctx.bezier_curve_to(a.x, a.y, b.x, b.y, c.x, c.y),
+            PathEl::ClosePath => ctx.close_path(),
+        }
+    }
+    ctx.set_fill_style_str(color);
+    ctx.fill();
+    if let Some(r) = bold_radius {
+        ctx.set_stroke_style_str(color);
+        ctx.set_line_width(r);
+        ctx.set_line_join("round");
+        ctx.stroke();
+    }
+    ctx.restore();
 }
 
 /// Conservative bounding box of a glyph run — the pen extents padded by the

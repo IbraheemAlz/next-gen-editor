@@ -16,7 +16,8 @@ pub mod shape;
 
 pub use bidi::{BidiAnalysis, VisualRun, analyze_bidi, first_strong_direction};
 pub use fonts::{
-    FontError, FontId, FontMetrics, FontStack, GlyphMetrics, LoadedFont, RasterizedGlyph, Synthesis,
+    FontError, FontId, FontMetrics, FontStack, GlyphMetrics, LoadedFont, MAX_OUTLINE_PX,
+    MAX_RASTER_PX, OutlineCmd, RasterizedGlyph, Synthesis,
 };
 pub use justify::{Alignment, JustifyMode};
 pub use line_break::break_opportunities;

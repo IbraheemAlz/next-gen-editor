@@ -29,7 +29,9 @@ paths:
 ## Unit tests (issue #332)
 - `vitest` (node environment, `fake-indexeddb`, no jsdom/happy-dom), run with `pnpm -r test`; tests are `src/**/*.test.ts` beside the module, config in the root `vitest.shared.ts` + a per-package `vitest.config.ts`.
 - A module you want to unit-test must not touch the DOM at import time. Stub what it reads off `globalThis` (`Worker`, `location`, `indexedDB` + `IDBKeyRange` — `vi.stubGlobal`, `vi.stubEnv('DEV', false)`) inside the test, not globally.
-- `engine.worker.ts` imports the wasm engine and is not loadable under vitest: put new pure decisions (schedules, scoring, state folds) in their own module and import them from the worker.
+- `engine.worker.ts` imports the wasm engine and is not loadable under vitest: put new pure decisions (schedules, scoring, state folds) in their own module and import them from the worker (issue #438: `checkpoint-retry.ts` — snapshot/journal retry machines with an injectable `Timers` + writers; `snapshot-flow.ts` — `takeSnapshot`'s decisions; `recovery-plan.ts` — the #268 candidate ranking + journal-gap count). The worker only wires them to `setTimeout`, IndexedDB and `postMessage`.
+- Reactive code (`createEffect` / `createMemo`) needs Solid's browser build: the vitest configs spread `solidBrowserVite` from `vitest.shared.ts` (`browser` condition on `resolve` AND `ssr.resolve`, Solid inlined). Without it effects silently never run.
+- `package.json` pins `packageManager` (pnpm); CI's `pnpm/action-setup` has no `version:` input and reads that pin.
 - Prefer a unit test over a Playwright spec for pure-TS behaviour; keep e2e for what needs the browser + wasm engine. `pnpm -r tsc` also type-checks the test files.
 
 ## tsify-next interop

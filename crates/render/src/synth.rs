@@ -7,7 +7,7 @@ use text_pipeline::RasterizedGlyph;
 
 /// Shear factor for faux italic — a row's horizontal shift is its distance
 /// above the baseline times this. ~12.4 degrees, a conventional oblique angle.
-const SHEAR: f32 = 0.22;
+pub(crate) const SHEAR: f32 = 0.22;
 
 /// Faux bold — dilate the alpha mask down-and-right by `radius` pixels so
 /// every stroke thickens. `radius` scales with `px_size` (~1 px at 22 pt). The
@@ -21,11 +21,17 @@ const SHEAR: f32 = 0.22;
 /// form was `O(width × height × radius²)`: ~6 × 10¹¹ steps for a 4096 px
 /// glyph (radius 186), a hang. The output is identical
 /// (`embolden_matches_the_direct_box_dilation`).
+/// Faux-bold dilation radius in pixels for `px_size` — shared by the mask
+/// path ([`embolden`]) and the outline path (a stroke of this width).
+pub(crate) fn embolden_radius(px_size: f32) -> u32 {
+    ((px_size / 22.0).round() as u32).max(1)
+}
+
 pub fn embolden(g: &RasterizedGlyph, px_size: f32) -> RasterizedGlyph {
     if g.width == 0 || g.height == 0 {
         return g.clone();
     }
-    let radius = ((px_size / 22.0).round() as u32).max(1);
+    let radius = embolden_radius(px_size);
     let (w, h) = (g.width as usize, g.height as usize);
     let r = radius as usize;
     let (nw, nh) = (w + r, h + r);
