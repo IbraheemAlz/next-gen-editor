@@ -18382,6 +18382,17 @@ impl Engine {
         })
     }
 
+    /// Issue #329 — the font substitutions layout makes for `doc` against
+    /// `stack` (the shell's boot faces, in a tool): the same walk as
+    /// `Event::DocumentLoaded.substituted`, for `tools/corpus-native`'s
+    /// substitution counter.
+    pub fn font_substitutions_for_tools(
+        doc: &DocumentTree,
+        stack: &FontStack,
+    ) -> Vec<bridge::FontSubstitution> {
+        font_substitution::document_font_substitutions(doc, stack)
+    }
+
     /// Exercise the real, browser-free glyph rasterizer
     /// (`render::atlas::GlyphAtlas::get_or_rasterize`, swash-backed) over
     /// every glyph run in the most recent layout snapshot. This is

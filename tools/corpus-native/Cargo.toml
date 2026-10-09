@@ -20,6 +20,8 @@ format-pdf = { path = "../../crates/format-pdf" }
 # grid + autofit, headers/footers, notes) driven natively through the
 # canvas-less `fuzz-native` surface, timed per document under a budget.
 engine-wasm = { path = "../../crates/engine-wasm", features = ["fuzz-native"] }
+# Issue #329 — `bridge::FontSlot` in the substitution census.
+bridge = { path = "../../crates/bridge" }
 # Issue #418 - `getrusage` for the CPU-time layout budget.
 libc = "0.2"
 serde = { workspace = true }

@@ -798,6 +798,125 @@ pub fn theme_loaded_faces_docx() -> Vec<u8> {
     ))
 }
 
+/// Text of [`substitution_fonts_docx`]'s paragraphs, in order.
+pub const SUBSTITUTION_FIXTURE_TEXTS: [&str; 4] = [
+    "Calibri and Simplified Arabic",
+    "This paragraph names Calibri, a face the editor does not ship. It is laid out \
+     with Carlito, Calibri's metric-compatible clone, so its line breaks and its \
+     page count follow the document as Word lays it out, instead of drifting with \
+     whatever face the script fallback happens to pick.",
+    "هذه الفقرة مكتوبة بخط العربية المبسطة الذي لا يشحنه المحرر، فتعرض بخط نسخ بديل \
+     قريب من شكله، وتبقى المسافات بين الأسطر محسوبة من مقاييس الخط كما يحسبها وورد.",
+    "English words and كلمات عربية share one paragraph here.",
+];
+
+/// Issue #329 — a Word-shaped document that names two faces the editor does
+/// not ship, directly (no theme): docDefaults `<w:rFonts w:ascii="Calibri"
+/// w:hAnsi="Calibri" w:cs="Simplified Arabic"/>`, `w:sz="22"` /
+/// `w:szCs="28"` (11 pt Latin, 14 pt Arabic, as Arabic templates set them)
+/// and Word 2013's Normal spacing (`w:after="160"`, `w:line="259"`
+/// `lineRule="auto"`), on an explicit A4 page with 1-inch margins (so a
+/// differential run against LibreOffice compares the same page). Paragraph
+/// 0 is a bold 16 pt heading, 1 English body text, 2 an RTL Arabic
+/// paragraph, 3 a mixed one. The editor lays the Latin text out in
+/// Carlito (Calibri's metric clone) and the Arabic in Noto Naskh Arabic
+/// (Simplified Arabic's closest shipped style), with Word's font-derived
+/// line pitch.
+pub fn substitution_fonts_docx() -> Vec<u8> {
+    use engine::{FontFamily, SpanStyle};
+    let [heading, body, arabic, mixed] = SUBSTITUTION_FIXTURE_TEXTS;
+    let paras = [
+        engine::Paragraph {
+            text: heading.into(),
+            style_id: Some("Heading1".into()),
+            ..Default::default()
+        },
+        engine::Paragraph {
+            text: body.into(),
+            ..Default::default()
+        },
+        engine::Paragraph {
+            text: arabic.into(),
+            props: engine::ParaProperties {
+                direction: Some(engine::TextDirection::Rtl),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        engine::Paragraph {
+            text: mixed.into(),
+            ..Default::default()
+        },
+    ];
+    let mut doc = engine::DocumentTree::from_rich_paragraphs(paras);
+    doc.style_run_defaults = SpanStyle {
+        font_family: FontFamily::from_display_name("Calibri"),
+        font_family_cs: FontFamily::from_display_name("Simplified Arabic"),
+        font_size: Some(11.0),
+        font_size_cs: Some(14.0),
+        ..Default::default()
+    };
+    doc.style_defaults = engine::ParaProperties {
+        spacing: engine::Spacing {
+            before_twips: 0,
+            after_twips: 160,
+        },
+        line_height: Some(engine::LineHeight::Auto { twips: 259 }),
+        ..Default::default()
+    };
+    doc.styles.insert(
+        "Heading1".into(),
+        engine::ParagraphStyle {
+            id: "Heading1".into(),
+            name: "heading 1".into(),
+            run: SpanStyle {
+                bold: Some(true),
+                bold_cs: Some(true),
+                font_size: Some(16.0),
+                font_size_cs: Some(16.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    doc.styles_dirty = true;
+    let base = crate::writer::build_minimal_docx(&doc).expect("minimal package");
+    rewrite_document_xml(&base, |xml| {
+        assert!(xml.contains("<w:sectPr/>"), "bare sectPr expected");
+        xml.replacen(
+            "<w:sectPr/>",
+            "<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
+             <w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" \
+             w:header=\"720\" w:footer=\"720\"/></w:sectPr>",
+            1,
+        )
+    })
+}
+
+/// Rewrite a package's `word/document.xml` through `f`; every other entry
+/// keeps its bytes and order.
+fn rewrite_document_xml(docx: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
+    use std::io::Read;
+    let mut zin = zip::ZipArchive::new(Cursor::new(docx)).expect("read package");
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zin.len());
+    for i in 0..zin.len() {
+        let mut file = zin.by_index(i).expect("zip entry");
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).expect("read entry");
+        let name = file.name().to_owned();
+        if name == "word/document.xml" {
+            buf = f(std::str::from_utf8(&buf).expect("utf8 document.xml")).into_bytes();
+        }
+        entries.push((name, buf));
+    }
+    zip_entries(
+        entries
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect(),
+    )
+}
+
 /// Issue #395 — the `Title` style of Word 2007's default template, as the
 /// corpus carries it (`docx4j-sample-docs/toc.docx`, `Headers.docx`,
 /// `sample-docx.docx`, `Symbols.docx`, `ArialUnicodeMS.docx`): a bottom

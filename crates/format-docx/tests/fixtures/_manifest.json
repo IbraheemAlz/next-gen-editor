@@ -273,6 +273,22 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "substitution_fonts.docx": {
+      "generator": "build_minimal_docx",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 4,
+        "paragraph_texts": [
+          "Calibri and Simplified Arabic",
+          "This paragraph names Calibri, a face the editor does not ship. It is laid out with Carlito, Calibri's metric-compatible clone, so its line breaks and its page count follow the document as Word lays it out, instead of drifting with whatever face the script fallback happens to pick.",
+          "هذه الفقرة مكتوبة بخط العربية المبسطة الذي لا يشحنه المحرر، فتعرض بخط نسخ بديل قريب من شكله، وتبقى المسافات بين الأسطر محسوبة من مقاييس الخط كما يحسبها وورد.",
+          "English words and كلمات عربية share one paragraph here."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 141
+      }
+    },
     "table_2x2_opaque.docx": {
       "generator": "handcrafted",
       "phase_introduced": 5,

@@ -66,6 +66,7 @@ const VIEWPORTS = {
     'rich-text-caps': { width: 595, height: 842 },
     'rich-text-cs-size': { width: 595, height: 842 },
     'theme-fonts': { width: 1190, height: 360 },
+    'font-substitution': { width: 1190, height: 640 },
 };
 function viewportFor(name) {
     if (process.env.VIEWPORT) {

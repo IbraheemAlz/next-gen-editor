@@ -365,3 +365,72 @@ fn an_empty_word_paragraph_is_sized_by_its_mark() {
     let h = paragraph_heights(&tests::test_engine_with_doc(doc));
     assert!((h[0] - 24.0 * 2355.0 / 2048.0).abs() < 1e-3, "{h:?}");
 }
+
+/// Issue #329 acceptance fixture — a document naming Calibri and
+/// Simplified Arabic directly (`format_docx::test_fixtures::
+/// substitution_fonts_docx`, committed as `substitution_fonts.docx`), laid
+/// out with the editor's boot faces: the Latin text in Carlito, the Arabic
+/// in Noto Naskh Arabic, at Word's font-derived pitch — Word 2013's Normal
+/// `w:line="259"` multiple of Carlito's 1.221 em at 11 pt for a Latin
+/// line, of Noto Naskh's 1.703 em at the 14 pt `w:szCs` for an Arabic
+/// one. One page; geometry pinned.
+#[test]
+fn the_substitution_fixture_lays_out_in_its_substitutes() {
+    let doc = format_docx::read_docx(&format_docx::test_fixtures::substitution_fonts_docx())
+        .expect("fixture")
+        .document;
+    let e = engine_with_editor_faces(doc);
+    assert_eq!(
+        e.font_substitutions(),
+        [
+            sub("Calibri", FontSlot::Latin, "Carlito", "carlito", true),
+            sub(
+                "Simplified Arabic",
+                FontSlot::ComplexScript,
+                "Noto Naskh Arabic",
+                "noto-naskh",
+                false
+            ),
+        ]
+    );
+    let (pages, _, _, info) = e.build_pages(1.0, false, None).expect("layout");
+    assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+    assert_eq!(pages.len(), 1);
+    let texts = format_docx::test_fixtures::SUBSTITUTION_FIXTURE_TEXTS;
+    let multiple = 259.0 / 240.0;
+    let latin_line = 11.0 * 2500.0 / 2048.0 * multiple;
+    let arabic_line = 14.0 * 1703.0 / 1000.0 * multiple;
+    for (i, block) in pages[0].blocks.iter().enumerate() {
+        let para = block.as_paragraph().expect("paragraph");
+        for line in &para.lines {
+            for run in &line.runs {
+                let piece =
+                    &texts[i][run.source_range.start as usize..run.source_range.end as usize];
+                let arabic = piece
+                    .chars()
+                    .any(|c| ('\u{0600}'..='\u{06FF}').contains(&c));
+                let latin = piece.chars().any(|c| c.is_ascii_alphabetic());
+                if arabic {
+                    assert_eq!(run.font, "noto-naskh", "{piece:?}");
+                } else if latin {
+                    assert_eq!(run.font, "carlito", "{piece:?}");
+                }
+            }
+            let has_arabic = line.runs.iter().any(|r| r.font == "noto-naskh");
+            if i == 1 {
+                assert!((line.height - latin_line).abs() < 1e-3, "{}", line.height);
+            } else if i == 2 && has_arabic {
+                assert!((line.height - arabic_line).abs() < 1e-2, "{}", line.height);
+            }
+        }
+    }
+    let fp = layout::geometry_fingerprint(&pages);
+    eprintln!("SUBSTITUTION FIXTURE FINGERPRINT = {fp:#x}");
+    assert_eq!(
+        fp, PINNED_SUBSTITUTION_FIXTURE,
+        "substitution fixture geometry changed"
+    );
+}
+
+/// Recorded on this change via `--nocapture` (issue #329).
+const PINNED_SUBSTITUTION_FIXTURE: u64 = 0x2b50961476972aa6;

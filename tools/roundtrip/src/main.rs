@@ -5005,6 +5005,31 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             bytes: format_docx::test_fixtures::theme_loaded_faces_docx(),
             entry: theme_fixture_entry(),
         },
+        /* Issue #329 — a document naming Calibri and Simplified Arabic
+        directly (docDefaults `w:rFonts`), Word 2013's Normal spacing: the
+        editor lays it out with Carlito / Noto Naskh Arabic and Word's
+        font-derived line pitch (the visual-diff `font-substitution`
+        golden loads it). Explicit A4 `<w:sectPr>` (the differential
+        harness compares it against LibreOffice), hence the compaction
+        drift bound. */
+        PrebuiltFixture {
+            name: "substitution_fonts.docx",
+            bytes: format_docx::test_fixtures::substitution_fonts_docx(),
+            entry: FixtureEntry {
+                generator: "build_minimal_docx".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 4,
+                    paragraph_texts: format_docx::test_fixtures::SUBSTITUTION_FIXTURE_TEXTS
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect(),
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
+            },
+        },
         /* Issue #365 — a table under review: a tracked row deletion, a
         tracked row insertion, `<w:tblPrChange>` / `<w:trPrChange>`
         history. Zero-edit drift 0; the default harness's step 53 edits,

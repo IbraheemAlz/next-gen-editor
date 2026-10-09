@@ -766,6 +766,10 @@ pub struct DocResult {
     /// when the read failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme_fonts: Option<ThemeFontCensus>,
+    /// Issue #329 — the font substitutions the editor's boot faces make
+    /// for the document. Absent when the read failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_substitutions: Option<SubstitutionCensus>,
     /// Issues #325 / #394 — the parts the reader re-prefixed into the
     /// canonical namespace spelling (`DocxWarning::NonCanonicalNamespaces`
     /// with `normalized`): each is regenerate-only, so its zero-edit save
@@ -883,6 +887,43 @@ impl ThemeFontCensus {
     }
 }
 
+/// Issue #329 — what the editor substitutes for the families a document
+/// names (`engine_wasm::Engine::font_substitutions_for_tools` against the
+/// shell's boot faces, `fonts::editor_stack`): the walk behind
+/// `Event::DocumentLoaded.substituted`, one entry per (family, slot).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SubstitutionCensus {
+    /// Latin-slot substitutions, `"Calibri→Carlito"`, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub latin: Vec<String>,
+    /// Complex-script substitutions, `"Arial→Noto Naskh Arabic"`, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub complex_script: Vec<String>,
+    /// How many of them are metric-compatible (widths kept).
+    pub metric_compatible: u32,
+}
+
+impl SubstitutionCensus {
+    pub fn of(doc: &engine::DocumentTree, stack: &text_pipeline::FontStack) -> SubstitutionCensus {
+        let mut c = SubstitutionCensus::default();
+        for s in engine_wasm::Engine::font_substitutions_for_tools(doc, stack) {
+            let entry = format!("{}→{}", s.family, s.substitute);
+            if s.slot == bridge::FontSlot::ComplexScript {
+                c.complex_script.push(entry);
+            } else {
+                c.latin.push(entry);
+            }
+            c.metric_compatible += u32::from(s.metric_compatible);
+        }
+        c
+    }
+
+    /// Substitutions in both slots.
+    pub fn total(&self) -> usize {
+        self.latin.len() + self.complex_script.len()
+    }
+}
+
 /// Issue #318 — the production-layout stage's switches.
 #[derive(Debug, Clone, Copy)]
 pub struct EngineLayoutOpts {
@@ -939,6 +980,7 @@ impl DocResult {
             engine_page_count: None,
             engine_fingerprint: None,
             theme_fonts: None,
+            font_substitutions: None,
             engine_degradations: Vec::new(),
             normalized_parts: Vec::new(),
             regen_check: None,
@@ -1108,6 +1150,10 @@ pub fn run_one(
     read_doc = Some(archive_a.document.clone());
     rec.paragraph_count = Some(archive_a.document.paragraph_count());
     rec.theme_fonts = Some(ThemeFontCensus::of(&archive_a.document));
+    rec.font_substitutions = Some(SubstitutionCensus::of(
+        &archive_a.document,
+        crate::fonts::editor_stack_cached(),
+    ));
     rec.normalized_parts = archive_a
         .warnings
         .iter()

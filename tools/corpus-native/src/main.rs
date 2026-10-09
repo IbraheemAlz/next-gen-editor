@@ -541,6 +541,13 @@ fn main() -> ExitCode {
     let mut theme_runs = 0u64;
     let mut theme_faces: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    /* Issue #329 — font substitution: documents with at least one, the
+    (family, slot) entries in total, and each entry's document count. */
+    let mut substituting_docs = 0usize;
+    let mut substitutions_total = 0usize;
+    let mut substitutions_metric = 0usize;
+    let mut substitution_pairs: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     /* Issue #384 — `--regen-check`: paragraphs regenerated / mismatching
     (all, and those with text), documents with a mismatch, and the
     mismatching paragraphs per class. */
@@ -682,6 +689,20 @@ fn main() -> ExitCode {
             theme_runs += t.runs;
             for face in &t.faces {
                 *theme_faces.entry(face.clone()).or_insert(0) += 1;
+            }
+        }
+
+        if let Some(sc) = &rec.font_substitutions {
+            substituting_docs += usize::from(sc.total() > 0);
+            substitutions_total += sc.total();
+            substitutions_metric += sc.metric_compatible as usize;
+            for pair in &sc.latin {
+                *substitution_pairs.entry(pair.clone()).or_insert(0) += 1;
+            }
+            for pair in &sc.complex_script {
+                *substitution_pairs
+                    .entry(format!("{pair} (cs)"))
+                    .or_insert(0) += 1;
             }
         }
 
@@ -839,6 +860,21 @@ fn main() -> ExitCode {
          {normalized_parts} parts normalised (regenerate-only: their zero-edit save is not \
          byte-identical to the source)"
     );
+    println!(
+        "[corpus-native] font substitution (#329): {substituting_docs}/{} documents substitute \
+         a family with the editor's boot faces ({substitutions_total} (family, slot) entries, \
+         {substitutions_metric} metric-compatible)",
+        files.len()
+    );
+    if !substitution_pairs.is_empty() {
+        let mut pairs: Vec<(&String, &usize)> = substitution_pairs.iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let list: Vec<String> = pairs.iter().map(|(p, n)| format!("{p} ({n})")).collect();
+        println!(
+            "[corpus-native]   substitutions (docs): {}",
+            list.join(", ")
+        );
+    }
     if !theme_faces.is_empty() {
         let mut faces: Vec<(&String, &usize)> = theme_faces.iter().collect();
         faces.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
