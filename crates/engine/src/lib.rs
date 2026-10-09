@@ -182,6 +182,9 @@ pub struct DocumentTree {
     /// Phase 5 PR 1 widened it to `Vector<Block>` so tables can appear at
     /// any document position. Still `im::Vector` so undo snapshots clone
     /// in O(1) — table cells use plain `Vec<Block>` instead.
+    /// Issue #422 — decoded through [`snapshot::de_bounded_vector`], so a
+    /// hostile declared count cannot drive `im`'s uncapped preallocation.
+    #[serde(deserialize_with = "crate::snapshot::de_bounded_vector")]
     pub blocks: Vector<Block>,
     /// Phase 3 (#40) — the body-level trailing `<w:sectPr>` governing the
     /// FINAL section. Interior section boundaries live on their closing
@@ -7303,7 +7306,7 @@ impl DocumentTree {
         };
         let mut blocks = self.blocks.clone();
         let parent = start.path.parent();
-        for idx in start_idx..=end_idx {
+        for idx in self.sibling_range(&start.path, start_idx, end_idx) {
             let Some(Block::Paragraph(p)) = container.get(idx as usize) else {
                 continue;
             };
@@ -7417,7 +7420,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.alignment = Some(align);
@@ -7486,7 +7489,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.direction = Some(direction);
@@ -8193,7 +8196,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8306,7 +8309,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8504,7 +8507,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8567,7 +8570,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8627,7 +8630,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8748,7 +8751,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8825,7 +8828,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8880,7 +8883,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.list_item = None;
@@ -9402,7 +9405,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.borders = borders.clone();
@@ -11903,6 +11906,58 @@ pub fn parent_container_snapshot(doc: &DocumentTree, path: &BlockPath) -> Option
     };
     let cell = t.rows.get(row as usize)?.cells.get(col as usize)?;
     Some(cell.blocks.clone())
+}
+
+/// Issue #422 — [`parent_container_snapshot`]'s length, without the clone:
+/// how many blocks the container `path`'s last step indexes into holds
+/// (the top-level sequence, or a table cell's blocks). `None` when the
+/// path does not resolve to a container.
+pub fn parent_container_len(doc: &DocumentTree, path: &BlockPath) -> Option<usize> {
+    if path.steps.len() == 1 {
+        return Some(doc.blocks.len());
+    }
+    if path.steps.len() < 3 {
+        return None;
+    }
+    let n = path.steps.len();
+    let grandparent = BlockPath {
+        steps: path.steps[..n - 2].to_vec(),
+    };
+    let Block::Table(t) = doc.block_at(&grandparent)? else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = path.steps[n - 2] else {
+        return None;
+    };
+    Some(
+        t.rows
+            .get(row as usize)?
+            .cells
+            .get(col as usize)?
+            .blocks
+            .len(),
+    )
+}
+
+impl DocumentTree {
+    /// Issue #422 — the sibling indices `start_idx..=end_idx` of a
+    /// same-parent range, clipped to the blocks that exist in `path`'s
+    /// container. The indices come off the wire: an end index of ~4
+    /// billion used to drive the range loops of `set_line_spacing` & co.
+    /// through 4 billion iterations (88 s for one fuzz-generated
+    /// `SetLineSpacing`), each building a path to a block that is not
+    /// there. A missing index addresses nothing, so the clipped loop
+    /// mutates exactly the paragraphs the unclipped one did.
+    fn sibling_range(
+        &self,
+        path: &BlockPath,
+        start_idx: u32,
+        end_idx: u32,
+    ) -> std::ops::Range<u32> {
+        let len = parent_container_len(self, path).unwrap_or(0) as u64;
+        let stop = (u64::from(end_idx) + 1).min(len) as u32;
+        start_idx..stop
+    }
 }
 
 /// Same parent container? Two paragraph paths share a container
@@ -15313,6 +15368,51 @@ mod tests {
         );
         let d = d.set_line_spacing(start, end, 0.0);
         assert_eq!(d.blocks[0].as_paragraph().unwrap().props.line_height, None);
+    }
+
+    /// Issue #422 — a wire end index of `u32::MAX` used to walk ~4 billion
+    /// missing siblings (88 s for one fuzz `SetLineSpacing`). The range is
+    /// clipped to the blocks that exist; the same paragraphs change.
+    #[test]
+    fn range_edits_clip_a_hostile_end_index_to_existing_siblings() {
+        let mut d = DocumentTree::from_text("a");
+        let p = d.blocks[0].clone();
+        d.blocks.push_back(p.clone());
+        d.blocks.push_back(p);
+        let start = LogicalPos::new(BlockPath::top(1), 0);
+        let end = LogicalPos::new(BlockPath::top(u32::MAX), 0);
+        let started = std::time::Instant::now();
+        let spaced = d.set_line_spacing(start.clone(), end.clone(), 2.0);
+        let aligned = d.set_alignment(start.clone(), end.clone(), Alignment::Center);
+        let styled = d.apply_style(
+            start.clone(),
+            end,
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let lh =
+            |doc: &DocumentTree, i: usize| doc.blocks[i].as_paragraph().unwrap().props.line_height;
+        assert_eq!(lh(&spaced, 0), None);
+        assert_eq!(lh(&spaced, 1), Some(LineHeight::Auto { twips: 480 }));
+        assert_eq!(lh(&spaced, 2), Some(LineHeight::Auto { twips: 480 }));
+        let al = |i: usize| aligned.blocks[i].as_paragraph().unwrap().props.alignment;
+        assert_eq!(
+            (al(0), al(1), al(2)),
+            (None, Some(Alignment::Center), Some(Alignment::Center))
+        );
+        assert!(styled.blocks[0].as_paragraph().unwrap().spans.is_empty());
+        assert!(!styled.blocks[2].as_paragraph().unwrap().spans.is_empty());
+        // A start index past the end addresses nothing.
+        let far = LogicalPos::new(BlockPath::top(u32::MAX - 1), 0);
+        let none = d.set_line_spacing(
+            far.clone(),
+            LogicalPos::new(BlockPath::top(u32::MAX), 0),
+            2.0,
+        );
+        assert!((0..3).all(|i| lh(&none, i).is_none()));
     }
 
     /// Issue #145 — `SetTabStops` must not clobber an existing leader

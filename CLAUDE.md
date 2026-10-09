@@ -160,7 +160,7 @@ D5.10 are external/human sign-offs, not code.
   `crates/format-pdf/build.rs` synthesizes the sRGB ICC profile — no binary
   blob in the tree. `tools/pdf-validate` is the veraPDF harness.
 - **Fuzzing (D5.5, scaled up by issue #90).** `fuzz/` is a cargo-fuzz crate
-  in its **own workspace** with four structure-aware targets, all
+  in its **own workspace** with six structure-aware targets, all
   compile-checked on stable via `cargo check --manifest-path fuzz/Cargo.toml`
   (`cargo +nightly fuzz run` is the nightly flow, `.github/workflows/
   fuzz-nightly.yml`, ≥ 30 min/target with `-fork=4` so one already-known
@@ -170,6 +170,15 @@ D5.10 are external/human sign-offs, not code.
     schema-shaped WML (random `pPr`/`rPr`/`tbl`/`sectPr` trees, valid and
     deliberately-invalid attributes) inside a minimal OPC zip, not raw
     bytes, then `read_docx` / `read → write → read`.
+    Issue #358 widened it: complex fields (balanced / not, nested to 40),
+    `fldSimple`, block + inline `w:sdt` (to 5000 deep), paragraph- and
+    run-level `mc:AlternateContent` with random `Requires`, drawings whose
+    `r:embed` resolves to nothing, `NaN` / unit / hex numbers, 60-deep
+    tables, and a splice mode (spec snippets, raw input bytes, flips,
+    truncation) — all chains, linear in depth, `document.xml` capped at
+    2 MB (#422). `docx_roundtrip` also asserts the zero-edit save keeps
+    the text (exception: a namespace-ill-formed source). The nightly
+    passes `-dict=dictionaries/docx.dict` to both legs.
   - `rpc_command` — `fuzz/src/command_gen.rs` derives `arbitrary::Arbitrary`
     for `Command` (bridge's `arbitrary` feature, optional + off by default,
     zero cost to the wasm build) and drives sequences end to end through
@@ -178,14 +187,33 @@ D5.10 are external/human sign-offs, not code.
     needed: `Engine::new_headless` skips the `OffscreenCanvas` requirement,
     and `apply`'s auto-repaint still runs the full layout pipeline (only
     the final canvas blit is unreachable, and already skipped whenever no
-    canvas is registered).
+    canvas is registered). Issue #341: a command answered with
+    `Event::Error` must leave the document, selection, active story,
+    document name and undo depth unchanged
+    (`Engine::state_fingerprint_for_fuzzing`; the only exception is a
+    reply-stage error after a committed edit on a never-painted headless
+    engine, `is_post_commit_report_error`).
+  - `snapshot_decode` (issue #341) — `fuzz/src/snapshot_gen.rs` takes the
+    engine's own snapshot of a generated session, parses the MessagePack
+    into a tree and mutates it (hostile ints / floats, truncated or lying
+    containers, dangling stories, v1 / v2 / forged package keys, a wrong
+    magic / version byte), ≤ 4 MB; `Engine::restore` must answer `Ok` or a
+    typed error, then one `apply` round keeps
+    `Engine::check_invariants_for_fuzzing`, and `Command::Recover` must
+    answer `Recovered`. Seeds (`corpus/snapshot_decode/`, v1 FNV + v2
+    `sha256-` detached packages, hostile envelopes) come from
+    `examples/regen-seeds`.
   - `layout_paginate` (new) — `fuzz/src/layout_gen.rs` builds random
     paragraph/table/section trees straight into the paginator; a page-count
     bound stands in for a termination watchdog (`Engine::
     layout_page_count_for_fuzzing`).
   - `fuzz/examples/smoke.rs` is a stable-only driver (no nightly needed)
-    proving all four work: `cargo run --manifest-path fuzz/Cargo.toml
-    --example smoke --release`.
+    proving all six work: `systemd-run --user --scope -p MemoryMax=16G
+    --quiet -- cargo run --manifest-path fuzz/Cargo.toml --example smoke
+    --release` — always under the cap (issue #422, see "Bash / agent
+    ergonomics"); it prints `smoke: peak RSS …` (keep it < 4 GB) and
+    aborts on its own on a runaway input (live-heap ceiling, `RLIMIT_AS`,
+    per-input timeout), naming the input.
   - Issue #229 — the `rpc_command` corpus's #186/#187 regression seeds are
     derived from `command_gen::Scenario`'s explicit builder (a fixed-prefix
     fast path in `gen_targeted_command`, immune to unrelated arms' byte-
@@ -329,6 +357,20 @@ Engine backlog" references a real issue.
   `roundtrip-dump` artifact on failure (the harness has no separate
   diff-file dump — its `FAIL:` line carries the inline diff).
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
+- `pnpm -r test` (issue #332) — the TypeScript **unit** tests: `vitest`
+  (pinned, workspace root dev dep; shared node-environment config in
+  `vitest.shared.ts`, **no jsdom** — a module under test must not touch
+  the DOM), `fake-indexeddb` for `ts/src/engine/event-log.ts`, a scripted
+  fake `Worker` for `EngineClient`. Tests sit beside the code
+  (`*.test.ts`, `src/**` of `ts/`, `packages/core`, `packages/ui`) and run in
+  about a second. Pure TS logic (event-log scoring / pruning / package GC /
+  the #314 write-confirm, the #333 retry schedule, `recoveryNotices()`,
+  `nextCleanState`, `devHooksEnabled` / `resolveTelemetryEndpoint`) is
+  tested here, **not** through Playwright; the e2e suite keeps what needs a
+  real browser + the wasm engine. `engine.worker.ts` imports the wasm
+  engine and cannot be loaded by vitest: extract a pure decision into its
+  own module (as `retry-schedule.ts`) to unit-test it. CI runs it as the
+  `unit` step of the `e2e` job, before Playwright.
 - `pnpm exec playwright test` (from `ts/`) — the full e2e suite in `ts/e2e/`
   (`workers: 1`, well under a minute locally) all green.
   **Blocking since issue #230**: `ci.yml`'s `e2e` job reuses the `wasm`
@@ -466,6 +508,17 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
 
 - **Working dir drifts** between Bash tool calls. Use absolute paths or `cd /home/ibrahim/Desktop/code/next-gen-editor &&` at the top of every multi-step command.
 - Long-running processes (vite dev, wasm-pack build) run in `run_in_background: true`.
+- **Heavy local runs go through a memory-capped scope (issue #422).** The
+  fuzz smoke driver / sweeps, `tools/corpus-native`, Playwright and `cargo
+  test --workspace` run as `systemd-run --user --scope -p MemoryMax=16G
+  --quiet -- <command>` (inherits env + cwd). On 2026-10-09 one uncapped
+  smoke input reached 46.5 GB and the OOM killer took the whole terminal
+  scope — session, agents, merge queues, Chrome. `fuzz/examples/smoke.rs`
+  also self-limits (`RLIMIT_AS` 8 GiB, a 2 GiB live-heap ceiling, a 300 s
+  per-input timeout — `SMOKE_AS_LIMIT_MB` / `SMOKE_RSS_LIMIT_MB` /
+  `SMOKE_TIMEOUT_SECS`; the offending input is printed and, with
+  `SMOKE_ARTIFACT_DIR`, saved) and prints its peak RSS at exit; bisect a
+  heavy input with `--from/--to/--log-inputs`.
 - Don't `git add .` blindly. Stage by explicit path.
 - Commit messages: heredoc + a `Co-Authored-By:` trailer naming the model that wrote the change (e.g. `Claude Fable 5.1`, `Claude Opus 5.5`, `Claude Sonnet 5`, each `<noreply@anthropic.com>`); the session that merges adds its `Claude-Session:` link.
 - **Parallel agents in git worktrees.** A shared `CARGO_TARGET_DIR` across

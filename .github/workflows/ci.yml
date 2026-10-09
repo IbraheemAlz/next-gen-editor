@@ -250,6 +250,13 @@ jobs:
         # this exact trap: the workspace lockfile lives at the repo root).
         run: pnpm install --frozen-lockfile
 
+      # Issue #332 - the TypeScript unit tests (vitest, node environment,
+      # fake-indexeddb): event-log scoring / GC / write-confirm, EngineClient
+      # trap handling, recoveryNotices, dev-hook gating. Seconds, no browser
+      # and no wasm; failing here saves the minute of Playwright below.
+      - name: Run TypeScript unit tests
+        run: pnpm -r test
+
       - name: Run Playwright e2e suite
         env:
           CI: 'true'

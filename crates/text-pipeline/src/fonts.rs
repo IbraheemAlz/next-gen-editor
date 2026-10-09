@@ -19,7 +19,22 @@ pub enum FontError {
     GlyphMissing(u32),
     #[error("rasterizer produced no image")]
     NoImage,
+    /// Issue #422 — the requested pixel size is non-finite, not positive,
+    /// or above [`MAX_RASTER_PX`]; nothing was rasterized.
+    #[error("glyph pixel size outside the rasterizable range")]
+    SizeOutOfRange,
 }
+
+/// Issue #422 — the largest pixel size [`LoadedFont::rasterize_glyph`]
+/// rasterizes. The size is untrusted (a span's font size from a `.docx`
+/// `w:sz`, a restored snapshot or a wire `ApplyFormatting`, times the zoom
+/// and device scale): a fuzz-restored snapshot asked for a 20 720 638 px
+/// glyph and `swash` reserved a 1.4 GB coverage mask for it. 4096 device
+/// px keeps one mask at most ~16 MB; it is 3072 pt at 100 % zoom on a 1×
+/// display (Word's own maximum font size is 1638 pt) and ~300 pt at the
+/// 450 % zoom on a 3× display. A larger glyph is not rasterized — the
+/// renderer skips it as it skips a glyph the font cannot draw.
+pub const MAX_RASTER_PX: f32 = 4096.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FontMetrics {
@@ -194,6 +209,9 @@ impl LoadedFont {
     /// Rasterize a glyph by its glyph id (skipping the charmap lookup;
     /// used after `rustybuzz` shaping returns glyph ids directly).
     pub fn rasterize_glyph(&self, gid: u16, px_size: f32) -> Result<RasterizedGlyph, FontError> {
+        if !(px_size.is_finite() && px_size > 0.0 && px_size <= MAX_RASTER_PX) {
+            return Err(FontError::SizeOutOfRange);
+        }
         let face = self.face();
         let mut ctx = ScaleContext::new();
         let mut scaler = ctx.builder(face).size(px_size).hint(true).build();
@@ -362,6 +380,33 @@ mod tests {
                 Err(FontError::Parse)
             ));
         }
+    }
+
+    /* Issue #422 — a hostile pixel size (the fuzz-restored snapshot asked
+    for 20 720 638 px, a 1.4 GB mask) is a typed refusal, not a giant
+    allocation; nominal sizes and the cap itself still rasterize. */
+    #[test]
+    fn rasterize_refuses_sizes_outside_the_cap() {
+        let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("lib".to_string(), bytes).expect("font");
+        for px in [
+            20_720_638.0,
+            MAX_RASTER_PX + 1.0,
+            f32::INFINITY,
+            f32::NAN,
+            0.0,
+            -12.0,
+        ] {
+            assert!(
+                matches!(font.rasterize('H', px), Err(FontError::SizeOutOfRange)),
+                "{px}"
+            );
+        }
+        assert!(font.rasterize('H', 16.0).is_ok());
+        let at_cap = font
+            .rasterize('H', MAX_RASTER_PX)
+            .expect("the cap rasterizes");
+        assert!((at_cap.width as usize) * (at_cap.height as usize) <= 4096 * 4096 * 2);
     }
 
     /* Issue #23 — a dynamically-registered custom font (here `cairo`, the
