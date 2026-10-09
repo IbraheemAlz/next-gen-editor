@@ -66,6 +66,8 @@ describe('recoveryNotices (#315)', () => {
         const withTime = recoveryNotices(report({ tailDropped: true, baseSnapshotAt: 1234 }), fmt);
         expect(withTime).toHaveLength(1);
         expect(withTime[0]?.kind).toBe('tail-dropped');
+        expect(withTime[0]?.title).toBe('Recovered an earlier version of your document');
+        expect(withTime[0]?.detail).toContain('changes made after that were lost');
         expect(withTime[0]?.detail).toContain('as it was at t1234');
         const noTime = recoveryNotices(report({ tailDropped: true }), fmt);
         expect(noTime[0]?.detail).toContain('as it was at an earlier recovery point');
@@ -74,6 +76,7 @@ describe('recoveryNotices (#315)', () => {
     it('package-lost: points at Save As', () => {
         const [n] = recoveryNotices(report({ packageLost: true }));
         expect(n).toMatchObject({ kind: 'package-lost' });
+        expect(n?.title).toBe('Parts of the original file could not be restored');
         expect(n?.action).toMatch(/Save As/);
     });
 
@@ -161,6 +164,7 @@ describe('checkpointNotices (#333 / #390)', () => {
         const [n, ...rest] = checkpointNotices(true);
         expect(rest).toEqual([]);
         expect(n?.kind).toBe('checkpoint-failing');
+        expect(n?.title).toBe('Changes are not being checkpointed');
         expect(n?.action).toMatch(/Save/);
     });
 
