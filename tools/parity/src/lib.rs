@@ -35,7 +35,7 @@ pub const E2E_ROOT: &str = "ts/e2e";
 pub const FUZZ_GEN: &str = "fuzz/src/command_gen.rs";
 /// Ratchet: `Implemented` commands the e2e suite dispatches by wire name.
 /// Raise it as coverage grows; never lower it.
-pub const E2E_IMPLEMENTED_FLOOR: usize = 41;
+pub const E2E_IMPLEMENTED_FLOOR: usize = 45;
 /// Ratchet: gaps citing `bridge::UNFILED` instead of an issue number
 /// (mirrors `bridge::meta`'s own cap). File the issue, then shrink this.
 pub const MAX_UNFILED: usize = 4;
