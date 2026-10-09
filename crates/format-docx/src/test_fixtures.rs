@@ -172,6 +172,11 @@ pub fn no_pgsz_docx(paragraph_text: &str) -> Vec<u8> {
         ("word/document.xml", document.as_bytes()),
         ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
     ];
+    zip_entries(entries)
+}
+
+/// Deflated zip of `entries`, in order.
+fn zip_entries(entries: Vec<(&str, &[u8])>) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut zip = ZipWriter::new(Cursor::new(&mut buf));
@@ -184,4 +189,73 @@ pub fn no_pgsz_docx(paragraph_text: &str) -> Vec<u8> {
         zip.finish().expect("zip finish");
     }
     buf
+}
+
+/// Issue #359 — paragraph 0 of [`complex_script_size_docx`]: ONE run
+/// (`w:sz="22" w:szCs="28"`) mixing Latin and Arabic words, long enough to
+/// wrap, so the line breaks depend on BOTH sizes.
+pub const CS_SIZE_MIXED_TEXT: &str = "Latin words stay at eleven points while \
+النص العربي يكبر إلى أربعة عشر نقطة inside the very same run, and every line \
+break follows both sizes at once كما يفعل وورد تماما when the run mixes scripts.";
+
+/// Issue #359 — paragraph 1: a `<w:rtl/>` run — every character, the
+/// digits and the Latin word included, takes `w:szCs`.
+pub const CS_SIZE_RTL_TEXT: &str = "صدر الإصدار 2026 باسم Engine للمرة الأولى";
+
+/// Issue #359 — paragraph 2: only `<w:sz w:val="22"/>`; the Arabic takes
+/// the `w:szCs` the docDefaults cascade (16 pt), never the run's Latin
+/// size.
+pub const CS_SIZE_CASCADE_TEXT: &str = "Only w:sz here: العربية تأخذ حجم القالب";
+
+/// Issue #359 — the mixed-size complex-script fixture: docDefaults
+/// `w:sz="24"` / `w:szCs="32"`, then the three paragraphs above (an LTR
+/// mixed run at 11 / 14 pt, an RTL `<w:rtl/>` run at 11 / 14 pt, a run
+/// with only `w:sz="22"`), A4 with 1-inch margins. Hand-written OOXML in
+/// Word's own shape; the source of `tools/roundtrip`'s
+/// `complex_script_size.docx` and the engine-wasm layout pin.
+pub fn complex_script_size_docx() -> Vec<u8> {
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:document xmlns:w=\"{W_NS}\"><w:body>\
+         <w:p><w:r><w:rPr><w:sz w:val=\"22\"/><w:szCs w:val=\"28\"/></w:rPr>\
+         <w:t xml:space=\"preserve\">{CS_SIZE_MIXED_TEXT}</w:t></w:r></w:p>\
+         <w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:sz w:val=\"22\"/><w:szCs w:val=\"28\"/>\
+         <w:rtl/></w:rPr><w:t xml:space=\"preserve\">{CS_SIZE_RTL_TEXT}</w:t></w:r></w:p>\
+         <w:p><w:r><w:rPr><w:sz w:val=\"22\"/></w:rPr>\
+         <w:t xml:space=\"preserve\">{CS_SIZE_CASCADE_TEXT}</w:t></w:r></w:p>\
+         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
+         <w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" \
+         w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>\
+         </w:body></w:document>"
+    );
+    let styles = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:styles xmlns:w=\"{W_NS}\"><w:docDefaults><w:rPrDefault><w:rPr>\
+         <w:sz w:val=\"24\"/><w:szCs w:val=\"32\"/></w:rPr></w:rPrDefault>\
+         </w:docDefaults></w:styles>"
+    );
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
+</Types>";
+    let dot_rels = rels(&[(
+        "rId1",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+        "word/document.xml",
+    )]);
+    let doc_rels = rels(&[(
+        "rId1",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+        "styles.xml",
+    )]);
+    zip_entries(vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", dot_rels.as_bytes()),
+        ("word/document.xml", document.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+        ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+    ])
 }

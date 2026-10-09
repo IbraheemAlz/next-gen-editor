@@ -590,6 +590,33 @@ mod tests {
         );
     }
 
+    /// Issues #359 / #104 / #249 — the complex-script twins survive crash
+    /// recovery byte-stably, and a style without them encodes exactly as
+    /// before they existed (the unset twins are absent keys).
+    #[test]
+    fn complex_script_twins_round_trip_and_stay_absent_when_unset() {
+        let latin = SpanStyle {
+            font_size: Some(11.0),
+            ..SpanStyle::default()
+        };
+        let plain = encode(&latin).unwrap();
+        let has_key = |bytes: &[u8], key: &[u8]| bytes.windows(key.len()).any(|w| w == key);
+        assert!(
+            !has_key(&plain, b"font_size_cs"),
+            "unset twins are absent from the encoding"
+        );
+        let twins = SpanStyle {
+            font_size_cs: Some(14.0),
+            ..latin
+        };
+        let bytes = encode(&twins).unwrap();
+        let back: Decoded<SpanStyle> = decode(&bytes).unwrap();
+        assert_eq!(back.payload, twins);
+        assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
+        let old: Decoded<SpanStyle> = decode(&plain).unwrap();
+        assert_eq!(old.payload.font_size_cs, None);
+    }
+
     /// Issue #79 — the `<w:bidiVisual>` flag survives crash recovery.
     #[test]
     fn table_bidi_visual_round_trips() {

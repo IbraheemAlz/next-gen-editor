@@ -24,8 +24,8 @@ use engine::{
 };
 use kurbo::Rect;
 use layout::{
-    A4Page, LayoutBlock, LineBox, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan,
-    TableBox, TableCellBox, TableRowBox, layout_paragraph,
+    A4Page, ComplexScriptAttrs, LayoutBlock, LineBox, PageBox, ParagraphBox, ParagraphConfig,
+    Point, Size, StyleSpan, TableBox, TableCellBox, TableRowBox, layout_paragraph,
     paginate::{PageGeometry as PaginatorGeometry, Paginator},
 };
 use lru::LruCache;
@@ -2813,7 +2813,21 @@ fn build_style_spans(
                 .map(str::to_string),
             caps_transform: false,
             baseline_shift_px,
+            cs: None,
         };
+        /* Issues #359 / #104 / #249 — the complex-script twins, resolved
+        through the same cascade (an unset twin takes the document
+        default, never the Latin value — Word's rule). */
+        let raw_cs_px = style.font_size_cs.unwrap_or(default_size) * scale;
+        let cs = ComplexScriptAttrs {
+            px_size: (raw_cs_px * px_factor).max(1.0),
+            baseline_shift_px: raw_cs_px * shift_factor,
+            bold: template.bold,
+            italic: template.italic,
+            font_family: template.font_family.clone(),
+            whole_span: style.forces_complex_script(),
+        };
+        let template = template.with_cs(cs);
         push_caps_spans(&para.text, style, &template, base_px, out);
     };
     for run in &para.spans {
@@ -2883,6 +2897,21 @@ fn push_caps_spans(
     }
     let slice = &para_text[lo..hi];
     let small_px = (base_px * 0.8).max(1.0);
+    /* Issue #359 — a shrunk (originally-lowercase) piece shrinks its
+    complex-script twin by the same factor. */
+    let piece = |start: u32, end: u32, lower: bool| {
+        let mut s = StyleSpan {
+            start,
+            end,
+            px_size: if lower { small_px } else { base_px },
+            caps_transform: true,
+            ..template.clone()
+        };
+        if lower && let Some(cs) = s.cs.as_mut() {
+            cs.px_size = (cs.px_size * 0.8).max(1.0);
+        }
+        s
+    };
     let mut sub_start = lo as u32;
     let mut sub_is_lower: Option<bool> = None;
     for (off, ch) in slice.char_indices() {
@@ -2894,29 +2923,13 @@ fn push_caps_spans(
             continue;
         }
         if Some(ch_is_lower) != sub_is_lower {
-            out.push(StyleSpan {
-                start: sub_start,
-                end: abs,
-                px_size: if sub_is_lower == Some(true) {
-                    small_px
-                } else {
-                    base_px
-                },
-                caps_transform: true,
-                ..template.clone()
-            });
+            out.push(piece(sub_start, abs, sub_is_lower == Some(true)));
             sub_start = abs;
             sub_is_lower = Some(ch_is_lower);
         }
     }
     if let Some(was_lower) = sub_is_lower {
-        out.push(StyleSpan {
-            start: sub_start,
-            end: hi as u32,
-            px_size: if was_lower { small_px } else { base_px },
-            caps_transform: true,
-            ..template.clone()
-        });
+        out.push(piece(sub_start, hi as u32, was_lower));
     }
 }
 
@@ -2997,7 +3010,7 @@ fn composition_layout_spans(
         }
     }
     let st = para.style_at(off);
-    out.push(StyleSpan {
+    let comp = StyleSpan {
         start: off,
         end: off + comp_len,
         px_size: st.font_size.unwrap_or(default_size) * scale,
@@ -3014,9 +3027,31 @@ fn composition_layout_spans(
             .map(str::to_string),
         caps_transform: false,
         baseline_shift_px: 0.0,
-    });
+        cs: None,
+    };
+    /* Issue #359 — an Arabic composition previews at the complex-script
+    size it will commit with. */
+    let cs = ComplexScriptAttrs {
+        px_size: st.font_size_cs.unwrap_or(default_size) * scale,
+        baseline_shift_px: 0.0,
+        bold: comp.bold,
+        italic: comp.italic,
+        font_family: comp.font_family.clone(),
+        whole_span: st.forces_complex_script(),
+    };
+    out.push(comp.with_cs(cs));
     out.sort_by_key(|s| s.start);
     out
+}
+
+/// Issues #359 / #104 / #249 — fold a style's complex-script slots (and
+/// the `<w:rtl/>` / `<w:cs/>` flag that routes a whole run onto them) into
+/// the paragraph layout key: a `FontSlot::ComplexScript` edit changes
+/// nothing else, and a key blind to it would serve the stale box.
+fn hash_complex_script_slots(style: &SpanStyle, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    style.font_size_cs.map(f32::to_bits).hash(h);
+    style.forces_complex_script().hash(h);
 }
 
 /// Content + render-config hash that keys the paragraph layout cache
@@ -3050,6 +3085,7 @@ fn paragraph_layout_key(
     run_base.raw_font_family.hash(&mut h);
     run_base.caps.hash(&mut h);
     run_base.small_caps.hash(&mut h);
+    hash_complex_script_slots(&run_base, &mut h);
     /* Audit gap A.H2 — the cache key now folds the laid-out max width
     in. Same paragraph laid out at page-wide vs column-narrow widths
     produces different line breaks; without the mix-in a doc that
@@ -3076,6 +3112,7 @@ fn paragraph_layout_key(
         hit). Encode each as a small discriminant. */
         run.style.caps.hash(&mut h);
         run.style.small_caps.hash(&mut h);
+        hash_complex_script_slots(&run.style, &mut h);
         match run.style.vert_align {
             None => 0u8.hash(&mut h),
             Some(engine::VertAlign::Baseline) => 1u8.hash(&mut h),
@@ -6197,6 +6234,37 @@ fn doc_paragraph_neighbor(
     Some((candidate, para))
 }
 
+/// Issues #359 / #104 / #249 — `true` when the character the toolbar
+/// read-back at `offset` stands for is complex script, so it reports the
+/// complex-script twins. The character is the one the attributes come
+/// from — for a caret the one typing continues (before it; at the
+/// paragraph start the one after it), for a range its first — and a
+/// script-neutral one (space, digit, punctuation) takes the class of the
+/// nearest real-script character, the way layout segmentation absorbs it.
+/// No real-script character at all (an empty paragraph): an RTL
+/// paragraph predicts complex-script typing.
+fn reads_complex_script(para: &engine::Paragraph, offset: u32, collapsed: bool) -> bool {
+    use text_pipeline::{Script, is_complex_script, script_of};
+    let text = para.text.as_str();
+    let mut at = (offset as usize).min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let (before, after) = text.split_at(at);
+    let real = |c: &char| script_of(*c) != Script::Common;
+    let back = || before.chars().rev().find(real);
+    let fwd = || after.chars().find(real);
+    let pick = if collapsed && at > 0 {
+        back().or_else(fwd)
+    } else {
+        fwd().or_else(back)
+    };
+    match pick {
+        Some(c) => is_complex_script(c),
+        None => matches!(para.props.direction, Some(engine::TextDirection::Rtl)),
+    }
+}
+
 /// Flat list of every paragraph path in document order (top-level
 /// paragraphs + recursive descent into table cells). Cheap for the
 /// PoC and the small-table common case; cache when editing lands.
@@ -7266,7 +7334,22 @@ fn diff_a11y(prev: &[A11yNode], next: &[A11yNode]) -> Vec<A11yPatch> {
 
 /// Bridge `TextAttrsPatch` → engine `SpanStyle`. Shared by the body
 /// `ApplyFormatting` handler and the Phase 3 (#39) story twin.
+///
+/// Issues #359 / #104 / #249 — `font_slot` routes the size / weight /
+/// slant / family onto the Latin set, the complex-script twins, or (the
+/// default, Word's ribbon) both.
 fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
+    let style = patch_to_latin_span_style(attrs);
+    match attrs.font_slot.unwrap_or_default() {
+        bridge::FontSlot::Both => style.with_cs_twins(),
+        bridge::FontSlot::Latin => style,
+        bridge::FontSlot::ComplexScript => style.into_cs_only(),
+    }
+}
+
+/// [`patch_to_span_style`] before the slot routing: every field on its
+/// Latin slot.
+fn patch_to_latin_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
     SpanStyle {
         font_size: attrs.font_size,
         color: attrs.color.map(|c| [c.r, c.g, c.b, c.a]),
@@ -7300,6 +7383,7 @@ fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
         /* Issue #84 — a formatting patch never carries a grab bag; the
         run's own bag survives the merge (`SpanStyle::merged_with`). */
         grab_bag: None,
+        ..Default::default()
     }
 }
 
@@ -8223,6 +8307,7 @@ impl Engine {
             language: None,
             caps: None,
             small_caps: None,
+            font_slot: None,
         };
         match attr {
             T::Bold => patch.bold = Some(mixed.bold || !current.bold),
@@ -12966,20 +13051,31 @@ impl Engine {
         the direct span style so the toolbar reads the same cascaded
         values the renderer paints (Heading 1 reports bold even with
         zero direct formatting). Phase 3 (#39) — story-aware doc. */
-        let mut style = self.with_selection_doc(|doc| {
-            doc.paragraph_at_path(&engine_path)
-                .map_or_else(SpanStyle::default, |p| {
+        let (mut style, complex) = self.with_selection_doc(|doc| {
+            doc.paragraph_at_path(&engine_path).map_or_else(
+                || (SpanStyle::default(), false),
+                |p| {
                     let direct = if collapsed {
                         p.typing_style_at(pos.offset)
                     } else {
                         p.style_at(pos.offset)
                     };
-                    doc.resolve_style_run_cascade(p.style_id.as_deref())
-                        .merged_with(direct)
-                })
+                    (
+                        doc.resolve_style_run_cascade(p.style_id.as_deref())
+                            .merged_with(direct),
+                        reads_complex_script(p, pos.offset, collapsed),
+                    )
+                },
+            )
         });
         if apply_pending && let Some(pending) = self.pending_format.as_ref() {
             style = style.merged_with(pending.clone());
+        }
+        /* Issues #359 / #104 / #249 — complex-script text reports (and
+        toggles against) the twins it is laid out with, as Word's ribbon
+        does: a caret in `w:sz="22" w:szCs="28"` Arabic shows 14 pt. */
+        if complex || style.forces_complex_script() {
+            style = style.complex_script_view();
         }
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let [r, g, b, a] = style.color.unwrap_or([0, 0, 0, 255]);
@@ -15863,24 +15959,30 @@ impl Engine {
             }
             out
         });
-        let run_patch = props.run_props.map(|r| engine::SpanStyle {
-            bold: r.bold,
-            italic: r.italic,
-            underline: r.underline.map(bridge_to_engine_underline),
-            strike: r.strike,
-            font_size: r.font_size,
-            color: r.color.map(|c| [c.r, c.g, c.b, c.a]),
-            bg_color: r.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
-            font_family: r
-                .font_family
-                .as_deref()
-                .and_then(engine::FontFamily::from_id),
-            caps: r.caps,
-            small_caps: r.small_caps,
-            vert_align: None,
-            raw_font_family: r.font_family,
-            font_theme: None,
-            grab_bag: None,
+        /* Issue #359 — a style edit from the UI sets both script slots,
+        like direct formatting (`SpanStyle::with_cs_twins`). */
+        let run_patch = props.run_props.map(|r| {
+            engine::SpanStyle {
+                bold: r.bold,
+                italic: r.italic,
+                underline: r.underline.map(bridge_to_engine_underline),
+                strike: r.strike,
+                font_size: r.font_size,
+                color: r.color.map(|c| [c.r, c.g, c.b, c.a]),
+                bg_color: r.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
+                font_family: r
+                    .font_family
+                    .as_deref()
+                    .and_then(engine::FontFamily::from_id),
+                caps: r.caps,
+                small_caps: r.small_caps,
+                vert_align: None,
+                raw_font_family: r.font_family,
+                font_theme: None,
+                grab_bag: None,
+                ..Default::default()
+            }
+            .with_cs_twins()
         });
         let based_on = if props.clear_based_on == Some(true) {
             Some(None)
@@ -18915,6 +19017,7 @@ mod tests {
                 font_family: None,
                 caps_transform: false,
                 baseline_shift_px: 0.0,
+                cs: None,
             }];
             layout_paragraph(ParagraphConfig {
                 text: "hi",
@@ -18966,6 +19069,7 @@ mod tests {
             font_family: None,
             caps_transform: false,
             baseline_shift_px: 0.0,
+            cs: None,
         }
     }
 
@@ -27511,6 +27615,9 @@ mod para_style_edit_tests;
 #[cfg(test)]
 mod toggle_formatting_tests;
 
+#[cfg(test)]
+mod complex_script_tests;
+
 /// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
 /// `format_pdf::export_pdf` path, end to end (not the #144 acceptance
 /// test's `layout_paragraph`-simulated TOC-entry-shaped paragraph).
@@ -27660,6 +27767,7 @@ mod wire_validation_tests {
             language: None,
             caps: None,
             small_caps: None,
+            font_slot: None,
         }
     }
 

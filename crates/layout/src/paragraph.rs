@@ -10,8 +10,8 @@
 //! opportunities. Acceptable for the PoC; Phase 3 will cache widths.
 
 use crate::boxes::{
-    LineBox, LineSegment, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan,
-    TabLeaderKind, TextAttrs, VisualRun,
+    LineBox, LineSegment, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, SpanFace,
+    StyleSpan, TabLeaderKind, TextAttrs, VisualRun,
 };
 use std::borrow::Cow;
 use std::mem::take;
@@ -19,7 +19,7 @@ use text_pipeline::{
     Alignment, FontStack, JustifyMode, Script, ShapingDirection, analyze_bidi, break_opportunities,
     justify::is_arabic_codepoint,
     justify_kashida::{JoinRole, KashidaPriority, join_role, kashida_point},
-    segment_by_script, shape_text,
+    segment_by_script_class, shape_text,
 };
 
 /// Phase 7 — per-paragraph inline object metadata (image dimensions). The
@@ -1473,9 +1473,11 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
 
         /* Sub-segment the BiDi run by script (font) and by style span (size +
         colour) — both are hard splits. Collect in logical order, then reverse
-        to visual (left-to-right) order for an RTL run. */
+        to visual (left-to-right) order for an RTL run. Issues #359 / #104 /
+        #249 — the script cut also separates the complex-script class, which
+        picks the span's complex-script twins (`StyleSpan::face_for`). */
         let mut subs = Vec::new();
-        for (srange, script) in segment_by_script(brun_text) {
+        for (srange, script, complex) in segment_by_script_class(brun_text) {
             let mut cursor = brun_abs + srange.start as u32;
             let seg_end = brun_abs + srange.end as u32;
             while cursor < seg_end {
@@ -1500,6 +1502,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     (cursor - brun_abs) as usize,
                     (piece_end - brun_abs) as usize,
                     script,
+                    complex,
                     span,
                     marker,
                 ));
@@ -1510,10 +1513,11 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
             subs.reverse();
         }
 
-        for (rel_start, rel_end, script, span, marker) in subs {
+        for (rel_start, rel_end, script, complex, span, marker) in subs {
+            let sf = span.face_for(complex);
             let Some((font_id, face, synth)) =
                 cfg.fonts
-                    .resolve(script, span.font_family.as_deref(), span.bold, span.italic)
+                    .resolve(script, sf.font_family, sf.bold, sf.italic)
             else {
                 continue;
             };
@@ -1527,6 +1531,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     *anchor,
                     brun.direction,
                     &span,
+                    sf,
                     synth.faux_bold,
                     synth.faux_italic,
                     brun_abs + rel_start as u32..brun_abs + rel_end as u32,
@@ -1547,7 +1552,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
             let (sub_text_cow, cluster_map) =
                 transform_for_shape(sub_text_raw, span.caps_transform, needs_tab_sub);
             let sub_text: &str = &sub_text_cow;
-            let shaped = shape_text(face, sub_text, brun.direction, span.px_size);
+            let shaped = shape_text(face, sub_text, brun.direction, sf.px_size);
             let brun_abs_start = brun_abs + rel_start as u32;
             let glyphs: Vec<PositionedGlyph> = shaped
                 .glyphs
@@ -1658,14 +1663,14 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                 direction: brun.direction,
                 source_range: brun_abs + rel_start as u32..brun_abs + rel_end as u32,
                 attrs: TextAttrs {
-                    px_size: span.px_size,
+                    px_size: sf.px_size,
                     color: span.color,
                     faux_bold: synth.faux_bold,
                     faux_italic: synth.faux_italic,
                     underline: span.underline,
                     strike: span.strike,
                     bg_color: span.bg_color,
-                    baseline_shift_px: span.baseline_shift_px,
+                    baseline_shift_px: sf.baseline_shift_px,
                 },
             });
         }
@@ -1701,12 +1706,13 @@ fn shape_note_marker(
     anchor: Option<engine::NoteAnchor>,
     direction: ShapingDirection,
     span: &StyleSpan,
+    sf: SpanFace<'_>,
     faux_bold: bool,
     faux_italic: bool,
     source_range: std::ops::Range<u32>,
 ) -> VisualRun {
-    let px_size = (span.px_size * NOTE_MARK_SCALE).max(1.0);
-    let raise = span.px_size * NOTE_MARK_RAISE;
+    let px_size = (sf.px_size * NOTE_MARK_SCALE).max(1.0);
+    let raise = sf.px_size * NOTE_MARK_RAISE;
     let mut glyphs: Vec<PositionedGlyph> = Vec::new();
     if !text.is_empty() {
         /* Digits and letters are direction-neutral; shape them LTR so
@@ -1764,7 +1770,7 @@ fn shape_note_marker(
             underline: span.underline,
             strike: span.strike,
             bg_color: span.bg_color,
-            baseline_shift_px: span.baseline_shift_px + raise,
+            baseline_shift_px: sf.baseline_shift_px + raise,
         },
     }
 }
@@ -1853,7 +1859,7 @@ fn measure_text(
     inline_objects: &[InlineObjectInfo],
 ) -> f32 {
     let mut total = 0.0_f32;
-    for (srange, script) in segment_by_script(text) {
+    for (srange, script, complex) in segment_by_script_class(text) {
         let mut cursor = abs_start + srange.start as u32;
         let seg_end = abs_start + srange.end as u32;
         while cursor < seg_end {
@@ -1861,11 +1867,13 @@ fn measure_text(
                 break;
             };
             let mut piece_end = span.end.min(seg_end);
+            /* Issues #359 / #104 / #249 — the piece's script class picks
+            the span's Latin or complex-script set, exactly as in
+            `build_line`. */
+            let sf = span.face_for(complex);
             /* Resolve per span: an explicit font family changes shaping (and
             width); faux bold/italic do not, so weight/slant stay `false`. */
-            let Some((_, face, _)) =
-                fonts.resolve(script, span.font_family.as_deref(), false, false)
-            else {
+            let Some((_, face, _)) = fonts.resolve(script, sf.font_family, false, false) else {
                 break;
             };
             /* Issue #80 — mirror `build_line`'s marker pieces so the
@@ -1873,7 +1881,7 @@ fn measure_text(
             if let Some(info) = note_marker_at(inline_objects, cursor)
                 && let InlineObjectInfoKind::NoteMarker { text: mark, .. } = &info.kind
             {
-                total += measure_note_marker(face, mark, span.px_size);
+                total += measure_note_marker(face, mark, sf.px_size);
                 cursor += SENTINEL_LEN;
                 continue;
             }
@@ -1887,7 +1895,7 @@ fn measure_text(
             cluster map (only the total advance matters here). */
             let needs_tab_sub = sub_raw.contains('\u{0009}');
             let (sub_cow, _) = transform_for_shape(sub_raw, span.caps_transform, needs_tab_sub);
-            total += shape_text(face, &sub_cow, direction, span.px_size).total_advance;
+            total += shape_text(face, &sub_cow, direction, sf.px_size).total_advance;
             cursor = piece_end;
         }
     }
@@ -2659,5 +2667,120 @@ mod tests {
             }
             assert_eq!(map.len(), text.len(), "map covers every transformed byte");
         }
+    }
+
+    /* ---- issues #359 / #104 / #249: complex-script twins ---------- */
+
+    fn latin_arabic_stack() -> FontStack {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let face = |id: &str, bytes: &[u8]| {
+            Arc::new(text_pipeline::LoadedFont::parse(id.into(), bytes.to_vec()).expect("font"))
+        };
+        let mut faces = HashMap::new();
+        faces.insert(
+            "latin".to_string(),
+            face(
+                "latin",
+                include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf"),
+            ),
+        );
+        faces.insert(
+            "arabic".to_string(),
+            face(
+                "arabic",
+                include_bytes!("../../../ts/fonts/Amiri-Regular.ttf"),
+            ),
+        );
+        FontStack::from_faces(faces, "latin")
+    }
+
+    fn twin_span(len: u32, whole_span: bool) -> StyleSpan {
+        StyleSpan {
+            start: 0,
+            end: len,
+            px_size: 10.0,
+            color: [0, 0, 0, 255],
+            bold: false,
+            italic: false,
+            underline: engine::UnderlineStyle::None,
+            strike: false,
+            bg_color: None,
+            font_family: None,
+            caps_transform: false,
+            baseline_shift_px: 0.0,
+            cs: None,
+        }
+        .with_cs(crate::boxes::ComplexScriptAttrs {
+            px_size: 20.0,
+            baseline_shift_px: 0.0,
+            bold: true,
+            italic: false,
+            font_family: None,
+            whole_span,
+        })
+    }
+
+    fn twin_layout(text: &str, whole_span: bool) -> ParagraphBox {
+        let fonts = latin_arabic_stack();
+        layout_paragraph(ParagraphConfig {
+            text,
+            fonts: &fonts,
+            inline_objects: &[],
+            spans: &[twin_span(text.len() as u32, whole_span)],
+            base_direction: ShapingDirection::Ltr,
+            max_width: 1000.0,
+            line_height: 30.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 10.0,
+            tab_stops_px: &[],
+        })
+    }
+
+    /// Issues #359 / #104 — one span, two attribute sets: the Latin piece
+    /// shapes at the Latin size, the Arabic piece at the complex-script
+    /// size with the complex-script weight (faux, no bold face loaded).
+    #[test]
+    fn complex_script_pieces_take_the_span_twins() {
+        let text = "ab 12 \u{0628}\u{0628}";
+        let para = twin_layout(text, false);
+        let runs: Vec<_> = para.lines.iter().flat_map(|l| l.runs.iter()).collect();
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        for r in &runs {
+            let piece = &text[r.source_range.start as usize..r.source_range.end as usize];
+            let cs = piece.contains('\u{0628}');
+            assert_eq!(r.attrs.px_size, if cs { 20.0 } else { 10.0 }, "{piece:?}");
+            assert_eq!(r.attrs.faux_bold, cs, "{piece:?}");
+        }
+        /* `whole_span` (`<w:rtl/>` / `<w:cs/>`): every piece takes the
+        twins, the Latin letters included. */
+        let forced = twin_layout(text, true);
+        for r in forced.lines.iter().flat_map(|l| l.runs.iter()) {
+            assert_eq!(r.attrs.px_size, 20.0);
+            assert!(r.attrs.faux_bold);
+        }
+        assert!(forced.lines[0].width > para.lines[0].width);
+    }
+
+    /// A twin set equal to the Latin set is dropped: the nominal path
+    /// carries no `cs` and lays out exactly as before the twins existed.
+    #[test]
+    fn equal_twins_collapse_to_the_latin_set() {
+        let span = twin_span(4, false);
+        let same = crate::boxes::ComplexScriptAttrs {
+            px_size: span.px_size,
+            baseline_shift_px: span.baseline_shift_px,
+            bold: span.bold,
+            italic: span.italic,
+            font_family: span.font_family.clone(),
+            whole_span: true,
+        };
+        assert!(span.with_cs(same).cs.is_none());
     }
 }

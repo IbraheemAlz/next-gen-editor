@@ -325,11 +325,17 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
         );
     }
     /* `<w:sz>` / `<w:szCs>` — Word's half-point encoding; round to nearest.
-    Emit both elements so ASCII + complex-script runs (Arabic, Hebrew,
-    Thai) both pick up the size. Word's own writer always pairs them. */
+    Issue #359 — each slot writes its own element: a source run with only
+    `<w:sz>` never gains a synthesized `<w:szCs>` (#249), and an
+    engine-authored size change sets both slots (`SpanStyle::
+    with_cs_twins`), so it still writes the pair Word writes. */
+    let half_points = |pt: f32| (pt * 2.0).round().max(2.0) as u32;
     if let Some(pt) = style.font_size {
-        let half_pts = (pt * 2.0).round().max(2.0) as u32;
+        let half_pts = half_points(pt);
         ch.push(rank(b"w:sz"), format!("<w:sz w:val=\"{half_pts}\"/>"));
+    }
+    if let Some(pt) = style.font_size_cs {
+        let half_pts = half_points(pt);
         ch.push(rank(b"w:szCs"), format!("<w:szCs w:val=\"{half_pts}\"/>"));
     }
     /* `<w:u w:val="…"/>` — emit only when the variant is visible. The
@@ -5002,13 +5008,16 @@ mod tests {
 
     #[test]
     fn round_trip_font_size_sz_szcs() {
-        /* Reader must lift `<w:sz>` / `<w:szCs>` into `SpanStyle.font_size`;
-        writer must emit both elements so ASCII + complex-script runs
-        agree on the size. Half-point math: 13.5 pt = w:val="27". */
+        /* Issue #359 — the reader lifts `<w:sz>` into `font_size` and
+        `<w:szCs>` into `font_size_cs`; the writer emits each slot it
+        holds (an engine-authored size sets both — `with_cs_twins`), so
+        Latin and complex-script text agree on the size. Half-point math:
+        13.5 pt = w:val="27". */
         let sized = SpanStyle {
             font_size: Some(13.5),
             ..Default::default()
-        };
+        }
+        .with_cs_twins();
         let para = Paragraph {
             text: "abc".into(),
             spans: vec![StyleRun {
@@ -5053,24 +5062,42 @@ mod tests {
             saved_doc_xml.contains("<w:szCs w:val=\"27\"/>"),
             "complex-script font-size element missing: {saved_doc_xml}"
         );
-        /* Reader round-trip — value must come back as 13.5 pt. */
+        /* Reader round-trip — both slots come back as 13.5 pt. */
         let parsed = read_docx(&bytes).expect("read");
-        assert_eq!(
-            parsed
-                .document
-                .nth_paragraph(0)
-                .unwrap()
-                .style_at(1)
-                .font_size,
-            Some(13.5)
-        );
+        let back = parsed.document.nth_paragraph(0).unwrap().style_at(1);
+        assert_eq!(back.font_size, Some(13.5));
+        assert_eq!(back.font_size_cs, Some(13.5));
+        /* A Latin-only size never synthesizes `<w:szCs>` (#249). */
+        let latin_only = DocumentTree::from_rich_paragraphs([Paragraph {
+            text: "abc".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 3,
+                style: SpanStyle {
+                    font_size: Some(11.0),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        }]);
+        let bytes = build_minimal_docx(&latin_only).expect("build");
+        let xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(xml.contains("<w:sz w:val=\"22\"/>"), "{xml}");
+        assert!(!xml.contains("<w:szCs"), "{xml}");
     }
 
     #[test]
-    fn reader_szcs_overrides_sz_when_both_present() {
-        /* OOXML lists `<w:szCs>` after `<w:sz>` in CT_RPr; complex-script
-        docs depend on it winning. `apply_rpr` folds both into the same
-        slot in document order, so the last one written wins. */
+    fn reader_keeps_sz_and_szcs_apart() {
+        /* Issue #359 — OOXML sizes Latin text by `<w:sz>` and
+        complex-script text by `<w:szCs>`; Arabic documents routinely
+        carry `w:sz="22" w:szCs="28"` on one run. The old single slot let
+        `szCs` win and laid the Latin text out at 14 pt. */
         use crate::schema::ct_rpr::apply_rpr;
         use quick_xml::events::Event;
         use quick_xml::reader::Reader;
@@ -5089,7 +5116,8 @@ mod tests {
             }
             buf.clear();
         }
-        assert_eq!(style.font_size, Some(14.0));
+        assert_eq!(style.font_size, Some(10.0));
+        assert_eq!(style.font_size_cs, Some(14.0));
     }
 
     #[test]

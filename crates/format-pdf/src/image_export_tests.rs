@@ -125,6 +125,7 @@ fn image_page(stack: &FontStack) -> PageBox {
         font_family: None,
         caps_transform: false,
         baseline_shift_px: 0.0,
+        cs: None,
     };
     let mut para = layout_paragraph(ParagraphConfig {
         text: TEXT,
@@ -591,6 +592,7 @@ fn image_free_documents_are_byte_identical() {
                 font_family: None,
                 caps_transform: false,
                 baseline_shift_px: 0.0,
+                cs: None,
             }],
             base_direction: ShapingDirection::Ltr,
             max_width: 451.0,

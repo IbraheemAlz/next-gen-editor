@@ -1485,6 +1485,41 @@ impl GrabBag {
     }
 }
 
+/// Issue #359 — `true` when `fragment` is an OOXML on/off toggle element
+/// named `qname` that is ON: bare `<w:rtl/>`, or a `w:val` other than
+/// `false` / `0` / `off` (ECMA-376 Part 1 §17.17.4, `ST_OnOff`). A
+/// different element, including one whose name merely starts with
+/// `qname` (`<w:rtlGutter/>`), is `false`.
+pub fn toggle_fragment_on(fragment: &[u8], qname: &[u8]) -> bool {
+    let Some(rest) = fragment
+        .strip_prefix(b"<")
+        .and_then(|f| f.strip_prefix(qname))
+    else {
+        return false;
+    };
+    match rest.first() {
+        Some(b'/' | b'>') => true,
+        Some(c) if c.is_ascii_whitespace() => {
+            let Some(at) = rest.windows(6).position(|w| w == b"w:val=") else {
+                return true;
+            };
+            let value = &rest[at + 6..];
+            let Some((&quote, value)) = value.split_first() else {
+                return true;
+            };
+            let end = value
+                .iter()
+                .position(|&b| b == quote)
+                .unwrap_or(value.len());
+            !matches!(
+                value[..end].to_ascii_lowercase().as_slice(),
+                b"false" | b"0" | b"off"
+            )
+        }
+        _ => false,
+    }
+}
+
 /// Issues #199 / #106 — one raw XML attribute captured from a source
 /// element the model reads only partially (`<w:p w:rsidR="…">`,
 /// `<w:r w:rsidRPr="…">`, `<w:t xml:space="preserve">`). `name` is the
@@ -2081,10 +2116,28 @@ impl DocumentEnvelope {
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
+///
+/// Issues #359 / #104 / #249 — OOXML formats every character with ONE of
+/// two property sets chosen by its script class: the Latin slots
+/// (`font_size` = `<w:sz>`, …) or their complex-script twins
+/// (`font_size_cs` = `<w:szCs>`, …) for Arabic / Hebrew / Thai / …
+/// characters ([`text_pipeline`'s `is_complex_script`]) and for every
+/// character of a run flagged `<w:rtl/>` / `<w:cs/>`
+/// ([`Self::forces_complex_script`]). The twins cascade independently,
+/// exactly like Word: a run with `<w:sz w:val="22"/><w:szCs
+/// w:val="28"/>` lays its Latin text out at 11 pt and its Arabic at 14 pt.
+/// Engine-authored formatting writes both slots
+/// ([`Self::with_cs_twins`]) unless the caller names one.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct SpanStyle {
     pub font_size: Option<f32>,
+    /// Issue #359 — `<w:szCs>`: the complex-script twin of
+    /// [`Self::font_size`], in points. Absent from snapshots while unset,
+    /// so a document without complex-script sizes snapshots byte-for-byte
+    /// as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_size_cs: Option<f32>,
     pub color: Option<[u8; 4]>,
     pub bold: Option<bool>,
     pub italic: Option<bool>,
@@ -2151,10 +2204,54 @@ impl SpanStyle {
         }
     }
 
+    /// Issue #359 — mirror every set Latin slot onto its unset
+    /// complex-script twin: the "both slots" rule of engine-authored
+    /// formatting (Word's ribbon size / bold / italic / font apply to both
+    /// script classes). A twin the caller already set is kept.
+    pub fn with_cs_twins(mut self) -> SpanStyle {
+        if self.font_size_cs.is_none() {
+            self.font_size_cs = self.font_size;
+        }
+        self
+    }
+
+    /// Issue #359 — the `cs_only` form of a formatting patch: every Latin
+    /// slot moves onto its complex-script twin and the Latin slot is left
+    /// unset, so applying the patch touches only complex-script text.
+    pub fn into_cs_only(mut self) -> SpanStyle {
+        if let Some(size) = self.font_size.take() {
+            self.font_size_cs = Some(size);
+        }
+        self
+    }
+
+    /// Issue #359 — `self` as complex-script text sees it: every Latin
+    /// slot replaced by its complex-script twin (unset twin ⇒ unset, the
+    /// caller's default applies — the twins never fall back on each
+    /// other). The toolbar read-back uses it so a caret in Arabic text
+    /// reports the size Word shows there.
+    pub fn complex_script_view(&self) -> SpanStyle {
+        SpanStyle {
+            font_size: self.font_size_cs,
+            ..self.clone()
+        }
+    }
+
+    /// Issue #359 — `true` when the run carries `<w:rtl/>` or `<w:cs/>`
+    /// (both ride the grab bag): OOXML then formats EVERY character of the
+    /// run — Latin digits and punctuation included — with the
+    /// complex-script twins (ECMA-376 Part 1 §17.3.2.7 / §17.3.2.30).
+    pub fn forces_complex_script(&self) -> bool {
+        GrabBag::fragments_of(&self.grab_bag)
+            .iter()
+            .any(|f| toggle_fragment_on(f, b"w:rtl") || toggle_fragment_on(f, b"w:cs"))
+    }
+
     /// Overlay `patch`'s set fields onto `self`.
     pub fn merged_with(self, patch: SpanStyle) -> SpanStyle {
         SpanStyle {
             font_size: patch.font_size.or(self.font_size),
+            font_size_cs: patch.font_size_cs.or(self.font_size_cs),
             color: patch.color.or(self.color),
             bold: patch.bold.or(self.bold),
             italic: patch.italic.or(self.italic),
@@ -11529,6 +11626,70 @@ impl UndoStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* ---- issues #359 / #104 / #249: complex-script twins ---------- */
+
+    #[test]
+    fn toggle_fragment_on_reads_st_on_off() {
+        assert!(toggle_fragment_on(b"<w:rtl/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl w:val=\"true\"/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl w:val='1'/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:rtl></w:rtl>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"false\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"0\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtl w:val=\"off\"/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:rtlGutter/>", b"w:rtl"));
+        assert!(!toggle_fragment_on(b"<w:lang w:bidi=\"ar-SA\"/>", b"w:rtl"));
+        assert!(toggle_fragment_on(b"<w:cs/>", b"w:cs"));
+    }
+
+    #[test]
+    fn rtl_or_cs_in_the_bag_forces_complex_script() {
+        let mut s = SpanStyle::default();
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:lang w:val=\"en-US\"/>".to_vec());
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:rtl w:val=\"0\"/>".to_vec());
+        assert!(!s.forces_complex_script());
+        GrabBag::push_into(&mut s.grab_bag, b"<w:cs/>".to_vec());
+        assert!(s.forces_complex_script());
+    }
+
+    #[test]
+    fn cs_twins_mirror_move_and_view() {
+        let latin = SpanStyle {
+            font_size: Some(11.0),
+            ..Default::default()
+        };
+        let both = latin.clone().with_cs_twins();
+        assert_eq!(both.font_size_cs, Some(11.0));
+        /* A twin the caller set is kept. */
+        let kept = SpanStyle {
+            font_size_cs: Some(14.0),
+            ..latin.clone()
+        }
+        .with_cs_twins();
+        assert_eq!(kept.font_size_cs, Some(14.0));
+        let cs_only = latin.clone().into_cs_only();
+        assert_eq!(
+            (cs_only.font_size, cs_only.font_size_cs),
+            (None, Some(11.0))
+        );
+        /* The view never falls back across twins. */
+        assert_eq!(latin.complex_script_view().font_size, None);
+        assert_eq!(kept.complex_script_view().font_size, Some(14.0));
+        /* The twins cascade independently. */
+        let base = SpanStyle {
+            font_size: Some(12.0),
+            font_size_cs: Some(16.0),
+            ..Default::default()
+        };
+        let merged = base.merged_with(latin);
+        assert_eq!(
+            (merged.font_size, merged.font_size_cs),
+            (Some(11.0), Some(16.0))
+        );
+    }
 
     /* ---- issue #23: dynamic, string-backed FontFamily ------------- */
 

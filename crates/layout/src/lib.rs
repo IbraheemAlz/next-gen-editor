@@ -18,11 +18,11 @@ pub mod wrap;
 mod wrap_fixtures;
 
 pub use boxes::{
-    CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FloatWrap,
-    FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, LineSegment,
-    MarkerBox, NoteBand, PageBox, ParaFlow, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan,
-    TabLeaderKind, TableBox, TableCellBox, TableRowBox, TextAttrs, TextBoxFrame, TextBoxGlyph,
-    VisualRun, WrapSide,
+    CellAnchorRef, ComplexScriptAttrs, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx,
+    FloatSpec, FloatWrap, FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField,
+    LineBox, LineSegment, MarkerBox, NoteBand, PageBox, ParaFlow, ParagraphBox, Point,
+    PositionedGlyph, Size, SpanFace, StyleSpan, TabLeaderKind, TableBox, TableCellBox, TableRowBox,
+    TextAttrs, TextBoxFrame, TextBoxGlyph, VisualRun, WrapSide,
 };
 pub use floats::{ColumnLayout, resolve_page_floats, story_frame_page};
 pub use page::{A4Page, Margins};

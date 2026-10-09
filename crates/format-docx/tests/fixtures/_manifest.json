@@ -32,6 +32,21 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "complex_script_size.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 3,
+        "paragraph_texts": [
+          "Latin words stay at eleven points while النص العربي يكبر إلى أربعة عشر نقطة inside the very same run, and every line break follows both sizes at once كما يفعل وورد تماما when the run mixes scripts.",
+          "صدر الإصدار 2026 باسم Engine للمرة الأولى",
+          "Only w:sz here: العربية تأخذ حجم القالب"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "drawing_objects_preserved.docx": {
       "generator": "handcrafted",
       "phase_introduced": 12,

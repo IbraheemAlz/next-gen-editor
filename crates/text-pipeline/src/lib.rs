@@ -20,5 +20,7 @@ pub use fonts::{
 };
 pub use justify::{Alignment, JustifyMode};
 pub use line_break::break_opportunities;
-pub use script::{Script, script_of, segment_by_script};
+pub use script::{
+    Script, is_complex_script, script_of, segment_by_script, segment_by_script_class,
+};
 pub use shape::{ShapedGlyph, ShapedRun, ShapingDirection, shape_text};

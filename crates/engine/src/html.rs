@@ -609,7 +609,9 @@ fn tag_style(name: &str, body: &str) -> Option<SpanStyle> {
         }
         _ => return None,
     }
-    Some(s)
+    /* Issue #359 — CSS has no per-script slot: pasted formatting applies
+    to Latin and complex-script text alike. */
+    Some(s.with_cs_twins())
 }
 
 const VOID_TAGS: [&str; 6] = ["br", "hr", "img", "meta", "link", "input"];

@@ -39,6 +39,7 @@ fn hello_page(stack: &FontStack) -> PageBox {
         font_family: None,
         caps_transform: false,
         baseline_shift_px: 0.0,
+        cs: None,
     }];
     let mut para = layout_paragraph(ParagraphConfig {
         text,

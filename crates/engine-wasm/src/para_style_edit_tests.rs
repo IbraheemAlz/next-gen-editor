@@ -327,6 +327,7 @@ fn pending_bold_off_then_typing_is_plain() {
                 language: None,
                 caps: None,
                 small_caps: None,
+                font_slot: None,
             },
         },
     );

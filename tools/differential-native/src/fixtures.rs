@@ -283,6 +283,25 @@ fn build_long_document() -> Vec<u8> {
     build_plain(&body)
 }
 
+/// Issue #359 — Arabic documents routinely size the two script classes of
+/// ONE run differently (`w:sz="22" w:szCs="28"`: 11 pt Latin, 14 pt
+/// Arabic). 30 RTL paragraphs, each one such run mixing Arabic prose with
+/// Latin words, so the page count and every line break depend on both
+/// sizes (the old single-slot reader laid the Latin out at 14 pt too).
+fn build_mixed_cs_size() -> Vec<u8> {
+    let text = "يعرض هذا التقرير نتائج القياس باستخدام Microsoft Word و LibreOffice \
+لمقارنة حجم الخط العربي مع حجم الخط اللاتيني داخل المقطع نفسه، \
+while the English words keep the smaller Latin size within the same run \
+ثم تعود الجملة إلى العربية لتختبر فواصل الأسطر.";
+    let mut body = String::new();
+    for i in 1..=30u32 {
+        body.push_str(&format!(
+            r#"<w:p><w:pPr><w:bidi/><w:jc w:val="both"/>{PARA_SPACING_AFTER}</w:pPr><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="28"/><w:rtl/></w:rPr><w:t xml:space="preserve">{i}. </w:t></w:r><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="28"/></w:rPr><w:t xml:space="preserve">{text}</w:t></w:r></w:p>"#
+        ));
+    }
+    build_plain(&body)
+}
+
 /* ---------------------------------------------------------------- */
 /* Table pagination corpus (issue #155)                              */
 /* ---------------------------------------------------------------- */
@@ -531,6 +550,11 @@ fn fixtures() -> Vec<Fixture> {
             name: "long_document.docx",
             description: "24 justified RTL Arabic paragraphs — a multi-page stress fixture for the page-count and per-paragraph line-break oracle.",
             bytes: build_long_document(),
+        },
+        Fixture {
+            name: "mixed_cs_size.docx",
+            description: "Issue #359: 30 justified RTL paragraphs whose runs mix Arabic and Latin words with w:sz=22 / w:szCs=28 (11 pt Latin, 14 pt Arabic in the same run) plus a w:rtl number run.",
+            bytes: build_mixed_cs_size(),
         },
     ]
 }

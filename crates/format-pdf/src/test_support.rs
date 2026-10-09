@@ -239,6 +239,7 @@ mod tests {
                 font_family: None,
                 caps_transform: false,
                 baseline_shift_px: 0.0,
+                cs: None,
             }],
             base_direction: ShapingDirection::Ltr,
             max_width: 400.0,

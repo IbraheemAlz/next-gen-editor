@@ -186,6 +186,13 @@ pub fn family_from_docx(name: &str) -> Option<FontFamily> {
     FontFamily::from_display_name(name)
 }
 
+/// `<w:sz>` / `<w:szCs>` `w:val` (half-points) as points.
+fn half_points(e: &BytesStart) -> Option<f32> {
+    attr_val(e, b"w:val")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|half_pts| (half_pts as f32) / 2.0)
+}
+
 /// An OOXML toggle property: bare `<w:b/>` is on; `<w:b w:val="false"/>` off.
 pub fn toggle_on(e: &BytesStart) -> bool {
     match attr_val(e, b"w:val") {
@@ -269,15 +276,19 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             }
         }
         /* `<w:sz w:val="N"/>` and `<w:szCs w:val="N"/>` — N is half-points
-        (Word's native encoding; `w:val="24"` = 12 pt). `w:sz` targets ASCII
-        + high-ANSI runs; `w:szCs` targets complex-script (Arabic, Hebrew,
-        Thai) runs. The engine carries one `font_size` slot, so both fold
-        into it; `w:szCs` wins when both appear because OOXML lists it
-        second in CT_RPr and complex-script docs depend on it. */
-        b"w:sz" | b"w:szCs" => {
-            if let Some(half_pts) = attr_val(e, b"w:val").and_then(|v| v.trim().parse::<u32>().ok())
-            {
-                style.font_size = Some((half_pts as f32) / 2.0);
+        (Word's native encoding; `w:val="24"` = 12 pt). `w:sz` sizes the
+        Latin (ASCII + high-ANSI) characters, `w:szCs` the complex-script
+        ones (Arabic, Hebrew, Thai, …). Issue #359 — two slots: Arabic
+        documents routinely carry `w:sz="22" w:szCs="28"` on one run, and
+        folding both into one size laid the Latin text out at 14 pt. */
+        b"w:sz" => {
+            if let Some(pt) = half_points(e) {
+                style.font_size = Some(pt);
+            }
+        }
+        b"w:szCs" => {
+            if let Some(pt) = half_points(e) {
+                style.font_size_cs = Some(pt);
             }
         }
         _ => {}

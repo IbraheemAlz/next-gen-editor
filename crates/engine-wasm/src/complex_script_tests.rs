@@ -1,0 +1,278 @@
+//! Issues #359 / #104 / #249 — complex-script run properties. OOXML formats
+//! Arabic / Hebrew / Thai / … characters (and every character of a
+//! `<w:rtl/>` / `<w:cs/>` run) with the complex-script twins of the run
+//! properties: `<w:szCs>` instead of `<w:sz>`, `<w:bCs>` / `<w:iCs>`
+//! instead of `<w:b>` / `<w:i>`, `<w:rFonts w:cs>` instead of
+//! `w:ascii` / `w:hAnsi`. The engine keeps the twins apart from read to
+//! layout to write.
+
+use super::*;
+use bridge::FontSlot;
+use format_docx::test_fixtures::{
+    CS_SIZE_CASCADE_TEXT, CS_SIZE_MIXED_TEXT, CS_SIZE_RTL_TEXT, complex_script_size_docx,
+};
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut fut = Box::pin(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!("Engine::apply suspended in a native test"),
+    }
+}
+
+fn apply(e: &mut Engine, cmd: Command) -> Event {
+    let evt = block_on(e.apply(cmd));
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    evt
+}
+
+/// `doc` in an engine with a Latin AND an Arabic face loaded (the Arabic
+/// face covers U+0628, so the stack routes Arabic script runs to it).
+fn engine_with(doc: DocumentTree) -> Engine {
+    let mut e = tests::test_engine_with_doc(doc);
+    let bytes = include_bytes!("../../../ts/fonts/NotoNaskhArabic-Regular.ttf").to_vec();
+    let font = LoadedFont::parse("test-arabic".to_string(), bytes).expect("arabic font");
+    e.fonts.insert("test-arabic".to_string(), Arc::new(font));
+    e
+}
+
+fn fixture_engine() -> Engine {
+    let archive = format_docx::read_docx(&complex_script_size_docx()).expect("fixture");
+    engine_with(archive.document)
+}
+
+fn select(e: &mut Engine, para: u32, start: u32, end: u32) {
+    apply(
+        e,
+        Command::SetSelection {
+            range: BridgeLogicalRange {
+                start: bpos_top(para, start),
+                end: bpos_top(para, end),
+            },
+            caret: bpos_top(para, end),
+        },
+    );
+}
+
+fn patch(font_size: f32, font_slot: Option<FontSlot>) -> TextAttrsPatch {
+    TextAttrsPatch {
+        bold: None,
+        italic: None,
+        underline: None,
+        strike: None,
+        font_family: None,
+        font_size: Some(font_size),
+        color: None,
+        bg_color: None,
+        script: None,
+        language: None,
+        caps: None,
+        small_caps: None,
+        font_slot,
+    }
+}
+
+/// Every shaped run of top-level paragraph `para` (all pages), as
+/// (source text, px size).
+fn runs_of(pages: &[PageBox], doc: &DocumentTree, para: u32) -> Vec<(String, f32)> {
+    let text = doc.nth_paragraph(para).expect("paragraph").text.clone();
+    pages
+        .iter()
+        .flat_map(|p| p.blocks.iter())
+        .filter_map(|b| b.as_paragraph())
+        .filter(|p| p.source_paragraph_id == para)
+        .flat_map(|p| p.lines.iter())
+        .flat_map(|l| l.runs.iter())
+        .map(|r| {
+            let s = r.source_range.start as usize;
+            let e = r.source_range.end as usize;
+            (text[s..e].to_string(), r.attrs.px_size)
+        })
+        .collect()
+}
+
+fn is_arabic(s: &str) -> bool {
+    s.chars().any(text_pipeline::is_complex_script)
+}
+
+/// Acceptance (#359): one run with `w:sz="22" w:szCs="28"` lays its Latin
+/// words out at 11 pt and its Arabic words at 14 pt; a `<w:rtl/>` run puts
+/// EVERY character (digits, the Latin word) at its 14 pt `szCs`; a run with
+/// only `w:sz` takes the docDefaults `szCs` (16 pt) for its Arabic, never
+/// the Latin 11 pt. Geometry pinned.
+#[test]
+fn mixed_run_lays_latin_and_arabic_out_at_their_own_sizes() {
+    let engine = fixture_engine();
+    let doc = engine.undo.current().clone();
+    assert_eq!(doc.nth_paragraph(0).unwrap().text, CS_SIZE_MIXED_TEXT);
+    assert_eq!(doc.nth_paragraph(1).unwrap().text, CS_SIZE_RTL_TEXT);
+    assert_eq!(doc.nth_paragraph(2).unwrap().text, CS_SIZE_CASCADE_TEXT);
+    let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+    assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+
+    let mixed = runs_of(&pages, &doc, 0);
+    assert!(mixed.iter().any(|(t, _)| is_arabic(t)));
+    assert!(mixed.iter().any(|(t, _)| !is_arabic(t)));
+    for (t, px) in &mixed {
+        let want = if is_arabic(t) { 14.0 } else { 11.0 };
+        assert_eq!(*px, want, "{t:?}");
+    }
+    let lines_mixed = pages[0].blocks[0].as_paragraph().unwrap().lines.len();
+    assert!(lines_mixed >= 2, "the mixed paragraph wraps");
+
+    for (t, px) in runs_of(&pages, &doc, 1) {
+        assert_eq!(px, 14.0, "<w:rtl/> run: {t:?} takes w:szCs");
+    }
+
+    for (t, px) in runs_of(&pages, &doc, 2) {
+        let want = if is_arabic(&t) { 16.0 } else { 11.0 };
+        assert_eq!(px, want, "{t:?}");
+    }
+
+    let fp = layout::geometry_fingerprint(&pages);
+    eprintln!("COMPLEX SCRIPT SIZE FINGERPRINT = {fp:#x}");
+    assert_eq!(
+        fp, PINNED_CS_SIZE,
+        "complex-script size fixture geometry changed"
+    );
+}
+
+/// Recorded on this change via `--nocapture` (issue #359).
+const PINNED_CS_SIZE: u64 = 0x77225ebeb9c6b3ba;
+
+/// The old single slot let `w:szCs` win: the same paragraph with BOTH
+/// sizes at 14 pt needs more room — the twin split is what moves the
+/// line breaks.
+#[test]
+fn folding_szcs_into_sz_would_lay_the_latin_out_larger() {
+    let engine = fixture_engine();
+    let (split, _, _, _) = engine.build_pages(1.0, false, None).expect("layout");
+    let mut folded = engine.undo.current().clone();
+    if let Some(engine::Block::Paragraph(p)) = folded.blocks.get_mut(0) {
+        for run in &mut p.spans {
+            run.style.font_size = run.style.font_size_cs;
+        }
+    }
+    let folded_engine = engine_with(folded);
+    let (folded, _, _, _) = folded_engine.build_pages(1.0, false, None).expect("layout");
+    let width = |pages: &[PageBox]| {
+        pages[0].blocks[0]
+            .as_paragraph()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.width)
+            .sum::<f32>()
+    };
+    assert!(
+        width(&split) < width(&folded) - 10.0,
+        "11 pt Latin is narrower than 14 pt Latin ({} vs {})",
+        width(&split),
+        width(&folded)
+    );
+}
+
+/// `ApplyFormatting { font_size }` sets both slots by default (Word's
+/// ribbon); `font_slot: Latin` / `ComplexScript` (the `cs_only` flag) set
+/// one and leave the other alone — and the relayout sees a twin-only
+/// change (the paragraph layout key hashes the twins).
+#[test]
+fn apply_formatting_routes_the_size_by_font_slot() {
+    let mut e = fixture_engine();
+    let len = CS_SIZE_MIXED_TEXT.len() as u32;
+    let style = |e: &Engine| e.undo.current().nth_paragraph(0).unwrap().style_at(0);
+
+    select(&mut e, 0, 0, len);
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: patch(20.0, Some(FontSlot::ComplexScript)),
+        },
+    );
+    assert_eq!(style(&e).font_size, Some(11.0), "Latin slot untouched");
+    assert_eq!(style(&e).font_size_cs, Some(20.0));
+    let doc = e.undo.current().clone();
+    let (pages, _, _, _) = e.build_pages(1.0, false, None).expect("layout");
+    for (t, px) in runs_of(&pages, &doc, 0) {
+        let want = if is_arabic(&t) { 20.0 } else { 11.0 };
+        assert_eq!(px, want, "cs-only relayout: {t:?}");
+    }
+
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: patch(9.0, Some(FontSlot::Latin)),
+        },
+    );
+    assert_eq!(style(&e).font_size, Some(9.0));
+    assert_eq!(style(&e).font_size_cs, Some(20.0), "complex slot untouched");
+
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: patch(12.0, None),
+        },
+    );
+    assert_eq!(style(&e).font_size, Some(12.0));
+    assert_eq!(style(&e).font_size_cs, Some(12.0), "no slot = both");
+}
+
+/// The toolbar read-back reports the size the caret's text is laid out
+/// with: 14 pt inside the Arabic words of the mixed run, 11 pt inside
+/// its Latin words, 14 pt anywhere in the `<w:rtl/>` run.
+#[test]
+fn attrs_at_caret_report_the_complex_script_size_in_arabic_text() {
+    let e = fixture_engine();
+    let arabic_at = CS_SIZE_MIXED_TEXT.find('ا').unwrap() as u32 + 2;
+    let latin_at = 3;
+    assert_eq!(e.attrs_at(bpos_top(0, arabic_at), true).font_size, 14.0);
+    assert_eq!(e.attrs_at(bpos_top(0, latin_at), true).font_size, 11.0);
+    let digits_at = CS_SIZE_RTL_TEXT.find("2026").unwrap() as u32 + 2;
+    assert_eq!(
+        e.attrs_at(bpos_top(1, digits_at), true).font_size,
+        14.0,
+        "a <w:rtl/> run reports its complex-script size everywhere"
+    );
+    let cascade_arabic = CS_SIZE_CASCADE_TEXT.find('ا').unwrap() as u32 + 2;
+    assert_eq!(
+        e.attrs_at(bpos_top(2, cascade_arabic), true).font_size,
+        16.0,
+        "an unset szCs reads the cascade's"
+    );
+    /* A range reads its first character. */
+    assert_eq!(
+        e.attrs_at(bpos_top(0, arabic_at - 2), false).font_size,
+        14.0
+    );
+}
+
+/// The UI save path keeps the slots apart: a size the user set on part of
+/// the run comes back on BOTH slots, the rest keeps its source pair (the
+/// byte-level checks live in `tools/roundtrip`'s complex-script step).
+#[test]
+fn ui_save_keeps_each_slot() {
+    let mut e = fixture_engine();
+    select(&mut e, 0, 0, 5);
+    apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: None,
+            attrs: patch(18.0, None),
+        },
+    );
+    let saved = format_docx::save_docx(e.undo.current()).expect("save");
+    let back = format_docx::read_docx(&saved).expect("reread").document;
+    let p = back.nth_paragraph(0).unwrap();
+    assert_eq!(p.style_at(0).font_size, Some(18.0));
+    assert_eq!(p.style_at(0).font_size_cs, Some(18.0));
+    assert_eq!(p.style_at(10).font_size, Some(11.0));
+    assert_eq!(p.style_at(10).font_size_cs, Some(14.0));
+    let cascade = back.nth_paragraph(2).unwrap().style_at(0);
+    assert_eq!(cascade.font_size, Some(11.0));
+    assert_eq!(cascade.font_size_cs, None, "no szCs synthesized");
+}
