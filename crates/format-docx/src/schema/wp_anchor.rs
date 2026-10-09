@@ -24,6 +24,7 @@ use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
 use super::ct_rpr::attr_val;
+use super::measure::{EMU_COORD, EMU_EXTENT, attr_emu, text_emu};
 
 /// Which positioning axis is open while the reader walks an anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +54,12 @@ fn on_off(v: Option<String>) -> bool {
 /// attribute is required by the schema; a missing one falls back to the
 /// stock Word value so a hand-authored or truncated tag still yields a
 /// usable float rather than a dropped picture.
+///
+/// Issue #407 — the wrap distances are `ST_WrapDistance` (EMU, never
+/// negative): through the EMU reader, so a `NaN` / negative distance falls
+/// back to 0 and an absurd one is clamped to 22 in, both reported.
 pub fn anchor_from_start_tag(e: &BytesStart) -> FloatAnchor {
-    let num = |key: &[u8]| -> Option<i64> { attr_val(e, key).and_then(|v| v.parse().ok()) };
+    let num = |key: &[u8]| -> Option<i64> { attr_emu(e, key, EMU_EXTENT) };
     let flag = |key: &[u8], default: bool| -> bool {
         match attr_val(e, key) {
             Some(v) => on_off(Some(v)),
@@ -165,11 +170,15 @@ pub fn align_str(a: FloatAlign) -> &'static str {
 /// Lower the text content of an offset element into a `FloatOffset`.
 /// `None` for unparsable content — the axis keeps its previous offset
 /// (the stock `Emu(0)`), so a garbled element degrades to "at the
-/// frame origin" rather than dropping the picture.
+/// frame origin" rather than dropping the picture. Issue #407 — a
+/// `<wp:posOffset>` goes through the EMU reader (`ST_Coordinate`): a
+/// `NaN` / garbage offset is reported, an absurd one clamped to ±22 in.
 pub fn parse_offset(kind: AnchorOffsetKind, text: &str) -> Option<FloatOffset> {
     let text = text.trim();
     match kind {
-        AnchorOffsetKind::PosOffset => text.parse::<i64>().ok().map(FloatOffset::Emu),
+        AnchorOffsetKind::PosOffset => {
+            text_emu(text, EMU_COORD, "wp:posOffset").map(FloatOffset::Emu)
+        }
         AnchorOffsetKind::Align => align_from_str(text).map(FloatOffset::Align),
         AnchorOffsetKind::Percent => text.parse::<i32>().ok().map(FloatOffset::PercentMilli),
     }

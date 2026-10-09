@@ -210,17 +210,21 @@ pub(crate) fn css_length_emu(
     spec: MeasureSpec,
     attr: impl FnOnce() -> String,
 ) -> Option<i64> {
-    let v = raw.trim();
-    let split = v
-        .find(|c: char| (c.is_ascii_alphabetic() && c != 'e' && c != 'E') || c == '%')
-        .unwrap_or(v.len());
-    let (num, unit) = v.split_at(split);
-    let num = num.trim();
-    let unit = unit.trim().to_ascii_lowercase();
-    let lower = v.to_ascii_lowercase();
+    let lower = raw.trim().to_ascii_lowercase();
+    /* `emu` is the one unit that starts with the exponent letter. */
+    let (num, unit) = match lower.strip_suffix("emu") {
+        Some(num) => (num, "emu"),
+        None => {
+            let split = lower
+                .find(|c: char| (c.is_ascii_alphabetic() && c != 'e') || c == '%')
+                .unwrap_or(lower.len());
+            lower.split_at(split)
+        }
+    };
+    let (num, unit) = (num.trim(), unit.trim());
     let unsigned = lower.trim_start_matches(['+', '-']);
     let spelled_non_finite = unsigned.starts_with("nan") || unsigned.starts_with("inf");
-    let per = match unit.as_str() {
+    let per = match unit {
         "" => Some(bare_emu),
         "pt" => Some(12_700.0),
         "in" => Some(914_400.0),
@@ -367,6 +371,72 @@ mod tests {
         );
         assert_eq!(measure("0", PAGE_SIZE), Measure::Clamped(144.0));
         assert_eq!(measure("30in", PAGE_SIZE), Measure::Clamped(MAX_TWIPS));
+    }
+
+    /// Issue #407 — DrawingML EMU coordinates: bare integers are EMU,
+    /// universal measures convert, non-finite / garbage is unusable,
+    /// out-of-range clamps to ±22 in.
+    #[test]
+    fn emu_coordinates_read_validate_and_clamp() {
+        assert_eq!(emu("914400", EMU_EXTENT), Measure::Ok(914_400.0));
+        assert_eq!(emu(" -914400 ", EMU_COORD), Measure::Ok(-914_400.0));
+        assert_eq!(emu("1in", EMU_EXTENT), Measure::Ok(914_400.0));
+        assert_eq!(emu("72pt", EMU_EXTENT), Measure::Ok(914_400.0));
+        assert_eq!(emu("2.54cm", EMU_EXTENT), Measure::Ok(914_400.0));
+        for raw in ["NaN", "inf", "-inf", "", "x", "12px", "1e400"] {
+            assert_eq!(emu(raw, EMU_COORD), Measure::Invalid, "{raw}");
+        }
+        assert_eq!(emu("-1", EMU_EXTENT), Measure::Invalid, "unsigned type");
+        assert_eq!(emu("1e30", EMU_EXTENT), Measure::Clamped(MAX_EMU));
+        assert_eq!(emu("-99999999999", EMU_COORD), Measure::Clamped(-MAX_EMU));
+        assert_eq!(MAX_EMU, 20_116_800.0, "22 in, DrawingML's ST_LineWidth max");
+    }
+
+    /// Issue #407 — VML `style` lengths: units, the caller's bare unit,
+    /// silent `None` for spellings the model cannot place, a report for
+    /// non-finite numbers (the old `as i64` cast made NaN 0 and inf
+    /// `i64::MAX`) and for out-of-range ones.
+    #[test]
+    fn css_lengths_convert_validate_and_report() {
+        const PT: f64 = 12_700.0;
+        let len = |raw: &str| css_length_emu(raw, PT, EMU_COORD, || "v:shape/@style width".into());
+        for (raw, want) in [
+            ("72pt", 914_400),
+            ("1in", 914_400),
+            ("2.54cm", 914_400),
+            ("25.4mm", 914_400),
+            ("96px", 914_400),
+            ("914400emu", 914_400),
+            ("914400EMU", 914_400),
+            ("72", 914_400),
+            ("-1in", -914_400),
+            ("1e1pt", 127_000),
+            ("0", 0),
+        ] {
+            assert_eq!(len(raw), Some(want), "{raw}");
+        }
+        let mut out = Vec::new();
+        crate::error::collect_read_warnings(&mut out, |_| {
+            for raw in ["50%", "auto", "2em", "x", ""] {
+                assert_eq!(len(raw), None, "{raw}");
+            }
+        });
+        assert!(out.is_empty(), "unplaceable spellings are silent: {out:?}");
+        crate::error::collect_read_warnings(&mut out, |_| {
+            for raw in ["NaN", "nanpt", "inf", "-Infinity", "1e400pt"] {
+                assert_eq!(len(raw), None, "{raw}");
+            }
+            assert_eq!(len("99999in"), Some(MAX_EMU as i64));
+        });
+        assert_eq!(out.len(), 6, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            DocxWarning::InvalidMeasure { attr, value } if attr == "v:shape/@style width" && value == "NaN"
+        ));
+        assert!(matches!(
+            &out[5],
+            DocxWarning::EmuClamped { value, emu, .. } if value == "99999in" && *emu == 20_116_800
+        ));
     }
 
     /// The pre-#349 `f32` parse and the measure reader agree bit for bit

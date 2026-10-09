@@ -23,9 +23,7 @@ use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
 use crate::schema::mce;
-use crate::schema::measure::{
-    PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt, attr_measure_twips,
-};
+use crate::schema::measure::{PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt, attr_measure_twips};
 use crate::schema::source_markup::{
     MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_empty_run_child,
     is_modeled_textless_run_child,

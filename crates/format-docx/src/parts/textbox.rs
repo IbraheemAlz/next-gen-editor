@@ -26,6 +26,9 @@
 //! host paragraph's passthrough keeps its bytes).
 
 use crate::schema::grab_bag::NamespaceScope;
+use crate::schema::measure::{
+    EMU_COORD, EMU_EXTENT, MeasureSpec, attr_emu, css_length_emu, describe,
+};
 use crate::schema::wp_anchor::emit_anchor_open;
 use crate::style_resolver::StyleResolver;
 use engine::{
@@ -128,9 +131,12 @@ fn element_inner(fragment: &[u8]) -> Option<&[u8]> {
 }
 
 /// `<wps:bodyPr lIns tIns rIns bIns anchor>` → insets + vertical anchor.
-/// Absent insets keep Word's defaults (already on the story).
+/// Absent insets keep Word's defaults (already on the story). Issue #407 —
+/// the insets (`ST_Coordinate32`) go through the EMU reader: a `NaN` /
+/// garbage inset keeps the default, an absurd one is clamped, both
+/// reported; a negative one still reads as 0.
 pub(crate) fn apply_body_pr(e: &BytesStart, story: &mut TextBoxStory) {
-    let num = |k: &[u8]| attr(e, k).and_then(|v| v.trim().parse::<i64>().ok());
+    let num = |k: &[u8]| attr_emu(e, k, EMU_COORD);
     if let Some(v) = num(b"lIns") {
         story.inset_left_emu = v.max(0);
     }
@@ -225,7 +231,8 @@ pub(crate) fn apply_sp_pr(fragment: &[u8], story: &mut TextBoxStory) {
         match name.as_slice() {
             b"a:ln" => {
                 saw_ln = true;
-                ln_width = attr(&e, b"w").and_then(|v| v.parse().ok());
+                /* Issue #407 — `ST_LineWidth` (0 ..= 22 in, EMU). */
+                ln_width = attr_emu(&e, b"w", EMU_EXTENT);
             }
             b"a:noFill" if parent == b"wps:spPr" => story.fill = None,
             b"a:noFill" if parent == b"a:ln" => ln_none = true,
@@ -294,25 +301,16 @@ pub(crate) struct VmlTextBox {
     pub story: TextBoxStory,
 }
 
+/// EMU per CSS px — a bare VML text-box number is pixels.
+const EMU_PER_PX: f64 = 9_525.0;
+
 /// A CSS-ish VML length (`72pt`, `1in`, `2.54cm`, `10mm`, `96px`, bare
-/// numbers as px) → EMU.
-fn vml_len_emu(v: &str) -> Option<i64> {
-    let v = v.trim();
-    let (num, unit) = match v.find(|c: char| c.is_ascii_alphabetic() || c == '%') {
-        Some(i) => (&v[..i], &v[i..]),
-        None => (v, "px"),
-    };
-    let n: f64 = num.trim().parse().ok()?;
-    let per = match unit {
-        "pt" => 12_700.0,
-        "in" => 914_400.0,
-        "cm" => 360_000.0,
-        "mm" => 36_000.0,
-        "px" => 9_525.0,
-        "emu" => 1.0,
-        _ => return None,
-    };
-    Some((n * per).round() as i64)
+/// numbers as px) → EMU under `spec`. Issue #407 — through the measure
+/// reader's CSS-length variant: `NaN` / `inf` (which the old `as i64` cast
+/// turned into 0 / `i64::MAX`) are unusable and an out-of-range length is
+/// clamped, both reported to the reader as `attr`.
+fn vml_len_emu(v: &str, spec: MeasureSpec, attr: impl FnOnce() -> String) -> Option<i64> {
+    css_length_emu(v, EMU_PER_PX, spec, attr)
 }
 
 /// VML colour (`#rrggbb`, `#rgb`, `black`, `white`, `red [10]`, …).
@@ -355,6 +353,7 @@ pub(crate) fn parse_vml(
     let mut buf = Vec::new();
     let mut prev = 0usize;
     let mut shape_style: Option<String> = None;
+    let mut shape_name = String::new();
     let mut filled = true;
     let mut fill: Option<[u8; 4]> = Some([255, 255, 255, 255]);
     let mut stroked = true;
@@ -381,6 +380,7 @@ pub(crate) fn parse_vml(
         match e.name().as_ref() {
             b"v:shape" | b"v:rect" | b"v:roundrect" if shape_style.is_none() => {
                 shape_style = Some(attr(&e, b"style").unwrap_or_default());
+                shape_name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 filled = vml_on(attr(&e, b"filled"), true);
                 if let Some(c) = attr(&e, b"fillcolor") {
                     fill = vml_color(&c).or(fill);
@@ -389,7 +389,9 @@ pub(crate) fn parse_vml(
                 if let Some(c) = attr(&e, b"strokecolor").and_then(|c| vml_color(&c)) {
                     stroke_color = c;
                 }
-                if let Some(w) = attr(&e, b"strokeweight").and_then(|w| vml_len_emu(&w)) {
+                if let Some(w) = attr(&e, b"strokeweight")
+                    .and_then(|w| vml_len_emu(&w, EMU_EXTENT, || describe(&e, b"strokeweight")))
+                {
                     stroke_w = w;
                 }
             }
@@ -420,11 +422,13 @@ pub(crate) fn parse_vml(
         })
         .collect();
     let get = |k: &str| props.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    let width_emu = get("width").and_then(vml_len_emu).unwrap_or(914_400).max(1);
-    let height_emu = get("height")
-        .and_then(vml_len_emu)
-        .unwrap_or(457_200)
-        .max(1);
+    /* Issue #407 — each `style` length is reported as `v:shape/@style
+    width` when unusable or clamped. */
+    let style_len = |k: &str, spec: MeasureSpec| {
+        get(k).and_then(|v| vml_len_emu(v, spec, || format!("{shape_name}/@style {k}")))
+    };
+    let width_emu = style_len("width", EMU_EXTENT).unwrap_or(914_400).max(1);
+    let height_emu = style_len("height", EMU_EXTENT).unwrap_or(457_200).max(1);
 
     let mut story = TextBoxStory {
         body,
@@ -441,7 +445,10 @@ pub(crate) fn parse_vml(
         ..TextBoxStory::default()
     };
     if let Some(ins) = inset {
-        let parts: Vec<Option<i64>> = ins.split(',').map(vml_len_emu).collect();
+        let parts: Vec<Option<i64>> = ins
+            .split(',')
+            .map(|v| vml_len_emu(v, EMU_COORD, || "v:textbox/@inset".to_string()))
+            .collect();
         let pick = |i: usize, d: i64| parts.get(i).copied().flatten().unwrap_or(d);
         story.inset_left_emu = pick(0, story.inset_left_emu);
         story.inset_top_emu = pick(1, story.inset_top_emu);
@@ -486,7 +493,7 @@ pub(crate) fn parse_vml(
             Some("line") => VRelativeFrom::Line,
             _ => VRelativeFrom::Paragraph,
         };
-        let off = |k: &str| get(k).and_then(vml_len_emu).unwrap_or(0);
+        let off = |k: &str| style_len(k, EMU_COORD).unwrap_or(0);
         let z: i64 = get("z-index").and_then(|z| z.parse().ok()).unwrap_or(0);
         Box::new(FloatAnchor {
             position_h: HPosition {
@@ -769,11 +776,16 @@ mod tests {
 
     #[test]
     fn vml_lengths_convert_to_emu() {
-        assert_eq!(vml_len_emu("72pt"), Some(914_400));
-        assert_eq!(vml_len_emu("1in"), Some(914_400));
-        assert_eq!(vml_len_emu("2.54cm"), Some(914_400));
-        assert_eq!(vml_len_emu("96"), Some(914_400));
-        assert_eq!(vml_len_emu("x"), None);
+        let len = |v: &str| vml_len_emu(v, EMU_COORD, String::new);
+        assert_eq!(len("72pt"), Some(914_400));
+        assert_eq!(len("1in"), Some(914_400));
+        assert_eq!(len("2.54cm"), Some(914_400));
+        assert_eq!(len("96"), Some(914_400));
+        assert_eq!(len("x"), None);
+        /* Issue #407 — NaN is not 0, inf is not i64::MAX. */
+        assert_eq!(len("NaN"), None);
+        assert_eq!(len("inf"), None);
+        assert_eq!(len("1e30in"), Some(20_116_800));
     }
 
     #[test]
