@@ -14,6 +14,16 @@ export type CommandStatus =
 /** Story-mode behaviour (`bridge::StoryPolicy`, `Engine::story_gate`). */
 export type StoryPolicy = 'allowed' | 'body_only' | 'text_box_only' | 'exits_story';
 
+/** What an enforced document protection lets through
+ *  (`bridge::ProtectionClass`, issue #345). */
+export type ProtectionClass =
+    | 'exempt'
+    | 'comment'
+    | 'text'
+    | 'formatting'
+    | 'review_toggle'
+    | 'other';
+
 /** One command's dispatch metadata (`bridge::CommandMeta`). */
 export interface CommandMeta {
     /** The Rust `Command` variant identifier. */
@@ -28,6 +38,8 @@ export interface CommandMeta {
     readonly new_document: boolean;
     readonly story: StoryPolicy;
     readonly status: CommandStatus;
+    /** Issue #345 — what document protection lets through. */
+    readonly protection: ProtectionClass;
 }
 
 /** Commands that answer a placeholder error for every input. The
@@ -39,113 +51,124 @@ export type StubCommandType = 'INIT' | 'DISPOSE' | 'TICK' | 'MERGE_PARAGRAPH' | 
 export type PartialCommandType = 'SET_IMAGE_WRAP';
 
 export const COMMAND_META: { readonly [K in CommandType]: CommandMeta } = {
-    PING: { variant: 'Ping', mutates_doc: false, moves_selection: false, logged: true, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    LOAD_FONT: { variant: 'LoadFont', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    RASTERIZE_GLYPH: { variant: 'RasterizeGlyph', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    SHAPE_AND_RASTERIZE: { variant: 'ShapeAndRasterize', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    RENDER_PAGE: { variant: 'RenderPage', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'body_only', status: { kind: 'implemented' } },
-    INSERT_TEXT: { variant: 'InsertText', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    UNDO: { variant: 'Undo', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    REDO: { variant: 'Redo', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    LOAD_DOCX: { variant: 'LoadDocx', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' } },
-    SAVE_DOCX: { variant: 'SaveDocx', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    INIT: { variant: 'Init', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 397 } },
-    RECOVER: { variant: 'Recover', mutates_doc: true, moves_selection: true, logged: false, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SNAPSHOT: { variant: 'Snapshot', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    DISPOSE: { variant: 'Dispose', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 397 } },
-    TICK: { variant: 'Tick', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 397 } },
-    OPEN_DOCUMENT: { variant: 'OpenDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' } },
-    SAVE_DOCUMENT: { variant: 'SaveDocument', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    EXPORT_PDF: { variant: 'ExportPdf', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    CLOSE_DOCUMENT: { variant: 'CloseDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' } },
-    DELETE_RANGE: { variant: 'DeleteRange', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    REPLACE_RANGE: { variant: 'ReplaceRange', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    APPLY_FORMATTING: { variant: 'ApplyFormatting', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    TOGGLE_FORMATTING: { variant: 'ToggleFormatting', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SPLIT_PARAGRAPH: { variant: 'SplitParagraph', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    MERGE_PARAGRAPH: { variant: 'MergeParagraph', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 396 } },
-    INSERT_IMAGE: { variant: 'InsertImage', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    RESIZE_IMAGE: { variant: 'ResizeImage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'implemented' } },
-    MOVE_IMAGE: { variant: 'MoveImage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'implemented' } },
-    SET_IMAGE_WRAP: { variant: 'SetImageWrap', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'partial', issue: 137 } },
-    SET_SELECTION: { variant: 'SetSelection', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    EXTEND_SELECTION: { variant: 'ExtendSelection', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SELECT_ALL: { variant: 'SelectAll', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    MOVE_CARET: { variant: 'MoveCaret', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    BEGIN_COMPOSITION: { variant: 'BeginComposition', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    UPDATE_COMPOSITION: { variant: 'UpdateComposition', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    END_COMPOSITION: { variant: 'EndComposition', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_VIEWPORT: { variant: 'SetViewport', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_ZOOM: { variant: 'SetZoom', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_DEVICE_SCALE: { variant: 'SetDeviceScale', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    REQUEST_PAINT: { variant: 'RequestPaint', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    EXPAND_LAYOUT: { variant: 'ExpandLayout', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    UNLOAD_FONT: { variant: 'UnloadFont', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 376 } },
-    REQUEST_STATS: { variant: 'RequestStats', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    HIT_TEST: { variant: 'HitTest', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    HIT_TEST_IN_PAGE: { variant: 'HitTestInPage', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    PLACE_CARET_AT_POINT: { variant: 'PlaceCaretAtPoint', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    EXTEND_SELECTION_TO_POINT: { variant: 'ExtendSelectionToPoint', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    GET_IMAGE_RECTS: { variant: 'GetImageRects', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SELECT_WORD_AT: { variant: 'SelectWordAt', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SELECT_PARAGRAPH_AT: { variant: 'SelectParagraphAt', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SELECT_CELL_AT: { variant: 'SelectCellAt', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    DELETE_AT_CARET: { variant: 'DeleteAtCaret', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    REQUEST_ACCESSIBILITY_DELTA: { variant: 'RequestAccessibilityDelta', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    GET_SELECTION_AS_CLIPBOARD: { variant: 'GetSelectionAsClipboard', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    PASTE_PLAIN: { variant: 'PastePlain', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_PARAGRAPH_ALIGN: { variant: 'SetParagraphAlign', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_PARAGRAPH_DIRECTION: { variant: 'SetParagraphDirection', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    PASTE_HTML: { variant: 'PasteHtml', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    INSERT_TABLE: { variant: 'InsertTable', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    DELETE_TABLE: { variant: 'DeleteTable', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    INSERT_ROW: { variant: 'InsertRow', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    DELETE_ROW: { variant: 'DeleteRow', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    INSERT_COLUMN: { variant: 'InsertColumn', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    DELETE_COLUMN: { variant: 'DeleteColumn', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    MERGE_CELLS: { variant: 'MergeCells', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SPLIT_CELL: { variant: 'SplitCell', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_CELL_SHADING: { variant: 'SetCellShading', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_CELL_BORDERS: { variant: 'SetCellBorders', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_TABLE_PROPERTIES: { variant: 'SetTableProperties', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_COLUMNS: { variant: 'SetColumns', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    INSERT_PAGE_BREAK: { variant: 'InsertPageBreak', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    INSERT_SECTION_BREAK: { variant: 'InsertSectionBreak', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    ENTER_HEADER_FOOTER: { variant: 'EnterHeaderFooter', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    EXIT_HEADER_FOOTER: { variant: 'ExitHeaderFooter', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_HEADER_FOOTER_LINK: { variant: 'SetHeaderFooterLink', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_TITLE_PAGE: { variant: 'SetTitlePage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_EVEN_ODD_HEADERS: { variant: 'SetEvenOddHeaders', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    INSERT_FIELD: { variant: 'InsertField', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    INSERT_FOOTNOTE: { variant: 'InsertFootnote', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    INSERT_ENDNOTE: { variant: 'InsertEndnote', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    INSERT_TEXT_BOX: { variant: 'InsertTextBox', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    SET_RENDER_DATE: { variant: 'SetRenderDate', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    UPDATE_FIELDS: { variant: 'UpdateFields', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_FIELD_CODE_VIEW: { variant: 'SetFieldCodeView', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_FIELD_INSTRUCTION: { variant: 'SetFieldInstruction', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    INSERT_TOC: { variant: 'InsertToc', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    SET_PARAGRAPH_BORDERS: { variant: 'SetParagraphBorders', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_PAGE_MARGINS: { variant: 'SetPageMargins', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    SET_PAGE_ORIENTATION: { variant: 'SetPageOrientation', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    TOGGLE_LIST: { variant: 'ToggleList', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    CHANGE_LIST_LEVEL: { variant: 'ChangeListLevel', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_PARAGRAPH_INDENT: { variant: 'SetParagraphIndent', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_LINE_SPACING: { variant: 'SetLineSpacing', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_PARAGRAPH_SHADING: { variant: 'SetParagraphShading', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    TOGGLE_TRACK_CHANGES: { variant: 'ToggleTrackChanges', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    ACCEPT_REVISION: { variant: 'AcceptRevision', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    REJECT_REVISION: { variant: 'RejectRevision', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    ACCEPT_ALL_REVISIONS: { variant: 'AcceptAllRevisions', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    REJECT_ALL_REVISIONS: { variant: 'RejectAllRevisions', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    INSERT_COMMENT: { variant: 'InsertComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    DELETE_COMMENT: { variant: 'DeleteComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    SET_TAB_STOPS: { variant: 'SetTabStops', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    SET_REVIEW_IDENTITY: { variant: 'SetReviewIdentity', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    APPLY_STYLE: { variant: 'ApplyStyle', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
-    RESOLVE_COMMENT: { variant: 'ResolveComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    REPLY_TO_COMMENT: { variant: 'ReplyToComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' } },
-    MODIFY_STYLE: { variant: 'ModifyStyle', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' } },
+    PING: { variant: 'Ping', mutates_doc: false, moves_selection: false, logged: true, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    LOAD_FONT: { variant: 'LoadFont', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    RASTERIZE_GLYPH: { variant: 'RasterizeGlyph', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'exempt' },
+    SHAPE_AND_RASTERIZE: { variant: 'ShapeAndRasterize', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'exempt' },
+    RENDER_PAGE: { variant: 'RenderPage', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'body_only', status: { kind: 'implemented' }, protection: 'exempt' },
+    INSERT_TEXT: { variant: 'InsertText', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'text' },
+    UNDO: { variant: 'Undo', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    REDO: { variant: 'Redo', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    LOAD_DOCX: { variant: 'LoadDocx', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' }, protection: 'exempt' },
+    SAVE_DOCX: { variant: 'SaveDocx', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    INIT: { variant: 'Init', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 397 }, protection: 'exempt' },
+    RECOVER: { variant: 'Recover', mutates_doc: true, moves_selection: true, logged: false, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SNAPSHOT: { variant: 'Snapshot', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    DISPOSE: { variant: 'Dispose', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 397 }, protection: 'exempt' },
+    TICK: { variant: 'Tick', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 397 }, protection: 'exempt' },
+    OPEN_DOCUMENT: { variant: 'OpenDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' }, protection: 'exempt' },
+    SAVE_DOCUMENT: { variant: 'SaveDocument', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    EXPORT_PDF: { variant: 'ExportPdf', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    CLOSE_DOCUMENT: { variant: 'CloseDocument', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: true, story: 'exits_story', status: { kind: 'implemented' }, protection: 'exempt' },
+    DELETE_RANGE: { variant: 'DeleteRange', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'text' },
+    REPLACE_RANGE: { variant: 'ReplaceRange', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'text' },
+    APPLY_FORMATTING: { variant: 'ApplyFormatting', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'formatting' },
+    TOGGLE_FORMATTING: { variant: 'ToggleFormatting', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'formatting' },
+    SPLIT_PARAGRAPH: { variant: 'SplitParagraph', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'text' },
+    MERGE_PARAGRAPH: { variant: 'MergeParagraph', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 396 }, protection: 'other' },
+    INSERT_IMAGE: { variant: 'InsertImage', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    RESIZE_IMAGE: { variant: 'ResizeImage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'implemented' }, protection: 'other' },
+    MOVE_IMAGE: { variant: 'MoveImage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'implemented' }, protection: 'other' },
+    SET_IMAGE_WRAP: { variant: 'SetImageWrap', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'partial', issue: 137 }, protection: 'other' },
+    SET_SELECTION: { variant: 'SetSelection', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    EXTEND_SELECTION: { variant: 'ExtendSelection', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SELECT_ALL: { variant: 'SelectAll', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    MOVE_CARET: { variant: 'MoveCaret', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    BEGIN_COMPOSITION: { variant: 'BeginComposition', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    UPDATE_COMPOSITION: { variant: 'UpdateComposition', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    END_COMPOSITION: { variant: 'EndComposition', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'text' },
+    SET_VIEWPORT: { variant: 'SetViewport', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SET_ZOOM: { variant: 'SetZoom', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SET_DEVICE_SCALE: { variant: 'SetDeviceScale', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    REQUEST_PAINT: { variant: 'RequestPaint', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    EXPAND_LAYOUT: { variant: 'ExpandLayout', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    UNLOAD_FONT: { variant: 'UnloadFont', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 376 }, protection: 'exempt' },
+    REQUEST_STATS: { variant: 'RequestStats', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    HIT_TEST: { variant: 'HitTest', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    HIT_TEST_IN_PAGE: { variant: 'HitTestInPage', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    PLACE_CARET_AT_POINT: { variant: 'PlaceCaretAtPoint', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    EXTEND_SELECTION_TO_POINT: { variant: 'ExtendSelectionToPoint', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    GET_IMAGE_RECTS: { variant: 'GetImageRects', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SELECT_WORD_AT: { variant: 'SelectWordAt', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SELECT_PARAGRAPH_AT: { variant: 'SelectParagraphAt', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SELECT_CELL_AT: { variant: 'SelectCellAt', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    DELETE_AT_CARET: { variant: 'DeleteAtCaret', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'text' },
+    REQUEST_ACCESSIBILITY_DELTA: { variant: 'RequestAccessibilityDelta', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    GET_SELECTION_AS_CLIPBOARD: { variant: 'GetSelectionAsClipboard', mutates_doc: false, moves_selection: false, logged: false, read_only: true, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    PASTE_PLAIN: { variant: 'PastePlain', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'text' },
+    SET_PARAGRAPH_ALIGN: { variant: 'SetParagraphAlign', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_PARAGRAPH_DIRECTION: { variant: 'SetParagraphDirection', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    PASTE_HTML: { variant: 'PasteHtml', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'text' },
+    INSERT_TABLE: { variant: 'InsertTable', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    DELETE_TABLE: { variant: 'DeleteTable', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_ROW: { variant: 'InsertRow', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    DELETE_ROW: { variant: 'DeleteRow', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_COLUMN: { variant: 'InsertColumn', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    DELETE_COLUMN: { variant: 'DeleteColumn', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    MERGE_CELLS: { variant: 'MergeCells', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SPLIT_CELL: { variant: 'SplitCell', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_CELL_SHADING: { variant: 'SetCellShading', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_CELL_BORDERS: { variant: 'SetCellBorders', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_TABLE_PROPERTIES: { variant: 'SetTableProperties', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_COLUMNS: { variant: 'SetColumns', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_PAGE_BREAK: { variant: 'InsertPageBreak', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_SECTION_BREAK: { variant: 'InsertSectionBreak', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    ENTER_HEADER_FOOTER: { variant: 'EnterHeaderFooter', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    EXIT_HEADER_FOOTER: { variant: 'ExitHeaderFooter', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SET_HEADER_FOOTER_LINK: { variant: 'SetHeaderFooterLink', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_TITLE_PAGE: { variant: 'SetTitlePage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_EVEN_ODD_HEADERS: { variant: 'SetEvenOddHeaders', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_FIELD: { variant: 'InsertField', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_FOOTNOTE: { variant: 'InsertFootnote', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_ENDNOTE: { variant: 'InsertEndnote', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_TEXT_BOX: { variant: 'InsertTextBox', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    SET_RENDER_DATE: { variant: 'SetRenderDate', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    UPDATE_FIELDS: { variant: 'UpdateFields', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_FIELD_CODE_VIEW: { variant: 'SetFieldCodeView', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SET_FIELD_INSTRUCTION: { variant: 'SetFieldInstruction', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_TOC: { variant: 'InsertToc', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    SET_PARAGRAPH_BORDERS: { variant: 'SetParagraphBorders', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_PAGE_MARGINS: { variant: 'SetPageMargins', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    SET_PAGE_ORIENTATION: { variant: 'SetPageOrientation', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    TOGGLE_LIST: { variant: 'ToggleList', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    CHANGE_LIST_LEVEL: { variant: 'ChangeListLevel', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_PARAGRAPH_INDENT: { variant: 'SetParagraphIndent', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_LINE_SPACING: { variant: 'SetLineSpacing', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_PARAGRAPH_SHADING: { variant: 'SetParagraphShading', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    TOGGLE_TRACK_CHANGES: { variant: 'ToggleTrackChanges', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'review_toggle' },
+    ACCEPT_REVISION: { variant: 'AcceptRevision', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    REJECT_REVISION: { variant: 'RejectRevision', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    ACCEPT_ALL_REVISIONS: { variant: 'AcceptAllRevisions', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    REJECT_ALL_REVISIONS: { variant: 'RejectAllRevisions', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
+    INSERT_COMMENT: { variant: 'InsertComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'comment' },
+    DELETE_COMMENT: { variant: 'DeleteComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'comment' },
+    SET_TAB_STOPS: { variant: 'SetTabStops', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    SET_REVIEW_IDENTITY: { variant: 'SetReviewIdentity', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'exempt' },
+    APPLY_STYLE: { variant: 'ApplyStyle', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+    RESOLVE_COMMENT: { variant: 'ResolveComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'comment' },
+    REPLY_TO_COMMENT: { variant: 'ReplyToComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'comment' },
+    MODIFY_STYLE: { variant: 'ModifyStyle', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
+};
+
+/** Issue #345 — the protection classes each enforced mode admits
+ *  (`bridge::ProtectionClass::admitted_by`); the engine refines
+ *  `text` (form-field content only under `forms`, recordable edits
+ *  only under `trackedChanges`) and `review_toggle` (only ON). */
+export const PROTECTION_ADMITS: { readonly [mode: string]: readonly ProtectionClass[] } = {
+    readOnly: ['exempt'],
+    comments: ['exempt', 'comment'],
+    trackedChanges: ['exempt', 'comment', 'text', 'formatting', 'review_toggle'],
+    forms: ['exempt', 'text'],
 };
 
 /** A conservative stand-in for a type the table does not know (a
@@ -159,6 +182,7 @@ const UNKNOWN_COMMAND_META: CommandMeta = {
     new_document: false,
     story: 'body_only',
     status: { kind: 'implemented' },
+    protection: 'other',
 };
 
 /** Metadata for a runtime command type — `UNKNOWN_COMMAND_META` when
@@ -167,4 +191,14 @@ export function commandMeta(type: string): CommandMeta {
     return Object.prototype.hasOwnProperty.call(COMMAND_META, type)
         ? COMMAND_META[type as CommandType]
         : UNKNOWN_COMMAND_META;
+}
+
+/** Issue #345 — whether an enforced protection `mode` (the
+ *  `SELECTION_CHANGED.protection` value) can admit command `type` at
+ *  all; `true` for an unprotected document. A `true` for a `text` /
+ *  `review_toggle` command is not a promise: the engine refines it. */
+export function protectionAdmits(mode: string | undefined, type: string): boolean {
+    if (mode === undefined) return true;
+    const admitted = PROTECTION_ADMITS[mode];
+    return admitted === undefined || admitted.includes(commandMeta(type).protection);
 }

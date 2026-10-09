@@ -319,6 +319,7 @@ fn open_style_bidi(base: ShapingDirection) -> Engine {
             name: None,
             limits: None,
             defaults: None,
+            password: None,
         },
     );
     assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");

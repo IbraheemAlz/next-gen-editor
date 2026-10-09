@@ -27,7 +27,8 @@ use crate::schema::measure::{
     PAGE_SIZE, SIGNED_TWIPS, TWIPS, attr_measure_pt, attr_measure_twips,
 };
 use crate::schema::source_markup::{
-    MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_textless_run_child,
+    MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_empty_run_child,
+    is_modeled_textless_run_child,
 };
 use crate::style_resolver::StyleResolver;
 use engine::{
@@ -183,6 +184,90 @@ impl FieldSourceTracker {
         bookmark, text-less runs) ride its bytes now. */
         markup.drain_markers(b.marker_mark, mend);
         self.end_pending = run_start.map(|r| (idx, r));
+    }
+
+    /// Issue #384 — the `end` of `ending` produced a multi-paragraph
+    /// field's Tail (`fields` gained it past `fields_before`): the Tail
+    /// keeps its end run as source form ([`engine::FieldSource::close`],
+    /// filled when the run closes) and the Head — in this paragraph (a
+    /// one-paragraph TOC) or the earlier one in `out_blocks` the
+    /// `separate` fired in — its verbatim prologue, so a regenerated TOC
+    /// paragraph keeps `begin … separate` (the untrimmed instruction, the
+    /// run properties, the whitespace) instead of the stock prologue.
+    #[allow(clippy::too_many_arguments)]
+    fn span_end(
+        &mut self,
+        ending: Option<&FieldBuilder>,
+        fields: &mut [engine::Field],
+        fields_before: usize,
+        out_blocks: &mut [Block],
+        xml: &[u8],
+        ns: &NamespaceScope,
+        markup: &mut MarkupCapture,
+        run_start: Option<usize>,
+    ) {
+        let n = fields.len();
+        let is_span = |f: &engine::Field, s: engine::FieldSpan| f.span == Some(s);
+        let Some(b) = ending else {
+            return;
+        };
+        if n <= fields_before || !is_span(&fields[n - 1], engine::FieldSpan::Tail) {
+            return;
+        }
+        let tail = n - 1;
+        fields[tail].source = Some(Box::new(engine::FieldSource::default()));
+        self.end_pending = run_start.map(|r| (tail, r));
+        let Some((ps, pe, mend)) = b.prologue else {
+            return;
+        };
+        let Some(open) = xml
+            .get(ps..pe)
+            .filter(|o| is_balanced_fragment(o) && bound_by_root(o, ns))
+        else {
+            return;
+        };
+        let source = |f: &engine::Field| {
+            Some(Box::new(engine::FieldSource {
+                instruction: f.instruction.clone(),
+                open: open.to_vec(),
+                close: Vec::new(),
+            }))
+        };
+        if n >= fields_before + 2 && is_span(&fields[n - 2], engine::FieldSpan::Head) {
+            /* A one-paragraph TOC: the prologue's markers ride its bytes. */
+            let head = &mut fields[n - 2];
+            head.source = source(head);
+            markup.drain_markers(b.marker_mark, mend);
+            return;
+        }
+        /* The Head sits on the paragraph the `separate` fired in, already
+        read: its prologue markers leave that paragraph's markup — only
+        when they are exactly the ones captured at the `begin` offset. */
+        let Some((block, false)) = b.cached_block else {
+            return;
+        };
+        let Some(Block::Paragraph(p)) = out_blocks.get_mut(block) else {
+            return;
+        };
+        let at = b.begin_at;
+        let Some(head) = p
+            .fields
+            .iter_mut()
+            .rev()
+            .find(|f| is_span(f, engine::FieldSpan::Head) && f.start == at)
+        else {
+            return;
+        };
+        let Some(m) = p.source_markup.as_deref_mut() else {
+            head.source = source(head);
+            return;
+        };
+        let range = b.marker_mark..mend;
+        if mend > m.markers.len() || m.markers[range.clone()].iter().any(|mk| mk.at != at) {
+            return;
+        }
+        m.markers.drain(range);
+        head.source = source(head);
     }
 
     /// A `</w:r>` ended at byte `end`; `run_text_len` is the run's text
@@ -488,6 +573,15 @@ fn track_field_span(e: &BytesStart<'_>, markup: &mut MarkupCapture, cx: FieldSpa
             markup.field_begin(cx.here, cx.stack.len(), eligible);
         }
         "end" if cx.depth_before > 0 => markup.field_end(cx.depth_before, cx.here, cx.modeled),
+        /* Issue #384 — the prologue of a field the writer regenerates as a
+        wrapper (every enclosing field in its result) ends here. */
+        "separate" if !cx.stack.is_empty() => {
+            let enclosing = &cx.stack[..cx.stack.len() - 1];
+            markup.field_separate(
+                cx.stack.len(),
+                enclosing.iter().all(|f| f.cached_start.is_some()),
+            );
+        }
         _ => {}
     }
 }
@@ -578,7 +672,10 @@ fn mark_revision_kind(qname: &[u8]) -> Option<engine::RevisionKind> {
     }
 }
 
-fn mark_revision(kind: engine::RevisionKind, e: &BytesStart<'_>) -> engine::Revision {
+/// A `CT_TrackChange` element (`w:id` / `w:author` / `w:date`) as a
+/// range-less revision of `kind`: a paragraph mark's (issue #262) or a
+/// table row's (`<w:trPr><w:ins/>`, issue #365).
+pub(crate) fn mark_revision(kind: engine::RevisionKind, e: &BytesStart<'_>) -> engine::Revision {
     engine::Revision {
         start: 0,
         end: 0,
@@ -1398,7 +1495,7 @@ pub(crate) fn parse_document_xml_with_events(
     holds the `w:id` of every `_Toc*` bookmark the model owns, so its
     `<w:bookmarkEnd>` is not ALSO kept as a verbatim marker. */
     let mut markup = MarkupCapture::new();
-    let mut toc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut toc_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     /* Issue #84 — namespace prefixes the part's root element binds. Grab-bag
     fragments in a foreign namespace (`w14:`, `mc:`, …) re-bind their
@@ -1494,6 +1591,36 @@ pub(crate) fn parse_document_xml_with_events(
                     b"w:sdt" if in_para => {
                         markup.sdt_start(prev_pos);
                         prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    /* Issues #272 / #384 — an in-paragraph `<w:smartTag>` /
+                    `<w:customXml>`: the runs stay paragraph content, the
+                    wrapper (start tag + property child / end tag) rides the
+                    source markup as an opener / closer pair, exactly like a
+                    run-level `<w:sdt>`. */
+                    n @ (b"w:smartTag" | b"w:customXml") if in_para && !in_ppr => {
+                        let qname = n.to_vec();
+                        markup.wrapper_start(prev_pos);
+                        let end = reader.buffer_position() as usize;
+                        if let Some((content, close)) =
+                            crate::schema::source_markup::inline_wrapper_opener_end(
+                                &qname,
+                                xml,
+                                &mut reader,
+                                end,
+                            )?
+                        {
+                            markup.wrapper_content_start(
+                                xml,
+                                content,
+                                para_text.len() as u32,
+                                &ns,
+                                false,
+                                close,
+                            );
+                            prev_pos = content;
+                        }
                         buf.clear();
                         continue;
                     }
@@ -1840,6 +1967,8 @@ pub(crate) fn parse_document_xml_with_events(
                         `w:tooltip`, …) ride the link for regeneration. */
                         let attrs = crate::schema::source_markup::raw_attrs(&e, &ns);
                         hyperlink_stack.push((target, start, attrs));
+                        /* Issue #384 — a wrapper start for marker slots. */
+                        markup.wrapper_open(start);
                     }
                     b"w:t" => {
                         in_text_elt = true;
@@ -1849,7 +1978,9 @@ pub(crate) fn parse_document_xml_with_events(
                         in_del_text_elt = true;
                         markup.run_text_elt(&e, &ns);
                     }
-                    b"w:instrText" => in_instr_text = true,
+                    /* Issue #384 — a field inside a tracked deletion spells
+                    its code `<w:delInstrText>`: the same instruction. */
+                    b"w:instrText" | b"w:delInstrText" => in_instr_text = true,
                     /* Issue #350 — a field character past the nesting cap,
                     or one with no open field: not modeled, its run is kept
                     verbatim. */
@@ -1921,6 +2052,17 @@ pub(crate) fn parse_document_xml_with_events(
                                 let local = (para_fields.len() == fields_before + 1
                                     && para_fields.last().is_some_and(|f| f.is_local()))
                                 .then(|| para_fields.len() - 1);
+                                /* Issue #384 — a TOC's source form. */
+                                field_sources.span_end(
+                                    ending.as_ref(),
+                                    &mut para_fields,
+                                    fields_before,
+                                    &mut out_blocks,
+                                    xml,
+                                    &ns,
+                                    &mut markup,
+                                    clean_run,
+                                );
                                 field_sources.end(
                                     ending,
                                     &mut para_fields,
@@ -1943,6 +2085,7 @@ pub(crate) fn parse_document_xml_with_events(
                             .filter(|t| bound_by_root(t, &ns))
                             .map(<[u8]>::to_vec);
                         fld_simple_stack.push((instr, start, tag));
+                        markup.wrapper_open(start);
                     }
                     b"w:ins" | b"w:del" | b"w:moveFrom" | b"w:moveTo" => {
                         let kind = match name.as_ref() {
@@ -1972,6 +2115,7 @@ pub(crate) fn parse_document_xml_with_events(
                             start: (para_text.len() + run_text.len()) as u32,
                             move_name,
                         });
+                        markup.wrapper_open((para_text.len() + run_text.len()) as u32);
                     }
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
@@ -2033,7 +2177,7 @@ pub(crate) fn parse_document_xml_with_events(
                 }
                 let at_block_level =
                     in_block_container && p_start_byte.is_none() && in_tbl == 0 && !in_sect_pr;
-                if in_run && is_modeled_textless_run_child(name.as_ref()) {
+                if in_run && is_modeled_empty_run_child(name.as_ref()) {
                     markup.run_modeled();
                 }
                 if in_run && !in_rpr && name.as_ref() != b"w:rPr" {
@@ -2094,9 +2238,19 @@ pub(crate) fn parse_document_xml_with_events(
                         }
                     }
                     b"w:bookmarkEnd" if in_para && !in_run && !in_ppr => {
-                        let modeled = attr_val(&e, b"w:id").is_some_and(|id| toc_ids.contains(&id));
-                        if !modeled && let Some(frag) = slice_fragment(xml, prev_pos, here) {
-                            markup.marker(para_text.len() as u32, frag, &ns);
+                        let toc = attr_val(&e, b"w:id").and_then(|id| toc_ids.get(&id).cloned());
+                        if let Some(frag) = slice_fragment(xml, prev_pos, here) {
+                            /* Issue #384 — a model-owned `_Toc*` bookmark's
+                            end rides as a verified marker. */
+                            match toc {
+                                Some(name) => markup.toc_bookmark_marker(
+                                    para_text.len() as u32,
+                                    frag,
+                                    name,
+                                    &ns,
+                                ),
+                                None => markup.marker(para_text.len() as u32, frag, &ns),
+                            }
                         }
                     }
                     n if in_para
@@ -2307,7 +2461,21 @@ pub(crate) fn parse_document_xml_with_events(
                             /* Modeled (issue #81): the writer re-emits the
                             start AND its end from `Paragraph::bookmarks`. */
                             if let Some(id) = &raw_id {
-                                toc_ids.insert(id.clone());
+                                toc_ids.insert(id.clone(), name.clone());
+                            }
+                            /* Issue #384 — and its start keeps its source
+                            position as a verified marker. */
+                            if !in_run
+                                && !in_ppr
+                                && let Some(frag) =
+                                    slice_fragment(xml, prev_pos, reader.buffer_position() as usize)
+                            {
+                                markup.toc_bookmark_marker(
+                                    para_text.len() as u32,
+                                    frag,
+                                    name.clone(),
+                                    &ns,
+                                );
                             }
                             if !para_bookmarks.iter().any(|b| b.name == name) {
                                 para_bookmarks.push(engine::Bookmark {
@@ -2484,6 +2652,17 @@ pub(crate) fn parse_document_xml_with_events(
                                 let local = (para_fields.len() == fields_before + 1
                                     && para_fields.last().is_some_and(|f| f.is_local()))
                                 .then(|| para_fields.len() - 1);
+                                /* Issue #384 — a TOC's source form. */
+                                field_sources.span_end(
+                                    ending.as_ref(),
+                                    &mut para_fields,
+                                    fields_before,
+                                    &mut out_blocks,
+                                    xml,
+                                    &ns,
+                                    &mut markup,
+                                    clean_run,
+                                );
                                 field_sources.end(
                                     ending,
                                     &mut para_fields,
@@ -2742,12 +2921,25 @@ pub(crate) fn parse_document_xml_with_events(
                             &ns,
                         );
                     }
+                    /* Issues #272 / #384 — the in-paragraph wrapper's close. */
+                    b"w:smartTag" | b"w:customXml"
+                        if p_start_byte.is_some() && !in_run && !in_ppr =>
+                    {
+                        markup.sdt_content_end(prev_pos);
+                        markup.sdt_end(
+                            xml,
+                            reader.buffer_position() as usize,
+                            para_text.len() as u32,
+                            &ns,
+                        );
+                    }
                     b"w:t" => in_text_elt = false,
                     b"w:delText" => in_del_text_elt = false,
-                    b"w:instrText" => in_instr_text = false,
+                    b"w:instrText" | b"w:delInstrText" => in_instr_text = false,
                     b"w:ins" | b"w:del" | b"w:moveFrom" | b"w:moveTo" => {
                         if let Some(open) = revision_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
+                            markup.wrapper_close(end > open.start);
                             if end > open.start {
                                 para_revisions.push(engine::Revision {
                                     start: open.start,
@@ -2816,6 +3008,7 @@ pub(crate) fn parse_document_xml_with_events(
                         if let Some((instr, start, tag)) = fld_simple_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
                             let instr = instr.trim().to_string();
+                            markup.wrapper_close(end > start && !instr.is_empty());
                             if end > start && !instr.is_empty() {
                                 /* Issue #246 — remember the simple form. */
                                 let close = xml
@@ -2841,6 +3034,7 @@ pub(crate) fn parse_document_xml_with_events(
                     b"w:hyperlink" => {
                         if let Some((target, start, attrs)) = hyperlink_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
+                            markup.wrapper_close(end > start && !target.is_empty());
                             if end > start && !target.is_empty() {
                                 para_hyperlinks.push(engine::Hyperlink {
                                     start,

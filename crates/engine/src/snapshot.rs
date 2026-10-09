@@ -871,6 +871,7 @@ mod tests {
                     open: b"\n  ".to_vec(),
                     after_rpr: b"\n  ".to_vec(),
                     close: b"\n".to_vec(),
+                    inner: b"\n  ".to_vec(),
                 })),
                 bare_edge_ws: true,
             }],
@@ -886,6 +887,7 @@ mod tests {
                     xml: br#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#.to_vec(),
                     role: crate::MarkerRole::Content,
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     /* Issue #245 — a content control's two ends. */
@@ -896,12 +898,14 @@ mod tests {
                         close_xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     },
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     at: 5,
                     xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     role: crate::MarkerRole::Close { id: 7 },
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     /* Issue #243 — a comment anchor keeps its identity. */
@@ -911,6 +915,16 @@ mod tests {
                         kind: crate::CommentAnchorKind::RangeEnd,
                         id: 3,
                     }),
+                    ..SourceMarker::default()
+                },
+                SourceMarker {
+                    /* Issue #384 — a marker's slot among the wrapper
+                    boundaries, and a `_Toc*` bookmark's name. */
+                    at: 11,
+                    xml: br#"<w:bookmarkEnd w:id="4"/>"#.to_vec(),
+                    closes_after: 2,
+                    opens_before: 1,
+                    toc_bookmark: Some("_Toc4".into()),
                     ..SourceMarker::default()
                 },
             ],
@@ -992,6 +1006,36 @@ mod tests {
         assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
         let old: Decoded<SpanStyle> = decode(&plain).unwrap();
         assert_eq!(old.payload.font_size_cs, None);
+    }
+
+    /// Issue #345 — a protected document's restriction survives crash
+    /// recovery byte-stably; an unprotected one encodes exactly as before
+    /// the field existed (no `protection` key).
+    #[test]
+    fn document_protection_round_trips_and_stays_absent_when_unset() {
+        let has_key = |bytes: &[u8], key: &[u8]| bytes.windows(key.len()).any(|w| w == key);
+        let plain = DocumentTree::from_text("x");
+        let plain_bytes = encode(&plain).unwrap();
+        assert!(!has_key(&plain_bytes, b"protection"));
+        let mut protected = plain.clone();
+        protected.settings.protection = Some(crate::DocumentProtection {
+            edit: Some(crate::ProtectionEdit::Forms),
+            enforcement: true,
+            hash: Some("aGFzaA==".into()),
+            salt: Some("c2FsdA==".into()),
+            spin_count: Some(100_000),
+            algorithm: Some("SHA-512".into()),
+        });
+        let bytes = encode(&protected).unwrap();
+        let back: Decoded<DocumentTree> = decode(&bytes).unwrap();
+        assert_eq!(back.payload.settings, protected.settings);
+        assert_eq!(
+            back.payload.protection_mode(),
+            Some(crate::ProtectionEdit::Forms)
+        );
+        assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
+        let old: Decoded<DocumentTree> = decode(&plain_bytes).unwrap();
+        assert_eq!(old.payload.settings.protection, None);
     }
 
     /// Issue #79 — the `<w:bidiVisual>` flag survives crash recovery.

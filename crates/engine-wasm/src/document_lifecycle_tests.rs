@@ -173,6 +173,7 @@ fn open(e: &mut Engine, bytes: &[u8], format: DocFormat, name: &str) -> Event {
             name: Some(name.into()),
             defaults: None,
             limits: None,
+            password: None,
         },
     )
 }
@@ -295,6 +296,7 @@ fn open_html_keeps_tables_and_directions() {
                 widow_control: None,
             }),
             limits: None,
+            password: None,
         },
     );
     assert!(matches!(loaded, Event::DocumentLoaded { .. }), "{loaded:?}");
@@ -357,6 +359,7 @@ fn open_text_honours_the_host_package_limits() {
                     max_part_bytes: Some(4),
                     ..Default::default()
                 }),
+                password: None,
             },
         );
         let Event::Error { message, kind } = evt else {
@@ -377,6 +380,7 @@ fn open_text_honours_the_host_package_limits() {
                 max_part_bytes: Some(4),
                 ..Default::default()
             }),
+            password: None,
         },
     );
     assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");

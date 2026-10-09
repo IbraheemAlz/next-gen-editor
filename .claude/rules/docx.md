@@ -258,6 +258,29 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   other than `w:val` (`schema::source_markup::adopt_source_children`) —
   `<w:u w:color>` survives a bold toggle, a changed font never inherits a
   stale `w:asciiTheme`.
+- **Per-child `<w:pPr>` reuse (issue #419).** A recorded pPr that is not
+  current as a whole is SPLICED, not regenerated (`writer::ppr_splice`):
+  the children `ppr_children` writes for the recorded state
+  (`SourcePPr::props` / `style_id` / `list_item` / mark revisions, the
+  same read-only clearing as the live side) and for the live one are
+  compared by element name — an equal pair keeps the source bytes (or
+  the source's ABSENCE: a value only the cascade supplies is never baked
+  into direct formatting); a changed child is re-emitted from the live
+  model, an empty one keeping the source twin's unowned attributes
+  (`w:theme*` dropped; `<w:spacing>` keeps `*Lines` / `*Autospacing`
+  only beside an unchanged before / after; `<w:ind>` keeps the `w:left`
+  spelling and an unchanged `*Chars`); `<w:pBdr>` splices edge by edge,
+  `<w:tabs>` stop by stop (keyed by `w:pos`); a removed child goes, a new
+  one is inserted at its rank; whitespace stays with the child it
+  precedes. A section-mark paragraph's pPr is recorded too (never
+  replayed whole: `source_ppr_is_current` refuses bytes holding a
+  `<w:sectPr>`), the `<w:sectPr>` child always the live one — a split's
+  left half drops it. Modeled for this: `BorderStroke::space_pt` /
+  `shadow` / `frame` (`w:space` / `w:shadow` / `w:frame`, every border),
+  `ParaProperties::shading_pattern` (`<w:shd w:val w:color>` beside the
+  fill; clearing the shading clears it). Harness: `tools/roundtrip` step
+  57 (`ppr_attributes.docx`); `tools/corpus-native`'s `ppr_check` (an
+  indent change on the first pPr paragraph respells only `<w:ind>`).
 - Positioned verbatim markers (`<w:proofErr/>`, non-TOC bookmarks,
   permission / move ranges, an empty `<w:fldSimple/>`, text-less runs with
   only unmodeled content, pretty-print whitespace) re-emit at their
@@ -366,6 +389,13 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   any one that removes the mark merges; a single Accept/Reject decides
   the addressed one (by range: the first) — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
+  Issue #367 — a removed mark carrying a SECTION BREAK merges too
+  (`merge_paragraph_with_next`), by Word's rule (the #70 `delete_range`
+  one): the text joins the FOLLOWING section and takes its properties
+  (`concat` keeps the tail's `section_end`), and the dropped section's
+  header / footer refs backfill the surviving terminal's EMPTY slots
+  (owned slots win) — so an own inserted break is removed, not marked.
+  Harness: `tools/roundtrip` step 54 (`section_break_revision.docx`).
   Issue #305 — the single `AcceptRevision` / `RejectRevision` is the
   SAME resolver (`DocumentTree::resolve_revisions` with a
   `RevisionPick::Only`, addressed by `engine::RevisionRef`); text leaves
@@ -409,16 +439,40 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   straddling change is cut once, `tracked::split_revisions`; the right
   piece drops its source id, and `concat` re-joins the two pieces). A
   tracked deletion (`try_tracked_delete_range`; `tracked_delete_range`
-  wraps it) works over any range inside ONE container: per paragraph the
-  reviewer's own pending insertions are removed outright (the #265 path,
-  `revisions::remove_text`), already-deleted bytes are left alone, the
-  rest is marked `Delete`; every swallowed mark is marked `Delete` — or,
-  when it is the reviewer's own inserted mark, removed (the paragraphs
-  merge through `merge_paragraph_with_next`). A range across a cell
-  boundary or over a table is refused (`TrackedEditError`, answered as
-  `Event::Error` — never a silent no-op). Tracked Backspace leaves the
-  caret at the START of what it marked (Word: it steps over struck
-  text).
+  wraps it) works over any range between two paragraphs: per paragraph
+  the reviewer's own pending insertions are removed outright (the #265
+  path, `revisions::remove_text`), already-deleted bytes are left alone,
+  the rest is marked `Delete`; every swallowed mark (one whose merge
+  partner on accept — the next paragraph, past any table the range
+  deletes whole — is in the range) is marked `Delete` — or, when it is
+  the reviewer's own inserted mark, removed (the paragraphs merge through
+  `merge_paragraph_with_next`). Issue #365 — tables, Word's way: a range
+  crossing a row boundary or entering a table from outside deletes every
+  row it touches WHOLE (`RowProperties::revisions` += `Delete` — the
+  `<w:trPr><w:del/>` — plus the cells' contents as text; a nested
+  table's rows marked too; the reviewer's own inserted row removed
+  outright), a range across cells of ONE row deletes each cell's
+  sub-range. Only an end that addresses no paragraph is refused
+  (`TrackedEditError::NoParagraph`, answered as `Event::Error` — never a
+  silent no-op). Tracked Backspace leaves the caret at the START of what
+  it marked (Word: it steps over struck text). Issue #366 — a paste with
+  review mode on (`tracked_insert_multiline` / `tracked_insert_rich_blocks`)
+  records its text as `Insert`s and every mark it creates as inserted
+  (a pasted table's rows as inserted rows); replacing a selection marks
+  it deleted first. An IME commit goes through the tracked typing path.
+- **Table-row revisions (issue #365).** `<w:trPr><w:ins/>` / `<w:del/>`
+  (both, in source order) read into `RowProperties::revisions` (modeled
+  `CT_TrPr` children — no longer bagged), so the verified `<w:trPr>`
+  passthrough covers them; a regenerated `<w:trPr>` emits them at their
+  rank (before `<w:trPrChange>`) with #295 id tokens. The resolver
+  (`resolve_revisions`) resolves rows in the mark walk, after a table's
+  cells and before the paragraph in front of it: an accepted deletion /
+  rejected insertion removes the row (`remove_table_rows`, comment anchors
+  via `remap_table_cells`; a table left without rows goes via
+  `remap_block_splice`). `revision_entries` lists row changes of
+  top-level tables as `RevisionSlot::Row { row, index }` (path = the
+  table), `revisions_snapshot` rows carry `row`. `<w:tblPrChange>` /
+  `<w:trPrChange>` stay verbatim grab-bag bytes (not resolved).
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`
@@ -474,6 +528,70 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   self-closing paragraph rewrites its `/`) and `t preserve` (a bare
   `<w:t>` gaining `xml:space="preserve"` — two insertions the
   single-region metric reports as one rewritten `>`).
+- **The regenerator is measured on its own (issue #384).**
+  `format_docx::writer::regen_check` runs one ordinary `write_docx` with a
+  probe on: every clean paragraph (body and cells, any depth) is also
+  regenerated in the exact write context and compared with its source
+  bytes; `tools/corpus-native --regen-check` histograms the mismatches by
+  class (`proofErr-order` / `whitespace` / `instrText-space` / `smartTag` /
+  `mixed` / `other`, the same shapes `classify_rewrite` now tags). The
+  classes it found are fixed by construction:
+  - **Marker slots.** Every unpaired marker records where it sat among
+    the wrapper boundaries at its offset (`SourceMarker::closes_after` /
+    `opens_before`, counted by `MarkupCapture` from `wrapper_open` /
+    `wrapper_close` / the field `separate` / `end` — a run holding a field
+    character is a boundary, any other run ends the stretch). The writer
+    builds the ends (field, revision, hyperlink, span tails) and starts
+    (span heads, hyperlink, revision, field) at an offset as pieces and
+    interleaves the markers by slot (`emit_boundaries`), clamped to what
+    is there — a `<w:proofErr/>` before `</w:hyperlink>` stays inside the
+    link, an edit that moved a marker can never make it cross a wrapper.
+    Content-control openers / closers always sit between.
+  - `_Toc*` bookmarks keep their source position as *verified* markers
+    (`SourceMarker::toc_bookmark`): replayed while the paragraph still owns
+    the bookmark (then it does not wrap the content there), dropped
+    otherwise (a split's right half).
+  - A TOC's Head / Tail carry `Field::source` too (the verbatim prologue —
+    untrimmed instruction, run properties, whitespace — and the end run);
+    `emit_span_event` writes them while the instruction is unchanged.
+  - In-paragraph `<w:smartTag>` / `<w:customXml>` are opener / closer
+    pairs like a run-level `<w:sdt>` (#272); `<w:delInstrText>` is read as
+    the instruction of a field inside a deletion (a source prologue is
+    reused where its `del`-ness matches); `RunPad::inner` / the lead keep
+    whitespace between a run's children; an empty `<w:pict/>` run is kept
+    verbatim; a source paragraph with no text mints no empty run and stays
+    self-closing when nothing is inside.
+  Harness: `tools/roundtrip` step 56 (`regen_classes.docx`).
+
+## `styles.xml` is patched, not regenerated (issue #371)
+
+`ModifyStyle` (`styles_dirty`) no longer rebuilds the part from the
+engine's paragraph-style table (which dropped every character / table /
+numbering style, `<w:latentStyles>`, unmodeled `<w:docDefaults>` children
+and the unmodeled children of the styles it kept). With a source part
+(`write_docx`, the UI save path through `source_package` included),
+`writer::styles_patch` copies it and re-writes only:
+
+- a paragraph style whose model (`<w:name>`, `basedOn`, `next`, pPr, rPr)
+  no longer equals what its source `<w:style>` element produced (the
+  part re-parsed — no recorded model needed): spliced child by child
+  (`ppr_splice::splice_style` — `<w:pPr>` through the #419 pPr splice, the
+  `<w:rPr>` through `splice_rpr`: unchanged children keep their bytes,
+  unmodeled ones such as `<w:kern>` / `<w:lang>` / `<w:link>` /
+  `<w:uiPriority>` / `<w:rsid>` stay, a changed child adopts its source
+  twin by meaning);
+- `<w:docDefaults>`, only when the defaults changed (regenerated whole);
+- a style the source does not have, appended before `</w:styles>`.
+
+Only the LAST source element of an id is compared (the parsed table's).
+`build_styles_xml` remains the path for a package without `styles.xml`
+(`build_minimal_docx`, an engine-authored tree). Character / table /
+numbering styles are not mirrored into the engine model: the part's own
+bytes are the source of truth, and format-docx's `StyleTable` already
+models their id / name / type / `basedOn` for the read-time cascade.
+Harness: `tools/roundtrip` step 58 (`styles_patch.docx`);
+`tools/corpus-native`'s `style_check` (bold toggled on `Heading1` or the
+first paragraph style: only that element of `styles.xml` may change).
 
 ## Table source markup (issue #248)
 

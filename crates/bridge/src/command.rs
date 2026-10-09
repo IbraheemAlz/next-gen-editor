@@ -207,6 +207,17 @@ pub enum Command {
         #[serde(default)]
         #[tsify(optional)]
         limits: Option<PackageLimitsOverride>,
+        /// Issue #345 — the password of an encrypted (MS-OFFCRYPTO agile or
+        /// standard) `.docx`. Without one an encrypted package answers
+        /// `Event::Error { kind: EncryptedDocument }`; a wrong one `kind:
+        /// WrongPassword`. Ignored for a plain package and the text
+        /// formats. Additive (`None` = the pre-#345 shape) and NEVER
+        /// journaled: the worker strips it before the command reaches the
+        /// event log. Opening decrypts in memory only — a later save writes
+        /// an unencrypted package.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        password: Option<String>,
     },
     SaveDocument {
         format: DocFormat,
@@ -1548,6 +1559,7 @@ mod tests {
                 name: None,
                 defaults: None,
                 limits: None,
+                password: None,
             } if bytes == vec![1, 2, 3]
         ));
 

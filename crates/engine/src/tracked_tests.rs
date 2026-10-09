@@ -466,41 +466,25 @@ fn comments_follow_their_text_through_the_tracked_delete() {
     assert_eq!(covered(&rejected), "tail");
 }
 
-/// No silent no-op: a range over a table or across a cell boundary is
-/// refused with a typed error; the wrapper leaves the tree unchanged.
+/// No silent no-op: an end that addresses no paragraph (here: the table
+/// block itself) is refused with a typed error; the wrapper leaves the
+/// tree unchanged. (Since issue #365 a range over a table or across cells
+/// is recorded — `tracked_table_tests`.)
 #[test]
-fn a_range_over_a_table_or_across_a_cell_is_refused() {
+fn an_end_that_addresses_no_paragraph_is_refused() {
     let d = DocumentTree::from_paragraphs(["before".to_string(), "after".to_string()])
         .insert_table(BlockPath::top(1), 1, 1);
-    let kinds: Vec<bool> = d
+    let table = d
         .blocks
         .iter()
-        .map(|b| matches!(b, Block::Table(_)))
-        .collect();
-    let table = kinds.iter().position(|&t| t).expect("table") as u32;
-    let after = (table + 1..d.blocks.len() as u32)
-        .find(|&i| d.blocks[i as usize].as_paragraph().is_some())
-        .expect("a paragraph after the table");
+        .position(|b| matches!(b, Block::Table(_)))
+        .expect("table") as u32;
     assert_eq!(
-        d.try_tracked_delete_range(pos(0, 2), pos(after, 2), ME, DATE)
+        d.try_tracked_delete_range(pos(0, 2), pos(table, 0), ME, DATE)
             .err(),
-        Some(crate::TrackedEditError::SpansTable)
+        Some(crate::TrackedEditError::NoParagraph)
     );
-    let cell = LogicalPos::new(
-        BlockPath {
-            steps: vec![
-                PathStep::Block(table),
-                PathStep::Cell { row: 0, col: 0 },
-                PathStep::Block(0),
-            ],
-        },
-        0,
-    );
-    assert_eq!(
-        d.try_tracked_delete_range(pos(0, 2), cell, ME, DATE).err(),
-        Some(crate::TrackedEditError::CrossContainer)
-    );
-    let unchanged = d.tracked_delete_range(pos(0, 2), pos(after, 2), ME.into(), DATE.into());
+    let unchanged = d.tracked_delete_range(pos(0, 2), pos(table, 0), ME.into(), DATE.into());
     assert!(!unchanged.has_revisions());
 }
 

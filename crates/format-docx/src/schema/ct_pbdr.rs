@@ -48,6 +48,8 @@ pub(crate) fn parse_pbdr_stroke(e: &BytesStart) -> Option<BorderStroke> {
         style,
         size_eighth_pt,
         color,
+        /* Issue #419 — `w:space` / `w:shadow` / `w:frame`. */
+        ..crate::schema::source_markup::border_extras(e)
     })
 }
 

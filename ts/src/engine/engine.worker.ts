@@ -9,6 +9,7 @@ import type {
 import { commandMeta } from '@nge/core/command-meta';
 import {
     openEventLog,
+    setActiveLogDb,
     appendCommand,
     persistSnapshot,
     writeCleanMarker,
@@ -18,6 +19,7 @@ import {
 } from './event-log';
 import { nextCleanState } from './clean-state';
 import { nextRetry } from './retry-schedule';
+import { journalSafe } from './journal-safe';
 import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
@@ -56,6 +58,8 @@ type ClientInitMsg = {
     type: 'INIT';
     canvas: OffscreenCanvas;
     documentId: string;
+    /** Issue #426 - the event-log database this tab owns (`tab-session.ts`). */
+    logDb?: string;
     /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
     mockBackend?: 'vello';
     /** Issue #240 — a crash loop on the GPU backend persisted across
@@ -66,6 +70,8 @@ type ClientRecoverMsg = {
     id: number;
     type: 'RECOVER';
     canvas: OffscreenCanvas;
+    /** Issue #426 - the event-log database this tab owns. */
+    logDb?: string;
     /** Issue #241 — bases to try, newest snapshot first, ending with the
      *  snapshot-less log base (see `event-log.ts` `loadRecoveryLog`). */
     candidates: RecoveryCandidate[];
@@ -1063,6 +1069,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         const renderer = probe.renderer;
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
+        if (msg.logDb) setActiveLogDb(msg.logDb);
         await openEventLog(msg.documentId);
         cleanState = true;
         committedPackageHash = undefined;
@@ -1105,6 +1112,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                 import.meta.url,
             ),
         });
+        if (msg.logDb) setActiveLogDb(msg.logDb);
         /* Issue #66 — re-probe the backend exactly as INIT does. The fresh
            canvas has taken no context yet, so Vello is available again
            whenever the GPU is. The engine reports what it ACTUALLY paints
@@ -1573,7 +1581,11 @@ function noteCleanState(cmd: Command, evt: Event): void {
  * `logSequence` increments synchronously so sequence order is preserved even
  * though the IndexedDB writes settle asynchronously. Returns the row's seq.
  */
-function logCommand(cmd: Command): number {
+function logCommand(command: Command): number {
+    /* Issue #345 — an encrypted document's password never reaches the
+       durable log (a replay without it answers EncryptedDocument; the
+       snapshot pinned after the open restores the document instead). */
+    const cmd = journalSafe(command);
     const seq = ++logSequence;
     const write = appendCommand(seq, cmd).then(
         () => noteJournalWriteOk(),

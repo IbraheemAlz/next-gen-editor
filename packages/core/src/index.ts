@@ -41,7 +41,11 @@ export {
 export type { EditorCommands, ParagraphStyleId, SlotFormatPatch } from './createEditorCommands';
 
 export { createEditorState } from './createEditorState';
-export type { EditorState, CheckpointHealth, EditorError } from './createEditorState';
+export type {
+    EditorState,
+    CheckpointHealth,
+    EditorError,
+} from './createEditorState';
 
 export { createFontRegistry } from './createFontRegistry';
 export type {
@@ -82,7 +86,12 @@ export {
 /* Issue #342 — per-command metadata generated from `bridge::meta` (also
  * importable on its own as `@nge/core/command-meta`, which the worker and
  * `EngineClient` use so they never pull Solid into the worker bundle). */
-export { COMMAND_META, commandMeta } from './commandMeta.generated';
+export {
+    COMMAND_META,
+    commandMeta,
+    PROTECTION_ADMITS,
+    protectionAdmits,
+} from './commandMeta.generated';
 export { COMMAND_FACADE, FACADE_METHOD_COMMANDS } from './facadeMap';
 export type {
     FacadeTarget,
@@ -94,6 +103,7 @@ export type {
     CommandMeta,
     CommandStatus,
     CommandType,
+    ProtectionClass,
     StoryPolicy,
     StubCommandType,
     PartialCommandType,
@@ -112,6 +122,7 @@ export type {
     ErrorKind,
     ReadWarning,
     ReadWarningKind,
+    ProtectionMode,
     PackageLimitsOverride,
     TextAttrsPatch,
     UnderlineStyle,

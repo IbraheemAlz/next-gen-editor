@@ -20,11 +20,14 @@ import type {
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { commandMeta } from '@nge/core/command-meta';
 import {
-    archiveActiveLog,
+    PRIMARY_DB,
+    archiveLog,
     clearRendererStreak,
     discardArchive,
     inspectActiveLog,
-    loadArchiveInfo,
+    listArchive,
+    markArchiveSeen,
+    setActiveLogDb,
     loadCleanMarker,
     loadRendererStreak,
     loadRecoveryLog,
@@ -35,6 +38,8 @@ import {
     type RendererStreak,
 } from './event-log';
 import { nextCleanState } from './clean-state';
+import { claimTabSession } from './tab-session';
+import { devHooksEnabled } from '../dev-hooks';
 
 type WorkerReply = {
     ok: boolean;
@@ -116,6 +121,9 @@ export interface RevisionSnapshot {
     /** Issue #262 — a paragraph-MARK revision (a tracked paragraph split
      *  or merge), addressed by the empty range at the paragraph end. */
     mark?: boolean;
+    /** Issue #365 — a tracked table-ROW insertion / deletion: the row's
+     *  index in the top-level table at `block` (`start == end == 0`). */
+    row?: number;
     /** Issue #304 — the revision's stable id (`ACCEPT_REVISION` /
      *  `REJECT_REVISION` `revision_id`): unique per row, unchanged by
      *  edits elsewhere. */
@@ -225,6 +233,10 @@ const CARRY_OVER_MAX_AGE_MS = 2 * 60 * 1000;
 /** Issue #330 — how long a planned retirement may take before the
  *  worker is declared unresponsive and terminated anyway. */
 const RETIRE_TIMEOUT_MS = 3000;
+/** Issue #428 - how long a prepared carry-over reload may take to start
+ *  (`pagehide`) before the page is declared still alive and the unload
+ *  guard re-armed. */
+const CARRY_OVER_WATCH_MS = 20_000;
 
 function writeCarryOver(documentId: string): void {
     try {
@@ -399,8 +411,12 @@ export class EngineClient {
      *  document is not at risk, so the unload guard stays quiet. */
     private carryOverPrepared = false;
     /** Issue #388 - the previous session waiting for a decision. */
-    private previous: PreviousSession | undefined;
+    private previous: PreviousSession[] = [];
     private previousListeners = new Set<(p: PreviousSession | undefined) => void>();
+    private previousListListeners = new Set<(p: PreviousSession[]) => void>();
+    /** Issue #426 - the event-log database this tab owns
+     *  (`tab-session.ts`); sent to every worker generation. */
+    private logDb: string = PRIMARY_DB;
     /** Issue #330 — set from the moment the shell is asked to remount a
      *  canvas and call `recover()` until that recovery settles. Lets
      *  "Reload engine" join a recovery already under way instead of
@@ -414,13 +430,23 @@ export class EngineClient {
     private stableTimer: ReturnType<typeof setTimeout> | undefined;
     /** Worker generations spawned so far (1 = the boot worker). */
     private generations = 0;
-    /** Issue #99 — DEV-only `?mockBackend=vello` test hook, forwarded to
-     *  the worker (which also ignores it outside DEV). */
+    /** Issue #99 — `?mockBackend=vello` test hook, forwarded to the worker
+     *  (which also ignores it outside DEV). Issue #428 - read only under
+     *  `devHooksEnabled()` like every other debug URL parameter, so a
+     *  production page never lets the URL steer the renderer probe. */
     private readonly mockBackend: 'vello' | undefined =
-        import.meta.env.DEV &&
+        devHooksEnabled() &&
         new URLSearchParams(globalThis.location?.search ?? '').get('mockBackend') === 'vello'
             ? 'vello'
             : undefined;
+    /** Issue #428 - a renderer the USER chose in Settings
+     *  (`setRenderer('canvas2d')`): every later generation of this session
+     *  boots without a GPU probe, exactly like a crash-loop downgrade but
+     *  without the downgrade record (nothing failed). */
+    private userRenderer: 'canvas2d' | undefined;
+    /** Issue #428 - tears down the pending-reload watch of
+     *  `prepareCarryOver`. */
+    private cancelCarryOverWatch: (() => void) | undefined;
 
     /**
      * @param documentId identifies the IndexedDB event log for this document.
@@ -500,6 +526,15 @@ export class EngineClient {
     }
 
     async init(canvas: OffscreenCanvas): Promise<void> {
+        /* Issue #426 - which event-log database is this tab's? Taken
+           before anything reads or clears a log. Storage trouble falls
+           back to the primary (the pre-#426 behaviour). */
+        const session = await claimTabSession().catch((e: unknown) => {
+            console.warn('[event-log] tab session not claimed; using the shared log', e);
+            return undefined;
+        });
+        this.logDb = session?.db ?? PRIMARY_DB;
+        setActiveLogDb(this.logDb);
         /* Issue #240 — honour a crash loop that spanned reloads / tab
            deaths: resume its count, and once it reached the limit boot on
            Canvas2D without probing the GPU. An unreadable log is no
@@ -534,6 +569,7 @@ export class EngineClient {
             ) {
                 /* Issue #388 - the carried log keeps its own marker. */
                 this.clean = (await loadCleanMarker().catch(() => undefined)) !== false;
+                this.setPrevious(await listArchive().catch(() => []));
                 this.worker.terminate();
                 this.pendingCause = 'page-reload';
                 await this.recover(canvas);
@@ -549,6 +585,7 @@ export class EngineClient {
                 type: 'INIT',
                 canvas,
                 documentId: this.documentId,
+                logDb: this.logDb,
                 ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
                 ...(this.downgrade ? { forceRenderer: 'canvas2d' } : {}),
             },
@@ -563,27 +600,37 @@ export class EngineClient {
     }
 
     /** Issue #388 - copy the previous generation's log into the archive
-     *  when it holds unsaved edits (clean marker `false`), then publish
-     *  whatever the archive holds (it may predate this boot: an undecided
-     *  session survives further reloads). A storage failure must not
-     *  block the boot - it degrades to the pre-#388 behaviour. */
+     *  ring when it holds unsaved edits (clean marker `false`), then
+     *  publish whatever the ring holds (it may predate this boot: an
+     *  undecided session survives further reloads). Issue #426 - the log
+     *  here is THIS tab's own (its previous page generation, or a primary
+     *  whose owning tab is gone): a live tab's log is never touched. A
+     *  storage failure must not block the boot - it degrades to the
+     *  pre-#388 behaviour. */
     private async stashPreviousSession(): Promise<void> {
         try {
             const status = await inspectActiveLog();
-            if (status.clean === false && status.hasContent) await archiveActiveLog();
-            this.setPrevious(await loadArchiveInfo());
+            if (status.clean === false && status.hasContent) await archiveLog();
+            this.setPrevious(await listArchive());
         } catch (e: unknown) {
             console.warn('[recovery] previous session could not be set aside', e);
         }
     }
 
-    private setPrevious(next: PreviousSession | undefined): void {
+    private setPrevious(next: PreviousSession[]): void {
         this.previous = next;
-        for (const fn of this.previousListeners) fn(next);
+        for (const fn of this.previousListeners) fn(next[0]);
+        for (const fn of this.previousListListeners) fn(next);
     }
 
-    /** Issue #388 - the previous session awaiting Recover / Discard. */
+    /** Issue #388 - the newest previous session awaiting Recover / Discard. */
     get previousSession(): PreviousSession | undefined {
+        return this.previous[0];
+    }
+
+    /** Issue #426 - every previous session awaiting a decision (the
+     *  archive ring, newest first). */
+    get previousSessions(): PreviousSession[] {
         return this.previous;
     }
 
@@ -595,6 +642,14 @@ export class EngineClient {
         };
     }
 
+    /** Issue #426 - observe `previousSessions` changes. */
+    onPreviousSessions(fn: (p: PreviousSession[]) => void): () => void {
+        this.previousListListeners.add(fn);
+        return () => {
+            this.previousListListeners.delete(fn);
+        };
+    }
+
     /** Issue #388 - whether closing the page now would lose edits: the
      *  document differs from the last save and no carry-over is prepared. */
     get hasUnsavedChanges(): boolean {
@@ -603,14 +658,17 @@ export class EngineClient {
 
     /**
      * Issue #388 - the banner's "Recover": replace the live (fresh)
-     * session with the archived one. The live worker is retired (its
-     * log head flushed), the archive becomes the active event log in one
-     * transaction, and the engine respawns through the normal recovery
-     * path (`cause = 'session-restore'`). Resolves once the recovery
-     * settles. A failed restore leaves the archive in place.
+     * session with an archived one (issue #426: `id` picks the ring
+     * entry; default the newest). The live worker is retired (its
+     * log head flushed), the entry becomes this tab's active event log,
+     * and the engine respawns through the normal recovery path
+     * (`cause = 'session-restore'`). Resolves once the recovery
+     * settles. A failed restore leaves the archive in place; the other
+     * ring entries stay offered.
      */
-    async recoverPreviousSession(): Promise<void> {
-        if (!this.previous) return;
+    async recoverPreviousSession(id?: string): Promise<void> {
+        const target = id === undefined ? this.previous[0] : this.previous.find((p) => p.id === id);
+        if (!target) return;
         if (this.recoveryPending) return this.recoveryPending.promise;
         if (this.recovering || this.retiring) return;
         this.retiring = true;
@@ -622,7 +680,7 @@ export class EngineClient {
             this.retiring = false;
         }
         if (this.generations !== generation || retired.trap || this.recovering) return;
-        const restored = await restoreArchive().catch((e: unknown) => {
+        const restored = await restoreArchive(target.id).catch((e: unknown) => {
             console.error('[recovery] the previous session could not be restored', e);
             return false;
         });
@@ -633,7 +691,7 @@ export class EngineClient {
             this.respawnAfterRetire('engine-reload');
             return back;
         }
-        this.setPrevious(undefined);
+        this.setPrevious(await listArchive().catch(() => []));
         this.clean = false;
         this.markRecoveryPending();
         const done = this.recoveryPending!.promise;
@@ -641,10 +699,23 @@ export class EngineClient {
         return done;
     }
 
-    /** Issue #388 - the banner's "Discard": drop the archived session. */
-    async discardPreviousSession(): Promise<void> {
-        await discardArchive();
-        this.setPrevious(undefined);
+    /** Issue #388 - the banner's "Discard": drop an archived session
+     *  (issue #426: `id` picks the ring entry; default the newest). */
+    async discardPreviousSession(id?: string): Promise<void> {
+        const target = id ?? this.previous[0]?.id;
+        if (target === undefined) return;
+        await discardArchive(target);
+        this.setPrevious(await listArchive().catch(() => []));
+    }
+
+    /** Issue #426 - the banner's "Dismiss": record that the offered
+     *  sessions were seen and left undecided. They stay in the ring and are
+     *  offered again at the next boot, but a full ring evicts them first. */
+    async dismissPreviousSessions(): Promise<void> {
+        const ids = this.previous.filter((p) => p.decision !== 'seen').map((p) => p.id);
+        if (ids.length === 0) return;
+        await markArchiveSeen(ids);
+        this.previous = this.previous.map((p) => ({ ...p, decision: 'seen' as const }));
     }
 
     /** Issue #240 — whether the current worker generation probed the GPU
@@ -681,33 +752,61 @@ export class EngineClient {
      * counts it from zero.
      */
     async retryGpuRenderer(): Promise<void> {
-        if (this.recovering || this.retiring) return;
+        await this.switchRendererInPlace(undefined);
+    }
+
+    /**
+     * Issue #428 - the Settings menu's renderer switch, on the same
+     * in-place retire-respawn path as {@link retryGpuRenderer} (#270): the
+     * document, selection, undo window and zoom survive, nothing reloads.
+     * `'vello'` lifts any downgrade and probes the GPU again (an adapter-
+     * less machine lands on Canvas2D, reported by `renderer`); `'canvas2d'`
+     * pins the rest of the session to Canvas2D without probing. A no-op
+     * while a recovery / retirement is already running. Session-scoped:
+     * a page reload starts from the boot policy again.
+     */
+    async setRenderer(kind: 'vello' | 'canvas2d'): Promise<void> {
+        const done = await this.switchRendererInPlace(kind === 'canvas2d' ? 'canvas2d' : undefined);
+        /* Resolve once the new generation is up, so `renderer` is current. */
+        await done;
+    }
+
+    /** Resolves to the recovery's settle promise (when one was started). */
+    private async switchRendererInPlace(
+        pin: 'canvas2d' | undefined,
+    ): Promise<Promise<void> | undefined> {
+        if (this.recovering || this.retiring) return undefined;
         this.retiring = true;
         const generation = this.generations;
         let retired: WorkerReply;
         try {
-            await clearRendererStreak().catch((e: unknown) =>
-                console.warn('[recovery] renderer streak not cleared', e),
-            );
-            if (this.stableTimer !== undefined) {
-                clearTimeout(this.stableTimer);
-                this.stableTimer = undefined;
+            this.userRenderer = pin;
+            if (pin === undefined) {
+                await clearRendererStreak().catch((e: unknown) =>
+                    console.warn('[recovery] renderer streak not cleared', e),
+                );
+                if (this.stableTimer !== undefined) {
+                    clearTimeout(this.stableTimer);
+                    this.stableTimer = undefined;
+                }
+                this.velloTrapStreak = 0;
+                this.streakLive = false;
+                this.setDowngrade(undefined);
             }
-            this.velloTrapStreak = 0;
-            this.streakLive = false;
-            this.setDowngrade(undefined);
             retired = await this.send({ type: 'RETIRE' });
         } finally {
             this.retiring = false;
         }
         /* A trap while retiring already runs the ordinary recovery (with
            the downgrade lifted, it re-probes too): nothing left to do. */
-        if (this.recovering || this.generations !== generation || retired.trap) return;
+        if (this.recovering || this.generations !== generation || retired.trap) return undefined;
         if (!retired.ok) {
-            console.warn('[recovery] renderer retry: the worker did not retire cleanly', retired.error);
+            console.warn('[recovery] renderer switch: the worker did not retire cleanly', retired.error);
         }
         this.markRecoveryPending();
+        const done = this.recoveryPending!.promise;
         this.respawnAfterRetire('renderer-retry');
+        return done;
     }
 
     private markRecoveryPending(): void {
@@ -799,6 +898,57 @@ export class EngineClient {
         }
         writeCarryOver(this.documentId);
         this.carryOverPrepared = true;
+        this.watchCarryOver();
+    }
+
+    /**
+     * Issue #428 - `carryOverPrepared` mutes the unload guard because the
+     * reload that follows `prepareCarryOver()` carries the document. If
+     * that reload never happens (the caller threw, the navigation was
+     * blocked or cancelled) the page is still alive: the flag would keep
+     * the guard disabled for good. The page coming back to `visible` (or
+     * restoring from the bfcache) without a `pagehide` in between - or
+     * `CARRY_OVER_WATCH_MS` passing with the page still up - means no
+     * reload is under way: drop the flag and the one-shot token, which
+     * re-arms the guard (it reads `hasUnsavedChanges` live).
+     */
+    private watchCarryOver(): void {
+        this.cancelCarryOverWatch?.();
+        const g = globalThis;
+        if (typeof g.addEventListener !== 'function') return;
+        let left = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const stop = (): void => {
+            g.removeEventListener('pagehide', onHide);
+            g.removeEventListener('pageshow', onShow);
+            g.document?.removeEventListener('visibilitychange', onVisible);
+            if (timer !== undefined) clearTimeout(timer);
+            if (this.cancelCarryOverWatch === stop) this.cancelCarryOverWatch = undefined;
+        };
+        const abandon = (): void => {
+            stop();
+            this.carryOverPrepared = false;
+            try {
+                g.sessionStorage?.removeItem(CARRY_OVER_KEY);
+            } catch {
+                /* storage blocked: nothing to clear */
+            }
+            console.warn('[recovery] the prepared page reload did not happen; unload guard re-armed');
+        };
+        const onHide = (): void => {
+            left = true;
+        };
+        const onShow = (): void => abandon();
+        const onVisible = (): void => {
+            if (g.document?.visibilityState === 'visible' && !left) abandon();
+        };
+        g.addEventListener('pagehide', onHide);
+        g.addEventListener('pageshow', onShow);
+        g.document?.addEventListener('visibilitychange', onVisible);
+        timer = setTimeout(() => {
+            if (!left) abandon();
+        }, CARRY_OVER_WATCH_MS);
+        this.cancelCarryOverWatch = stop;
     }
 
     /** Issue #333 — current checkpoint health (`failing` once the retries
@@ -989,6 +1139,7 @@ export class EngineClient {
             {
                 type: 'RECOVER',
                 canvas,
+                logDb: this.logDb,
                 candidates: recoveryLog.candidates,
                 commands: recoveryLog.commands,
                 lastSeq: recoveryLog.lastSeq,
@@ -997,7 +1148,9 @@ export class EngineClient {
                 ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
                 ...(this.downgrade
                     ? { forceRenderer: 'canvas2d', rendererDowngrade: this.downgrade }
-                    : {}),
+                    : this.userRenderer
+                      ? { forceRenderer: 'canvas2d' }
+                      : {}),
             },
             [
                 canvas,
@@ -1018,7 +1171,7 @@ export class EngineClient {
         this.activeRenderer = r.renderer ?? 'canvas2d';
         if (r.crossOriginIsolated !== undefined) this.workerIsolated = r.crossOriginIsolated;
         /* Issue #270 — this generation probed unless it was forced. */
-        this.bootProbed = this.downgrade === undefined;
+        this.bootProbed = this.downgrade === undefined && this.userRenderer === undefined;
         const recovered = r.evt?.type === 'RECOVERED' ? r.evt : undefined;
         const deviceScale = recovered?.device_scale;
         this.lastRecoveryInfo = {

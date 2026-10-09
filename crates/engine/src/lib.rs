@@ -72,8 +72,14 @@ mod paragraph_merge_tests;
 #[cfg(test)]
 mod revision_tests;
 mod revisions;
+#[cfg(test)]
+mod section_mark_tests;
 mod text_remap;
 mod tracked;
+#[cfg(test)]
+mod tracked_paste_tests;
+#[cfg(test)]
+mod tracked_table_tests;
 #[cfg(test)]
 mod tracked_tests;
 pub use text_remap::TextEdit;
@@ -82,6 +88,8 @@ pub use tracked::{TrackedDeletion, TrackedEditError};
 pub mod html;
 pub mod numbering;
 pub mod package;
+/// Issue #345 — `w:documentProtection` model + form-region predicates.
+pub mod protection;
 pub mod snapshot;
 pub mod theme;
 
@@ -91,6 +99,7 @@ pub use fields::{
     TypedField, render_date_time_picture,
 };
 pub use package::{MediaRef, PackageEntry, SourcePackage};
+pub use protection::{DocumentProtection, FormEdit, FormRegion, ProtectionEdit};
 pub use theme::{
     ColorScheme, ColorSchemeMapping, DocumentTheme, FontBinding, FontClass, FontScheme,
     ResolvedFont, RunFontBindings, SchemeColor, ThemeColorRef, ThemeFontLang, ThemeFontRef,
@@ -1027,6 +1036,13 @@ pub struct DocumentSettings {
     /// and only a host calling `format_docx::read_docx_with_settings`
     /// with the strict ECMA-376 reading sets it `false`.
     pub widow_control_default: bool,
+    /// Issue #345 — `<w:documentProtection>` as read (`None` when the
+    /// part has none). Read-only ingest: `settings.xml` passes through
+    /// byte-identical, hash and salt included. The engine enforces
+    /// [`DocumentProtection::enforced_mode`]. Skipped when `None`, so an
+    /// unprotected document's snapshot encodes exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protection: Option<DocumentProtection>,
 }
 
 impl Default for DocumentSettings {
@@ -1036,6 +1052,7 @@ impl Default for DocumentSettings {
             author: None,
             default_page_size: DefaultPageSize::default(),
             widow_control_default: true,
+            protection: None,
         }
     }
 }
@@ -1671,6 +1688,12 @@ pub struct RunPad {
     pub after_rpr: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub close: Vec<u8>,
+    /// Issue #384 — the whitespace between two content children of the
+    /// run (`<w:br/>`, the text that follows it), re-emitted between the
+    /// regenerated pieces that share the run. Skipped when empty, so a
+    /// pre-#384 snapshot encodes unchanged.
+    #[serde(with = "serde_bytes", skip_serializing_if = "Vec::is_empty")]
+    pub inner: Vec<u8>,
 }
 
 /// Issues #199 / #106 — unmodeled in-paragraph markup at text offset `at`:
@@ -1697,6 +1720,40 @@ pub struct SourceMarker {
     /// where the tree says).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<CommentAnchor>,
+    /// Issue #384 — where the marker sat among the wrapper boundaries the
+    /// source wrote at its offset (the ends and starts of hyperlinks,
+    /// tracked changes, `<w:fldSimple>` and complex fields — everything
+    /// the writer regenerates around runs). `closes_after` = how many
+    /// wrapper ENDS followed it there (a `<w:proofErr/>` right before a
+    /// `</w:hyperlink>` is inside the link: it belongs to the run before
+    /// it); `opens_before` = how many wrapper STARTS preceded it there
+    /// (a bookmark right after `<w:hyperlink>` belongs to the run after
+    /// it). Both 0 (the pre-#384 default) = between the ends and the
+    /// starts. The writer re-emits the marker at the same slot among the
+    /// boundaries it writes at that offset, clamped to what is there —
+    /// so an edit that moved the marker or a wrapper can never make it
+    /// cross one. Only meaningful on unpaired markers (a content
+    /// control's opener / closer pair always sits between). Skipped when
+    /// 0, so a pre-#384 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub closes_after: u8,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub opens_before: u8,
+    /// Issue #384 — `Some(name)` when the marker is the
+    /// `<w:bookmarkStart/>` / `<w:bookmarkEnd/>` of a paragraph-scoped
+    /// `_Toc*` bookmark the model owns ([`Paragraph::bookmarks`]). Like a
+    /// comment anchor it is *verified*: replayed at its source position
+    /// only while the paragraph still holds a bookmark of that name (the
+    /// writer then does not wrap the content with it); otherwise dropped
+    /// (a split's right half), and a bookmark with no carried end is
+    /// closed at the paragraph end as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toc_bookmark: Option<String>,
+}
+
+/// Issue #384 — serde skip helper for [`SourceMarker`]'s slot counters.
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl SourceMarker {
@@ -1707,6 +1764,9 @@ impl SourceMarker {
             xml,
             role: MarkerRole::Verbatim,
             comment: None,
+            closes_after: 0,
+            opens_before: 0,
+            toc_bookmark: None,
         }
     }
 }
@@ -3581,6 +3641,13 @@ pub struct ParaProperties {
     /// rect at the paragraph's bounding rectangle before drawing the
     /// `<w:pBdr>` strokes.
     pub shading: Option<[u8; 4]>,
+    /// Issue #419 — the pattern half of the paragraph's `<w:shd>`
+    /// (`w:val` + `w:color`), when it is not the plain `clear` / `auto`
+    /// fill [`Self::shading`] describes alone. Travels with `shading`
+    /// through the cascade. Skipped when `None`, so a pre-#419 snapshot
+    /// encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shading_pattern: Option<ShadingPattern>,
     /// Issue #84 — unmodeled direct `<w:pPr>` children (and the whole
     /// paragraph-mark `<w:pPr>/<w:rPr>`, which the writer never
     /// regenerates) captured verbatim by the `.docx` reader. See
@@ -3650,6 +3717,14 @@ impl ParaProperties {
             rtl,
         );
         ParaProperties {
+            /* Issue #419 — the pattern travels with the `<w:shd>` that
+            set it (evaluated first: `or` below moves nothing, but the
+            pattern is not `Copy`). */
+            shading_pattern: if patch.shading.is_some() || patch.shading_pattern.is_some() {
+                patch.shading_pattern
+            } else {
+                self.shading_pattern
+            },
             shading: patch.shading.or(self.shading),
             alignment: patch.alignment.or(self.alignment),
             indent: if patch.indent == Indent::default() {
@@ -3829,6 +3904,16 @@ fn merged_border_spelling(
             }
         }
     }
+}
+
+/// Issue #419 — `<w:shd w:val w:color>`: the ST_Shd pattern (`pct25`,
+/// `solid`, `horzStripe`, …) and its colour (`None` = `auto`), drawn over
+/// the `w:fill` background ([`ParaProperties::shading`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ShadingPattern {
+    pub val: String,
+    pub color: Option<[u8; 4]>,
 }
 
 /// `<w:numPr>` reference — a paragraph's binding to a numbering definition.
@@ -4922,6 +5007,17 @@ pub struct BorderStroke {
     pub style: BorderStyle,
     pub size_eighth_pt: u16,
     pub color: Option<[u8; 4]>,
+    /// Issue #419 — `w:space`: the gap between the border and the text,
+    /// in points. `None` = not written. Skipped when `None` (and the two
+    /// flags below when off), so a pre-#419 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_pt: Option<u16>,
+    /// Issue #419 — `w:shadow`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub shadow: bool,
+    /// Issue #419 — `w:frame`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub frame: bool,
 }
 
 /// Issue #352 — which paragraph-border edges the source spelled with the
@@ -5094,6 +5190,26 @@ pub struct RowProperties {
     /// Issue #84 — unmodeled `<w:trPr>` children, verbatim. See
     /// [`GrabBag`].
     pub grab_bag: Option<Box<GrabBag>>,
+    /// Issue #365 — the row's tracked changes: `<w:trPr><w:ins/>` (a
+    /// tracked row insertion) / `<w:del/>` (a tracked row deletion), in
+    /// source order — a row one reviewer inserted and another deleted
+    /// carries both (the #303 rule for paragraph marks). `start` / `end`
+    /// are unused. They are `CT_TrPr` children, so they live with the
+    /// row properties: the verified `<w:trPr>` passthrough (issue #248)
+    /// re-emits the source bytes only while they are unchanged. Accepting
+    /// a deletion / rejecting an insertion removes the row
+    /// ([`DocumentTree::resolve_revisions`]). Skipped when empty, so a
+    /// pre-#365 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<Revision>,
+}
+
+impl TableRow {
+    /// Issue #365 — the row's first tracked change (see
+    /// [`RowProperties::revisions`] for a row carrying several).
+    pub fn revision(&self) -> Option<&Revision> {
+        self.props.revisions.first()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -8621,6 +8737,12 @@ impl DocumentTree {
             para.props.shading = color;
             /* Sprint 12 (#11) — shadow into direct_overrides. */
             para.direct_overrides.shading = color;
+            /* Issue #419 — a new fill keeps the source pattern drawn over
+            it (`pct25` + its colour); clearing the shading clears both. */
+            if color.is_none() {
+                para.props.shading_pattern = None;
+                para.direct_overrides.shading_pattern = None;
+            }
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -11283,6 +11405,7 @@ pub fn default_word_stroke() -> BorderStroke {
         style: BorderStyle::Single,
         size_eighth_pt: DEFAULT_BORDER_SIZE_EIGHTH_PT,
         color: Some([0, 0, 0, 255]),
+        ..Default::default()
     }
 }
 
@@ -15881,6 +16004,7 @@ mod tests {
                     style: BorderStyle::Single,
                     size_eighth_pt: 8,
                     color: Some([0, 0, 0xFF, 0xFF]),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
