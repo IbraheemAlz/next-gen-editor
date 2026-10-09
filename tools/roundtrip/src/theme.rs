@@ -119,20 +119,20 @@ pub fn run_theme_fonts_roundtrip() -> Result<()> {
     }
     println!("[roundtrip] step 46b OK — typing into theme-bound runs is a pure insertion");
 
-    /* The toolbar picks Amiri for the body paragraph's first run. */
+    /* The toolbar picks Amiri for the body paragraph's first run — both
+    script slots, as the ribbon does (issues #359 / #249). */
     let body_len = THEME_FIXTURE_TEXTS[1].find("explicit").expect("needle");
-    let refonted = doc.apply_style(
-        at(1, 0),
-        at(1, body_len),
-        SpanStyle {
-            font_family: Some(engine::FontFamily::Amiri),
-            ..Default::default()
-        },
-    );
+    let amiri = SpanStyle {
+        font_family: Some(engine::FontFamily::Amiri),
+        ..Default::default()
+    };
+    let refonted = doc.apply_style(at(1, 0), at(1, body_len), amiri.clone().with_cs_twins());
     let bytes = write_docx(&archive, &refonted).context("write re-fonted")?;
     assert_document_xml_well_formed(&bytes).context("re-fonted theme fixture")?;
     let out = String::from_utf8(extract_doc_xml(&bytes)?)?;
-    if !out.contains(r#"<w:rFonts w:ascii="Amiri" w:hAnsi="Amiri" w:cs="Amiri"/>"#) {
+    if !out.contains(
+        r#"<w:rFonts w:ascii="Amiri" w:hAnsi="Amiri" w:cs="Amiri"/></w:rPr><w:t xml:space="preserve">Body text"#,
+    ) {
         bail!("the picked family was not written:\n{out}");
     }
     if !out.contains(r#"<w:rFonts w:cstheme="majorBidi"/>"#) {
@@ -145,8 +145,20 @@ pub fn run_theme_fonts_roundtrip() -> Result<()> {
     if resolved(&back.document, 2) != some("Calibri", "Arial") {
         bail!("an untouched paragraph changed its theme fonts");
     }
+    /* Issue #249 — a Latin-only pick (`FontSlot::Latin`) claims ascii /
+    hAnsi alone: the run's complex-script slot stays on the theme. */
+    let latin_only = doc.apply_style(at(1, 0), at(1, body_len), amiri);
+    let bytes = write_docx(&archive, &latin_only).context("write Latin-only re-font")?;
+    assert_document_xml_well_formed(&bytes).context("Latin-only re-font")?;
+    let back = read_docx(&bytes).context("reread Latin-only re-font")?;
+    if resolved(&back.document, 1) != some("Amiri", "Arial") {
+        bail!(
+            "Latin-only re-font resolves {:?}",
+            resolved(&back.document, 1)
+        );
+    }
     println!(
-        "[roundtrip] step 46c OK — a picked family claims its slots; other bindings untouched"
+        "[roundtrip] step 46c OK — a picked family claims its slots (a Latin-only pick keeps the cs theme face); other bindings untouched"
     );
     Ok(())
 }
