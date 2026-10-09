@@ -10,7 +10,9 @@
  * Authoritative shapes: see `crates/engine-wasm/pkg/engine_wasm.d.ts`.
  *   - `SELECTION_CHANGED` carries: range, caret, direction, rects,
  *     attrs_at_caret, paragraph_alignment, can_undo, can_redo,
- *     selection_kind, attrs_mixed, paragraph_direction.
+ *     selection_kind, attrs_mixed, paragraph_direction, and (issues
+ *     #423 / #420) resolved_font_latin, resolved_font_cs, font_source,
+ *     slot_formats, caret_font_slot.
  *   - `STATS` is inline: `({ type: "STATS" } & EngineStats)`.
  *   - `PAINTED` carries: dirty, version, paint_ms, document_height,
  *     page_count, is_full_layout, estimated_document_height.
@@ -24,12 +26,15 @@ import type {
     BridgeStoryRef,
     BridgeFieldRef,
     BridgeCellProperties,
+    BridgeFontSources,
     BridgeIndent,
     BridgeSectionGeometry,
+    BridgeSlotFormats,
     BridgeTabStop,
     Direction,
     EngineStats,
     Event,
+    FontSlot,
     LayoutDegraded,
     LogicalRange,
     RecoveryReport,
@@ -50,6 +55,31 @@ export interface EditorState {
     attrsAtCaret: Accessor<TextAttrs | undefined>;
     /** Mixed flags across the selection (bold/italic/underline/strike). */
     attrsMixed: Accessor<AttrsMixed | undefined>;
+    /**
+     * Issue #423 — the family the caret run's LATIN slot resolves to
+     * after the full cascade (run name → theme binding → style chain →
+     * docDefaults → the layout's default face), as a display name
+     * (`"Calibri"`). `undefined` before the first SELECTION_CHANGED or
+     * from an engine that predates the field. Unlike
+     * `attrsAtCaret().font_family` (the run's own id, else the layout
+     * default), this is what Word's font box shows.
+     */
+    resolvedFontLatin: Accessor<string | undefined>;
+    /** Issue #423 — {@link EditorState.resolvedFontLatin} for the
+     *  COMPLEX-SCRIPT slot (`w:cs` / `w:cstheme` + the theme's script
+     *  entry): what Arabic / Hebrew text at the caret is shaped with. */
+    resolvedFontCs: Accessor<string | undefined>;
+    /** Issue #423 — where each slot's family came from (`Explicit` /
+     *  `Theme` / `Style` / `Default`); a picker marks `Theme` fonts. */
+    fontSource: Accessor<BridgeFontSources | undefined>;
+    /** Issue #420 — the caret run's resolved family id / size / bold /
+     *  italic PER SCRIPT SLOT — the Font dialog's "Latin text" and
+     *  "Complex scripts" seed. */
+    slotFormats: Accessor<BridgeSlotFormats | undefined>;
+    /** Issue #423 — the slot `attrsAtCaret` reports: `'ComplexScript'`
+     *  when the caret sits in Arabic / Hebrew / … text (or a `<w:rtl/>`
+     *  run), else `'Latin'`. The toolbar picker shows that slot's family. */
+    caretFontSlot: Accessor<FontSlot | undefined>;
     /** Paragraph alignment of the paragraph containing the caret. */
     paragraphAlignment: Accessor<Alignment | undefined>;
     /** Paragraph direction (`Ltr` / `Rtl` / `undefined` when mixed across selection). */
@@ -292,6 +322,11 @@ export function createEditorState(): EditorState {
     const [rects, setRects] = createSignal<Rect[]>([]);
     const [attrsAtCaret, setAttrsAtCaret] = createSignal<TextAttrs | undefined>(undefined);
     const [attrsMixed, setAttrsMixed] = createSignal<AttrsMixed | undefined>(undefined);
+    const [resolvedFontLatin, setResolvedFontLatin] = createSignal<string | undefined>(undefined);
+    const [resolvedFontCs, setResolvedFontCs] = createSignal<string | undefined>(undefined);
+    const [fontSource, setFontSource] = createSignal<BridgeFontSources | undefined>(undefined);
+    const [slotFormats, setSlotFormats] = createSignal<BridgeSlotFormats | undefined>(undefined);
+    const [caretFontSlot, setCaretFontSlot] = createSignal<FontSlot | undefined>(undefined);
     const [paragraphAlignment, setParagraphAlignment] = createSignal<Alignment | undefined>(undefined);
     const [paragraphDirection, setParagraphDirection] = createSignal<Direction | undefined>(undefined);
     const [selectionKind, setSelectionKind] = createSignal<SelectionKind | undefined>(undefined);
@@ -333,6 +368,14 @@ export function createEditorState(): EditorState {
                 setRects(evt.rects);
                 setAttrsAtCaret(evt.attrs_at_caret);
                 setAttrsMixed(evt.attrs_mixed);
+                /* Issue #423 — an engine predating the per-slot read-back
+                   sends empty names (serde default); surface those as
+                   "unknown", not as a family called "". */
+                setResolvedFontLatin(evt.resolved_font_latin || undefined);
+                setResolvedFontCs(evt.resolved_font_cs || undefined);
+                setFontSource(evt.font_source);
+                setSlotFormats(evt.slot_formats);
+                setCaretFontSlot(evt.caret_font_slot);
                 setParagraphAlignment(evt.paragraph_alignment);
                 setParagraphDirection(evt.paragraph_direction);
                 setSelectionKind(evt.selection_kind);
@@ -400,6 +443,11 @@ export function createEditorState(): EditorState {
         rects,
         attrsAtCaret,
         attrsMixed,
+        resolvedFontLatin,
+        resolvedFontCs,
+        fontSource,
+        slotFormats,
+        caretFontSlot,
         paragraphAlignment,
         paragraphDirection,
         selectionKind,

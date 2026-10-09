@@ -14,8 +14,19 @@
  *
  * Both controls reflect the resolved value at the caret on selection
  * change so the indicator matches Word / Google Docs behaviour.
+ *
+ * Issue #423 — the family shown is the one the caret's script slot
+ * RESOLVES to (`state.slotFormats()` / `resolvedFontLatin()` /
+ * `resolvedFontCs()`: the run's name → its theme binding → the style
+ * chain → docDefaults → the layout default), for the slot the caret's
+ * own text reads (`caretFontSlot()` — the complex-script slot inside
+ * Arabic text). A theme font carries a subtle "(theme)" marker; a family
+ * the registry does not ship (Word's Calibri) still shows by name, as a
+ * disabled placeholder option, instead of silently showing the first
+ * registry font. Picks stay "Both" slots (Word's ribbon); per-slot picks
+ * live in the Font dialog (issue #420).
  */
-import { createSignal, createMemo, For, Show, type Component } from 'solid-js';
+import { createSignal, createMemo, createEffect, For, Show, type Component } from 'solid-js';
 import {
     createEditorCommands,
     createEditorState,
@@ -33,8 +44,32 @@ export const FontPickers: Component = () => {
     const [pending, setPending] = createSignal(false);
 
     const ready = createMemo(() => state.selection() !== undefined);
-    const currentFamily = () => state.attrsAtCaret()?.font_family ?? '';
+    /* Issue #423 — the slot the caret's text reads, and its resolution. */
+    const slotKey = () =>
+        state.caretFontSlot() === 'ComplexScript' ? 'complex_script' : 'latin';
+    const currentFamily = () =>
+        state.slotFormats()?.[slotKey()].font_family ||
+        state.attrsAtCaret()?.font_family ||
+        '';
+    const resolvedName = () =>
+        (slotKey() === 'complex_script' ? state.resolvedFontCs() : state.resolvedFontLatin()) ??
+        currentFamily();
+    const fromTheme = () => state.fontSource()?.[slotKey()] === 'Theme';
+    const inRegistry = () => registry.fonts().some((f) => f.id === currentFamily());
     const currentSize = () => state.attrsAtCaret()?.font_size ?? 12;
+
+    /* The select's value is synced in a USER effect, which Solid runs
+       after every DOM binding of the same update: a `value={…}` binding
+       could run before the placeholder option's own `value` changed
+       (Arial → Times New Roman, both unshipped) and leave nothing
+       selected. */
+    let familyEl: HTMLSelectElement | undefined;
+    createEffect(() => {
+        const id = currentFamily();
+        registry.fonts();
+        inRegistry();
+        if (familyEl && familyEl.value !== id) familyEl.value = id;
+    });
 
     const applyFamily = async (id: string) => {
         if (!ready() || !id) return;
@@ -61,13 +96,27 @@ export const FontPickers: Component = () => {
         <div class="nge-font" role="group" aria-label="Font" data-pending={pending()}>
             <div class="nge-font__familywrap">
                 <select
+                    ref={familyEl}
                     class="nge-font__family"
                     aria-label="Font family"
                     aria-busy={pending()}
                     disabled={!ready() || pending()}
-                    value={currentFamily()}
+                    title={
+                        fromTheme()
+                            ? `${resolvedName()} — from the document theme`
+                            : 'Font family'
+                    }
+                    data-nge-command="APPLY_FORMATTING"
                     onChange={(e) => void applyFamily(e.currentTarget.value)}
                 >
+                    {/* Issue #423 — a resolved family the registry does not
+                        ship (a theme's Calibri) shows by name; it cannot be
+                        picked (no bytes to load), only displayed. */}
+                    <Show when={currentFamily() !== '' && !inRegistry()}>
+                        <option value={currentFamily()} disabled data-nge-resolved-font="">
+                            {resolvedName()}
+                        </option>
+                    </Show>
                     <For each={registry.fonts()}>
                         {(f) => (
                             <option value={f.id}>
@@ -81,6 +130,15 @@ export const FontPickers: Component = () => {
                     <span class="nge-font__spinner" aria-hidden="true" />
                 </Show>
             </div>
+            <Show when={fromTheme()}>
+                <span
+                    class="nge-font__source"
+                    data-nge-font-source="theme"
+                    title="This font comes from the document theme"
+                >
+                    (theme)
+                </span>
+            </Show>
             <input
                 class="nge-font__size"
                 type="number"
