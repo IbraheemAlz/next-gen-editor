@@ -881,3 +881,79 @@ pub fn regen_classes_body() -> String {
 pub fn regen_classes_docx() -> Vec<u8> {
     docx_with_body(&regen_classes_body())
 }
+
+/* ============================ issue #419 — per-child pPr reuse ==== */
+
+/// Issue #419 — a paragraph whose `<w:pPr>` carries what the model used
+/// to lose when ONE property changed: leader tabs, border edges with
+/// `w:space` / `w:shadow` / a theme colour, a `pct25` pattern shading,
+/// autospacing, the physical `w:left` indent spelling and `jc="right"`.
+pub const PPR_ATTRS_PARAGRAPH: &str = concat!(
+    r#"<w:p w:rsidR="00B1"><w:pPr><w:pBdr>"#,
+    r#"<w:top w:val="single" w:sz="4" w:space="1" w:color="auto" w:shadow="1"/>"#,
+    r#"<w:left w:val="double" w:sz="6" w:space="4" w:color="FF0000" w:themeColor="accent2"/>"#,
+    r#"<w:bottom w:val="single" w:sz="4" w:space="1" w:color="auto"/>"#,
+    r#"</w:pBdr><w:shd w:val="pct25" w:color="FF0000" w:fill="00FF00"/>"#,
+    r#"<w:tabs><w:tab w:val="left" w:leader="hyphen" w:pos="2880"/><w:tab w:val="right" w:leader="dot" w:pos="9350"/></w:tabs>"#,
+    r#"<w:spacing w:before="100" w:beforeAutospacing="1" w:after="100" w:afterAutospacing="1"/>"#,
+    r#"<w:ind w:left="720" w:firstLine="360"/><w:jc w:val="right"/></w:pPr>"#,
+    r#"<w:r><w:t>Bordered, shaded, tabbed</w:t></w:r></w:p>"#,
+);
+
+/// Issue #419 — a section-mark paragraph (the `<w:sectPr>` inside its
+/// `<w:pPr>`); docDefaults give it spacing it does not spell.
+pub const PPR_SECTION_PARAGRAPH: &str = concat!(
+    r#"<w:p w:rsidR="00B2"><w:pPr><w:jc w:val="center"/><w:sectPr w:rsidR="00B2">"#,
+    r#"<w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>"#,
+    r#"<w:cols w:space="708"/></w:sectPr></w:pPr><w:r><w:t>End of section one</w:t></w:r></w:p>"#,
+);
+
+/// Issue #419 — a paragraph with no `<w:pPr>` at all.
+pub const PPR_PLAIN_PARAGRAPH: &str =
+    r#"<w:p w:rsidR="00B3"><w:r><w:t>Plain body text</w:t></w:r></w:p>"#;
+
+/// Issue #419 — the three paragraphs above over a styles part whose
+/// docDefaults give every paragraph `after="200"` / `line="276"`.
+pub fn ppr_attributes_docx() -> Vec<u8> {
+    let body = [
+        PPR_ATTRS_PARAGRAPH,
+        PPR_SECTION_PARAGRAPH,
+        PPR_PLAIN_PARAGRAPH,
+    ]
+    .concat();
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:document xmlns:w=\"{W_NS}\"><w:body>{body}\
+         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:body></w:document>"
+    );
+    let styles = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:styles xmlns:w=\"{W_NS}\"><w:docDefaults><w:pPrDefault><w:pPr>\
+         <w:spacing w:after=\"200\" w:line=\"276\" w:lineRule=\"auto\"/>\
+         </w:pPr></w:pPrDefault></w:docDefaults></w:styles>"
+    );
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
+</Types>";
+    let dot_rels = rels(&[(
+        "rId1",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+        "word/document.xml",
+    )]);
+    let doc_rels = rels(&[(
+        "rId1",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+        "styles.xml",
+    )]);
+    zip_entries(vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", dot_rels.as_bytes()),
+        ("word/document.xml", document.as_bytes()),
+        ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+    ])
+}

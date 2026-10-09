@@ -177,6 +177,21 @@ pub fn is_inline_marker(qname: &[u8]) -> bool {
     )
 }
 
+/// Issue #419 — the modeled attributes of a border edge beyond its style,
+/// size and colour: `w:space` (points), `w:shadow`, `w:frame` (on/off,
+/// `true` / `1` / `on`). Every other field default — the caller fills
+/// those.
+pub fn border_extras(e: &BytesStart) -> engine::BorderStroke {
+    let attr = |name: &[u8]| crate::schema::ct_rpr::attr_val(e, name);
+    let on = |name: &[u8]| attr(name).is_some_and(|v| matches!(v.trim(), "1" | "true" | "on"));
+    engine::BorderStroke {
+        space_pt: attr(b"w:space").and_then(|v| v.trim().parse().ok()),
+        shadow: on(b"w:shadow"),
+        frame: on(b"w:frame"),
+        ..engine::BorderStroke::default()
+    }
+}
+
 /// Issue #384 — [`is_modeled_textless_run_child`] for an EMPTY element
 /// (`<w:pict/>`): an object container with no content models nothing,
 /// so a run holding only such elements is kept verbatim like any other
@@ -456,10 +471,11 @@ impl MarkupCapture {
     }
 
     /// A `<w:sectPr>` inside the paragraph's `<w:pPr>`: the section
-    /// marker moves on edits, so the pPr bytes are never reused.
-    pub fn note_sect_in_ppr(&mut self) {
-        self.ppr_unusable = true;
-    }
+    /// marker moves on edits, so the pPr bytes are never reused whole
+    /// (`section_end` blocks the writer's verified passthrough). Issue
+    /// #419 — they are still recorded: a regenerated pPr splices its
+    /// changed children into them, the `<w:sectPr>` always the live one.
+    pub fn note_sect_in_ppr(&mut self) {}
 
     fn content(&mut self, at: u32) {
         if !self.content_seen {

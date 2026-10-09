@@ -163,6 +163,89 @@ pub struct CommentCheck {
     pub delete_gone: Option<bool>,
 }
 
+/// Issue #419 — the paragraph-property probe: the first untouched
+/// top-level paragraph with a source `<w:pPr>` gets its start indent
+/// moved by half an inch and is saved on its own. The per-child splice
+/// must respell nothing but the `<w:ind>` element (or insert one).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PprCheck {
+    /// Top-level block index of the probed paragraph.
+    pub block: u32,
+    /// [`EditCheck::source_bytes_rewritten`] of that save.
+    pub source_bytes_rewritten: u64,
+    /// Bytes of the edited part inside the rewritten span.
+    pub edited_region_bytes: u64,
+    /// The whole difference lies inside one `<w:ind …/>` element.
+    pub ind_only: bool,
+    /// The re-read paragraph has the new indent.
+    pub reread_ok: bool,
+}
+
+/// Issue #419 — see [`PprCheck`]. `None` when no paragraph qualifies.
+fn ppr_check(archive: &DocxArchive, orig_xml: &[u8]) -> Option<PprCheck> {
+    let doc = &archive.document;
+    let (block, p) = doc.blocks.iter().enumerate().find_map(|(i, b)| match b {
+        engine::Block::Paragraph(p)
+            if !p.dirty
+                && p.source_xml.is_some()
+                && p.section_end.is_none()
+                && p.source_markup
+                    .as_deref()
+                    .and_then(|m| m.ppr.as_ref())
+                    .is_some_and(|sp| sp.xml.windows(6).any(|w| w == b"<w:pPr")) =>
+        {
+            Some((i as u32, p))
+        }
+        _ => None,
+    })?;
+    let ind = &p.props.indent;
+    let pt = |twips: i32| twips as f32 / 20.0;
+    let first_line = if ind.hanging_twips > 0 {
+        -pt(ind.hanging_twips)
+    } else {
+        pt(ind.first_line_twips)
+    };
+    let new_start = pt(ind.start_twips) + 36.0;
+    let at = engine::LogicalPos::new(engine::BlockPath::top(block), 0);
+    let edited = doc.set_paragraph_indent(at.clone(), at, new_start, pt(ind.end_twips), first_line);
+    let bytes = format_docx::write_docx(archive, &edited).ok()?;
+    let xml = extract_doc_xml(&bytes).ok()?;
+    let (prefix, rewritten, inserted) = rewritten_region(orig_xml, &xml);
+    /* The whole difference is ONE `<w:ind …/>` element replaced (or
+    inserted) at the point the two parts start to differ. */
+    let ind_only = (|| {
+        let from = prefix.saturating_sub(64);
+        let pos = from + xml.get(from..)?.windows(7).position(|w| w == b"<w:ind ")?;
+        let element_len = |x: &[u8]| x.iter().position(|&b| b == b'>').map(|e| e + 1);
+        let new_len = element_len(&xml[pos..])?;
+        let old_len = if orig_xml.get(pos..)?.starts_with(b"<w:ind ") {
+            element_len(&orig_xml[pos..])?
+        } else {
+            0
+        };
+        Some(
+            pos <= prefix
+                && orig_xml[..pos] == xml[..pos]
+                && orig_xml.get(pos + old_len..)? == xml.get(pos + new_len..)?,
+        )
+    })()
+    .unwrap_or(false);
+    let reread_ok = format_docx::read_docx(&bytes).is_ok_and(|back| {
+        matches!(
+            back.document.blocks.get(block as usize),
+            Some(engine::Block::Paragraph(q))
+                if q.props.indent.start_twips == (new_start * 20.0).round() as i32
+        )
+    });
+    Some(PprCheck {
+        block,
+        source_bytes_rewritten: rewritten,
+        edited_region_bytes: inserted,
+        ind_only,
+        reread_ok,
+    })
+}
+
 /// Issue #282 — `edited` is `orig` plus insertions only (a byte-level
 /// minimal diff with no deletion; prefix and suffix are trimmed first, so
 /// a local edit of a large part stays cheap).
@@ -535,6 +618,9 @@ pub struct DocResult {
     /// Issue #282 — see [`CommentCheck`] (with the scripted edit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_check: Option<CommentCheck>,
+    /// Issue #419 — see [`PprCheck`] (with the scripted edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppr_check: Option<PprCheck>,
     /// Issue #318 — wall-clock ms of the PRODUCTION layout
     /// (`engine-wasm`'s `Engine::build_pages`: the real table grid +
     /// autofit, header/footer bands, notes, wrap convergence), driven
@@ -714,6 +800,7 @@ impl DocResult {
             ui_save_siblings_identical: None,
             ui_save_matches_write_docx: None,
             comment_check: None,
+            ppr_check: None,
             engine_layout_ms: None,
             engine_page_count: None,
             engine_fingerprint: None,
@@ -1056,6 +1143,8 @@ pub fn run_one(
             /* Issue #282 — comments on untouched paragraphs. */
             rec.comment_check =
                 stage_infallible!("comment_check", comment_check(&archive_a, &doc_xml_orig));
+            /* Issue #419 — a paragraph-property change. */
+            rec.ppr_check = stage_infallible!("ppr_check", ppr_check(&archive_a, &doc_xml_orig));
         }
     }
 

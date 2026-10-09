@@ -481,6 +481,11 @@ fn main() -> ExitCode {
     let mut comment_delete_checked = 0usize;
     let mut comment_delete_pure = 0usize;
     let mut comment_delete_clean = 0usize;
+    /* Issue #419 — the paragraph-property probe. */
+    let mut ppr_checked = 0usize;
+    let mut ppr_ind_only = 0usize;
+    let mut ppr_reread_ok = 0usize;
+    let mut ppr_rewritten = 0u64;
     let mut rewrite_causes: std::collections::BTreeMap<String, (usize, String, u64)> =
         std::collections::BTreeMap::new();
     /* Issue #318 — production-layout timings `(ms, label)`, the
@@ -586,6 +591,13 @@ fn main() -> ExitCode {
                 comment_delete_clean +=
                     usize::from(cc.delete_anchors_left == Some(0) && cc.delete_gone == Some(true));
             }
+        }
+
+        if let Some(pc) = &rec.ppr_check {
+            ppr_checked += 1;
+            ppr_ind_only += usize::from(pc.ind_only);
+            ppr_reread_ok += usize::from(pc.reread_ok);
+            ppr_rewritten += pc.source_bytes_rewritten;
         }
 
         if let Some(t) = &rec.theme_fonts {
@@ -705,6 +717,11 @@ fn main() -> ExitCode {
          {comment_insert_pure}/{comment_checked}, re-read anchored {comment_insert_anchored}/{comment_checked}; \
          source comment deleted: pure deletion {comment_delete_pure}/{comment_delete_checked}, \
          no anchor or body left {comment_delete_clean}/{comment_delete_checked}"
+    );
+    println!(
+        "[corpus-native] paragraph-property change (#419): only <w:ind> respelled \
+         {ppr_ind_only}/{ppr_checked}, re-read with the new indent {ppr_reread_ok}/{ppr_checked} \
+         ({ppr_rewritten} source bytes rewritten in all)"
     );
     if !rewrite_causes.is_empty() {
         let mut buckets: Vec<(&String, &(usize, String, u64))> = rewrite_causes.iter().collect();

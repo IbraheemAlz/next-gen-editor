@@ -230,6 +230,29 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   other than `w:val` (`schema::source_markup::adopt_source_children`) —
   `<w:u w:color>` survives a bold toggle, a changed font never inherits a
   stale `w:asciiTheme`.
+- **Per-child `<w:pPr>` reuse (issue #419).** A recorded pPr that is not
+  current as a whole is SPLICED, not regenerated (`writer::ppr_splice`):
+  the children `ppr_children` writes for the recorded state
+  (`SourcePPr::props` / `style_id` / `list_item` / mark revisions, the
+  same read-only clearing as the live side) and for the live one are
+  compared by element name — an equal pair keeps the source bytes (or
+  the source's ABSENCE: a value only the cascade supplies is never baked
+  into direct formatting); a changed child is re-emitted from the live
+  model, an empty one keeping the source twin's unowned attributes
+  (`w:theme*` dropped; `<w:spacing>` keeps `*Lines` / `*Autospacing`
+  only beside an unchanged before / after; `<w:ind>` keeps the `w:left`
+  spelling and an unchanged `*Chars`); `<w:pBdr>` splices edge by edge,
+  `<w:tabs>` stop by stop (keyed by `w:pos`); a removed child goes, a new
+  one is inserted at its rank; whitespace stays with the child it
+  precedes. A section-mark paragraph's pPr is recorded too (never
+  replayed whole: `source_ppr_is_current` refuses bytes holding a
+  `<w:sectPr>`), the `<w:sectPr>` child always the live one — a split's
+  left half drops it. Modeled for this: `BorderStroke::space_pt` /
+  `shadow` / `frame` (`w:space` / `w:shadow` / `w:frame`, every border),
+  `ParaProperties::shading_pattern` (`<w:shd w:val w:color>` beside the
+  fill; clearing the shading clears it). Harness: `tools/roundtrip` step
+  50 (`ppr_attributes.docx`); `tools/corpus-native`'s `ppr_check` (an
+  indent change on the first pPr paragraph respells only `<w:ind>`).
 - Positioned verbatim markers (`<w:proofErr/>`, non-TOC bookmarks,
   permission / move ranges, an empty `<w:fldSimple/>`, text-less runs with
   only unmodeled content, pretty-print whitespace) re-emit at their
@@ -479,6 +502,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
     whitespace between a run's children; an empty `<w:pict/>` run is kept
     verbatim; a source paragraph with no text mints no empty run and stays
     self-closing when nothing is inside.
+  Harness: `tools/roundtrip` step 49 (`regen_classes.docx`).
 
 ## Table source markup (issue #248)
 

@@ -35,6 +35,7 @@ mod inline_spans;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod ppr_splice;
 mod reader_hardening;
 mod regen;
 mod revision_ids;
@@ -355,6 +356,7 @@ fn run_default() -> Result<()> {
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
     regen::run_regen_classes_roundtrip()?;
+    ppr_splice::run_ppr_splice_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

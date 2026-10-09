@@ -1338,6 +1338,8 @@ fn parse_border_stroke(e: &BytesStart) -> BorderStroke {
         style,
         size_eighth_pt,
         color,
+        /* Issue #419 — `w:space` / `w:shadow` / `w:frame`. */
+        ..crate::schema::source_markup::border_extras(e)
     }
 }
 

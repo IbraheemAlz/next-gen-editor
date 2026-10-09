@@ -45,6 +45,10 @@ mod revision_ids;
 #[path = "writer_regen_check.rs"]
 pub mod regen_check;
 
+/// Issue #419 — per-child verified reuse inside a regenerated `<w:pPr>`.
+#[path = "writer_ppr_splice.rs"]
+mod ppr_splice;
+
 /// Standard OOXML document namespace boilerplate (matches what Word emits).
 const DOC_XML_HEADER: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
@@ -705,6 +709,21 @@ fn emit_ppr(
     {
         return;
     }
+    let mut ch = ppr_children(props, style_id, list_item, section_end);
+    ch.adopt(source);
+    ch.finish("w:pPr", out);
+}
+
+/// The children [`emit_ppr`] writes for this model state, each at its
+/// CT_PPrBase rank, the grab bag's included (no source adoption). Issue
+/// #419 — also what [`ppr_splice`] compares, for the recorded and the
+/// live state, child by child.
+fn ppr_children(
+    props: &ParaProperties,
+    style_id: Option<&str>,
+    list_item: Option<engine::ListItem>,
+    section_end: Option<&engine::SectionProps>,
+) -> PrChildren {
     /* Issue #84 — children are collected with their CT_PPrBase rank and
     emitted sorted, so preserved grab-bag fragments (`<w:framePr>`,
     `<w:widowControl>`, `<w:cnfStyle>`, the paragraph-mark `<w:rPr>`, …)
@@ -800,12 +819,27 @@ fn emit_ppr(
     }
     /* Paragraph shading mirrors the rPr / tcPr `<w:shd>` emitters: the
     arbitrary RGB rides `w:fill` with a `clear` pattern; alpha has no
-    OOXML slot. */
-    if let Some([r, g, b, _]) = props.shading {
-        ch.push(
-            rank(b"w:shd"),
-            format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"),
-        );
+    OOXML slot. Issue #419 — a modeled pattern (`w:val` + `w:color`)
+    is written instead of `clear` / `auto`. */
+    if props.shading.is_some() || props.shading_pattern.is_some() {
+        let hex = |c: Option<[u8; 4]>| {
+            c.map_or_else(
+                || "auto".to_string(),
+                |[r, g, b, _]| format!("{r:02X}{g:02X}{b:02X}"),
+            )
+        };
+        let (val, color) = props
+            .shading_pattern
+            .as_ref()
+            .map_or(("clear", None), |p| (p.val.as_str(), p.color));
+        let mut s = String::from("<w:shd w:val=\"");
+        push_escaped_attr(val, &mut s);
+        s.push_str(&format!(
+            "\" w:color=\"{}\" w:fill=\"{}\"/>",
+            hex(color),
+            hex(props.shading)
+        ));
+        ch.push(rank(b"w:shd"), s);
     }
     /* Audit gap A.M3 — `<w:tabs>` custom stops, child order preserved.
     Empty list ⇒ no element. `Clear` kind round-trips so a user-defined
@@ -930,8 +964,7 @@ fn emit_ppr(
         ch.push(rank(b"w:sectPr"), s);
     }
     ch.push_bag(&props.grab_bag, ppr_child_rank);
-    ch.adopt(source);
-    ch.finish("w:pPr", out);
+    ch
 }
 
 /// Serialize one paragraph. A span-free paragraph with default `props` emits
@@ -994,12 +1027,18 @@ fn serialize_paragraph_body(
     } else {
         std::borrow::Cow::Owned(with_mark_revisions(&props, &para.mark_revisions))
     };
+    /* Issue #419 — not current as a whole: the source element with only
+    the changed children replaced. */
+    let spliced = source_ppr
+        .filter(|sp| !source_ppr_is_current(sp, para))
+        .and_then(|sp| splice_source_ppr(sp, para, &props));
     match source_ppr {
         /* Verified passthrough: the model still holds exactly what these
         bytes produced, so they are the most faithful serialization (and
         the source never baked docDefaults / style spacing into a direct
         `<w:spacing>`). */
         Some(sp) if source_ppr_is_current(sp, para) => push_utf8(&sp.xml, out),
+        Some(_) if spliced.is_some() => out.push_str(spliced.as_deref().unwrap_or_default()),
         sp => emit_ppr(
             &props,
             para.style_id.as_deref(),
@@ -1198,8 +1237,9 @@ fn direction_is_inherited(para: &Paragraph) -> bool {
 
 /// Issues #199 / #106 — the recorded source `<w:pPr>` still describes the
 /// paragraph: every model input of [`emit_ppr`] equals what the reader
-/// built from those bytes, and no section marker rides the paragraph (the
-/// reader never records a pPr holding a `<w:sectPr>`).
+/// built from those bytes, and no section marker rides the paragraph or
+/// the bytes (issue #419: a section paragraph's pPr is recorded for the
+/// per-child splice, never replayed whole).
 ///
 /// Only inside [`write_docx`] ([`source_bytes_trusted`]): the recorded
 /// bytes lean on the source package's `styles.xml` (a bare `<w:pStyle>`),
@@ -1208,6 +1248,9 @@ fn direction_is_inherited(para: &Paragraph) -> bool {
 fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
     source_bytes_trusted()
         && para.section_end.is_none()
+        /* Issue #419 — a recorded pPr may hold the source section marker
+        (a split's left half inherits it): never replayed whole. */
+        && !sp.xml.windows(9).any(|w| w == b"<w:sectPr")
         && sp.props == para.props
         && sp.style_id == para.style_id
         && sp.list_item == para.list_item
@@ -1216,6 +1259,41 @@ fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
         && sp.mark_revisions == para.mark_revisions
         /* Issue #293 — and the mark's run properties. */
         && mark_rpr_is_current(&para.props, para.mark_style.as_deref())
+}
+
+/// Issue #419 — `sp` (the paragraph's recorded `<w:pPr>`) with only the
+/// children whose meaning changed re-emitted from `live` (the props
+/// [`serialize_paragraph_body`] writes: mark style and revisions folded
+/// in, read-only fields cleared): see [`ppr_splice`]. The recorded side
+/// goes through the same transformations, so an unchanged child compares
+/// equal. Only inside [`write_docx`] ([`source_bytes_trusted`]); `None`
+/// when the source bytes cannot be split.
+fn splice_source_ppr(sp: &SourcePPr, para: &Paragraph, live: &ParaProperties) -> Option<String> {
+    if !source_bytes_trusted() {
+        return None;
+    }
+    let live_children = ppr_children(
+        live,
+        para.style_id.as_deref(),
+        para.list_item,
+        para.section_end.as_deref(),
+    );
+    let mut rec = sp.props.clone();
+    rec.outline_level = None;
+    rec.widow_control = None;
+    /* The live direction was dropped as inherited from the style
+    (issue #202): the same value recorded is inherited too. */
+    if live.direction.is_none()
+        && para.props.direction.is_some()
+        && sp.props.direction == para.props.direction
+    {
+        rec.direction = None;
+    }
+    if !sp.mark_revisions.is_empty() {
+        rec = with_mark_revisions(&rec, &sp.mark_revisions);
+    }
+    let rec_children = ppr_children(&rec, sp.style_id.as_deref(), sp.list_item, None);
+    ppr_splice::splice_ppr(&sp.xml, &rec_children.items, &live_children.items)
 }
 
 /// Issue #293 — the paragraph-mark `<w:rPr>` fragment riding the pPr
@@ -3330,8 +3408,19 @@ fn emit_border_edge(elem: &str, edge: &Option<BorderStroke>, out: &mut String) {
         BorderStyle::Other(o) => o.as_str(),
     };
     let mut attrs = format!(" w:val=\"{val}\" w:sz=\"{}\"", s.size_eighth_pt);
+    /* Issue #419 — Word's attribute order: val, sz, space, color, …,
+    shadow, frame. */
+    if let Some(space) = s.space_pt {
+        attrs.push_str(&format!(" w:space=\"{space}\""));
+    }
     if let Some([r, g, b, _]) = s.color {
         attrs.push_str(&format!(" w:color=\"{r:02X}{g:02X}{b:02X}\""));
+    }
+    if s.shadow {
+        attrs.push_str(" w:shadow=\"1\"");
+    }
+    if s.frame {
+        attrs.push_str(" w:frame=\"1\"");
     }
     out.push_str(&format!("<{elem}{attrs}/>"));
 }
@@ -8193,6 +8282,7 @@ mod tests {
             tab_stops: Vec::new(),
             list_item: None,
             shading: Some([0x33, 0x66, 0x99, 0xFF]),
+            shading_pattern: None,
             grab_bag: None,
             outline_level: None,
             widow_control: None,
@@ -11343,3 +11433,8 @@ mod theme_tests;
 #[cfg(test)]
 #[path = "writer_regen_tests.rs"]
 mod regen_tests;
+
+/// Issue #419 — per-child verified reuse inside a regenerated `<w:pPr>`.
+#[cfg(test)]
+#[path = "writer_ppr_splice_tests.rs"]
+mod ppr_splice_tests;

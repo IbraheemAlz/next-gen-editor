@@ -1032,6 +1032,7 @@ fn parse_border_stroke(e: &quick_xml::events::BytesStart) -> Option<engine::Bord
         style,
         size_eighth_pt,
         color,
+        ..crate::schema::source_markup::border_extras(e)
     })
 }
 

@@ -3575,6 +3575,13 @@ pub struct ParaProperties {
     /// rect at the paragraph's bounding rectangle before drawing the
     /// `<w:pBdr>` strokes.
     pub shading: Option<[u8; 4]>,
+    /// Issue #419 — the pattern half of the paragraph's `<w:shd>`
+    /// (`w:val` + `w:color`), when it is not the plain `clear` / `auto`
+    /// fill [`Self::shading`] describes alone. Travels with `shading`
+    /// through the cascade. Skipped when `None`, so a pre-#419 snapshot
+    /// encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shading_pattern: Option<ShadingPattern>,
     /// Issue #84 — unmodeled direct `<w:pPr>` children (and the whole
     /// paragraph-mark `<w:pPr>/<w:rPr>`, which the writer never
     /// regenerates) captured verbatim by the `.docx` reader. See
@@ -3636,6 +3643,14 @@ impl ParaProperties {
     /// acceptable for Phase 3; Phase 4+ may widen to `Option`.
     pub fn merged_with(self, patch: ParaProperties) -> ParaProperties {
         ParaProperties {
+            /* Issue #419 — the pattern travels with the `<w:shd>` that
+            set it (evaluated first: `or` below moves nothing, but the
+            pattern is not `Copy`). */
+            shading_pattern: if patch.shading.is_some() || patch.shading_pattern.is_some() {
+                patch.shading_pattern
+            } else {
+                self.shading_pattern
+            },
             shading: patch.shading.or(self.shading),
             alignment: patch.alignment.or(self.alignment),
             indent: if patch.indent == Indent::default() {
@@ -3686,6 +3701,16 @@ impl ParaProperties {
             widow_control: patch.widow_control.or(self.widow_control),
         }
     }
+}
+
+/// Issue #419 — `<w:shd w:val w:color>`: the ST_Shd pattern (`pct25`,
+/// `solid`, `horzStripe`, …) and its colour (`None` = `auto`), drawn over
+/// the `w:fill` background ([`ParaProperties::shading`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ShadingPattern {
+    pub val: String,
+    pub color: Option<[u8; 4]>,
 }
 
 /// `<w:numPr>` reference — a paragraph's binding to a numbering definition.
@@ -4779,6 +4804,17 @@ pub struct BorderStroke {
     pub style: BorderStyle,
     pub size_eighth_pt: u16,
     pub color: Option<[u8; 4]>,
+    /// Issue #419 — `w:space`: the gap between the border and the text,
+    /// in points. `None` = not written. Skipped when `None` (and the two
+    /// flags below when off), so a pre-#419 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_pt: Option<u16>,
+    /// Issue #419 — `w:shadow`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub shadow: bool,
+    /// Issue #419 — `w:frame`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub frame: bool,
 }
 
 /// Issue #352 — which paragraph-border edges the source spelled with the
@@ -8478,6 +8514,12 @@ impl DocumentTree {
             para.props.shading = color;
             /* Sprint 12 (#11) — shadow into direct_overrides. */
             para.direct_overrides.shading = color;
+            /* Issue #419 — a new fill keeps the source pattern drawn over
+            it (`pct25` + its colour); clearing the shading clears both. */
+            if color.is_none() {
+                para.props.shading_pattern = None;
+                para.direct_overrides.shading_pattern = None;
+            }
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -11135,6 +11177,7 @@ pub fn default_word_stroke() -> BorderStroke {
         style: BorderStyle::Single,
         size_eighth_pt: DEFAULT_BORDER_SIZE_EIGHTH_PT,
         color: Some([0, 0, 0, 255]),
+        ..Default::default()
     }
 }
 
@@ -15550,6 +15593,7 @@ mod tests {
                     style: BorderStyle::Single,
                     size_eighth_pt: 8,
                     color: Some([0, 0, 0xFF, 0xFF]),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
