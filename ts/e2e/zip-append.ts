@@ -3,7 +3,7 @@
  * embedded font (`word/fonts/font1.odttf`) a real Word document carries,
  * without committing a multi-megabyte binary. Plain OPC zip only: no
  * zip64, no archive comment handling beyond locating the end record. */
-import { crc32 } from 'node:zlib';
+import { crc32, inflateRawSync } from 'node:zlib';
 
 const EOCD_SIG = 0x06054b50;
 const LOCAL_SIG = 0x04034b50;
@@ -76,6 +76,48 @@ export function appendStoredEntry(zip: Uint8Array, name: string, data: Uint8Arra
             end,
         ]),
     );
+}
+
+/** Issue #420 — read one entry of a plain OPC zip (stored or deflated),
+ *  located through the central directory; `undefined` when absent. Enough
+ *  to inspect a saved `.docx`'s `word/document.xml` in a spec. */
+export function readZipEntry(zip: Uint8Array, name: string): Uint8Array | undefined {
+    const src = Buffer.from(zip.buffer, zip.byteOffset, zip.byteLength);
+    let eocd = -1;
+    for (let i = src.length - 22; i >= 0; i--) {
+        if (src.readUInt32LE(i) === EOCD_SIG) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd < 0) throw new Error('readZipEntry: no end-of-central-directory record');
+    const entries = src.readUInt16LE(eocd + 10);
+    let at = src.readUInt32LE(eocd + 16);
+    for (let n = 0; n < entries; n++) {
+        if (src.readUInt32LE(at) !== CENTRAL_SIG) {
+            throw new Error('readZipEntry: bad central directory');
+        }
+        const method = src.readUInt16LE(at + 10);
+        const compressed = src.readUInt32LE(at + 20);
+        const nameLen = src.readUInt16LE(at + 28);
+        const extraLen = src.readUInt16LE(at + 30);
+        const commentLen = src.readUInt16LE(at + 32);
+        const local = src.readUInt32LE(at + 42);
+        const entryName = src.subarray(at + 46, at + 46 + nameLen).toString('utf8');
+        if (entryName === name) {
+            if (src.readUInt32LE(local) !== LOCAL_SIG) {
+                throw new Error('readZipEntry: bad local header');
+            }
+            const start =
+                local + 30 + src.readUInt16LE(local + 26) + src.readUInt16LE(local + 28);
+            const data = src.subarray(start, start + compressed);
+            if (method === 0) return new Uint8Array(data);
+            if (method === 8) return new Uint8Array(inflateRawSync(data));
+            throw new Error(`readZipEntry: unsupported method ${method}`);
+        }
+        at += 46 + nameLen + extraLen + commentLen;
+    }
+    return undefined;
 }
 
 /** Deterministic incompressible bytes (xorshift32) — font-like payload. */

@@ -59,3 +59,11 @@
     text-align: center;
     font-variant-numeric: tabular-nums;
 }
+
+/* Issue #423 — the resolved family comes from the document theme. Subtle:
+ * muted, small, never louder than the family name itself. */
+.nge-font__source {
+    color: var(--nge-color-text-muted);
+    font: 500 var(--nge-font-size-xs)/1 var(--nge-font-ui);
+    white-space: nowrap;
+}

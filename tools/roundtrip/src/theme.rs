@@ -162,3 +162,97 @@ pub fn run_theme_fonts_roundtrip() -> Result<()> {
     );
     Ok(())
 }
+
+/// Step 47 (issue #424) — a family the font registry does not ship
+/// ("Sakkal Majalla") claims exactly the script slot the pick targeted,
+/// whichever way the engine holds it: as the `FontFamily::Custom` the
+/// UI's `ApplyFormatting` builds from the picked id, or as an unresolved
+/// `raw_font_family` name. On Word's default template (every slot bound
+/// to the theme through docDefaults):
+///
+/// a. A complex-script pick writes `w:cs="Sakkal Majalla"` and nothing
+///    for `w:ascii` / `w:hAnsi`: the reread resolves Calibri (theme) for
+///    the Latin text and Sakkal Majalla for the Arabic.
+/// b. A Latin pick writes `w:ascii` / `w:hAnsi` only; the Arabic stays on
+///    the theme's Arial.
+/// c. A both-slot pick (the ribbon) writes all three names.
+/// d. The zero-edit save is still byte-identical.
+pub fn run_unregistered_family_roundtrip() -> Result<()> {
+    const NAME: &str = "Sakkal Majalla";
+    let fixture = theme_word_default_docx();
+    let archive = read_docx(&fixture).context("read theme fixture")?;
+    let doc = &archive.document;
+    let body_len = THEME_FIXTURE_TEXTS[1].find("explicit").expect("needle");
+    let picked = r#"<w:t xml:space="preserve">Body text"#;
+    let some = |a: &str, b: &str| (Some(a.to_string()), Some(b.to_string()));
+    /* The UI path builds a `Custom` face from the picked id
+    (`engine-wasm`'s `parse_font_family`); a raw name is the other shape
+    an unresolvable family can take. Both must claim the same slots. */
+    let shapes = [
+        (
+            "Custom",
+            SpanStyle {
+                font_family: engine::FontFamily::from_id(NAME),
+                ..Default::default()
+            },
+        ),
+        (
+            "raw",
+            SpanStyle {
+                raw_font_family: Some(NAME.into()),
+                ..Default::default()
+            },
+        ),
+    ];
+    for (shape, latin) in shapes {
+        for (step, patch, rfonts, want) in [
+            (
+                "47a",
+                latin.clone().into_cs_only(),
+                format!(r#"<w:rFonts w:cs="{NAME}"/>"#),
+                some("Calibri", NAME),
+            ),
+            (
+                "47b",
+                latin.clone(),
+                format!(r#"<w:rFonts w:ascii="{NAME}" w:hAnsi="{NAME}"/>"#),
+                some(NAME, "Arial"),
+            ),
+            (
+                "47c",
+                latin.clone().with_cs_twins(),
+                format!(r#"<w:rFonts w:ascii="{NAME}" w:hAnsi="{NAME}" w:cs="{NAME}"/>"#),
+                some(NAME, NAME),
+            ),
+        ] {
+            let edited = doc.apply_style(at(1, 0), at(1, body_len), patch);
+            let bytes = write_docx(&archive, &edited)
+                .with_context(|| format!("step {step} ({shape}): write"))?;
+            assert_document_xml_well_formed(&bytes)
+                .with_context(|| format!("step {step} ({shape})"))?;
+            let out = String::from_utf8(extract_doc_xml(&bytes)?)?;
+            let run = format!("{rfonts}</w:rPr>{picked}");
+            if !out.contains(&run) {
+                bail!("step {step} ({shape}): expected the run to write {rfonts}:\n{out}");
+            }
+            let back = read_docx(&bytes).with_context(|| format!("step {step}: reread"))?;
+            if resolved(&back.document, 1) != want {
+                bail!(
+                    "step {step} ({shape}): the reread resolves {:?}, expected {want:?}",
+                    resolved(&back.document, 1)
+                );
+            }
+            if resolved(&back.document, 2) != some("Calibri", "Arial") {
+                bail!("step {step} ({shape}): an untouched paragraph changed its fonts");
+            }
+        }
+    }
+    let saved = write_docx(&archive, doc).context("zero-edit save")?;
+    if extract_doc_xml(&saved)? != extract_doc_xml(&fixture)? {
+        bail!("step 47d: zero-edit save drifted");
+    }
+    println!(
+        "[roundtrip] step 47 OK — an unregistered family ({NAME}) claims exactly the picked slot (cs-only → w:cs, Latin-only → w:ascii/w:hAnsi, both → all three; Custom and raw alike); zero-edit identity holds"
+    );
+    Ok(())
+}

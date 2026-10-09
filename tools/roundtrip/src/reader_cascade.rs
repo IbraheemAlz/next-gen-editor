@@ -76,7 +76,7 @@ const P_MARKED: &str = concat!(
 /// Paragraph 1: EMPTY, its mark bold.
 const P_EMPTY_BOLD: &str = r#"<w:p w14:paraId="0B000002" w:rsidR="00BB0002" w:rsidRDefault="00BB0002"><w:pPr><w:rPr><w:b/></w:rPr></w:pPr></w:p>"#;
 
-/// Issue #369 — step 47.
+/// Issue #369 — step 49.
 ///
 /// a. A bold + red mark over plain runs: the runs read plain (the italic
 ///    one italic only), the mark keeps its formatting, a zero-edit save
@@ -106,7 +106,7 @@ pub(crate) fn run_mark_formatting_roundtrip() -> Result<()> {
         bail!("document.xml drifted on a zero-edit save");
     }
     println!(
-        "[roundtrip] step 47a OK — a bold mark over plain runs reads plain runs; zero-edit save byte-identical"
+        "[roundtrip] step 49a OK — a bold mark over plain runs reads plain runs; zero-edit save byte-identical"
     );
 
     let typed = doc.insert_text(at(0, 2), "ai");
@@ -124,7 +124,7 @@ pub(crate) fn run_mark_formatting_roundtrip() -> Result<()> {
     if s.bold.is_some() || s.color.is_some() {
         bail!("the re-read inserted text took the mark's formatting: {s:?}");
     }
-    println!("[roundtrip] step 47b OK — typing under a bold mark stays plain through a save");
+    println!("[roundtrip] step 49b OK — typing under a bold mark stays plain through a save");
 
     let typed = doc.insert_text(at(1, 0), "loud");
     let bytes = save_both(&a, &typed)?;
@@ -151,7 +151,7 @@ pub(crate) fn run_mark_formatting_roundtrip() -> Result<()> {
     {
         bail!("the typed run lost its bold");
     }
-    println!("[roundtrip] step 47c OK — an empty bold-marked paragraph still types bold (#293)");
+    println!("[roundtrip] step 49c OK — an empty bold-marked paragraph still types bold (#293)");
     Ok(())
 }
 
@@ -193,7 +193,7 @@ fn prefixed_siblings_docx() -> (String, Vec<u8>) {
     (xml, docx)
 }
 
-/// Issue #394 — step 48.
+/// Issue #394 — step 50.
 ///
 /// a. `styles.xml` and `header1.xml` binding WordprocessingML to `x:` are
 ///    normalised before they are parsed: the style cascades, the header
@@ -248,7 +248,7 @@ pub(crate) fn run_sibling_prefix_roundtrip() -> Result<()> {
         bail!("warnings: {:?}", a.warnings);
     }
     println!(
-        "[roundtrip] step 48a OK — x:-prefixed styles.xml / header1.xml cascade and render, reported per part"
+        "[roundtrip] step 50a OK — x:-prefixed styles.xml / header1.xml cascade and render, reported per part"
     );
 
     let zero = save_both(&a, &a.document)?;
@@ -276,7 +276,7 @@ pub(crate) fn run_sibling_prefix_roundtrip() -> Result<()> {
         bail!("typing into the body is not a pure insertion");
     }
     println!(
-        "[roundtrip] step 48b OK — the normalised parts are regenerate-only and re-read silently; body edits stay pure insertions"
+        "[roundtrip] step 50b OK — the normalised parts are regenerate-only and re-read silently; body edits stay pure insertions"
     );
     Ok(())
 }
@@ -318,7 +318,7 @@ const STYLE_BORDERS: [&str; 7] = [
     "L:0000FF",
 ];
 
-/// Issue #395 — step 49 (`format_docx::test_fixtures::
+/// Issue #395 — step 51 (`format_docx::test_fixtures::
 /// styled_paragraph_borders_docx`: the corpus' Word `Title` style, a
 /// `basedOn` box, a direct nil, logical start edges on LTR / RTL styles
 /// and paragraphs).
@@ -345,7 +345,7 @@ pub(crate) fn run_style_borders_roundtrip() -> Result<()> {
         bail!("styles.xml drifted on a zero-edit save");
     }
     println!(
-        "[roundtrip] step 49a OK — style borders cascade per edge, by the paragraph's direction; zero-edit save byte-identical"
+        "[roundtrip] step 51a OK — style borders cascade per edge, by the paragraph's direction; zero-edit save byte-identical"
     );
 
     let typed = a.document.insert_text(at(0, 5), " page");
@@ -359,7 +359,7 @@ pub(crate) fn run_style_borders_roundtrip() -> Result<()> {
     if painted_borders(&b.document) != STYLE_BORDERS {
         bail!("re-read borders: {:?}", painted_borders(&b.document));
     }
-    println!("[roundtrip] step 49b OK — typing into a bordered Title is a pure insertion");
+    println!("[roundtrip] step 51b OK — typing into a bordered Title is a pure insertion");
 
     let modified = a.document.modify_style(
         "Box",
@@ -384,6 +384,6 @@ pub(crate) fn run_style_borders_roundtrip() -> Result<()> {
             painted_borders(&b.document)
         );
     }
-    println!("[roundtrip] step 49c OK — ModifyStyle writes the style borders back");
+    println!("[roundtrip] step 51c OK — ModifyStyle writes the style borders back");
     Ok(())
 }

@@ -20,7 +20,8 @@ import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
 import { createEngineStore, SCREEN_DPI_SCALE, type EngineStore } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
-import { installDevHook, resolveTelemetryEndpoint } from './dev-hooks';
+import { attachUnloadGuard } from './state/unload-guard';
+import { devHooksEnabled, installDevHook, resolveTelemetryEndpoint } from './dev-hooks';
 import { attachDragDrop } from './input/dnd';
 import { createFontRegistry, createTelemetryConfig, type FontRegistry } from '@nge/core';
 import type { Command, Event } from './engine/types';
@@ -101,28 +102,18 @@ async function setupEngine(
     });
 }
 
-/** D2.5: poll EngineStats every 5 s; log to console + a small debug div. */
+/** D2.5: poll EngineStats every 5 s into `window.__lastStats` - a dev /
+ *  live-validation hook, so it is started only under the dev-hooks flag
+ *  (`devHooksEnabled()`, issue #389). The visible readout lives in the
+ *  Dev HUD (`@nge/ui`, Ctrl+Shift+D), not in a fixed `#stats` box on every
+ *  page. */
 function startStatsPolling(client: EngineClient): void {
-    const debug = document.createElement('div');
-    debug.id = 'stats';
-    debug.style.cssText =
-        'position:fixed;right:8px;bottom:8px;padding:6px 10px;z-index:10;' +
-        'background:rgba(0,0,0,0.78);color:#5f5;border-radius:4px;' +
-        'font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre;';
-    document.body.appendChild(debug);
-
+    if (!devHooksEnabled()) return;
     const poll = async (): Promise<void> => {
         try {
             const evt = await client.dispatch({ type: 'REQUEST_STATS' });
             if (evt.type !== 'STATS') return;
-            const heapMiB = (evt.wasm_heap_bytes / (1024 * 1024)).toFixed(1);
-            const line =
-                `EngineStats — heap ${evt.wasm_heap_bytes} B (${heapMiB} MiB) · ` +
-                `tree ${evt.document_tree_bytes} B · undo depth ${evt.undo_stack_depth} · ` +
-                `fonts ${evt.fonts_resident} · glyph cache ${evt.glyph_cache_entries}`;
-            console.log(`[stats] ${line}`);
-            debug.textContent = line;
-            window.__lastStats = evt;
+            installDevHook('__lastStats', evt);
         } catch (e: unknown) {
             console.warn('[stats] poll failed', e);
         }
@@ -234,6 +225,11 @@ export function App() {
 
     /* §10 D4.10 — drop a .docx anywhere on the page to load it. */
     onMount(() => onCleanup(attachDragDrop(client)));
+
+    /* Issue #388 - a reload / tab close with unsaved edits raises the
+       browser's prompt (off via VITE_NGE_UNLOAD_GUARD=0 for hosts that
+       autosave); the next boot offers the session back regardless. */
+    onMount(() => onCleanup(attachUnloadGuard(client)));
 
     /* Engine scale follows monitor / browser-zoom DPR changes. A
        `matchMedia('(resolution: …dppx)')` query fires exactly once when

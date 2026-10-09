@@ -16,6 +16,8 @@ export PATH="/home/linuxbrew/.linuxbrew/bin:$HOME/.cargo/bin:$PATH"
 
 echo "=== 1. fmt ==="
 cargo fmt --all -- --check
+# fuzz/ is its own workspace: --all does not cover it (issue #412)
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
 echo "=== 2. clippy ==="
 cargo clippy --workspace --all-targets -- -D warnings
