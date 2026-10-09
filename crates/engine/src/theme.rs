@@ -1003,11 +1003,25 @@ mod tests {
             Some("Calibri")
         );
 
-        /* The toolbar (no bindings) claims ascii / hAnsi / cs. */
-        let toolbar = crate::SpanStyle {
+        /* A Latin-only pick (no bindings, `FontSlot::Latin`) claims
+        ascii / hAnsi alone — issue #249: Arabic keeps its theme face. */
+        let latin_only = crate::SpanStyle {
             font_family: Some(crate::FontFamily::Amiri),
             ..Default::default()
         };
+        let eff = defaults().merged_with(latin_only.clone());
+        assert_eq!(family(&eff, &t, FontClass::Latin).as_deref(), Some("Amiri"));
+        assert_eq!(
+            family(&eff, &t, FontClass::ComplexScript).as_deref(),
+            Some("Arial")
+        );
+        let b = eff.font_bindings.as_deref().unwrap();
+        assert_eq!(b.h_ansi, Some(FontBinding::Name));
+        assert_eq!(b.cs, theme_b("minorBidi"));
+
+        /* The toolbar (no bindings, both script slots — `with_cs_twins`)
+        claims ascii / hAnsi / cs. */
+        let toolbar = latin_only.with_cs_twins();
         let eff = defaults().merged_with(toolbar);
         assert_eq!(family(&eff, &t, FontClass::Latin).as_deref(), Some("Amiri"));
         assert_eq!(

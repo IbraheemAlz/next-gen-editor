@@ -683,13 +683,16 @@ pub fn theme_fonts_docx(theme_xml: &str) -> Vec<u8> {
         },
         engine::Paragraph {
             text: body.into(),
+            /* Issue #249 — both script slots, as the toolbar names them
+            (`w:ascii` / `w:hAnsi` / `w:cs`). */
             spans: vec![run(
                 body,
                 "explicit Amiri",
                 SpanStyle {
                     font_family: Some(engine::FontFamily::Amiri),
                     ..Default::default()
-                },
+                }
+                .with_cs_twins(),
             )],
             ..Default::default()
         },
@@ -738,8 +741,11 @@ pub fn theme_fonts_docx(theme_xml: &str) -> Vec<u8> {
         },
     ];
     let mut doc = engine::DocumentTree::from_rich_paragraphs(paras);
+    /* Issues #359 / #104 — every size / bold below names both script
+    slots (`w:sz` + `w:szCs`, `w:b` + `w:bCs`), as Word's template does. */
     doc.style_run_defaults = SpanStyle {
         font_size: Some(11.0),
+        font_size_cs: Some(11.0),
         font_theme: Some("minorHAnsi".into()),
         font_bindings: slots("minorHAnsi", "minorEastAsia", "minorBidi"),
         ..Default::default()
@@ -751,7 +757,9 @@ pub fn theme_fonts_docx(theme_xml: &str) -> Vec<u8> {
             name: "heading 1".into(),
             run: SpanStyle {
                 bold: Some(true),
+                bold_cs: Some(true),
                 font_size: Some(16.0),
+                font_size_cs: Some(16.0),
                 color: Some([0x2F, 0x54, 0x96, 255]),
                 color_theme: theme_color("accent1", None, Some("BF")),
                 font_theme: Some("majorHAnsi".into()),

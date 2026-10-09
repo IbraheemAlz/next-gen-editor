@@ -344,29 +344,15 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             its Arabic with the second (`w:cs` alone no longer becomes the
             Latin face either). `w:eastAsia` / `w:hint` stay unmodeled —
             the writer carries them over from the source element. */
-            let cs_name = attr_val(e, b"w:cs");
-            let cs_family = cs_name.as_deref().and_then(family_from_docx);
-            if let Some(fam) = cs_family.clone() {
+            let cs_family = attr_val(e, b"w:cs").and_then(|n| family_from_docx(&n));
+            let cs_modeled = cs_family.is_some();
+            if let Some(fam) = cs_family {
                 style.font_family_cs = Some(fam);
             }
             /* Issue #355 — the per-slot bindings layout resolves through
             (name vs theme reference per ascii / hAnsi / eastAsia / cs);
-            `w:cstheme` lives only here, on the `cs` slot. The canonical
-            all-names spelling reads as no bindings — the names themselves
-            claim the slots (`SpanStyle::merged_with`) — unless its `w:cs`
-            names a face the model cannot hold (no `font_family_cs`): then
-            the `cs` claim is kept explicit, or an inherited `w:cstheme`
-            would take that run's Arabic text over. */
-            style.font_bindings = crate::parts::theme::rfonts_bindings(e);
-            if style.font_bindings.is_none() && cs_name.is_some() && cs_family.is_none() {
-                use engine::FontBinding::Name;
-                style.font_bindings = Some(Box::new(engine::RunFontBindings {
-                    ascii: Some(Name),
-                    h_ansi: Some(Name),
-                    east_asia: attr_val(e, b"w:eastAsia").map(|_| Name),
-                    cs: Some(Name),
-                }));
-            }
+            `w:cstheme` lives only here, on the `cs` slot. */
+            style.font_bindings = crate::parts::theme::rfonts_bindings(e, cs_modeled);
         }
         /* `<w:sz w:val="N"/>` and `<w:szCs w:val="N"/>` — N is half-points
         (Word's native encoding; `w:val="24"` = 12 pt). `w:sz` sizes the
