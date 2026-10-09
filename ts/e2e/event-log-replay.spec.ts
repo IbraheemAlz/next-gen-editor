@@ -246,8 +246,6 @@ for (const corrupt of ['newest', 'all'] as const) {
             await expect(banner).toBeVisible();
             await expect(banner).toHaveAttribute('role', 'alert');
             await expect(banner).toHaveAttribute('data-kinds', 'log-truncated');
-            await expect(banner).toContainText('Your document could not be recovered');
-            await expect(banner).toContainText('Open your last saved copy');
         }
     });
 }
@@ -421,13 +419,8 @@ test('pruned log + all but the pinned base unreadable: the pinned base restores'
     await expect(banner).toBeVisible();
     await expect(banner).toHaveAttribute('role', 'alert');
     await expect(banner).toHaveAttribute('data-kinds', 'tail-dropped');
-    await expect(banner).toContainText('Recovered an earlier version of your document');
-    await expect(banner).toContainText('changes made after that were lost');
-    const hhmm = await page.evaluate(
-        (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        r.info.baseSnapshotAt as number,
-    );
-    await expect(banner).toContainText(`as it was at ${hhmm}`);
+    /* The notice copy (title, snapshot time, advice) is unit-tested in
+       packages/core/src/recovery.test.ts (#332); here only the wiring. */
     /* …and the Dev HUD carries the raw flags. */
     await page.evaluate(() => window.dispatchEvent(new Event('nge-toggle-hud')));
     await expect(page.locator('.nge-hud__recovery-base')).toContainText('pinned snapshot');
@@ -561,8 +554,6 @@ test('pruned log + the package row lost: the recovered loss is visible (#315)', 
     await expect(banner).toBeVisible();
     await expect(banner).toHaveAttribute('role', 'alert');
     await expect(banner).toHaveAttribute('data-kinds', 'package-lost');
-    await expect(banner).toContainText('Parts of the original file could not be restored');
-    await expect(banner).toContainText('Save As');
     await page.evaluate(() => window.dispatchEvent(new Event('nge-toggle-hud')));
     await expect(page.locator('.nge-hud__recovery-losses')).toHaveText('package lost');
 });
@@ -674,8 +665,6 @@ test('exhausted snapshot-write retries raise the "not being checkpointed" warnin
     await expect(banner).toBeVisible({ timeout: 40_000 });
     await expect(banner).toHaveAttribute('role', 'alert');
     await expect(banner).toHaveAttribute('data-kinds', 'checkpoint-failing');
-    await expect(banner).toContainText('Changes are not being checkpointed');
-    await expect(banner).toContainText('Save your work');
     expect(
         await page.evaluate(() => (window as any).__engineClient.checkpointFailures as number),
         'initial write + 3 retries',
