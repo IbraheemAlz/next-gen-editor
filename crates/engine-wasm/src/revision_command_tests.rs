@@ -58,7 +58,7 @@ fn review_engine() -> Engine {
         DocumentTree::from_paragraphs(["drop hello ".into(), "world tail".into(), "last".into()]);
     if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0) {
         p.revisions.push(rev(engine::RevisionKind::Delete, 0, 5));
-        p.mark_revision = Some(rev(engine::RevisionKind::Delete, 0, 0));
+        p.mark_revisions = vec![rev(engine::RevisionKind::Delete, 0, 0)];
     }
     let (doc, _) = doc.insert_comment(
         EnginePos::new(EngineBlockPath::top(1), 0),
@@ -164,7 +164,7 @@ fn a_mark_revision_paints_a_pilcrow_without_moving_geometry() {
     let mut without = review_engine();
     let mut doc = without.undo.current().clone();
     if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0) {
-        p.mark_revision = None;
+        p.mark_revisions.clear();
     }
     without.undo = UndoStack::new(doc, 100);
     let (pages_a, ..) = with_mark.build_pages(1.0, false, None).expect("layout");

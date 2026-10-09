@@ -136,9 +136,14 @@ const MAX_PAGES: usize = 2000;
 /// the layout engine's robustness against extreme/malformed structural
 /// trees (zero-size cells, mismatched grid/row column counts, degenerate
 /// page geometry), not about `.docx` parsing or the RPC surface.
+///
+/// Issue #318 — a [`layout_gen::NESTING_MAGIC`]-prefixed input is a tower
+/// of nested tables up to [`layout_gen::MAX_FUZZ_NESTING`] deep instead
+/// (`corpus/layout_paginate/seed_nested_200`): the cost of nested-table
+/// layout used to grow like `F(2·depth)`, so a deep tower hung the target
+/// (libFuzzer `-timeout`) instead of degrading with `NestingCapped`.
 pub fn run_layout_paginate(data: &[u8]) {
-    let mut u = Unstructured::new(data);
-    let doc = layout_gen::gen_document_tree(&mut u);
+    let doc = layout_gen::gen_layout_document(data);
     let mut engine = engine_wasm::Engine::new_headless(doc);
     if engine.ensure_layout_for_fuzzing().is_err() {
         // A missing font / layout config is an engine setup error, not a
@@ -254,5 +259,27 @@ pub fn run_format_pdf_image_decode(data: &[u8]) {
             // assert; the exporter turns this into a `PdfWarning` and
             // leaves the image's rect blank (never a panic).
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// libFuzzer always executes the zero-length input first, and under
+    /// `-fork` every worker attributes an exit-time failure to it (that is
+    /// how the nightly lane produced the empty reproducers of issues 323
+    /// and 324). Every target body must take it without panicking. The
+    /// leak that actually tripped LeakSanitizer is only observable under
+    /// the nightly sanitizer runtime; its stable guards are
+    /// `LoadedFont::parse`'s unit test and the process-wide font shared by
+    /// `Engine::new_headless`.
+    #[test]
+    fn every_target_body_accepts_the_empty_input() {
+        run_docx_reader(&[]);
+        run_docx_roundtrip(&[]);
+        run_rpc_command(&[]);
+        run_layout_paginate(&[]);
+        run_format_pdf_image_decode(&[]);
     }
 }

@@ -18,6 +18,23 @@
 //!     --out /data/corpus/results.jsonl
 //! ```
 //!
+//! ## Production layout timing (issue #318)
+//!
+//! The reduced layout above flattens tables, so it can never see a
+//! table-layout cost. Each document is therefore also laid out by the
+//! PRODUCTION pipeline (`engine-wasm`'s `Engine::build_pages`, through its
+//! canvas-less `fuzz-native` surface) and the record carries
+//! `engine_layout_ms`, `engine_page_count`, `engine_fingerprint` (the
+//! `layout::geometry_fingerprint`, so two runs on two engine builds diff
+//! document by document) and `engine_degradations`. The stage runs under a
+//! per-document budget, `--layout-budget-ms` (default
+//! [`DEFAULT_LAYOUT_BUDGET_MS`]): a layout still running past it reports
+//! `outcome: "timeout"`, `stage: "engine_layout"` with every other column
+//! intact, instead of stalling the run until `--timeout-secs` kills the
+//! worker. `--no-engine-layout` skips the stage; `--time` prints one
+//! timing line per document and the slowest production layouts at the
+//! end.
+//!
 //! ## Why every document runs in its own subprocess
 //!
 //! `pipeline::run_one` wraps every stage in `catch_unwind`, which catches
@@ -63,7 +80,18 @@ struct Args {
     /// `<name>.resaved.xml` for every document whose zero-edit resave is
     /// not byte-identical, so the drift can be diffed.
     dump_drift: Option<PathBuf>,
+    /// Issue #318 — `--no-engine-layout` / `--layout-budget-ms N`.
+    engine: pipeline::EngineLayoutOpts,
+    /// Issue #318 — `--time`: one timing line per document on stderr and
+    /// the slowest production layouts in the summary.
+    time: bool,
 }
+
+/// Issue #318 — default per-document production-layout budget. Every
+/// document of the local corpus lays out in well under a second; ten is
+/// generous headroom for a slow CI box while still far below the
+/// `--timeout-secs` backstop.
+const DEFAULT_LAYOUT_BUDGET_MS: u64 = 10_000;
 
 fn parse_args() -> Args {
     let mut corpus_dir = PathBuf::from("/data/corpus/files");
@@ -73,6 +101,11 @@ fn parse_args() -> Args {
     let mut timeout_secs: u64 = 60;
     let mut worker = None;
     let mut dump_drift = None;
+    let mut engine = pipeline::EngineLayoutOpts {
+        enabled: true,
+        budget: Duration::from_millis(DEFAULT_LAYOUT_BUDGET_MS),
+    };
+    let mut time = false;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -117,6 +150,14 @@ fn parse_args() -> Args {
                     dump_drift = Some(PathBuf::from(v));
                 }
             }
+            "--no-engine-layout" => engine.enabled = false,
+            "--layout-budget-ms" => {
+                i += 1;
+                if let Some(v) = raw.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    engine.budget = Duration::from_millis(v);
+                }
+            }
+            "--time" => time = true,
             other => {
                 eprintln!("[corpus-native] warning: unrecognized arg `{other}`");
             }
@@ -132,6 +173,8 @@ fn parse_args() -> Args {
         timeout_secs,
         worker,
         dump_drift,
+        engine,
+        time,
     }
 }
 
@@ -139,7 +182,12 @@ fn parse_args() -> Args {
 /// print its JSON record to stdout. This process is expected to sometimes
 /// die abnormally (that IS the thing being tested) — the parent driver
 /// interprets a non-JSON stdout / non-zero exit as [`pipeline::Outcome::Crash`].
-fn run_worker(path: &Path, with_edit: bool, dump_drift: Option<&Path>) -> ExitCode {
+fn run_worker(
+    path: &Path,
+    with_edit: bool,
+    dump_drift: Option<&Path>,
+    engine: pipeline::EngineLayoutOpts,
+) -> ExitCode {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -152,7 +200,7 @@ fn run_worker(path: &Path, with_edit: bool, dump_drift: Option<&Path>) -> ExitCo
     };
     let fonts = fonts::bundled_stack();
     let label = path.to_string_lossy();
-    let rec = pipeline::run_one(&label, &bytes, &fonts, with_edit, dump_drift);
+    let rec = pipeline::run_one(&label, &bytes, &fonts, with_edit, dump_drift, engine);
     match serde_json::to_string(&rec) {
         Ok(json) => {
             println!("{json}");
@@ -169,23 +217,30 @@ fn run_worker(path: &Path, with_edit: bool, dump_drift: Option<&Path>) -> ExitCo
 /// wall-clock `timeout`. See the module docs for why this is a process, not
 /// a thread. Reads the child's stdout to EOF on a helper thread so a slow
 /// child can never deadlock this driver on a full pipe buffer; a timeout
-/// kills the child outright (a real, unlike-a-thread cancellation).
+/// kills the child outright (a real, unlike-a-thread cancellation). The
+/// worker inherits the per-document switches of `args` (`--no-edit`,
+/// `--dump-drift`, and the issue #318 production-layout stage).
 fn run_in_subprocess(
     exe: &Path,
     doc_path: &Path,
     label: &str,
     size_bytes: u64,
-    with_edit: bool,
     timeout: Duration,
-    dump_drift: Option<&Path>,
+    args: &Args,
 ) -> pipeline::DocResult {
     let mut cmd = Command::new(exe);
     cmd.arg("--worker").arg(doc_path);
-    if !with_edit {
+    if !args.with_edit {
         cmd.arg("--no-edit");
     }
-    if let Some(dir) = dump_drift {
+    if let Some(dir) = &args.dump_drift {
         cmd.arg("--dump-drift").arg(dir);
+    }
+    if args.engine.enabled {
+        cmd.arg("--layout-budget-ms")
+            .arg(args.engine.budget.as_millis().to_string());
+    } else {
+        cmd.arg("--no-engine-layout");
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -304,7 +359,12 @@ fn main() -> ExitCode {
     let args = parse_args();
 
     if let Some(worker_path) = &args.worker {
-        return run_worker(worker_path, args.with_edit, args.dump_drift.as_deref());
+        return run_worker(
+            worker_path,
+            args.with_edit,
+            args.dump_drift.as_deref(),
+            args.engine,
+        );
     }
 
     if !args.corpus_dir.is_dir() {
@@ -403,6 +463,12 @@ fn main() -> ExitCode {
     let mut comment_delete_clean = 0usize;
     let mut rewrite_causes: std::collections::BTreeMap<String, (usize, String, u64)> =
         std::collections::BTreeMap::new();
+    /* Issue #318 — production-layout timings `(ms, label)`, the
+    documents that blew the budget, and a degradation-reason histogram. */
+    let mut engine_times: Vec<(u128, String)> = Vec::new();
+    let mut engine_over_budget: Vec<String> = Vec::new();
+    let mut engine_reasons: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     for (i, path) in files.iter().enumerate() {
         let label = path
             .strip_prefix(&args.corpus_dir)
@@ -411,21 +477,41 @@ fn main() -> ExitCode {
             .replace('\\', "/");
         let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-        let rec = run_in_subprocess(
-            &exe,
-            path,
-            &label,
-            size_bytes,
-            args.with_edit,
-            timeout,
-            args.dump_drift.as_deref(),
-        );
+        let rec = run_in_subprocess(&exe, path, &label, size_bytes, timeout, &args);
         match rec.outcome {
             pipeline::Outcome::Ok => ok += 1,
             pipeline::Outcome::Error => errors += 1,
             pipeline::Outcome::Panic => panicked += 1,
             pipeline::Outcome::Timeout => timed_out += 1,
             pipeline::Outcome::Crash => crashed += 1,
+        }
+        if let Some(ms) = rec.engine_layout_ms {
+            engine_times.push((ms, label.clone()));
+        }
+        if rec.outcome == pipeline::Outcome::Timeout
+            && rec.stage.as_deref() == Some("engine_layout")
+        {
+            engine_over_budget.push(label.clone());
+        }
+        let mut seen: Vec<&String> = Vec::new();
+        for reason in &rec.engine_degradations {
+            if !seen.contains(&reason) {
+                seen.push(reason);
+                *engine_reasons.entry(reason.clone()).or_insert(0) += 1;
+            }
+        }
+        if args.time {
+            let ms = |v: Option<u128>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
+            eprintln!(
+                "[corpus-native] time {label}: outcome={:?} engine_layout_ms={} \
+                 engine_pages={} reduced_layout_ms={} elapsed_ms={}",
+                rec.outcome,
+                ms(rec.engine_layout_ms),
+                rec.engine_page_count
+                    .map_or_else(|| "-".to_string(), |v| v.to_string()),
+                ms(rec.layout_ms),
+                rec.elapsed_ms
+            );
         }
         if let Some(identical) = rec.document_xml_byte_identical {
             noedit_checked += 1;
@@ -566,6 +652,32 @@ fn main() -> ExitCode {
             println!(
                 "[corpus-native]   {count:5}  {cause:<14} e.g. {example_path} ({example_bytes} B)"
             );
+        }
+    }
+    /* Issue #318 — the production layout's cost and degradations. */
+    if args.engine.enabled {
+        engine_times.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let total: u128 = engine_times.iter().map(|(ms, _)| ms).sum();
+        println!(
+            "[corpus-native] production layout (#318): {} laid out, {total} ms total, \
+             {} over the {} ms budget",
+            engine_times.len(),
+            engine_over_budget.len(),
+            args.engine.budget.as_millis()
+        );
+        for label in &engine_over_budget {
+            println!("[corpus-native]   over budget: {label}");
+        }
+        if args.time {
+            for (ms, label) in engine_times.iter().take(10) {
+                println!("[corpus-native]   {ms:7} ms  {label}");
+            }
+        }
+        if !engine_reasons.is_empty() {
+            println!("[corpus-native] production layout degradation reasons (docs):");
+            for (reason, count) in &engine_reasons {
+                println!("[corpus-native]   {count:5}  {reason}");
+            }
         }
     }
     println!("[corpus-native] JSONL written to {}", args.out.display());

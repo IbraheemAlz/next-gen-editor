@@ -405,8 +405,12 @@ struct LazyLayoutInfo {
     /// next section (L2.3, #8), so the page is laid out unbalanced here
     /// and balanced in any band that gets further; pages from this index
     /// on are excluded from the verified prefix (`layout::
-    /// verify_prefix_open`). `None` — every page is final (up to the
-    /// usual partial last page).
+    /// verify_prefix_open`). Issue #181 — likewise when the cull stopped
+    /// while a footnote cut on that page still waits for its
+    /// continuation (`Paginator::has_pending_note_continuation`): the
+    /// band drains it onto notes-only pages that a longer band shares
+    /// with body text. `None` — every page is final (up to the usual
+    /// partial last page).
     open_from_page: Option<usize>,
 }
 
@@ -475,7 +479,42 @@ fn shift_pos_across_tocs(
 
 /// Issue #87 — record a sub-paginator degradation (no page index).
 fn note_layout_degradation(reason: LayoutDegradeReason) {
+    /* Issue #318 — the sink's strict switch, the counterpart of
+    `Paginator::with_strict_watchdog`: a recovery under test becomes a
+    hard failure instead of a silent note. */
+    #[cfg(test)]
+    assert!(
+        !STRICT_LAYOUT_NOTES.with(std::cell::Cell::get),
+        "layout watchdog (strict): {reason:?}"
+    );
     LAYOUT_NOTES.with(|n| n.borrow_mut().push(LayoutDegraded { reason, page: None }));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Issue #318 — see [`StrictLayoutNotes`].
+    static STRICT_LAYOUT_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Issue #318 — test-only: while alive, every sub-paginator degradation
+/// note on this thread (`NestingCapped`, `AutofitCap`, `CacheMismatch`)
+/// panics, the way a strict `layout::Watchdog` turns its notes into hard
+/// failures — CI catches a new recovery instead of a silent note.
+#[cfg(test)]
+struct StrictLayoutNotes(bool);
+
+#[cfg(test)]
+impl StrictLayoutNotes {
+    fn on() -> Self {
+        Self(STRICT_LAYOUT_NOTES.with(|s| s.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for StrictLayoutNotes {
+    fn drop(&mut self) {
+        STRICT_LAYOUT_NOTES.with(|s| s.set(self.0));
+    }
 }
 
 /// Issue #87 — take every note recorded since the last drain.
@@ -503,6 +542,8 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::WrapPolygonFallback => LayoutDegradeReason::WrapPolygonFallback,
         R::PageRefCap => LayoutDegradeReason::PageRefCap,
         R::NoteRestartCap => LayoutDegradeReason::NoteRestartCap,
+        R::FloatClampedByNotes => LayoutDegradeReason::FloatClampedByNotes,
+        R::NestingCapped => LayoutDegradeReason::NestingCapped,
     };
     LayoutDegraded {
         reason,
@@ -1244,10 +1285,11 @@ impl Engine {
                         mark: false,
                     });
                 }
-                /* Issue #262 — the paragraph-mark revision, addressed as
+                /* Issue #262 — the paragraph-mark revisions, addressed as
                 the empty range at the paragraph end (what
-                `AcceptRevision` / `RejectRevision` resolve it by). */
-                if let Some(r) = &p.mark_revision {
+                `AcceptRevision` / `RejectRevision` resolve it by — the
+                FIRST of several, issue #303: one row each, in order). */
+                for r in &p.mark_revisions {
                     let end = p.text.len() as u32;
                     rows.push(RevisionOut {
                         block: block_idx as u32,
@@ -1979,9 +2021,11 @@ const REVISION_MOVE_COLOR: [u8; 4] = [0x6A, 0x1B, 0x9A, 0xFF];
 
 /// Issue #262 — the pilcrow colour of a paragraph whose MARK carries a
 /// tracked change (paint-only review decoration), in the same tint as
-/// the matching text revision.
+/// the matching text revision. Issue #303 — a mark carrying several
+/// changes shows its LATEST state (an inserted-then-deleted mark reads
+/// as deleted).
 fn review_mark_color(para: &engine::Paragraph) -> Option<[u8; 4]> {
-    para.mark_revision.as_ref().map(|r| match r.kind {
+    para.mark_revisions.last().map(|r| match r.kind {
         engine::RevisionKind::Insert => REVISION_INSERT_COLOR,
         engine::RevisionKind::Delete => REVISION_DELETE_COLOR,
         engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => REVISION_MOVE_COLOR,
@@ -4241,15 +4285,109 @@ fn tab_stops_to_layout_px(
 Phase 5 PR 2 — table layout
 ==================================================================== */
 
+/// Issue #318 — deepest table nesting level laid out as a grid. The
+/// outermost table of a story is level 0; a table at this level or deeper
+/// is flattened to its paragraphs, in document (walk) order, stacked in
+/// the cell that holds it — a paint, never a hang — and the layout
+/// reports [`LayoutDegradeReason::NestingCapped`]. Thirty-two levels is
+/// far beyond any human-authored document (the deepest in the real-world
+/// corpus is four) yet keeps every box-tree walker downstream (paginator,
+/// renderer, PDF export, hit-testing) inside a bounded recursion; the
+/// reader keeps typed nesting up to `MAX_TABLE_NESTING_DEPTH` (64) and a
+/// command- or fuzz-built tree is not bounded at all.
+const MAX_TABLE_LAYOUT_DEPTH: u32 = 32;
+
+/// Issue #318 — ONE top-level table layout: the inputs every nested call
+/// shares, plus the memo that lays each inner table out once per width.
+///
+/// Every level of a nested table used to re-lay every descendant once
+/// per autofit pass — the probe layout, the min-content probe (a nested
+/// autofit at width 1.0) and the final layout — so a `d`-deep tower cost
+/// `F(2d)` grid layouts (≈ 2.618^d; 46 368 at depth 12, never finishing
+/// at the reader's 64-level cap). The memo collapses that to one grid
+/// layout per (inner table, available width), one autofit solve per
+/// (table, width, grid hint) and one intrinsic-width measure per cell;
+/// the autofit probe reads a nested table's width off its column solve
+/// ([`cell_natural_width`]) instead of laying it out, so an inner table
+/// is laid out only at the widths final layouts offer it — once per
+/// level for a tower.
+///
+/// Memo keys are the ADDRESS of the subtree in the tree being laid out:
+/// the tree is borrowed immutably for the whole call and every other
+/// layout input (fonts, config, scale, style context) is fixed per
+/// instance, so the address identifies the subtree's content exactly —
+/// no hash to collide, nothing to forget to mix in. The memo never
+/// outlives the call (an address is meaningless after it). Hits are
+/// still verified (issue #87 doctrine: a fast path is a prediction) —
+/// [`cached_table_is_consistent`] and friends — and a hit that fails is
+/// re-laid from scratch with a `CacheMismatch` note.
+struct TableLayout<'r, 'a> {
+    fonts: &'r FontStack,
+    cfg: &'r RenderConfig,
+    scale: f32,
+    sctx: StyleContext<'a>,
+    cache: &'r mut LruCache<u64, ParagraphBox>,
+    /// `(inner table address, available width bits)` → its laid-out box.
+    boxes: HashMap<(usize, u32), TableBox>,
+    /// `(table address, available width bits, grid hint given)` → the
+    /// autofit column widths.
+    columns: HashMap<(usize, u32, bool), Vec<f32>>,
+    /// `(cell blocks address, block count)` → `(min_content,
+    /// max_content)` — width-independent, measured once per cell.
+    intrinsic: HashMap<(usize, usize), (f32, f32)>,
+    /// Table past the cap address → its flattened paragraphs'
+    /// `(min_content, max_content)`.
+    flat_intrinsic: HashMap<usize, (f32, f32)>,
+    /// A table past [`MAX_TABLE_LAYOUT_DEPTH`] was flattened.
+    nesting_capped: bool,
+}
+
+impl<'r, 'a> TableLayout<'r, 'a> {
+    fn new(
+        fonts: &'r FontStack,
+        cfg: &'r RenderConfig,
+        scale: f32,
+        sctx: StyleContext<'a>,
+        cache: &'r mut LruCache<u64, ParagraphBox>,
+    ) -> Self {
+        Self {
+            fonts,
+            cfg,
+            scale,
+            sctx,
+            cache,
+            boxes: HashMap::new(),
+            columns: HashMap::new(),
+            intrinsic: HashMap::new(),
+            flat_intrinsic: HashMap::new(),
+            nesting_capped: false,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Issue #318 — grid layouts actually run (memo misses), so a test
+    /// can pin the per-level cost of a nested tower.
+    static TABLE_GRID_LAYOUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Issue #318 — autofit column solves actually run (memo misses).
+    static AUTOFIT_SOLVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Lay out an `engine::Table` into a `layout::TableBox`. Column widths
 /// come straight from `<w:tblGrid>` (literal twips → px); cells with
 /// `grid_span > 1` consume the sum of their N spanned columns. Each
-/// cell's content recursively lays out via [`layout_block_for_layout`]
+/// cell's content recursively lays out via [`layout_cell_blocks`]
 /// so nested tables work. Row height = max cell measured height,
 /// skipping `VMergeRole::Continue` cells (their content is owned by
 /// the matching `Restart` cell — Phase 5c will accumulate Restart
 /// cell heights across the merged span; PR 2 simply renders the
 /// Restart cell at the row's natural height).
+///
+/// Issue #318 — the entry point of ONE top-level table (body, band,
+/// note, text-box story): nested tables go through the [`TableLayout`]
+/// memo, and a table nested past [`MAX_TABLE_LAYOUT_DEPTH`] is
+/// flattened with one `NestingCapped` note for the whole table.
 fn layout_table_box(
     table: &engine::Table,
     available_width_px: f32,
@@ -4259,47 +4397,159 @@ fn layout_table_box(
     sctx: StyleContext,
     cache: &mut LruCache<u64, ParagraphBox>,
 ) -> TableBox {
-    /* Column widths in device px. Decision tree:
-    - `<w:tblLayout w:type="fixed"/>` AND grid present → use grid as-is.
-    - Default (Autofit) AND grid present → start with grid, then run
-      the autofit measure-then-distribute pass to right-size each
-      column to its content (audit gap A.M8).
-    - Grid absent → autofit always, the grid simply has no anchor. */
-    let mut columns: Vec<f32> = if table.grid.is_empty() {
-        Vec::new()
-    } else {
-        table
-            .grid
-            .iter()
-            .map(|&t| twips_to_layout_px(t, scale))
-            .collect()
-    };
-    /* Audit gap A.M8 — autofit. Measure each column's intrinsic
-    natural width (max line width across all cells in that column at
-    a generous probe width), then redistribute `available_width_px`
-    so wide columns get more room and narrow columns aren't forced
-    to wrap their longest unbreakable word. Single-pass: re-uses the
-    cell layout result from the measure pass as the layout (no second
-    layout call for unchanged column widths). */
-    if matches!(table.props.layout, engine::TableLayout::Autofit) {
-        columns = autofit_distribute(
-            table,
-            available_width_px,
-            fonts,
-            cfg,
-            scale,
-            &columns,
-            sctx,
-            cache,
-        );
+    let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
+    let laid = layout_table_box_uncached(&mut tl, table, available_width_px, 0);
+    if tl.nesting_capped {
+        note_layout_degradation(LayoutDegradeReason::NestingCapped);
     }
+    laid
+}
 
+/// Issue #318 — the memo address of a model node (see [`TableLayout`]).
+fn node_addr<T>(node: &T) -> usize {
+    std::ptr::from_ref(node) as usize
+}
+
+/// Issue #318 — an inner table (nesting `depth` ≥ 1) at
+/// `available_width_px`, laid out once per width per top-level layout.
+fn layout_table_box_at(
+    tl: &mut TableLayout<'_, '_>,
+    table: &engine::Table,
+    available_width_px: f32,
+    depth: u32,
+) -> TableBox {
+    let key = (node_addr(table), available_width_px.to_bits());
+    if let Some(hit) = tl.boxes.get(&key) {
+        if cached_table_is_consistent(hit, table) {
+            return hit.clone();
+        }
+        tl.boxes.remove(&key);
+        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+    }
+    let laid = layout_table_box_uncached(tl, table, available_width_px, depth);
+    tl.boxes.insert(key, laid.clone());
+    laid
+}
+
+/// Issue #318 — post-conditions a memoized `TableBox` must satisfy for
+/// the table it is about to stand in for (the [`cached_paragraph_is_consistent`]
+/// counterpart): one row box per model row, in order, each with one cell
+/// box per model cell carrying the cell's span and vertical-merge role.
+/// O(rows + cells).
+fn cached_table_is_consistent(cached: &TableBox, table: &engine::Table) -> bool {
+    cached.rows.len() == table.rows.len()
+        && cached
+            .rows
+            .iter()
+            .zip(&table.rows)
+            .enumerate()
+            .all(|(i, (row_box, row))| {
+                row_box.source_row == i as u32
+                    && row_box.cells.len() == row.cells.len()
+                    && row_box
+                        .cells
+                        .iter()
+                        .zip(&row.cells)
+                        .all(|(cell_box, cell)| {
+                            cell_box.grid_span == cell.props.grid_span.max(1)
+                                && cell_box.v_merge == cell.props.v_merge
+                        })
+            })
+}
+
+/// Issue #318 — the paragraphs of a table past the nesting cap, in the
+/// order `walk_block_texts` (and so `source_paragraph_id`, the PDF text
+/// table) visits them: rows, then cells (vertical-merge continuations
+/// own no content), then each cell's blocks, nested tables in place.
+/// Iterative — the subtree past the cap may itself be arbitrarily deep.
+fn flatten_table_paragraphs(table: &engine::Table) -> Vec<&engine::Paragraph> {
+    fn push_cells<'t>(t: &'t engine::Table, stack: &mut Vec<std::slice::Iter<'t, engine::Block>>) {
+        /* Reversed, so the first cell is walked first. */
+        for row in t.rows.iter().rev() {
+            for cell in row.cells.iter().rev() {
+                if cell.props.v_merge != engine::VMergeRole::Continue {
+                    stack.push(cell.blocks.iter());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut stack = Vec::new();
+    push_cells(table, &mut stack);
+    while let Some(top) = stack.last_mut() {
+        match top.next() {
+            None => {
+                stack.pop();
+            }
+            Some(engine::Block::Paragraph(p)) => out.push(p),
+            Some(engine::Block::Table(t)) => push_cells(t, &mut stack),
+        }
+    }
+    out
+}
+
+/// Column widths in device px for `table` in a band
+/// `available_width_px` wide. Decision tree:
+/// - `<w:tblLayout w:type="fixed"/>` AND grid present → use grid as-is.
+/// - Default (Autofit) AND grid present → start with grid, then run
+///   the autofit measure-then-distribute pass to right-size each
+///   column to its content (audit gap A.M8).
+/// - Grid absent → autofit always, the grid simply has no anchor.
+///
+/// Audit gap A.M8 — autofit. Measure each column's intrinsic natural
+/// width (max line width across all cells in that column at a generous
+/// probe width), then redistribute `available_width_px` so wide columns
+/// get more room and narrow columns aren't forced to wrap their longest
+/// unbreakable word.
+///
+/// Issue #318 — shared by the grid layout and the autofit probe's width
+/// measure of a nested table ([`cell_natural_width`]), so the two can
+/// never disagree.
+fn table_columns(
+    tl: &mut TableLayout<'_, '_>,
+    table: &engine::Table,
+    available_width_px: f32,
+    depth: u32,
+) -> Vec<f32> {
+    let grid: Vec<f32> = table
+        .grid
+        .iter()
+        .map(|&t| twips_to_layout_px(t, tl.scale))
+        .collect();
+    if matches!(table.props.layout, engine::TableLayout::Autofit) {
+        autofit_distribute_at(tl, table, available_width_px, &grid, depth)
+    } else {
+        grid
+    }
+}
+
+/// A table's laid-out width (`TableBox::size.width`): its columns' sum,
+/// or the whole band when that is not positive (no grid information).
+/// Neither `mirror_bidi_visual` nor `place_table` changes it.
+fn table_width_of(columns: &[f32], available_width_px: f32) -> f32 {
+    let width = columns.iter().sum::<f32>();
+    if width <= 0.0 {
+        available_width_px
+    } else {
+        width
+    }
+}
+
+/// One grid layout of `table` (nesting level `depth`) — the body of
+/// [`layout_table_box`], reached through the memo for inner tables.
+fn layout_table_box_uncached(
+    tl: &mut TableLayout<'_, '_>,
+    table: &engine::Table,
+    available_width_px: f32,
+    depth: u32,
+) -> TableBox {
+    #[cfg(test)]
+    TABLE_GRID_LAYOUTS.with(|n| n.set(n.get() + 1));
+    let scale = tl.scale;
+    let columns = table_columns(tl, table, available_width_px, depth);
     let mut rows_out: Vec<TableRowBox> = Vec::with_capacity(table.rows.len());
     let mut y = 0.0_f32;
-    let mut table_width = columns.iter().sum::<f32>();
-    if table_width <= 0.0 {
-        table_width = available_width_px;
-    }
+    let table_width = table_width_of(&columns, available_width_px);
     for row in &table.rows {
         let mut cells_out: Vec<TableCellBox> = Vec::with_capacity(row.cells.len());
         let mut x = 0.0_f32;
@@ -4328,8 +4578,7 @@ fn layout_table_box(
             let pad_left = twips_to_layout_px(eff.left_twips, scale);
             let pad_right = twips_to_layout_px(eff.right_twips, scale);
             let content_width = (cell_width - pad_left - pad_right).max(0.0);
-            let inner_blocks =
-                layout_cell_blocks(&cell.blocks, content_width, fonts, cfg, scale, sctx, cache);
+            let inner_blocks = layout_cell_blocks(tl, &cell.blocks, content_width, depth + 1);
             let content_height: f32 = inner_blocks.iter().map(|b| b.size().height).sum();
             /* `VMergeRole::Continue` cells contribute zero — the matching
             `Restart` cell visually owns the merged region. */
@@ -4509,32 +4758,22 @@ fn layout_table_box(
 /// once more at the final widths in the caller. Total ≈ 3× a fixed-
 /// grid table for autofit. Bounded for typical tables; infinite-loop
 /// risk in the iterative shrink is zero because each iteration pins
-/// strictly more columns or terminates.
-#[allow(clippy::too_many_arguments)]
-fn autofit_distribute(
+/// strictly more columns or terminates. Issue #318 — a NESTED table's
+/// share of those passes no longer compounds per nesting level: the
+/// probe reads its width off its (memoized) column solve
+/// ([`cell_natural_width`]) and its intrinsic widths are measured once
+/// per cell ([`measure_unbreakable_width_at`]).
+fn autofit_distribute_uncached(
+    tl: &mut TableLayout<'_, '_>,
     table: &engine::Table,
     available_width_px: f32,
-    fonts: &FontStack,
-    cfg: &RenderConfig,
-    scale: f32,
     grid_hint: &[f32],
-    sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    depth: u32,
 ) -> Vec<f32> {
-    /* Number of columns: max(grid, max row's cell-count). The grid
-    might be empty; cells might over-/under-shoot it; take the union. */
-    let max_cols_in_rows = table
-        .rows
-        .iter()
-        .map(|r| {
-            r.cells
-                .iter()
-                .map(|c| c.props.grid_span.max(1) as usize)
-                .sum::<usize>()
-        })
-        .max()
-        .unwrap_or(0);
-    let n_cols = grid_hint.len().max(max_cols_in_rows);
+    #[cfg(test)]
+    AUTOFIT_SOLVES.with(|n| n.set(n.get() + 1));
+    let scale = tl.scale;
+    let n_cols = autofit_column_count(table, grid_hint);
     if n_cols == 0 {
         return Vec::new();
     }
@@ -4562,9 +4801,7 @@ fn autofit_distribute(
             let pad = twips_to_layout_px(eff.left_twips + eff.right_twips, scale);
             /* Lay out at the probe width — max line width across all
             paragraphs is the natural fit. */
-            let inner =
-                layout_cell_blocks(&cell.blocks, probe_width, fonts, cfg, scale, sctx, cache);
-            let natural_content_w = block_max_width(&inner);
+            let natural_content_w = cell_natural_width(tl, &cell.blocks, probe_width, depth + 1);
             let cell_natural = natural_content_w + pad;
             let share = cell_natural / span as f32;
             for i in 0..span {
@@ -4579,7 +4816,7 @@ fn autofit_distribute(
             longest atom that cannot be split. Padding is folded into
             the floor on the same basis as the natural measure. */
             let (cell_min_content, _cell_max_content) =
-                measure_unbreakable_width(&cell.blocks, sctx, fonts, cfg, scale, cache);
+                measure_unbreakable_width_at(tl, &cell.blocks, depth + 1);
             let min_share = (cell_min_content + pad) / span as f32;
             for i in 0..span {
                 let ci = col_cursor + i;
@@ -4688,6 +4925,107 @@ fn autofit_distribute(
     final_widths
 }
 
+/// Number of autofit columns: max(grid, max row's cell-count). The grid
+/// might be empty; cells might over-/under-shoot it; take the union.
+fn autofit_column_count(table: &engine::Table, grid_hint: &[f32]) -> usize {
+    let max_cols_in_rows = table
+        .rows
+        .iter()
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| c.props.grid_span.max(1) as usize)
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    grid_hint.len().max(max_cols_in_rows)
+}
+
+/// Issue #318 — [`autofit_distribute_uncached`] once per (table, width,
+/// grid hint) per top-level layout. `grid_hint` is either the table's
+/// own `<w:tblGrid>` in px (from [`layout_table_box_uncached`]) or empty
+/// (the min-content probe), so "given or not" identifies it. A hit must
+/// still have one width per column.
+fn autofit_distribute_at(
+    tl: &mut TableLayout<'_, '_>,
+    table: &engine::Table,
+    available_width_px: f32,
+    grid_hint: &[f32],
+    depth: u32,
+) -> Vec<f32> {
+    let key = (
+        node_addr(table),
+        available_width_px.to_bits(),
+        !grid_hint.is_empty(),
+    );
+    if let Some(hit) = tl.columns.get(&key) {
+        if hit.len() == autofit_column_count(table, grid_hint) {
+            return hit.clone();
+        }
+        tl.columns.remove(&key);
+        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+    }
+    let widths = autofit_distribute_uncached(tl, table, available_width_px, grid_hint, depth);
+    tl.columns.insert(key, widths.clone());
+    widths
+}
+
+/// Audit gap A.M8 — the autofit column solve for a standalone table
+/// (unit tests; production goes through [`layout_table_box`]).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)] // the pre-#318 signature the tests call
+fn autofit_distribute(
+    table: &engine::Table,
+    available_width_px: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    grid_hint: &[f32],
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+) -> Vec<f32> {
+    let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
+    autofit_distribute_at(&mut tl, table, available_width_px, grid_hint, 0)
+}
+
+/// L2.2 (#7) — `(min_content, max_content)` of a standalone table's cell
+/// blocks (unit tests; production goes through [`layout_table_box`]).
+#[cfg(test)]
+fn measure_unbreakable_width(
+    blocks: &[engine::Block],
+    sctx: StyleContext,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    cache: &mut LruCache<u64, ParagraphBox>,
+) -> (f32, f32) {
+    let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
+    measure_unbreakable_width_at(&mut tl, blocks, 1)
+}
+
+/// Issue #318 — [`measure_unbreakable_width_uncached`] once per cell per
+/// top-level layout: intrinsic widths do not depend on the width the
+/// cell is offered, so the probe and the final pass of every ancestor
+/// share one measurement. A hit must be a finite pair.
+fn measure_unbreakable_width_at(
+    tl: &mut TableLayout<'_, '_>,
+    blocks: &[engine::Block],
+    depth: u32,
+) -> (f32, f32) {
+    let key = (blocks.as_ptr() as usize, blocks.len());
+    if let Some(&(lo, hi)) = tl.intrinsic.get(&key) {
+        if lo.is_finite() && hi.is_finite() {
+            return (lo, hi);
+        }
+        tl.intrinsic.remove(&key);
+        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+    }
+    let measured = measure_unbreakable_width_uncached(tl, blocks, depth);
+    tl.intrinsic.insert(key, measured);
+    measured
+}
+
 /// L2.2 (#7) — measure a cell's `(min_content, max_content)` widths.
 ///
 /// `min_content` is the pixel width of the longest contiguous segment
@@ -4705,19 +5043,19 @@ fn autofit_distribute(
 ///
 /// Nested tables recurse through `autofit_distribute` at width = 1.0
 /// so the inner table's min-content sum bubbles up to its parent
-/// cell.
+/// cell. Issue #318 — `depth` is the nesting level a table among
+/// `blocks` sits at; one past [`MAX_TABLE_LAYOUT_DEPTH`] is measured
+/// as the paragraphs it flattens to, like it lays out.
 ///
 /// Cost: one extra `shape_text` call per segment per paragraph. The
-/// existing probe-width `layout_cell_blocks` pass continues to drive
-/// the natural-width measurement.
-fn measure_unbreakable_width(
+/// probe-width [`cell_natural_width`] pass continues to drive the
+/// natural-width measurement.
+fn measure_unbreakable_width_uncached(
+    tl: &mut TableLayout<'_, '_>,
     blocks: &[engine::Block],
-    sctx: StyleContext,
-    fonts: &FontStack,
-    cfg: &RenderConfig,
-    scale: f32,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    depth: u32,
 ) -> (f32, f32) {
+    let (fonts, cfg, scale) = (tl.fonts, tl.cfg, tl.scale);
     let mut min_content = 0.0_f32;
     let mut max_content = 0.0_f32;
     for block in blocks {
@@ -4731,13 +5069,19 @@ fn measure_unbreakable_width(
                     max_content = xc;
                 }
             }
+            engine::Block::Table(t) if depth >= MAX_TABLE_LAYOUT_DEPTH => {
+                tl.nesting_capped = true;
+                let (mc, xc) = flattened_intrinsic_width(tl, t);
+                min_content = min_content.max(mc);
+                max_content = max_content.max(xc);
+            }
             engine::Block::Table(t) => {
                 /* Nested table — recurse. Sum of inner column min-content
                 widths bubbles up as this cell's contribution. Probe the
                 inner table against width = 1.0 so its own
                 `autofit_distribute` lands in the CASE 1 overflow path
                 (returns col_floor verbatim). */
-                let sub_widths = autofit_distribute(t, 1.0, fonts, cfg, scale, &[], sctx, cache);
+                let sub_widths = autofit_distribute_at(tl, t, 1.0, &[], depth);
                 let sub_sum: f32 = sub_widths.iter().sum();
                 if sub_sum > min_content {
                     min_content = sub_sum;
@@ -4802,16 +5146,78 @@ fn measure_segment_advance(text: &str, fonts: &FontStack, cfg: &RenderConfig, sc
     total
 }
 
-/// Max width across a slice of laid-out cell blocks. Paragraphs report
-/// the widest line; nested tables report the table's outer width.
-fn block_max_width(blocks: &[LayoutBlock]) -> f32 {
-    blocks
-        .iter()
-        .map(|b| match b {
-            LayoutBlock::Paragraph(p) => p.lines.iter().map(|l| l.width).fold(0.0_f32, f32::max),
-            LayoutBlock::Table(t) => t.size.width,
-        })
-        .fold(0.0_f32, f32::max)
+/// The autofit probe's natural width of one cell's `blocks` at
+/// `probe_width`: the widest line of its paragraphs laid out at that
+/// width, and the outer width of its nested tables (`depth` = their
+/// nesting level) — the max width across the cell laid out at the probe
+/// width.
+///
+/// Issue #318 — a nested table's outer width is its columns' sum
+/// ([`table_width_of`]), so the probe takes it from the (memoized)
+/// column solve instead of laying the table's cells out at a width the
+/// final layout never uses. Laying them out made every level offer each
+/// descendant one extra width per ancestor — `O(depth²)` grid layouts on
+/// top of the memo; now every inner table is laid out only at the widths
+/// final layouts offer it. A table past [`MAX_TABLE_LAYOUT_DEPTH`]
+/// (flattened, degraded) reports its intrinsic max-content width,
+/// clamped into `[min_content, probe_width]` — what its paragraphs'
+/// widest line would be, without laying them out at every probe width.
+fn cell_natural_width(
+    tl: &mut TableLayout<'_, '_>,
+    blocks: &[engine::Block],
+    probe_width: f32,
+    depth: u32,
+) -> f32 {
+    let mut widest = 0.0_f32;
+    for b in blocks {
+        let width = match b {
+            engine::Block::Paragraph(p) => layout_paragraph_cached(
+                p,
+                tl.fonts,
+                tl.cfg,
+                tl.scale,
+                probe_width.max(1.0),
+                tl.sctx,
+                tl.cache,
+            )
+            .lines
+            .iter()
+            .map(|l| l.width)
+            .fold(0.0_f32, f32::max),
+            engine::Block::Table(t) if depth >= MAX_TABLE_LAYOUT_DEPTH => {
+                tl.nesting_capped = true;
+                let (min_content, max_content) = flattened_intrinsic_width(tl, t);
+                max_content.min(probe_width.max(min_content))
+            }
+            engine::Block::Table(t) => {
+                let columns = table_columns(tl, t, probe_width, depth);
+                table_width_of(&columns, probe_width)
+            }
+        };
+        widest = widest.max(width);
+    }
+    widest
+}
+
+/// Issue #318 — `(min_content, max_content)` of a table past the nesting
+/// cap, measured as the paragraphs it flattens to; once per table.
+fn flattened_intrinsic_width(tl: &mut TableLayout<'_, '_>, table: &engine::Table) -> (f32, f32) {
+    let key = node_addr(table);
+    if let Some(&(lo, hi)) = tl.flat_intrinsic.get(&key) {
+        if lo.is_finite() && hi.is_finite() {
+            return (lo, hi);
+        }
+        tl.flat_intrinsic.remove(&key);
+        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+    }
+    let (mut lo, mut hi) = (0.0_f32, 0.0_f32);
+    for para in flatten_table_paragraphs(table) {
+        let (mc, xc) = paragraph_min_max_advance(para, tl.fonts, tl.cfg, tl.scale);
+        lo = lo.max(mc);
+        hi = hi.max(xc);
+    }
+    tl.flat_intrinsic.insert(key, (lo, hi));
+    (lo, hi)
 }
 
 /// Audit gap C.M1 — vertical-merge height pass. For every Restart cell
@@ -4992,43 +5398,62 @@ fn cached_paragraph_is_consistent(
             .all(|l| l.source_start <= len && l.runs.iter().all(|r| r.source_range.end <= len))
 }
 
+/// One cell's blocks at `content_width_px`, stacked from `y = 0`.
+/// `depth` is the nesting level a table among `blocks` sits at (the
+/// enclosing table's plus one): inner tables come from the
+/// [`TableLayout`] memo, and one at [`MAX_TABLE_LAYOUT_DEPTH`] or deeper
+/// is flattened to its paragraphs (issue #318).
 fn layout_cell_blocks(
+    tl: &mut TableLayout<'_, '_>,
     blocks: &[engine::Block],
     content_width_px: f32,
-    fonts: &FontStack,
-    cfg: &RenderConfig,
-    scale: f32,
-    sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    depth: u32,
 ) -> Vec<LayoutBlock> {
     let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
-    for b in blocks {
-        let mut lb = match b {
-            engine::Block::Paragraph(p) => LayoutBlock::Paragraph(layout_paragraph_cached(
-                p,
-                fonts,
-                cfg,
-                scale,
-                content_width_px.max(1.0),
-                sctx,
-                cache,
-            )),
-            engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
-                t,
-                content_width_px,
-                fonts,
-                cfg,
-                scale,
-                sctx,
-                cache,
-            )),
-        };
+    let mut stack = |mut lb: LayoutBlock, out: &mut Vec<LayoutBlock>| {
         let mut o = lb.origin();
         o.y = y;
         lb.set_origin(o);
         y += lb.size().height;
         out.push(lb);
+    };
+    for b in blocks {
+        match b {
+            engine::Block::Paragraph(p) => stack(
+                LayoutBlock::Paragraph(layout_paragraph_cached(
+                    p,
+                    tl.fonts,
+                    tl.cfg,
+                    tl.scale,
+                    content_width_px.max(1.0),
+                    tl.sctx,
+                    tl.cache,
+                )),
+                &mut out,
+            ),
+            engine::Block::Table(t) if depth >= MAX_TABLE_LAYOUT_DEPTH => {
+                tl.nesting_capped = true;
+                for p in flatten_table_paragraphs(t) {
+                    stack(
+                        LayoutBlock::Paragraph(layout_paragraph_cached(
+                            p,
+                            tl.fonts,
+                            tl.cfg,
+                            tl.scale,
+                            content_width_px.max(1.0),
+                            tl.sctx,
+                            tl.cache,
+                        )),
+                        &mut out,
+                    );
+                }
+            }
+            engine::Block::Table(t) => stack(
+                LayoutBlock::Table(layout_table_box_at(tl, t, content_width_px, depth)),
+                &mut out,
+            ),
+        }
     }
     out
 }
@@ -9345,7 +9770,17 @@ impl Engine {
                             && sections.get(sect_idx + 1).is_some_and(|next| {
                                 matches!(next.section_type, engine::SectionType::Continuous)
                             });
-                        if balance_pending {
+                        /* Issue #181 — stopping while a footnote cut on
+                        the in-progress page still waits for its
+                        continuation: `finish` drains it onto notes-only
+                        pages a longer band fills with body text, so the
+                        page is provisional too. (Document-end endnotes
+                        need no flag: they trail the last body block, so
+                        a band that ends before them is a plain prefix.) */
+                        let notes_pending = paginator
+                            .as_ref()
+                            .is_some_and(Paginator::has_pending_note_continuation);
+                        if balance_pending || notes_pending {
                             open_from_page = Some(
                                 emitted_pages.len()
                                     + paginator.as_ref().map_or(0, |p| p.page_count_emitted()),
@@ -14251,13 +14686,12 @@ impl Engine {
             self.undo.current().clone()
         } else if tracking {
             /* Sprint 14 (#14) — replacing a selection while tracking
-            = mark-old-as-delete + insert-new-as-insert. */
-            self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end),
-                author.clone(),
-                date.clone(),
-            )
+            = mark-old-as-delete + insert-new-as-insert (issue #298:
+            across paragraphs too). */
+            match self.tracked_delete("InsertText", &start, &end) {
+                Ok(t) => t.doc,
+                Err(e) => return *e,
+            }
         } else {
             self.undo
                 .current()
@@ -14317,12 +14751,10 @@ impl Engine {
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
-            self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end),
-                author.clone(),
-                date.clone(),
-            )
+            match self.tracked_delete("ReplaceRange", &start, &end) {
+                Ok(t) => t.doc,
+                Err(e) => return *e,
+            }
         } else {
             self.undo
                 .current()
@@ -14349,15 +14781,15 @@ impl Engine {
             Err(e) => return *e,
         };
         let (new_doc, caret) = if self.tracking_changes {
-            let d = self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end.clone()),
-                self.review_author.clone(),
-                self.current_review_date(),
-            );
             /* Marker-only tracked delete keeps text; caret lands at
-            the end of the marked range so further typing extends past. */
-            (d, end)
+            the end of the marked range (where the reviewer's own
+            removed insertions moved it) so further typing extends
+            past. Issue #298 — across paragraphs too; a refused range
+            answers an error. */
+            match self.tracked_delete("DeleteRange", &start, &end) {
+                Ok(t) => (t.doc, to_bridge_pos(t.end)),
+                Err(e) => return *e,
+            }
         } else {
             let d = self
                 .undo
@@ -14391,11 +14823,23 @@ impl Engine {
         if self.story_active() {
             return self.story_split_paragraph(at);
         }
+        let tracking = self.tracking_changes;
+        let author = self.review_author.clone();
+        let date = self.current_review_date();
         let (base, split_at) = match self.selection.clone() {
             Some(s) => {
                 let (start, end) = ordered(s.anchor, s.caret);
                 let doc = if start == end {
                     self.undo.current().clone()
+                } else if tracking {
+                    /* Issue #301 — replacing a selection with a break
+                    while tracking = mark the selection deleted, then
+                    the tracked break at its start (the typed-replacement
+                    path's order). */
+                    match self.tracked_delete("SplitParagraph", &start, &end) {
+                        Ok(t) => t.doc,
+                        Err(e) => return *e,
+                    }
                 } else {
                     self.undo
                         .current()
@@ -14405,7 +14849,13 @@ impl Engine {
             }
             None => (self.undo.current().clone(), at),
         };
-        let new_doc = base.split_paragraph(to_engine_pos(split_at.clone()));
+        /* Issue #301 — with review mode on, the new paragraph mark is a
+        tracked insertion (reject merges the halves back). */
+        let new_doc = if tracking {
+            base.tracked_split_paragraph(to_engine_pos(split_at.clone()), &author, &date)
+        } else {
+            base.split_paragraph(to_engine_pos(split_at.clone()))
+        };
         let next_path = engine::bump_last_block_index(&bridge_to_engine_path(split_at.path));
         let caret = BridgeLogicalPos {
             path: engine_to_bridge_path(next_path),
@@ -14427,41 +14877,71 @@ impl Engine {
         };
         let (start, end) = ordered(sel.anchor, sel.caret.clone());
         if start != end {
-            let (new_doc, caret) = self.delete_or_mark(start.clone(), end);
-            return self.commit_edit(new_doc, caret);
+            return match self.delete_or_mark(start.clone(), end, false) {
+                Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
+                Err(e) => *e,
+            };
         }
         let Some((del_start, del_end)) = self.delete_target(sel.caret, forward, by_word) else {
             /* Caret at a document edge — nothing to delete. */
             return self.selection_changed();
         };
-        let (new_doc, caret) = self.delete_or_mark(del_start, del_end);
-        self.commit_edit(new_doc, caret)
+        match self.delete_or_mark(del_start, del_end, !forward) {
+            Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
+            Err(e) => *e,
+        }
     }
 
     /// Sprint 14 (#14) — shared dispatch for "delete a logical range":
-    /// route through `tracked_delete_range` when tracking is on
-    /// (marker-only, caret lands at end), else the plain `delete_range`
-    /// (text removed, caret lands at start).
+    /// route through the tracked deletion when tracking is on (marker-
+    /// only: the caret lands at the end of the marked range — or, for a
+    /// collapsed Backspace (`backward`), at its start, stepping over the
+    /// struck text the way Word does, so the next Backspace reaches the
+    /// character before it), else the plain `delete_range` (text removed,
+    /// caret lands at start). Issue #298 — a tracked range the engine
+    /// refuses (across a table-cell boundary, over a table) is an
+    /// `Event::Error`, never a silent no-op.
     fn delete_or_mark(
         &self,
         start: BridgeLogicalPos,
         end: BridgeLogicalPos,
-    ) -> (engine::DocumentTree, BridgeLogicalPos) {
+        backward: bool,
+    ) -> Result<(engine::DocumentTree, BridgeLogicalPos), Box<Event>> {
         if self.tracking_changes {
-            let d = self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end.clone()),
-                self.review_author.clone(),
-                self.current_review_date(),
-            );
-            (d, end)
+            let t = self.tracked_delete("DeleteAtCaret", &start, &end)?;
+            let caret = if backward { t.start } else { t.end };
+            Ok((t.doc, to_bridge_pos(caret)))
         } else {
             let d = self
                 .undo
                 .current()
                 .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
-            (d, start)
+            Ok((d, start))
         }
+    }
+
+    /// Issue #298 — the tracked deletion of `[start, end)` on the current
+    /// document by the review identity, or the engine's refusal as a
+    /// typed `Event::Error` (`<cmd>: <reason>`).
+    fn tracked_delete(
+        &self,
+        cmd: &str,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+    ) -> Result<engine::TrackedDeletion, Box<Event>> {
+        self.undo
+            .current()
+            .try_tracked_delete_range(
+                to_engine_pos(start.clone()),
+                to_engine_pos(end.clone()),
+                &self.review_author,
+                &self.current_review_date(),
+            )
+            .map_err(|e| {
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                })
+            })
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching
@@ -15060,6 +15540,7 @@ impl Engine {
     fn do_accept_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
         let new_doc = self.undo.current().accept_revision_at(block, start, end);
         self.undo.push(new_doc);
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15069,10 +15550,25 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// A review decision merged or shortened paragraphs (issue #262 / #301 —
+    /// a resolved paragraph mark merges two): keep the caret on real text.
+    fn clamp_selection_to_document(&mut self) {
+        if let Some(sel) = self.selection.clone() {
+            let doc = self.undo.current();
+            self.selection = Some(SelectionState {
+                anchor: clamp_pos(doc, sel.anchor),
+                caret: clamp_pos(doc, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+        }
+    }
+
     /// `Command::RejectRevision` (Sprint 7 UI Edition).
     fn do_reject_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
         let new_doc = self.undo.current().reject_revision_at(block, start, end);
         self.undo.push(new_doc);
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15095,16 +15591,7 @@ impl Engine {
         }
         let new_doc = doc.resolve_all_revisions(accept);
         self.undo.push(new_doc);
-        /* Merged / shortened paragraphs: keep the caret on real text. */
-        if let Some(sel) = self.selection.clone() {
-            let doc = self.undo.current();
-            self.selection = Some(SelectionState {
-                anchor: clamp_pos(doc, sel.anchor),
-                caret: clamp_pos(doc, sel.caret),
-                ideal_x: None,
-                kind: sel.kind,
-            });
-        }
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -16804,11 +17291,26 @@ impl Engine {
     /// the very first mutating command, no separate `LoadFont` +
     /// `RenderPage` dance required in every corpus entry.
     pub fn new_headless(doc: DocumentTree) -> Engine {
-        let bytes_font = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
-        let font = LoadedFont::parse("fuzz-latin".to_string(), bytes_font)
-            .expect("bundled LiberationSans-Regular.ttf must parse");
+        /* Parsed ONCE per process and shared. `LoadedFont::parse`
+        intentionally `Vec::leak`s the font bytes (the cached rustybuzz
+        face borrows them for `'static`), so parsing per engine leaked
+        ~400 KB on EVERY fuzz iteration: LeakSanitizer flagged the very
+        first (empty) input as a "crash" and the nightly lane filed
+        content-free issues (#323 / #324). A process-wide static keeps
+        the allocation reachable, which LSan does not report. */
+        static FUZZ_FONT: std::sync::OnceLock<Arc<LoadedFont>> = std::sync::OnceLock::new();
+        let font = FUZZ_FONT
+            .get_or_init(|| {
+                let bytes_font =
+                    include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+                Arc::new(
+                    LoadedFont::parse("fuzz-latin".to_string(), bytes_font)
+                        .expect("bundled LiberationSans-Regular.ttf must parse"),
+                )
+            })
+            .clone();
         let mut fonts: HashMap<String, Arc<LoadedFont>> = HashMap::new();
-        fonts.insert("fuzz-latin".to_string(), Arc::new(font));
+        fonts.insert("fuzz-latin".to_string(), font);
         let mut engine = assemble_engine(None, None);
         engine.fonts = fonts;
         engine.layout_cfg = Some(RenderConfig {
@@ -16898,6 +17400,24 @@ impl Engine {
             .map_or(0, |s| s.pages.len())
     }
 
+    /// Issue #318 — what a whole-corpus layout probe compares across two
+    /// builds of the engine: the most recent layout snapshot's page count,
+    /// its [`layout::geometry_fingerprint`] and the degradation reasons it
+    /// carried (`Event::Painted.layout_degraded`, `Debug` names, in
+    /// order). `None` before the first `ensure_layout_for_fuzzing`.
+    pub fn layout_probe_for_fuzzing(&self) -> Option<LayoutProbe> {
+        self.layout_snapshot.borrow().as_ref().map(|s| LayoutProbe {
+            page_count: s.pages.len(),
+            fingerprint: layout::geometry_fingerprint(&s.pages),
+            degradations: s
+                .info
+                .degradations
+                .iter()
+                .map(|d| format!("{:?}", d.reason))
+                .collect(),
+        })
+    }
+
     /// Exercise the real, browser-free glyph rasterizer
     /// (`render::atlas::GlyphAtlas::get_or_rasterize`, swash-backed) over
     /// every glyph run in the most recent layout snapshot. This is
@@ -16941,6 +17461,15 @@ impl Engine {
         }
         rasterized
     }
+}
+
+/// Issue #318 — [`Engine::layout_probe_for_fuzzing`]'s report.
+#[cfg(feature = "fuzz-native")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutProbe {
+    pub page_count: usize,
+    pub fingerprint: u64,
+    pub degradations: Vec<String>,
 }
 
 /// Poll `fut` once with a no-op waker and expect it to be immediately
@@ -17613,7 +18142,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -17768,7 +18297,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -17807,7 +18336,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -18982,7 +19511,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             })],
             source_markup: None,
         }
@@ -25293,9 +25822,13 @@ mod tests {
     /// `apply` dispatcher, runs the real layout pipeline, and the
     /// invariant accessors read back sane values. This is a native
     /// smoke test for `fuzz/fuzz_targets/rpc_command.rs` /
-    /// `layout_paginate.rs`, exercised here where `cargo test --workspace`
-    /// already runs it — the fuzz crate itself is a *separate* cargo
-    /// workspace `cargo test` never touches (see `fuzz/Cargo.toml`).
+    /// `layout_paginate.rs`. NOTE (issue #321): `fuzz-native` is off by
+    /// default, so a plain `cargo test --workspace` compiles this test out
+    /// and collects ZERO of the feature-gated tests. They only run under
+    /// `cargo test -p engine-wasm --features fuzz-native` — a dedicated
+    /// step in `ci.yml`'s `rust-native` job and in the `ci-gate` skill.
+    /// (The fuzz crate itself is a *separate* cargo workspace — see
+    /// `fuzz/Cargo.toml` — that enables the same feature.)
     #[cfg(feature = "fuzz-native")]
     #[test]
     fn fuzz_native_surface_drives_engine_end_to_end() {
@@ -27015,6 +27548,21 @@ mod a11y_object_tests;
 #[cfg(test)]
 mod note_container_tests;
 
+/// Issues #317 / #181 / #141 — the `#[ignore]`d whole-corpus note-band
+/// probe (one `.docx` per process, driven by `NGE_PROBE_FILE`).
+#[cfg(test)]
+mod note_corpus_probe_tests;
+
+/// Issues #181 / #141 — note bands vs. the viewport-culled band and
+/// floating objects.
+#[cfg(test)]
+mod note_band_tests;
+
+/// Issue #318 — nested-table layout cost: the per-top-level-table memo
+/// (linear in nesting depth, verified hits) and the nesting cap.
+#[cfg(test)]
+mod nested_table_tests;
+
 #[cfg(test)]
 mod part_media_tests;
 
@@ -27026,6 +27574,9 @@ mod text_remap_tests;
 
 #[cfg(test)]
 mod revision_command_tests;
+
+#[cfg(test)]
+mod tracked_command_tests;
 
 #[cfg(test)]
 mod story_tab_tests;

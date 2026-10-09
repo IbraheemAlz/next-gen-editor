@@ -100,6 +100,40 @@ test.describe('D5.7 telemetry transport (Issue #86)', () => {
             .map((e) => e.kind.recovery_outcome);
         expect(outcomes.length).toBeGreaterThan(0);
         expect(outcomes.every((o) => o === 'PENDING' || o === 'RECOVERED' || o === 'FAILED')).toBe(true);
+
+        /* Issue #315 — the RECOVERED follow-up carries the recovery's
+           flags (booleans + counts only); the PENDING one keeps its exact
+           #86 shape. */
+        type CrashKind = { type: string; recovery_outcome?: string; recovery?: Record<string, unknown> };
+        const crashKinds = async (): Promise<CrashKind[]> =>
+            (await received(page))
+                .flatMap((b) => (b as { events: { kind: CrashKind }[] }).events)
+                .map((e) => e.kind)
+                .filter((k) => k.type === 'CRASH');
+        await expect
+            .poll(async () => (await crashKinds()).some((k) => k.recovery_outcome === 'RECOVERED'), {
+                timeout: 15_000,
+            })
+            .toBe(true);
+        const kinds = await crashKinds();
+        const recovered = kinds.find((k) => k.recovery_outcome === 'RECOVERED')!;
+        expect(Object.keys(recovered.recovery ?? {}).sort()).toEqual([
+            'log_truncated',
+            'package_fallbacks',
+            'package_lost',
+            'pinned_base',
+            'snapshot_fallbacks',
+            'snapshot_restored',
+            'tail_dropped',
+        ]);
+        expect(recovered.recovery).toMatchObject({
+            tail_dropped: false,
+            package_lost: false,
+            log_truncated: false,
+        });
+        for (const k of kinds.filter((x) => x.recovery_outcome === 'PENDING')) {
+            expect(k.recovery).toBeUndefined();
+        }
     });
 
     test('a batch flushes on visibilitychange, not just the 60s interval', async ({ page }) => {

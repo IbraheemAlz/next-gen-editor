@@ -40,6 +40,7 @@ import {
     ReviewControls,
     StatusBar,
     TrapOverlay,
+    RecoveryBanner,
     Ruler,
     ZoomControls,
     TextFormatButtons,
@@ -138,6 +139,9 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 <TableContextMenu />
                 <DevHud pollMs={1000} />
                 <TrapOverlay />
+                {/* Issue #315 — a degraded crash recovery says what was
+                    lost and what to do; a normal one stays silent. */}
+                <RecoveryBanner />
             </div>
           </TelemetryProvider>
           </FontRegistryProvider>

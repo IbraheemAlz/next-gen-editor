@@ -32,6 +32,7 @@ import type {
     Event,
     LayoutDegraded,
     LogicalRange,
+    RecoveryReport,
     Rect,
     RendererDowngrade,
     SelectionKind,
@@ -184,6 +185,14 @@ export interface EditorState {
      * Shared like `zoom`.
      */
     rendererDowngrade: Accessor<RendererDowngrade | undefined>;
+    /**
+     * Issue #315 — the report of the most recent completed crash recovery
+     * (`engine.onRecovery`), `undefined` before any or when the engine
+     * offers no recovery report. Feed it to `recoveryNotices()` for the
+     * user-facing losses; the Dev HUD shows the raw flags. Shared like
+     * `zoom`, so a component mounted after the recovery still sees it.
+     */
+    lastRecovery: Accessor<RecoveryReport | undefined>;
 }
 
 /**
@@ -199,6 +208,7 @@ interface ViewState {
     zoom: Accessor<number>;
     deviceScale: Accessor<number | undefined>;
     rendererDowngrade: Accessor<RendererDowngrade | undefined>;
+    lastRecovery: Accessor<RecoveryReport | undefined>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -222,6 +232,12 @@ function viewStateFor(engine: EngineHandle): ViewState {
             RendererDowngrade | undefined
         >(engine.rendererDowngrade);
         engine.onRendererDowngrade?.((d) => setRendererDowngrade(d));
+        /* Issue #315 — fed AFTER the client folded the worker reply into
+           its report (the RECOVERED event arrives before that). */
+        const [lastRecovery, setLastRecovery] = createSignal<RecoveryReport | undefined>(
+            engine.lastRecovery,
+        );
+        engine.onRecovery?.((report) => setLastRecovery(() => report));
         engine.subscribe((evt: Event) => {
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
@@ -248,7 +264,7 @@ function viewStateFor(engine: EngineHandle): ViewState {
                 setRendererDowngrade(evt.renderer_downgrade);
             }
         });
-        return { zoom, deviceScale, rendererDowngrade };
+        return { zoom, deviceScale, rendererDowngrade, lastRecovery };
     });
     viewStates.set(engine, state);
     return state;
@@ -396,5 +412,6 @@ export function createEditorState(): EditorState {
         zoom: view.zoom,
         deviceScale: view.deviceScale,
         rendererDowngrade: view.rendererDowngrade,
+        lastRecovery: view.lastRecovery,
     };
 }

@@ -61,6 +61,8 @@ type WorkerReply = {
     pinnedBase?: boolean;
     /** Issue #268 — RECOVER reply: see `RecoveryInfo.tailDropped`. */
     tailDropped?: boolean;
+    /** Issue #315 — RECOVER reply: see `RecoveryInfo.baseSnapshotAt`. */
+    baseTakenAt?: number;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -164,7 +166,24 @@ export interface RecoveryInfo {
      * snapshot is unreadable; better than `logTruncated`'s total loss.
      */
     tailDropped: boolean;
+    /**
+     * Issue #315 — this recovery is the one that tripped the #99 crash-loop
+     * downgrade (`rendererDowngrade` is re-sent on every later forced
+     * recovery of the session; only the first one is news to the user).
+     */
+    rendererDowngraded: boolean;
+    /** Issue #315 — when the restored base snapshot was persisted (ms
+     *  since the epoch); `undefined` when none was restored or the row
+     *  predates the timestamp. Lets the shell say since when edits were
+     *  lost (`tailDropped`). */
+    baseSnapshotAt: number | undefined;
+    /** Issue #270 — why the recovery ran: a worker `trap`, or the Dev
+     *  HUD's in-place `renderer-retry` (a planned respawn, no crash). */
+    cause: RecoveryCause;
 }
+
+/** Issue #270 — see `RecoveryInfo.cause`. */
+export type RecoveryCause = 'trap' | 'renderer-retry';
 
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
  *  stops re-probing the GPU and forces Canvas2D (so a persistently failing
@@ -271,8 +290,18 @@ export class EngineClient {
     private downgrade: RendererDowngrade | undefined;
     /** Issue #240 — listeners for `downgrade` changes (the Dev HUD). */
     private downgradeListeners = new Set<(d: RendererDowngrade | undefined) => void>();
-    /** Issue #240 — whether the boot worker probed the GPU backend. */
+    /** Issue #315 — listeners for completed recoveries (the recovery
+     *  banner, the Dev HUD, the telemetry `CRASH` sample). */
+    private recoveryListeners = new Set<(info: RecoveryInfo) => void>();
+    /** Issue #240 — whether the boot worker probed the GPU backend.
+     *  Issue #270 — re-set by every recovery (a respawned generation
+     *  probes unless the crash-loop downgrade forces Canvas2D). */
     private bootProbed = true;
+    /** Issue #270 — an in-place renderer retry is retiring the live
+     *  worker (guards against a second click). */
+    private retiring = false;
+    /** Issue #270 — why the NEXT `recover()` runs (`RecoveryInfo.cause`). */
+    private pendingCause: RecoveryCause = 'trap';
     /** Issue #240 — the persisted streak currently marks a live Vello
      *  generation (cleared on a clean `pagehide`). */
     private streakLive = false;
@@ -291,10 +320,12 @@ export class EngineClient {
 
     /**
      * @param documentId identifies the IndexedDB event log for this document.
-     * @param onCrash    invoked when the engine worker traps. The handler must
-     *                   create a fresh `<canvas>`, transfer it, and call
-     *                   `recover()` — `transferControlToOffscreen()` is
-     *                   one-shot, so the trapped surface cannot be reused.
+     * @param onCrash    invoked when the engine worker traps — and, issue
+     *                   #270, when it is retired for an in-place renderer
+     *                   retry. The handler must create a fresh `<canvas>`,
+     *                   transfer it, and call `recover()` —
+     *                   `transferControlToOffscreen()` is one-shot, so the
+     *                   old surface cannot be reused.
      */
     constructor(documentId: string, onCrash: () => void) {
         this.documentId = documentId;
@@ -404,8 +435,9 @@ export class EngineClient {
         this.armStableTimer();
     }
 
-    /** Issue #240 — whether the boot worker probed the GPU backend
-     *  (`false` when a persisted crash loop forced Canvas2D). */
+    /** Issue #240 — whether the current worker generation probed the GPU
+     *  backend (`false` when a crash-loop downgrade — persisted or
+     *  tripped this session — forced Canvas2D). */
     get rendererProbed(): boolean {
         return this.bootProbed;
     }
@@ -420,18 +452,56 @@ export class EngineClient {
     }
 
     /**
-     * Issue #240 — the Dev HUD's "retry Vello": forget the persisted
-     * streak and reload. A reload is the only honest retry — the live
-     * canvases' contexts are fixed for life, and a fresh probe needs a
-     * fresh page (the event log's document is not carried across it, as
-     * with any reload).
+     * Issue #240 — the Dev HUD's "retry Vello": forget the crash-loop
+     * record and probe the GPU renderer again.
+     *
+     * Issue #270 — IN PLACE, never a reload: a reload is a new session,
+     * whose boot clears the event log, so an unsaved document was lost.
+     * Instead the live worker is RETIRED — it applies everything already
+     * dispatched, snapshots the log head, flushes its event-log writes and
+     * closes itself — and the shell respawns it exactly like a crash
+     * recovery, but without a trap: `onCrash` remounts a fresh
+     * `<canvas>` (whose context is not fixed yet), `recover()` restores
+     * the document, selection, undo window and zoom from the log, and,
+     * the downgrade being lifted, re-probes the GPU. Commands sent after
+     * the retirement settle like requests to a trapped worker. If the
+     * retry generation traps on Vello again, the ordinary #99 streak
+     * counts it from zero.
      */
     async retryGpuRenderer(): Promise<void> {
-        await clearRendererStreak().catch((e: unknown) =>
-            console.warn('[recovery] renderer streak not cleared', e),
-        );
-        this.streakLive = false;
-        globalThis.location?.reload();
+        if (this.recovering || this.retiring) return;
+        this.retiring = true;
+        const generation = this.generations;
+        let retired: WorkerReply;
+        try {
+            await clearRendererStreak().catch((e: unknown) =>
+                console.warn('[recovery] renderer streak not cleared', e),
+            );
+            if (this.stableTimer !== undefined) {
+                clearTimeout(this.stableTimer);
+                this.stableTimer = undefined;
+            }
+            this.velloTrapStreak = 0;
+            this.streakLive = false;
+            this.setDowngrade(undefined);
+            retired = await this.send({ type: 'RETIRE' });
+        } finally {
+            this.retiring = false;
+        }
+        /* A trap while retiring already runs the ordinary recovery (with
+           the downgrade lifted, it re-probes too): nothing left to do. */
+        if (this.recovering || this.generations !== generation || retired.trap) return;
+        if (!retired.ok) {
+            console.warn('[recovery] renderer retry: the worker did not retire cleanly', retired.error);
+        }
+        this.worker.terminate();
+        this.recovering = true;
+        for (const resolve of this.pending.values()) {
+            resolve({ ok: false, error: 'engine worker retired for a renderer retry' });
+        }
+        this.pending.clear();
+        this.pendingCause = 'renderer-retry';
+        this.onCrash();
     }
 
     /** Worker generations spawned so far (1 = boot; +1 per recovery). */
@@ -485,12 +555,30 @@ export class EngineClient {
     }
 
     /**
+     * Issue #315 — observe completed recoveries. Fires once per
+     * `recover()`, AFTER `lastRecovery` holds its outcome (unlike the
+     * `RECOVERED` event, which subscribers see before the client has
+     * folded the worker's reply into `RecoveryInfo`). Returns the
+     * unsubscribe.
+     */
+    onRecovery(fn: (info: RecoveryInfo) => void): () => void {
+        this.recoveryListeners.add(fn);
+        return () => {
+            this.recoveryListeners.delete(fn);
+        };
+    }
+
+    /**
      * Recover after a trap: load the persisted snapshots + command log,
      * spawn a fresh worker, and replay via `Command::Recover` (newest
      * snapshot first, falling back to older ones — issue #241). `canvas` must be a
      * brand-new OffscreenCanvas — the trapped surface is gone.
      */
     async recover(canvas: OffscreenCanvas): Promise<void> {
+        /* Issue #270 — read before any await: a trap during this recovery
+           starts the next one as a plain `trap`. */
+        const cause = this.pendingCause;
+        this.pendingCause = 'trap';
         /* An event-log read failure (IndexedDB rejection / corruption) must
            not strand a dead client — respawn with an empty log instead. */
         const recoveryLog = await loadRecoveryLog().catch((e: unknown): RecoveryLog => {
@@ -505,7 +593,11 @@ export class EngineClient {
         /* Issue #99 — N traps in a row on Vello: stop re-probing the GPU
            (it would pick Vello again and crash-loop) and force Canvas2D for
            this and every later generation of the session. */
+        /* Issue #315 — whether THIS recovery trips the downgrade (the
+           banner announces it once, not on every later recovery). */
+        let downgradedNow = false;
         if (this.downgrade === undefined && this.velloTrapStreak >= VELLO_TRAP_LIMIT) {
+            downgradedNow = true;
             this.setDowngrade({
                 from: 'vello',
                 to: 'canvas2d',
@@ -550,6 +642,8 @@ export class EngineClient {
         );
         if (!r.ok) throw new Error(r.error);
         this.activeRenderer = r.renderer ?? 'canvas2d';
+        /* Issue #270 — this generation probed unless it was forced. */
+        this.bootProbed = this.downgrade === undefined;
         const recovered = r.evt?.type === 'RECOVERED' ? r.evt : undefined;
         const deviceScale = recovered?.device_scale;
         this.lastRecoveryInfo = {
@@ -566,6 +660,9 @@ export class EngineClient {
             packageLost: r.packageLost === true,
             pinnedBase: r.pinnedBase === true,
             tailDropped: r.tailDropped === true,
+            rendererDowngraded: downgradedNow && recovered?.renderer_downgrade !== undefined,
+            baseSnapshotAt: r.restored === true ? r.baseTakenAt : undefined,
+            cause,
         };
         this.noteGenerationStart();
         if (this.lastRecoveryInfo.logTruncated) {
@@ -587,6 +684,9 @@ export class EngineClient {
             );
         }
         this.armStableTimer();
+        /* Issue #315 — after `lastRecovery` is final. */
+        const info = this.lastRecoveryInfo;
+        for (const fn of this.recoveryListeners) fn(info);
     }
 
     /**

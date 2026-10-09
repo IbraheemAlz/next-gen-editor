@@ -1,4 +1,5 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect } from '@playwright/test';
+import { boot, burst, documentText, settle } from './helpers/editor';
 
 /* Issue #64 regression guards — the rest of the #53 stale-position family.
  *
@@ -10,24 +11,12 @@ import { test, expect, type Page } from '@playwright/test';
  * 2. Enter (SPLIT_PARAGRAPH) and IME start (BEGIN_COMPOSITION) carried the
  *    UI caret MIRROR, which only updates when SELECTION_CHANGED lands. Both
  *    now send `at: undefined` and the engine uses its live selection.
+ *
+ * Issue #310 -- the race tests drive the SHELL (`pointer.ts`,
+ * `HiddenInput`) through the synchronous `burst` helper, not `__dispatch`
+ * directly, so a deferral re-introduced in either listener fails them.
+ * Proven against such deferrals -- see CLAUDE.md, e2e notes.
  */
-
-async function boot(page: Page): Promise<void> {
-    await page.goto('/');
-    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
-        timeout: 30_000,
-    });
-}
-
-/** The whole document as plain text (paragraphs joined by the engine). */
-async function documentText(page: Page): Promise<string> {
-    return page.evaluate(async () => {
-        const dispatch = (window as any).__dispatch;
-        await dispatch({ type: 'SELECT_ALL' });
-        const clip = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
-        return clip.type === 'CLIPBOARD_PAYLOAD' ? (clip.plain as string) : `<${clip.type}>`;
-    });
-}
 
 /* Page-local device px on the "Hello world …" seed line (A4 margin ≈ 96
    device px at dpr 1, 24 pt seed text) — same band click-type-race uses. */
@@ -35,25 +24,22 @@ const LINE_Y = 110;
 const ANCHOR_X = 150;
 const EXTEND_X = 300;
 
-test('insert fired immediately after a point-extension replaces the EXTENDED selection', async ({
+test('insert fired immediately after a shift-click replaces the EXTENDED selection', async ({
     page,
 }) => {
     await boot(page);
     const before = await documentText(page);
 
-    const after = await page.evaluate(
-        async ({ y, ax, ex }) => {
-            const dispatch = (window as any).__dispatch;
-            await dispatch({ type: 'PLACE_CARET_AT_POINT', page: 0, at: { x: ax, y } });
-            /* Fire-and-forget extension — deliberately NOT awaited. */
-            void dispatch({ type: 'EXTEND_SELECTION_TO_POINT', page: 0, at: { x: ex, y } });
-            await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'EXT' });
-            await dispatch({ type: 'SELECT_ALL' });
-            const clip = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
-            return clip.type === 'CLIPBOARD_PAYLOAD' ? (clip.plain as string) : `<${clip.type}>`;
-        },
-        { y: LINE_Y, ax: ANCHOR_X, ex: EXTEND_X },
-    );
+    /* Anchor placed and settled; then the shift-click and the keystroke
+       land in ONE synchronous burst. */
+    await burst(page, [{ pointerdown: { x: ANCHOR_X, y: LINE_Y } }, { pointerup: true }]);
+    await settle(page);
+    await burst(page, [
+        { pointerdown: { x: EXTEND_X, y: LINE_Y, shift: true } },
+        { pointerup: true },
+        'EXT',
+    ]);
+    const after = await documentText(page);
 
     const idx = after.indexOf('EXT');
     expect(idx, `insert position in ${JSON.stringify(after)}`).toBeGreaterThan(0);
@@ -65,7 +51,7 @@ test('insert fired immediately after a point-extension replaces the EXTENDED sel
     expect(before.endsWith(after.slice(idx + 3))).toBe(true);
 });
 
-test('a real shift-click followed immediately by typing replaces the extended range', async ({
+test('real-input smoke: a Playwright shift-click then typing replaces the extended range', async ({
     page,
 }) => {
     await boot(page);
@@ -103,44 +89,48 @@ test('Enter during a pending UI-mirror update splits at the engine caret', async
     const textarea = page.locator('textarea[data-nge-hidden-input]');
     const before = await documentText(page);
 
-    /* Park the engine caret (and, once the reply lands, the UI mirror) at
-       the start of the seed line so a stale mirror is unambiguous. */
+    /* Reference: the intended semantics straight at the engine, every step
+       awaited (shell-independent, so a shell deferral cannot taint it):
+       caret at the click, split, then 'Z' at the new paragraph's start. */
+    const reference = await page.evaluate(
+        async ({ y }) => {
+            const dispatch = (window as any).__dispatch;
+            await dispatch({ type: 'PLACE_CARET_AT_POINT', page: 0, at: { x: 200, y } });
+            await dispatch({ type: 'SPLIT_PARAGRAPH', at: undefined });
+            await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Z' });
+            await dispatch({ type: 'SELECT_ALL' });
+            const clip = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+            return clip.type === 'CLIPBOARD_PAYLOAD' ? (clip.plain as string) : `<${clip.type}>`;
+        },
+        { y: LINE_Y },
+    );
+
+    /* Racy form on a fresh boot: click placement posted, reply NOT yet
+       delivered -- and in the same task, Enter reaches HiddenInput while
+       its caret mirror is stale (parked at offset 0). A trailing 'Z'
+       keystroke queues right behind the Enter: if the shell defers the
+       split even by one macrotask, the 'Z' overtakes it and lands on the
+       wrong side of the break (the readback below arrives too late to
+       notice a bare delay on its own). */
+    await boot(page);
     await page.evaluate(async () => {
         const dispatch = (window as any).__dispatch;
         const home = { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 };
         await dispatch({ type: 'SET_SELECTION', range: { start: home, end: home }, caret: home });
     });
     await textarea.focus();
+    await burst(page, [{ pointerdown: { x: 200, y: LINE_Y } }, { pointerup: true }, 'ENTER', 'Z']);
+    const after = await documentText(page);
 
-    const after = await page.evaluate(async (y) => {
-        const dispatch = (window as any).__dispatch;
-        const input = document.querySelector<HTMLTextAreaElement>(
-            'textarea[data-nge-hidden-input]',
-        );
-        if (!input) throw new Error('hidden input missing');
-        /* Click placement posted, reply NOT yet delivered — and in the
-           same task, Enter reaches HiddenInput while its caret mirror
-           still says offset 0. */
-        void dispatch({ type: 'PLACE_CARET_AT_POINT', page: 0, at: { x: 200, y } });
-        input.dispatchEvent(
-            new InputEvent('beforeinput', {
-                inputType: 'insertLineBreak',
-                bubbles: true,
-                cancelable: true,
-            }),
-        );
-        /* A round-trip queued behind the split. */
-        await dispatch({ type: 'SELECT_ALL' });
-        const clip = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
-        return clip.type === 'CLIPBOARD_PAYLOAD' ? (clip.plain as string) : `<${clip.type}>`;
-    }, LINE_Y);
-
-    /* One paragraph break more than before, and NOT at the stale offset 0:
-       the first line keeps a non-empty head of the seed text. */
+    /* One paragraph break more than before, not at the stale offset 0, and
+       at EXACTLY the clicked position the settled reference split at (a
+       stale mirror elsewhere in the line, e.g. its end, would still be a
+       single plain break). */
     const breaks = (s: string): number => (s.match(/\n/g) ?? []).length;
     expect(breaks(after), JSON.stringify(after)).toBe(breaks(before) + 1);
     expect(after.startsWith('\n'), JSON.stringify(after)).toBe(false);
-    const nl = after.indexOf('\n');
-    expect(nl).toBeGreaterThan(0);
-    expect(after.replace('\n', '')).toBe(before);
+    expect(after.indexOf('\n')).toBeGreaterThan(0);
+    expect(after.replace('\n', '').replace('Z', '')).toBe(before);
+    expect(after, 'split lands where the settled click put the caret').toBe(reference);
+    expect(after.replace('\n', '')).toContain('Z');
 });
