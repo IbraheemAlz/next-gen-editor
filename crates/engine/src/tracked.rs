@@ -286,7 +286,10 @@ fn tracked_delete_span(
     if s >= e {
         return Vec::new();
     }
-    let clipped = |r: &Revision| (r.start.max(s), r.end.min(e));
+    /* Issue #115 — every boundary the deletion stores is a char boundary,
+    whatever offsets an existing revision carries. */
+    let snap = |o: u32| crate::snap_offset(&para.text, o);
+    let clipped = |r: &Revision| (snap(r.start.max(s)), snap(r.end.min(e)));
     let own = union(
         para.revisions
             .iter()
