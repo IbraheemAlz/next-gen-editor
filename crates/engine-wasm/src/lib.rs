@@ -7831,6 +7831,16 @@ impl Engine {
     }
 
     async fn apply_command(&mut self, cmd: Command) -> Event {
+        /* Issue #407 — argument validation first: a NaN / infinite number
+        anywhere in the command (a JS `NaN` crosses `serde-wasm-bindgen`
+        into an `f32` unchanged, and `f32::clamp` passes it through) is
+        refused before any gate or handler can act on it. */
+        if let Some(bad) = cmd.first_non_finite() {
+            return Event::Error {
+                message: format!("{}: {bad}", cmd.kind().name()),
+                kind: Some(bridge::ErrorKind::InvalidArgument),
+            };
+        }
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
         }
@@ -8858,9 +8868,14 @@ impl Engine {
         let mut pending_zoom: Option<f32> = None;
         let mut applied_commands: u32 = 0;
         for cmd in log_tail {
+            /* Issue #407 — a logged non-finite scale is refused by the
+            replayed `apply` below; never let it reach the stashed config
+            (`f32::clamp` keeps NaN). */
             match &cmd {
-                Command::SetDeviceScale { scale } => pending_base_scale = Some(*scale),
-                Command::SetZoom { scale } => pending_zoom = Some(*scale),
+                Command::SetDeviceScale { scale } if scale.is_finite() => {
+                    pending_base_scale = Some(*scale)
+                }
+                Command::SetZoom { scale } if scale.is_finite() => pending_zoom = Some(*scale),
                 _ => {}
             }
             /* Replayed events are not observable: the shell rebuilds its
@@ -28741,6 +28756,10 @@ mod document_protection_tests;
 
 /// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
 mod protection_gate;
+
+/// Issue #407 — the command-boundary finiteness guard (`InvalidArgument`).
+#[cfg(test)]
+mod finite_guard_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

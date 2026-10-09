@@ -623,6 +623,11 @@ pub enum ErrorKind {
     /// Issue #345 — `OpenDocument.password` does not open the encrypted
     /// package. The previous document stays open.
     WrongPassword,
+    /// Issue #407 — a numeric argument of the command was `NaN` or
+    /// infinite (`Command::first_non_finite`; the message names the
+    /// field). Nothing was applied. A host / shell bug, never a user
+    /// action, so `@nge/ui` shows it in the Dev HUD, not a toast.
+    InvalidArgument,
 }
 
 /// Issue #345 — an enforced editing restriction (`w:documentProtection`
@@ -1339,6 +1344,13 @@ mod a11y_note_wire_tests {
         })
         .unwrap();
         assert_eq!(encrypted["kind"], "EncryptedDocument");
+        /* Issue #407 — the non-finite argument refusal. */
+        let invalid = serde_json::to_value(Event::Error {
+            message: "SetZoom: scale is NaN".into(),
+            kind: Some(ErrorKind::InvalidArgument),
+        })
+        .unwrap();
+        assert_eq!(invalid["kind"], "InvalidArgument");
     }
 
     /// Issue #345 — protection modes spell `w:edit`; the typed refusal.
