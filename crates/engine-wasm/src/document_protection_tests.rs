@@ -174,7 +174,8 @@ fn an_encrypted_package_answers_the_typed_error() {
 }
 
 /// Issue #345 — a compound file WITHOUT the encryption streams (a legacy
-/// binary `.doc`) is an honest, untyped refusal naming the format.
+/// binary `.doc`) is an honest refusal naming the format — typed
+/// `InvalidDocument` (issue #427), never `EncryptedDocument`.
 #[test]
 fn a_legacy_compound_file_is_not_reported_as_encrypted() {
     let doc = format_docx::opc::cfb::test_writer::build(&[("WordDocument", &[1u8; 600])]);
@@ -183,7 +184,7 @@ fn a_legacy_compound_file_is_not_reported_as_encrypted() {
     let Event::Error { message, kind } = evt else {
         panic!("a legacy compound file answers Error, got {evt:?}");
     };
-    assert_eq!(kind, None, "{message}");
+    assert_eq!(kind, Some(bridge::ErrorKind::InvalidDocument), "{message}");
     assert!(message.contains("97-2003"), "{message}");
     assert_eq!(e.undo.current().to_plain_text(), "keep me");
 }
