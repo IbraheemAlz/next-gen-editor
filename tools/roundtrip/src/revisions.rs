@@ -508,3 +508,99 @@ pub(crate) fn run_tracked_split_roundtrip() -> Result<()> {
     );
     Ok(())
 }
+
+/// Issue #298 — step 38: a deletion across a paragraph mark with track
+/// changes on.
+///
+/// a. `try_tracked_delete_range` marks the first paragraph's tail, the
+///    swallowed mark and the second paragraph's head deleted; both save
+///    paths write `<w:del>` / `<w:delText>` and the mark's
+///    `<w:pPr><w:rPr><w:del …/>`, which re-read as such.
+/// b. Accept-all on the re-read document merges the survivors; the save
+///    carries no revision.
+/// c. Reject-all restores both paragraphs; the save carries no revision
+///    and rewrites no source byte (`write_docx`).
+pub(crate) fn run_tracked_cross_paragraph_delete_roundtrip() -> Result<()> {
+    let xml = document(TRACKED_EDIT_BODY);
+    let bytes = build_styled_docx(STYLES_XML, &xml);
+    let archive = read_docx(&bytes).context("read tracked-edit fixture")?;
+    let deleted = archive
+        .document
+        .try_tracked_delete_range(at(0, 6), at(1, 6), REVIEWER, REVIEW_DATE)
+        .map_err(|e| anyhow::anyhow!("step 38a: refused: {e}"))?
+        .doc;
+    let mark = format!(
+        r#"<w:pPr><w:rPr><w:del w:id="0" w:author="{REVIEWER}" w:date="{REVIEW_DATE}"/></w:rPr></w:pPr>"#
+    );
+    let mut reread_deleted = None;
+    for (got, reread) in save_and_reread("step 38a", &archive, &deleted)? {
+        if !got.contains(&mark) || !got.contains("<w:delText") {
+            bail!("step 38a: the deleted mark / text was not written ({mark})\n{got}");
+        }
+        let kinds: Vec<Vec<RevisionKind>> = reread
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| p.mark_revisions.iter().map(|r| r.kind).collect())
+            .collect();
+        let text_revs: Vec<Vec<(RevisionKind, u32, u32)>> = reread
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| {
+                p.revisions
+                    .iter()
+                    .map(|r| (r.kind, r.start, r.end))
+                    .collect()
+            })
+            .collect();
+        if texts(&reread) != vec!["alpha beta", "gamma delta"]
+            || kinds != vec![vec![RevisionKind::Delete], vec![]]
+            || text_revs
+                != vec![
+                    vec![(RevisionKind::Delete, 6, 10)],
+                    vec![(RevisionKind::Delete, 0, 6)],
+                ]
+        {
+            bail!(
+                "step 38a: re-read {:?} / {kinds:?} / {text_revs:?}",
+                texts(&reread)
+            );
+        }
+        reread_deleted = Some(reread);
+    }
+    println!("[roundtrip] step 38a OK — a cross-paragraph tracked delete writes and re-reads");
+
+    let reread_deleted = reread_deleted.context("no re-read")?;
+    for (accept, want) in [
+        (true, vec!["alpha delta"]),
+        (false, vec!["alpha beta", "gamma delta"]),
+    ] {
+        let step = if accept { "step 38b" } else { "step 38c" };
+        let resolved = reread_deleted.resolve_all_revisions(accept);
+        if texts(&resolved) != want || resolved.has_revisions() {
+            bail!("{step}: resolved to {:?}", texts(&resolved));
+        }
+        for (got, reread) in save_and_reread(step, &archive, &resolved)? {
+            if got.contains("<w:del ") || reread.has_revisions() || texts(&reread) != want {
+                bail!("{step}: saved {:?}\n{got}", texts(&reread));
+            }
+        }
+    }
+    /* Rejecting on the in-memory tree (source markup intact) gives the
+    source bytes back. */
+    let rejected = deleted.resolve_all_revisions(false);
+    let out = write_docx(&archive, &rejected).context("write rejected")?;
+    let got = extract_doc_xml(&out)?;
+    let (_, rewritten, _) = rewritten_region(xml.as_bytes(), &got);
+    if rewritten != 0 {
+        bail!(
+            "step 38c: the reject rewrote {rewritten} source bytes\n{}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+    println!(
+        "[roundtrip] step 38b/c OK — accept-all merges, reject-all restores (no source byte rewritten)"
+    );
+    Ok(())
+}

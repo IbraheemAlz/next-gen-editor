@@ -14241,13 +14241,12 @@ impl Engine {
             self.undo.current().clone()
         } else if tracking {
             /* Sprint 14 (#14) — replacing a selection while tracking
-            = mark-old-as-delete + insert-new-as-insert. */
-            self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end),
-                author.clone(),
-                date.clone(),
-            )
+            = mark-old-as-delete + insert-new-as-insert (issue #298:
+            across paragraphs too). */
+            match self.tracked_delete("InsertText", &start, &end) {
+                Ok(t) => t.doc,
+                Err(e) => return *e,
+            }
         } else {
             self.undo
                 .current()
@@ -14307,12 +14306,10 @@ impl Engine {
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
-            self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end),
-                author.clone(),
-                date.clone(),
-            )
+            match self.tracked_delete("ReplaceRange", &start, &end) {
+                Ok(t) => t.doc,
+                Err(e) => return *e,
+            }
         } else {
             self.undo
                 .current()
@@ -14339,15 +14336,15 @@ impl Engine {
             Err(e) => return *e,
         };
         let (new_doc, caret) = if self.tracking_changes {
-            let d = self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end.clone()),
-                self.review_author.clone(),
-                self.current_review_date(),
-            );
             /* Marker-only tracked delete keeps text; caret lands at
-            the end of the marked range so further typing extends past. */
-            (d, end)
+            the end of the marked range (where the reviewer's own
+            removed insertions moved it) so further typing extends
+            past. Issue #298 — across paragraphs too; a refused range
+            answers an error. */
+            match self.tracked_delete("DeleteRange", &start, &end) {
+                Ok(t) => (t.doc, to_bridge_pos(t.end)),
+                Err(e) => return *e,
+            }
         } else {
             let d = self
                 .undo
@@ -14394,12 +14391,10 @@ impl Engine {
                     while tracking = mark the selection deleted, then
                     the tracked break at its start (the typed-replacement
                     path's order). */
-                    self.undo.current().tracked_delete_range(
-                        to_engine_pos(start.clone()),
-                        to_engine_pos(end),
-                        author.clone(),
-                        date.clone(),
-                    )
+                    match self.tracked_delete("SplitParagraph", &start, &end) {
+                        Ok(t) => t.doc,
+                        Err(e) => return *e,
+                    }
                 } else {
                     self.undo
                         .current()
@@ -14437,41 +14432,71 @@ impl Engine {
         };
         let (start, end) = ordered(sel.anchor, sel.caret.clone());
         if start != end {
-            let (new_doc, caret) = self.delete_or_mark(start.clone(), end);
-            return self.commit_edit(new_doc, caret);
+            return match self.delete_or_mark(start.clone(), end, false) {
+                Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
+                Err(e) => *e,
+            };
         }
         let Some((del_start, del_end)) = self.delete_target(sel.caret, forward, by_word) else {
             /* Caret at a document edge — nothing to delete. */
             return self.selection_changed();
         };
-        let (new_doc, caret) = self.delete_or_mark(del_start, del_end);
-        self.commit_edit(new_doc, caret)
+        match self.delete_or_mark(del_start, del_end, !forward) {
+            Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
+            Err(e) => *e,
+        }
     }
 
     /// Sprint 14 (#14) — shared dispatch for "delete a logical range":
-    /// route through `tracked_delete_range` when tracking is on
-    /// (marker-only, caret lands at end), else the plain `delete_range`
-    /// (text removed, caret lands at start).
+    /// route through the tracked deletion when tracking is on (marker-
+    /// only: the caret lands at the end of the marked range — or, for a
+    /// collapsed Backspace (`backward`), at its start, stepping over the
+    /// struck text the way Word does, so the next Backspace reaches the
+    /// character before it), else the plain `delete_range` (text removed,
+    /// caret lands at start). Issue #298 — a tracked range the engine
+    /// refuses (across a table-cell boundary, over a table) is an
+    /// `Event::Error`, never a silent no-op.
     fn delete_or_mark(
         &self,
         start: BridgeLogicalPos,
         end: BridgeLogicalPos,
-    ) -> (engine::DocumentTree, BridgeLogicalPos) {
+        backward: bool,
+    ) -> Result<(engine::DocumentTree, BridgeLogicalPos), Box<Event>> {
         if self.tracking_changes {
-            let d = self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end.clone()),
-                self.review_author.clone(),
-                self.current_review_date(),
-            );
-            (d, end)
+            let t = self.tracked_delete("DeleteAtCaret", &start, &end)?;
+            let caret = if backward { t.start } else { t.end };
+            Ok((t.doc, to_bridge_pos(caret)))
         } else {
             let d = self
                 .undo
                 .current()
                 .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
-            (d, start)
+            Ok((d, start))
         }
+    }
+
+    /// Issue #298 — the tracked deletion of `[start, end)` on the current
+    /// document by the review identity, or the engine's refusal as a
+    /// typed `Event::Error` (`<cmd>: <reason>`).
+    fn tracked_delete(
+        &self,
+        cmd: &str,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+    ) -> Result<engine::TrackedDeletion, Box<Event>> {
+        self.undo
+            .current()
+            .try_tracked_delete_range(
+                to_engine_pos(start.clone()),
+                to_engine_pos(end.clone()),
+                &self.review_author,
+                &self.current_review_date(),
+            )
+            .map_err(|e| {
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                })
+            })
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching

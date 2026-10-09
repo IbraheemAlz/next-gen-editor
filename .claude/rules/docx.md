@@ -247,12 +247,23 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   any one that removes the mark merges; a single Accept/Reject decides
   the first — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
-- **Recording structural tracked changes (issue #301).** Enter with
-  review mode on (`DocumentTree::tracked_split_paragraph`, engine
+- **Recording structural tracked changes (issues #301 / #298).** Enter
+  with review mode on (`DocumentTree::tracked_split_paragraph`, engine
   `crates/engine/src/tracked.rs`) records the NEW mark — the one ending
   the left half, Word's `<w:ins/>` on the first paragraph — as inserted;
   `split_paragraph` now carries the text revisions onto both halves
-  (a straddling change is cut; the right piece drops its source id).
+  (a straddling change is cut; the right piece drops its source id). A
+  tracked deletion (`try_tracked_delete_range`; `tracked_delete_range`
+  wraps it) works over any range inside ONE container: per paragraph the
+  reviewer's own pending insertions are removed outright (the #265 path,
+  `revisions::remove_text`), already-deleted bytes are left alone, the
+  rest is marked `Delete`; every swallowed mark is marked `Delete` — or,
+  when it is the reviewer's own inserted mark, removed (the paragraphs
+  merge through `merge_paragraph_with_next`). A range across a cell
+  boundary or over a table is refused (`TrackedEditError`, answered as
+  `Event::Error` — never a silent no-op). Tracked Backspace leaves the
+  caret at the START of what it marked (Word: it steps over struck
+  text).
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

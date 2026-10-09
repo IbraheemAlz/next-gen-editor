@@ -92,3 +92,58 @@ test('tracked Enter: the single mark row rejects through the sidebar address', a
     await run(page, [{ type: 'REJECT_REVISION', block: 0, start: 3, end: 3 }]);
     expect(await plain(page)).toBe('one two');
 });
+
+const BACKSPACE = { type: 'DELETE_AT_CARET', forward: false, by_word: false };
+
+test('cross-paragraph tracked delete: marked, then accept merges and reject restores', async ({
+    page,
+}) => {
+    await boot(page);
+    const original = 'alpha beta\nmiddle\ngamma delta';
+    await seed(page, ['alpha beta', 'middle', 'gamma delta']);
+    expect(await plain(page)).toBe(original);
+    const depth = (await run(page, [caret(0, 0)])).undo_depth as number;
+    const marked = await run(page, [
+        {
+            type: 'SET_SELECTION',
+            range: { start: pos(0, 6), end: pos(2, 6) },
+            caret: pos(2, 6),
+        },
+        BACKSPACE,
+    ]);
+    /* Not a silent no-op: one undo step, the text stays (struck). */
+    expect(marked.type).toBe('SELECTION_CHANGED');
+    expect(marked.undo_depth).toBe(depth + 1);
+    expect(await plain(page)).toBe(original);
+    await run(page, [{ type: 'ACCEPT_ALL_REVISIONS' }]);
+    expect(await plain(page)).toBe('alpha delta');
+    await run(page, [{ type: 'UNDO' }]);
+    expect(await plain(page)).toBe(original);
+    await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
+    expect(await plain(page)).toBe(original);
+    /* Nothing pending after the reject. */
+    const settled = (await run(page, [caret(0, 0)])).undo_depth as number;
+    const again = await run(page, [{ type: 'ACCEPT_ALL_REVISIONS' }]);
+    expect(again.undo_depth).toBe(settled);
+    expect(await plain(page)).toBe(original);
+});
+
+test('tracked Backspace at a paragraph start marks the break; Backspace over your own Enter removes it', async ({
+    page,
+}) => {
+    await boot(page);
+    await seed(page, ['one', 'two']);
+    const marked = await run(page, [caret(1, 0), BACKSPACE]);
+    expect(marked.type).toBe('SELECTION_CHANGED');
+    expect(await plain(page)).toBe('one\ntwo');
+    await run(page, [{ type: 'ACCEPT_ALL_REVISIONS' }]);
+    expect(await plain(page)).toBe('onetwo');
+    /* A tracked Enter of your own, then Backspace: no change is left. */
+    await run(page, [caret(0, 3), { type: 'SPLIT_PARAGRAPH', at: undefined }]);
+    expect(await plain(page)).toBe('one\ntwo');
+    await run(page, [BACKSPACE]);
+    expect(await plain(page)).toBe('onetwo');
+    const depth = (await run(page, [caret(0, 0)])).undo_depth as number;
+    const nothing = await run(page, [{ type: 'REJECT_ALL_REVISIONS' }]);
+    expect(nothing.undo_depth).toBe(depth);
+});

@@ -69,6 +69,7 @@ mod tracked;
 #[cfg(test)]
 mod tracked_tests;
 pub use text_remap::TextEdit;
+pub use tracked::{TrackedDeletion, TrackedEditError};
 pub mod html;
 pub mod numbering;
 pub mod package;
@@ -6314,19 +6315,13 @@ impl DocumentTree {
         doc
     }
 
-    /// Sprint 14 (#14) — track-changes-aware delete.
-    ///
-    /// Boundary math:
-    /// - **Range entirely inside a same-author Insert** → shrink the
-    ///   Insert AND remove the text. Inserts never originated in the
-    ///   source; deleting one's own pending insertion is a no-revision
-    ///   undo of that pending edit.
-    /// - **Range outside any Insert** → preserve the text, mark a
-    ///   fresh `Delete` revision covering the range. Adjacent
-    ///   same-author Delete gets merged.
-    /// - Mixed cases (range straddles Insert + non-Insert) fall back
-    ///   to the marker-only behaviour for v1 (text preserved, Delete
-    ///   stamped over the whole range; the overlapped Insert remains).
+    /// Sprint 14 (#14) — track-changes-aware delete: the reviewer's own
+    /// pending insertions inside the range are removed, everything else
+    /// is marked deleted — text and, across paragraphs (issue #298), the
+    /// swallowed paragraph marks. See [`Self::try_tracked_delete_range`],
+    /// which this wraps; a range it refuses (crossing a cell boundary,
+    /// spanning a table) leaves the tree unchanged here — interactive
+    /// callers use the `try_` form and report the refusal.
     pub fn tracked_delete_range(
         &self,
         start: LogicalPos,
@@ -6334,123 +6329,8 @@ impl DocumentTree {
         author: String,
         date: String,
     ) -> Self {
-        let (start, end) = order_positions(start, end);
-        if start == end || !same_parent(&start.path, &end.path) {
-            return self.clone();
-        }
-        let Some(s_idx) = start.path.last_block_index() else {
-            return self.clone();
-        };
-        let Some(e_idx) = end.path.last_block_index() else {
-            return self.clone();
-        };
-        if s_idx != e_idx {
-            /* Cross-paragraph tracked-delete falls back to the
-            mark-only flow per-paragraph; v1 limitation. */
-            return self.clone();
-        }
-        let target_path = start.path.clone();
-        /* Issue #115 — snap both ends to char boundaries before any
-        revision math or `replace_range` sees them. */
-        let (s_off, e_off) = match self.paragraph_at_path(&target_path) {
-            Some(p) => (p.snap_offset(start.offset), p.snap_offset(end.offset)),
-            None => (start.offset, end.offset),
-        };
-        if s_off >= e_off {
-            return self.clone();
-        }
-        let mut blocks = self.blocks.clone();
-        let mut removed_edit = None;
-        let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
-            /* Range entirely inside a same-author Insert? If so, undo
-            the Insert (remove text + shrink the Insert overlay). */
-            let owning_insert = para.revisions.iter().any(|r| {
-                r.kind == RevisionKind::Insert
-                    && r.author == author
-                    && r.start <= s_off
-                    && e_off <= r.end
-            });
-            if owning_insert {
-                let s = s_off.min(para.text.len() as u32);
-                let e = e_off.min(para.text.len() as u32);
-                let removed_len = e.saturating_sub(s);
-                if e > s {
-                    /* Issues #250 / #252 — one splice drives the source
-                    markup and (below) the comment anchors. Issue #265 —
-                    the SAME (at, removed) window then drives every other
-                    byte-offset table through `shift_paragraph_offsets_after`
-                    (spans, hyperlinks, fields, inline objects, and the
-                    revisions themselves): the owning Insert satisfies
-                    `start <= s && e <= end`, so the shared gap-shift rule
-                    shrinks its `end` by `removed_len` and leaves `start`
-                    alone — exactly the old bespoke shrink — and drops it
-                    outright if that shrinks it to empty, via the same
-                    `retain` every other overlay gets. This is the
-                    `apply_revision_decision` (accept/reject) bookkeeping,
-                    reused so a field, hyperlink or picture inside a
-                    reviewer's own removed insertion leaves no stale
-                    offsets. */
-                    let edit = para.splice_text(s, removed_len, "");
-                    shift_paragraph_offsets_after(para, edit.at, edit.removed);
-                    removed_edit = Some(edit);
-                }
-                para.dirty = true;
-                return;
-            }
-            /* Marker-only delete: stamp a fresh Delete over the range
-            (text preserved). Merge with adjacent same-author Delete. */
-            let new_end = e_off;
-            let merged_left = para
-                .revisions
-                .iter_mut()
-                .find(|r| r.kind == RevisionKind::Delete && r.end == s_off && r.author == author);
-            if let Some(left) = merged_left {
-                left.end = new_end;
-                left.date = date.clone();
-            } else {
-                para.revisions.push(Revision {
-                    start: s_off,
-                    end: new_end,
-                    kind: RevisionKind::Delete,
-                    author: author.clone(),
-                    date: date.clone(),
-                    id: None,
-                    prev_attrs: None,
-                    move_name: None,
-                });
-            }
-            para.dirty = true;
-        });
-        let mut out = Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-        };
-        if let Some(e) = removed_edit {
-            out.remap_text_edit_record(&target_path, e);
-        }
-        out
+        self.try_tracked_delete_range(start, end, &author, &date)
+            .map_or_else(|_| self.clone(), |t| t.doc)
     }
 
     /// Sprint 14 (#14) — track-changes-aware format-change stamp.
