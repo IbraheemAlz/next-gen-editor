@@ -56,6 +56,27 @@ fn attr_num(u: &mut Unstructured, max: i64) -> String {
                 "3.14.15",
                 "0x1F",
                 "999999999999999999999999",
+                /* Issue #349 — what `f32::from_str` used to accept into
+                page geometry, the universal-measure units ECMA-376
+                allows on twips measures, and their malformed cousins. */
+                "NaN",
+                "inf",
+                "-inf",
+                "infinity",
+                "1e30",
+                "1e400",
+                "-720",
+                "2.5in",
+                "-0.5in",
+                "12pt",
+                "2.54cm",
+                "25.4mm",
+                "6pc",
+                "3pi",
+                "12px",
+                "720.5",
+                "+720",
+                "50%",
             ],
         )
         .to_string()
@@ -155,9 +176,10 @@ fn gen_ppr(u: &mut Unstructured, allow_sect_pr: bool) -> String {
     }
     if u.ratio(1, 2).unwrap_or(false) {
         s.push_str(&format!(
-            r#"<w:spacing w:before="{}" w:after="{}"/>"#,
+            r#"<w:spacing w:before="{}" w:after="{}" w:line="{}"/>"#,
             attr_num(u, 2000),
-            attr_num(u, 2000)
+            attr_num(u, 2000),
+            attr_num(u, 720)
         ));
     }
     s.push_str(&maybe_bool_element(u, "w:bidi"));
@@ -180,13 +202,15 @@ fn gen_ppr(u: &mut Unstructured, allow_sect_pr: bool) -> String {
 
 fn gen_sect_pr(u: &mut Unstructured) -> String {
     format!(
-        r#"<w:sectPr><w:pgSz w:w="{}" w:h="{}"/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="720" w:footer="720"/></w:sectPr>"#,
+        r#"<w:sectPr><w:pgSz w:w="{}" w:h="{}"/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="{}" w:footer="{}"/></w:sectPr>"#,
         attr_num(u, 30000),
         attr_num(u, 30000),
         attr_num(u, 5000),
         attr_num(u, 5000),
         attr_num(u, 5000),
         attr_num(u, 5000),
+        attr_num(u, 1440),
+        attr_num(u, 1440),
     )
 }
 
@@ -245,7 +269,18 @@ fn gen_table(u: &mut Unstructured, used_hyperlink: &mut bool) -> String {
         }
         rows_xml.push_str(&format!("<w:tr>{cells}</w:tr>"));
     }
-    format!("<w:tbl><w:tblPr/>{grid}{rows_xml}</w:tbl>")
+    /* Issue #349 — table width / indent measures, valid or hostile. */
+    let tbl_pr = if u.ratio(1, 2).unwrap_or(false) {
+        let wtype = pick(u, &["dxa", "pct", "auto", "bogus"]);
+        format!(
+            r#"<w:tblPr><w:tblW w:w="{}" w:type="{wtype}"/><w:tblInd w:w="{}" w:type="dxa"/></w:tblPr>"#,
+            attr_num(u, 10000),
+            attr_num(u, 1440)
+        )
+    } else {
+        "<w:tblPr/>".to_string()
+    };
+    format!("<w:tbl>{tbl_pr}{grid}{rows_xml}</w:tbl>")
 }
 
 fn gen_body(u: &mut Unstructured) -> (String, bool) {

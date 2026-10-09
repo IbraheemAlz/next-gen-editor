@@ -404,8 +404,24 @@ export interface EditorCommands {
      *  window + selection + layout config). Read-only; resolves with the
      *  `SNAPSHOT` event (or `ERROR`). */
     snapshot(): Promise<Event>;
-    acceptRevision(block: number, start: number, end: number): Promise<Event>;
-    rejectRevision(block: number, start: number, end: number): Promise<Event>;
+    /** Accept one tracked change. Issue #304 — pass the snapshot row's
+     *  `revision_id` and it alone addresses the revision (the outer of
+     *  two wrappers over one range included; a stale id is a no-op);
+     *  without it the `(block, start, end)` range does. Either half of a
+     *  tracked move resolves the whole move. */
+    acceptRevision(
+        block: number,
+        start: number,
+        end: number,
+        revisionId?: number,
+    ): Promise<Event>;
+    /** Reject one tracked change — addressed like `acceptRevision`. */
+    rejectRevision(
+        block: number,
+        start: number,
+        end: number,
+        revisionId?: number,
+    ): Promise<Event>;
     /** Issue #262 — accept every tracked change of the document in ONE
      *  engine command (one undo step; paragraph-mark revisions merge
      *  paragraphs). */
@@ -840,10 +856,24 @@ function build(
         setReviewIdentity: (author, date) =>
             dispatch({ type: 'SET_REVIEW_IDENTITY', author, date }),
         snapshot: () => dispatch({ type: 'SNAPSHOT', seq: undefined }),
-        acceptRevision: (block, start, end) =>
-            dispatch({ type: 'ACCEPT_REVISION', block, start, end }),
-        rejectRevision: (block, start, end) =>
-            dispatch({ type: 'REJECT_REVISION', block, start, end }),
+        /* Issue #304 — `revision_id` is omitted, never `undefined`, when
+           absent (`exactOptionalPropertyTypes`). */
+        acceptRevision: (block, start, end, revisionId) =>
+            dispatch({
+                type: 'ACCEPT_REVISION',
+                block,
+                start,
+                end,
+                ...(revisionId === undefined ? {} : { revision_id: revisionId }),
+            }),
+        rejectRevision: (block, start, end, revisionId) =>
+            dispatch({
+                type: 'REJECT_REVISION',
+                block,
+                start,
+                end,
+                ...(revisionId === undefined ? {} : { revision_id: revisionId }),
+            }),
         acceptAllRevisions: () => dispatch({ type: 'ACCEPT_ALL_REVISIONS' }),
         rejectAllRevisions: () => dispatch({ type: 'REJECT_ALL_REVISIONS' }),
         insertComment: (text, author, range) =>

@@ -10,6 +10,10 @@
 
 use crate::error::{DocxError, DocxWarning};
 use crate::numbering_resolver::resolve_markers_blocks;
+use crate::opc::limits::{
+    PackageLimits, check_xml_part, is_walked_xml_part, read_entry_bounded, read_package_entries,
+};
+use crate::opc::part_names::{PartNames, rels_entry_name, target_candidates};
 use crate::parts::comments::{parse_comments_extended_xml, parse_comments_xml};
 use crate::parts::document::parse_document_xml_with_warnings;
 use crate::parts::endnotes::parse_endnotes_xml;
@@ -22,7 +26,7 @@ use crate::parts::styles::{StyleTable, parse_styles_xml};
 use crate::style_resolver::StyleResolver;
 use engine::{DocumentTree, ImageBlob};
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use zip::ZipArchive;
 
 pub const DOC_XML: &str = "word/document.xml";
@@ -54,11 +58,17 @@ pub struct DocxArchive {
     /// on every Word-authored `<w:p>`) and preserved grab-bag fragments
     /// stay namespace-well-formed. Empty for engine-authored archives.
     pub document_root_attrs: Vec<(String, String)>,
-    /// Non-fatal reader diagnostics raised while parsing
-    /// `word/document.xml` (issue #111 — a table nested past
-    /// `parts::table::MAX_TABLE_NESTING_DEPTH` kept as an opaque block).
-    /// Empty when the whole part landed in the typed model.
+    /// Non-fatal reader diagnostics raised while parsing the package
+    /// (issue #111 — a table nested past
+    /// `parts::table::MAX_TABLE_NESTING_DEPTH` kept as an opaque block;
+    /// issue #349 — an unusable or clamped measure; issue #350 — an
+    /// unbalanced or too deeply nested field). Empty when every part landed
+    /// in the typed model as written.
     pub warnings: Vec<DocxWarning>,
+    /// Issue #353 — where the main part and its special siblings live,
+    /// discovered from the package's relationships (fixed `word/…` names
+    /// are the fallback). The writer uses these, never the constants.
+    pub part_names: PartNames,
 }
 
 /// Issue #110 — strict well-formedness check of a saved package's
@@ -75,7 +85,29 @@ pub struct DocxArchive {
 /// that forgot to re-declare `xmlns:w14` is well-formed XML 1.0 but NOT
 /// namespace-well-formed, and Word refuses (or "repairs") the file.
 pub fn check_document_xml_well_formed(docx: &[u8]) -> Result<(), DocxError> {
-    check_part_xml_well_formed(docx, DOC_XML)
+    /* Issue #353 — the main part is whatever `_rels/.rels` says. */
+    let main = main_part_name(docx).unwrap_or_else(|| DOC_XML.to_string());
+    check_part_xml_well_formed(docx, &main)
+}
+
+/// Issue #353 — the main part's entry name in a packaged `.docx`
+/// (`_rels/.rels` → `officeDocument`), `None` when it cannot be resolved
+/// to an entry the archive holds.
+pub fn main_part_name(docx: &[u8]) -> Option<String> {
+    let mut archive = ZipArchive::new(Cursor::new(docx)).ok()?;
+    /* Issue #348 — bounded, never sized from the declared length. */
+    let rels = read_entry_bounded(
+        archive.by_name("_rels/.rels").ok()?,
+        "_rels/.rels",
+        &PackageLimits::DEFAULT,
+        &mut 0,
+    )
+    .ok()?;
+    let entries = vec![("_rels/.rels".to_string(), rels)];
+    let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+    PartNames::discover(&entries, &|n| names.iter().any(|e| e == n), &mut Vec::new())
+        .ok()
+        .map(|p| p.main)
 }
 
 /// [`check_document_xml_well_formed`] for any XML part of the package
@@ -88,11 +120,11 @@ pub fn check_part_xml_well_formed(docx: &[u8], part_name: &str) -> Result<(), Do
     use quick_xml::reader::NsReader;
 
     let mut archive = ZipArchive::new(Cursor::new(docx))?;
-    let mut part = archive
+    let part = archive
         .by_name(part_name)
         .map_err(|_| DocxError::MissingEntry(part_name.into()))?;
-    let mut xml = Vec::with_capacity(part.size() as usize);
-    part.read_to_end(&mut xml)?;
+    /* Issue #348 — never allocate from the declared size. */
+    let xml = read_entry_bounded(part, part_name, &PackageLimits::DEFAULT, &mut 0)?;
 
     let mut reader = NsReader::from_reader(xml.as_slice());
     let config = reader.config_mut();
@@ -248,37 +280,86 @@ pub fn read_docx_with_settings(
     default_page_size: engine::DefaultPageSize,
     widow_control_default: bool,
 ) -> Result<DocxArchive, DocxError> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
-    let mut other_entries: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut document_xml: Option<Vec<u8>> = None;
+    read_docx_with_limits(
+        bytes,
+        default_page_size,
+        widow_control_default,
+        &PackageLimits::DEFAULT,
+    )
+}
 
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let name = file.name().to_owned();
-        let mut buf = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut buf)?;
-        if name == DOC_XML {
-            document_xml = Some(buf);
-        } else {
-            other_entries.push((name, buf));
+/// [`read_docx_with_settings`] under explicit resource bounds (issue
+/// #348): the package is refused with [`DocxError::PackageTooLarge`] when
+/// it holds more than `limits.max_entries` entries, when any entry (or the
+/// package as a whole) inflates past its byte budget — every entry is read
+/// through `take(limit + 1)`, the declared size is never trusted — or when
+/// an XML part the reader walks nests deeper than `limits.max_xml_depth`
+/// or holds more than `limits.max_xml_elements` elements. The other
+/// entry points use [`PackageLimits::DEFAULT`].
+pub fn read_docx_with_limits(
+    bytes: &[u8],
+    default_page_size: engine::DefaultPageSize,
+    widow_control_default: bool,
+    limits: &PackageLimits,
+) -> Result<DocxArchive, DocxError> {
+    /* Issue #349 — every part's non-fatal diagnostics (styles,
+    headers, notes included) land on `DocxArchive::warnings`. */
+    let mut part_warnings = Vec::new();
+    let mut archive = crate::error::collect_read_warnings(&mut part_warnings, |_| {
+        read_docx_scoped(bytes, default_page_size, widow_control_default, limits)
+    })?;
+    archive.warnings.extend(part_warnings);
+    Ok(archive)
+}
+
+/// [`read_docx_with_limits`]'s body, run inside the warnings scope.
+fn read_docx_scoped(
+    bytes: &[u8],
+    default_page_size: engine::DefaultPageSize,
+    widow_control_default: bool,
+    limits: &PackageLimits,
+) -> Result<DocxArchive, DocxError> {
+    /* Issue #348 — every entry through the bounded reader (never an
+    allocation from the declared size), then the XML shape bounds of every
+    part the reader walks, before any typed walk. */
+    let mut all_entries = read_package_entries(bytes, limits)?;
+    for (name, buf) in &all_entries {
+        if is_walked_xml_part(name) {
+            check_xml_part(name, buf, limits)?;
         }
     }
 
-    let xml = document_xml.ok_or_else(|| DocxError::MissingEntry(DOC_XML.into()))?;
+    let mut warnings: Vec<DocxWarning> = Vec::new();
+    /* Issue #353 — the main part and its siblings come from the package's
+    relationships (fixed `word/…` names are the fallback). */
+    let part_names = PartNames::discover(
+        &all_entries,
+        &|n| all_entries.iter().any(|(e, _)| e == n),
+        &mut warnings,
+    )?;
+    let main_at = all_entries
+        .iter()
+        .position(|(n, _)| *n == part_names.main)
+        .ok_or_else(|| DocxError::MissingEntry(part_names.main.clone()))?;
+    let (_, xml) = all_entries.remove(main_at);
+    let mut other_entries = all_entries;
+    other_entries.shrink_to_fit();
+    /* Issue #325 — validate the root's namespace bindings; a non-canonical
+    spelling is normalised (regenerate-only) instead of reading empty. */
+    let xml = canonical_main_part(xml, &mut warnings);
 
     /* Phase 3 — `word/styles.xml` rides the pass-through but feeds the
     cascade resolver. Absent or malformed → empty table (all paragraphs
     just see direct formatting; behaviour matches pre-Phase-3). */
     let style_table: StyleTable = match other_entries
         .iter()
-        .find(|(n, _)| n == STYLES_XML)
+        .find(|(n, _)| *n == part_names.styles)
         .map(|(_, b)| parse_styles_xml(b))
     {
         Some(Ok(t)) => t,
         _ => StyleTable::default(),
     };
     let resolver = StyleResolver::new(&style_table);
-    let mut warnings: Vec<DocxWarning> = Vec::new();
     let mut document = parse_document_xml_with_warnings(
         &xml,
         &resolver,
@@ -293,7 +374,7 @@ pub fn read_docx_with_settings(
     list paragraph's `resolved_marker`. */
     let numbering: NumberingDefinitions = match other_entries
         .iter()
-        .find(|(n, _)| n == NUMBERING_XML)
+        .find(|(n, _)| *n == part_names.numbering)
         .map(|(_, b)| parse_numbering_xml(b))
     {
         Some(Ok(t)) => t,
@@ -322,14 +403,14 @@ pub fn read_docx_with_settings(
     to an empty band so a partial archive still renders. */
     let rels = other_entries
         .iter()
-        .find(|(n, _)| n == RELS_XML)
+        .find(|(n, _)| *n == part_names.main_rels)
         .and_then(|(_, b)| parse_rels_xml(b).ok())
         .unwrap_or_default();
     let mut headers: HashMap<String, Vec<engine::Block>> = HashMap::new();
     let mut footers: HashMap<String, Vec<engine::Block>> = HashMap::new();
     let fetch_part = |rid: &str| -> Option<&[u8]> {
         let target = rels.get(rid)?;
-        let entry = resolve_target(target);
+        let entry = resolve_in_package(&other_entries, &part_names.main, target);
         other_entries
             .iter()
             .find(|(n, _)| n == &entry)
@@ -396,13 +477,13 @@ pub fn read_docx_with_settings(
     relationship `Type` would be the canonical filter (`.../image`), but
     the pass is lenient — any rel resolving into `word/media/` counts. */
     let mut media: HashMap<String, ImageBlob> = HashMap::new();
-    let body_media_keys = register_part_media(&other_entries, DOC_XML, &rels, &mut media);
+    let body_media_keys = register_part_media(&other_entries, &part_names.main, &rels, &mut media);
     for (rid, blocks) in headers.iter_mut().chain(footers.iter_mut()) {
         if !numbering.num_instances.is_empty() {
             resolve_markers_blocks(blocks, &numbering);
         }
         if let Some(target) = rels.get(rid.as_str()) {
-            let entry = resolve_target(target);
+            let entry = resolve_in_package(&other_entries, &part_names.main, target);
             let rels_name = part_rels_entry_name(&entry);
             let part_rels = other_entries
                 .iter()
@@ -455,7 +536,10 @@ pub fn read_docx_with_settings(
             id.clone(),
             engine::ParagraphStyle {
                 id: id.clone(),
-                name: id.clone(),
+                /* Issue #297 — the display `<w:name>`, never the id: a
+                regenerated styles.xml writes this back, and Word's
+                gallery shows it (`heading 1`, not `Heading1`). */
+                name: def.name.clone().unwrap_or_default(),
                 based_on: def.based_on.clone(),
                 para: def.para.clone(),
                 run: def.run.clone(),
@@ -480,8 +564,8 @@ pub fn read_docx_with_settings(
     resolve against `numbering.xml`; hyperlink rel ids resolve against
     the PART's own rels file (`word/_rels/footnotes.xml.rels`). */
     for (entry, kind) in [
-        (FOOTNOTES_XML, engine::NoteKind::Footnote),
-        (ENDNOTES_XML, engine::NoteKind::Endnote),
+        (part_names.footnotes.as_str(), engine::NoteKind::Footnote),
+        (part_names.endnotes.as_str(), engine::NoteKind::Endnote),
     ] {
         let Some(bytes) = other_entries
             .iter()
@@ -535,7 +619,7 @@ pub fn read_docx_with_settings(
     // writer round-trips it byte-identical.
     if let Some(bytes) = other_entries
         .iter()
-        .find(|(n, _)| n == COMMENTS_XML)
+        .find(|(n, _)| *n == part_names.comments)
         .map(|(_, b)| b.as_slice())
         && let Ok(defs) = parse_comments_xml(bytes)
     {
@@ -552,7 +636,7 @@ pub fn read_docx_with_settings(
     comments". */
     if let Some(bytes) = other_entries
         .iter()
-        .find(|(n, _)| n == COMMENTS_EXTENDED_XML)
+        .find(|(n, _)| *n == part_names.comments_extended)
         .map(|(_, b)| b.as_slice())
         && let Ok(entries) = parse_comments_extended_xml(bytes)
     {
@@ -582,7 +666,7 @@ pub fn read_docx_with_settings(
     `even_and_odd_headers` toggle the paginator needs. */
     if let Some(bytes) = other_entries
         .iter()
-        .find(|(n, _)| n == SETTINGS_XML)
+        .find(|(n, _)| *n == part_names.settings)
         .map(|(_, b)| b.as_slice())
         && let Ok(settings) = crate::parts::settings::parse_settings_xml(bytes)
     {
@@ -596,7 +680,7 @@ pub fn read_docx_with_settings(
     the typed read lifts `<dc:creator>` so `AUTHOR` fields resolve. */
     if let Some(bytes) = other_entries
         .iter()
-        .find(|(n, _)| n == CORE_PROPS_XML)
+        .find(|(n, _)| *n == part_names.core_props)
         .map(|(_, b)| b.as_slice())
         && let Ok(props) = crate::parts::core_props::parse_core_props_xml(bytes)
     {
@@ -622,7 +706,44 @@ pub fn read_docx_with_settings(
         document,
         document_root_attrs,
         warnings,
+        part_names,
     })
+}
+
+/// Issue #325 — gate the main part on its root's namespace bindings
+/// ([`crate::schema::grab_bag::NamespaceScope::classify_root`]). Canonical
+/// roots (either family) are returned untouched — the byte-identical fast
+/// path. A non-canonical root is re-prefixed
+/// ([`crate::schema::ns_normalize::canonicalize_prefixes`]) and reported;
+/// when even that fails, or the root is no WordprocessingML at all, the
+/// part is returned as-is with a typed warning — never a silent empty
+/// document.
+fn canonical_main_part(xml: Vec<u8>, warnings: &mut Vec<DocxWarning>) -> Vec<u8> {
+    use crate::schema::family::RootBinding;
+    use crate::schema::ns_normalize::{canonicalize_prefixes, inspect_root};
+    match inspect_root(&xml) {
+        RootBinding::Canonical(_) => xml,
+        RootBinding::NotWordprocessingMl => {
+            warnings.push(DocxWarning::NotWordprocessingMl);
+            xml
+        }
+        RootBinding::NonCanonical { detail } => match canonicalize_prefixes(&xml) {
+            Ok(normalised) => {
+                warnings.push(DocxWarning::NonCanonicalNamespaces {
+                    detail,
+                    normalized: true,
+                });
+                normalised
+            }
+            Err(e) => {
+                warnings.push(DocxWarning::NonCanonicalNamespaces {
+                    detail: format!("{detail}; normalisation failed: {e}"),
+                    normalized: false,
+                });
+                xml
+            }
+        },
+    }
 }
 
 /// Guess a MIME type from a `word/media/*` archive entry name. The OOXML
@@ -686,6 +807,14 @@ fn register_part_media(
     let exists = |name: &str| entries.iter().any(|(n, _)| n == name);
     for (rid, target) in rels {
         let mut entry = resolve_part_relative_target(source_part, target);
+        /* Issue #353 — a percent-encoded target (`my%20pic.png`) names the
+        decoded entry. */
+        if !exists(&entry)
+            && let Ok(candidates) = target_candidates(source_part, target)
+            && let Some(found) = candidates.into_iter().find(|c| exists(c))
+        {
+            entry = found;
+        }
         /* Pre-#188 leniency: a malformed `word/media/…` target written
         package-relative without its leading slash still resolves. */
         if !exists(&entry) {
@@ -694,7 +823,9 @@ fn register_part_media(
                 entry = legacy;
             }
         }
-        if !entry.starts_with("word/media/") {
+        /* Issue #353 — media live in a `media/` directory next to the
+        main part, which is `word/media/` unless the main part moved. */
+        if !(entry.starts_with("media/") || entry.contains("/media/")) {
             continue;
         }
         if !media.contains_key(&entry) {
@@ -740,10 +871,27 @@ fn stamp_media_keys(blocks: &mut [engine::Block], keys: &HashMap<String, String>
 /// `word/header1.xml` live at `word/_rels/header1.xml.rels` (the part's
 /// directory + `_rels/` + basename + `.rels`).
 fn part_rels_entry_name(part_entry: &str) -> String {
-    match part_entry.rsplit_once('/') {
-        Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
-        None => format!("_rels/{part_entry}.rels"),
+    rels_entry_name(part_entry)
+}
+
+/// Issue #353 — the archive entry a relationship `target` of `source_part`
+/// denotes: the OPC resolution (`..`, `/`-absolute, `%20`) when the
+/// archive holds it, else the pre-#353 `word/`-anchored guess. An escaping
+/// target resolves to the legacy guess too (a missing entry — nothing
+/// outside the archive is ever opened).
+pub(crate) fn resolve_in_package(
+    entries: &[(String, Vec<u8>)],
+    source_part: &str,
+    target: &str,
+) -> String {
+    if let Ok(candidates) = target_candidates(source_part, target)
+        && let Some(found) = candidates
+            .into_iter()
+            .find(|c| entries.iter().any(|(n, _)| n == c))
+    {
+        return found;
     }
+    resolve_target(target)
 }
 
 /// Walk a block, rewriting every paragraph's hyperlink `target` from the
@@ -1065,5 +1213,144 @@ mod tests {
             letter.document.body_section.geometry,
             engine::PageGeometry::letter()
         );
+    }
+
+    /* ---------------------------------------------------------------
+    Issue #348 — package limits.
+    --------------------------------------------------------------- */
+
+    use crate::opc::limits::PackageLimit;
+    use crate::test_fixtures::{
+        compressible_bomb_docx, lying_size_docx, nested_sdt_docx, nested_tables_docx,
+    };
+
+    fn limit_of(err: &DocxError) -> Option<PackageLimit> {
+        match err {
+            DocxError::PackageTooLarge { limit, .. } => Some(*limit),
+            _ => None,
+        }
+    }
+
+    fn body_text(doc: &DocumentTree) -> String {
+        doc.to_plain_text()
+    }
+
+    /// A directory record claiming 4 GiB (or `u64::MAX`) for a 100-byte
+    /// part used to reach `Vec::with_capacity(declared)` — a "capacity
+    /// overflow" trap on wasm32 (and natively for the larger lie). The
+    /// declared size is never trusted now: the real bytes are read.
+    #[test]
+    fn a_lying_declared_size_never_reaches_the_allocator() {
+        for declared in [4 * 1024 * 1024 * 1024, u64::MAX - 1] {
+            let docx = lying_size_docx(declared);
+            let archive = read_docx(&docx).expect("the real part is small");
+            assert_eq!(body_text(&archive.document), "small", "declared {declared}");
+            /* The harness guard reads through the same bounded path. */
+            check_document_xml_well_formed(&docx).expect("well-formed");
+        }
+    }
+
+    /// A compression bomb is inflated only up to its budget + 1 byte and
+    /// refused with the typed error, naming the part.
+    #[test]
+    fn a_compressible_bomb_is_refused_at_the_part_budget() {
+        let limits = PackageLimits {
+            max_part_bytes: 1024 * 1024,
+            ..PackageLimits::DEFAULT
+        };
+        let docx = compressible_bomb_docx(8 * 1024 * 1024);
+        assert!(
+            docx.len() < 64 * 1024,
+            "the bomb is small on disk: {}",
+            docx.len()
+        );
+        let err = read_docx_with_limits(&docx, engine::DefaultPageSize::A4, true, &limits)
+            .expect_err("8 MiB > 1 MiB part budget");
+        assert_eq!(limit_of(&err), Some(PackageLimit::PartBytes), "{err:?}");
+        assert!(err.to_string().contains("word/media/bomb.bin"), "{err}");
+        /* Under the total budget instead: 3 × 600 KiB parts, 1 MiB total. */
+        let limits = PackageLimits {
+            max_total_bytes: 1024 * 1024,
+            ..PackageLimits::DEFAULT
+        };
+        let part = vec![0u8; 600 * 1024];
+        let docx = crate::test_fixtures::package_with_document_xml(
+            &crate::test_fixtures::document_xml_with_body("<w:p/>"),
+            &[("word/media/a.bin", &part), ("word/media/b.bin", &part)],
+        );
+        let err = read_docx_with_limits(&docx, engine::DefaultPageSize::A4, true, &limits)
+            .expect_err("1.2 MiB > 1 MiB total");
+        assert_eq!(limit_of(&err), Some(PackageLimit::TotalBytes), "{err:?}");
+        /* The stock budget reads the same package. */
+        read_docx(&docx).expect("well under the default limits");
+    }
+
+    #[test]
+    fn too_many_entries_are_refused_before_any_is_read() {
+        let limits = PackageLimits {
+            max_entries: 4,
+            ..PackageLimits::DEFAULT
+        };
+        let docx = crate::test_fixtures::package_with_document_xml(
+            &crate::test_fixtures::document_xml_with_body("<w:p/>"),
+            &[("word/media/a.bin", b"a")],
+        );
+        let err = read_docx_with_limits(&docx, engine::DefaultPageSize::A4, true, &limits)
+            .expect_err("5 entries > 4");
+        assert_eq!(limit_of(&err), Some(PackageLimit::Entries), "{err:?}");
+    }
+
+    /// 5000 content controls nested inside each other: refused by the XML
+    /// depth cap with the typed error instead of being walked.
+    #[test]
+    fn five_thousand_nested_sdts_are_refused_by_the_depth_cap() {
+        let err = read_docx(&nested_sdt_docx(5000)).expect_err("depth 10 000 > 256");
+        assert_eq!(limit_of(&err), Some(PackageLimit::XmlDepth), "{err:?}");
+        assert!(err.to_string().contains("word/document.xml"), "{err}");
+        /* A shallow chain still reads. */
+        let ok = read_docx(&nested_sdt_docx(20)).expect("40 levels");
+        assert_eq!(body_text(&ok.document), "deep");
+    }
+
+    /// 60 nested tables (depth ≈ 185) stay under the cap and read fully —
+    /// the innermost cell's text is reachable in the typed model.
+    #[test]
+    fn sixty_nested_tables_still_read() {
+        let archive = read_docx(&nested_tables_docx(60)).expect("60 nested tables read");
+        assert!(archive.warnings.is_empty(), "{:?}", archive.warnings);
+        let mut table = archive.document.blocks[0].as_table().expect("table");
+        let mut levels = 1;
+        loop {
+            let cell = &table.rows[0].cells[0];
+            match cell.blocks.first() {
+                Some(engine::Block::Table(inner)) => {
+                    table = inner;
+                    levels += 1;
+                }
+                Some(engine::Block::Paragraph(p)) => {
+                    assert_eq!(p.text, "deep");
+                    break;
+                }
+                None => panic!("empty cell at level {levels}"),
+            }
+        }
+        assert_eq!(levels, 60);
+    }
+
+    /// The element-count cap refuses a part with too many elements.
+    #[test]
+    fn the_element_cap_is_enforced_on_walked_parts() {
+        let limits = PackageLimits {
+            max_xml_elements: 50,
+            ..PackageLimits::DEFAULT
+        };
+        let body = "<w:p><w:r><w:t>x</w:t></w:r></w:p>".repeat(20);
+        let docx = crate::test_fixtures::package_with_document_xml(
+            &crate::test_fixtures::document_xml_with_body(&body),
+            &[],
+        );
+        let err = read_docx_with_limits(&docx, engine::DefaultPageSize::A4, true, &limits)
+            .expect_err("60+ elements > 50");
+        assert_eq!(limit_of(&err), Some(PackageLimit::XmlElements), "{err:?}");
     }
 }

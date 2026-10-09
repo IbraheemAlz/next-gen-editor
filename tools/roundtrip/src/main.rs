@@ -32,6 +32,10 @@
 mod complex_script;
 mod inline_spans;
 mod note_containers;
+mod package_families;
+mod paragraph_format;
+mod reader_hardening;
+mod revision_ids;
 mod revisions;
 mod table_markup;
 
@@ -336,10 +340,15 @@ fn run_default() -> Result<()> {
     run_hyperlink_identity_roundtrip()?;
     run_comment_anchor_roundtrip()?;
     note_containers::run_note_containers_roundtrip()?;
-    complex_script::run_complex_script_roundtrip()?;
     revisions::run_double_mark_revisions_roundtrip()?;
     revisions::run_tracked_split_roundtrip()?;
     revisions::run_tracked_cross_paragraph_delete_roundtrip()?;
+    revision_ids::run_revision_ids_roundtrip()?;
+    paragraph_format::run_paragraph_format_roundtrip()?;
+    package_families::run_package_families_roundtrip()?;
+    reader_hardening::run_field_phases_roundtrip()?;
+    reader_hardening::run_alternate_content_roundtrip()?;
+    complex_script::run_complex_script_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4346,6 +4355,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         }]),
     };
     vec![
@@ -4937,7 +4947,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         /* Issue #359 — one run with `w:sz="22" w:szCs="28"` mixing Latin
         and Arabic, a `<w:rtl/>` run, a run with only `w:sz` over a
         docDefaults `w:szCs`. Zero-edit drift 0; the default harness's
-        step 41 edits it. */
+        step 45 edits it. */
         PrebuiltFixture {
             name: "complex_script_size.docx",
             bytes: format_docx::test_fixtures::complex_script_size_docx(),

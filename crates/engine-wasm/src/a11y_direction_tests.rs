@@ -317,6 +317,7 @@ fn open_style_bidi(base: ShapingDirection) -> Engine {
             bytes: style_bidi_docx(),
             format: DocFormat::Docx,
             name: None,
+            limits: None,
             defaults: None,
         },
     );

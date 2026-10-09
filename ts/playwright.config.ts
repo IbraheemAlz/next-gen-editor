@@ -88,6 +88,10 @@ export default defineConfig({
              * `vite.config.ts`, which logs the served absolute path + short
              * commit SHA on every boot so a mismatch is visible at a glance). */
             command: `pnpm exec vite --port ${PORT} --strictPort`,
+            /* Issue #340 - the dev hooks (window.__dispatch, ...) are build-time
+             * gated; a dev server has them already, the flag keeps the contract
+             * explicit (and covers a future non-dev e2e server). */
+            env: { VITE_NGE_DEV_HOOKS: '1' },
             url: BASE_URL,
             reuseExistingServer: REUSE_SERVER,
             timeout: 60_000,

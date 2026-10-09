@@ -10,6 +10,7 @@
 //! Twip values land in the engine model verbatim; layout converts to px.
 
 use crate::schema::ct_rpr::{attr_val, parse_hex_color, schema_rank, toggle_on};
+use crate::schema::measure::{SIGNED_TWIPS, TWIPS, attr_measure_twips};
 use engine::{Alignment, Indent, LineHeight, ParaProperties, Spacing, TextDirection};
 use quick_xml::events::BytesStart;
 
@@ -101,17 +102,19 @@ pub(crate) fn parse_jc(v: &str) -> Option<Alignment> {
     }
 }
 
-/// Parse a signed twip attribute. Returns `None` if absent or malformed.
+/// Parse a signed twip attribute (`ST_SignedTwipsMeasure`). Returns `None`
+/// if absent or unusable. Issue #349 — through the one lenient measure
+/// reader: unit suffixes honoured, NaN / infinite rejected, the value
+/// clamped to Word's ±22 in.
 fn attr_twips(e: &BytesStart, key: &[u8]) -> Option<i32> {
-    attr_val(e, key).and_then(|v| v.trim().parse::<i32>().ok())
+    attr_measure_twips(e, key, SIGNED_TWIPS)
 }
 
-/// Parse an unsigned twip attribute (used for `<w:ind w:firstLine>` /
-/// `<w:hanging>` / `<w:spacing w:before>` / `<w:after>`).
+/// Parse an unsigned twip attribute (`ST_TwipsMeasure`, used for
+/// `<w:ind w:firstLine>` / `<w:hanging>` / `<w:spacing w:before>` /
+/// `<w:after>`): a negative value is unusable.
 fn attr_utwips(e: &BytesStart, key: &[u8]) -> Option<i32> {
-    attr_val(e, key)
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .map(|v| v as i32)
+    attr_measure_twips(e, key, TWIPS)
 }
 
 /// `<w:ind w:start|left="…" w:end|right="…" w:firstLine="…" w:hanging="…"/>`.

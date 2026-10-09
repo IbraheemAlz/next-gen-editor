@@ -11,6 +11,7 @@
 //! export path itself deflates `/FlateDecode` streams), so no Cargo.toml
 //! change was needed to share it across the workspace this way.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 
 /// Every top-level content-stream object embedded in `pdf`, inflated, in
@@ -21,6 +22,14 @@ use std::io::Read;
 /// is opaque binary and a CMap's `beginbfchar`/`endcidrange` text never
 /// contains that token.
 pub fn content_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
+    inflated_streams(pdf)
+        .into_iter()
+        .filter(|decoded| find(decoded, b"BT").is_some() && find(decoded, b"begincmap").is_none())
+        .collect()
+}
+
+/// Every `/FlateDecode` stream in `pdf` that inflates cleanly, in file order.
+fn inflated_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
     const MARKER: &[u8] = b">>\nstream\n";
     let mut out = Vec::new();
     let mut cursor = 0usize;
@@ -35,12 +44,92 @@ pub fn content_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
         if flate2::read::ZlibDecoder::new(raw)
             .read_to_end(&mut decoded)
             .is_ok()
-            && find(&decoded, b"BT").is_some()
         {
             out.push(decoded);
         }
     }
     out
+}
+
+/// Issue #327 — every `/ToUnicode` CMap embedded in `pdf` (one per font, in
+/// file order), parsed into code → text. Subset fonts renumber glyph ids,
+/// so a test can no longer compare a content stream's codes against the
+/// shaper's glyph ids; it recovers the TEXT the codes stand for instead —
+/// exactly what a viewer's copy / text extraction does.
+pub fn to_unicode_cmaps(pdf: &[u8]) -> Vec<BTreeMap<u16, String>> {
+    inflated_streams(pdf)
+        .into_iter()
+        .filter(|decoded| find(decoded, b"begincmap").is_some())
+        .map(|decoded| parse_bfchar(&decoded))
+        .collect()
+}
+
+/// The `<code> <utf16-hex>` pairs of every `beginbfchar` … `endbfchar`
+/// section (the only form `pdf_writer::types::UnicodeCmap` writes).
+fn parse_bfchar(cmap: &[u8]) -> BTreeMap<u16, String> {
+    let text = String::from_utf8_lossy(cmap);
+    let mut out = BTreeMap::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.ends_with("beginbfchar") {
+            in_section = true;
+        } else if line == "endbfchar" {
+            in_section = false;
+        } else if in_section {
+            let mut hex = line.split(['<', '>', ' ']).filter(|part| !part.is_empty());
+            let (Some(code), Some(utf16)) = (hex.next(), hex.next()) else {
+                continue;
+            };
+            let Ok(code) = u16::from_str_radix(code, 16) else {
+                continue;
+            };
+            let units: Vec<u16> = (0..utf16.len() / 4)
+                .filter_map(|i| u16::from_str_radix(&utf16[i * 4..i * 4 + 4], 16).ok())
+                .collect();
+            out.insert(code, String::from_utf16_lossy(&units));
+        }
+    }
+    out
+}
+
+/// Issue #327 — the distinct faces `pdf` embeds, by `/BaseFont` name with
+/// any six-letter `ABCDEF+` subset tag stripped (the `Type0` and `CIDFont`
+/// dictionaries both carry the name — deduplicated), in file order.
+pub fn embedded_font_names(pdf: &[u8]) -> Vec<String> {
+    const KEY: &[u8] = b"/BaseFont /";
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = find(&pdf[cursor..], KEY) {
+        let start = cursor + rel + KEY.len();
+        let len = pdf[start..]
+            .iter()
+            .position(|b| b.is_ascii_whitespace() || b"/<>[]()%".contains(b))
+            .unwrap_or(pdf.len() - start);
+        cursor = start + len;
+        let name = String::from_utf8_lossy(&pdf[start..start + len]).into_owned();
+        let bytes = name.as_bytes();
+        let untagged =
+            if bytes.len() > 7 && bytes[6] == b'+' && bytes[..6].iter().all(u8::is_ascii_uppercase)
+            {
+                name[7..].to_string()
+            } else {
+                name
+            };
+        if !out.contains(&untagged) {
+            out.push(untagged);
+        }
+    }
+    out
+}
+
+/// Decode one text block's codes through a font's `/ToUnicode` map; an
+/// unmapped code becomes U+FFFD so a missing mapping fails loudly.
+pub fn decode_codes(codes: &[u16], cmap: &BTreeMap<u16, String>) -> String {
+    codes
+        .iter()
+        .map(|code| cmap.get(code).map_or("\u{fffd}", String::as_str))
+        .collect()
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -287,14 +376,16 @@ mod tests {
         assert!(!streams.is_empty(), "no content stream decoded");
         let blocks: Vec<Vec<u16>> = streams.iter().flat_map(|s| text_blocks(s)).collect();
         assert!(!blocks.is_empty(), "no BT/ET text block decoded");
-        let face = stack.face("liberation").expect("liberation face");
-        let expected: Vec<u16> = "Hi"
-            .chars()
-            .map(|c| face.glyph_id(c).expect("glyph"))
-            .collect();
+        /* Issue #327 — the font is a subset, so the codes are its
+        renumbered ids (first use: 'H' → 1, 'i' → 2), and they decode
+        back to the source text through the font's `/ToUnicode`. */
         assert!(
-            blocks.contains(&expected),
-            "expected {expected:?} among decoded blocks {blocks:?}"
+            blocks.contains(&vec![1, 2]),
+            "expected the subset codes [1, 2] among decoded blocks {blocks:?}"
         );
+        let cmaps = to_unicode_cmaps(&out);
+        assert_eq!(cmaps.len(), 1, "one font, one /ToUnicode CMap");
+        let texts: Vec<String> = blocks.iter().map(|b| decode_codes(b, &cmaps[0])).collect();
+        assert!(texts.iter().any(|t| t == "Hi"), "decoded blocks {texts:?}");
     }
 }

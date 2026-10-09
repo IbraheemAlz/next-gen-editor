@@ -23,7 +23,7 @@ const BCS_RUN: &str = r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rStyle w:va
 const WORD_ARABIC_RPR: &str = r#"<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Simplified Arabic" w:hint="cs"/><w:b w:val="false"/><w:sz w:val="22"/><w:szCs w:val="28"/><w:rtl/><w:lang w:bidi="ar-SA"/>"#;
 const WORD_ARABIC_TEXT: &str = "الإصدار الأول";
 
-/// Step 41e — regeneration fidelity (#249): changing bold rewrites only
+/// Step 45e — regeneration fidelity (#249): changing bold rewrites only
 /// `<w:b>`; changing the font rewrites only the font names, keeping
 /// `w:hint`, the explicit OFF bold and both sizes.
 fn run_regeneration_fidelity_step() -> Result<()> {
@@ -94,12 +94,12 @@ fn run_regeneration_fidelity_step() -> Result<()> {
         );
     }
     println!(
-        "[roundtrip] step 41e OK — changing bold rewrites only <w:b>; a font change keeps w:hint, the OFF bold and both sizes (#249)"
+        "[roundtrip] step 45e OK — changing bold rewrites only <w:b>; a font change keeps w:hint, the OFF bold and both sizes (#249)"
     );
     Ok(())
 }
 
-/// Step 41d — Ctrl+B on an Arabic `<w:bCs/>` run writes `<w:b/>` next to
+/// Step 45d — Ctrl+B on an Arabic `<w:bCs/>` run writes `<w:b/>` next to
 /// the existing `<w:bCs/>` and keeps its `<w:rStyle>`: a pure insertion.
 fn run_bcs_rstyle_step() -> Result<()> {
     let src = docx_with_body(BCS_RUN);
@@ -143,7 +143,7 @@ fn run_bcs_rstyle_step() -> Result<()> {
         bail!("b / bCs / rStyle lost on re-read: {s:?}");
     }
     println!(
-        "[roundtrip] step 41d OK — bold on an Arabic <w:bCs/> run inserts <w:b/> and keeps <w:rStyle> (both slots re-read)"
+        "[roundtrip] step 45d OK — bold on an Arabic <w:bCs/> run inserts <w:b/> and keeps <w:rStyle> (both slots re-read)"
     );
     Ok(())
 }
@@ -172,13 +172,13 @@ fn nth_paragraph_xml(xml: &str, n: usize) -> &str {
     &xml[start..end]
 }
 
-/// Step 41 — the mixed-size complex-script fixture.
+/// Step 45 — the mixed-size complex-script fixture.
 pub(crate) fn run_complex_script_roundtrip() -> Result<()> {
     let src = complex_script_size_docx();
     let archive = read_docx(&src).context("read complex-script fixture")?;
     let doc_a = doc_xml_string(&src)?;
 
-    /* 41a — each slot reads into its own field; both save paths
+    /* 45a — each slot reads into its own field; both save paths
     reproduce the source byte for byte. */
     let slots = |doc: &DocumentTree, para: u32, at: u32| {
         let s = doc
@@ -207,10 +207,10 @@ pub(crate) fn run_complex_script_roundtrip() -> Result<()> {
         bail!("untouched complex-script document drifted (UI save path)");
     }
     println!(
-        "[roundtrip] step 41a OK — w:sz / w:szCs read into their own slots; zero-edit save byte-identical (both save paths)"
+        "[roundtrip] step 45a OK — w:sz / w:szCs read into their own slots; zero-edit save byte-identical (both save paths)"
     );
 
-    /* 41b — typing into the mixed-size run is a pure insertion. */
+    /* 45b — typing into the mixed-size run is a pure insertion. */
     let at = CS_SIZE_MIXED_TEXT
         .find("النص")
         .context("Arabic word in the mixed run")?;
@@ -230,11 +230,11 @@ pub(crate) fn run_complex_script_roundtrip() -> Result<()> {
         );
     }
     println!(
-        "[roundtrip] step 41b OK — typing into the mixed-size run is a pure insertion (Δ {} B)",
+        "[roundtrip] step 45b OK — typing into the mixed-size run is a pure insertion (Δ {} B)",
         xml.len() - doc_a.len()
     );
 
-    /* 41c — a size set on part of the run writes BOTH slots, the rest
+    /* 45c — a size set on part of the run writes BOTH slots, the rest
     keeps its source pair, and a run that only had `w:sz` never gains a
     synthesized `w:szCs` when something else about it changes (#249). */
     let sized = archive.document.apply_style(
@@ -276,7 +276,7 @@ pub(crate) fn run_complex_script_roundtrip() -> Result<()> {
         bail!("slots lost on re-read");
     }
     println!(
-        "[roundtrip] step 41c OK — a set size writes w:sz + w:szCs, untouched text keeps its pair, no synthesized w:szCs"
+        "[roundtrip] step 45c OK — a set size writes w:sz + w:szCs, untouched text keeps its pair, no synthesized w:szCs"
     );
     run_bcs_rstyle_step()?;
     run_regeneration_fidelity_step()

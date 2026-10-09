@@ -1269,41 +1269,7 @@ impl Engine {
     /// `Delete`), author, and date. The TS shell uses this to render
     /// hover tooltips over revision-marked text in the canvas.
     pub fn revisions_snapshot(&self) -> Result<JsValue, JsValue> {
-        let doc = self.undo.current();
-        let mut rows: Vec<RevisionOut> = Vec::new();
-        for (block_idx, block) in doc.blocks.iter().enumerate() {
-            if let engine::Block::Paragraph(p) = block {
-                for r in &p.revisions {
-                    rows.push(RevisionOut {
-                        block: block_idx as u32,
-                        start: r.start,
-                        end: r.end,
-                        kind: revision_kind_label(r.kind),
-                        author: r.author.clone(),
-                        date: r.date.clone(),
-                        move_name: r.move_name.clone(),
-                        mark: false,
-                    });
-                }
-                /* Issue #262 — the paragraph-mark revisions, addressed as
-                the empty range at the paragraph end (what
-                `AcceptRevision` / `RejectRevision` resolve it by — the
-                FIRST of several, issue #303: one row each, in order). */
-                for r in &p.mark_revisions {
-                    let end = p.text.len() as u32;
-                    rows.push(RevisionOut {
-                        block: block_idx as u32,
-                        start: end,
-                        end,
-                        kind: revision_kind_label(r.kind),
-                        author: r.author.clone(),
-                        date: r.date.clone(),
-                        move_name: r.move_name.clone(),
-                        mark: true,
-                    });
-                }
-            }
-        }
+        let rows = revision_rows(self.undo.current());
         serde_wasm_bindgen::to_value(&rows)
             .map_err(|e| JsValue::from_str(&format!("encode revisions: {e}")))
     }
@@ -1379,7 +1345,7 @@ struct PaintDimsOut {
     paint_geometry_seq: u64,
 }
 
-#[derive(::serde::Serialize)]
+#[derive(::serde::Serialize, Debug, Clone, PartialEq)]
 struct RevisionOut {
     block: u32,
     start: u32,
@@ -1395,6 +1361,48 @@ struct RevisionOut {
     /// addressed by the empty range `start == end == text length`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mark: bool,
+    /// Issue #304 — the revision's stable id
+    /// (`DocumentTree::revision_entries`): what `AcceptRevision` /
+    /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
+    /// by edits elsewhere — two wrappers over one range are two ids.
+    revision_id: u32,
+}
+
+/// The `revisions_snapshot()` rows: every tracked change of the
+/// top-level paragraphs, in document order — per paragraph its text
+/// revisions, then its mark's changes (issue #262: the empty range at
+/// the paragraph end; issue #303: one row per change, in order) — each
+/// with its issue #304 `revision_id` (the range alone addresses only a
+/// mark's FIRST change; the id addresses each).
+fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
+    doc.revision_entries()
+        .into_iter()
+        .filter_map(|e| {
+            let block = match e.at.path.steps.as_slice() {
+                [EnginePathStep::Block(b)] => *b,
+                _ => return None,
+            };
+            let r = e.revision;
+            let mark = matches!(e.at.slot, engine::RevisionSlot::Mark(_));
+            let (start, end) = if mark {
+                let end = e.paragraph.text.len() as u32;
+                (end, end)
+            } else {
+                (r.start, r.end)
+            };
+            Some(RevisionOut {
+                block,
+                start,
+                end,
+                kind: revision_kind_label(r.kind),
+                author: r.author.clone(),
+                date: r.date.clone(),
+                move_name: r.move_name.clone(),
+                mark,
+                revision_id: e.id,
+            })
+        })
+        .collect()
 }
 
 /// The `revisions_snapshot()` wire label of a revision kind.
@@ -1778,9 +1786,9 @@ fn derive_selection_kind(anchor: &BridgeLogicalPos, caret: &BridgeLogicalPos) ->
 /// pipeline. Returns a descriptive error so callers fail loudly rather than
 /// silently no-op'ing.
 fn phase3_stub(name: &str) -> Event {
-    Event::Error {
-        message: format!("{name}: accepted by the Phase 2 schema, implemented in Phase 3"),
-    }
+    Event::error(format!(
+        "{name}: accepted by the Phase 2 schema, implemented in Phase 3"
+    ))
 }
 
 /// Current WASM linear-memory size in bytes (PHASE_2_BRIDGE_MEMORY.md §8.2).
@@ -6692,6 +6700,13 @@ fn replaced_text_style(
     ((start.offset as usize) < p.text.len()).then(|| p.style_at(start.offset))
 }
 
+/// Issue #293 — `true` when the paragraph `at` addresses holds no text
+/// (typing there formats the paragraph mark too).
+fn paragraph_is_empty(doc: &DocumentTree, at: &BridgeLogicalPos) -> bool {
+    doc.paragraph_at_path(&bridge_to_engine_path(at.path.clone()))
+        .is_some_and(|p| p.text.is_empty())
+}
+
 /// Issue #276 — apply [`replaced_text_style`]'s result to the `len` bytes
 /// just inserted at `start`.
 fn restyle_replacement(
@@ -6740,6 +6755,23 @@ fn file_base_name(name: &str) -> String {
         .unwrap_or(name)
         .trim()
         .to_string()
+}
+
+/// Issue #348 — the reader's resource limits under the host's
+/// `OpenDocument.limits` overrides; every unset bound keeps
+/// `format_docx::PackageLimits::DEFAULT`.
+fn package_limits(o: Option<bridge::PackageLimitsOverride>) -> format_docx::PackageLimits {
+    let d = format_docx::PackageLimits::DEFAULT;
+    let Some(o) = o else {
+        return d;
+    };
+    format_docx::PackageLimits {
+        max_part_bytes: o.max_part_bytes.unwrap_or(d.max_part_bytes),
+        max_total_bytes: o.max_total_bytes.unwrap_or(d.max_total_bytes),
+        max_entries: o.max_entries.map_or(d.max_entries, |v| v as usize),
+        max_xml_depth: o.max_xml_depth.map_or(d.max_xml_depth, |v| v as usize),
+        max_xml_elements: o.max_xml_elements.unwrap_or(d.max_xml_elements),
+    }
 }
 
 /// Clamp a position into `doc` — `path` resolved to a real paragraph
@@ -7567,8 +7599,7 @@ impl Engine {
                 self.exit_story_to_body();
                 None
             }
-            _ => Some(Event::Error {
-                message: match &self.active_story {
+            _ => Some(Event::error(match &self.active_story {
                     StoryTarget::Note { .. } => {
                         "This action isn't available while editing a footnote or endnote \
                          — click back into the document body first."
@@ -7582,8 +7613,7 @@ impl Engine {
                          — exit the header/footer first."
                     }
                 }
-                .into(),
-            }),
+                )),
         }
     }
 
@@ -7637,9 +7667,7 @@ impl Engine {
                         metrics: bridge_metrics,
                     }
                 }
-                Err(e) => Event::Error {
-                    message: format!("LoadFont: {e}"),
-                },
+                Err(e) => Event::error(format!("LoadFont: {e}")),
             },
 
             Command::RasterizeGlyph {
@@ -7742,6 +7770,7 @@ impl Engine {
                 format,
                 name,
                 defaults,
+                limits,
             } => match format {
                 DocFormat::Docx => {
                     /* Issue #77 — FILENAME resolves to the opened file's
@@ -7750,19 +7779,15 @@ impl Engine {
                         .as_deref()
                         .map(file_base_name)
                         .filter(|n| !n.is_empty());
-                    self.load_docx_bytes(&bytes, "OpenDocument", defaults)
+                    self.load_docx_bytes_with_limits(&bytes, "OpenDocument", defaults, limits)
                 }
-                other => Event::Error {
-                    message: format!(
-                        "OpenDocument: format {other:?} not supported — only Docx ships today"
-                    ),
-                },
+                other => Event::error(format!(
+                    "OpenDocument: format {other:?} not supported — only Docx ships today"
+                )),
             },
             Command::SaveDocument { format } => match format {
                 DocFormat::Docx => self.save_docx_bytes("SaveDocument"),
-                DocFormat::Pdf => Event::Error {
-                    message: "SaveDocument: use ExportPdf for PDF output".into(),
-                },
+                DocFormat::Pdf => Event::error("SaveDocument: use ExportPdf for PDF output"),
                 DocFormat::Html => self.save_html_bytes(),
                 DocFormat::PlainText => self.save_plain_text_bytes(),
             },
@@ -7988,12 +8013,18 @@ impl Engine {
             Command::SetReviewIdentity { author, date } => {
                 self.do_set_review_identity(author, date)
             }
-            Command::AcceptRevision { block, start, end } => {
-                self.do_accept_revision(block, start, end)
-            }
-            Command::RejectRevision { block, start, end } => {
-                self.do_reject_revision(block, start, end)
-            }
+            Command::AcceptRevision {
+                block,
+                start,
+                end,
+                revision_id,
+            } => self.do_resolve_revision(block, start, end, revision_id, true),
+            Command::RejectRevision {
+                block,
+                start,
+                end,
+                revision_id,
+            } => self.do_resolve_revision(block, start, end, revision_id, false),
             Command::AcceptAllRevisions => self.do_resolve_all_revisions(true),
             Command::RejectAllRevisions => self.do_resolve_all_revisions(false),
             Command::InsertComment {
@@ -8015,33 +8046,25 @@ impl Engine {
         let ch = match ch.chars().next() {
             Some(c) => c,
             None => {
-                return Event::Error {
-                    message: "RasterizeGlyph: empty char string".into(),
-                };
+                return Event::error("RasterizeGlyph: empty char string");
             }
         };
         let font = match self.fonts.get(&font_id) {
             Some(f) => f.clone(),
             None => {
-                return Event::Error {
-                    message: format!("font `{font_id}` not loaded"),
-                };
+                return Event::error(format!("font `{font_id}` not loaded"));
             }
         };
         let gm = match font.glyph_metrics(ch, px_size) {
             Ok(g) => g,
             Err(e) => {
-                return Event::Error {
-                    message: format!("glyph_metrics: {e}"),
-                };
+                return Event::error(format!("glyph_metrics: {e}"));
             }
         };
         let raster = match font.rasterize(ch, px_size) {
             Ok(r) => r,
             Err(e) => {
-                return Event::Error {
-                    message: format!("rasterize: {e}"),
-                };
+                return Event::error(format!("rasterize: {e}"));
             }
         };
         let scaled = font.metrics(px_size);
@@ -8054,9 +8077,7 @@ impl Engine {
                 [0, 0, 0],
                 None,
             ) {
-                return Event::Error {
-                    message: format!("paint: {e:?}"),
-                };
+                return Event::error(format!("paint: {e:?}"));
             }
         }
         Event::GlyphPainted {
@@ -8083,9 +8104,7 @@ impl Engine {
         let font = match self.fonts.get(&font_id) {
             Some(f) => f.clone(),
             None => {
-                return Event::Error {
-                    message: format!("font `{font_id}` not loaded"),
-                };
+                return Event::error(format!("font `{font_id}` not loaded"));
             }
         };
         let shaped = shape_text(&font, &text, dir, px_size);
@@ -8116,9 +8135,7 @@ impl Engine {
                     [0, 0, 0],
                     None,
                 ) {
-                    return Event::Error {
-                        message: format!("paint: {e:?}"),
-                    };
+                    return Event::error(format!("paint: {e:?}"));
                 }
                 pen_x += g.x_advance as f64;
             }
@@ -8228,9 +8245,7 @@ impl Engine {
                     BridgeLogicalRange { start, end }
                 }
                 None => {
-                    return Event::Error {
-                        message: "ApplyFormatting: no range given and no active selection".into(),
-                    };
+                    return Event::error("ApplyFormatting: no range given and no active selection");
                 }
             },
         };
@@ -8319,9 +8334,7 @@ impl Engine {
     ) -> Event {
         use bridge::FormattingToggle as T;
         let Some(sel) = self.selection.clone() else {
-            return Event::Error {
-                message: "ToggleFormatting: no active selection".into(),
-            };
+            return Event::error("ToggleFormatting: no active selection");
         };
         let (start, end) = ordered(sel.anchor, sel.caret);
         let collapsed = start == end;
@@ -8676,9 +8689,7 @@ impl Engine {
                 package_hash,
                 package,
             },
-            Err(e) => Event::Error {
-                message: format!("Snapshot: {e}"),
-            },
+            Err(e) => Event::error(format!("Snapshot: {e}")),
         }
     }
 
@@ -9455,15 +9466,16 @@ impl Engine {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
-                return Err(Box::new(Event::Error {
-                    message: "build_pages: no layout config cached".into(),
-                }));
+                return Err(Box::new(Event::error(
+                    "build_pages: no layout config cached",
+                )));
             }
         };
         if !self.fonts.contains_key(&cfg.font_id) {
-            return Err(Box::new(Event::Error {
-                message: format!("font `{}` not loaded", cfg.font_id),
-            }));
+            return Err(Box::new(Event::error(format!(
+                "font `{}` not loaded",
+                cfg.font_id
+            ))));
         }
 
         /* Per-script font stack; the cached `font_id` is the fallback root. */
@@ -10412,11 +10424,7 @@ impl Engine {
                     .get(id)
                     .map(|f| render::vello_backend::font_data(f.data_static()))
             })
-            .map_err(|e| {
-                Box::new(Event::Error {
-                    message: format!("vello paint: {e}"),
-                })
-            })?;
+            .map_err(|e| Box::new(Event::error(format!("vello paint: {e}"))))?;
             self.last_paint_ms = (now_ms() - paint_t0) as f32;
             self.last_paint_dims = LastPaintDims {
                 document_height: stats.document_height,
@@ -10477,9 +10485,7 @@ impl Engine {
                 |rel| image_cache.get(rel).cloned(),
                 clip_rect,
             ) {
-                return Err(Box::new(Event::Error {
-                    message: format!("paint page {idx}: {e:?}"),
-                }));
+                return Err(Box::new(Event::error(format!("paint page {idx}: {e:?}"))));
             }
         }
 
@@ -10706,9 +10712,7 @@ impl Engine {
                 }
             }
             Err(e) => {
-                return Event::Error {
-                    message: format!("ExportPdf: {e}"),
-                };
+                return Event::error(format!("ExportPdf: {e}"));
             }
         }
         let pages_count = pages.len() as u32;
@@ -11080,9 +11084,7 @@ impl Engine {
     fn do_set_field_instruction(&mut self, at: BridgeLogicalPos, instruction: String) -> Event {
         let instruction = instruction.trim().to_string();
         if instruction.is_empty() {
-            return Event::Error {
-                message: "SetFieldInstruction: the field code is empty".into(),
-            };
+            return Event::error("SetFieldInstruction: the field code is empty");
         }
         let epath = bridge_to_engine_path(at.path.clone());
         let index = self.with_selection_doc(|d| {
@@ -11090,18 +11092,14 @@ impl Engine {
                 .and_then(|p| p.field_index_at(at.offset))
         });
         let Some(index) = index else {
-            return Event::Error {
-                message: "SetFieldInstruction: no field at the caret".into(),
-            };
+            return Event::error("SetFieldInstruction: no field at the caret");
         };
         if self.story_active() {
             let Some(temp) = self.story_doc() else {
                 return self.story_vanished();
             };
             let Some(mutated) = temp.set_field_instruction_at(&epath, index, &instruction) else {
-                return Event::Error {
-                    message: "SetFieldInstruction: no field at the caret".into(),
-                };
+                return Event::error("SetFieldInstruction: no field at the caret");
             };
             self.announce(AnnouncementPriority::Polite, "Field code updated");
             return self.story_mutate(|_| mutated, at, true);
@@ -11111,9 +11109,7 @@ impl Engine {
                 .current()
                 .set_field_instruction_at(&epath, index, &instruction)
         else {
-            return Event::Error {
-                message: "SetFieldInstruction: no field at the caret".into(),
-            };
+            return Event::error("SetFieldInstruction: no field at the caret");
         };
         self.undo.push(new_doc);
         if let Some(sel) = self.selection.clone() {
@@ -12535,9 +12531,7 @@ impl Engine {
     /// Assemble a `SelectionChanged` event from the current selection.
     fn selection_changed(&self) -> Event {
         let Some(sel) = self.selection.clone() else {
-            return Event::Error {
-                message: "selection_changed: no active selection".into(),
-            };
+            return Event::error("selection_changed: no active selection");
         };
         let geom = match self.document_geometry() {
             Ok(g) => g,
@@ -13191,9 +13185,7 @@ impl Engine {
                 host, at, inner, ..
             } => StoryPart::TextBox(host.clone(), *at, inner.clone()),
             StoryTarget::Body => {
-                return Event::Error {
-                    message: "commit_story_edit outside a story".into(),
-                };
+                return Event::error("commit_story_edit outside a story");
             }
         };
         let mut blocks: Vec<engine::Block> = mutated.blocks.iter().cloned().collect();
@@ -13242,6 +13234,7 @@ impl Engine {
         } else {
             temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
+        let was_empty = paragraph_is_empty(&base, &start);
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
         let mut new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         let inserted_end = start.offset + text.len() as u32;
@@ -13254,6 +13247,10 @@ impl Engine {
                 },
                 pending,
             );
+        }
+        /* Issue #293 — as in the body. */
+        if was_empty {
+            new_doc = new_doc.mark_follows_text(&bridge_to_engine_path(start.path.clone()));
         }
         let caret = BridgeLogicalPos {
             path: start.path,
@@ -13293,9 +13290,7 @@ impl Engine {
     /// cross-paragraph semantics.
     fn story_delete_at_caret(&mut self, forward: bool, by_word: bool) -> Event {
         let Some(sel) = self.selection.clone() else {
-            return Event::Error {
-                message: "DeleteAtCaret: no active selection".into(),
-            };
+            return Event::error("DeleteAtCaret: no active selection");
         };
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
@@ -13421,9 +13416,7 @@ impl Engine {
     /// Story `PastePlain` — multiline plain-text paste into the band.
     fn story_paste_plain(&mut self, text: String) -> Event {
         let Some(sel) = self.selection.clone() else {
-            return Event::Error {
-                message: "PastePlain: no active selection".into(),
-            };
+            return Event::error("PastePlain: no active selection");
         };
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
@@ -13672,23 +13665,21 @@ impl Engine {
             engine::NoteKind::Endnote => "endnote",
         };
         if self.story_active() {
-            return Event::Error {
-                message: format!(
-                    "Insert {what}: notes can only be inserted from the document body"
-                ),
-            };
+            return Event::error(format!(
+                "Insert {what}: notes can only be inserted from the document body"
+            ));
         }
         if at.path.steps.len() != 1 {
-            return Event::Error {
-                message: format!("Insert {what}: notes inside table cells aren't supported yet"),
-            };
+            return Event::error(format!(
+                "Insert {what}: notes inside table cells aren't supported yet"
+            ));
         }
         let pos = to_engine_pos(at.clone());
         let doc = self.undo.current();
         if doc.paragraph_at_path(&pos.path).is_none() {
-            return Event::Error {
-                message: format!("Insert {what}: the caret does not address a paragraph"),
-            };
+            return Event::error(format!(
+                "Insert {what}: the caret does not address a paragraph"
+            ));
         }
         let (new_doc, id) = doc.insert_note_at(pos, kind);
         self.undo.push(new_doc);
@@ -13987,30 +13978,24 @@ impl Engine {
         layout. */
         const MAX_EMU: i64 = 22 * 914_400;
         if self.story_active() {
-            return Event::Error {
-                message: "Insert text box: text boxes can only be inserted from the document body"
-                    .into(),
-            };
+            return Event::error(
+                "Insert text box: text boxes can only be inserted from the document body",
+            );
         }
         if at.path.steps.len() != 1 {
-            return Event::Error {
-                message: "Insert text box: text boxes inside table cells aren't supported yet"
-                    .into(),
-            };
+            return Event::error(
+                "Insert text box: text boxes inside table cells aren't supported yet",
+            );
         }
         if width_emu <= 0 || height_emu <= 0 || width_emu > MAX_EMU || height_emu > MAX_EMU {
-            return Event::Error {
-                message: format!(
-                    "Insert text box: size {width_emu}×{height_emu} EMU is out of range"
-                ),
-            };
+            return Event::error(format!(
+                "Insert text box: size {width_emu}×{height_emu} EMU is out of range"
+            ));
         }
         let pos = to_engine_pos(at.clone());
         let doc = self.undo.current();
         if doc.paragraph_at_path(&pos.path).is_none() {
-            return Event::Error {
-                message: "Insert text box: the caret does not address a paragraph".into(),
-            };
+            return Event::error("Insert text box: the caret does not address a paragraph");
         }
         let (new_doc, host, box_at) = doc.insert_text_box_at(pos, width_emu, height_emu);
         self.undo.push(new_doc);
@@ -14153,18 +14138,16 @@ impl Engine {
             area,
             bridge::HeaderFooterArea::Footnote | bridge::HeaderFooterArea::Endnote
         ) {
-            return Event::Error {
-                message: "EnterHeaderFooter: notes are entered by clicking into the note \
-                          or with InsertFootnote / InsertEndnote, not by page zone"
-                    .into(),
-            };
+            return Event::error(
+                "EnterHeaderFooter: notes are entered by clicking into the note \
+                          or with InsertFootnote / InsertEndnote, not by page zone",
+            );
         }
         if matches!(area, bridge::HeaderFooterArea::TextBox) {
-            return Event::Error {
-                message: "EnterHeaderFooter: text boxes are entered by clicking into the box \
-                          or with InsertTextBox, not by page zone"
-                    .into(),
-            };
+            return Event::error(
+                "EnterHeaderFooter: text boxes are entered by clicking into the box \
+                          or with InsertTextBox, not by page zone",
+            );
         }
         let is_header = matches!(area, bridge::HeaderFooterArea::Header);
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
@@ -14285,9 +14268,7 @@ impl Engine {
     fn do_set_header_footer_link(&mut self, linked: bool) -> Event {
         let (is_header, page, section_block, role, cur_rid) = match &self.active_story {
             StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => {
-                return Event::Error {
-                    message: "SetHeaderFooterLink: no header or footer is being edited".into(),
-                };
+                return Event::error("SetHeaderFooterLink: no header or footer is being edited");
             }
             StoryTarget::Header {
                 rid,
@@ -14348,10 +14329,9 @@ impl Engine {
         } else {
             /* RELINK — clear the own slot; the section inherits again. */
             if section_idx == 0 {
-                return Event::Error {
-                    message: "SetHeaderFooterLink: the first section cannot link to previous"
-                        .into(),
-                };
+                return Event::error(
+                    "SetHeaderFooterLink: the first section cannot link to previous",
+                );
             }
             let doc = self.undo.current();
             let cleared = doc.set_section_hf_ref_at(sect_pos, is_header, role, None);
@@ -14541,9 +14521,7 @@ impl Engine {
     /// lands at the start of the paragraph after the TOC.
     fn do_insert_toc(&mut self, at: BridgeLogicalPos, switches: bridge::TocSwitches) -> Event {
         if self.story_active() {
-            return Event::Error {
-                message: "InsertToc: a table of contents belongs in the document body".into(),
-            };
+            return Event::error("InsertToc: a table of contents belongs in the document body");
         }
         let sw = toc_switches_from_bridge(&switches);
         let Some((stub_doc, first)) = self
@@ -14551,11 +14529,10 @@ impl Engine {
             .current()
             .insert_toc_at(&to_engine_pos(at.clone()), &sw)
         else {
-            return Event::Error {
-                message: "InsertToc: place the caret in a body paragraph outside tables and \
-                          other tables of contents"
-                    .into(),
-            };
+            return Event::error(
+                "InsertToc: place the caret in a body paragraph outside tables and \
+                          other tables of contents",
+            );
         };
         let (new_doc, _) = self.regenerate_tocs_converged(&stub_doc);
         let after = new_doc
@@ -14591,9 +14568,7 @@ impl Engine {
     /// cells (the cell reader cannot round-trip fields yet).
     fn do_insert_field(&mut self, at: BridgeLogicalPos, kind: bridge::FieldKind) -> Event {
         if at.path.steps.len() != 1 {
-            return Event::Error {
-                message: "InsertField: fields inside table cells aren't supported yet".into(),
-            };
+            return Event::error("InsertField: fields inside table cells aren't supported yet");
         }
         let (instruction, cached) = match kind {
             bridge::FieldKind::Page => ("PAGE".to_string(), "1".to_string()),
@@ -14677,9 +14652,7 @@ impl Engine {
                 host, at, inner, ..
             } => StoryPart::TextBox(host.clone(), *at, inner.clone()),
             StoryTarget::Body => {
-                return Event::Error {
-                    message: "story_mutate outside a story".into(),
-                };
+                return Event::error("story_mutate outside a story");
             }
         };
         let Some(temp) = self.story_doc() else {
@@ -14756,12 +14729,10 @@ impl Engine {
                 path: pos.path,
                 offset,
             }),
-            None => Err(Box::new(Event::Error {
-                message: format!(
-                    "{cmd}: position {:?} does not address a paragraph",
-                    pos.path.steps
-                ),
-            })),
+            None => Err(Box::new(Event::error(format!(
+                "{cmd}: position {:?} does not address a paragraph",
+                pos.path.steps
+            )))),
         }
     }
 
@@ -14813,6 +14784,7 @@ impl Engine {
                 .current()
                 .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
+        let was_empty = paragraph_is_empty(&base, &start);
         let mut new_doc = if tracking {
             base.tracked_insert_text(
                 to_engine_pos(start.clone()),
@@ -14838,6 +14810,10 @@ impl Engine {
                 },
                 pending,
             );
+        }
+        /* Issue #293 — text typed into an empty paragraph formats its mark. */
+        if was_empty {
+            new_doc = new_doc.mark_follows_text(&bridge_to_engine_path(start.path.clone()));
         }
         let caret = BridgeLogicalPos {
             path: start.path,
@@ -14931,9 +14907,9 @@ impl Engine {
                 Err(e) => return *e,
             },
             (None, None) => {
-                return Event::Error {
-                    message: "SplitParagraph: no caret (pass `at` or set a selection first)".into(),
-                };
+                return Event::error(
+                    "SplitParagraph: no caret (pass `at` or set a selection first)",
+                );
             }
         };
         if self.story_active() {
@@ -14987,9 +14963,7 @@ impl Engine {
             return self.story_delete_at_caret(forward, by_word);
         }
         let Some(sel) = self.selection.clone() else {
-            return Event::Error {
-                message: "DeleteAtCaret: no active selection".into(),
-            };
+            return Event::error("DeleteAtCaret: no active selection");
         };
         let (start, end) = ordered(sel.anchor, sel.caret.clone());
         if start != end {
@@ -15053,11 +15027,7 @@ impl Engine {
                 &self.review_author,
                 &self.current_review_date(),
             )
-            .map_err(|e| {
-                Box::new(Event::Error {
-                    message: format!("{cmd}: {e}"),
-                })
-            })
+            .map_err(|e| Box::new(Event::error(format!("{cmd}: {e}"))))
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching
@@ -15606,7 +15576,6 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::AcceptRevision` (Sprint 7 UI Edition).
     /// Sprint 14 (#14) — best-effort current review date stamp.
     /// Prefers the explicit value `Command::SetReviewIdentity` set;
     /// otherwise falls back to the engine clock (`now_iso8601`, issue
@@ -15653,17 +15622,40 @@ impl Engine {
         self.selection_changed()
     }
 
-    fn do_accept_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
-        let new_doc = self.undo.current().accept_revision_at(block, start, end);
-        self.undo.push(new_doc);
-        self.clamp_selection_to_document();
-        self.layout_cache.get_mut().clear();
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
-        }
-        self.announce(AnnouncementPriority::Polite, "Revision accepted");
-        self.selection_changed()
+    /// `Command::AcceptRevision` / `RejectRevision` (Sprint 7 UI
+    /// Edition). Issue #305 — the single revision resolves through the
+    /// accept-all resolver (`DocumentTree::resolve_revision`), as one
+    /// undo step with the selection clamped like accept-all's; an
+    /// address that names no revision pushes nothing. Issue #304 — a
+    /// `revision_id` (the stable id `revisions_snapshot` lists) is the
+    /// address when present, the range otherwise; either half of a
+    /// tracked move resolves the whole move.
+    fn do_resolve_revision(
+        &mut self,
+        block: u32,
+        start: u32,
+        end: u32,
+        revision_id: Option<u32>,
+        accept: bool,
+    ) -> Event {
+        let doc = self.undo.current();
+        let at = match revision_id {
+            Some(id) => doc.revision_by_id(id),
+            None => doc.revision_at_range(block, start, end),
+        };
+        let resolved = at.and_then(|at| doc.resolve_revision(&at, accept));
+        let Some(new_doc) = resolved else {
+            self.announce(AnnouncementPriority::Polite, "No such tracked change");
+            return self.selection_changed();
+        };
+        self.commit_resolved_revisions(
+            new_doc,
+            if accept {
+                "Revision accepted"
+            } else {
+                "Revision rejected"
+            },
+        )
     }
 
     /// A review decision merged or shortened paragraphs (issue #262 / #301 —
@@ -15680,25 +15672,10 @@ impl Engine {
         }
     }
 
-    /// `Command::RejectRevision` (Sprint 7 UI Edition).
-    fn do_reject_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
-        let new_doc = self.undo.current().reject_revision_at(block, start, end);
-        self.undo.push(new_doc);
-        self.clamp_selection_to_document();
-        self.layout_cache.get_mut().clear();
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
-        }
-        self.announce(AnnouncementPriority::Polite, "Revision rejected");
-        self.selection_changed()
-    }
-
     /// Issue #262 — `Command::AcceptAllRevisions` /
     /// `RejectAllRevisions`: every tracked change of the body resolved in
     /// one tree edit, pushed as ONE undo step. Nothing to resolve → no
-    /// undo step. The selection is clamped back into the (possibly
-    /// merged / shortened) paragraphs.
+    /// undo step.
     fn do_resolve_all_revisions(&mut self, accept: bool) -> Event {
         let doc = self.undo.current();
         if !doc.has_revisions() {
@@ -15706,6 +15683,20 @@ impl Engine {
             return self.selection_changed();
         }
         let new_doc = doc.resolve_all_revisions(accept);
+        self.commit_resolved_revisions(
+            new_doc,
+            if accept {
+                "All tracked changes accepted"
+            } else {
+                "All tracked changes rejected"
+            },
+        )
+    }
+
+    /// Push a revision resolution (single or all) as ONE undo step and
+    /// repaint. The selection is clamped back into the (possibly merged /
+    /// shortened) paragraphs.
+    fn commit_resolved_revisions(&mut self, new_doc: DocumentTree, announcement: &str) -> Event {
         self.undo.push(new_doc);
         self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
@@ -15713,14 +15704,7 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
-        self.announce(
-            AnnouncementPriority::Polite,
-            if accept {
-                "All tracked changes accepted"
-            } else {
-                "All tracked changes rejected"
-            },
-        );
+        self.announce(AnnouncementPriority::Polite, announcement);
         self.selection_changed()
     }
 
@@ -15798,9 +15782,9 @@ impl Engine {
             .current()
             .reply_to_comment(parent_id, text, author, date)
         else {
-            return Event::Error {
-                message: format!("ReplyToComment: unknown parent comment id {parent_id}"),
-            };
+            return Event::error(format!(
+                "ReplyToComment: unknown parent comment id {parent_id}"
+            ));
         };
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
@@ -15956,9 +15940,7 @@ impl Engine {
     /// `do_apply_style`'s invalidation discipline.
     fn do_modify_style(&mut self, style_id: String, props: BridgeStyleProperties) -> Event {
         if !self.undo.current().styles.contains_key(&style_id) {
-            return Event::Error {
-                message: format!("ModifyStyle: unknown style id {style_id}"),
-            };
+            return Event::error(format!("ModifyStyle: unknown style id {style_id}"));
         }
         let para_patch = props.para_props.map(|p| {
             let mut out = engine::ParaProperties {
@@ -16273,14 +16255,33 @@ impl Engine {
         origin: &'static str,
         defaults: Option<DocumentDefaults>,
     ) -> Event {
+        self.load_docx_bytes_with_limits(bytes, origin, defaults, None)
+    }
+
+    /// [`Self::load_docx_bytes`] under the host's `OpenDocument.limits`
+    /// overrides (issue #348). A package past a limit is refused with
+    /// `Event::Error { kind: PackageTooLarge }`; the open document, the
+    /// undo stack and every per-document cache stay untouched.
+    fn load_docx_bytes_with_limits(
+        &mut self,
+        bytes: &[u8],
+        origin: &'static str,
+        defaults: Option<DocumentDefaults>,
+        limits: Option<bridge::PackageLimitsOverride>,
+    ) -> Event {
         let default_page_size = match defaults.as_ref().and_then(|d| d.page_size) {
             Some(BridgeDefaultPageSize::A4) => engine::DefaultPageSize::A4,
             Some(BridgeDefaultPageSize::Letter) => engine::DefaultPageSize::Letter,
             None => engine::DefaultPageSize::default(),
         };
         let widow_control_default = defaults.and_then(|d| d.widow_control).unwrap_or(true);
-        match format_docx::read_docx_with_settings(bytes, default_page_size, widow_control_default)
-        {
+        let limits = package_limits(limits);
+        match format_docx::read_docx_with_limits(
+            bytes,
+            default_page_size,
+            widow_control_default,
+            &limits,
+        ) {
             Ok(archive) => {
                 let paragraph_count = archive.document.paragraph_count();
                 self.install_undo_stack(UndoStack::new(archive.document, 100));
@@ -16333,9 +16334,14 @@ impl Engine {
                 }
                 Event::DocumentLoaded { paragraph_count }
             }
-            Err(e) => Event::Error {
-                message: format!("{origin}: {e}"),
-            },
+            Err(e) => {
+                let kind = matches!(e, format_docx::DocxError::PackageTooLarge { .. })
+                    .then_some(bridge::ErrorKind::PackageTooLarge);
+                Event::Error {
+                    message: format!("{origin}: {e}"),
+                    kind,
+                }
+            }
         }
     }
 
@@ -16357,9 +16363,7 @@ impl Engine {
                 let size = bytes.len() as u32;
                 Event::DocumentSaved { bytes, size }
             }
-            Err(e) => Event::Error {
-                message: format!("{origin}: {e}"),
-            },
+            Err(e) => Event::error(format!("{origin}: {e}")),
         }
     }
 
@@ -16415,9 +16419,7 @@ impl Engine {
     /// still silently clamped, same as before.
     fn do_set_zoom(&mut self, zoom: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(zoom) {
-            return Event::Error {
-                message: format!("SetZoom: {e}"),
-            };
+            return Event::error(format!("SetZoom: {e}"));
         }
         let zoom = zoom.clamp(0.25, 4.0);
         let Some(cfg) = self.layout_cfg.as_mut() else {
@@ -16448,9 +16450,7 @@ impl Engine {
     /// Issue #186 — same NaN/±∞ rejection as `do_set_zoom`.
     fn do_set_device_scale(&mut self, scale: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(scale) {
-            return Event::Error {
-                message: format!("SetDeviceScale: {e}"),
-            };
+            return Event::error(format!("SetDeviceScale: {e}"));
         }
         let base = scale.clamp(0.5, 8.0);
         let Some(cfg) = self.layout_cfg.as_mut() else {
@@ -16488,9 +16488,7 @@ impl Engine {
         minute: Option<u32>,
     ) -> Event {
         if let Err(e) = engine::validate_render_date(year, month, day, hour, minute) {
-            return Event::Error {
-                message: format!("SetRenderDate: {e}"),
-            };
+            return Event::error(format!("SetRenderDate: {e}"));
         }
         self.render_date = Some((year, month, day));
         /* Issue #77 — the clock half is optional; both parts or nothing
@@ -16609,11 +16607,9 @@ impl Engine {
         at: u32,
     ) -> Result<StoryImage, Box<Event>> {
         if story.len() > MAX_TEXT_BOX_LAYOUT_DEPTH as usize {
-            return Err(Box::new(Event::Error {
-                message: format!(
-                    "{origin}: text boxes nest at most {MAX_TEXT_BOX_LAYOUT_DEPTH} deep"
-                ),
-            }));
+            return Err(Box::new(Event::error(format!(
+                "{origin}: text boxes nest at most {MAX_TEXT_BOX_LAYOUT_DEPTH} deep"
+            ))));
         }
         let hops: Vec<(EngineBlockPath, u32)> = story
             .iter()
@@ -16632,9 +16628,9 @@ impl Engine {
             find(doc)
         } else {
             let Some(tree) = doc.text_box_story_tree(&hops) else {
-                return Err(Box::new(Event::Error {
-                    message: format!("{origin}: the story chain addresses no text box"),
-                }));
+                return Err(Box::new(Event::error(format!(
+                    "{origin}: the story chain addresses no text box"
+                ))));
             };
             find(&tree)
         };
@@ -16651,9 +16647,7 @@ impl Engine {
         edit: impl FnOnce(&DocumentTree) -> DocumentTree,
     ) -> Event {
         let Some(new_doc) = self.undo.current().with_text_box_story_edit(hops, edit) else {
-            return Event::Error {
-                message: "Image edit: the story chain addresses no text box".into(),
-            };
+            return Event::error("Image edit: the story chain addresses no text box");
         };
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
@@ -16682,9 +16676,7 @@ impl Engine {
         let hops = match self.resolve_story_image("ResizeImage", &story, &epath, at) {
             Ok((hops, io)) => {
                 if !hops.is_empty() && io.is_none() {
-                    return Event::Error {
-                        message: "ResizeImage: no picture at that address in the text box".into(),
-                    };
+                    return Event::error("ResizeImage: no picture at that address in the text box");
                 }
                 hops
             }
@@ -16716,11 +16708,10 @@ impl Engine {
         let hops = match self.resolve_story_image("MoveImage", &story, &epath, at) {
             Ok((hops, Some(io))) if io.is_floating() => hops,
             Ok(_) => {
-                return Event::Error {
-                    message: "MoveImage: no floating image at that address — inline images \
-                              flow with the text and have no free position (issue #69)"
-                        .into(),
-                };
+                return Event::error(
+                    "MoveImage: no floating image at that address — inline images \
+                              flow with the text and have no free position (issue #69)",
+                );
             }
             Err(e) => return *e,
         };
@@ -16749,11 +16740,10 @@ impl Engine {
         let hops = match self.resolve_story_image("SetImageWrap", &story, &epath, at) {
             Ok((hops, Some(io))) if io.is_floating() => hops,
             Ok(_) => {
-                return Event::Error {
-                    message: "SetImageWrap: no floating image at that address — an inline image \
-                              flows with the text and has no wrap mode (issue #82)"
-                        .into(),
-                };
+                return Event::error(
+                    "SetImageWrap: no floating image at that address — an inline image \
+                              flows with the text and has no wrap mode (issue #82)",
+                );
             }
             Err(e) => return *e,
         };
@@ -16815,9 +16805,9 @@ impl Engine {
             .map(|sel| ordered(sel.anchor.clone(), sel.caret.clone()));
         let (start, end) = replacing.clone().unwrap_or((at.clone(), at.clone()));
         if start.path.steps.len() != 1 || end.path.steps.len() != 1 {
-            return Event::Error {
-                message: "InsertPageBreak: page breaks inside table cells are not supported".into(),
-            };
+            return Event::error(
+                "InsertPageBreak: page breaks inside table cells are not supported",
+            );
         }
         if replacing.is_none() {
             self.selection = Some(SelectionState {
@@ -16844,10 +16834,9 @@ impl Engine {
     /// affordance).
     fn do_insert_section_break(&mut self, at: BridgeLogicalPos, kind: SectionBreakKind) -> Event {
         if at.path.steps.len() != 1 {
-            return Event::Error {
-                message: "InsertSectionBreak: section breaks inside table cells are not supported"
-                    .into(),
-            };
+            return Event::error(
+                "InsertSectionBreak: section breaks inside table cells are not supported",
+            );
         }
         let engine_kind = match kind {
             SectionBreakKind::NextPage => engine::SectionType::NextPage,
@@ -16942,11 +16931,7 @@ impl Engine {
     ) -> Result<(), Box<Event>> {
         let epath = bridge_to_engine_path(path.clone());
         self.with_selection_doc(|d| d.resolve_table_target(&epath, row, col).and_then(extra))
-            .map_err(|e| {
-                Box::new(Event::Error {
-                    message: format!("{cmd}: {e}"),
-                })
-            })
+            .map_err(|e| Box::new(Event::error(format!("{cmd}: {e}"))))
     }
 
     fn do_insert_table(&mut self, at: bridge::BlockPath, rows: u32, cols: u32) -> Event {
@@ -16955,9 +16940,7 @@ impl Engine {
         defence, but the shell gets a typed rejection rather than a
         silently smaller table. */
         if let Err(e) = engine::check_table_dims(rows, cols) {
-            return Event::Error {
-                message: format!("InsertTable: {e}"),
-            };
+            return Event::error(format!("InsertTable: {e}"));
         }
         /* Issue #117 — Word parks the caret in the new table's first cell.
         Doing so explicitly (instead of leaving the caret on the block
@@ -18265,6 +18248,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -18420,6 +18404,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -18459,6 +18444,7 @@ mod tests {
             body_xml: None,
             source_markup: None,
             mark_revisions: Vec::new(),
+            mark_style: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -19636,6 +19622,7 @@ mod tests {
                 body_xml: None,
                 source_markup: None,
                 mark_revisions: Vec::new(),
+                mark_style: None,
             })],
             source_markup: None,
         }
@@ -20377,7 +20364,7 @@ mod tests {
             width_emu: 10,
             height_emu: 10,
         });
-        let Some(Event::Error { message }) = gated else {
+        let Some(Event::Error { message, .. }) = gated else {
             panic!("expected a gate rejection, got {gated:?}");
         };
         assert!(message.contains("text box"), "{message}");
@@ -20877,7 +20864,7 @@ mod tests {
         let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Footnote);
         assert!(matches!(evt, Event::SelectionChanged { .. }));
         let gated = engine.story_gate(&Command::InsertFootnote { at: bpos_top(0, 0) });
-        let Some(Event::Error { message }) = gated else {
+        let Some(Event::Error { message, .. }) = gated else {
             panic!("expected a gate rejection, got {gated:?}");
         };
         assert!(message.contains("footnote or endnote"), "{message}");
@@ -26022,6 +26009,7 @@ mod tests {
             bytes,
             format: DocFormat::Docx,
             name: None,
+            limits: None,
             defaults: Some(DocumentDefaults {
                 page_size: Some(BridgeDefaultPageSize::Letter),
                 widow_control: None,
@@ -26040,6 +26028,70 @@ mod tests {
             "expected Letter width {letter_width_pt}, got {} (A4 would be {a4_width_pt})",
             pages[0].size.width
         );
+    }
+
+    /// Issue #348 — a hostile package (5000 nested content controls, a
+    /// compression bomb past an overridden part budget) is refused through
+    /// the REAL bridge dispatcher with the typed `PackageTooLarge` error —
+    /// never a trap — and the open document survives untouched; a package
+    /// whose directory LIES about a 4 GiB part opens normally.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn open_document_refuses_a_hostile_package_with_a_typed_error() {
+        let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+        let open = |engine: &mut Engine, bytes, limits| {
+            engine.apply_sync(Command::OpenDocument {
+                bytes,
+                format: DocFormat::Docx,
+                name: None,
+                defaults: None,
+                limits,
+            })
+        };
+        let evt = open(
+            &mut engine,
+            format_docx::test_fixtures::nested_sdt_docx(5000),
+            None,
+        );
+        assert!(
+            matches!(
+                &evt,
+                Event::Error {
+                    kind: Some(bridge::ErrorKind::PackageTooLarge),
+                    message,
+                } if message.contains("XML nesting depth")
+            ),
+            "{evt:?}"
+        );
+        assert_eq!(engine.undo.current().to_plain_text(), "seed");
+
+        let evt = open(
+            &mut engine,
+            format_docx::test_fixtures::compressible_bomb_docx(2 * 1024 * 1024),
+            Some(bridge::PackageLimitsOverride {
+                max_part_bytes: Some(1024 * 1024),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            matches!(
+                &evt,
+                Event::Error {
+                    kind: Some(bridge::ErrorKind::PackageTooLarge),
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
+        assert_eq!(engine.undo.current().to_plain_text(), "seed");
+
+        let evt = open(
+            &mut engine,
+            format_docx::test_fixtures::lying_size_docx(4 * 1024 * 1024 * 1024),
+            None,
+        );
+        assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+        assert_eq!(engine.undo.current().to_plain_text(), "small");
     }
 
     /// Issue #221 — `OpenDocument.defaults.widow_control: Some(false)`
@@ -26061,6 +26113,7 @@ mod tests {
             bytes,
             format: DocFormat::Docx,
             name: None,
+            limits: None,
             defaults: Some(DocumentDefaults {
                 page_size: None,
                 widow_control: Some(false),
@@ -27529,6 +27582,7 @@ mod snapshot_tests {
                 bytes: PACKAGE_FIXTURE.to_vec(),
                 format: bridge::DocFormat::Docx,
                 name: None,
+                limits: None,
                 defaults: None,
             }],
         );
@@ -27692,6 +27746,8 @@ mod nested_table_tests;
 
 #[cfg(test)]
 mod part_media_tests;
+#[cfg(test)]
+mod pbdr_start_end_tests;
 
 #[cfg(test)]
 mod block_remap_tests;
@@ -27704,6 +27760,9 @@ mod revision_command_tests;
 
 #[cfg(test)]
 mod tracked_command_tests;
+
+#[cfg(test)]
+mod revision_address_tests;
 
 #[cfg(test)]
 mod story_tab_tests;

@@ -32,7 +32,8 @@
 //! undo snapshot carries its own consistent copy.
 
 use crate::{
-    BlockPath, DocumentTree, LogicalPos, Paragraph, PathStep, STALE_TEXT_LEN, SourceMarkup,
+    BlockPath, DocumentTree, Hyperlink, LogicalPos, Paragraph, PathStep, Revision, STALE_TEXT_LEN,
+    SourceMarkup,
 };
 
 /// One in-place replacement of paragraph bytes `[at, at + removed)` by
@@ -73,6 +74,137 @@ impl Paragraph {
             edit.inserted,
         );
         edit
+    }
+
+    /// Issue #292 — carry the paragraph's RANGE overlays (hyperlinks and
+    /// tracked-change revisions) through `edit`, the same record the
+    /// source markup and the comment anchors see ([`TextEdit::map_range`]);
+    /// a range the edit swallowed whole is dropped. Used by the paragraph
+    /// primitives that rebuild a paragraph around a text change —
+    /// `delete_text`, both halves of `split_at` (each half is the
+    /// original minus the other half) and the tail of `concat` (shifted
+    /// right by the head) — so a hyperlink or a tracked insertion
+    /// survives Backspace / Delete / Enter instead of silently vanishing
+    /// (the old #56 limitation).
+    pub(crate) fn remap_range_overlays(&mut self, edit: TextEdit) {
+        remap_ranges(&mut self.hyperlinks, edit);
+        remap_ranges(&mut self.revisions, edit);
+    }
+}
+
+/// Issue #292 — a paragraph overlay addressed by a byte range
+/// (hyperlink, tracked-change revision).
+pub(crate) trait RangeOverlay {
+    fn range(&self) -> (u32, u32);
+    fn set_range(&mut self, start: u32, end: u32);
+}
+
+impl RangeOverlay for Hyperlink {
+    fn range(&self) -> (u32, u32) {
+        (self.start, self.end)
+    }
+    fn set_range(&mut self, start: u32, end: u32) {
+        self.start = start;
+        self.end = end;
+    }
+}
+
+impl RangeOverlay for Revision {
+    fn range(&self) -> (u32, u32) {
+        (self.start, self.end)
+    }
+    fn set_range(&mut self, start: u32, end: u32) {
+        self.start = start;
+        self.end = end;
+    }
+}
+
+/// Map every range of `items` through `edit`, dropping the emptied ones.
+fn remap_ranges<T: RangeOverlay>(items: &mut Vec<T>, edit: TextEdit) {
+    items.retain_mut(|it| {
+        let (s, e) = it.range();
+        match edit.map_range(s, e) {
+            Some((s, e)) => {
+                it.set_range(s, e);
+                true
+            }
+            None => false,
+        }
+    });
+}
+
+/// Issue #292 — append the (already shifted) `tail` overlays of a
+/// paragraph merge to the head's `items`, re-joining an overlay the
+/// paragraph break had cut in two: a head range ending at `seam` and a
+/// tail range starting there that `same` says are one (a hyperlink with
+/// the same target, a revision with the same author / date / kind whose
+/// right piece gave up its id in `split_at`). Enter then Backspace inside
+/// a link leaves one link, not two.
+pub(crate) fn join_at_seam<T: RangeOverlay>(
+    items: &mut Vec<T>,
+    tail: Vec<T>,
+    seam: u32,
+    same: impl Fn(&T, &T) -> bool,
+) {
+    let head_len = items.len();
+    for t in tail {
+        let (ts, te) = t.range();
+        let joined = ts == seam
+            && items[..head_len].iter_mut().any(|h| {
+                let (hs, he) = h.range();
+                if he == seam && hs < seam && same(h, &t) {
+                    h.set_range(hs, te);
+                    true
+                } else {
+                    false
+                }
+            });
+        if !joined {
+            items.push(t);
+        }
+    }
+}
+
+impl TextEdit {
+    /// Issue #292 — map an overlay range `[start, end)` through this edit;
+    /// `None` when nothing of it is left.
+    ///
+    /// - Pure insertion (`removed == 0`): a range starting at or after
+    ///   `at` shifts right; one strictly containing `at` grows (typing at
+    ///   either boundary of a link or a revision stays outside it — the
+    ///   `insert_text` rule, issues #242 / #247).
+    /// - Deletion / replacement: offsets before the gap are unchanged,
+    ///   offsets at or past its end shift by the length delta; a START
+    ///   inside the gap clamps to `at`, an END inside clamps to the end
+    ///   of the replacement (the [`Paragraph::with_spliced_range`]
+    ///   discipline). A range left empty is dropped.
+    pub fn map_range(&self, start: u32, end: u32) -> Option<(u32, u32)> {
+        let (at, gap_end) = (self.at, self.at.saturating_add(self.removed));
+        let shift = |o: u32| o - self.removed + self.inserted;
+        let (s, e) = if self.removed == 0 {
+            (
+                if start >= at { shift(start) } else { start },
+                if end > at { shift(end) } else { end },
+            )
+        } else {
+            (
+                if start <= at {
+                    start
+                } else if start >= gap_end {
+                    shift(start)
+                } else {
+                    at
+                },
+                if end <= at {
+                    end
+                } else if end >= gap_end {
+                    shift(end)
+                } else {
+                    at + self.inserted
+                },
+            )
+        };
+        (s < e).then_some((s, e))
     }
 }
 
@@ -165,6 +297,21 @@ pub(crate) fn debug_assert_tree_in_step(doc: &DocumentTree) {
                  Paragraph::splice_text",
                 m.text_len,
                 p.text.len()
+            );
+        }
+        /* Issue #305 — every inline object still anchors on its own
+        U+FFFC sentinel: an edit that removed the sentinel removed the
+        object (`revisions::remove_text`, `Paragraph::delete_text`). */
+        for o in &p.inline_objects {
+            assert!(
+                p.text
+                    .get(o.at as usize..)
+                    .is_some_and(|t| t.starts_with('\u{FFFC}')),
+                "issue #305: paragraph {path:?} carries an inline object at byte {} \
+                 that no longer anchors on a U+FFFC sentinel (text {:?}) — an edit \
+                 removed or moved its sentinel without remapping the object",
+                o.at,
+                p.text
             );
         }
     });
