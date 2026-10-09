@@ -60,4 +60,20 @@ fn main() {
         "regen-seeds: done — {} hostile docx seed(s) rewritten",
         hostile.len()
     );
+    /* Issue #341 — the `snapshot_decode` seeds: engine snapshots in the
+    v1 (`pkg-<len>-<fnv>`) and v2 (`sha256-`) package-key formats plus the
+    hostile envelopes, pinned by `tests::snapshot_seeds_are_committed`. */
+    let snap_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/snapshot_decode");
+    std::fs::create_dir_all(&snap_dir).expect("create corpus/snapshot_decode");
+    let seeds = engine_fuzz::snapshot_gen::snapshot_seeds();
+    for (name, bytes) in &seeds {
+        let path = snap_dir.join(name);
+        std::fs::write(&path, bytes)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        println!("wrote {} ({} bytes)", path.display(), bytes.len());
+    }
+    println!(
+        "regen-seeds: done — {} snapshot_decode seed(s) rewritten",
+        seeds.len()
+    );
 }

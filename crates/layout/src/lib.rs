@@ -9,6 +9,7 @@ pub mod floats;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
+pub mod pattern;
 pub mod table_bidi;
 pub mod table_place;
 mod table_split;
@@ -34,6 +35,7 @@ pub use paginate::{
 pub use paragraph::{
     InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
 };
+pub use pattern::{MAX_PATTERN_TILES, pattern_tile_bound};
 pub use table_bidi::mirror_bidi_visual;
 pub use table_place::{place_table, resolve_table_placement};
 pub use watchdog::{

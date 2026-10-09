@@ -35,6 +35,7 @@ mod inline_spans;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod reader_cascade;
 mod reader_hardening;
 mod revision_ids;
 mod revisions;
@@ -355,6 +356,9 @@ fn run_default() -> Result<()> {
     theme::run_theme_fonts_roundtrip()?;
     theme::run_unregistered_family_roundtrip()?;
     complex_script::run_font_dialog_slots_roundtrip()?;
+    reader_cascade::run_mark_formatting_roundtrip()?;
+    reader_cascade::run_sibling_prefix_roundtrip()?;
+    reader_cascade::run_style_borders_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
