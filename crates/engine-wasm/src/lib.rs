@@ -43,6 +43,8 @@ use text_pipeline::{
 use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
+mod pdf_semantics;
+
 #[wasm_bindgen(start)]
 pub fn boot() {
     console_error_panic_hook::set_once();
@@ -1379,6 +1381,10 @@ struct RevisionOut {
     /// addressed by the empty range `start == end == text length`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mark: bool,
+    /// Issue #365 — a tracked table-ROW insertion / deletion: the row's
+    /// index in the top-level table at `block` (`start == end == 0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row: Option<u32>,
     /// Issue #304 — the revision's stable id
     /// (`DocumentTree::revision_entries`): what `AcceptRevision` /
     /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
@@ -1389,9 +1395,10 @@ struct RevisionOut {
 /// The `revisions_snapshot()` rows: every tracked change of the
 /// top-level paragraphs, in document order — per paragraph its text
 /// revisions, then its mark's changes (issue #262: the empty range at
-/// the paragraph end; issue #303: one row per change, in order) — each
-/// with its issue #304 `revision_id` (the range alone addresses only a
-/// mark's FIRST change; the id addresses each).
+/// the paragraph end; issue #303: one row per change, in order) — and,
+/// issue #365, every row change of a top-level table — each with its
+/// issue #304 `revision_id` (the range alone addresses only a mark's
+/// FIRST change, and no row change; the id addresses each).
 fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
     doc.revision_entries()
         .into_iter()
@@ -1402,9 +1409,15 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
             };
             let r = e.revision;
             let mark = matches!(e.at.slot, engine::RevisionSlot::Mark(_));
+            let row = match e.at.slot {
+                engine::RevisionSlot::Row { row, .. } => Some(row),
+                _ => None,
+            };
             let (start, end) = if mark {
-                let end = e.paragraph.text.len() as u32;
+                let end = e.paragraph.map_or(0, |p| p.text.len() as u32);
                 (end, end)
+            } else if row.is_some() {
+                (0, 0)
             } else {
                 (r.start, r.end)
             };
@@ -1417,6 +1430,7 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
                 date: r.date.clone(),
                 move_name: r.move_name.clone(),
                 mark,
+                row,
                 revision_id: e.id,
             })
         })
@@ -6339,6 +6353,59 @@ fn doc_paragraph_neighbor(
     Some((candidate, para))
 }
 
+/// Issues #423 / #420 — the formatting at a caret position before it is
+/// flattened (`Engine::caret_style`).
+struct CaretStyle {
+    /// docDefaults → paragraph style chain → direct span → armed pending
+    /// style: what the caret's text is laid out with.
+    full: SpanStyle,
+    /// The run's own direct formatting (+ pending style): what the run
+    /// itself names — the `Explicit` font source.
+    direct: SpanStyle,
+    /// The caret's text reads the complex-script twins (Arabic / Hebrew /
+    /// … text, or a `<w:rtl/>` / `<w:cs/>` run).
+    complex: bool,
+    /// The theme's supplemental script entry the complex-script slot
+    /// resolves through (`Arab`, `Hebr`, …).
+    script_hint: &'static str,
+}
+
+/// Issues #423 / #420 — `Engine::font_slots_of`'s result: the per-slot
+/// fields of `Event::SelectionChanged`.
+struct CaretFontSlots {
+    resolved_latin: String,
+    resolved_cs: String,
+    sources: bridge::BridgeFontSources,
+    formats: bridge::BridgeSlotFormats,
+    caret_slot: bridge::FontSlot,
+}
+
+/// Issue #423 — the theme script tag for the complex-script slot at
+/// `offset`: the nearest complex-script character (back, then forward),
+/// as layout's `run_font_ids` takes the run's first; `Arab` when the
+/// paragraph has none (the theme's Arabic row is the bidi default).
+fn caret_script_tag(para: &engine::Paragraph, offset: u32) -> &'static str {
+    let text = para.text.as_str();
+    let mut at = (offset as usize).min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let (before, after) = text.split_at(at);
+    /* Bounded: this runs on every `SelectionChanged`, and a long Latin
+    paragraph would otherwise be walked end to end each keystroke. */
+    before
+        .chars()
+        .rev()
+        .take(SCRIPT_TAG_SCAN)
+        .chain(after.chars().take(SCRIPT_TAG_SCAN))
+        .find_map(text_pipeline::complex_script_tag)
+        .unwrap_or("Arab")
+}
+
+/// How far (in chars, each way) [`caret_script_tag`] looks for the
+/// caret's complex script.
+const SCRIPT_TAG_SCAN: usize = 256;
+
 /// Issues #359 / #104 / #249 — `true` when the character the toolbar
 /// read-back at `offset` stands for is complex script, so it reports the
 /// complex-script twins. The character is the one the attributes come
@@ -7673,7 +7740,8 @@ impl Engine {
     ///   address and never move a text byte, so they are allowed while a
     ///   text box is open (#206), rejected in other stories.
     /// - `ExitsStory` — document loads / close tear the story's ground
-    ///   away: exit to the body first, then handle normally.
+    ///   away: the command exits to the body itself, at its commit point
+    ///   (issue #341 — a refused load must leave the story open).
     /// - `BodyOnly` — everything else (images, comments, sections, page
     ///   setup, track-changes, notes, rich paste, …) is rejected loudly.
     ///   The UI disables these controls in story mode (Honest UX); this
@@ -7692,10 +7760,11 @@ impl Engine {
             {
                 None
             }
-            bridge::StoryPolicy::ExitsStory => {
-                self.exit_story_to_body();
-                None
-            }
+            /* Issue #341 — the command exits the story itself, at its
+            commit point (the load's success path, `do_close_document`),
+            so a REFUSED load leaves the open story, selection and
+            document name alone ("`Event::Error` => no mutation"). */
+            bridge::StoryPolicy::ExitsStory => None,
             bridge::StoryPolicy::BodyOnly | bridge::StoryPolicy::TextBoxOnly => {
                 Some(Event::error(match &self.active_story {
                     StoryTarget::Note { .. } => {
@@ -7882,11 +7951,17 @@ impl Engine {
                 DocFormat::Docx => {
                     /* Issue #77 — FILENAME resolves to the opened file's
                     base name (directory components stripped). */
-                    self.document_name = name
+                    let new_name = name
                         .as_deref()
                         .map(file_base_name)
                         .filter(|n| !n.is_empty());
-                    self.load_docx_bytes_with_limits(&bytes, "OpenDocument", defaults, limits)
+                    self.load_docx_bytes_with_limits(
+                        &bytes,
+                        "OpenDocument",
+                        defaults,
+                        limits,
+                        Some(new_name),
+                    )
                 }
                 /* Issue #339 — `.txt` / `.html` open through the engine's
                 own plain-text model and the rich-paste HTML parser; no
@@ -7898,6 +7973,8 @@ impl Engine {
                     if let Some(refused) = text_file_over_limits(bytes.len(), limits) {
                         return refused;
                     }
+                    /* Issue #341 — past the only refusal: commit. */
+                    self.exit_story_to_body();
                     self.document_name = name
                         .as_deref()
                         .map(file_base_name)
@@ -7930,6 +8007,7 @@ impl Engine {
                 PdfConformance::A1b => format_pdf::PdfProfile::A1b,
                 PdfConformance::A2u => format_pdf::PdfProfile::A2u,
                 PdfConformance::X3 => format_pdf::PdfProfile::X3,
+                PdfConformance::Ua1 => format_pdf::PdfProfile::Ua1,
             }),
             Command::CloseDocument => self.do_close_document(),
             Command::DeleteRange { range } => self.do_delete_range(range),
@@ -10700,8 +10778,23 @@ impl Engine {
         source text. */
         let doc = self.undo.current();
         let mut para_texts: Vec<&str> = Vec::new();
+        /* Issue #360 — the semantic side table (headings → outline,
+        hyperlinks + bookmarks → link annotations) is indexed like
+        `para_texts`: every walk below runs beside the matching
+        `walk_block_texts`; stories that carry no semantics (header /
+        footer bands, text boxes) are padded with defaults. */
+        let mut semantics = format_pdf::PdfSemantics {
+            metadata: pdf_semantics::document_metadata(doc),
+            ..Default::default()
+        };
         for b in doc.blocks.iter() {
             walk_block_texts(b, &mut para_texts);
+            pdf_semantics::walk_block_semantics(
+                doc,
+                b,
+                pdf_semantics::Story::Body,
+                &mut semantics.paragraphs,
+            );
         }
         /* Issue #71 — band paragraphs join the SAME table: per
         referenced part (headers rid-sorted, then footers — the
@@ -10769,8 +10862,19 @@ impl Engine {
                     }
                     _ => continue,
                 }
+                /* Issue #360 — header / footer entries (artifacts, no
+                semantics) pad the side table up to this story's base. */
+                semantics
+                    .paragraphs
+                    .resize_with(para_texts.len(), Default::default);
                 for b in &story.body {
                     walk_block_texts(b, &mut para_texts);
+                    pdf_semantics::walk_block_semantics(
+                        doc,
+                        b,
+                        pdf_semantics::Story::Note,
+                        &mut semantics.paragraphs,
+                    );
                 }
             }
         }
@@ -10854,12 +10958,13 @@ impl Engine {
         /* Issue #121 — images embed from the document's media parts. A
         skipped image (missing / Tier-3 format / corrupt) is a console
         warning, never a failed export. */
-        match format_pdf::export_pdf_with_media(
+        match format_pdf::export_pdf_document(
             &pages,
             &font_stack,
             &para_texts,
             &doc.media,
-            profile,
+            &semantics,
+            format_pdf::PdfExportOptions::new(profile),
             &mut bytes,
         ) {
             Ok(report) => {
@@ -12722,6 +12827,10 @@ impl Engine {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
         };
+        /* Issues #423 / #420 — one cascade walk feeds the flat read-back
+        and the per-slot one. */
+        let caret_style = self.caret_style(&start, start == end);
+        let fonts = self.font_slots_of(&caret_style);
         Event::SelectionChanged {
             range: BridgeLogicalRange {
                 start: start.clone(),
@@ -12738,7 +12847,7 @@ impl Engine {
             rects,
             /* A collapsed caret reflects any armed pending style; a real
             selection reports the document's own attributes (Backlog #11). */
-            attrs_at_caret: self.attrs_at(start.clone(), start == end),
+            attrs_at_caret: self.text_attrs_of(&caret_style),
             paragraph_alignment: self.paragraph_alignment_at(&sel.caret.path),
             paragraph_style_id: self.with_selection_doc(|d| {
                 d.paragraph_at_path(&bridge_to_engine_path(sel.caret.path.clone()))
@@ -12764,6 +12873,11 @@ impl Engine {
             /* Issue #260 — `apply` re-stamps this after the command's own
             mutation bump; outside `apply` (replay) it is already final. */
             document_revision: self.mutation_seq,
+            resolved_font_latin: fonts.resolved_latin,
+            resolved_font_cs: fonts.resolved_cs,
+            font_source: fonts.sources,
+            slot_formats: fonts.formats,
+            caret_font_slot: fonts.caret_slot,
         }
     }
 
@@ -13231,15 +13345,22 @@ impl Engine {
     /// style overlaid (Backlog #11). A range reports its first character
     /// — which is also what typing over it produces.
     fn attrs_at(&self, pos: BridgeLogicalPos, collapsed: bool) -> TextAttrs {
-        let apply_pending = collapsed;
+        self.text_attrs_of(&self.caret_style(&pos, collapsed))
+    }
+
+    /// Issues #423 / #420 — the formatting at `pos` before it is flattened
+    /// into one [`TextAttrs`] (the collapsed / range rules of
+    /// [`Self::attrs_at`]). Computed once per `SelectionChanged` and read
+    /// by both the flat read-back and the per-slot one.
+    fn caret_style(&self, pos: &BridgeLogicalPos, collapsed: bool) -> CaretStyle {
         let engine_path = bridge_to_engine_path(pos.path.clone());
         /* Issue #29 — fold the paragraph's style-chain run base UNDER
         the direct span style so the toolbar reads the same cascaded
         values the renderer paints (Heading 1 reports bold even with
         zero direct formatting). Phase 3 (#39) — story-aware doc. */
-        let (mut style, complex) = self.with_selection_doc(|doc| {
+        let (mut full, mut direct, complex, script_hint) = self.with_selection_doc(|doc| {
             doc.paragraph_at_path(&engine_path).map_or_else(
-                || (SpanStyle::default(), false),
+                || (SpanStyle::default(), SpanStyle::default(), false, "Arab"),
                 |p| {
                     let direct = if collapsed {
                         p.typing_style_at(pos.offset)
@@ -13248,21 +13369,38 @@ impl Engine {
                     };
                     (
                         doc.resolve_style_run_cascade(p.style_id.as_deref())
-                            .merged_with(direct),
+                            .merged_with(direct.clone()),
+                        direct,
                         reads_complex_script(p, pos.offset, collapsed),
+                        caret_script_tag(p, pos.offset),
                     )
                 },
             )
         });
-        if apply_pending && let Some(pending) = self.pending_format.as_ref() {
-            style = style.merged_with(pending.clone());
+        if collapsed && let Some(pending) = self.pending_format.as_ref() {
+            full = full.merged_with(pending.clone());
+            direct = direct.merged_with(pending.clone());
         }
         /* Issues #359 / #104 / #249 — complex-script text reports (and
         toggles against) the twins it is laid out with, as Word's ribbon
         does: a caret in `w:sz="22" w:szCs="28"` Arabic shows 14 pt. */
-        if complex || style.forces_complex_script() {
-            style = style.complex_script_view();
+        let complex = complex || full.forces_complex_script();
+        CaretStyle {
+            full,
+            direct,
+            complex,
+            script_hint,
         }
+    }
+
+    /// The flat [`TextAttrs`] read-back of `caret`: the script slot the
+    /// caret's own text reads (see [`Self::caret_style`]).
+    fn text_attrs_of(&self, caret: &CaretStyle) -> TextAttrs {
+        let style = if caret.complex {
+            caret.full.complex_script_view()
+        } else {
+            caret.full.clone()
+        };
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let [r, g, b, a] = style.color.unwrap_or([0, 0, 0, 255]);
         let underline =
@@ -13297,6 +13435,120 @@ impl Engine {
             caps: style.caps.unwrap_or(false),
             small_caps: style.small_caps.unwrap_or(false),
         }
+    }
+
+    /// Issues #423 / #420 — `caret`'s formatting per script slot, fully
+    /// resolved the way layout resolves it (`StyleContext::run_font_ids`):
+    /// the slot's theme binding through the document theme (the
+    /// complex-script slot with the caret script's supplemental entry),
+    /// else the slot's own name, else — nothing in the document names it
+    /// — the face the font stack falls back to for the script. The
+    /// source says which cascade level answered: the run's own direct
+    /// formatting (+ pending style) → `Explicit`, a theme binding →
+    /// `Theme`, the style chain / docDefaults → `Style`, nothing →
+    /// `Default`.
+    fn font_slots_of(&self, caret: &CaretStyle) -> CaretFontSlots {
+        let theme = self.undo.current().theme.as_deref();
+        let direct = &caret.direct;
+        let latin_named = direct.font_family.is_some()
+            || direct
+                .raw_font_family
+                .as_deref()
+                .is_some_and(|n| !n.trim().is_empty());
+        let cs_named = direct.font_family_cs.is_some();
+        let resolve = |class, hint, named: bool| match caret.full.resolve_font(theme, class, hint) {
+            Some(r) if r.from_theme => (Some(r.family), bridge::FontSource::Theme),
+            Some(r) if named => (Some(r.family), bridge::FontSource::Explicit),
+            Some(r) => (Some(r.family), bridge::FontSource::Style),
+            None => (None, bridge::FontSource::Default),
+        };
+        let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
+        let full = &caret.full;
+        /* Built at most once, and only when a slot falls to `Default`. */
+        let stack = std::cell::OnceCell::new();
+        let slot = |(family, source): (Option<EngineFontFamily>, bridge::FontSource),
+                    script: text_pipeline::Script,
+                    size: Option<f32>,
+                    bold: Option<bool>,
+                    italic: Option<bool>| {
+            let (bold, italic) = (bold.unwrap_or(false), italic.unwrap_or(false));
+            let (id, name) = match family {
+                Some(f) => (font_family_id(&f).to_string(), f.display_name().to_string()),
+                None => {
+                    let id = self.default_face_for(&stack, script, bold, italic);
+                    let name = EngineFontFamily::from_id(&id)
+                        .map(|f| f.display_name().to_string())
+                        .unwrap_or_default();
+                    (id, name)
+                }
+            };
+            let format = bridge::BridgeSlotFormat {
+                font_family: id,
+                font_size: size.unwrap_or(default_size),
+                bold,
+                italic,
+            };
+            (name, source, format)
+        };
+        let (latin_name, latin_source, latin) = slot(
+            resolve(engine::FontClass::Latin, None, latin_named),
+            text_pipeline::Script::Latin,
+            full.font_size,
+            full.bold,
+            full.italic,
+        );
+        let (cs_name, cs_source, complex_script) = slot(
+            resolve(
+                engine::FontClass::ComplexScript,
+                Some(caret.script_hint),
+                cs_named,
+            ),
+            text_pipeline::Script::Arabic,
+            full.font_size_cs,
+            full.bold_cs,
+            full.italic_cs,
+        );
+        CaretFontSlots {
+            resolved_latin: latin_name,
+            resolved_cs: cs_name,
+            sources: bridge::BridgeFontSources {
+                latin: latin_source,
+                complex_script: cs_source,
+            },
+            formats: bridge::BridgeSlotFormats {
+                latin,
+                complex_script,
+            },
+            caret_slot: if caret.complex {
+                bridge::FontSlot::ComplexScript
+            } else {
+                bridge::FontSlot::Latin
+            },
+        }
+    }
+
+    /// Issue #423 — the face layout shapes `script` text with when the run
+    /// names no family for it (`FontStack::resolve` with no family): the
+    /// `Default` source's family id. The layout config's root face when
+    /// the stack cannot answer; empty before the first `RenderPage`.
+    /// `stack` caches the font stack across the two slots of one read-back.
+    fn default_face_for(
+        &self,
+        stack: &std::cell::OnceCell<FontStack>,
+        script: text_pipeline::Script,
+        bold: bool,
+        italic: bool,
+    ) -> String {
+        let Some(cfg) = self.layout_cfg.as_ref() else {
+            return String::new();
+        };
+        if self.fonts.is_empty() {
+            return cfg.font_id.clone();
+        }
+        stack
+            .get_or_init(|| FontStack::from_faces(self.fonts.clone(), &cfg.font_id))
+            .resolve(script, None, bold, italic)
+            .map_or_else(|| cfg.font_id.clone(), |(id, _, _)| id.clone())
     }
 
     /// Commit a document edit: push undo, collapse the caret at `caret`,
@@ -15148,8 +15400,9 @@ impl Engine {
     /// struck text the way Word does, so the next Backspace reaches the
     /// character before it), else the plain `delete_range` (text removed,
     /// caret lands at start). Issue #298 — a tracked range the engine
-    /// refuses (across a table-cell boundary, over a table) is an
-    /// `Event::Error`, never a silent no-op.
+    /// refuses is an `Event::Error`, never a silent no-op (since issue
+    /// #365 a range across cells or over a table is recorded — rows
+    /// marked deleted — so only a malformed end is refused).
     fn delete_or_mark(
         &self,
         start: BridgeLogicalPos,
@@ -15186,7 +15439,13 @@ impl Engine {
                 &self.review_author,
                 &self.current_review_date(),
             )
-            .map_err(|e| Box::new(Event::error(format!("{cmd}: {e}"))))
+            .map_err(|e| {
+                /* Issue #364 - typed, so the shell shows a visible refusal. */
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                    kind: Some(bridge::ErrorKind::TrackedDeletionRefused),
+                })
+            })
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching
@@ -15603,15 +15862,47 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = if start == end {
-            self.undo.current().clone()
-        } else {
-            self.undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        let base = match self.paste_base("PastePlain", &start, end) {
+            Ok(d) => d,
+            Err(e) => return *e,
         };
-        let (new_doc, caret) = base.insert_multiline(to_engine_pos(start), &normalized);
+        /* Issue #366 — with review mode on, every pasted line is a
+        tracked insertion and every newline an inserted paragraph mark. */
+        let (new_doc, caret) = if self.tracking_changes {
+            base.tracked_insert_multiline(
+                to_engine_pos(start),
+                &normalized,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            base.insert_multiline(to_engine_pos(start), &normalized)
+        };
         self.commit_edit(new_doc, to_bridge_pos(caret))
+    }
+
+    /// Issue #366 — the tree a paste over `[start, end)` lands in: the
+    /// range removed (`start == end`: the current tree) or, with review
+    /// mode on, recorded as a tracked deletion first (the reviewer's own
+    /// pending insertions inside it removed outright, #265) — the typed
+    /// replacement's order. A tracked range the engine refuses answers a
+    /// typed `Event::Error`.
+    fn paste_base(
+        &self,
+        cmd: &str,
+        start: &BridgeLogicalPos,
+        end: BridgeLogicalPos,
+    ) -> Result<engine::DocumentTree, Box<Event>> {
+        if *start == end {
+            Ok(self.undo.current().clone())
+        } else if self.tracking_changes {
+            self.tracked_delete(cmd, start, &end).map(|t| t.doc)
+        } else {
+            Ok(self
+                .undo
+                .current()
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end)))
+        }
     }
 
     /// `Command::PasteHtml` (Backlog #12) — parse HTML into styled paragraphs
@@ -15634,14 +15925,22 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = if start == end {
-            self.undo.current().clone()
-        } else {
-            self.undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        let base = match self.paste_base("PasteHtml", &start, end) {
+            Ok(d) => d,
+            Err(e) => return *e,
         };
-        let (new_doc, caret) = base.insert_rich_blocks(to_engine_pos(start), &blocks_in);
+        /* Issue #366 — with review mode on, the pasted content (and every
+        paragraph mark it creates) is a tracked insertion. */
+        let (new_doc, caret) = if self.tracking_changes {
+            base.tracked_insert_rich_blocks(
+                to_engine_pos(start),
+                &blocks_in,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            base.insert_rich_blocks(to_engine_pos(start), &blocks_in)
+        };
         self.commit_edit(new_doc, to_bridge_pos(caret))
     }
 
@@ -16486,12 +16785,15 @@ impl Engine {
     /// undo history, comments, revisions, media, the retained source
     /// package (#134 — the next save goes through the minimal-package
     /// writer) and the document name all go; track-changes recording
-    /// turns off, as in a new Word document. An active story was already
-    /// exited by `story_gate` (`StoryPolicy::ExitsStory`). Answers
+    /// turns off, as in a new Word document. An active story is exited
+    /// first (`StoryPolicy::ExitsStory`). Answers
     /// `SelectionChanged`; the worker sees `mutation_seq` move and
     /// broadcasts the accessibility delta + `Painted`, and pins the next
     /// snapshot as the new document's base (`CommandMeta.new_document`).
     fn do_close_document(&mut self) -> Event {
+        /* Issue #341 — `StoryPolicy::ExitsStory`: the story is left here,
+        at the commit point (the gate no longer exits for us). */
+        self.exit_story_to_body();
         self.document_name = None;
         self.tracking_changes = false;
         self.stashed_body_selection = None;
@@ -16519,7 +16821,7 @@ impl Engine {
         origin: &'static str,
         defaults: Option<DocumentDefaults>,
     ) -> Event {
-        self.load_docx_bytes_with_limits(bytes, origin, defaults, None)
+        self.load_docx_bytes_with_limits(bytes, origin, defaults, None, None)
     }
 
     /// [`Self::load_docx_bytes`] under the host's `OpenDocument.limits`
@@ -16532,6 +16834,7 @@ impl Engine {
         origin: &'static str,
         defaults: Option<DocumentDefaults>,
         limits: Option<bridge::PackageLimitsOverride>,
+        new_name: Option<Option<String>>,
     ) -> Event {
         let default_page_size = match defaults.as_ref().and_then(|d| d.page_size) {
             Some(BridgeDefaultPageSize::A4) => engine::DefaultPageSize::A4,
@@ -16548,6 +16851,16 @@ impl Engine {
         ) {
             Ok(archive) => {
                 let paragraph_count = archive.document.paragraph_count();
+                /* Issue #341 — everything below only runs for a package
+                that parsed: a refused one (`Err` arm) must not have
+                closed the open header/footer / note / text-box story,
+                moved the selection or renamed the document. FILENAME
+                resolves to the opened file's base name (issue #77);
+                `LoadDocx` passes `None` and keeps the name. */
+                self.exit_story_to_body();
+                if let Some(n) = new_name {
+                    self.document_name = n;
+                }
                 /* Issue #51/#54 — a failed post-load paint (missing font,
                 backend error) previously returned `DocumentLoaded` anyway,
                 leaving every canvas showing the previous document while
@@ -17701,6 +18014,86 @@ impl Engine {
     pub fn undo_depth(&self) -> u32 {
         self.undo.depth()
     }
+
+    /// Issue #341 — the `snapshot_decode` target's entry: decode `bytes`
+    /// (an `engine::snapshot` envelope, optionally with the detached source
+    /// `package` a `Command::Recover` would carry) and install it, exactly
+    /// the restore path `Command::Recover` runs. `Ok((format_version,
+    /// package_lost))` or a typed snapshot error rendered to text — a
+    /// hostile envelope may be refused, never panic.
+    pub fn restore_for_fuzzing(
+        &mut self,
+        bytes: &[u8],
+        package: Option<&[u8]>,
+    ) -> Result<(u8, bool), String> {
+        self.restore_from_bytes_with_package(bytes, package)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Issue #341 — the engine's cheap structural invariants, checked after
+    /// a restore + one `apply` round: the undo stack respects its cap, the
+    /// live and the stashed selection resolve inside the document they
+    /// address, and an active note / text-box story still exists. `Err`
+    /// names the first violation.
+    pub fn check_invariants_for_fuzzing(&self) -> Result<(), String> {
+        if self.undo.depth() as usize > self.undo.cap() {
+            return Err(format!(
+                "undo depth {} exceeds its cap {}",
+                self.undo.depth(),
+                self.undo.cap()
+            ));
+        }
+        if !self.selection_is_valid() {
+            return Err("the live selection escaped its document".to_string());
+        }
+        if let Some(sel) = &self.stashed_body_selection {
+            let body = self.undo.current();
+            if clamp_pos(body, sel.anchor.clone()) != sel.anchor
+                || clamp_pos(body, sel.caret.clone()) != sel.caret
+            {
+                return Err("the stashed body selection escaped the body".to_string());
+            }
+        }
+        if matches!(
+            self.active_story,
+            StoryTarget::Note { .. } | StoryTarget::TextBox { .. }
+        ) && self.story_blocks().is_none()
+        {
+            return Err("the active note / text-box story no longer exists".to_string());
+        }
+        Ok(())
+    }
+
+    /// Issue #341 — a per-component fingerprint of the session state a
+    /// FAILED command must leave alone: the current document (its
+    /// deterministic snapshot encoding), the selection, the active story,
+    /// the document name and the undo depth. `rpc_command` compares it
+    /// before and after every command answered with `Event::Error`.
+    pub fn state_fingerprint_for_fuzzing(&self) -> [u64; 5] {
+        use std::hash::{Hash, Hasher};
+        fn h<T: Hash + ?Sized>(v: &T) -> u64 {
+            let mut s = std::collections::hash_map::DefaultHasher::new();
+            v.hash(&mut s);
+            s.finish()
+        }
+        [
+            h(&engine::snapshot::encode(self.undo.current()).unwrap_or_default()),
+            h(&engine::snapshot::encode(&self.selection).unwrap_or_default()),
+            h(&engine::snapshot::encode(&self.active_story).unwrap_or_default()),
+            h(&self.document_name),
+            h(&self.undo.depth()),
+        ]
+    }
+
+    /// Names of the [`Self::state_fingerprint_for_fuzzing`] components,
+    /// in order.
+    pub const FINGERPRINT_PARTS: [&'static str; 5] = [
+        "document",
+        "selection",
+        "active story",
+        "document name",
+        "undo depth",
+    ];
 
     /// Run the real layout pipeline (`build_pages` → `Paginator` →
     /// `layout_paragraph`) over the current document without requiring a
@@ -26409,6 +26802,53 @@ mod tests {
         assert_eq!(engine.undo.current().to_plain_text(), "small");
     }
 
+    /// Issue #341 — found by `rpc_command`'s new "`Event::Error` => no
+    /// mutation" assertion: a refused `OpenDocument` / `LoadDocx` used to
+    /// exit the open header / footer story (and `OpenDocument` renamed the
+    /// document) BEFORE the package was parsed, so the error reply left the
+    /// session changed. Both now refuse with the story, selection, name and
+    /// undo depth untouched; a package that parses still exits the story.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn a_refused_load_leaves_the_open_story_and_name_alone() {
+        let mut engine = Engine::new_headless(DocumentTree::from_text("seed text"));
+        let evt = engine.apply_sync(Command::EnterHeaderFooter {
+            page: 0,
+            area: bridge::HeaderFooterArea::Header,
+        });
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(matches!(engine.active_story, StoryTarget::Header { .. }));
+        let before = engine.state_fingerprint_for_fuzzing();
+        for cmd in [
+            Command::OpenDocument {
+                bytes: b"not a zip".to_vec(),
+                format: DocFormat::Docx,
+                name: Some("renamed.docx".to_string()),
+                defaults: None,
+                limits: None,
+            },
+            Command::LoadDocx {
+                bytes: b"PK\x03\x04 truncated".to_vec(),
+            },
+        ] {
+            let evt = engine.apply_sync(cmd);
+            assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+            assert_eq!(engine.state_fingerprint_for_fuzzing(), before);
+            assert!(matches!(engine.active_story, StoryTarget::Header { .. }));
+        }
+        // A package that parses replaces the document: the story is closed.
+        let evt = engine.apply_sync(Command::OpenDocument {
+            bytes: format_docx::test_fixtures::no_pgsz_docx("fresh"),
+            format: DocFormat::Docx,
+            name: Some("dir/fresh.docx".to_string()),
+            defaults: None,
+            limits: None,
+        });
+        assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+        assert!(matches!(engine.active_story, StoryTarget::Body));
+        assert_eq!(engine.document_name.as_deref(), Some("fresh.docx"));
+    }
+
     /// Issue #221 — `OpenDocument.defaults.widow_control: Some(false)`
     /// reaches `DocumentSettings::widow_control_default` through the REAL
     /// bridge dispatcher and reproduces the pinned pre-#95 fingerprints
@@ -27197,6 +27637,87 @@ mod snapshot_tests {
         assert_eq!(s.review_author, "You");
         assert_eq!(s.doc_history.len(), 1);
         assert_eq!(s.undo_cursor, 0);
+    }
+
+    /// Issue #422 — `engine()`'s snapshot with the current document's
+    /// `blocks` header (an `im::Vector`, whose serde visitor preallocates
+    /// the declared count uncapped) rewritten to claim 4 G entries.
+    fn snapshot_with_a_lying_block_count() -> Vec<u8> {
+        let bytes = engine().snapshot_bytes().unwrap();
+        // `a6 "blocks"` then a fixarray / array16 / array32 header.
+        let key = b"\xa6blocks";
+        let at = bytes
+            .windows(key.len())
+            .position(|w| w == key)
+            .expect("the snapshot names a blocks field")
+            + key.len();
+        let header_len = match bytes[at] {
+            0x90..=0x9f => 1,
+            0xdc => 3,
+            0xdd => 5,
+            other => panic!("blocks is not an array header: {other:#x}"),
+        };
+        let mut lying = bytes[..at].to_vec();
+        lying.push(0xdd);
+        lying.extend_from_slice(&u32::MAX.to_be_bytes());
+        lying.extend_from_slice(&bytes[at + header_len..]);
+        lying
+    }
+
+    /// Issue #422 — one flipped length in a persisted snapshot must be
+    /// refused with a typed error before anything is allocated (a wasm
+    /// worker would abort on the `4 G × size_of::<Block>()` reservation),
+    /// and the refused restore leaves the engine untouched.
+    #[test]
+    fn restore_refuses_a_lying_block_count_before_allocating() {
+        let lying = snapshot_with_a_lying_block_count();
+        let mut b = engine();
+        let doc_before = engine::snapshot::encode(b.undo.current()).unwrap();
+        let depth_before = b.undo.depth();
+        let err = b.restore_from_bytes(&lying).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SnapshotError::DeclaredLength {
+                    declared: 4_294_967_295,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            engine::snapshot::encode(b.undo.current()).unwrap(),
+            doc_before
+        );
+        assert_eq!(b.undo.depth(), depth_before);
+    }
+
+    /// Issue #422 — the same envelope through the production entry:
+    /// `Command::Recover` reports the unreadable base and replays the tail
+    /// onto a fresh document — `Recovered`, never a trap.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn recover_survives_a_lying_block_count() {
+        let mut b = engine();
+        let evt = b.apply_sync(Command::Recover {
+            snapshot: snapshot_with_a_lying_block_count(),
+            log_tail: vec![Command::InsertText {
+                text: "tail".into(),
+                at: None,
+            }],
+            renderer_downgrade: None,
+            package: None,
+        });
+        assert!(
+            matches!(
+                evt,
+                Event::Recovered {
+                    snapshot_restored: false,
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
     }
 
     #[test]
@@ -28074,6 +28595,10 @@ mod toc_pdf_export_tests;
 #[cfg(test)]
 mod pdf_validate_fixtures_tests;
 
+/// Issue #360 — PDF outline / links / XMP / tagging, end to end.
+#[cfg(test)]
+mod pdf_semantics_tests;
+
 #[cfg(test)]
 mod a11y_note_tests;
 
@@ -28104,6 +28629,9 @@ mod nested_table_tests;
 mod part_media_tests;
 #[cfg(test)]
 mod pbdr_start_end_tests;
+/// Issue #395 — paragraph borders defined on styles, on canvas.
+#[cfg(test)]
+mod pbdr_style_cascade_tests;
 
 #[cfg(test)]
 mod block_remap_tests;
@@ -28126,6 +28654,10 @@ mod story_tab_tests;
 /// Issue #355 — theme fonts / colours through read → layout.
 #[cfg(test)]
 mod theme_layout_tests;
+
+/// Issues #423 / #420 — the per-slot font read-back on `SelectionChanged`.
+#[cfg(test)]
+mod font_readback_tests;
 
 #[cfg(test)]
 mod document_lifecycle_tests;

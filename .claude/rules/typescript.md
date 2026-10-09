@@ -26,6 +26,12 @@ paths:
 - **`packages/core/`** + **`packages/ui/`** carry their own per-package `tsconfig.json` and `package.json`; the root `pnpm-workspace.yaml` globs them in. Run `pnpm -r tsc` for a workspace-wide type-check.
 - Inter-package deps use `workspace:*` (see `ts/package.json` for `@nge/core` + `@nge/ui` consumption).
 
+## Unit tests (issue #332)
+- `vitest` (node environment, `fake-indexeddb`, no jsdom/happy-dom), run with `pnpm -r test`; tests are `src/**/*.test.ts` beside the module, config in the root `vitest.shared.ts` + a per-package `vitest.config.ts`.
+- A module you want to unit-test must not touch the DOM at import time. Stub what it reads off `globalThis` (`Worker`, `location`, `indexedDB` + `IDBKeyRange` — `vi.stubGlobal`, `vi.stubEnv('DEV', false)`) inside the test, not globally.
+- `engine.worker.ts` imports the wasm engine and is not loadable under vitest: put new pure decisions (schedules, scoring, state folds) in their own module and import them from the worker.
+- Prefer a unit test over a Playwright spec for pure-TS behaviour; keep e2e for what needs the browser + wasm engine. `pnpm -r tsc` also type-checks the test files.
+
 ## tsify-next interop
 - `Option<T>` in Rust → `T | undefined` in `.d.ts`. **Pass `undefined`, not `null`** from TS.
 - `Vec<u8>` with `#[serde(with = "serde_bytes")]` + `#[tsify(type = "Uint8Array")]` → pass `Uint8Array` directly. Without `serde_bytes`, decoder demands a number-array and balks at `Uint8Array`.

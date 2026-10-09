@@ -281,3 +281,84 @@ pub(crate) fn run_complex_script_roundtrip() -> Result<()> {
     run_bcs_rstyle_step()?;
     run_regeneration_fidelity_step()
 }
+
+/// Step 48 (issue #420) — the Font dialog's per-section Apply: each
+/// section is ONE formatting patch on its script slot (`setSlotFormat` →
+/// `ApplyFormatting { font_slot }`, routed by engine-wasm's
+/// `patch_to_span_style`: `Latin` as is, `ComplexScript` through
+/// `SpanStyle::into_cs_only`). On the mixed-size run (`w:sz="22"
+/// w:szCs="28"`):
+///
+/// a. "Complex scripts": Amiri, 20 pt, bold → `w:cs`, `<w:bCs/>`,
+///    `<w:szCs w:val="40"/>` only; the Latin `<w:sz w:val="22"/>` stays and
+///    no `w:ascii` / `<w:b>` appears.
+/// b. "Latin text": italic, 9 pt on top → `<w:i/>` + `<w:sz w:val="18"/>`;
+///    the complex-script set from (a) is untouched.
+/// c. The reread keeps every slot apart.
+pub(crate) fn run_font_dialog_slots_roundtrip() -> Result<()> {
+    let src = complex_script_size_docx();
+    let archive = read_docx(&src).context("read complex-script fixture")?;
+    let len = CS_SIZE_MIXED_TEXT.len();
+    let cs_section = SpanStyle {
+        font_family: Some(engine::FontFamily::Amiri),
+        font_size: Some(20.0),
+        bold: Some(true),
+        ..SpanStyle::default()
+    }
+    .into_cs_only();
+    let cs_doc = archive
+        .document
+        .apply_style(pos(0, 0), pos(0, len), cs_section);
+    let bytes = write_docx(&archive, &cs_doc).context("write cs-only")?;
+    assert_document_xml_well_formed(&bytes).context("cs-only .docx")?;
+    let xml = doc_xml_string(&bytes)?;
+    let p0 = nth_paragraph_xml(&xml, 0);
+    let want =
+        r#"<w:rPr><w:rFonts w:cs="Amiri"/><w:bCs/><w:sz w:val="22"/><w:szCs w:val="40"/></w:rPr>"#;
+    if !p0.contains(want) {
+        bail!(
+            "step 48a: the Complex scripts section must write only the cs set\nwant {want}\n got {p0}"
+        );
+    }
+    println!(
+        "[roundtrip] step 48a OK — the Font dialog's Complex scripts section writes w:cs / <w:bCs/> / <w:szCs> only"
+    );
+
+    let latin_section = SpanStyle {
+        italic: Some(true),
+        font_size: Some(9.0),
+        ..SpanStyle::default()
+    };
+    let both = cs_doc.apply_style(pos(0, 0), pos(0, len), latin_section);
+    let bytes = write_docx(&archive, &both).context("write Latin on top")?;
+    assert_document_xml_well_formed(&bytes).context("Latin-on-top .docx")?;
+    let xml = doc_xml_string(&bytes)?;
+    let p0 = nth_paragraph_xml(&xml, 0);
+    let want = r#"<w:rPr><w:rFonts w:cs="Amiri"/><w:bCs/><w:i/><w:sz w:val="18"/><w:szCs w:val="40"/></w:rPr>"#;
+    if !p0.contains(want) {
+        bail!("step 48b: the Latin text section must leave the cs set\nwant {want}\n got {p0}");
+    }
+    let back = read_docx(&bytes).context("re-read")?.document;
+    let s = back.nth_paragraph(0).context("paragraph")?.style_at(0);
+    let got = (
+        s.font_family.clone(),
+        s.font_family_cs.clone(),
+        (s.font_size, s.font_size_cs),
+        (s.bold, s.bold_cs),
+        (s.italic, s.italic_cs),
+    );
+    let expected = (
+        None,
+        Some(engine::FontFamily::Amiri),
+        (Some(9.0), Some(20.0)),
+        (None, Some(true)),
+        (Some(true), None),
+    );
+    if got != expected {
+        bail!("step 48c: slots lost on re-read: {got:?}, expected {expected:?}");
+    }
+    println!(
+        "[roundtrip] step 48 OK — the Font dialog's two sections write their own script slots (Latin: <w:i/> <w:sz>; complex: w:cs <w:bCs/> <w:szCs>) and re-read apart"
+    );
+    Ok(())
+}

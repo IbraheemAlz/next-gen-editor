@@ -69,6 +69,9 @@ export type { StatusBarProps } from './StatusBar';
 
 export { SettingsMenu } from './SettingsMenu';
 
+export { ErrorToast, ERROR_TOAST_COPY, toastMessageFor } from './ErrorToast';
+export type { ErrorToastProps } from './ErrorToast';
+
 export { TrapOverlay } from './TrapOverlay';
 export type { TrapOverlayProps } from './TrapOverlay';
 
@@ -80,6 +83,8 @@ export type { RulerProps } from './Ruler';
 
 export { TextFormatButtons } from './TextFormatButtons';
 export { FontPickers } from './FontPickers';
+export { FontDialog } from './FontDialog';
+export type { FontDialogProps } from './FontDialog';
 export { ColorPickers } from './ColorPickers';
 export { AlignmentButtons } from './AlignmentButtons';
 export { InsertTableButton } from './InsertTableButton';

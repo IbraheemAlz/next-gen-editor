@@ -614,3 +614,454 @@ fn ignorable_unknown_elements_are_not_walked() {
     let saved = document_xml_of(&write_docx(&archive, &edited).expect("write"));
     assert_eq!(saved, xml.replacen(">shown<", ">shownX<", 1));
 }
+
+/* ------------------------------------------------------------------ */
+/* Issue #358 — the widened fuzz generator's intents, pinned            */
+/* ------------------------------------------------------------------ */
+
+/// Read + zero-edit save + re-read: the text survives (the
+/// `docx_roundtrip` fuzz invariant), returning the first archive.
+fn assert_text_round_trips(xml: &str) -> crate::DocxArchive {
+    let docx = package_with_document_xml(xml, &[]);
+    let a = read_docx(&docx).expect("read");
+    let saved = write_docx(&a, &a.document).expect("write");
+    let b = read_docx(&saved).expect("re-read");
+    assert_eq!(a.document.to_plain_text(), b.document.to_plain_text());
+    a
+}
+
+/// Issue #358 — a `begin` field character outside every paragraph
+/// (before `<w:body>`, or between two blocks) used to stay in its
+/// instruction phase into the next paragraph and hide all of its text:
+/// #350's `</w:p>` close cannot reach a field that opened before the
+/// paragraph did. Outside a paragraph a field character is not modeled.
+#[test]
+fn a_field_character_outside_every_paragraph_hides_nothing() {
+    let visible = text("visible");
+    for junk in [fld("begin"), fld("separate"), instr(" PAGE ")] {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n{ROOT}{junk}<w:body><w:p>{visible}</w:p>{SECT}</w:body></w:document>"
+        );
+        let a = assert_text_round_trips(&xml);
+        assert_eq!(a.document.to_plain_text(), "visible", "{junk}");
+    }
+    let between = document(
+        &format!(
+            "<w:p>{}</w:p>{}<w:p>{}</w:p>",
+            text("one"),
+            fld("begin"),
+            text("two")
+        ),
+        SECT,
+    );
+    let a = assert_text_round_trips(&between);
+    assert_eq!(a.document.to_plain_text(), "one\ntwo");
+    assert!(
+        a.warnings
+            .iter()
+            .any(|w| matches!(w, DocxWarning::StrayFieldChar { kind } if kind == "begin")),
+        "{:?}",
+        a.warnings
+    );
+}
+
+/// Issue #358 — a 40-deep balanced chain (one `separate` for the
+/// innermost field, so every outer field is still in its instruction when
+/// the result appears) and one past the reader's nesting cap both read,
+/// hide the nested result and save byte-identical.
+#[test]
+fn deep_field_chains_read_and_round_trip() {
+    for depth in [40usize, 41] {
+        let mut runs = text("a");
+        for _ in 0..depth {
+            runs.push_str(&fld("begin"));
+            runs.push_str(&instr(" PAGE "));
+        }
+        runs.push_str(&fld("separate"));
+        runs.push_str(&text("deep"));
+        for _ in 0..depth {
+            runs.push_str(&fld("end"));
+        }
+        let a = assert_zero_edit_identity(&document(&format!("<w:p>{runs}</w:p>"), SECT));
+        assert_eq!(a.document.to_plain_text(), "a", "depth {depth}");
+    }
+}
+
+/// Issue #358 — surplus `separate` / `end` markers after a closed field
+/// are ignored (warned), and a `fldSimple` with an empty, quote-only or
+/// unknown instruction keeps its cached result.
+#[test]
+fn surplus_markers_and_hostile_simple_fields_keep_their_text() {
+    let surplus = [
+        fld("begin"),
+        instr(" PAGE "),
+        fld("separate"),
+        text("1"),
+        fld("end"),
+        fld("separate"),
+        fld("end"),
+        text("after"),
+    ]
+    .concat();
+    let a = assert_zero_edit_identity(&document(&format!("<w:p>{surplus}</w:p>"), SECT));
+    assert_eq!(a.document.to_plain_text(), "1after");
+    for instr in ["", "&quot;", " ", "BOGUS", " PAGE \\* ROMAN "] {
+        let p = format!(
+            r#"<w:p><w:fldSimple w:instr="{instr}">{}</w:fldSimple></w:p>"#,
+            text("r")
+        );
+        let a = assert_zero_edit_identity(&document(&p, SECT));
+        assert_eq!(a.document.to_plain_text(), "r", "{instr:?}");
+    }
+}
+
+/// Issue #358 — drawings whose `r:embed` resolves to nothing (no such
+/// relationship, an empty id) or that are empty (`<wp:inline/>`), inline
+/// or anchored, with hostile extents and offsets: each reads as one
+/// object placeholder with FINITE geometry and saves byte-identical.
+#[test]
+fn unresolvable_drawings_read_as_placeholders_and_round_trip() {
+    let graphic = |rid: &str| {
+        format!(
+            r#"<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip r:embed="{rid}"/></pic:blipFill></pic:pic></a:graphicData></a:graphic>"#
+        )
+    };
+    let mut drawings = vec!["<wp:inline/>".to_string()];
+    for (rid, cx, cy) in [
+        ("rIdNowhere", "NaN", "-1e30"),
+        ("", "inf", "1in"),
+        ("rIdNowhere", "50%", "0x20"),
+        ("rIdNowhere", "99999999999999999999", "-5"),
+    ] {
+        drawings.push(format!(
+            r#"<wp:inline><wp:extent cx="{cx}" cy="{cy}"/><wp:docPr id="1" name="p"/>{}</wp:inline>"#,
+            graphic(rid)
+        ));
+        drawings.push(format!(
+            r#"<wp:anchor behindDoc="bogus" relativeHeight="{cx}"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:posOffset>{cy}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>{cx}</wp:posOffset></wp:positionV><wp:extent cx="{cx}" cy="{cy}"/><wp:wrapSquare wrapText="bothSides"/><wp:docPr id="2" name="p"/>{}</wp:anchor>"#,
+            graphic(rid)
+        ));
+    }
+    for d in drawings {
+        let p = format!(
+            "<w:p>{}<w:r><w:drawing>{d}</w:drawing></w:r>{}</w:p>",
+            text("a"),
+            text("b")
+        );
+        let a = assert_zero_edit_identity(&document(&p, SECT));
+        assert_eq!(a.document.to_plain_text(), "a[image]b", "{d}");
+        let para = a.document.blocks[0].as_paragraph().expect("paragraph");
+        for o in &para.inline_objects {
+            if let engine::InlineKind::Image {
+                width_emu,
+                height_emu,
+                ..
+            } = &o.kind
+            {
+                assert!(
+                    *width_emu >= 0 && *height_emu >= 0,
+                    "{d}: {width_emu}×{height_emu}"
+                );
+            }
+        }
+    }
+}
+
+/// Issue #358 — inline content controls nested 100 deep (200 XML levels,
+/// under the 256 cap) read their innermost text and save byte-identical;
+/// past the cap the package is a typed refusal (the 5000-deep block-level
+/// case is `opc::archive`'s).
+#[test]
+fn deep_inline_content_controls_read_or_refuse_typed() {
+    let nest = |depth: usize| {
+        let mut s = text("inner");
+        for _ in 0..depth {
+            s = format!("<w:sdt><w:sdtContent>{s}</w:sdtContent></w:sdt>");
+        }
+        document(&format!("<w:p>{s}</w:p>"), SECT)
+    };
+    let a = assert_zero_edit_identity(&nest(100));
+    assert_eq!(a.document.to_plain_text(), "inner");
+    let err = read_docx(&package_with_document_xml(&nest(200), &[])).expect_err("too deep");
+    assert!(err.to_string().contains("nesting depth"), "{err}");
+}
+
+/// Issue #358 — the splice snippets: a NUL character reference is a typed
+/// XML error (XML 1.0 forbids it), and a literal U+FFFC — the engine's own
+/// inline-object placeholder — stays TEXT through read → save → read,
+/// never becoming an object.
+#[test]
+fn nul_references_refuse_and_object_replacement_characters_stay_text() {
+    let nul = document(r#"<w:p><w:r><w:t>a&#0;b</w:t></w:r></w:p>"#, SECT);
+    let err = read_docx(&package_with_document_xml(&nul, &[])).expect_err("NUL");
+    assert!(matches!(err, crate::DocxError::Xml(_)), "{err:?}");
+    for t in ["a\u{FFFC}b", "a&#xFFFC;b"] {
+        let xml = document(&format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>"), SECT);
+        let a = assert_text_round_trips(&xml);
+        assert_eq!(a.document.to_plain_text(), "a\u{FFFC}b");
+        let para = a.document.blocks[0].as_paragraph().expect("paragraph");
+        assert!(para.inline_objects.is_empty(), "{:?}", para.inline_objects);
+    }
+}
+
+/// Issue #358 — `mc:AlternateContent` with hostile `Requires` values,
+/// around runs inside a paragraph and around whole paragraphs: an empty
+/// or blank value requires nothing (the choice), an unknown or malformed
+/// prefix selects the fallback, the first satisfiable of several choices
+/// wins, an unsatisfied choice with no fallback and an empty envelope
+/// contribute nothing — never both branches. Every shape reads, saves
+/// byte-identical and keeps its text through read => write => read.
+#[test]
+fn hostile_requires_values_select_exactly_one_branch() {
+    let choice =
+        |req: &str, body: &str| format!(r#"<mc:Choice Requires="{req}">{body}</mc:Choice>"#);
+    let fallback = |body: &str| format!("<mc:Fallback>{body}</mc:Fallback>");
+    // (envelope children built from a branch body, expected branch text)
+    let shapes = |c: &dyn Fn(&str) -> String| -> Vec<(String, &'static str)> {
+        let (cx, fb, c2) = (c("CHOICE"), c("FALLBACK"), c("SECOND"));
+        let mut v: Vec<(String, &'static str)> = Vec::new();
+        for (req, expect) in [
+            ("", "CHOICE"),
+            ("  ", "CHOICE"),
+            ("wps", "CHOICE"),
+            ("a:b", "FALLBACK"),
+            ("bogus", "FALLBACK"),
+            ("wps w99", "FALLBACK"),
+            ("w99 ", "FALLBACK"),
+        ] {
+            v.push((format!("{}{}", choice(req, &cx), fallback(&fb)), expect));
+        }
+        v.push((
+            format!(
+                "{}{}{}",
+                choice("bogus", &cx),
+                choice("", &c2),
+                fallback(&fb)
+            ),
+            "SECOND",
+        ));
+        v.push((choice("w99", &cx), ""));
+        v.push((fallback(&fb), "FALLBACK"));
+        v.push((String::new(), ""));
+        v
+    };
+    // Around runs, inside one paragraph.
+    for (children, expect) in shapes(&|t| text(t)) {
+        let ac = if children.is_empty() {
+            "<mc:AlternateContent/>".to_string()
+        } else {
+            format!("<mc:AlternateContent>{children}</mc:AlternateContent>")
+        };
+        let xml = document(&format!("<w:p>{}{ac}{}</w:p>", text("x"), text("y")), SECT);
+        let a = assert_zero_edit_identity(&xml);
+        assert_eq!(a.document.to_plain_text(), format!("x{expect}y"), "{ac}");
+        assert_text_round_trips(&xml);
+    }
+    // Around whole paragraphs, between two body paragraphs.
+    for (children, expect) in shapes(&|t| format!("<w:p>{}</w:p>", text(t))) {
+        let ac = if children.is_empty() {
+            "<mc:AlternateContent/>".to_string()
+        } else {
+            format!("<mc:AlternateContent>{children}</mc:AlternateContent>")
+        };
+        let body = format!("<w:p>{}</w:p>{ac}<w:p>{}</w:p>", text("x"), text("y"));
+        let xml = document(&body, SECT);
+        let a = assert_zero_edit_identity(&xml);
+        let plain = a.document.to_plain_text();
+        for other in ["CHOICE", "FALLBACK", "SECOND"] {
+            assert_eq!(plain.contains(other), other == expect, "{ac}: {plain:?}");
+        }
+        assert!(
+            plain.starts_with('x') && plain.trim_end().ends_with('y'),
+            "{plain:?}"
+        );
+        assert_text_round_trips(&xml);
+    }
+    // An empty envelope between table rows and between a cell's blocks.
+    for (row_gap, cell_gap) in [
+        ("<mc:AlternateContent/>", ""),
+        ("", "<mc:AlternateContent/>"),
+    ] {
+        let row = |t: &str| {
+            format!(
+                "<w:tr><w:tc><w:p>{}</w:p>{cell_gap}<w:p/></w:tc></w:tr>",
+                text(t)
+            )
+        };
+        let body = format!(
+            r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>{}{row_gap}{}</w:tbl><w:p/>"#,
+            row("r1"),
+            row("r2")
+        );
+        let xml = document(&body, SECT);
+        let a = assert_zero_edit_identity(&xml);
+        let plain = a.document.to_plain_text();
+        assert!(plain.contains("r1") && plain.contains("r2"), "{plain:?}");
+        assert_text_round_trips(&xml);
+    }
+}
+
+/// Issue #358 — found by the splice mode's raw-input splice: junk bytes
+/// that are not UTF-8 (`\xae\x95`, control characters) as character data
+/// inside an UNSELECTED `mc:Fallback` (paragraph level and block level).
+/// The reader never decodes them, so the package opens; the writer used to
+/// skip any captured fragment that was not UTF-8, dropping the
+/// `mc:AlternateContent` closer and writing a part its own reader refused.
+/// The structure now survives a save: the re-read succeeds with the text.
+#[test]
+fn junk_bytes_in_an_unselected_branch_keep_the_part_well_formed() {
+    let junk: &[u8] = b"j\xae\x9512\x1cc?\x02\xa0\xd52\xd8\xfd";
+    let fallback = |inner: &[u8]| {
+        let mut v = b"<mc:Fallback>".to_vec();
+        v.extend_from_slice(junk);
+        v.extend_from_slice(inner);
+        v.extend_from_slice(b"</mc:Fallback>");
+        v
+    };
+    let run = text("fallback");
+    let para = format!("<w:p>{run}</w:p>");
+    let shapes: Vec<Vec<u8>> = vec![
+        // Paragraph level: around runs.
+        [
+            format!("<w:p>{}<mc:AlternateContent>", text("x")).as_bytes(),
+            format!(
+                r#"<mc:Choice Requires="wps">{}</mc:Choice>"#,
+                text("choice")
+            )
+            .as_bytes(),
+            &fallback(run.as_bytes()),
+            format!("</mc:AlternateContent>{}</w:p>", text("y")).as_bytes(),
+        ]
+        .concat(),
+        // Block level: around paragraphs.
+        [
+            format!("<w:p>{}</w:p><mc:AlternateContent>", text("x")).as_bytes(),
+            format!(
+                r#"<mc:Choice Requires="wps"><w:p>{}</w:p></mc:Choice>"#,
+                text("choice")
+            )
+            .as_bytes(),
+            &fallback(para.as_bytes()),
+            format!("</mc:AlternateContent><w:p>{}</w:p>", text("y")).as_bytes(),
+        ]
+        .concat(),
+    ];
+    for body in shapes {
+        let xml = [
+            document("", SECT)
+                .split("<w:body>")
+                .next()
+                .unwrap()
+                .as_bytes(),
+            b"<w:body>",
+            &body,
+            SECT.as_bytes(),
+            b"</w:body></w:document>",
+        ]
+        .concat();
+        let docx = crate::test_fixtures::package_with_document_xml_bytes(&xml, &[]);
+        let a = read_docx(&docx).expect("the source opens");
+        let plain = a.document.to_plain_text();
+        assert!(
+            plain.contains("choice") && !plain.contains("fallback"),
+            "{plain:?}"
+        );
+        let saved = write_docx(&a, &a.document).expect("write");
+        let b = read_docx(&saved).expect("the writer's own output re-reads");
+        assert_eq!(b.document.to_plain_text(), plain);
+    }
+}
+
+/// Issue #358 — a picture-less drawing (`r:embed=""`) whose bytes hold a
+/// byte that is not UTF-8 (a flipped attribute-name byte the reader never
+/// decodes) is written from its bytes — lossily — instead of being
+/// dropped: the `[image]` placeholder survives read => write => read.
+#[test]
+fn a_drawing_with_non_utf8_bytes_keeps_its_placeholder() {
+    let drawing: &[u8] = b"<w:r><w:drawing><wp:inline><wp:extent cx=\"914400\" cy=\"914400\"/><wp:docPr id=\"1\" name=\"p\"/><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:blipFill><a:blip r:embed=\"\"/></pic:blipFill><pic:spPr><a:xfrm><a:ext \x9cx=\"914400\" cy=\"914400\"/></a:xfrm></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>";
+    let xml = [
+        document("", SECT)
+            .split("<w:body>")
+            .next()
+            .unwrap()
+            .as_bytes(),
+        b"<w:body><w:p>",
+        text("a").as_bytes(),
+        drawing,
+        text("b").as_bytes(),
+        b"</w:p>",
+        SECT.as_bytes(),
+        b"</w:body></w:document>",
+    ]
+    .concat();
+    let docx = crate::test_fixtures::package_with_document_xml_bytes(&xml, &[]);
+    let a = read_docx(&docx).expect("the source opens");
+    assert_eq!(a.document.to_plain_text(), "a[image]b");
+    let saved = write_docx(&a, &a.document).expect("write");
+    let b = read_docx(&saved).expect("re-read");
+    assert_eq!(b.document.to_plain_text(), "a[image]b");
+}
+
+/// Issue #358 — a `<w:tab/>` / `<w:br/>` spliced into a run's `<w:rPr>`
+/// is not content: it rides the rPr grab bag and adds no text, so a save
+/// cannot double it (the tab used to count as text AND ride the bag, and
+/// every resave added one more).
+#[test]
+fn a_tab_inside_run_properties_is_not_text() {
+    let para = r#"<w:p><w:r><w:rPr><w:i/><w:tab/><w:br/></w:rPr><w:t xml:space="preserve">a</w:t><w:tab/><w:t xml:space="preserve">b</w:t></w:r></w:p>"#;
+    let xml = document(para, SECT);
+    let a = assert_zero_edit_identity(&xml);
+    assert_eq!(a.document.to_plain_text(), "a\tb");
+    assert_text_round_trips(&xml);
+    // A regenerated paragraph (an edit) keeps the rPr children verbatim
+    // and still reads back the same text plus the insertion.
+    let edited = a.document.insert_text(a.document.end_of_document(), "c");
+    let saved = write_docx(&a, &edited).expect("write");
+    let b = read_docx(&saved).expect("re-read");
+    assert_eq!(b.document.to_plain_text(), "a\tbc");
+}
+
+/// Issue #358 — a 60-deep chain of 1×1 tables (deeper than layout's
+/// 32-level flattening, under the reader's typed-table cap) around one
+/// paragraph: it reads, the innermost text survives, and a zero-edit save
+/// is byte-identical and re-reads to the same text.
+#[test]
+fn sixty_deep_table_chains_read_and_round_trip() {
+    let mut inner = format!("<w:p>{}</w:p>", text("deep"));
+    for level in 0..60 {
+        inner = format!(
+            r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="{}"/></w:tblGrid><w:tr><w:tc>{inner}<w:p/></w:tc></w:tr></w:tbl>"#,
+            9000 - level * 100
+        );
+    }
+    let xml = document(&format!("{inner}<w:p>{}</w:p>", text("after")), SECT);
+    let a = assert_zero_edit_identity(&xml);
+    let plain = a.document.to_plain_text();
+    assert!(
+        plain.contains("deep") && plain.contains("after"),
+        "{plain:?}"
+    );
+    assert_text_round_trips(&xml);
+}
+
+/// Issue #422 — `<w:start w:val="2147483647"/>` on a letter level: the
+/// counter saturates instead of overflowing on the next item, and every
+/// marker stays short (the repeated-letter form used to spell 82 MB).
+#[test]
+fn a_hostile_numbering_start_keeps_markers_bounded() {
+    let numbering = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="2147483647"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+    let item = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p>"#;
+    let xml = document(&item.repeat(3), SECT);
+    let docx = package_with_document_xml(&xml, &[("word/numbering.xml", numbering.as_bytes())]);
+    let a = read_docx(&docx).expect("read");
+    let markers: Vec<_> = a
+        .document
+        .blocks
+        .iter()
+        .filter_map(|b| b.as_paragraph()?.resolved_marker.clone())
+        .collect();
+    for m in &markers {
+        assert!(m.len() <= 16, "marker of {} bytes", m.len());
+    }
+}

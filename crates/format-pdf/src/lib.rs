@@ -33,8 +33,8 @@
 //! conformance keys, and a document `/ID`. Every font is embedded — as a
 //! subset carrying the `/CIDSet` ISO 19005-1 §6.3.5 requires of CIDFont
 //! subsets — which satisfies the font clauses. Strict /A-1**a** tagging
-//! (structure tree, marked content) is out of scope — level B is a
-//! visual-reproduction guarantee only.
+//! is out of scope — level B is a visual-reproduction guarantee only (the
+//! tagged export is [`PdfProfile::Ua1`]).
 //!
 //! The ICC profile is **not** a vendored binary blob: `build.rs` synthesizes a
 //! minimal valid sRGB v2 profile from plain Rust at build time and `lib.rs`
@@ -48,7 +48,8 @@
 //! (PDF/A-2 is based on ISO 32000-1), and an XMP packet claiming
 //! `pdfaid:part` 2 / `pdfaid:conformance` U. Level U's defining requirement —
 //! every text string maps to Unicode — is carried by the `/ToUnicode` CMaps
-//! every profile already emits. Level A tagging is out of scope, as for A-1.
+//! every profile already emits. It is untagged; [`PdfProfile::Ua1`] is its
+//! tagged (PDF/UA-1) twin.
 //!
 //! # PDF/X-3
 //!
@@ -67,8 +68,8 @@
 //! - `/CreationDate`, `/ModDate` and the XMP dates are a **fixed, documented
 //!   timestamp** (`X3_DATE_XMP`) so exports stay byte-deterministic
 //!   (reproducible-build convention); they do not reflect wall-clock time.
-//! - `/Title` is a fixed string (`X3_TITLE`) — the export API carries no
-//!   document title today.
+//! - `/Title` is the document's `docProps/core.xml` title (issue #360),
+//!   else a fixed string (`X3_TITLE`).
 //!
 //! # Images (issue #121)
 //!
@@ -91,6 +92,67 @@
 //! WebP with their feature off) and corrupt or oversized images are skipped
 //! with a [`PdfWarning`].
 //!
+//! # Document semantics (issue #360)
+//!
+//! [`export_pdf_document`] takes a [`PdfSemantics`] side table — what the
+//! document model knows that the box tree does not, indexed like
+//! `para_texts` by `ParagraphBox::source_paragraph_id` — and writes:
+//!
+//! - **Outline.** One `/Outlines` item per heading paragraph (`Heading N`
+//!   / outline level), nested by level, each `/Dest [page /XYZ left top
+//!   0]` at the laid-out paragraph's top-left (zoom `0` = keep the
+//!   viewer's), and `/PageMode /UseOutlines` — only when a heading exists.
+//! - **Links.** One `/Link` annotation per laid-out line a hyperlink
+//!   touches (a link wrapping over three lines is three annotations), its
+//!   `/Rect` the union of the link's glyph boxes on that line (pen ×
+//!   advance × line height — per glyph, so BiDi-reordered runs are
+//!   covered). External targets get a `/URI` action (7-bit ASCII,
+//!   percent-encoded; `javascript:` / `vbscript:` / `data:` are dropped —
+//!   PDF/A forbids JavaScript), internal ones (`w:anchor`) a `/Dest` at the
+//!   bookmarked paragraph's top-left; an unresolvable bookmark gets no
+//!   annotation. Every link has `/Border [0 0 0]`, `/F 4` (Print — PDF/A
+//!   requires it) and `/Contents` (the link text). PDF/X-3 writes none: a
+//!   print-exchange file has no use for interactive annotations, and
+//!   ISO 15930 restricts annotations inside the trim area.
+//! - **Document information.** [`DocumentMetadata`] (the source package's
+//!   `docProps/core.xml`) becomes an `/Info` dictionary — `/Title`,
+//!   `/Author`, `/Subject`, `/Keywords` — and, in every conformant
+//!   profile, the matching XMP `dc:title` / `dc:creator` /
+//!   `dc:description` / `pdf:Keywords` (ISO 19005 requires every Info
+//!   entry with an XMP analogue to agree with it). PDF/X-3's `/Title` is
+//!   the real title when there is one. No core properties → no `/Info`
+//!   (X-3 aside) and the unchanged XMP packet.
+//! - **Tagging** (only when [`PdfExportOptions::tagged`] — always for
+//!   [`PdfProfile::Ua1`], off by default everywhere else). A logical
+//!   structure tree (`Document` > `P` / `H1`–`H6` / `L` > `LI` > `Lbl` +
+//!   `LBody` / `Table` > `TR` > `TH` / `TD` / `Figure` / `Link`), every
+//!   painted glyph and picture inside marked content with an `/MCID`,
+//!   everything else (shading, borders, highlights, decorations, leaders,
+//!   header / footer bands, repeated table header rows) an `/Artifact`,
+//!   a `/ParentTree`, `/StructParents` on pages and annotations,
+//!   `/MarkInfo`, a catalog `/Lang` plus a per-paragraph one where the
+//!   model says the language differs (Arabic text in an English document),
+//!   figure `/Alt` from `<wp:docPr descr>`. See the `tagging` module. A
+//!   tagged PDF 1.5+ file packs its dictionaries into an object stream
+//!   with a cross-reference stream (the `objstm` module).
+//!
+//! # PDF/UA-1
+//!
+//! [`PdfProfile::Ua1`] is a **tagged PDF/A-2u** (ISO 14289-1 on ISO
+//! 19005-2 level U): everything [`PdfProfile::A2u`] writes, plus tagging,
+//! `/ViewerPreferences /DisplayDocTitle`, `/Tabs /S` on annotated pages, a
+//! title (the core-properties one, else the first heading's text, else the
+//! first text) and an XMP `pdfuaid:part` 1 claim, declared through a PDF/A
+//! extension schema as PDF/A-2 requires. It validates as both PDF/UA-1 and
+//! PDF/A-2u. `A2u` itself stays untagged — byte-identical to the pre-#360
+//! exporter, and smaller — so tagging is opt-in through the `Ua1` target
+//! (or [`PdfExportOptions::with_tagging`]).
+//!
+//! Every object it adds is allocated after the pre-#360 ones and only
+//! when the document has the feature, so an empty side table (what
+//! [`export_pdf`] / [`export_pdf_with_media`] pass) reproduces the
+//! earlier output byte for byte.
+//!
 //! # Stream compression & text extraction
 //!
 //! Content streams and the embedded `FontFile2` programs are zlib-compressed
@@ -105,13 +167,14 @@ use flate2::write::ZlibEncoder;
 use font_program::{FontProgram, GlyphCodes, Outlines};
 use layout::{LayoutBlock, PageBox, ParagraphBox, TabLeaderKind, TableBox, VisualRun};
 use pdf_writer::types::{
-    CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, TextRenderingMode, TrappingStatus,
-    UnicodeCmap,
+    CidFontType, FontFlags, OutputIntentSubtype, PageMode, SystemInfo, TabOrder, TextRenderingMode,
+    TrappingStatus, UnicodeCmap,
 };
 use pdf_writer::{Content, Date, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
+use tagging::{ArtifactKind, FigureMark};
 use text_pipeline::{FontStack, LoadedFont};
 
 #[cfg(test)]
@@ -120,6 +183,11 @@ mod font_program;
 mod image;
 #[cfg(test)]
 mod image_export_tests;
+mod objstm;
+mod semantic;
+#[cfg(test)]
+mod semantic_tests;
+mod tagging;
 #[doc(hidden)]
 pub use image::test_images;
 /// Issue #227 — the `format_pdf_image_decode` fuzz target drives
@@ -131,6 +199,10 @@ pub use image::test_images;
 /// just not nameable from outside).
 pub use image::{AlphaMode, ImageColor, ImageEncoding, PreparedImage, prepare_image};
 pub use image::{ImageSkipReason, MAX_IMAGE_PIXELS};
+pub use semantic::{
+    CellSemantics, DocumentMetadata, LinkSpan, LinkTarget, ListSemantics, ObjectSemantics,
+    ParagraphSemantics, PdfSemantics,
+};
 
 /// Issue #258 — the shared PDF content-stream / string-literal decoder.
 /// See the module's own doc comment for why it lives here rather than in
@@ -143,12 +215,29 @@ pub mod test_support;
 const SRGB_ICC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/srgb-v2-micro.icc"));
 
 /// XMP metadata packet for a PDF/A document. The `pdfaid` keys are the
-/// conformance claim veraPDF checks; no Info dictionary is written, so there is
-/// nothing this must be kept consistent with (ISO 19005-1 §6.7.3 / 19005-2
-/// §6.6.4). `part` / `conformance` are `1`/`B` for A-1b and `2`/`U` for A-2u —
-/// the packet bytes for `(1, 'B')` are identical to the pre-A2u constant, so
-/// the A-1b output stays byte-stable.
-fn pdfa_xmp(part: u8, conformance: char) -> String {
+/// conformance claim veraPDF checks. `part` / `conformance` are `1`/`B` for
+/// A-1b and `2`/`U` for A-2u. Issue #360 — `meta`'s document information
+/// adds `dc:title` / `dc:creator` / `dc:description` / `pdf:Keywords`,
+/// kept equal to the `/Info` entries written beside it (ISO 19005-1
+/// §6.7.3 / 19005-2 §6.6.2.3 — every Info entry with an XMP analogue must
+/// match it). Without document information no Info dictionary is written
+/// and the packet bytes are identical to the pre-#360 constant, so
+/// existing output stays byte-stable.
+fn pdfa_xmp(part: u8, conformance: char, meta: &DocumentMetadata, ua: bool) -> String {
+    let pdf_ns = if meta.keywords.is_some() {
+        "    xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\"\n"
+    } else {
+        ""
+    };
+    let (ua_ns, ua_part, ua_schema) = if ua {
+        (
+            "    xmlns:pdfuaid=\"http://www.aiim.org/pdfua/ns/id/\"\n",
+            "   <pdfuaid:part>1</pdfuaid:part>\n",
+            PDFUA_EXTENSION_SCHEMA,
+        )
+    } else {
+        ("", "", "")
+    };
     format!(
         concat!(
             "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
@@ -156,25 +245,99 @@ fn pdfa_xmp(part: u8, conformance: char) -> String {
             " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
             "  <rdf:Description rdf:about=\"\"\n",
             "    xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"\n",
+            "{pdf_ns}{ua_ns}",
             "    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n",
             "    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">\n",
             "   <pdfaid:part>{part}</pdfaid:part>\n",
             "   <pdfaid:conformance>{conformance}</pdfaid:conformance>\n",
+            "{ua_part}",
             "   <dc:format>application/pdf</dc:format>\n",
+            "{dc}",
             "   <xmp:CreatorTool>next-gen-editor</xmp:CreatorTool>\n",
             "  </rdf:Description>\n",
+            "{ua_schema}",
             " </rdf:RDF>\n",
             "</x:xmpmeta>\n",
             "<?xpacket end=\"r\"?>",
         ),
         part = part,
         conformance = conformance,
+        pdf_ns = pdf_ns,
+        ua_ns = ua_ns,
+        ua_part = ua_part,
+        ua_schema = ua_schema,
+        dc = xmp_document_info(meta, true),
     )
 }
 
-/// `/Title` for the PDF/X-3 Info dictionary — the export API carries no
-/// document title, so a fixed honest placeholder keeps the required key
-/// present *and* the output byte-deterministic.
+/// Issue #360 — the PDF/A extension schema (ISO 19005-2 §6.6.2.3.2)
+/// declaring the PDF/UA identification property: PDF/A-2 accepts only
+/// predefined XMP schemas unless an extension schema describes the others,
+/// and `pdfuaid` is not predefined. Written without indentation: the
+/// metadata stream is never compressed (PDF/A), and this block is most of
+/// the tagged export's fixed size cost.
+const PDFUA_EXTENSION_SCHEMA: &str = concat!(
+    "  <rdf:Description rdf:about=\"\"",
+    " xmlns:pdfaExtension=\"http://www.aiim.org/pdfa/ns/extension/\"",
+    " xmlns:pdfaSchema=\"http://www.aiim.org/pdfa/ns/schema#\"",
+    " xmlns:pdfaProperty=\"http://www.aiim.org/pdfa/ns/property#\">\n",
+    "<pdfaExtension:schemas><rdf:Bag><rdf:li rdf:parseType=\"Resource\">",
+    "<pdfaSchema:schema>PDF/UA identification</pdfaSchema:schema>",
+    "<pdfaSchema:namespaceURI>http://www.aiim.org/pdfua/ns/id/</pdfaSchema:namespaceURI>",
+    "<pdfaSchema:prefix>pdfuaid</pdfaSchema:prefix>",
+    "<pdfaSchema:property><rdf:Seq><rdf:li rdf:parseType=\"Resource\">",
+    "<pdfaProperty:name>part</pdfaProperty:name>",
+    "<pdfaProperty:valueType>Integer</pdfaProperty:valueType>",
+    "<pdfaProperty:category>internal</pdfaProperty:category>",
+    "<pdfaProperty:description>ISO 14289 part</pdfaProperty:description>",
+    "</rdf:li></rdf:Seq></pdfaSchema:property></rdf:li></rdf:Bag></pdfaExtension:schemas>\n",
+    "  </rdf:Description>\n",
+);
+
+/// Issue #360 — the XMP twins of the `/Info` document-information entries
+/// (`dc:title` only when `with_title`; X-3 writes its own). Empty for a
+/// document without core properties.
+fn xmp_document_info(meta: &DocumentMetadata, with_title: bool) -> String {
+    let mut out = String::new();
+    if with_title && let Some(t) = &meta.title {
+        out.push_str(&xmp_alt("dc:title", t));
+    }
+    if let Some(a) = &meta.author {
+        out.push_str(&format!(
+            "   <dc:creator>\n    <rdf:Seq>\n     <rdf:li>{}</rdf:li>\n    </rdf:Seq>\n   </dc:creator>\n",
+            xml_escape(a)
+        ));
+    }
+    if let Some(s) = &meta.subject {
+        out.push_str(&xmp_alt("dc:description", s));
+    }
+    if let Some(k) = &meta.keywords {
+        out.push_str(&format!(
+            "   <pdf:Keywords>{}</pdf:Keywords>\n",
+            xml_escape(k)
+        ));
+    }
+    out
+}
+
+/// One `rdf:Alt` language-alternative property with an `x-default` item.
+fn xmp_alt(tag: &str, value: &str) -> String {
+    format!(
+        "   <{tag}>\n    <rdf:Alt>\n     <rdf:li xml:lang=\"x-default\">{}</rdf:li>\n    </rdf:Alt>\n   </{tag}>\n",
+        xml_escape(value)
+    )
+}
+
+/// XML character data: `&`, `<`, `>` escaped (the packet's text nodes).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// `/Title` for the PDF/X-3 Info dictionary when the document has no
+/// core-properties title (issue #360) — a fixed honest placeholder keeps
+/// the required key present *and* the output byte-deterministic.
 const X3_TITLE: &str = "next-gen-editor document";
 
 /// The fixed timestamp PDF/X-3 output stamps into `/CreationDate`, `/ModDate`
@@ -198,8 +361,10 @@ fn x3_date() -> Date {
 /// XMP metadata packet for a PDF/X-3 document, kept consistent with the Info
 /// dictionary (`dc:title` ↔ `/Title`, `pdfxid:GTS_PDFXVersion` ↔
 /// `/GTS_PDFXVersion`, `pdf:Trapped` ↔ `/Trapped`, dates ↔
-/// `/CreationDate` + `/ModDate`).
-fn x3_xmp() -> String {
+/// `/CreationDate` + `/ModDate`; issue #360 — `dc:creator` ↔ `/Author`,
+/// `dc:description` ↔ `/Subject`, `pdf:Keywords` ↔ `/Keywords`). `title`
+/// is the document's core-properties title, else [`X3_TITLE`].
+fn x3_xmp(title: &str, meta: &DocumentMetadata) -> String {
     format!(
         concat!(
             "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
@@ -218,6 +383,7 @@ fn x3_xmp() -> String {
             "     <rdf:li xml:lang=\"x-default\">{title}</rdf:li>\n",
             "    </rdf:Alt>\n",
             "   </dc:title>\n",
+            "{dc}",
             "   <xmp:CreatorTool>next-gen-editor</xmp:CreatorTool>\n",
             "   <xmp:CreateDate>{date}</xmp:CreateDate>\n",
             "   <xmp:ModifyDate>{date}</xmp:ModifyDate>\n",
@@ -226,7 +392,8 @@ fn x3_xmp() -> String {
             "</x:xmpmeta>\n",
             "<?xpacket end=\"r\"?>",
         ),
-        title = X3_TITLE,
+        title = xml_escape(title),
+        dc = xmp_document_info(meta, false),
         date = X3_DATE_XMP,
     )
 }
@@ -257,6 +424,15 @@ pub enum PdfProfile {
     /// model, so no BleedBox is invented). See the module docs for the honest
     /// deviations from a real print-shop workflow.
     X3,
+    /// Issue #360 — PDF/UA-1 (ISO 14289-1) on a PDF/A-2u base: every A-2u
+    /// structure, plus a **tagged** file (structure tree, marked content,
+    /// artifacts — see the `tagging` module), `/MarkInfo`, a catalog
+    /// `/Lang`, `/DisplayDocTitle`, `/Tabs /S` on pages with annotations,
+    /// and an XMP `pdfuaid:part` 1 claim (declared through a PDF/A
+    /// extension schema, as PDF/A-2 requires). The file validates as both
+    /// PDF/A-2u and PDF/UA-1. A document without a core-properties title
+    /// gets one derived from its first heading (else its first text).
+    Ua1,
 }
 
 /// The five indirect objects + resource name an embedded font occupies, and
@@ -296,6 +472,9 @@ struct Res<'a> {
     fonts: &'a [(String, FontObj)],
     images: &'a HashMap<String, String>,
     stack: &'a FontStack,
+    /// Issue #360 — the semantic collector (outline destinations); `None`
+    /// for the content-only test driver.
+    sem: Option<&'a semantic::SemCtx<'a>>,
 }
 
 /// A non-fatal export note (the `DocxWarning` counterpart): the PDF is
@@ -367,8 +546,78 @@ pub fn export_pdf_with_media(
     profile: PdfProfile,
     out: &mut Vec<u8>,
 ) -> Result<PdfExportReport, String> {
-    let pdfa = matches!(profile, PdfProfile::A1b | PdfProfile::A2u);
+    export_pdf_document(
+        pages,
+        fonts,
+        para_texts,
+        media,
+        &PdfSemantics::default(),
+        PdfExportOptions::new(profile),
+        out,
+    )
+}
+
+/// Issue #360 — how [`export_pdf_document`] writes the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfExportOptions {
+    /// The conformance target.
+    pub profile: PdfProfile,
+    /// Write a tagged PDF (structure tree + marked content). Always on for
+    /// [`PdfProfile::Ua1`]; **off by default everywhere else** — notably
+    /// PDF/A-2u, whose untagged output stays byte-identical to the
+    /// pre-#360 exporter (and smaller); `Ua1` *is* the tagged A-2u.
+    pub tagged: bool,
+}
+
+impl PdfExportOptions {
+    /// The options for `profile` (tagged exactly when it is `Ua1`).
+    pub fn new(profile: PdfProfile) -> Self {
+        Self {
+            profile,
+            tagged: profile == PdfProfile::Ua1,
+        }
+    }
+
+    /// Tag the export (or not — `Ua1` stays tagged regardless).
+    pub fn with_tagging(mut self, tagged: bool) -> Self {
+        self.tagged = tagged || self.profile == PdfProfile::Ua1;
+        self
+    }
+}
+
+/// Export `pages` with the document-model semantics the box tree does not
+/// carry (issue #360), appending the bytes to `out`.
+///
+/// [`export_pdf_with_media`]'s contract, plus `semantics` — a side table
+/// indexed like `para_texts` (by `ParagraphBox::source_paragraph_id`):
+///
+/// - **Outline.** Every heading paragraph ([`ParagraphSemantics::heading`])
+///   that reaches a page becomes an `/Outlines` item, nested by level,
+///   whose `/Dest` is `[page /XYZ left top 0]` at the laid-out
+///   paragraph's top-left; the catalog then opens with `/PageMode
+///   /UseOutlines`. No heading → no outline and no page mode.
+/// - **Links.** Every hyperlink range ([`ParagraphSemantics::links`])
+///   becomes one `/Link` annotation per laid-out line it touches (`/URI`
+///   or `/Dest` to a [`ParagraphSemantics::bookmarks`] paragraph); none
+///   under PDF/X-3. See the module docs.
+/// - **Document information.** [`PdfSemantics::metadata`] → `/Info` +
+///   the XMP twins of its entries.
+///
+/// An empty `semantics` produces exactly [`export_pdf_with_media`]'s bytes.
+pub fn export_pdf_document(
+    pages: &[PageBox],
+    fonts: &FontStack,
+    para_texts: &[&str],
+    media: &HashMap<String, engine::ImageBlob>,
+    semantics: &PdfSemantics,
+    options: PdfExportOptions,
+    out: &mut Vec<u8>,
+) -> Result<PdfExportReport, String> {
+    let profile = options.profile;
+    let pdfa = matches!(profile, PdfProfile::A1b | PdfProfile::A2u | PdfProfile::Ua1);
     let pdfx = profile == PdfProfile::X3;
+    let ua = profile == PdfProfile::Ua1;
+    let tagged = options.tagged || ua;
     /* Every conformance target shares the ICC output intent, the XMP
     metadata stream and the deterministic document `/ID`. */
     let conformant = pdfa || pdfx;
@@ -417,8 +666,8 @@ pub fn export_pdf_with_media(
         PdfProfile::Plain => {}
         /* PDF/A-1 is based on PDF 1.4; PDF/X-3:2003 likewise. */
         PdfProfile::A1b | PdfProfile::X3 => pdf.set_version(1, 4),
-        /* PDF/A-2 is based on ISO 32000-1 (PDF 1.7). */
-        PdfProfile::A2u => pdf.set_version(1, 7),
+        /* PDF/A-2 is based on ISO 32000-1 (PDF 1.7); so is PDF/UA-1. */
+        PdfProfile::A2u | PdfProfile::Ua1 => pdf.set_version(1, 7),
     }
 
     let mut next = 1_i32;
@@ -461,7 +710,7 @@ pub fn export_pdf_with_media(
     every pre-existing object so image-free output is byte-identical. */
     let mut report = PdfExportReport::default();
     let alpha_mode = match profile {
-        PdfProfile::Plain | PdfProfile::A2u => AlphaMode::SoftMask,
+        PdfProfile::Plain | PdfProfile::A2u | PdfProfile::Ua1 => AlphaMode::SoftMask,
         PdfProfile::A1b | PdfProfile::X3 => AlphaMode::FlattenOnWhite,
     };
     let page_rels: Vec<Vec<&str>> = pages.iter().map(page_image_rels).collect();
@@ -515,15 +764,23 @@ pub fn export_pdf_with_media(
     switched to the full-embedding identity codes and the contents are
     rebuilt — every round converts at least one more font, so this runs
     at most `font_objs.len() + 1` times, and in practice once. */
-    let (contents, programs) = loop {
+    let (contents, programs, collected) = loop {
+        /* Issue #360 — a fresh collector per round: a rebuilt round
+        re-reports every placement. */
+        let sem_ctx = semantic::SemCtx::new(semantics, para_texts, !pdfx, tagged);
         let res = Res {
             fonts: &font_objs,
             images: &image_names,
             stack: fonts,
+            sem: Some(&sem_ctx),
         };
         let contents: Vec<Vec<u8>> = pages
             .iter()
-            .map(|page| build_page_content(page, &res))
+            .enumerate()
+            .map(|(i, page)| {
+                sem_ctx.begin_page(i, page.size.height);
+                build_page_content(page, &res)
+            })
             .collect();
         let mut programs: Vec<FontProgram> = Vec::with_capacity(font_objs.len());
         let mut rejected = false;
@@ -544,7 +801,7 @@ pub fn export_pdf_with_media(
             }
         }
         if !rejected {
-            break (contents, programs);
+            break (contents, programs, sem_ctx.finish());
         }
         for (_, fo) in &font_objs {
             let mut codes = fo.codes.borrow_mut();
@@ -560,6 +817,31 @@ pub fn export_pdf_with_media(
         .iter()
         .map(|p| (profile == PdfProfile::A1b && p.subset_tag.is_some()).then(&mut alloc))
         .collect();
+    /* Issue #360 — every object below is allocated only when the document
+    has the feature, AFTER every pre-#360 object, so a document without
+    it keeps its object numbering (and bytes). */
+    let outline = collected.plan_outline(&mut alloc);
+    let annots = collected.plan_links(&mut alloc);
+    /* X-3 always has its Info dictionary (allocated above); the other
+    profiles get one only for a document with core properties. */
+    let mut meta = semantics.metadata.cleaned();
+    if ua && meta.title.is_none() {
+        /* PDF/UA-1 §7.1: the title is displayed (`/DisplayDocTitle`) and
+        lives in the XMP `dc:title` — a document without one gets its
+        first heading's (else its first text's). */
+        meta.title = Some(collected.fallback_title());
+    }
+    let doc_info_id = if !pdfx && meta.has_info() {
+        Some(alloc())
+    } else {
+        None
+    };
+    /* Tagging — the catalog `/Lang` (paragraphs in another language carry
+    their own) and the structure tree, planned from the recorded marked
+    content once the contents are final. */
+    let root_lang = meta.lang.clone().unwrap_or_else(|| "en-US".to_string());
+    let structure =
+        tagged.then(|| collected.plan_structure(&annots, pages.len(), &root_lang, &mut alloc));
     if conformant {
         let mut hash_in: Vec<u8> = Vec::new();
         for c in &contents {
@@ -577,6 +859,18 @@ pub fn export_pdf_with_media(
     {
         let mut catalog = pdf.catalog(catalog_id);
         catalog.pages(pages_id);
+        if let Some(plan) = &outline {
+            catalog.outlines(plan.root);
+            catalog.page_mode(PageMode::UseOutlines);
+        }
+        if let Some(plan) = &structure {
+            catalog.pair(Name(b"StructTreeRoot"), plan.root);
+            catalog.mark_info().marked(true);
+            catalog.lang(TextStr(&root_lang));
+            if meta.title.is_some() {
+                catalog.viewer_preferences().display_doc_title(true);
+            }
+        }
         if conformant {
             catalog.metadata(metadata_id.expect("metadata id allocated for conformance"));
             let mut intents = catalog.output_intents();
@@ -627,6 +921,22 @@ pub fn export_pdf_with_media(
             p.trim_box(media);
         }
         p.contents(*content_id);
+        /* Issue #360 — this page's link annotations. */
+        let page_annots: Vec<Ref> = annots
+            .iter()
+            .filter(|a| a.page == page_idx)
+            .map(|a| a.id)
+            .collect();
+        if let Some(key) = structure.as_ref().and_then(|s| s.page_key(page_idx)) {
+            p.struct_parents(key);
+        }
+        if !page_annots.is_empty() {
+            if tagged {
+                /* PDF/UA-1 §7.18.3 — annotations in structure order. */
+                p.tab_order(TabOrder::StructureOrder);
+            }
+            p.annotations(page_annots);
+        }
         let mut resources = p.resources();
         {
             let mut font_dict = resources.fonts();
@@ -668,25 +978,37 @@ pub fn export_pdf_with_media(
             .filter(Filter::FlateDecode);
     }
 
+    let x3_title = meta.title.as_deref().unwrap_or(X3_TITLE);
     if let Some(info_id) = info_id {
         /* X-3 Info dictionary — every key mirrored into the XMP packet so
         the two stay consistent. The dates are the fixed deterministic
         timestamp; see `X3_DATE_XMP`. */
         let mut info = pdf.document_info(info_id);
-        info.title(TextStr(X3_TITLE));
+        info.title(TextStr(x3_title));
+        write_document_info(&mut info, &meta);
         info.creation_date(x3_date());
         info.modified_date(x3_date());
         info.trapped(TrappingStatus::NotTrapped);
         info.pair(Name(b"GTS_PDFXVersion"), TextStr("PDF/X-3:2003"));
+    }
+    if let Some(info_id) = doc_info_id {
+        /* Issue #360 — core properties as `/Info`; under PDF/A every
+        entry has its XMP twin in the packet below. */
+        let mut info = pdf.document_info(info_id);
+        if let Some(t) = &meta.title {
+            info.title(TextStr(t));
+        }
+        write_document_info(&mut info, &meta);
     }
 
     if conformant {
         pdf.icc_profile(icc_id.expect("icc id allocated for conformance"), SRGB_ICC)
             .n(3);
         let xmp = match profile {
-            PdfProfile::A1b => pdfa_xmp(1, 'B'),
-            PdfProfile::A2u => pdfa_xmp(2, 'U'),
-            PdfProfile::X3 => x3_xmp(),
+            PdfProfile::A1b => pdfa_xmp(1, 'B', &meta, false),
+            PdfProfile::A2u => pdfa_xmp(2, 'U', &meta, false),
+            PdfProfile::Ua1 => pdfa_xmp(2, 'U', &meta, true),
+            PdfProfile::X3 => x3_xmp(x3_title, &meta),
             PdfProfile::Plain => unreachable!("Plain writes no metadata stream"),
         };
         pdf.metadata(
@@ -699,8 +1021,45 @@ pub fn export_pdf_with_media(
         write_image_xobject(&mut pdf, x);
     }
 
-    out.extend_from_slice(&pdf.finish());
+    let page_ids: Vec<Ref> = page_refs.iter().map(|(p, _)| *p).collect();
+    if let Some(plan) = &outline {
+        plan.write(&mut pdf, &page_ids);
+    }
+    for (i, annot) in annots.iter().enumerate() {
+        let key = structure.as_ref().and_then(|s| s.annot_key(i));
+        annot.write(&mut pdf, &page_ids, key);
+    }
+    if let Some(plan) = &structure {
+        plan.write(&mut pdf, &page_ids);
+    }
+
+    let bytes = pdf.finish();
+    if tagged && !matches!(profile, PdfProfile::A1b | PdfProfile::X3) {
+        /* Issue #360 — a tagged PDF 1.5+ file is written compactly: its
+        plain dictionaries (the structure tree's dozens among them) in one
+        compressed object stream, a cross-reference stream for the table
+        (see `objstm`). PDF/A-1 and PDF/X-3 are PDF 1.4, which has
+        neither; an untagged export keeps the classic layout, byte for
+        byte. */
+        out.extend_from_slice(&objstm::pack(&bytes)?);
+    } else {
+        out.extend_from_slice(&bytes);
+    }
     Ok(report)
+}
+
+/// Issue #360 — `/Author`, `/Subject`, `/Keywords` from the document's
+/// core properties (the caller writes `/Title`: X-3 always has one).
+fn write_document_info(info: &mut pdf_writer::writers::DocumentInfo<'_>, meta: &DocumentMetadata) {
+    if let Some(a) = &meta.author {
+        info.author(TextStr(a));
+    }
+    if let Some(s) = &meta.subject {
+        info.subject(TextStr(s));
+    }
+    if let Some(k) = &meta.keywords {
+        info.keywords(TextStr(k));
+    }
 }
 
 /// Issue #121 — one embedded image: its XObject ref, optional soft-mask
@@ -846,6 +1205,7 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)], fonts: &FontSt
             fonts: font_objs,
             images: &HashMap::new(),
             stack: fonts,
+            sem: None,
         },
     )
 }
@@ -865,6 +1225,9 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
     footnotes, footer). Band origin comes from the SAME shared
     placement methods the canvas paints with. */
     if let Some(hf) = &page.header {
+        /* Issue #360 — a header band (page numbers included) is a
+        pagination artifact in a tagged export. */
+        artifact_begin(&mut content, res, ArtifactKind::Header);
         emit_band_blocks(
             &mut content,
             page_h,
@@ -873,12 +1236,15 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
             &hf.blocks,
             res,
         );
+        artifact_end(&mut content, res);
     }
 
     /* Pass 1 — cell + paragraph shading. */
-    for block in &page.blocks {
-        emit_block_shading(&mut content, page_h, content_x, content_y, block);
-    }
+    decoration_pass(&mut content, res, |c| {
+        for block in &page.blocks {
+            emit_block_shading(c, page_h, content_x, content_y, block);
+        }
+    });
 
     /* Pass 2 — every paragraph's highlights + glyphs + decorations
     (top-level + cell content), in document order. */
@@ -894,9 +1260,11 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
     }
 
     /* Pass 3 — cell + table-outer + paragraph borders. */
-    for block in &page.blocks {
-        emit_block_borders(&mut content, page_h, content_x, content_y, block);
-    }
+    decoration_pass(&mut content, res, |c| {
+        for block in &page.blocks {
+            emit_block_borders(c, page_h, content_x, content_y, block);
+        }
+    });
 
     /* Issue #80 — note bands at the paginator's `NoteBand::y` (the
     SAME placement scene.rs paints): separator rule (30 % of the content
@@ -913,6 +1281,7 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
             content_w * 0.3
         };
         let rule_y = band_top - 6.0;
+        artifact_begin(&mut content, res, ArtifactKind::Layout);
         content.save_state();
         content.set_fill_rgb(
             0x55 as f32 / 255.0,
@@ -922,12 +1291,15 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
         content.rect(content_x, page_h - (rule_y + 0.75), rule_w, 0.75);
         content.fill_nonzero();
         content.restore_state();
+        artifact_end(&mut content, res);
         for entry in &band.entries {
             let entry_x = content_x + entry.origin.x;
             let entry_top = band_top + entry.origin.y;
-            for block in &entry.blocks {
-                emit_block_shading(&mut content, page_h, entry_x, entry_top, block);
-            }
+            decoration_pass(&mut content, res, |c| {
+                for block in &entry.blocks {
+                    emit_block_shading(c, page_h, entry_x, entry_top, block);
+                }
+            });
             for block in &entry.blocks {
                 match block {
                     LayoutBlock::Paragraph(p) => {
@@ -938,9 +1310,11 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
                     }
                 }
             }
-            for block in &entry.blocks {
-                emit_block_borders(&mut content, page_h, entry_x, entry_top, block);
-            }
+            decoration_pass(&mut content, res, |c| {
+                for block in &entry.blocks {
+                    emit_block_borders(c, page_h, entry_x, entry_top, block);
+                }
+            });
         }
     }
 
@@ -948,6 +1322,7 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
     `footer_band_top`, which already subtracts the laid content
     height). */
     if let Some(hf) = &page.footer {
+        artifact_begin(&mut content, res, ArtifactKind::Footer);
         emit_band_blocks(
             &mut content,
             page_h,
@@ -956,6 +1331,7 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
             &hf.blocks,
             res,
         );
+        artifact_end(&mut content, res);
     }
 
     /* Issue #83 / #121 — the in-front float group closes the page. */
@@ -972,11 +1348,69 @@ fn emit_floats(content: &mut Content, page: &PageBox, behind: bool, res: &Res<'_
         content,
         page.size.height,
         &page.floats,
+        &page.blocks,
         0.0,
         0.0,
         behind,
         res,
     );
+}
+
+/// Issue #360 — open an artifact sequence (no-op unless tagged).
+fn artifact_begin(content: &mut Content, res: &Res<'_>, kind: ArtifactKind) {
+    if let Some(sem) = res.sem {
+        sem.begin_artifact(content, kind);
+    }
+}
+
+/// Issue #360 — close the artifact sequence [`artifact_begin`] opened.
+fn artifact_end(content: &mut Content, res: &Res<'_>) {
+    if let Some(sem) = res.sem {
+        sem.end_artifact(content);
+    }
+}
+
+/// Issue #360 — run a pure decoration pass (shading, borders), in a
+/// tagged export wrapped in an artifact sequence — only when it paints
+/// something: the pass is probed into a scratch stream first, so a page
+/// without shading writes no empty `/Artifact BMC EMC`. Untagged (or
+/// inside a header / footer artifact) it simply runs.
+fn decoration_pass(content: &mut Content, res: &Res<'_>, pass: impl Fn(&mut Content)) {
+    if res.sem.is_some_and(|s| s.tagging()) {
+        let mut probe = Content::new();
+        pass(&mut probe);
+        if probe.finish().is_empty() {
+            return;
+        }
+        artifact_begin(content, res, ArtifactKind::Decoration);
+        pass(content);
+        artifact_end(content, res);
+    } else {
+        pass(content);
+    }
+}
+
+/// Issue #360 — the source paragraph a float is anchored in, resolved
+/// against the blocks its anchor indexes (the page's, or a text box
+/// story's for a nested float). `None` for a band anchor.
+fn anchor_paragraph(blocks: &[LayoutBlock], anchor: layout::FloatAnchorRef) -> Option<u32> {
+    let para = |b: &LayoutBlock| match b {
+        LayoutBlock::Paragraph(p) => Some(p.source_paragraph_id),
+        LayoutBlock::Table(_) => None,
+    };
+    match anchor {
+        layout::FloatAnchorRef::Body { block, cell: None } => para(blocks.get(block)?),
+        layout::FloatAnchorRef::Body {
+            block,
+            cell: Some(c),
+        } => match blocks.get(block)? {
+            LayoutBlock::Table(t) => {
+                para(t.rows.get(c.row)?.cells.get(c.col)?.content.get(c.inner)?)
+            }
+            LayoutBlock::Paragraph(_) => None,
+        },
+        layout::FloatAnchorRef::Header | layout::FloatAnchorRef::Footer => None,
+    }
 }
 
 /// One z-order group of `floats` whose origins are relative to
@@ -985,10 +1419,12 @@ fn emit_floats(content: &mut Content, page: &PageBox, behind: bool, res: &Res<'_
 /// its image XObject into the float's wrap-independent rect (issue #121);
 /// a text box paints shape fill, the story clipped to the shape rect
 /// (with its own nested boxes), outline (issue #83).
+#[allow(clippy::too_many_arguments)]
 fn emit_float_group(
     content: &mut Content,
     page_h: f32,
     floats: &[layout::FloatBox],
+    blocks: &[LayoutBlock],
     base_x: f32,
     base_y: f32,
     behind: bool,
@@ -1003,21 +1439,64 @@ fn emit_float_group(
         if f.size.width <= 0.0 || f.size.height <= 0.0 {
             continue;
         }
+        /* Issue #360 — a float anchored in a header / footer band is part
+        of that pagination artifact. */
+        let band = match f.anchor {
+            layout::FloatAnchorRef::Header => Some(ArtifactKind::Header),
+            layout::FloatAnchorRef::Footer => Some(ArtifactKind::Footer),
+            layout::FloatAnchorRef::Body { .. } => None,
+        };
+        if let Some(kind) = band {
+            artifact_begin(content, res, kind);
+        }
         match f.text_box.as_deref() {
             Some(tb) => emit_text_box(content, page_h, f, tb, base_x, base_y, res),
-            None => emit_image(
-                content,
-                page_h,
-                &f.rel_id,
-                [
-                    base_x + f.origin.x,
-                    base_y + f.origin.y,
-                    f.size.width,
-                    f.size.height,
-                ],
-                res,
-            ),
+            None => {
+                let anchor = anchor_paragraph(blocks, f.anchor);
+                let mark = figure_begin(content, res, &f.rel_id, anchor, f.at);
+                emit_image(
+                    content,
+                    page_h,
+                    &f.rel_id,
+                    [
+                        base_x + f.origin.x,
+                        base_y + f.origin.y,
+                        f.size.width,
+                        f.size.height,
+                    ],
+                    res,
+                );
+                if let Some(sem) = res.sem {
+                    sem.figure_end(content, mark);
+                }
+            }
         }
+        if band.is_some() {
+            artifact_end(content, res);
+        }
+    }
+}
+
+/// Issue #360 — mark a picture about to paint as a `Figure` (or, when
+/// decorative, an artifact). Nothing for an image the exporter could not
+/// embed — it paints nothing.
+fn figure_begin(
+    content: &mut Content,
+    res: &Res<'_>,
+    rel_id: &str,
+    parent: Option<u32>,
+    at: u32,
+) -> FigureMark {
+    match res.sem {
+        Some(sem) if res.images.contains_key(rel_id) => {
+            let meta = parent.and_then(|id| {
+                sem.sem
+                    .paragraph(id)
+                    .and_then(|m| m.objects.iter().find(|o| o.at == at))
+            });
+            sem.figure_begin(content, parent, at, meta)
+        }
+        _ => FigureMark::None,
     }
 }
 
@@ -1061,6 +1540,7 @@ fn emit_text_box(
     let (x, w, h) = (base_x + f.origin.x, f.size.width, f.size.height);
     let pdf_y = page_h - (base_y + f.origin.y + h);
     if let Some([r, g, b, _]) = tb.source.fill {
+        artifact_begin(content, res, ArtifactKind::Decoration);
         content.save_state();
         content.set_fill_rgb(
             f32::from(r) / 255.0,
@@ -1070,6 +1550,7 @@ fn emit_text_box(
         content.rect(x, pdf_y, w, h);
         content.fill_nonzero();
         content.restore_state();
+        artifact_end(content, res);
     }
     if let Some((origin, _)) = f.text_box_content_rect() {
         let (cx, cy) = (base_x + origin.x, base_y + origin.y);
@@ -1077,10 +1558,12 @@ fn emit_text_box(
         content.rect(x, pdf_y, w, h);
         content.clip_nonzero();
         content.end_path();
-        emit_float_group(content, page_h, &tb.floats, cx, cy, true, res);
-        for block in &tb.blocks {
-            emit_block_shading(content, page_h, cx, cy, block);
-        }
+        emit_float_group(content, page_h, &tb.floats, &tb.blocks, cx, cy, true, res);
+        decoration_pass(content, res, |c| {
+            for block in &tb.blocks {
+                emit_block_shading(c, page_h, cx, cy, block);
+            }
+        });
         for block in &tb.blocks {
             match block {
                 LayoutBlock::Paragraph(p) => {
@@ -1091,15 +1574,18 @@ fn emit_text_box(
                 }
             }
         }
-        for block in &tb.blocks {
-            emit_block_borders(content, page_h, cx, cy, block);
-        }
-        emit_float_group(content, page_h, &tb.floats, cx, cy, false, res);
+        decoration_pass(content, res, |c| {
+            for block in &tb.blocks {
+                emit_block_borders(c, page_h, cx, cy, block);
+            }
+        });
+        emit_float_group(content, page_h, &tb.floats, &tb.blocks, cx, cy, false, res);
         content.restore_state();
     }
     if let Some(([r, g, b, _], lw)) = tb.source.outline
         && lw > 0.0
     {
+        artifact_begin(content, res, ArtifactKind::Decoration);
         content.save_state();
         content.set_stroke_rgb(
             f32::from(r) / 255.0,
@@ -1110,6 +1596,7 @@ fn emit_text_box(
         content.rect(x, pdf_y, w, h);
         content.stroke();
         content.restore_state();
+        artifact_end(content, res);
     }
 }
 
@@ -1234,9 +1721,22 @@ fn emit_paragraph_text(
 ) {
     let para_x = origin_x + para.origin.x;
     let para_y = origin_y + para.origin.y;
+    let id = para.source_paragraph_id;
+    if let Some(sem) = res.sem {
+        sem.paragraph_placed(para, para_x, para_y);
+    }
+    /* Issue #360 — in a tagged export the highlight, leader and
+    decoration passes are artifacts; the marker and line glyphs are the
+    paragraph's (or its links') marked content. */
+    let tagging = res.sem.is_some_and(|s| s.tagging());
+    let runs = || para.lines.iter().flat_map(|l| l.runs.iter());
 
     /* Background highlights — a run's `bg_color` fills the line's full
     height across the run's advance so adjacent highlights tile. */
+    let highlights = tagging && runs().any(|r| r.attrs.bg_color.is_some() && run_advance(r) > 0.0);
+    if highlights {
+        artifact_begin(content, res, ArtifactKind::Decoration);
+    }
     for line in &para.lines {
         let line_x = para_x + line.origin.x;
         let line_top = para_y + line.origin.y;
@@ -1262,6 +1762,9 @@ fn emit_paragraph_text(
             pen += advance;
         }
     }
+    if highlights {
+        artifact_end(content, res);
+    }
 
     /* Issue #121 — inline images, over the highlights and under the
     glyphs. Same rect as `render/scene.rs::paint_paragraph`: the pen
@@ -1276,6 +1779,12 @@ fn emit_paragraph_text(
                 for glyph in &run.glyphs {
                     if let Some(rel) = glyph.inline_image_rel_id.as_deref() {
                         let h = glyph.inline_object_height;
+                        let mark = if h > 0.0 && glyph.x_advance > 0.0 {
+                            let at = run.source_range.start + glyph.cluster;
+                            figure_begin(content, res, rel, Some(id), at)
+                        } else {
+                            FigureMark::None
+                        };
                         emit_image(
                             content,
                             page_h,
@@ -1283,6 +1792,9 @@ fn emit_paragraph_text(
                             [line_x + pen, baseline - h, glyph.x_advance, h],
                             res,
                         );
+                        if let Some(sem) = res.sem {
+                            sem.figure_end(content, mark);
+                        }
                     }
                     pen += glyph.x_advance;
                 }
@@ -1296,7 +1808,14 @@ fn emit_paragraph_text(
     if let Some(marker) = &para.marker {
         let m_x = para_x + marker.origin.x;
         let m_baseline = para_y + marker.origin.y + marker.baseline;
+        let labeled = res.sem.is_some_and(|s| s.label_begin(content, id));
         show_run(content, page_h, &marker.run, m_x, m_baseline, res);
+        if labeled && let Some(sem) = res.sem {
+            sem.label_end(content);
+        }
+    }
+    if let Some(sem) = res.sem {
+        sem.text_begin(id);
     }
     for line in &para.lines {
         let line_x = para_x + line.origin.x;
@@ -1306,6 +1825,9 @@ fn emit_paragraph_text(
         for run in &line.runs {
             pen += show_run(content, page_h, run, line_x + pen, baseline, res);
         }
+    }
+    if let Some(sem) = res.sem {
+        sem.text_end(content);
     }
     content.end_text();
 
@@ -1319,6 +1841,10 @@ fn emit_paragraph_text(
     viewer copies out of Word); heavy / middleDot — and any font that
     can't shape the fill character — fall back to a plain filled rule,
     the PDF twin of `render/scene.rs::push_tab_leader`. */
+    let leaders = tagging && runs().any(|r| r.glyphs.iter().any(|g| g.leader.is_some()));
+    if leaders {
+        artifact_begin(content, res, ArtifactKind::Decoration);
+    }
     for line in &para.lines {
         let line_x = para_x + line.origin.x;
         let baseline = para_y + line.origin.y + line.baseline;
@@ -1362,11 +1888,20 @@ fn emit_paragraph_text(
             }
         }
     }
+    if leaders {
+        artifact_end(content, res);
+    }
 
     /* Decoration fills — over the glyphs, same metrics as
     `render/scene.rs` (underline just below the baseline, strike centred
     ~a quarter em above it, thickness scaling with the px size). Both
     anchor to the line baseline, not the shifted run baseline. */
+    let decorations = tagging
+        && runs()
+            .any(|r| (r.attrs.underline.is_visible() || r.attrs.strike) && run_advance(r) > 0.0);
+    if decorations {
+        artifact_begin(content, res, ArtifactKind::Decoration);
+    }
     for line in &para.lines {
         let line_x = para_x + line.origin.x;
         let baseline = para_y + line.origin.y + line.baseline;
@@ -1405,6 +1940,9 @@ fn emit_paragraph_text(
                 fill_decoration_rect(content, page_h, x0, x1, mid - thickness / 2.0, thickness);
             }
         }
+    }
+    if decorations {
+        artifact_end(content, res);
     }
 }
 
@@ -1487,6 +2025,11 @@ fn show_run(
         operator, so it must never reach a `Tj`, not even one a viewer
         would render as nothing. */
         if glyph.id != 0 {
+            /* Issue #360 — a tagged export switches marked-content
+            sequences where a hyperlink starts or ends. */
+            if let Some(sem) = res.sem {
+                sem.glyph(content, run.source_range.start + glyph.cluster);
+            }
             let gx = run_x + pen + glyph.x_offset;
             /* Invert the y axis: PDF origin is bottom-left. `<w:vertAlign>`
             baseline shift lifts (positive) / drops (negative) the run. */
@@ -1567,19 +2110,33 @@ fn emit_tab_leader_glyphs(
     if x + step > hi {
         return true;
     }
+    /* Issue #422 — an untileable advance (huge / non-finite): the caller's
+    rule fallback paints it instead of millions of glyphs. */
+    let Some(bound) = pdf_tile_bound(x, hi, step) else {
+        return false;
+    };
     let gy = page_h - baseline;
     /* Issue #327 — only now, with at least one dot certain to show, does
     the fill glyph join the font's subset. */
     let bytes = font.fo.show_code(gid).to_be_bytes();
     content.begin_text();
     content.set_font(Name(font.fo.resource.as_bytes()), font.px_size);
-    while x + step <= hi {
+    for _ in 0..bound {
+        if x + step > hi {
+            break;
+        }
         content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, gy]);
         content.show(Str(&bytes));
         x += step;
     }
     content.end_text();
     true
+}
+
+/// Issue #422 — [`layout::pattern_tile_bound`] for the PDF painters' `f32`
+/// geometry: `None` = do not tile (huge / non-finite span), paint a rule.
+fn pdf_tile_bound(lo: f32, hi: f32, pitch: f32) -> Option<usize> {
+    layout::pattern_tile_bound(f64::from(lo), f64::from(hi), f64::from(pitch))
 }
 
 /// Issue #144 — the PDF twin of `render/scene.rs::push_tab_leader`: fills
@@ -1618,7 +2175,18 @@ fn emit_tab_leader_rule(
                 baseline - px * 0.3
             };
             let mut x = (lo / step).ceil() * step;
-            while x + dot <= hi {
+            /* Issue #422 — bounded tiling; an untileable advance paints
+            as a rule. */
+            let Some(bound) = pdf_tile_bound(x, hi, step) else {
+                if lo.is_finite() && hi.is_finite() {
+                    rect(content, lo, y, hi, y + dot);
+                }
+                return;
+            };
+            for _ in 0..bound {
+                if x + dot > hi {
+                    break;
+                }
                 rect(content, x, y, x + dot, y + dot);
                 x += step;
             }
@@ -1628,7 +2196,16 @@ fn emit_tab_leader_rule(
             let dash = px * 0.25;
             let y = baseline - px * 0.28;
             let mut x = (lo / step).ceil() * step;
-            while x + dash <= hi {
+            let Some(bound) = pdf_tile_bound(x, hi, step) else {
+                if lo.is_finite() && hi.is_finite() {
+                    rect(content, lo, y, hi, y + dot);
+                }
+                return;
+            };
+            for _ in 0..bound {
+                if x + dash > hi {
+                    break;
+                }
                 rect(content, x, y, x + dash, y + dot);
                 x += step;
             }
@@ -1676,17 +2253,32 @@ fn emit_underline_pattern(
     thickness: f32,
 ) {
     use engine::UnderlineStyle::*;
+    /* Issue #422 — same bound as the canvas twin: a non-finite span paints
+    nothing, an untileable one (more than `layout::MAX_PATTERN_TILES`
+    fills) paints as one solid stroke. */
+    if !(x0.is_finite() && x1.is_finite() && top.is_finite() && thickness.is_finite()) {
+        return;
+    }
+    let solid = |content: &mut Content| {
+        fill_decoration_rect(content, page_h, x0, x1, top, thickness);
+    };
     match style {
         None => {}
-        Single => fill_decoration_rect(content, page_h, x0, x1, top, thickness),
+        Single => solid(content),
         Double => {
-            fill_decoration_rect(content, page_h, x0, x1, top, thickness);
+            solid(content);
             fill_decoration_rect(content, page_h, x0, x1, top + thickness * 2.0, thickness);
         }
         Dotted => {
             let pitch = (thickness * 2.0).max(2.0);
+            let Some(bound) = pdf_tile_bound(x0, x1, pitch) else {
+                return solid(content);
+            };
             let mut x = x0;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + thickness).min(x1);
                 fill_decoration_rect(content, page_h, x, end, top, thickness);
                 x += pitch;
@@ -1695,8 +2287,14 @@ fn emit_underline_pattern(
         Dashed => {
             let dash = (thickness * 4.0).max(3.0);
             let gap = dash;
+            let Some(bound) = pdf_tile_bound(x0, x1, dash + gap) else {
+                return solid(content);
+            };
             let mut x = x0;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + dash).min(x1);
                 fill_decoration_rect(content, page_h, x, end, top, thickness);
                 x += dash + gap;
@@ -1706,11 +2304,17 @@ fn emit_underline_pattern(
             /* Sawtooth: tile pairs of short rects on alternating rows.
             Period = `4 * thickness`; each half-period is one short rect. */
             let half = (thickness * 2.0).max(2.0);
+            let Some(bound) = pdf_tile_bound(x0, x1, half) else {
+                return solid(content);
+            };
             let top_band = top - thickness;
             let bottom_band = top + thickness;
             let mut x = x0;
             let mut up = true;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + half).min(x1);
                 let band_top = if up { top_band } else { bottom_band };
                 fill_decoration_rect(content, page_h, x, end, band_top, thickness);
@@ -1805,6 +2409,19 @@ fn emit_table_text(
     for row in &t.rows {
         let row_x = tx + row.origin.x;
         let row_y = ty + row.origin.y;
+        /* Issue #360 — a header row repeated on a continuation page is a
+        pagination artifact in a tagged export (its text was tagged where
+        the row first appeared). */
+        let repeated = row.header
+            && res.sem.is_some_and(|sem| {
+                row.cells
+                    .iter()
+                    .find_map(|c| first_paragraph_id(&c.content))
+                    .is_some_and(|id| sem.already_tagged_before(id))
+            });
+        if repeated {
+            artifact_begin(content, res, ArtifactKind::Pagination);
+        }
         for cell in &row.cells {
             if matches!(cell.v_merge, engine::VMergeRole::Continue) {
                 continue;
@@ -1834,7 +2451,20 @@ fn emit_table_text(
                 },
             );
         }
+        if repeated {
+            artifact_end(content, res);
+        }
     }
+}
+
+/// Issue #360 — the source id of the first paragraph in `blocks` (depth
+/// first through nested tables).
+fn first_paragraph_id(blocks: &[LayoutBlock]) -> Option<u32> {
+    let mut first = None;
+    for_each_paragraph(blocks, &mut |p: &ParagraphBox| {
+        first.get_or_insert(p.source_paragraph_id);
+    });
+    first
 }
 
 /// Issue #169 — emit one cell's content blocks, clipped to the cell rect
@@ -2151,6 +2781,14 @@ fn collect_to_unicode_pages(
                     add_kashida_mappings(run, fonts, map);
                 }
             }
+            /* Issue #360 (found by veraPDF on a tagged list) — the list
+            marker's glyphs map through the marker's own text. After the
+            line runs, so a glyph the body already mapped keeps its entry
+            and a marker whose glyphs all show elsewhere changes nothing. */
+            if let Some(marker) = &para.marker {
+                let map = out.entry(marker.run.font.clone()).or_default();
+                add_marker_mappings(marker, map);
+            }
         };
         for_each_paragraph(&page.blocks, &mut collect);
         /* Issue #71 — band + footnote glyphs need /ToUnicode coverage
@@ -2220,6 +2858,39 @@ fn add_run_mappings(run: &VisualRun, text: &str, map: &mut BTreeMap<u16, Vec<cha
         if !chars.is_empty() {
             map.entry(g.id).or_insert(chars);
         }
+    }
+}
+
+/// Issue #360 — a list marker's glyph→Unicode mappings. The marker run
+/// is shaped from [`layout::MarkerBox::text`] (its `source_range` is
+/// empty), so its clusters partition that text the way a body run's
+/// partition the paragraph's. Without this a marker glyph that shows
+/// nowhere else ("2." in a list whose body never types a 2) had no
+/// `/ToUnicode` entry — a PDF/A-2u §6.2.11.7.2 / PDF/UA-1 §7.21.7
+/// failure.
+fn add_marker_mappings(marker: &layout::MarkerBox, map: &mut BTreeMap<u16, Vec<char>>) {
+    let text = marker.text.as_str();
+    let mut bounds: Vec<usize> = marker
+        .run
+        .glyphs
+        .iter()
+        .map(|g| g.cluster as usize)
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    for g in &marker.run.glyphs {
+        let start = g.cluster as usize;
+        let end = bounds
+            .iter()
+            .copied()
+            .find(|&b| b > start)
+            .unwrap_or(text.len())
+            .min(text.len());
+        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        map.entry(g.id)
+            .or_insert_with(|| text[start..end].chars().collect());
     }
 }
 
@@ -2317,6 +2988,51 @@ fn fnv1a64(data: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// Issue #422 — the PDF decoration painters share the canvas twins'
+/// tiling bound: a giant span is one stroke, never millions of operators.
+#[cfg(test)]
+mod pattern_bound_tests {
+    use super::*;
+
+    /// Rectangles painted (`re` operators — each decoration fill is one).
+    fn fills(content: Content) -> usize {
+        let bytes = content.finish().to_vec();
+        bytes.windows(3).filter(|w| w == b" re").count()
+    }
+
+    #[test]
+    fn patterned_underline_over_a_giant_span_is_one_fill() {
+        for style in [
+            engine::UnderlineStyle::Wavy,
+            engine::UnderlineStyle::Dotted,
+            engine::UnderlineStyle::Dashed,
+        ] {
+            let mut c = Content::new();
+            emit_underline_pattern(&mut c, 842.0, style, 10.0, 640_730_000.0, 50.0, 1.0);
+            assert_eq!(fills(c), 1, "{style:?}");
+            let mut c = Content::new();
+            emit_underline_pattern(&mut c, 842.0, style, 0.0, f32::INFINITY, 50.0, 1.0);
+            assert_eq!(fills(c), 0, "{style:?}");
+            // Nominal spans still tile.
+            let mut c = Content::new();
+            emit_underline_pattern(&mut c, 842.0, style, 0.0, 300.0, 50.0, 1.0);
+            assert!(fills(c) > 10, "{style:?}");
+        }
+    }
+
+    #[test]
+    fn tab_leader_rule_over_a_giant_advance_is_one_fill() {
+        for kind in [TabLeaderKind::Dot, TabLeaderKind::Hyphen] {
+            let mut c = Content::new();
+            emit_tab_leader_rule(&mut c, 842.0, kind, 0.0, 1e12, 50.0, 12.0);
+            assert_eq!(fills(c), 1, "{kind:?}");
+            let mut c = Content::new();
+            emit_tab_leader_rule(&mut c, 842.0, kind, 0.0, f32::INFINITY, 50.0, 12.0);
+            assert_eq!(fills(c), 0, "{kind:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3624,6 +4340,9 @@ mod tests {
             (PdfProfile::A1b, "1b"),
             (PdfProfile::A2u, "2u"),
             (PdfProfile::X3, "x3"),
+            /* Issue #360 — tagged; `--profile ua1` also size-compares
+            each file against its `2u` twin. */
+            (PdfProfile::Ua1, "ua1"),
         ] {
             let dir = root.join(dir);
             std::fs::create_dir_all(&dir).expect("create output dir");
@@ -3857,6 +4576,24 @@ mod tests {
         );
     }
 
+    /// Issue #360 — a marker glyph that shows nowhere else ("7)" over a
+    /// body without a 7 or a parenthesis) still maps to Unicode: the
+    /// `/ToUnicode` CMap decodes the marker's own text.
+    #[test]
+    fn list_marker_glyphs_map_to_unicode() {
+        let stack = liberation_stack();
+        let page = page_with(&stack, "item", &[plain_span(4)], Some("7)"));
+        let mut out = Vec::new();
+        export_pdf(&[page], &stack, &["item"], PdfProfile::A2u, &mut out).expect("export");
+        let cmaps = test_support::to_unicode_cmaps(&out);
+        let mapped: String = cmaps.iter().flat_map(|m| m.values()).cloned().collect();
+        assert!(mapped.contains('7'), "marker digit unmapped: {mapped:?}");
+        assert!(
+            mapped.contains(')'),
+            "marker punctuation unmapped: {mapped:?}"
+        );
+    }
+
     /// The used-font collection must see the marker run — a marker-only
     /// paragraph (no line runs) still embeds its font.
     #[test]
@@ -3905,6 +4642,7 @@ mod tests {
                 baseline: 14.0,
                 run,
                 width: 10.0,
+                text: "1.".to_string(),
             }),
             source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
             fields: vec![],

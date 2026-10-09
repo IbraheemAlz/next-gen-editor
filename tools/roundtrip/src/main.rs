@@ -36,6 +36,7 @@ mod note_containers;
 mod package_families;
 mod paragraph_format;
 mod ppr_splice;
+mod reader_cascade;
 mod reader_hardening;
 mod regen;
 mod revision_ids;
@@ -43,6 +44,7 @@ mod revisions;
 mod styles_patch;
 mod table_markup;
 mod theme;
+mod tracked_coverage;
 
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
@@ -356,6 +358,14 @@ fn run_default() -> Result<()> {
     comments::run_comment_patch_roundtrip()?;
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
+    theme::run_unregistered_family_roundtrip()?;
+    complex_script::run_font_dialog_slots_roundtrip()?;
+    reader_cascade::run_mark_formatting_roundtrip()?;
+    reader_cascade::run_sibling_prefix_roundtrip()?;
+    reader_cascade::run_style_borders_roundtrip()?;
+    tracked_coverage::run_tracked_paste_roundtrip()?;
+    tracked_coverage::run_tracked_table_rows_roundtrip()?;
+    tracked_coverage::run_section_break_revision_roundtrip()?;
     regen::run_regen_classes_roundtrip()?;
     ppr_splice::run_ppr_splice_roundtrip()?;
     styles_patch::run_styles_patch_roundtrip()?;
@@ -4992,6 +5002,46 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             name: "theme_loaded_faces.docx",
             bytes: format_docx::test_fixtures::theme_loaded_faces_docx(),
             entry: theme_fixture_entry(),
+        },
+        /* Issue #365 — a table under review: a tracked row deletion, a
+        tracked row insertion, `<w:tblPrChange>` / `<w:trPrChange>`
+        history. Zero-edit drift 0; the default harness's step 53 edits,
+        resolves and re-records it. */
+        PrebuiltFixture {
+            name: "tracked_table_rows.docx",
+            bytes: format_docx::test_fixtures::tracked_table_rows_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec!["Rows under review".into(), "after".into()],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #367 — a section break on a tracked (deleted) paragraph
+        mark, its headers inherited by the final section. Zero-edit
+        drift 0; the default harness's step 54 accepts / rejects it. */
+        PrebuiltFixture {
+            name: "section_break_revision.docx",
+            bytes: format_docx::test_fixtures::section_break_revision_docx(false),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 3,
+                    paragraph_texts: format_docx::test_fixtures::SECTION_BREAK_TEXTS
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect(),
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
         },
     ]
 }

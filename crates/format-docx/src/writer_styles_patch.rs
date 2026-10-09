@@ -67,6 +67,9 @@ fn scan(xml: &[u8]) -> Option<StylesLayout> {
             Event::Eof => break,
             Event::Start(e) => {
                 match depth {
+                    /* Only the canonical spelling is patched (the reader
+                    re-prefixes any other, issue #394). */
+                    0 if e.name().as_ref() != b"w:styles" => return None,
                     0 => root_open_end = Some(bom + end),
                     1 => {
                         let name = e.name().as_ref().to_vec();

@@ -190,6 +190,7 @@ export const FACADE_METHOD_COMMANDS: { readonly [M in keyof EditorCommands]: Fac
         setVerticalScript: ['APPLY_FORMATTING'],
         setFontFamily: ['APPLY_FORMATTING'],
         setFontSize: ['APPLY_FORMATTING'],
+        setSlotFormat: ['APPLY_FORMATTING'],
         setColor: ['APPLY_FORMATTING'],
         setHighlight: ['APPLY_FORMATTING'],
         setCaps: ['APPLY_FORMATTING'],

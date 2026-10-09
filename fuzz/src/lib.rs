@@ -11,6 +11,7 @@
 pub mod command_gen;
 pub mod docx_gen;
 pub mod layout_gen;
+pub mod snapshot_gen;
 pub mod util;
 
 use arbitrary::Unstructured;
@@ -56,7 +57,7 @@ pub fn read_raw_package(data: &[u8]) -> Result<format_docx::DocxArchive, format_
 }
 
 /// `docx_roundtrip` (D5.5, new target) — read -> write -> read must be
-/// stable and never panic. Runs the cycle twice: the writer's own
+/// stable, never panic, and (issue #358) preserve the document's text. Runs the cycle twice: the writer's own
 /// passthrough-vs-resynthesize split (`DocxArchive.other_entries` verbatim,
 /// `word/document.xml` freshly serialized) means a bug that only manifests
 /// on the SECOND save (e.g. a `dirty` flag that doesn't reset) would slip
@@ -76,18 +77,104 @@ pub fn run_docx_roundtrip(data: &[u8]) {
         // contract — nothing further to exercise on this input.
         return;
     };
-    let Ok(archive_b) = format_docx::read_docx(&written_a) else {
-        panic!(
-            "docx_roundtrip: read_docx parsed the ORIGINAL package but \
-             rejected write_docx's own output — the writer produced an \
-             archive its own reader can't parse back"
-        );
+    let archive_b = match format_docx::read_docx(&written_a) {
+        Ok(a) => a,
+        Err(e) => {
+            if trace_enabled() {
+                eprintln!(
+                    "[docx_roundtrip] re-read refused: {e}\n  source document.xml: {}\n  saved document.xml: {}",
+                    String::from_utf8_lossy(&document_xml_of(&bytes)),
+                    String::from_utf8_lossy(&document_xml_of(&written_a)),
+                );
+            }
+            panic!(
+                "docx_roundtrip: read_docx parsed the ORIGINAL package but \
+                 rejected write_docx's own output — the writer produced an \
+                 archive its own reader can't parse back"
+            );
+        }
     };
+    /* Issue #358 — read => write => read preserves the text (every
+    generated and spliced package that parsed at all), with ONE documented
+    exception: a namespace-ill-formed source (an element prefix no
+    `xmlns:` declares — the generator's root omits the drawing / mc
+    bindings one time in eight). The reader skips such elements, while the
+    writer's namespace normalization binds the conventional URI on save, so
+    the second read may see a drawing or `AlternateContent` the first one
+    skipped. Tracked as a gap; everything namespace-well-formed must hold. */
+    let source_xml = document_xml_of(&bytes);
+    let comparable = !has_undeclared_element_prefix(&source_xml);
+    if comparable && trace_enabled() && doc_a.to_plain_text() != archive_b.document.to_plain_text()
+    {
+        eprintln!(
+            "[docx_roundtrip] text drift:\n  before: {:?}\n  after:  {:?}\n  source document.xml: {}\n  saved document.xml: {}",
+            doc_a.to_plain_text(),
+            archive_b.document.to_plain_text(),
+            String::from_utf8_lossy(&source_xml),
+            String::from_utf8_lossy(&document_xml_of(&written_a)),
+        );
+    }
+    assert!(
+        !comparable || doc_a.to_plain_text() == archive_b.document.to_plain_text(),
+        "docx_roundtrip: a zero-edit save changed the document text"
+    );
     let doc_b = archive_b.document.clone();
     let Ok(written_b) = format_docx::write_docx(&archive_b, &doc_b) else {
         panic!("docx_roundtrip: second write_docx failed after a successful first round-trip");
     };
     let _ = format_docx::read_docx(&written_b);
+}
+
+/// `word/document.xml` of a package (empty when unreadable) — trace output.
+fn document_xml_of(docx: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(mut z) = zip::ZipArchive::new(std::io::Cursor::new(docx)) else {
+        return Vec::new();
+    };
+    let Ok(mut f) = z.by_name("word/document.xml") else {
+        return Vec::new();
+    };
+    let mut v = Vec::new();
+    let _ = f.read_to_end(&mut v);
+    v
+}
+
+/// Issue #358 — `true` when some element in `xml` uses a prefix that no
+/// `xmlns:<prefix>=` anywhere in the part declares (namespace-ill-formed
+/// XML; see `run_docx_roundtrip`'s exception). A byte scan, not a parse:
+/// `<p:` / `</p:` element names against every declared prefix.
+fn has_undeclared_element_prefix(xml: &[u8]) -> bool {
+    let mut declared: Vec<&[u8]> = Vec::new();
+    let needle = b"xmlns:";
+    let mut i = 0;
+    while let Some(off) = xml[i..].windows(needle.len()).position(|w| w == needle) {
+        let start = i + off + needle.len();
+        let end = xml[start..]
+            .iter()
+            .position(|b| *b == b'=' || b.is_ascii_whitespace())
+            .map_or(xml.len(), |e| start + e);
+        declared.push(&xml[start..end]);
+        i = end;
+    }
+    let mut j = 0;
+    while let Some(off) = xml[j..].iter().position(|b| *b == b'<') {
+        let mut k = j + off + 1;
+        if xml.get(k) == Some(&b'/') {
+            k += 1;
+        }
+        let name_end = xml[k..]
+            .iter()
+            .position(|b| matches!(b, b' ' | b'/' | b'>' | b'\t' | b'\n' | b'\r'))
+            .map_or(xml.len(), |e| k + e);
+        let name = &xml[k..name_end];
+        if let Some(colon) = name.iter().position(|b| *b == b':')
+            && !declared.contains(&&name[..colon])
+        {
+            return true;
+        }
+        j = name_end.max(k);
+    }
+    false
 }
 
 /// Cap on how many commands one fuzz input drives — bounds wall-clock per
@@ -101,20 +188,58 @@ const MAX_COMMAND_SEQUENCE: usize = 64;
 /// entry point — see `crates/engine-wasm`'s `fuzz-native` feature) including
 /// the auto-repaint -> layout pipeline, then the native glyph rasterizer.
 /// Invariants asserted after every command: no panic (the fuzz harness
-/// itself), the undo stack never exceeds its 100-snapshot bound, and the
-/// live selection always resolves inside the current document.
+/// itself), the undo stack never exceeds its 100-snapshot bound, the
+/// live selection always resolves inside the current document, and
+/// (issue #341) a command answered with `Event::Error` changed nothing
+/// (`Engine::state_fingerprint_for_fuzzing`).
 pub fn run_rpc_command(data: &[u8]) {
     let mut u = Unstructured::new(data);
     let seed_text = command_gen::gen_seed_text(&mut u);
     let mut engine = engine_wasm::Engine::new_headless(engine::DocumentTree::from_text(&seed_text));
     let commands = command_gen::gen_command_sequence(&mut u, MAX_COMMAND_SEQUENCE);
-    for cmd in commands {
+    let trace = trace_enabled();
+    for (step, cmd) in commands.into_iter().enumerate() {
+        if trace {
+            eprintln!(
+                "[rpc_command] step {step}: {}",
+                format!("{cmd:?}").chars().take(300).collect::<String>()
+            );
+        }
         /* Kept only for the failure message: the variant name (not the
         payload, which would defeat the smoke driver's per-message
         dedup) tells triage WHICH command broke an invariant. Formatted
         lazily — `assert!`'s message arguments run only on failure. */
         let keep = cmd.clone();
-        let _evt = engine.apply_sync(cmd);
+        /* Issue #341 — "error => no mutation": the document, selection,
+        active story and undo depth before the command. */
+        let before = engine.state_fingerprint_for_fuzzing();
+        let started = trace.then(std::time::Instant::now);
+        let evt = engine.apply_sync(cmd);
+        if let Some(t) = started {
+            eprintln!(
+                "[rpc_command]   -> {} in {} ms",
+                format!("{evt:?}").chars().take(80).collect::<String>(),
+                t.elapsed().as_millis()
+            );
+        }
+        if let bridge::Event::Error { message, .. } = &evt
+            && !is_post_commit_report_error(message)
+        {
+            let after = engine.state_fingerprint_for_fuzzing();
+            let changed: Vec<&str> = engine_wasm::Engine::FINGERPRINT_PARTS
+                .iter()
+                .zip(before.iter().zip(after.iter()))
+                .filter(|(_, (b, a))| b != a)
+                .map(|(n, _)| *n)
+                .collect();
+            assert!(
+                changed.is_empty(),
+                "{} answered Event::Error but changed: {} [{}]",
+                variant_name(&keep),
+                changed.join(", "),
+                format!("{evt:?}").chars().take(160).collect::<String>()
+            );
+        }
         assert!(
             engine.undo_depth() <= 100,
             "undo depth exceeded its 100-snapshot bound after {}",
@@ -135,6 +260,148 @@ pub fn run_rpc_command(data: &[u8]) {
     // over whatever the command sequence left the document as.
     if engine.ensure_layout_for_fuzzing().is_ok() {
         let _ = engine.rasterize_last_layout_for_fuzzing();
+    }
+}
+
+/// Issue #422 — `ENGINE_FUZZ_TRACE=1` prints every generated command
+/// before it runs (`run_rpc_command`), so a slow or memory-hungry input
+/// found by `examples/smoke.rs --log-inputs` can be pinned to one command.
+fn trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("ENGINE_FUZZ_TRACE").is_some_and(|v| v != "0"))
+}
+
+/// Issue #341 — the one documented exception to "`Event::Error` => no
+/// mutation". Some commands COMMIT their edit (or move the selection, which
+/// is the whole command) and only then build the reply: the selection
+/// geometry (`selection_changed`) or the auto-repaint. On a headless engine
+/// that has not had its first `RenderPage` there is no selection, layout
+/// config or font yet, so that reply step answers an `Event::Error` for an
+/// edit that already landed (the `LoadDocx` doc comment states the same
+/// contract: "the document itself is loaded"). The shell never reaches this
+/// state — it paints before it edits — so these messages are reply-stage
+/// degradations, not lost atomicity. Anything else answering `Error` must
+/// have left the document, selection, story, name and undo depth alone.
+fn is_post_commit_report_error(message: &str) -> bool {
+    message.starts_with("selection_changed: no active selection")
+        || message.starts_with("build_pages: no layout config cached")
+        || (message.starts_with("font `") && message.ends_with("not loaded"))
+}
+
+/// Commands a post-restore "one apply round" drives.
+const MAX_RESTORE_ROUND: usize = 4;
+
+/// Restore `snapshot` (+ detached `package`) into a fresh engine and prove
+/// the result is usable: `Ok` or a typed error, never a panic; on `Ok`
+/// the engine invariants hold, one `apply` round (commands from `tail`)
+/// keeps them, and the same bytes sent through `Command::Recover` answer
+/// `Event::Recovered`. Returns the first restore's outcome.
+fn restore_and_check(
+    snapshot: &[u8],
+    package: Option<&[u8]>,
+    tail: &[u8],
+) -> Result<(u8, bool), String> {
+    let fresh = || engine_wasm::Engine::new_headless(engine::DocumentTree::from_text("fresh"));
+    let commands = |tail: &[u8]| {
+        command_gen::gen_command_sequence(&mut Unstructured::new(tail), MAX_RESTORE_ROUND)
+    };
+    let mut engine = fresh();
+    let outcome = engine.restore_for_fuzzing(snapshot, package);
+    if outcome.is_ok() {
+        if let Err(why) = engine.check_invariants_for_fuzzing() {
+            panic!("snapshot_decode: right after a successful restore: {why}");
+        }
+        for cmd in commands(tail) {
+            let name = variant_name(&cmd);
+            let _ = engine.apply_sync(cmd);
+            if let Err(why) = engine.check_invariants_for_fuzzing() {
+                panic!("snapshot_decode: after restore then {name}: {why}");
+            }
+        }
+        if engine.ensure_layout_for_fuzzing().is_ok() {
+            let _ = engine.rasterize_last_layout_for_fuzzing();
+        }
+    }
+    // The production entry: Recover = restore + replayed tail.
+    let mut recovering = fresh();
+    let evt = recovering.apply_sync(bridge::Command::Recover {
+        snapshot: snapshot.to_vec(),
+        log_tail: commands(tail),
+        renderer_downgrade: None,
+        package: package.map(<[u8]>::to_vec),
+    });
+    assert!(
+        matches!(evt, bridge::Event::Recovered { .. }),
+        "Command::Recover must answer Event::Recovered for any snapshot bytes"
+    );
+    if let Err(why) = recovering.check_invariants_for_fuzzing() {
+        panic!("snapshot_decode: after Command::Recover: {why}");
+    }
+    outcome
+}
+
+/// `snapshot_decode` (issue #341) — `engine::snapshot` envelopes, valid
+/// and mutated, through `Engine::restore` / `Command::Recover`.
+///
+/// Three input shapes: a committed seed container
+/// (`snapshot_gen::SEED_MAGIC`: snapshot + detached package), a raw
+/// `NGES` envelope (libFuzzer's own byte mutations of one), or — the
+/// structure-aware path — arbitrary bytes that build a session, snapshot it
+/// with the engine, and mutate the MessagePack tree
+/// (`snapshot_gen::mutate_snapshot`). An unmutated snapshot must restore.
+pub fn run_snapshot_decode(data: &[u8]) {
+    let tail = &data[data.len().saturating_sub(64)..];
+    if let Some((snapshot, package)) = snapshot_gen::parse_seed(data) {
+        let _ = restore_and_check(snapshot, package, tail);
+        return;
+    }
+    if data.starts_with(b"NGES") {
+        let _ = restore_and_check(data, None, tail);
+        return;
+    }
+    let mut u = Unstructured::new(data);
+    if u.is_empty() {
+        return;
+    }
+    let mut session = snapshot_gen::base_engine(&mut u);
+    let detach = u.ratio(1, 2).unwrap_or(false);
+    let Some((bytes, _, package)) = snapshot_gen::capture(&mut session, detach) else {
+        return;
+    };
+    let mutate = u.ratio(5, 6).unwrap_or(true);
+    let snapshot = if mutate {
+        snapshot_gen::mutate_snapshot(&mut u, &bytes, package.as_deref())
+    } else {
+        bytes
+    };
+    // The detached package itself: intact, absent, or one byte off.
+    let mut package = package;
+    let mut tampered = false;
+    match u.int_in_range(0u8..=7).unwrap_or(0) {
+        0 => {
+            tampered = package.is_some();
+            package = None;
+        }
+        1 => {
+            if let Some(p) = package.as_mut()
+                && !p.is_empty()
+            {
+                let i = u.choose_index(p.len()).unwrap_or(0);
+                p[i] ^= 0x55;
+                tampered = true;
+            }
+        }
+        _ => {}
+    }
+    let tail = u.take_rest();
+    let outcome = restore_and_check(&snapshot, package.as_deref(), tail);
+    if !mutate {
+        let (_, package_lost) = outcome
+            .unwrap_or_else(|e| panic!("an unmutated engine snapshot failed to restore: {e}"));
+        assert!(
+            tampered || !package_lost,
+            "an unmutated snapshot with its intact package reported the package lost"
+        );
     }
 }
 
@@ -307,7 +574,197 @@ mod tests {
         run_docx_roundtrip(&[]);
         run_rpc_command(&[]);
         run_layout_paginate(&[]);
+        run_snapshot_decode(&[]);
         run_format_pdf_image_decode(&[]);
+    }
+
+    #[test]
+    fn undeclared_element_prefixes_are_detected() {
+        let ok =
+            br#"<w:document xmlns:w="u" xmlns:wp="v"><w:body><wp:inline/></w:body></w:document>"#;
+        assert!(!has_undeclared_element_prefix(ok));
+        let bad = br#"<w:document xmlns:w="u"><w:body><wp:inline/></w:body></w:document>"#;
+        assert!(has_undeclared_element_prefix(bad));
+        assert!(!has_undeclared_element_prefix(
+            b"<?xml version=\"1.0\"?><a/>"
+        ));
+    }
+
+    /// Issue #358 — `dictionaries/docx.dict` parses as a libFuzzer
+    /// dictionary (`[name=]"value"` per line, `\\` / `\"` / `\xNN`
+    /// escapes, `#` comments) and every word fits libFuzzer's 64-byte
+    /// limit, so a typo cannot silently weaken the nightly `-dict=` legs.
+    #[test]
+    fn docx_dictionary_is_well_formed() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dictionaries/docx.dict");
+        let dict = std::fs::read_to_string(&path).expect("fuzz/dictionaries/docx.dict");
+        let mut words = std::collections::HashSet::new();
+        for (n, line) in dict.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let q = line
+                .find('"')
+                .unwrap_or_else(|| panic!("line {}: no quoted value", n + 1));
+            let name = &line[..q];
+            assert!(
+                name.is_empty()
+                    || name.strip_suffix('=').is_some_and(|k| !k.is_empty()
+                        && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')),
+                "line {}: bad keyword {name:?}",
+                n + 1
+            );
+            let body = &line[q..];
+            assert!(
+                body.len() >= 2 && body.ends_with('"'),
+                "line {}: unterminated",
+                n + 1
+            );
+            let inner = body[1..body.len() - 1].as_bytes();
+            let mut word = Vec::new();
+            let mut i = 0;
+            while i < inner.len() {
+                match inner[i] {
+                    b'\\' => match inner.get(i + 1) {
+                        Some(&c @ (b'\\' | b'"')) => {
+                            word.push(c);
+                            i += 2;
+                        }
+                        Some(b'x') => {
+                            let hex = inner
+                                .get(i + 2..i + 4)
+                                .and_then(|h| std::str::from_utf8(h).ok())
+                                .and_then(|h| u8::from_str_radix(h, 16).ok());
+                            word.push(hex.unwrap_or_else(|| panic!("line {}: bad \\x", n + 1)));
+                            i += 4;
+                        }
+                        _ => panic!("line {}: bad escape", n + 1),
+                    },
+                    b'"' => panic!("line {}: unescaped quote", n + 1),
+                    c => {
+                        word.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            assert!(
+                !word.is_empty() && word.len() <= 64,
+                "line {}: {} bytes",
+                n + 1,
+                word.len()
+            );
+            assert!(words.insert(word), "line {}: duplicate word", n + 1);
+        }
+        assert!(words.len() > 150, "only {} words", words.len());
+        assert!(words.contains(b"<w:fldChar w:fldCharType=\"begin\"/>".as_slice()));
+    }
+
+    /// Issue #422 — the committed reproducer scenario runs to completion
+    /// (one solid stroke per patterned underline, not millions of fills).
+    #[test]
+    fn the_422_reproducer_seed_completes() {
+        run_rpc_command(&command_gen::Scenario::PatternedUnderlineGiantImage.seed_bytes());
+    }
+
+    /// Issue #341 — the committed `snapshot_decode` seeds are exactly what
+    /// [`snapshot_gen::snapshot_seeds`] builds (re-run `examples/regen-seeds`
+    /// after changing the engine's snapshot shape), and every one reaches
+    /// `restore` without a panic: the valid ones restore, the hostile ones
+    /// are refused with a typed error.
+    #[test]
+    fn snapshot_seeds_are_committed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/snapshot_decode");
+        let seeds = snapshot_gen::snapshot_seeds();
+        assert!(seeds.len() >= 8, "expected the full seed set");
+        for (name, bytes) in seeds {
+            let committed = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("{name}: {e} — run examples/regen-seeds"));
+            assert!(
+                committed == bytes,
+                "{name} is stale — run examples/regen-seeds"
+            );
+            run_snapshot_decode(&bytes);
+            let (snapshot, package) = snapshot_gen::parse_seed(&bytes).expect("seed container");
+            let mut e = engine_wasm::Engine::new_headless(engine::DocumentTree::new());
+            let got = e.restore_for_fuzzing(snapshot, package);
+            let hostile = ["bad_magic", "truncated", "unsupported_version"]
+                .iter()
+                .any(|h| name.contains(h));
+            assert_eq!(got.is_err(), hostile, "{name}: {got:?}");
+        }
+    }
+
+    /// Issue #341 — the v1 seed really is a format-1 envelope naming an FNV
+    /// key, and the v2 one a `sha256-` key; both restore their package.
+    #[test]
+    fn snapshot_seeds_cover_both_package_key_formats() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/snapshot_decode");
+        let read = |n: &str| std::fs::read(dir.join(n)).expect(n);
+        let key_of = |snap: &[u8]| {
+            let Some(snapshot_gen::Mp::Map(m)) = snapshot_gen::Mp::parse(&snap[5..]) else {
+                panic!("payload is a map")
+            };
+            m.into_iter()
+                .find_map(|(k, v)| match (k, v) {
+                    (snapshot_gen::Mp::Str(k), snapshot_gen::Mp::Str(v))
+                        if k == b"package_hash" =>
+                    {
+                        String::from_utf8(v).ok()
+                    }
+                    _ => None,
+                })
+                .expect("package_hash")
+        };
+        let v1 = read("seed_v1_detached_pkg_fnv");
+        let (snap, pkg) = snapshot_gen::parse_seed(&v1).unwrap();
+        assert_eq!(snap[4], 1);
+        assert!(key_of(snap).starts_with("pkg-"));
+        let mut e = engine_wasm::Engine::new_headless(engine::DocumentTree::new());
+        assert_eq!(e.restore_for_fuzzing(snap, pkg), Ok((1, false)));
+        let v2 = read("seed_v2_detached_sha256");
+        let (snap, pkg) = snapshot_gen::parse_seed(&v2).unwrap();
+        assert!(key_of(snap).starts_with("sha256-"));
+        let mut e = engine_wasm::Engine::new_headless(engine::DocumentTree::new());
+        assert_eq!(e.restore_for_fuzzing(snap, pkg), Ok((2, false)));
+        // The package missing / mismatched is reported, not fatal.
+        for n in [
+            "seed_v2_detached_package_missing",
+            "seed_v2_detached_package_mismatch",
+        ] {
+            let b = read(n);
+            let (snap, pkg) = snapshot_gen::parse_seed(&b).unwrap();
+            let mut e = engine_wasm::Engine::new_headless(engine::DocumentTree::new());
+            assert_eq!(e.restore_for_fuzzing(snap, pkg), Ok((2, true)), "{n}");
+        }
+    }
+
+    /// Issue #341 — re-encoding an unmutated snapshot tree reproduces the
+    /// engine's bytes (the mutator edits the tree, not the encoding), and a
+    /// mutated one still never panics the restore.
+    #[test]
+    fn snapshot_tree_round_trips_and_mutations_do_not_panic() {
+        let (_, bytes) = snapshot_gen::snapshot_seeds()
+            .into_iter()
+            .find(|(n, _)| *n == "seed_v2_inline_media_refs")
+            .expect("seed");
+        let (snap, _) = snapshot_gen::parse_seed(&bytes).unwrap();
+        let tree = snapshot_gen::Mp::parse(&snap[5..]).expect("msgpack");
+        let mut again = snap[..5].to_vec();
+        tree.encode(&mut again);
+        assert!(again == snap, "Mp must re-encode what rmp_serde wrote");
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..200 {
+            let mut noise = Vec::new();
+            for _ in 0..96 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                noise.push(state as u8);
+            }
+            let mutated = snapshot_gen::mutate_snapshot(&mut Unstructured::new(&noise), snap, None);
+            run_snapshot_decode(&mutated);
+        }
     }
 
     /// Issue #348 — the committed hostile `docx_reader` seeds are exactly

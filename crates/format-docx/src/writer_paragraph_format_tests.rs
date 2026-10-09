@@ -321,6 +321,116 @@ fn minimal_package_writes_the_mark_and_an_empty_mark_rpr_round_trips() {
     assert_eq!(out, xml.replacen(">z<", ">zz<", 1));
 }
 
+/* ---- Issue #369 — the mark's run properties format the mark only ---- */
+
+/// A bold + red mark over two plain runs (one of them italic): Word
+/// formats the pilcrow with the mark's `<w:rPr>`, never the text. The
+/// runs read plain (the italic one italic only), the mark keeps its
+/// formatting, a zero-edit save is byte-identical and an insertion stays
+/// a pure insertion that re-reads plain.
+#[test]
+fn a_bold_mark_over_plain_runs_leaves_the_runs_plain() {
+    let body = concat!(
+        r#"<w:p><w:pPr><w:rPr><w:b/><w:color w:val="FF0000"/></w:rPr></w:pPr>"#,
+        r#"<w:r><w:t xml:space="preserve">plain </w:t></w:r>"#,
+        r#"<w:r><w:rPr><w:i/></w:rPr><w:t>slanted</w:t></w:r></w:p>"#,
+    );
+    let xml = document(body);
+    let parsed = read_docx(&package(STYLES_XML, &xml)).expect("read");
+    let p = parsed.document.nth_paragraph(0).unwrap();
+    let plain = p.style_at(0);
+    assert_eq!((plain.bold, plain.color), (None, None), "{:?}", p.spans);
+    let slanted = p.style_at(7);
+    assert_eq!(
+        (slanted.bold, slanted.italic, slanted.color),
+        (None, Some(true), None)
+    );
+    let mark = mark_of(&parsed.document, 0).expect("mark modeled");
+    assert_eq!(
+        (mark.bold, mark.color),
+        (Some(true), Some([0xFF, 0, 0, 255]))
+    );
+
+    assert_eq!(
+        document_xml_of(&write_docx(&parsed, &parsed.document).expect("write")),
+        xml,
+        "zero-edit save"
+    );
+    let edited = parsed.document.insert_text(at(0, 2), "ai");
+    let out = document_xml_of(&write_docx(&parsed, &edited).expect("write edit"));
+    assert_eq!(
+        out,
+        xml.replacen(">plain <", ">plaiain <", 1),
+        "pure insertion"
+    );
+    let back = read_docx(&write_docx(&parsed, &edited).unwrap()).expect("re-read");
+    let s = back.document.nth_paragraph(0).unwrap().style_at(2);
+    assert_eq!((s.bold, s.color), (None, None));
+}
+
+/// The headline regression: a bold run under a bold mark loses its bold
+/// in an edit (restyled plain — no `<w:b>` at all — and, separately,
+/// toggled to an explicit OFF). The mark stays bold, and the re-read
+/// text is NOT bold: the plain case used to come back bold, because the
+/// reader folded the mark into every run.
+#[test]
+fn unbolding_text_under_a_bold_mark_re_reads_unbolded() {
+    let body = concat!(
+        r#"<w:p><w:pPr><w:rPr><w:b/></w:rPr></w:pPr>"#,
+        r#"<w:r><w:rPr><w:b/></w:rPr><w:t>Bold</w:t></w:r></w:p>"#,
+    );
+    let parsed = read_docx(&package(STYLES_XML, &document(body))).expect("read");
+    assert_eq!(
+        parsed.document.nth_paragraph(0).unwrap().style_at(0).bold,
+        Some(true)
+    );
+    let plain = parsed
+        .document
+        .set_span_style(at(0, 0), 4, SpanStyle::default());
+    let off = parsed.document.apply_style(
+        at(0, 0),
+        at(0, 4),
+        SpanStyle {
+            bold: Some(false),
+            ..Default::default()
+        },
+    );
+    for (label, edited) in [("plain", plain), ("explicit off", off)] {
+        let bytes = write_docx(&parsed, &edited).expect("write");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let out = document_xml_of(&bytes);
+        assert!(
+            out.contains(r#"<w:pPr><w:rPr><w:b/></w:rPr></w:pPr>"#),
+            "{label}: the mark keeps its bytes: {out}"
+        );
+        let back = read_docx(&bytes).expect("re-read");
+        let p = back.document.nth_paragraph(0).unwrap();
+        assert_ne!(p.style_at(0).bold, Some(true), "{label}: {:?}", p.spans);
+        assert_eq!(mark_of(&back.document, 0).and_then(|m| m.bold), Some(true));
+    }
+}
+
+/// #293 preserved: an EMPTY paragraph with a bold mark types bold, through
+/// a save and a re-read (the typed run carries its own `<w:b/>`).
+#[test]
+fn typing_into_an_empty_paragraph_with_a_bold_mark_is_bold() {
+    let body = r#"<w:p><w:pPr><w:rPr><w:b/></w:rPr></w:pPr></w:p>"#;
+    let parsed = read_docx(&package(STYLES_XML, &document(body))).expect("read");
+    assert_eq!(
+        mark_of(&parsed.document, 0).and_then(|m| m.bold),
+        Some(true)
+    );
+    let typed = parsed.document.insert_text(at(0, 0), "loud");
+    assert_eq!(typed.nth_paragraph(0).unwrap().style_at(0).bold, Some(true));
+    let bytes = write_docx(&parsed, &typed).expect("write");
+    let out = document_xml_of(&bytes);
+    assert!(out.contains("<w:r><w:rPr><w:b/></w:rPr><w:t"), "{out}");
+    let back = read_docx(&bytes).expect("re-read");
+    let p = back.document.nth_paragraph(0).unwrap();
+    assert_eq!(p.text, "loud");
+    assert_eq!(p.style_at(0).bold, Some(true));
+}
+
 /* ---- Issue #297 — style ids and display names are distinct ---- */
 
 fn styles_xml_of(bytes: &[u8]) -> String {

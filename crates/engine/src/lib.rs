@@ -64,14 +64,22 @@ pub mod fields;
 mod revision_refs;
 pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};
 #[cfg(test)]
+mod para_border_cascade_tests;
+#[cfg(test)]
 mod paragraph_mark_tests;
 #[cfg(test)]
 mod paragraph_merge_tests;
 #[cfg(test)]
 mod revision_tests;
 mod revisions;
+#[cfg(test)]
+mod section_mark_tests;
 mod text_remap;
 mod tracked;
+#[cfg(test)]
+mod tracked_paste_tests;
+#[cfg(test)]
+mod tracked_table_tests;
 #[cfg(test)]
 mod tracked_tests;
 pub use text_remap::TextEdit;
@@ -180,6 +188,9 @@ pub struct DocumentTree {
     /// Phase 5 PR 1 widened it to `Vector<Block>` so tables can appear at
     /// any document position. Still `im::Vector` so undo snapshots clone
     /// in O(1) — table cells use plain `Vec<Block>` instead.
+    /// Issue #422 — decoded through [`snapshot::de_bounded_vector`], so a
+    /// hostile declared count cannot drive `im`'s uncapped preallocation.
+    #[serde(deserialize_with = "crate::snapshot::de_bounded_vector")]
     pub blocks: Vector<Block>,
     /// Phase 3 (#40) — the body-level trailing `<w:sectPr>` governing the
     /// FINAL section. Interior section boundaries live on their closing
@@ -2333,6 +2344,13 @@ impl SpanStyle {
     /// complex-script twin: the "both slots" rule of engine-authored
     /// formatting (Word's ribbon size / bold / italic / font apply to both
     /// script classes). A twin the caller already set is kept.
+    ///
+    /// Issue #424 — the Latin family slot is `font_family` OR an
+    /// unresolved `raw_font_family` ([`Self::names_latin_family`]): a raw
+    /// name the engine could not model is still the family the caller
+    /// picked, so the complex-script slot takes it too (written `w:cs`,
+    /// laid out — substituted — per slot) instead of silently keeping
+    /// its inherited theme face.
     pub fn with_cs_twins(mut self) -> SpanStyle {
         if self.font_size_cs.is_none() {
             self.font_size_cs = self.font_size;
@@ -2344,7 +2362,7 @@ impl SpanStyle {
             self.italic_cs = self.italic;
         }
         if self.font_family_cs.is_none() {
-            self.font_family_cs = self.font_family.clone();
+            self.font_family_cs = self.font_family.clone().or_else(|| self.raw_family());
         }
         self
     }
@@ -2352,6 +2370,12 @@ impl SpanStyle {
     /// Issue #359 — the `cs_only` form of a formatting patch: every Latin
     /// slot moves onto its complex-script twin and the Latin slot is left
     /// unset, so applying the patch touches only complex-script text.
+    ///
+    /// Issue #424 — an unresolved `raw_font_family` is a Latin-slot name
+    /// (`w:ascii` / `w:hAnsi`) like `font_family`: it moves to `w:cs`
+    /// (as the verbatim-display [`FontFamily::Custom`] the reader would
+    /// have built from `w:cs`), never stays behind to rename the Latin
+    /// text.
     pub fn into_cs_only(mut self) -> SpanStyle {
         if let Some(size) = self.font_size.take() {
             self.font_size_cs = Some(size);
@@ -2362,10 +2386,28 @@ impl SpanStyle {
         if let Some(italic) = self.italic.take() {
             self.italic_cs = Some(italic);
         }
-        if let Some(family) = self.font_family.take() {
+        let raw = self.raw_family();
+        self.raw_font_family = None;
+        if let Some(family) = self.font_family.take().or(raw) {
             self.font_family_cs = Some(family);
         }
         self
+    }
+
+    /// Issue #424 — `true` when this level names the Latin family slot
+    /// (`w:ascii` / `w:hAnsi`): a modeled `font_family` or a non-blank
+    /// unresolved `raw_font_family`. The two fields are ONE slot — see
+    /// [`Self::merged_with`].
+    pub fn names_latin_family(&self) -> bool {
+        self.font_family.is_some() || self.raw_family().is_some()
+    }
+
+    /// Issue #424 — `raw_font_family` as a family (verbatim display name);
+    /// `None` when unset or blank.
+    fn raw_family(&self) -> Option<FontFamily> {
+        self.raw_font_family
+            .as_deref()
+            .and_then(FontFamily::from_display_name)
     }
 
     /// Issue #359 — `self` as complex-script text sees it: every Latin
@@ -2416,10 +2458,23 @@ impl SpanStyle {
         `w:hAnsi`) claims those two, a complex-script one (`w:cs`) the
         `cs` slot, so a Latin-only font pick leaves the Arabic text on
         its theme face. */
+        let names_latin = patch.names_latin_family();
         let claims = theme::SlotClaims {
-            latin: patch.font_bindings.is_none()
-                && (patch.font_family.is_some() || patch.raw_font_family.is_some()),
+            latin: patch.font_bindings.is_none() && names_latin,
             complex_script: patch.font_bindings.is_none() && patch.font_family_cs.is_some(),
+        };
+        /* Issue #424 — `font_family` and `raw_font_family` are one slot (the
+        Latin name): a level naming it either way replaces both, so a raw
+        pick is never shadowed by an inherited modeled family (layout and
+        the writer both prefer `font_family`), nor a modeled pick trailed
+        by a stale raw name. A blank raw name names nothing. */
+        let (font_family, raw_font_family) = if names_latin {
+            (patch.font_family, patch.raw_font_family)
+        } else {
+            (
+                patch.font_family.or(self.font_family),
+                patch.raw_font_family.or(self.raw_font_family),
+            )
         };
         let font_theme = if claims.latin && patch.font_theme.is_none() {
             None
@@ -2444,13 +2499,13 @@ impl SpanStyle {
             underline: patch.underline.or(self.underline),
             strike: patch.strike.or(self.strike),
             bg_color: patch.bg_color.or(self.bg_color),
-            font_family: patch.font_family.or(self.font_family),
+            font_family,
             font_family_cs: patch.font_family_cs.or(self.font_family_cs),
             char_style: patch.char_style.or(self.char_style),
             caps: patch.caps.or(self.caps),
             small_caps: patch.small_caps.or(self.small_caps),
             vert_align: patch.vert_align.or(self.vert_align),
-            raw_font_family: patch.raw_font_family.or(self.raw_font_family),
+            raw_font_family,
             font_theme,
             /* Issue #84 — same "set field wins" rule as every slot above:
             a formatting patch (no bag) keeps the run's bag; a direct
@@ -3642,6 +3697,14 @@ impl ParaProperties {
     /// stylesheets virtually never set 0 explicitly, so the trade-off is
     /// acceptable for Phase 3; Phase 4+ may widen to `Option`.
     pub fn merged_with(self, patch: ParaProperties) -> ParaProperties {
+        /* Issue #395 — borders cascade PER EDGE (evaluated first: the
+        struct literal below moves both sides' borders). */
+        let rtl = patch.direction.or(self.direction) == Some(TextDirection::Rtl);
+        let border_spelling = merged_border_spelling(
+            (&self.borders, self.border_spelling),
+            (&patch.borders, patch.border_spelling),
+            rtl,
+        );
         ParaProperties {
             /* Issue #419 — the pattern travels with the `<w:shd>` that
             set it (evaluated first: `or` below moves nothing, but the
@@ -3671,16 +3734,13 @@ impl ParaProperties {
             keep_next: patch.keep_next.or(self.keep_next),
             keep_lines: patch.keep_lines.or(self.keep_lines),
             page_break_before: patch.page_break_before || self.page_break_before,
-            /* Audit gap A.M4 — `<w:pBdr>` overlay: patch's borders win
-            when set; otherwise inherit. */
-            /* Issue #352 — the spelling travels with the borders it
-            describes (evaluated first: `or` below moves `patch.borders`). */
-            border_spelling: if patch.borders.is_some() {
-                patch.border_spelling
-            } else {
-                self.border_spelling
-            },
-            borders: patch.borders.or(self.borders),
+            /* Audit gap A.M4 / issue #395 — `<w:pBdr>` overlay, per edge:
+            each edge the patch sets wins (an explicit `w:val="nil"` /
+            `"none"` is a set edge — a `BorderStyle::None` stroke — so it
+            REMOVES the inherited one); the others inherit. Issue #352 —
+            the logical spelling travels with the edge it describes. */
+            border_spelling,
+            borders: merged_borders(self.borders, patch.borders),
             /* Audit gap A.M3 — `<w:tabs>` overlay: patch's stops
             REPLACE the parent's (Word's documented behaviour — child
             `<w:tabs>` is not additive, it shadows the cascade).
@@ -3699,6 +3759,138 @@ impl ParaProperties {
             grab_bag: patch.grab_bag.or(self.grab_bag),
             outline_level: patch.outline_level.or(self.outline_level),
             widow_control: patch.widow_control.or(self.widow_control),
+        }
+    }
+
+    /// Issue #395 — `self` with its logically spelled border edges
+    /// (`border_spelling`, issue #352) re-oriented from its OWN direction
+    /// to a paragraph whose resolved direction is `rtl`.
+    ///
+    /// Convention: a `ParaProperties` stores a `<w:start>` / `<w:end>`
+    /// edge in the physical slot its own `direction` names (start = left
+    /// unless it is right-to-left). That holds for a paragraph's resolved
+    /// `props` (own = resolved direction), its `direct_overrides` (own =
+    /// the direct `<w:bidi>`, if any), a style definition and the
+    /// docDefaults (own = their `<w:bidi>`). A cascade re-orients every
+    /// level to the paragraph's final direction before folding it
+    /// ([`Self::cascade`]): a style's `<w:start>` is the start of the
+    /// paragraph it formats, not of the style. Physical edges never move;
+    /// on a collision (`<w:start>` and `<w:right>` naming one side) the
+    /// logical edge wins, as in the reader.
+    pub fn oriented_borders(mut self, rtl: bool) -> ParaProperties {
+        let own_rtl = self.direction == Some(TextDirection::Rtl);
+        let sp = self.border_spelling;
+        if own_rtl == rtl || !(sp.start || sp.end) {
+            return self;
+        }
+        let Some(b) = self.borders.as_mut() else {
+            return self;
+        };
+        /* Under the own orientation the start edge sits in `lead`, the
+        end edge in `trail`; the target orientation mirrors both sides.
+        A logical edge follows its name to the mirrored slot. A physical
+        edge stays on its side — which is the slot the OTHER logical edge
+        moves into, so it yields to it; the side the logical edge left
+        held nothing else. */
+        let (lead, trail) = if own_rtl {
+            (b.right.take(), b.left.take())
+        } else {
+            (b.left.take(), b.right.take())
+        };
+        let (to_lead, to_trail) = match (sp.start, sp.end) {
+            (true, true) => (lead, trail),
+            (true, false) => (lead, None),
+            _ => (None, trail),
+        };
+        if rtl {
+            (b.right, b.left) = (to_lead, to_trail);
+        } else {
+            (b.left, b.right) = (to_lead, to_trail);
+        }
+        self
+    }
+
+    /// Issue #395 — fold a paragraph's property cascade, `levels` root
+    /// first (docDefaults, the `<w:basedOn>` chain root → leaf, then the
+    /// direct `<w:pPr>`): [`Self::merged_with`] level by level, except
+    /// that the borders are folded per edge AFTER every level's logical
+    /// edges were re-oriented to the FINAL direction
+    /// ([`Self::oriented_borders`]), which is only known once every level
+    /// has been seen (a direct `<w:bidi>` turns a style's `<w:start>`
+    /// edge around).
+    pub fn cascade<'a>(levels: impl IntoIterator<Item = &'a ParaProperties>) -> ParaProperties {
+        let levels: Vec<&ParaProperties> = levels.into_iter().collect();
+        let mut out = ParaProperties::default();
+        for level in &levels {
+            out = out.merged_with((*level).clone());
+        }
+        let rtl = out.direction == Some(TextDirection::Rtl);
+        let mut borders: Option<CellBorders> = None;
+        let mut spelling = BorderSpelling::default();
+        for level in &levels {
+            if level.borders.is_none() {
+                continue;
+            }
+            let oriented = (*level).clone().oriented_borders(rtl);
+            spelling = merged_border_spelling(
+                (&borders, spelling),
+                (&oriented.borders, oriented.border_spelling),
+                rtl,
+            );
+            borders = merged_borders(borders, oriented.borders);
+        }
+        out.borders = borders;
+        out.border_spelling = spelling;
+        out
+    }
+}
+
+/// Issue #395 — per-edge overlay of `patch` onto `base` (see
+/// [`ParaProperties::merged_with`]).
+fn merged_borders(base: Option<CellBorders>, patch: Option<CellBorders>) -> Option<CellBorders> {
+    match (base, patch) {
+        (Some(b), Some(p)) => Some(CellBorders {
+            top: p.top.or(b.top),
+            left: p.left.or(b.left),
+            bottom: p.bottom.or(b.bottom),
+            right: p.right.or(b.right),
+            inside_h: p.inside_h.or(b.inside_h),
+            inside_v: p.inside_v.or(b.inside_v),
+        }),
+        (b, None) => b,
+        (None, p) => p,
+    }
+}
+
+/// Issues #352 / #395 — the logical spelling of [`merged_borders`]: each
+/// flag comes from whichever side supplied the edge it describes (start =
+/// the leading slot: left, or right when `rtl`).
+fn merged_border_spelling(
+    base: (&Option<CellBorders>, BorderSpelling),
+    patch: (&Option<CellBorders>, BorderSpelling),
+    rtl: bool,
+) -> BorderSpelling {
+    match (base.0, patch.0) {
+        (_, None) => base.1,
+        (None, Some(_)) => patch.1,
+        (Some(_), Some(p)) => {
+            let (lead, trail) = if rtl {
+                (&p.right, &p.left)
+            } else {
+                (&p.left, &p.right)
+            };
+            BorderSpelling {
+                start: if lead.is_some() {
+                    patch.1.start
+                } else {
+                    base.1.start
+                },
+                end: if trail.is_some() {
+                    patch.1.end
+                } else {
+                    base.1.end
+                },
+            }
         }
     }
 }
@@ -4987,6 +5179,26 @@ pub struct RowProperties {
     /// Issue #84 — unmodeled `<w:trPr>` children, verbatim. See
     /// [`GrabBag`].
     pub grab_bag: Option<Box<GrabBag>>,
+    /// Issue #365 — the row's tracked changes: `<w:trPr><w:ins/>` (a
+    /// tracked row insertion) / `<w:del/>` (a tracked row deletion), in
+    /// source order — a row one reviewer inserted and another deleted
+    /// carries both (the #303 rule for paragraph marks). `start` / `end`
+    /// are unused. They are `CT_TrPr` children, so they live with the
+    /// row properties: the verified `<w:trPr>` passthrough (issue #248)
+    /// re-emits the source bytes only while they are unchanged. Accepting
+    /// a deletion / rejecting an insertion removes the row
+    /// ([`DocumentTree::resolve_revisions`]). Skipped when empty, so a
+    /// pre-#365 snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<Revision>,
+}
+
+impl TableRow {
+    /// Issue #365 — the row's first tracked change (see
+    /// [`RowProperties::revisions`] for a row carrying several).
+    pub fn revision(&self) -> Option<&Revision> {
+        self.props.revisions.first()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -7199,7 +7411,7 @@ impl DocumentTree {
         };
         let mut blocks = self.blocks.clone();
         let parent = start.path.parent();
-        for idx in start_idx..=end_idx {
+        for idx in self.sibling_range(&start.path, start_idx, end_idx) {
             let Some(Block::Paragraph(p)) = container.get(idx as usize) else {
                 continue;
             };
@@ -7313,7 +7525,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.alignment = Some(align);
@@ -7382,7 +7594,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.direction = Some(direction);
@@ -8089,7 +8301,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8143,9 +8355,8 @@ impl DocumentTree {
     /// [`Self::recompute_paragraph_props`] (on every style mutation)
     /// and by the reader's first-pass cascade.
     pub fn resolve_style_cascade(&self, style_id: Option<&str>) -> ParaProperties {
-        let mut out = self.style_defaults.clone();
         let Some(leaf) = style_id else {
-            return out;
+            return ParaProperties::cascade([&self.style_defaults]);
         };
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut chain: Vec<&ParagraphStyle> = Vec::new();
@@ -8160,10 +8371,11 @@ impl DocumentTree {
             chain.push(def);
             current = def.based_on.as_deref();
         }
-        for def in chain.iter().rev() {
-            out = out.clone().merged_with(def.para.clone());
-        }
-        out
+        /* Issue #395 — through the direction-aware cascade, so a
+        style's logical border edges land by the chain's direction. */
+        ParaProperties::cascade(
+            std::iter::once(&self.style_defaults).chain(chain.iter().rev().map(|d| &d.para)),
+        )
     }
 
     /// Issue #29 — the RUN half of the cascade: fold
@@ -8202,7 +8414,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8400,7 +8612,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8463,7 +8675,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8529,7 +8741,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8650,7 +8862,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8727,7 +8939,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
             }
@@ -8782,7 +8994,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.list_item = None;
@@ -9304,7 +9516,7 @@ impl DocumentTree {
                 return self.clone();
             };
             let parent = start.path.parent();
-            for idx in start_idx..=end_idx {
+            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.borders = borders.clone();
@@ -11126,7 +11338,6 @@ pub fn recompute_paragraph_props(
     styles: &std::collections::HashMap<String, ParagraphStyle>,
     style_defaults: &ParaProperties,
 ) {
-    let mut resolved = style_defaults.clone();
     /* Walk the style chain leaf → root with the same cycle / depth
     guard as `DocumentTree::resolve_style_cascade` (kept here as a
     free fn so callers without a borrowed `DocumentTree` can still
@@ -11145,11 +11356,17 @@ pub fn recompute_paragraph_props(
             chain.push(def);
             current = def.based_on.as_deref();
         }
-        for def in chain.iter().rev() {
-            resolved = resolved.merged_with(def.para.clone());
-        }
+        /* Issue #395 — defaults → chain → direct in ONE direction-
+        aware cascade: the logical border edges of every level land on
+        the side the paragraph's final direction names. */
+        para.props = ParaProperties::cascade(
+            std::iter::once(style_defaults)
+                .chain(chain.iter().rev().map(|d| &d.para))
+                .chain(std::iter::once(&para.direct_overrides)),
+        );
+        return;
     }
-    para.props = resolved.merged_with(para.direct_overrides.clone());
+    para.props = ParaProperties::cascade([style_defaults, &para.direct_overrides]);
 }
 
 /// Sprint 11 — UAX-#29 word count for one paragraph's text. Shares
@@ -11803,6 +12020,58 @@ pub fn parent_container_snapshot(doc: &DocumentTree, path: &BlockPath) -> Option
     Some(cell.blocks.clone())
 }
 
+/// Issue #422 — [`parent_container_snapshot`]'s length, without the clone:
+/// how many blocks the container `path`'s last step indexes into holds
+/// (the top-level sequence, or a table cell's blocks). `None` when the
+/// path does not resolve to a container.
+pub fn parent_container_len(doc: &DocumentTree, path: &BlockPath) -> Option<usize> {
+    if path.steps.len() == 1 {
+        return Some(doc.blocks.len());
+    }
+    if path.steps.len() < 3 {
+        return None;
+    }
+    let n = path.steps.len();
+    let grandparent = BlockPath {
+        steps: path.steps[..n - 2].to_vec(),
+    };
+    let Block::Table(t) = doc.block_at(&grandparent)? else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = path.steps[n - 2] else {
+        return None;
+    };
+    Some(
+        t.rows
+            .get(row as usize)?
+            .cells
+            .get(col as usize)?
+            .blocks
+            .len(),
+    )
+}
+
+impl DocumentTree {
+    /// Issue #422 — the sibling indices `start_idx..=end_idx` of a
+    /// same-parent range, clipped to the blocks that exist in `path`'s
+    /// container. The indices come off the wire: an end index of ~4
+    /// billion used to drive the range loops of `set_line_spacing` & co.
+    /// through 4 billion iterations (88 s for one fuzz-generated
+    /// `SetLineSpacing`), each building a path to a block that is not
+    /// there. A missing index addresses nothing, so the clipped loop
+    /// mutates exactly the paragraphs the unclipped one did.
+    fn sibling_range(
+        &self,
+        path: &BlockPath,
+        start_idx: u32,
+        end_idx: u32,
+    ) -> std::ops::Range<u32> {
+        let len = parent_container_len(self, path).unwrap_or(0) as u64;
+        let stop = (u64::from(end_idx) + 1).min(len) as u32;
+        start_idx..stop
+    }
+}
+
 /// Same parent container? Two paragraph paths share a container
 /// when every step but the last is identical.
 pub fn same_parent(a: &BlockPath, b: &BlockPath) -> bool {
@@ -12127,6 +12396,92 @@ mod tests {
         );
         let view = fam.complex_script_view();
         assert_eq!((view.font_family, view.font_theme), (None, None));
+    }
+
+    /// Issue #424 — an unresolved (raw) family name is a real Latin-slot
+    /// claim: the slot routing moves / mirrors it like `font_family`, and
+    /// the cascade treats the two fields as one slot.
+    #[test]
+    fn raw_font_family_is_a_latin_slot_claim() {
+        let raw = SpanStyle {
+            raw_font_family: Some("Sakkal Majalla".into()),
+            ..Default::default()
+        };
+        let sakkal = FontFamily::from_display_name("Sakkal Majalla");
+        assert!(raw.names_latin_family());
+        assert!(
+            !SpanStyle {
+                raw_font_family: Some("  ".into()),
+                ..Default::default()
+            }
+            .names_latin_family(),
+            "a blank raw name names nothing"
+        );
+        /* Both slots: the complex-script slot takes the raw name. */
+        let both = raw.clone().with_cs_twins();
+        assert_eq!(both.raw_font_family.as_deref(), Some("Sakkal Majalla"));
+        assert_eq!(both.font_family_cs, sakkal);
+        /* Complex script only: the name leaves the Latin slot. */
+        let cs_only = raw.clone().into_cs_only();
+        assert_eq!((cs_only.font_family, cs_only.raw_font_family), (None, None));
+        assert_eq!(cs_only.font_family_cs, sakkal);
+        assert_eq!(
+            cs_only
+                .font_family_cs
+                .as_ref()
+                .map(FontFamily::display_name),
+            Some("Sakkal Majalla"),
+            "written verbatim as w:cs"
+        );
+        /* A raw pick over a modeled family replaces it (layout and the
+        writer prefer `font_family`, which used to shadow the pick)… */
+        let amiri = SpanStyle {
+            font_family: Some(FontFamily::Amiri),
+            font_family_cs: Some(FontFamily::Amiri),
+            ..Default::default()
+        };
+        let picked = amiri.clone().merged_with(raw.clone());
+        assert_eq!(picked.font_family, None);
+        assert_eq!(picked.raw_font_family.as_deref(), Some("Sakkal Majalla"));
+        assert_eq!(
+            picked.font_family_cs,
+            Some(FontFamily::Amiri),
+            "a Latin-only raw pick leaves the complex-script slot"
+        );
+        /* …a modeled pick drops a stale raw name… */
+        let back = picked.merged_with(SpanStyle {
+            font_family: Some(FontFamily::LiberationSans),
+            ..Default::default()
+        });
+        assert_eq!(
+            (back.font_family, back.raw_font_family),
+            (Some(FontFamily::LiberationSans), None)
+        );
+        /* …and a level naming neither keeps both. */
+        let kept = raw.clone().merged_with(SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(kept.raw_font_family.as_deref(), Some("Sakkal Majalla"));
+        /* A cs-only raw pick claims the `cs` theme binding, not the Latin
+        ones (issue #355's claim rule). */
+        let themed = SpanStyle {
+            font_bindings: Some(Box::new(theme::RunFontBindings {
+                ascii: Some(theme::FontBinding::Theme("minorHAnsi".into())),
+                h_ansi: Some(theme::FontBinding::Theme("minorHAnsi".into())),
+                east_asia: None,
+                cs: Some(theme::FontBinding::Theme("minorBidi".into())),
+            })),
+            ..Default::default()
+        };
+        let merged = themed.merged_with(raw.into_cs_only());
+        let b = merged.font_bindings.as_deref().expect("bindings");
+        assert_eq!(b.cs, Some(theme::FontBinding::Name));
+        assert_eq!(
+            b.ascii,
+            Some(theme::FontBinding::Theme("minorHAnsi".into())),
+            "the Latin slot stays on the theme"
+        );
     }
 
     /* ---- issue #23: dynamic, string-backed FontFamily ------------- */
@@ -15125,6 +15480,51 @@ mod tests {
         );
         let d = d.set_line_spacing(start, end, 0.0);
         assert_eq!(d.blocks[0].as_paragraph().unwrap().props.line_height, None);
+    }
+
+    /// Issue #422 — a wire end index of `u32::MAX` used to walk ~4 billion
+    /// missing siblings (88 s for one fuzz `SetLineSpacing`). The range is
+    /// clipped to the blocks that exist; the same paragraphs change.
+    #[test]
+    fn range_edits_clip_a_hostile_end_index_to_existing_siblings() {
+        let mut d = DocumentTree::from_text("a");
+        let p = d.blocks[0].clone();
+        d.blocks.push_back(p.clone());
+        d.blocks.push_back(p);
+        let start = LogicalPos::new(BlockPath::top(1), 0);
+        let end = LogicalPos::new(BlockPath::top(u32::MAX), 0);
+        let started = std::time::Instant::now();
+        let spaced = d.set_line_spacing(start.clone(), end.clone(), 2.0);
+        let aligned = d.set_alignment(start.clone(), end.clone(), Alignment::Center);
+        let styled = d.apply_style(
+            start.clone(),
+            end,
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let lh =
+            |doc: &DocumentTree, i: usize| doc.blocks[i].as_paragraph().unwrap().props.line_height;
+        assert_eq!(lh(&spaced, 0), None);
+        assert_eq!(lh(&spaced, 1), Some(LineHeight::Auto { twips: 480 }));
+        assert_eq!(lh(&spaced, 2), Some(LineHeight::Auto { twips: 480 }));
+        let al = |i: usize| aligned.blocks[i].as_paragraph().unwrap().props.alignment;
+        assert_eq!(
+            (al(0), al(1), al(2)),
+            (None, Some(Alignment::Center), Some(Alignment::Center))
+        );
+        assert!(styled.blocks[0].as_paragraph().unwrap().spans.is_empty());
+        assert!(!styled.blocks[2].as_paragraph().unwrap().spans.is_empty());
+        // A start index past the end addresses nothing.
+        let far = LogicalPos::new(BlockPath::top(u32::MAX - 1), 0);
+        let none = d.set_line_spacing(
+            far.clone(),
+            LogicalPos::new(BlockPath::top(u32::MAX), 0),
+            2.0,
+        );
+        assert!((0..3).all(|i| lh(&none, i).is_none()));
     }
 
     /// Issue #145 — `SetTabStops` must not clobber an existing leader

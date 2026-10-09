@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use engine::SpanStyle;
 use format_docx::test_fixtures::{STYLES_PATCH_XML, styles_patch_docx};
 
-/// Step 51:
+/// Step 57:
 ///
 /// a. A zero-edit save keeps `styles.xml` byte-identical.
 /// b. `ModifyStyle` on `Heading 1` (a larger size) rewrites exactly its
@@ -33,7 +33,7 @@ pub fn run_styles_patch_roundtrip() -> Result<()> {
     if styles_of(&zero)? != STYLES_PATCH_XML {
         bail!("zero-edit save changed styles.xml");
     }
-    println!("[roundtrip] step 51a OK — zero-edit save keeps styles.xml byte-identical");
+    println!("[roundtrip] step 57a OK — zero-edit save keeps styles.xml byte-identical");
 
     let bigger = SpanStyle {
         font_size: Some(20.0),
@@ -67,7 +67,7 @@ pub fn run_styles_patch_roundtrip() -> Result<()> {
         }
     }
     println!(
-        "[roundtrip] step 51b OK — ModifyStyle on Heading 1 rewrites only its <w:sz>; every other style element, latentStyles and docDefaults byte-identical"
+        "[roundtrip] step 57b OK — ModifyStyle on Heading 1 rewrites only its <w:sz>; every other style element, latentStyles and docDefaults byte-identical"
     );
 
     let renamed = doc.modify_style("Heading1", None, None, None, Some("Chapter".into()));
@@ -81,6 +81,6 @@ pub fn run_styles_patch_roundtrip() -> Result<()> {
     {
         bail!("a rename rewrote more than <w:name>:\n{out}");
     }
-    println!("[roundtrip] step 51c OK — a display-name change rewrites only <w:name>");
+    println!("[roundtrip] step 57c OK — a display-name change rewrites only <w:name>");
     Ok(())
 }

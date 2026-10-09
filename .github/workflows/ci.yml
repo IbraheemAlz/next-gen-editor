@@ -36,6 +36,11 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      # Issue #412 — `fuzz/` is its own workspace, so `--all` above does
+      # not reach it.
+      - name: cargo fmt --check (fuzz crate)
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -245,6 +250,13 @@ jobs:
         # this exact trap: the workspace lockfile lives at the repo root).
         run: pnpm install --frozen-lockfile
 
+      # Issue #332 - the TypeScript unit tests (vitest, node environment,
+      # fake-indexeddb): event-log scoring / GC / write-confirm, EngineClient
+      # trap handling, recoveryNotices, dev-hook gating. Seconds, no browser
+      # and no wasm; failing here saves the minute of Playwright below.
+      - name: Run TypeScript unit tests
+        run: pnpm -r test
+
       - name: Run Playwright e2e suite
         env:
           CI: 'true'
@@ -268,13 +280,13 @@ jobs:
     continue-on-error: true
     # Bound the runtime — visual-diff alone runs in ~1 min on a clean
     # runner, pdf-validate (issue #258) under 15 s more (measured ~9 s
-    # locally: 6 tier-a documents, browser export + structural checks;
-    # veraPDF itself is not installed on the runner, so external
-    # conformance is skipped there — the structural check is CI's gate).
-    # The 7-min cap catches dev-server boot stalls without letting the
-    # whole job burn an hour of runner time. continue-on-error keeps the
-    # overall workflow green when the cap fires.
-    timeout-minutes: 7
+    # locally: 6 tier-a documents, browser export + structural checks),
+    # plus (issue #393) the veraPDF install (cached after the first run;
+    # ~30 s cold) and the browserless `--native` pass. The 12-min cap
+    # catches dev-server boot stalls without letting the whole job burn
+    # an hour of runner time. continue-on-error keeps the overall workflow
+    # green when the cap fires.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v6
 
@@ -344,16 +356,62 @@ jobs:
           echo "visual-diff exit=$VD"
           [ "$VD" -eq 0 ]
 
+      # Issue #393 (resolves the open half of #322) — veraPDF on the runner,
+      # so both pdf-validate steps run the REAL PDF/A conformance checks
+      # instead of the structural-only fallback. The CLI is the official
+      # greenfield installer zip at a pinned version + SHA-256, installed
+      # headlessly (IzPack auto-install) into ~/verapdf and cached with
+      # actions/cache so only the first run downloads ~33 MB. Java ships on
+      # the ubuntu-24.04 image (veraPDF needs 11+).
+      - name: Cache veraPDF
+        id: verapdf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/verapdf
+          key: verapdf-1.30.2-${{ runner.os }}
+
+      - name: Install veraPDF 1.30.2
+        if: steps.verapdf-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          VERA_VERSION=1.30.2
+          VERA_SHA256=6cc6341cb1af644044054b81f00a6590a7918abb18f762243de115258bcad838
+          WORK="$(mktemp -d)"
+          curl -sSfL --retry 3 -o "$WORK/verapdf.zip" \
+            "https://software.verapdf.org/releases/1.30/verapdf-greenfield-${VERA_VERSION}-installer.zip"
+          echo "${VERA_SHA256}  $WORK/verapdf.zip" | sha256sum -c -
+          unzip -q "$WORK/verapdf.zip" -d "$WORK/unz"
+          cat > "$WORK/auto-install.xml" <<XML
+          <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+          <AutomatedInstallation langpack="eng">
+            <com.izforge.izpack.panels.htmlhello.HTMLHelloPanel id="welcome"/>
+            <com.izforge.izpack.panels.target.TargetPanel id="install_dir">
+              <installpath>$HOME/verapdf</installpath>
+            </com.izforge.izpack.panels.target.TargetPanel>
+            <com.izforge.izpack.panels.packs.PacksPanel id="sdk_pack_select">
+              <pack index="0" name="veraPDF Runtime" selected="true"/>
+            </com.izforge.izpack.panels.packs.PacksPanel>
+            <com.izforge.izpack.panels.install.InstallPanel id="install"/>
+            <com.izforge.izpack.panels.finish.FinishPanel id="finish"/>
+          </AutomatedInstallation>
+          XML
+          java -jar "$WORK/unz/verapdf-greenfield-${VERA_VERSION}/verapdf-izpack-installer-${VERA_VERSION}.jar" "$WORK/auto-install.xml"
+
+      - name: Put veraPDF on PATH
+        run: |
+          set -euo pipefail
+          echo "$HOME/verapdf" >> "$GITHUB_PATH"
+          "$HOME/verapdf/verapdf" --version
+
       - name: Run pdf-validate harness
         # Issue #258 — the tier-a corpus (6 documents: TOC leaders, inline
         # images, a bordered/shaded table, justified Arabic Kashida,
         # footnotes + endnotes, a text box) exported through the real
         # engine and checked for the PDF/A-1b structural markers
-        # `crates/format-pdf` must emit. veraPDF is not installed on this
-        # runner, so external conformance validation is skipped here (a
-        # WARNING, not a failure) — that full check runs locally
-        # (`node tools/pdf-validate/run.mjs`, veraPDF via Homebrew) and is
-        # this job's reason for staying non-blocking regardless.
+        # `crates/format-pdf` must emit, then (issue #393) validated by
+        # the real veraPDF installed above - `--strict` makes a missing
+        # veraPDF a failure instead of a silent skip. The job stays
+        # non-blocking regardless (see the job header).
         run: |
           set -uo pipefail
           pnpm --dir ts dev &
@@ -362,8 +420,22 @@ jobs:
             curl -sf http://localhost:5173 >/dev/null 2>&1 && break
             sleep 1
           done
-          timeout 60 node tools/pdf-validate/run.mjs --corpus tier-a --profile 1b
+          timeout 60 node tools/pdf-validate/run.mjs --corpus tier-a --profile 1b --strict
           PV=$?
           kill "$DEV_PID" 2>/dev/null || true
           echo "pdf-validate exit=$PV"
           [ "$PV" -eq 0 ]
+
+      # Issue #393 - the browserless `--native` pass (#361): Latin + Arabic
+      # fixtures in CFF-flavoured OpenType and TrueType, exported straight
+      # from `format-pdf` (no Vite, no Chrome), then the structural, size
+      # and veraPDF checks. The test binary is built in its own uncapped
+      # step so the 2-minute cap below bounds the run + validation, not a
+      # cold compile.
+      - name: Build native pdf-validate exporter
+        run: cargo test -p format-pdf --lib --no-run
+
+      - name: Run pdf-validate harness (native, no browser)
+        run: |
+          set -uo pipefail
+          timeout 120 node tools/pdf-validate/run.mjs --native --strict

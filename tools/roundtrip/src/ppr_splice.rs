@@ -19,7 +19,7 @@ fn save(archive: &format_docx::DocxArchive, doc: &engine::DocumentTree) -> Resul
     Ok(String::from_utf8(extract_doc_xml(&bytes)?)?)
 }
 
-/// Step 50:
+/// Step 56:
 ///
 /// a. Zero-edit identity; the pattern (`pct25` + colour) and the border
 ///    `w:space` / `w:shadow` are modeled.
@@ -53,7 +53,7 @@ pub fn run_ppr_splice_roundtrip() -> Result<()> {
         bail!("pattern / border extras not modeled: {:?}", p.props);
     }
     println!(
-        "[roundtrip] step 50a OK — zero-edit identity; pattern shading and border space / shadow modeled"
+        "[roundtrip] step 56a OK — zero-edit identity; pattern shading and border space / shadow modeled"
     );
 
     let indented = doc.set_paragraph_indent(at(0, 0), at(0, 0), 72.0, 0.0, 18.0);
@@ -67,7 +67,7 @@ pub fn run_ppr_splice_roundtrip() -> Result<()> {
         bail!("an indent change rewrote more than <w:ind>:\n{out}");
     }
     println!(
-        "[roundtrip] step 50b OK — an indent change rewrites only <w:ind>; every other pPr child byte-identical"
+        "[roundtrip] step 56b OK — an indent change rewrites only <w:ind>; every other pPr child byte-identical"
     );
 
     let shaded = doc.set_paragraph_shading(at(0, 0), at(0, 0), Some([0, 0, 0xFF, 0xFF]));
@@ -92,7 +92,7 @@ pub fn run_ppr_splice_roundtrip() -> Result<()> {
         bail!("a changed fill / edge lost what the model does not change:\n{out}");
     }
     println!(
-        "[roundtrip] step 50c OK — a changed fill keeps pct25 + its colour; a changed edge keeps w:space, drops the stale theme colour"
+        "[roundtrip] step 56c OK — a changed fill keeps pct25 + its colour; a changed edge keeps w:space, drops the stale theme colour"
     );
 
     let typed = doc.insert_text(at(1, 3), "X");
@@ -105,6 +105,6 @@ pub fn run_ppr_splice_roundtrip() -> Result<()> {
     if !out.contains(r#"<w:p w:rsidR="00B3"><w:pPr><w:jc w:val="center"/></w:pPr><w:r>"#) {
         bail!("aligning a pPr-less paragraph baked cascade values:\n{out}");
     }
-    println!("[roundtrip] step 50d OK — no cascade value is baked into a regenerated pPr");
+    println!("[roundtrip] step 56d OK — no cascade value is baked into a regenerated pPr");
     Ok(())
 }

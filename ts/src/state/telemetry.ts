@@ -26,6 +26,7 @@ type ErrorCode =
     | 'FONT_LOAD'
     | 'RPC'
     | 'CHECKPOINT_FAILED'
+    | 'JOURNAL_FAILED'
     | 'UNKNOWN';
 type RecoveryOutcome = 'RECOVERED' | 'FAILED' | 'PENDING';
 /** Mirror of `bridge::RendererDowngrade` (issue #99). */
@@ -238,6 +239,8 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
     /* Issue #87 — the synthetic paint side-channel replays the last real
        paint's degradation notes verbatim; sample a note set once. */
     let lastDegradedKey = '[]';
+    /* Issue #390 - one JOURNAL_FAILED sample per exhausted-journal run. */
+    let journalFailedReported = false;
     const recentCommands: string[] = [];
     let pendingDocOpen: { sizeBytes: number; openMs: number; deadlineMs: number } | null = null;
 
@@ -341,6 +344,18 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                     );
                 }
                 pendingDocOpen = null;
+            }
+        } else if (e.type === 'CHECKPOINT_STATE') {
+            /* Issue #390 - the command journal gave up after its bounded
+               retries: a recovery would now miss commands. The per-attempt
+               failures are already counted by `onCheckpointFailure`. */
+            if (!e.ok && e.journal_failing) {
+                if (!journalFailedReported) {
+                    journalFailedReported = true;
+                    pending.push(sample({ type: 'ERROR', code: 'JOURNAL_FAILED', recoverable: true }));
+                }
+            } else {
+                journalFailedReported = false;
             }
         } else if (e.type === 'FONT_MISSING') {
             pending.push(
