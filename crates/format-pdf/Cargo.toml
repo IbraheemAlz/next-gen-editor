@@ -11,11 +11,19 @@ engine = { path = "../engine" }
 layout = { path = "../layout" }
 text-pipeline = { path = "../text-pipeline" }
 pdf-writer = { workspace = true }
+subsetter = { workspace = true }
 flate2 = { workspace = true }
 png = { workspace = true }
 gif = { workspace = true, optional = true }
 image-webp = { workspace = true, optional = true }
 tiff = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Issue #361 — `src/cff_test_font.rs` reads TrueType outlines through
+# rustybuzz's `ttf_parser` re-export to synthesize a CFF test font at test
+# time (no binary fixture in the tree). Same version text-pipeline already
+# links, so no new crate.
+rustybuzz = { workspace = true }
 
 [features]
 # Issue #189 — pure-Rust GIF / WebP decoders for PDF image XObjects. Issue

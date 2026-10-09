@@ -80,6 +80,12 @@ quick-xml = "0.36"
 rc-zip = "5"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 pdf-writer = "0.14"
+# Issue #327 — PDF font subsetting (embed only the glyphs a document shows).
+# The subsetter behind Typst / krilla, MIT OR Apache-2.0. `default-features =
+# false` drops `variable-fonts` (skrifa + write-fonts + kurbo — CFF2 → TrueType
+# instancing, out of scope), leaving `rustc-hash` 2 as its only dependency.
+# Consumed only by `format-pdf`; wasm cost measured in its `font_program.rs`.
+subsetter = { version = "0.2.6", default-features = false }
 # flate2 default features select the pure-Rust `miniz_oxide` backend — no C,
 # wasm-safe. PDF `/FlateDecode` streams are zlib (RFC 1950), which flate2's
 # `ZlibEncoder` produces directly.
