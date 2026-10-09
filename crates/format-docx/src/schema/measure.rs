@@ -166,37 +166,6 @@ pub(crate) fn attr_measure_twips(e: &BytesStart, key: &[u8], spec: MeasureSpec) 
     attr_measure(e, key, spec).map(|t| t.round() as i32)
 }
 
-/// Issue #349 — a `w:type="pct"` width (`ST_MeasurementOrPercent` /
-/// `ST_DecimalNumberOrPercent`): fiftieths of a percent (`5000` = 100 %),
-/// or a transitional `50%` string. Clamped into what the model holds.
-pub(crate) fn attr_pct(e: &BytesStart, key: &[u8]) -> Option<u16> {
-    let raw = attr_val(e, key)?;
-    let v = raw.trim();
-    let parsed = match v.strip_suffix('%') {
-        Some(p) => p.trim().parse::<f64>().ok().map(|p| p * 50.0),
-        None => v.parse::<f64>().ok(),
-    }
-    .filter(|p| p.is_finite() && *p >= 0.0 && v.bytes().all(|b| !b.is_ascii_alphabetic()));
-    match parsed {
-        Some(p) if p <= f64::from(u16::MAX) => Some(p.round() as u16),
-        Some(_) => {
-            warn(DocxWarning::MeasureClamped {
-                attr: describe(e, key),
-                value: raw,
-                twips: i64::from(u16::MAX),
-            });
-            Some(u16::MAX)
-        }
-        None => {
-            warn(DocxWarning::InvalidMeasure {
-                attr: describe(e, key),
-                value: raw,
-            });
-            None
-        }
-    }
-}
-
 /// `w:pgSz/@w:w`-style name of the attribute, for the reader report.
 fn describe(e: &BytesStart, key: &[u8]) -> String {
     format!(

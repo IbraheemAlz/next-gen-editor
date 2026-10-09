@@ -134,6 +134,69 @@ pub fn part_scoped_media_docx(body_image: &[u8], header_image: &[u8]) -> Vec<u8>
     buf
 }
 
+/// Issue #352 — four single-line paragraphs on a plain A4 page, each with
+/// a 3 pt red border on ONE logical/physical edge:
+///
+/// 0. LTR, `<w:start>`   → painted on the LEFT
+/// 1. RTL (`<w:bidi/>`), `<w:start>` → painted on the RIGHT
+/// 2. RTL, `<w:end>`     → painted on the LEFT
+/// 3. RTL, physical `<w:left>` → painted on the LEFT (legacy spelling,
+///    unchanged by #352)
+pub fn paragraph_start_end_borders_docx() -> Vec<u8> {
+    let ns = ns_decls();
+    let bdr = |edge: &str| {
+        format!(
+            "<w:pBdr><w:{edge} w:val=\"single\" w:sz=\"24\" w:space=\"4\" w:color=\"FF0000\"/></w:pBdr>"
+        )
+    };
+    let para = |edge: &str, rtl: bool, text: &str| {
+        format!(
+            "<w:p><w:pPr>{}{}</w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>",
+            bdr(edge),
+            if rtl { "<w:bidi/>" } else { "" },
+        )
+    };
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <w:document {ns}><w:body>{}{}{}{}\
+         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
+         <w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>\
+         </w:sectPr></w:body></w:document>",
+        para("start", false, "LTR start"),
+        para("start", true, "RTL start"),
+        para("end", true, "RTL end"),
+        para("left", true, "RTL left"),
+    );
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+</Types>";
+    let dot_rels = rels(&[(
+        "rId1",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+        "word/document.xml",
+    )]);
+    let entries: Vec<(&str, &[u8])> = vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", dot_rels.as_bytes()),
+        ("word/document.xml", document.as_bytes()),
+    ];
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            zip.start_file(name, opts).expect("zip entry");
+            zip.write_all(bytes).expect("zip write");
+        }
+        zip.finish().expect("zip finish");
+    }
+    buf
+}
+
 /// Issue #221 — a minimal one-paragraph package whose `<w:sectPr>` is
 /// entirely empty: no `<w:pgSz>` at all (ECMA-376 requires it, but real
 /// "wild" documents skip it — issue #109's original finding). Deliberately

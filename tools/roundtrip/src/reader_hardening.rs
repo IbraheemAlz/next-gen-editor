@@ -115,7 +115,7 @@ fn text(t: &str) -> String {
 
 /* ============================================ #350 — field phases ==== */
 
-/// Issue #350 — step 41: a nested field's result inside an instruction
+/// Issue #350 — step 42: a nested field's result inside an instruction
 /// (`IF { MERGEFIELD x } = "a" "yes" "no"`), field characters before any
 /// `begin`, and 200 `begin`s that never separate.
 pub(crate) fn run_field_phases_roundtrip() -> Result<()> {
@@ -137,16 +137,16 @@ pub(crate) fn run_field_phases_roundtrip() -> Result<()> {
     ]
     .concat();
     let xml = document(&format!("<w:p>{nested}</w:p>"));
-    let archive = check_fixture("step 41a", &xml, &["Pre no post"], &[(0, 0), (0, 11)])?;
+    let archive = check_fixture("step 42a", &xml, &["Pre no post"], &[(0, 0), (0, 11)])?;
     let p = archive
         .document
         .nth_paragraph(0)
         .context("nested-field paragraph")?;
     if p.fields.len() != 1 || p.fields[0].instruction != r#"IF { MERGEFIELD x } = "a" "yes" "no""# {
-        bail!("step 41a: fields {:?}", p.fields);
+        bail!("step 42a: fields {:?}", p.fields);
     }
     println!(
-        "[roundtrip] step 41a OK — a nested field's result inside an instruction is hidden; edits are pure insertions"
+        "[roundtrip] step 42a OK — a nested field's result inside an instruction is hidden; edits are pure insertions"
     );
 
     /* 41b — `end` / `separate` before `begin`. */
@@ -162,23 +162,23 @@ pub(crate) fn run_field_phases_roundtrip() -> Result<()> {
     ]
     .concat();
     let xml = document(&format!("<w:p>{stray}</w:p>"));
-    check_fixture("step 41b", &xml, &["visible 1"], &[(0, 0), (0, 9)])?;
-    println!("[roundtrip] step 41b OK — stray separate / end are ignored and survive regeneration");
+    check_fixture("step 42b", &xml, &["visible 1"], &[(0, 0), (0, 9)])?;
+    println!("[roundtrip] step 42b OK — stray separate / end are ignored and survive regeneration");
 
     /* 41c — 200 unclosed begins, then an ordinary paragraph. */
     let mut broken = fld("begin").repeat(200);
     broken.push_str(&instr(" PAGE "));
     broken.push_str(&text("code"));
     let xml = document(&format!("<w:p>{broken}</w:p><w:p>{}</w:p>", text("normal")));
-    let archive = check_fixture("step 41c", &xml, &["", "normal"], &[(0, 0), (1, 6)])?;
+    let archive = check_fixture("step 42c", &xml, &["", "normal"], &[(0, 0), (1, 6)])?;
     if !archive
         .warnings
         .contains(&format_docx::DocxWarning::UnclosedField { count: 200 })
     {
-        bail!("step 41c: warnings {:?}", archive.warnings);
+        bail!("step 42c: warnings {:?}", archive.warnings);
     }
     println!(
-        "[roundtrip] step 41c OK — 200 unclosed begins close at their paragraph end; the next paragraph is visible"
+        "[roundtrip] step 42c OK — 200 unclosed begins close at their paragraph end; the next paragraph is visible"
     );
     Ok(())
 }
@@ -213,7 +213,7 @@ fn text_box_story(archive: &format_docx::DocxArchive, idx: u32) -> Result<String
     }
 }
 
-/// Issue #351 — step 42: `mc:AlternateContent` at paragraph, block and
+/// Issue #351 — step 43: `mc:AlternateContent` at paragraph, block and
 /// cell level reads ONE branch (the first satisfiable choice, else the
 /// fallback) and keeps every branch through a save.
 pub(crate) fn run_alternate_content_roundtrip() -> Result<()> {
@@ -229,27 +229,27 @@ pub(crate) fn run_alternate_content_roundtrip() -> Result<()> {
         text(" after")
     ));
     let archive = check_fixture(
-        "step 42a",
+        "step 43a",
         &xml,
         &["before \u{FFFC} after"],
         &[(0, 0), (0, 7), (0, 15)],
     )?;
     let story = text_box_story(&archive, 0)?;
     if story != "choice story" {
-        bail!("step 42a: text box story {story:?}, expected the choice's");
+        bail!("step 43a: text box story {story:?}, expected the choice's");
     }
     println!(
-        "[roundtrip] step 42a OK — paragraph-level AlternateContent reads its wps choice once; edits are pure insertions"
+        "[roundtrip] step 43a OK — paragraph-level AlternateContent reads its wps choice once; edits are pure insertions"
     );
 
     /* 42b — an unknown requirement takes the fallback. */
     let xml = xml.replace(r#"Requires="wps""#, r#"Requires="w99""#);
-    let archive = check_fixture("step 42b", &xml, &["before \u{FFFC} after"], &[(0, 15)])?;
+    let archive = check_fixture("step 43b", &xml, &["before \u{FFFC} after"], &[(0, 15)])?;
     let story = text_box_story(&archive, 0)?;
     if story != "fallback story" {
-        bail!("step 42b: text box story {story:?}, expected the fallback's");
+        bail!("step 43b: text box story {story:?}, expected the fallback's");
     }
-    println!("[roundtrip] step 42b OK — Requires=\"w99\" takes the VML fallback");
+    println!("[roundtrip] step 43b OK — Requires=\"w99\" takes the VML fallback");
 
     /* 42c — block level and between the paragraphs of a table cell. */
     let body = concat!(
@@ -261,7 +261,7 @@ pub(crate) fn run_alternate_content_roundtrip() -> Result<()> {
         r#"</w:tc></w:tr></w:tbl><w:p><w:r><w:t>last</w:t></w:r></w:p>"#,
     );
     let xml = document(body);
-    let archive = check_fixture("step 42c", &xml, &["choice", "last"], &[(0, 6), (2, 4)])?;
+    let archive = check_fixture("step 43c", &xml, &["choice", "last"], &[(0, 6), (2, 4)])?;
     let cell_blocks = archive
         .document
         .blocks
@@ -269,10 +269,10 @@ pub(crate) fn run_alternate_content_roundtrip() -> Result<()> {
         .and_then(engine::Block::as_table)
         .map(|t| t.rows[0].cells[0].blocks.len());
     if cell_blocks != Some(1) {
-        bail!("step 42c: the cell holds {cell_blocks:?} blocks, expected 1");
+        bail!("step 43c: the cell holds {cell_blocks:?} blocks, expected 1");
     }
     println!(
-        "[roundtrip] step 42c OK — block- and cell-level AlternateContent read one branch and keep both"
+        "[roundtrip] step 43c OK — block- and cell-level AlternateContent read one branch and keep both"
     );
     Ok(())
 }

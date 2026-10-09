@@ -11,9 +11,11 @@ pub mod ct_ppr;
 pub mod ct_rpr;
 pub mod ct_tbl;
 pub mod drawing;
+pub mod family;
 pub mod grab_bag;
 pub(crate) mod mce;
 pub(crate) mod measure;
+pub mod ns_normalize;
 pub mod source_markup;
 pub mod wp_anchor;
 
@@ -25,3 +27,6 @@ pub const NS_R: &str = "http://schemas.openxmlformats.org/package/2006/relations
 
 /// Content-types namespace (used by `[Content_Types].xml`).
 pub const NS_CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
+
+/// Issue #325 — the Transitional ↔ Strict namespace-family table.
+pub use family::{NS_W_STRICT, NsFamily};

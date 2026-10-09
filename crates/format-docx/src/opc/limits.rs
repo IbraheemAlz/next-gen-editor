@@ -162,15 +162,18 @@ pub(crate) fn read_package_entries(
     Ok(out)
 }
 
-/// `true` for an entry the reader parses as XML (and therefore walks):
-/// the WordprocessingML parts under `word/`, every relationship part and
-/// the core properties. Other XML (custom XML data, `docProps/app.xml`)
-/// rides the passthrough as bytes and is never walked.
+/// `true` for an entry the reader may parse as XML (and therefore walk):
+/// every `.xml` / `.rels` part — the main part and its siblings are found
+/// through the relationships (issue #353), so they can live anywhere —
+/// except the data parts the reader never parses (custom XML data, the
+/// extended / custom document properties), which ride the passthrough as
+/// bytes.
 pub(crate) fn is_walked_xml_part(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    (lower.starts_with("word/") && lower.ends_with(".xml"))
-        || lower.ends_with(".rels")
-        || lower == "docprops/core.xml"
+    let xml = lower.ends_with(".xml") || lower.ends_with(".rels");
+    let data_only = lower.starts_with("customxml/")
+        || (lower.starts_with("docprops/") && lower != "docprops/core.xml");
+    xml && !data_only
 }
 
 /// Issue #348 — the XML shape bounds of one part: element nesting depth

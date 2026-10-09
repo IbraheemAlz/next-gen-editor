@@ -807,6 +807,82 @@ pub(crate) fn apply_pbdr_edge(
     }
 }
 
+/// Issue #352 — the logical `<w:start>` / `<w:end>` edges of a `<w:pBdr>`
+/// (ISO 29500; ECMA-376 2nd ed. and later accept them in Transitional
+/// too), collected during the parse and mapped to a physical side only
+/// once the paragraph's direction is final.
+#[derive(Default)]
+pub(crate) struct PbdrLogical {
+    start: Option<engine::BorderStroke>,
+    end: Option<engine::BorderStroke>,
+    /// The element was present (even with `w:val="none"`): the source
+    /// spelled that edge logically.
+    start_seen: bool,
+    end_seen: bool,
+}
+
+impl PbdrLogical {
+    /// Take `<w:start>` / `<w:end>`; `false` for every other edge name
+    /// (the caller then applies the physical-edge path).
+    pub(crate) fn accept(&mut self, name: &[u8], e: &quick_xml::events::BytesStart) -> bool {
+        match name {
+            b"w:start" => {
+                self.start = parse_border_stroke(e);
+                self.start_seen = true;
+                true
+            }
+            b"w:end" => {
+                self.end = parse_border_stroke(e);
+                self.end_seen = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Land the collected edges on `props` (the resolved paragraph
+    /// properties) and `overrides` (the direct pPr kept for a later
+    /// re-cascade): start = left in a left-to-right paragraph and right
+    /// in a right-to-left one, end the opposite. The spelling flags record
+    /// which edges the source wrote logically, for the writer.
+    pub(crate) fn fold_into(
+        self,
+        props: &mut engine::ParaProperties,
+        overrides: &mut engine::ParaProperties,
+    ) {
+        if !self.start_seen && !self.end_seen {
+            return;
+        }
+        let rtl = props.direction == Some(engine::TextDirection::Rtl);
+        for target in [props, overrides] {
+            if self.start.is_some() {
+                let borders = target
+                    .borders
+                    .get_or_insert_with(engine::CellBorders::default);
+                let slot = if rtl {
+                    &mut borders.right
+                } else {
+                    &mut borders.left
+                };
+                *slot = self.start.clone();
+            }
+            if self.end.is_some() {
+                let borders = target
+                    .borders
+                    .get_or_insert_with(engine::CellBorders::default);
+                let slot = if rtl {
+                    &mut borders.left
+                } else {
+                    &mut borders.right
+                };
+                *slot = self.end.clone();
+            }
+            target.border_spelling.start |= self.start_seen;
+            target.border_spelling.end |= self.end_seen;
+        }
+    }
+}
+
 /// Audit gap A.M3 — parse one `<w:tab w:val w:pos/>` child.
 /// `w:val` defaults to `left`; `w:pos` is twips (signed integer per
 /// spec). Returns `None` for malformed entries (missing pos) so they
@@ -1250,6 +1326,9 @@ fn parse_document_xml_inner(
     fold into `direct_ppr`. */
     let mut in_pbdr = false;
     let mut in_tabs = false;
+    /* Issue #352 — `<w:pBdr>` `<w:start>` / `<w:end>` edges, held until
+    the paragraph's direction is final (after the style cascade). */
+    let mut pbdr_logical = PbdrLogical::default();
 
     /* Issue #119 — run-level drawing objects (`<w:drawing>`,
     `<mc:AlternateContent>`, `<w:pict>`, `<w:object>`) are captured whole
@@ -1689,6 +1768,7 @@ fn parse_document_xml_inner(
                         markup.open_paragraph(&e, &ns, reader.buffer_position() as usize);
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
+                        pbdr_logical = PbdrLogical::default();
                         pmark_rpr = SpanStyle::default();
                         para_mark_revisions.clear();
                         para_mark_style = None;
@@ -2433,6 +2513,9 @@ fn parse_document_xml_inner(
                     }
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
                     /* Audit gap A.M4 — `<w:pBdr>` per-edge children. */
+                    /* Issue #352 — `accept` takes (and records) the logical
+                    `start` / `end` edges; every other edge falls through. */
+                    n if in_ppr && in_pbdr && pbdr_logical.accept(n, &e) => {}
                     n if in_ppr && in_pbdr => apply_pbdr_edge(n, &e, &mut direct_ppr),
                     /* Audit gap A.M3 — `<w:tabs>` per-stop children. */
                     n if in_ppr && in_tabs && n == b"w:tab" => {
@@ -2890,15 +2973,20 @@ fn parse_document_xml_inner(
                         the originals to produce the up-front resolved
                         view; we clone before consumption. */
                         let style_id_for_paragraph = p_style_id.clone();
-                        let direct_overrides_for_paragraph = direct_ppr.clone();
+                        let mut direct_overrides_for_paragraph = direct_ppr.clone();
                         /* Paragraph cascade: bake direct_ppr on top of doc
                         defaults + pStyle chain. The baseline rPr we computed
                         per-run is informational here. */
-                        let (props, _) = resolver.resolve_paragraph(
+                        let (mut props, _) = resolver.resolve_paragraph(
                             p_style_id.take().as_deref(),
                             std::mem::take(&mut direct_ppr),
                             std::mem::take(&mut pmark_rpr),
                         );
+                        /* Issue #352 — logical `<w:start>` / `<w:end>`
+                        border edges land on the physical side the
+                        RESOLVED direction names. */
+                        std::mem::take(&mut pbdr_logical)
+                            .fold_into(&mut props, &mut direct_overrides_for_paragraph);
                         /* Compose `ListItem` from the per-paragraph numPr
                         accumulators; partial refs (numId without ilvl, or
                         vice versa) default the missing field to 0 — Word
