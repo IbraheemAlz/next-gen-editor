@@ -69,6 +69,9 @@ export interface SdkShelfProps {
      *  sequence (`startTelemetry(client, { enabled: telemetry.enabled, ... })`)
      *  so `SettingsMenu`'s toggle and the actual collector agree. */
     telemetry: TelemetryConfig;
+    /** Issue #340 - the resolved telemetry collector endpoint, handed to
+     *  `EngineProvider` so SDK consumers read it from context. */
+    telemetryEndpoint?: string | undefined;
     /** Editor canvas + overlays mount here, inside the main grid track. */
     children: JSX.Element;
     /** True once the worker has finished INIT. Defaults to true if omitted
@@ -88,7 +91,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
     const ready = () => (props.engineReady ? props.engineReady() : true);
 
     return (
-        <EngineProvider client={handle}>
+        <EngineProvider client={handle} telemetryEndpoint={props.telemetryEndpoint}>
           <FontRegistryProvider registry={props.fontRegistry}>
           <TelemetryProvider config={props.telemetry}>
             <div class="nge-root nge-shell">

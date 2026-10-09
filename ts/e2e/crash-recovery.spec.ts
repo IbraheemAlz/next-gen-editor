@@ -812,3 +812,124 @@ test('a failed package write never leaves a snapshot naming a missing package (#
         (r as any).preHash,
     );
 });
+
+/* Issue #330 — the crash overlay's buttons must never lose the document.
+   `TrapOverlay` used to fall back to `window.location.reload()` for both
+   "Reload engine" and "Reload page"; a reload is a new session whose boot
+   clears the event log, so everything typed since the last manual save was
+   gone. The overlay is only visible between the TRAP and the RECOVERED
+   events, so the spec holds the in-place recovery open with a gate on
+   `client.recover` (the shell's `EditorCanvas` calls it through the same
+   instance), then clicks each button. */
+async function typeThenTrapWithOverlay(page: Page, typed: string): Promise<void> {
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+    await page.evaluate(async (text: string) => {
+        const w = window as any;
+        w.__survivedMarker = 'same-page';
+        for (const ch of text) {
+            await w.__dispatch({ type: 'INSERT_TEXT', at: undefined, text: ch });
+        }
+        const client = w.__engineClient;
+        let release!: () => void;
+        const gate = new Promise<void>((r) => (release = r));
+        w.__releaseRecover = release;
+        const orig = client.recover.bind(client);
+        client.recover = async (canvas: OffscreenCanvas) => {
+            await gate;
+            return orig(canvas);
+        };
+        await client.armTrap(1);
+        await w.__dispatch({ type: 'PING' }).catch(() => undefined);
+    }, typed);
+    await expect(page.locator('.nge-trap')).toBeVisible({ timeout: 15_000 });
+}
+
+async function docText(page: Page): Promise<string> {
+    return page.evaluate(async () => {
+        const dispatch = (window as any).__dispatch;
+        await dispatch({ type: 'SELECT_ALL' });
+        const p = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+        return p.type === 'CLIPBOARD_PAYLOAD' ? (p.plain as string) : `<${p.type}>`;
+    });
+}
+
+test('#330 crash overlay "Reload engine" recovers in place and keeps the document', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await typeThenTrapWithOverlay(page, 'KEEPME');
+    await page.getByRole('button', { name: 'Reload engine' }).click();
+    await page.evaluate(() => (window as any).__releaseRecover());
+    await page.waitForFunction(() => (window as any).__recovered === true, undefined, {
+        timeout: 15_000,
+    });
+    await expect(page.locator('.nge-trap')).toHaveCount(0);
+    /* Same page, not a reload. */
+    expect(await page.evaluate(() => (window as any).__survivedMarker)).toBe('same-page');
+    expect(await docText(page)).toBe(`KEEPME${SEED}`);
+});
+
+test('#330 crash overlay "Reload page" carries the document across the reload', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await typeThenTrapWithOverlay(page, 'CARRY');
+    await Promise.all([
+        page.waitForEvent('load'),
+        page.getByRole('button', { name: /Reload page/ }).click(),
+    ]);
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 30_000,
+    });
+    expect(await page.evaluate(() => (window as any).__survivedMarker)).toBeUndefined();
+    expect(await docText(page)).toBe(`CARRY${SEED}`);
+    /* The carry-over is honoured once: a second plain reload is a new session. */
+    await page.reload();
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 30_000,
+    });
+    expect(await docText(page)).toBe(SEED);
+});
+
+test('#330 a healthy session restarts its engine in place without losing text', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+    await page.evaluate(async () => {
+        const w = window as any;
+        w.__survivedMarker = 'same-page';
+        for (const ch of 'LIVE') await w.__dispatch({ type: 'INSERT_TEXT', at: undefined, text: ch });
+        w.__recovered = false;
+        await w.__engineClient.restartInPlace();
+    });
+    await page.waitForFunction(() => (window as any).__recovered === true, undefined, {
+        timeout: 15_000,
+    });
+    expect(await page.evaluate(() => (window as any).__survivedMarker)).toBe('same-page');
+    expect(await docText(page)).toBe(`LIVE${SEED}`);
+});
+
+test('#330 "Discard document" needs a confirmation and is the only action that drops the log', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await typeThenTrapWithOverlay(page, 'GONE');
+    await page.getByRole('button', { name: 'Discard document' }).click();
+    /* Still on the same page: the first click only arms the confirmation. */
+    expect(await page.evaluate(() => (window as any).__survivedMarker)).toBe('same-page');
+    await Promise.all([
+        page.waitForEvent('load'),
+        page.getByRole('button', { name: /Confirm: discard/ }).click(),
+    ]);
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 30_000,
+    });
+    expect(await docText(page)).toBe(SEED);
+});

@@ -1,4 +1,4 @@
-//! Issues #282 / #284 — step 39: comments on paragraphs the writer
+//! Issues #282 / #284 — step 42: comments on paragraphs the writer
 //! replays from their source bytes, and comments inside table cells.
 
 use super::{
@@ -78,7 +78,7 @@ fn save_both(archive: &format_docx::DocxArchive, doc: &DocumentTree) -> Result<V
     Ok(bytes)
 }
 
-/// Issue #282 — step 39.
+/// Issue #282 — step 42.
 ///
 /// a. A comment added to an untouched paragraph, and one added inside an
 ///    untouched table, are spliced into the replayed source bytes: the
@@ -96,7 +96,7 @@ pub fn run_comment_patch_roundtrip() -> Result<()> {
     let archive = read_docx(&fixture).context("read comment patch fixture")?;
     let doc_xml = extract_doc_xml(&fixture)?;
     if extract_doc_xml(&write_docx(&archive, &archive.document)?)? != doc_xml {
-        bail!("step 39: untouched save drifted");
+        bail!("step 42: untouched save drifted");
     }
 
     let top = |block: u32, offset: u32| LogicalPos::new(BlockPath::top(block), offset);
@@ -119,18 +119,18 @@ pub fn run_comment_patch_roundtrip() -> Result<()> {
     let xml = extract_doc_xml(&bytes)?;
     if !pure_insertion(&doc_xml, &xml) {
         bail!(
-            "step 39a: document.xml is not source + insertions:\n{}",
+            "step 42a: document.xml is not source + insertions:\n{}",
             String::from_utf8_lossy(&xml)
         );
     }
     let back = read_docx(&bytes).context("re-read")?;
     let comments = entry_bytes(&back, "word/comments.xml").context("comments.xml")?;
     if !pure_insertion(COMMENTS.as_bytes(), comments) {
-        bail!("step 39a: comments.xml is not source + insertions");
+        bail!("step 42a: comments.xml is not source + insertions");
     }
     if covered(&back.document, para_id).as_deref() != Some("beta") {
         bail!(
-            "step 39a: paragraph comment re-reads on {:?}",
+            "step 42a: paragraph comment re-reads on {:?}",
             covered(&back.document, para_id)
         );
     }
@@ -143,11 +143,11 @@ pub fn run_comment_patch_roundtrip() -> Result<()> {
             .as_deref()
             != Some(text)
         {
-            bail!("step 39a: comment {id} lost its body");
+            bail!("step 42a: comment {id} lost its body");
         }
     }
     println!(
-        "[roundtrip] step 39a OK — comments added to an untouched paragraph and table cell are spliced in (source + insertions, both save paths)"
+        "[roundtrip] step 42a OK — comments added to an untouched paragraph and table cell are spliced in (source + insertions, both save paths)"
     );
 
     let deleted = archive.document.delete_comment(0);
@@ -155,16 +155,16 @@ pub fn run_comment_patch_roundtrip() -> Result<()> {
     let xml = extract_doc_xml(&bytes)?;
     if !pure_insertion(&xml, &doc_xml) || String::from_utf8_lossy(&xml).contains("w:comment") {
         bail!(
-            "step 39b: delete is not a pure deletion of every anchor:\n{}",
+            "step 42b: delete is not a pure deletion of every anchor:\n{}",
             String::from_utf8_lossy(&xml)
         );
     }
     let back = read_docx(&bytes).context("re-read deleted")?;
     if !back.document.comment_defs.is_empty() || !back.document.comment_ranges.is_empty() {
-        bail!("step 39b: the deleted comment re-reads");
+        bail!("step 42b: the deleted comment re-reads");
     }
     println!(
-        "[roundtrip] step 39b OK — a deleted comment leaves the untouched paragraph and comments.xml (pure deletion)"
+        "[roundtrip] step 42b OK — a deleted comment leaves the untouched paragraph and comments.xml (pure deletion)"
     );
 
     /* c. Issue #284 — a comment anchored inside a table cell. */
@@ -184,7 +184,7 @@ pub fn run_comment_patch_roundtrip() -> Result<()> {
         .context("the cell comment has no range")?;
     if r.start.path != cell_path() || r.end.path != cell_path() {
         bail!(
-            "step 39c: cell comment read at {:?} .. {:?}",
+            "step 42c: cell comment read at {:?} .. {:?}",
             r.start,
             r.end
         );
@@ -198,20 +198,20 @@ pub fn run_comment_patch_roundtrip() -> Result<()> {
         let xml = extract_doc_xml(&bytes)?;
         if !pure_insertion(&source, &xml) {
             bail!(
-                "step 39c: edit at {offset} in the commented cell rewrote source bytes:\n{}",
+                "step 42c: edit at {offset} in the commented cell rewrote source bytes:\n{}",
                 String::from_utf8_lossy(&xml)
             );
         }
         let back = read_docx(&bytes).context("re-read edited cell")?;
         if covered(&back.document, cell_id).as_deref() != Some(want) {
             bail!(
-                "step 39c: edit at {offset}: cell comment covers {:?}",
+                "step 42c: edit at {offset}: cell comment covers {:?}",
                 covered(&back.document, cell_id)
             );
         }
     }
     println!(
-        "[roundtrip] step 39c OK — a cell comment re-reads with its full path and survives edits inside the cell (pure insertions)"
+        "[roundtrip] step 42c OK — a cell comment re-reads with its full path and survives edits inside the cell (pure insertions)"
     );
     Ok(())
 }

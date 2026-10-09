@@ -2,7 +2,9 @@
  *
  * Owns the EngineClient lifecycle: spawns the worker, seeds the first paint,
  * drives crash recovery, and mirrors the `window.__*` hooks the Phase 2
- * exit-gate e2e specs depend on. Document state lives in the engine (§9) —
+ * exit-gate e2e specs depend on - issue #340: only in dev / `?test=` /
+ * `VITE_NGE_DEV_HOOKS=1` builds (`dev-hooks.ts`); live validation against
+ * a built bundle needs that flag too. Document state lives in the engine (§9) —
  * App holds only UI signals. */
 import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { EditorCanvas } from './components/EditorCanvas';
@@ -18,6 +20,7 @@ import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
 import { createEngineStore, SCREEN_DPI_SCALE, type EngineStore } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
+import { installDevHook, resolveTelemetryEndpoint } from './dev-hooks';
 import { attachDragDrop } from './input/dnd';
 import { createFontRegistry, createTelemetryConfig, type FontRegistry } from '@nge/core';
 import type { Command, Event } from './engine/types';
@@ -172,8 +175,12 @@ export function App() {
 
     const client = new EngineClient('interactive', onCrash);
     const dispatch = (cmd: Command): Promise<Event> => client.dispatch(cmd);
-    window.__engineClient = client;
-    window.__dispatch = dispatch;
+    /* Issue #340 - dev hooks: dev server / `?test=` / VITE_NGE_DEV_HOOKS=1
+       builds only (see `dev-hooks.ts`). Live validation and Playwright
+       need the flag in any non-dev build; a release build has none of
+       these handles on `window`. */
+    installDevHook('__engineClient', client);
+    installDevHook('__dispatch', dispatch);
 
     /* Issue #51 — the engine restarts its lazy-layout band at the top on
        a document swap; mirror it DOM-side, or the first SET_VIEWPORT
@@ -192,17 +199,17 @@ export function App() {
        sequence (loadDefaults) and the toolbar (JIT ensureFont) so a font
        loaded by either path is cached once. Manifest: public/fonts.json. */
     const fontRegistry = createFontRegistry(client);
-    window.__fontRegistry = fontRegistry;
+    installDevHook('__fontRegistry', fontRegistry);
 
     /* Issue #86 — D5.7 telemetry opt-in flag, shared with `SettingsMenu`
        (via `TelemetryProvider`, wired in `SdkShelf`) and the collector
-       started in `onReady` below. `?telemetryEndpoint=` is an e2e /
-       local-debug hook — production wiring supplies a real endpoint
-       through the same option once a collector exists (D5.6/D5.9 scope). */
+       started in `onReady` below. Issue #340 - the endpoint comes from the
+       build constant `VITE_NGE_TELEMETRY_ENDPOINT` (or a host-supplied
+       `EngineProvider` prop); the `?telemetryEndpoint=` URL parameter is
+       an e2e / local-debug hook honoured only under the dev-hooks flag. */
     const telemetryConfig = createTelemetryConfig();
-    const telemetryEndpoint =
-        new URLSearchParams(window.location.search).get('telemetryEndpoint') ?? undefined;
-    window.__setTelemetryEnabled = telemetryConfig.setEnabled;
+    const telemetryEndpoint = resolveTelemetryEndpoint();
+    installDevHook('__setTelemetryEnabled', telemetryConfig.setEnabled);
 
     /* §9 store — mirrors engine SELECTION_CHANGED events into signals the
        caret + selection overlays render from. */
@@ -274,7 +281,7 @@ export function App() {
                covers a snapshot-less recovery whose replayed tail carried
                the boot RENDER_PAGE: re-seeding would wipe the replayed
                document and snap the zoom back to 100 %. */
-            generation > 0 && client.lastRecovery?.layoutRestored === true,
+            client.lastRecovery?.layoutRestored === true,
         );
         setBooting(false);
         /* Issue #54 — the boot paint presents while the opaque
@@ -302,7 +309,8 @@ export function App() {
             console.error('[boot] settle repaint failed:', settle.message);
         }
         window.__paintIdle = true;
-        if (generation > 0) {
+        /* Issue #330 — generation 0 can also be a recovery (a carried-over reload). */
+        if (generation > 0 || client.lastRecovery !== undefined) {
             window.__recovered = true;
         }
         if (firstReady) {
@@ -310,7 +318,7 @@ export function App() {
             startStatsPolling(client);
             /* Issue #86 — D5.7 real telemetry transport. Opt-in only
                (`telemetryConfig.enabled`, off by default, toggled from
-               Settings); with no `?telemetryEndpoint=` configured, an
+               Settings); with no endpoint configured, an
                opted-in session still only logs to the console (dev-safe —
                see `ConsoleTransport`), never fires a real network request. */
             startTelemetry(client, {
@@ -333,6 +341,7 @@ export function App() {
                 client={client}
                 fontRegistry={fontRegistry}
                 telemetry={telemetryConfig}
+                telemetryEndpoint={telemetryEndpoint}
                 engineReady={() => !booting()}
                 onRevealCaret={revealCaret}
             >

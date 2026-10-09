@@ -644,3 +644,67 @@ fn a_splice_keeps_the_paragraphs_hyperlinks() {
     assert_eq!(anchored_text(&back.document, id), "the site");
     assert_eq!(back.document.nth_paragraph(0).unwrap().hyperlinks.len(), 1);
 }
+
+/// The `w:id`s of every tracked-change annotation in `xml`, in order.
+fn annotation_ids(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for el in ["<w:ins ", "<w:del ", "<w:rPrChange "] {
+        let mut rest = xml;
+        while let Some(at) = rest.find(el) {
+            rest = &rest[at + el.len()..];
+            if let Some(v) = rest
+                .split("w:id=\"")
+                .nth(1)
+                .and_then(|t| t.split('"').next())
+            {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Issue #295 × #282 — a comment spliced into an untouched paragraph that
+/// carries tracked changes (an `<w:ins>` wrapper, a run with a recorded
+/// formatting change): the regenerated baselines carry annotation-id
+/// tokens, the splice still lands as a pure insertion of the anchors (no
+/// token, no id respelled), and every annotation id stays unique.
+#[test]
+fn a_splice_into_a_paragraph_with_tracked_changes_keeps_its_ids() {
+    let body = concat!(
+        r#"<w:p><w:r><w:t xml:space="preserve">keep </w:t></w:r>"#,
+        r#"<w:ins w:id="5" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:t>alpha beta</w:t></w:r></w:ins>"#,
+        r#"<w:r><w:rPr><w:b/><w:rPrChange w:id="7" w:author="A" w:date="2026-01-01T00:00:00Z"><w:rPr/></w:rPrChange></w:rPr><w:t xml:space="preserve"> gamma delta</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>second</w:t></w:r></w:p>"#,
+    );
+    let (xml, archive) = package(body, Some(COMMENTS));
+    for (lo, hi, covered) in [
+        /* Inside the insertion. */
+        (11usize, 15usize, "beta"),
+        /* Across the insertion's end into the format-changed run. */
+        (11, 21, "beta gamma"),
+    ] {
+        let (doc, id) = archive.document.insert_comment(
+            at(0, lo),
+            at(0, hi),
+            "n".into(),
+            "Me".into(),
+            String::new(),
+        );
+        let bytes = save(&archive, &doc);
+        let out = document_xml_of(&bytes);
+        assert!(!out.contains('\u{E000}'), "an unresolved token: {out}");
+        assert!(pure_insertion(&xml, &out), "{lo}..{hi}: {out}");
+        let ids = annotation_ids(&out);
+        let mut unique = ids.clone();
+        unique.dedup();
+        assert_eq!(ids, unique, "{lo}..{hi}: duplicate annotation ids {ids:?}");
+        assert!(
+            ids.contains(&"5".to_string()) && ids.contains(&"7".to_string()),
+            "{ids:?}"
+        );
+        let back = read_docx(&bytes).expect("re-read");
+        assert_eq!(anchored_text(&back.document, id), covered);
+    }
+}
