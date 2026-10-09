@@ -110,9 +110,10 @@ export interface EditorCommands {
     requestStats(): Promise<Event>;
     /** Issue #240 — whether the engine offers `retryGpuRenderer`. */
     readonly canRetryGpuRenderer: boolean;
-    /** Issue #240 — forget a persisted GPU crash-loop downgrade and reload
-     *  so the next boot probes the GPU renderer again. A no-op when
-     *  `canRetryGpuRenderer` is false. */
+    /** Issue #240 — forget a GPU crash-loop downgrade and probe the GPU
+     *  renderer again. Issue #270 — in place: the engine restarts as a
+     *  recovery generation (no reload), so the document, selection, undo
+     *  and zoom survive. A no-op when `canRetryGpuRenderer` is false. */
     retryGpuRenderer(): Promise<void>;
     requestPaint(viewport: Rect, dirty?: Rect): Promise<Event>;
 
