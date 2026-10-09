@@ -46,6 +46,8 @@ interface RecoveryFlags {
     log_truncated: boolean;
     snapshot_fallbacks: number;
     package_fallbacks: number;
+    /** Issue #427 - journal rows that never landed (#390). */
+    journal_gap: number;
 }
 /** Issue #315 — the recovery-report fields the CRASH sample reads (a
  *  structural subset of `EngineClient`'s `RecoveryInfo` and of
@@ -58,6 +60,8 @@ export interface TelemetryRecoveryReport {
     logTruncated: boolean;
     snapshotFallbacks: number;
     packageFallbacks: number;
+    /** Issue #390 - absent = 0. */
+    journalGap?: number;
     rendererDowngrade: RendererDowngrade | undefined;
 }
 
@@ -70,6 +74,7 @@ function recoveryFlags(r: TelemetryRecoveryReport): RecoveryFlags {
         log_truncated: r.logTruncated,
         snapshot_fallbacks: r.snapshotFallbacks,
         package_fallbacks: r.packageFallbacks,
+        journal_gap: r.journalGap ?? 0,
     };
 }
 
