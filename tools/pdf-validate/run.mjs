@@ -11,6 +11,7 @@
  *   node run.mjs --corpus tier-a --profile 1b — explicit corpus + profile
  *   node run.mjs --profile 2u                 — PDF/A-2u flavour
  *   node run.mjs --profile x3                 — PDF/X-3 (structural check only)
+ *   node run.mjs --profile ua1                — PDF/UA-1 (tagged, on PDF/A-2u)
  *   node run.mjs --strict                     — fail if veraPDF is unavailable
  *   node run.mjs --regen                      — regenerate tests/corpus/tier-a
  *   node run.mjs --check-fixtures             — CI gate: fail if stale
@@ -76,11 +77,28 @@
  * veraPDF checks then run on those files; a `cff-*` document must also
  * embed `CIDFontType0` + `FontFile3 /Subtype /CIDFontType0C` and no
  * `FontFile2`. No dev server is needed — it is the CI-friendly path.
+ *
+ * Issue #360 — `--profile ua1` validates the tagged export
+ * (`PdfConformance::Ua1`: PDF/UA-1 on a PDF/A-2u base). veraPDF checks it
+ * twice, against its `ua1` AND `2u` flavours — the file claims both. Every
+ * document is also exported untagged as PDF/A-2u (the browser path exports
+ * it alongside; `--native` reads the `2u` twin) and the tagged file must
+ * stay within `UA_SIZE_BUDGET` (15 %) of it: tagging is a structure tree,
+ * marked content and an XMP identification block, never a second copy of
+ * the document (the tagged writer packs its dictionaries into an object
+ * stream to keep it so — `crates/format-pdf/src/objstm.rs`).
+ *
+ * Poppler, where installed (`pdfinfo` / `pdftotext` on PATH), is a second
+ * independent reader for every profile: `pdfinfo` must parse the file
+ * without a syntax error (and, for ua1, report `Tagged: yes` and a title)
+ * and `pdftotext` must extract some text. Skipped, with a note, when
+ * poppler is absent.
  */
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { inflateSync } from 'node:zlib';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..', '..');
@@ -160,6 +178,10 @@ const PROFILES = {
     '1b': { conformance: 'A1b', veraFlavour: '1b' },
     '2u': { conformance: 'A2u', veraFlavour: '2u' },
     'x3': { conformance: 'X3', veraFlavour: null },
+    /* Issue #360 — tagged PDF/UA-1 on PDF/A-2u: veraPDF checks both
+       claims, and `baseline` is the untagged twin the size budget is
+       measured against. */
+    'ua1': { conformance: 'Ua1', veraFlavour: 'ua1', extraFlavours: ['2u'], baseline: 'A2u' },
 };
 const profileSpec = PROFILES[profile];
 if (!profileSpec) {
@@ -170,6 +192,9 @@ if (!profileSpec) {
     process.exit(2);
 }
 const { conformance, veraFlavour } = profileSpec;
+const veraFlavours = veraFlavour === null ? [] : [veraFlavour, ...(profileSpec.extraFlavours ?? [])];
+/* Issue #360 — the tagged export's size budget over its untagged twin. */
+const UA_SIZE_BUDGET = 0.15;
 
 const OUT_DIR = join(REPO, 'tmp', 'pdf-validate');
 mkdirSync(OUT_DIR, { recursive: true });
@@ -198,8 +223,11 @@ function exportNative() {
     return docs.map((f) => {
         const path = join(dir, f);
         const bytes = readFileSync(path);
-        const count = /\/Type \/Pages[^]*?\/Count (\d+)/.exec(bytes.toString('latin1'));
+        const count = /\/Type \/Pages[^]*?\/Count (\d+)/.exec(searchableText(bytes));
         const doc = { name: basename(f, '.pdf'), path, size: bytes.length, pages: count ? Number(count[1]) : 0 };
+        /* Issue #360 — the untagged twin the ua1 size budget compares. */
+        const twin = join(nativeRoot, '2u', f);
+        if (profileSpec.baseline && existsSync(twin)) doc.baselineSize = statSync(twin).size;
         console.log(`[pdf-validate] native ${doc.name} -> ${path} (${doc.size} B, ${doc.pages}p)`);
         return doc;
     });
@@ -267,13 +295,17 @@ async function exportViaBrowser() {
                 }
             }
 
-            const result = await page.evaluate(async (conf) => {
-                const evt = await window.__dispatch({ type: 'EXPORT_PDF', conformance: conf });
-                if (evt.type !== 'PDF_EXPORTED') {
-                    return { ok: false, error: evt.type === 'ERROR' ? evt.message : evt.type };
-                }
-                return { ok: true, bytes: Array.from(evt.bytes), pages: evt.pages };
-            }, conformance);
+            const exportAs = (conf) =>
+                page.evaluate(async (c) => {
+                    const evt = await window.__dispatch({ type: 'EXPORT_PDF', conformance: c });
+                    if (evt.type !== 'PDF_EXPORTED') {
+                        return { ok: false, error: evt.type === 'ERROR' ? evt.message : evt.type };
+                    }
+                    return { ok: true, bytes: Array.from(evt.bytes), pages: evt.pages };
+                }, conf);
+            const result = await exportAs(conformance);
+            /* Issue #360 — the untagged twin for the ua1 size budget. */
+            const baseline = profileSpec.baseline ? await exportAs(profileSpec.baseline) : null;
 
             if (!result.ok) {
                 console.error(`[pdf-validate] ${testCase.name}: EXPORT_PDF failed — ${result.error}`);
@@ -287,6 +319,7 @@ async function exportViaBrowser() {
                 path: pdfPath,
                 size: result.bytes.length,
                 pages: result.pages,
+                ...(baseline?.ok ? { baselineSize: baseline.bytes.length } : {}),
             });
             console.log(
                 `[pdf-validate] exported ${testCase.name} -> ${pdfPath} ` +
@@ -309,13 +342,34 @@ if (!exported.length) {
 /* The per-profile structures crates/format-pdf must emit. This is a cheap
    sanity gate — it confirms the markers exist; veraPDF (where it supports the
    flavour) is the authority on whether they are correct. */
-function structuralMarkers(pdf) {
+/* Issue #360 — the file as text with every object stream inflated and
+   appended: a tagged PDF 1.5+ export packs its dictionaries (catalog,
+   pages, structure tree) into one, out of reach of a plain byte search. */
+function searchableText(pdf) {
     const body = pdf.toString('latin1');
+    let out = body;
+    let at = body.indexOf('/Type /ObjStm');
+    while (at >= 0) {
+        const s = body.indexOf('stream\n', at);
+        const e = s < 0 ? -1 : body.indexOf('\nendstream', s);
+        if (e < 0) break;
+        try {
+            out += '\n' + inflateSync(pdf.subarray(s + 7, e)).toString('latin1');
+        } catch {
+            /* not a stream we can read — leave it to veraPDF */
+        }
+        at = body.indexOf('/Type /ObjStm', e);
+    }
+    return out;
+}
+
+function structuralMarkers(pdf) {
+    const body = searchableText(pdf);
     const common = {
         'OutputIntent': body.includes('/OutputIntent'),
         'embedded ICC profile': body.includes('/DestOutputProfile') && body.includes('acsp'),
         'document /ID': body.includes('/ID'),
-        'EOF marker': body.trimEnd().endsWith('%%EOF'),
+        'EOF marker': pdf.toString('latin1').trimEnd().endsWith('%%EOF'),
     };
     /* Issue #121 — image XObjects. PDF/A-1b (ISO 19005-1 §6.4) and
        PDF/X-3:2003 forbid transparency, so format-pdf flattens PNG alpha
@@ -344,6 +398,23 @@ function structuralMarkers(pdf) {
                 'ToUnicode CMaps': body.includes('/ToUnicode'),
                 ...common,
             };
+        case 'ua1':
+            return {
+                'PDF 1.7 header': body.startsWith('%PDF-1.7'),
+                'GTS_PDFA1 subtype': body.includes('GTS_PDFA1'),
+                'XMP pdfaid:part': body.includes('pdfaid:part>2'),
+                'XMP pdfaid:conformance': body.includes('pdfaid:conformance>U'),
+                'XMP pdfuaid:part': body.includes('pdfuaid:part>1'),
+                'pdfuaid extension schema': body.includes('<pdfaSchema:prefix>pdfuaid</pdfaSchema:prefix>'),
+                'XMP dc:title': body.includes('<dc:title>'),
+                'StructTreeRoot': body.includes('/StructTreeRoot'),
+                'MarkInfo /Marked true': body.includes('/Marked true'),
+                'catalog /Lang': /\/Lang \(/.test(body),
+                'DisplayDocTitle': body.includes('/DisplayDocTitle true'),
+                'page /StructParents': body.includes('/StructParents'),
+                'ToUnicode CMaps': body.includes('/ToUnicode'),
+                ...common,
+            };
         case 'x3':
             return {
                 'PDF 1.4 header': body.startsWith('%PDF-1.4'),
@@ -366,7 +437,7 @@ function structuralMarkers(pdf) {
    bare CFF program (`FontFile3 /Subtype /CIDFontType0C`), never the
    TrueType font type. Applies to the `--native` `cff-*` documents. */
 function cffMarkers(pdf) {
-    const body = pdf.toString('latin1');
+    const body = searchableText(pdf);
     return {
         'CIDFontType0 descendant font': /\/Subtype \/CIDFontType0\s/.test(body),
         'FontFile3 /CIDFontType0C program': body.includes('/FontFile3') && body.includes('/Subtype /CIDFontType0C'),
@@ -413,7 +484,7 @@ function registryFontSizes() {
    `ABCDEF+` subset tag stripped (the Type0 and CIDFont dictionaries both
    carry it — deduplicated). */
 function embeddedFontIds(pdf) {
-    const body = pdf.toString('latin1');
+    const body = searchableText(pdf);
     const ids = new Set();
     for (const m of body.matchAll(/\/BaseFont\s*\/(?:[A-Z]{6}\+)?([^\s/<>()[\]{}%]+)/g)) {
         ids.add(m[1]);
@@ -454,6 +525,58 @@ for (const doc of exported) {
     );
 }
 
+/* ---- Issue #360 — the tagged export's size budget -------------------- */
+
+let uaSizeOk = true;
+if (profileSpec.baseline) {
+    for (const doc of exported) {
+        if (doc.baselineSize === undefined) {
+            uaSizeOk = false;
+            console.error(`[pdf-validate] ${doc.name}: tagging size FAIL — no untagged twin to compare`);
+            continue;
+        }
+        const delta = (doc.size - doc.baselineSize) / doc.baselineSize;
+        const pass = delta < UA_SIZE_BUDGET;
+        if (!pass) uaSizeOk = false;
+        console.log(
+            `[pdf-validate] ${doc.name}: tagging size ${pass ? 'PASS' : 'FAIL'} — ${doc.size} B tagged vs ` +
+                `${doc.baselineSize} B untagged PDF/A-2u = ${(100 * delta).toFixed(1)} %; ` +
+                `bound < ${UA_SIZE_BUDGET * 100} %`,
+        );
+    }
+}
+
+/* ---- Poppler — an independent second reader, where installed ---------- */
+
+function havePoppler() {
+    return ['pdfinfo', 'pdftotext'].every((bin) => !spawnSync(bin, ['-v'], { encoding: 'utf8' }).error);
+}
+
+let popplerOk = true;
+if (havePoppler()) {
+    for (const doc of exported) {
+        const info = spawnSync('pdfinfo', [doc.path], { encoding: 'utf8' });
+        const text = spawnSync('pdftotext', [doc.path, '-'], { encoding: 'utf8' });
+        const problems = [];
+        if (info.status !== 0 || /error/i.test(info.stderr ?? '')) {
+            problems.push(`pdfinfo: ${(info.stderr ?? '').trim() || `exit ${info.status}`}`);
+        }
+        if (profile === 'ua1') {
+            if (!/^Tagged:\s+yes$/m.test(info.stdout ?? '')) problems.push('pdfinfo: not Tagged');
+            if (!/^Title:\s+\S/m.test(info.stdout ?? '')) problems.push('pdfinfo: no Title');
+        }
+        if (text.status !== 0 || !(text.stdout ?? '').trim()) {
+            problems.push(`pdftotext: ${text.status !== 0 ? `exit ${text.status}` : 'no text extracted'}`);
+        }
+        if (problems.length) popplerOk = false;
+        console.log(
+            `[pdf-validate] ${doc.name}: poppler ${problems.length ? `FAIL — ${problems.join('; ')}` : 'PASS'}`,
+        );
+    }
+} else {
+    console.log('[pdf-validate] poppler (pdfinfo / pdftotext) not on PATH — reader cross-check skipped.');
+}
+
 /* ---- External veraPDF validation ------------------------------------- */
 
 function findVeraPdf() {
@@ -464,12 +587,13 @@ function findVeraPdf() {
     return null;
 }
 
+const localOk = structuralOk && sizeOk && uaSizeOk && popplerOk;
 if (veraFlavour === null) {
     console.log(
         `[pdf-validate] veraPDF has no '${profile}' flavour (it validates PDF/A + ` +
             'PDF/UA only) — the structural check above is the final result.',
     );
-    process.exit(structuralOk && sizeOk ? 0 : 1);
+    process.exit(localOk ? 0 : 1);
 }
 
 const veraPdf = findVeraPdf();
@@ -480,29 +604,32 @@ if (!veraPdf) {
         console.error('[pdf-validate] FAIL: --strict set and veraPDF is unavailable');
         process.exit(1);
     }
-    process.exit(structuralOk && sizeOk ? 0 : 1);
+    process.exit(localOk ? 0 : 1);
 }
 
-console.log(`[pdf-validate] validating with ${veraPdf} --flavour ${veraFlavour}`);
 let veraOk = true;
-for (const doc of exported) {
-    const run = spawnSync(
-        veraPdf,
-        ['--flavour', veraFlavour, '--format', 'text', doc.path],
-        { encoding: 'utf8' },
-    );
-    const report = `${run.stdout ?? ''}${run.stderr ?? ''}`.trim();
-    const pass = run.status === 0 && !/\bnon-compliant\b/i.test(report);
-    if (!pass) veraOk = false;
-    console.log(`[pdf-validate] ${doc.name}: veraPDF ${pass ? 'PASS' : 'FAIL'}`);
-    if (report) {
-        console.log(report.split('\n').map((line) => `    ${line}`).join('\n'));
+for (const flavour of veraFlavours) {
+    console.log(`[pdf-validate] validating with ${veraPdf} --flavour ${flavour}`);
+    for (const doc of exported) {
+        const run = spawnSync(
+            veraPdf,
+            ['--flavour', flavour, '--format', 'text', '-v', doc.path],
+            { encoding: 'utf8' },
+        );
+        const report = `${run.stdout ?? ''}${run.stderr ?? ''}`.trim();
+        const pass = run.status === 0 && /^PASS\b/m.test(report) && !/^FAIL\b/m.test(report);
+        if (!pass) veraOk = false;
+        console.log(`[pdf-validate] ${doc.name}: veraPDF ${flavour} ${pass ? 'PASS' : 'FAIL'}`);
+        if (report) {
+            console.log(report.split('\n').map((line) => `    ${line}`).join('\n'));
+        }
     }
 }
 
-if (!structuralOk || !veraOk || !sizeOk) {
+if (!localOk || !veraOk) {
     console.error('[pdf-validate] FAIL');
     process.exit(1);
 }
-console.log(`[pdf-validate] PASS — ${exported.length} document(s) conform to PDF/A-${profile}`);
+const claim = profile === 'ua1' ? 'PDF/UA-1 + PDF/A-2u' : `PDF/A-${profile}`;
+console.log(`[pdf-validate] PASS — ${exported.length} document(s) conform to ${claim}`);
 process.exit(0);

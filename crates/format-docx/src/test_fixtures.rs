@@ -809,7 +809,7 @@ pub const SECTION_BREAK_TEXTS: [&str; 3] = [
 /// the final section; its empty header slots take `rIdH1` / `rIdH2`.
 /// With `inserted`, the mark is a tracked INSERTION instead (a tracked
 /// section break: rejecting removes it). Source of `tools/roundtrip`'s
-/// `section_break_revision.docx` (step 49).
+/// `section_break_revision.docx` (step 51).
 pub fn section_break_revision_docx(inserted: bool) -> Vec<u8> {
     let ns = ns_decls();
     let [t0, t1, t2] = SECTION_BREAK_TEXTS;
@@ -880,7 +880,7 @@ pub const TRACKED_ROWS_CELLS: [[&str; 2]; 3] = [
 /// tracked row DELETION (`<w:trPr><w:del/>`, its cells' text in `<w:del>`
 /// runs and their marks deleted); row 2 a tracked row INSERTION
 /// (`<w:trPr><w:ins/>`, inserted text and marks). Source of
-/// `tools/roundtrip`'s `tracked_table_rows.docx` (step 48).
+/// `tools/roundtrip`'s `tracked_table_rows.docx` (step 50).
 pub fn tracked_table_rows_docx() -> Vec<u8> {
     const D1: &str = "w:author=\"Author\" w:date=\"2026-01-01T00:00:00Z\"";
     const D2: &str = "w:author=\"Author\" w:date=\"2026-01-02T00:00:00Z\"";

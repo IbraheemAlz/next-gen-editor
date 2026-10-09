@@ -10,7 +10,9 @@
  * Authoritative shapes: see `crates/engine-wasm/pkg/engine_wasm.d.ts`.
  *   - `SELECTION_CHANGED` carries: range, caret, direction, rects,
  *     attrs_at_caret, paragraph_alignment, can_undo, can_redo,
- *     selection_kind, attrs_mixed, paragraph_direction.
+ *     selection_kind, attrs_mixed, paragraph_direction, and (issues
+ *     #423 / #420) resolved_font_latin, resolved_font_cs, font_source,
+ *     slot_formats, caret_font_slot.
  *   - `STATS` is inline: `({ type: "STATS" } & EngineStats)`.
  *   - `PAINTED` carries: dirty, version, paint_ms, document_height,
  *     page_count, is_full_layout, estimated_document_height.
@@ -24,13 +26,19 @@ import type {
     BridgeStoryRef,
     BridgeFieldRef,
     BridgeCellProperties,
+    BridgeFontSources,
     BridgeIndent,
     BridgeSectionGeometry,
+    BridgeSlotFormats,
     BridgeTabStop,
+    CheckpointStatus,
     Direction,
     EngineStats,
+    ErrorKind,
     Event,
+    FontSlot,
     LayoutDegraded,
+    PreviousSessionInfo,
     LogicalRange,
     RecoveryReport,
     Rect,
@@ -50,6 +58,31 @@ export interface EditorState {
     attrsAtCaret: Accessor<TextAttrs | undefined>;
     /** Mixed flags across the selection (bold/italic/underline/strike). */
     attrsMixed: Accessor<AttrsMixed | undefined>;
+    /**
+     * Issue #423 — the family the caret run's LATIN slot resolves to
+     * after the full cascade (run name → theme binding → style chain →
+     * docDefaults → the layout's default face), as a display name
+     * (`"Calibri"`). `undefined` before the first SELECTION_CHANGED or
+     * from an engine that predates the field. Unlike
+     * `attrsAtCaret().font_family` (the run's own id, else the layout
+     * default), this is what Word's font box shows.
+     */
+    resolvedFontLatin: Accessor<string | undefined>;
+    /** Issue #423 — {@link EditorState.resolvedFontLatin} for the
+     *  COMPLEX-SCRIPT slot (`w:cs` / `w:cstheme` + the theme's script
+     *  entry): what Arabic / Hebrew text at the caret is shaped with. */
+    resolvedFontCs: Accessor<string | undefined>;
+    /** Issue #423 — where each slot's family came from (`Explicit` /
+     *  `Theme` / `Style` / `Default`); a picker marks `Theme` fonts. */
+    fontSource: Accessor<BridgeFontSources | undefined>;
+    /** Issue #420 — the caret run's resolved family id / size / bold /
+     *  italic PER SCRIPT SLOT — the Font dialog's "Latin text" and
+     *  "Complex scripts" seed. */
+    slotFormats: Accessor<BridgeSlotFormats | undefined>;
+    /** Issue #423 — the slot `attrsAtCaret` reports: `'ComplexScript'`
+     *  when the caret sits in Arabic / Hebrew / … text (or a `<w:rtl/>`
+     *  run), else `'Latin'`. The toolbar picker shows that slot's family. */
+    caretFontSlot: Accessor<FontSlot | undefined>;
     /** Paragraph alignment of the paragraph containing the caret. */
     paragraphAlignment: Accessor<Alignment | undefined>;
     /** Paragraph direction (`Ltr` / `Rtl` / `undefined` when mixed across selection). */
@@ -200,6 +233,33 @@ export interface EditorState {
      * `zoom`.
      */
     checkpointFailing: Accessor<boolean>;
+    /**
+     * Issue #390 - the event log's health as the bridge's
+     * `Event::CheckpointState` reports it (broadcast on `subscribe()`
+     * whenever it changes; seeded from `engine.checkpointStatus`).
+     * `ok: false` once the bounded retries of a failed checkpoint
+     * (snapshot dispatch / snapshot write) or of the command journal ran
+     * out; `journalFailing` marks the journal specifically (recovery would
+     * miss commands). Shared like `zoom`.
+     */
+    checkpointState: Accessor<CheckpointHealth>;
+    /**
+     * Issue #364 - the most recent `Event::Error` any command answered
+     * (engine refusals such as a tracked deletion across a table cell, or
+     * a typed `ErrorKind`), with the command that produced it and a
+     * running count; `undefined` until the first one. Every error reply
+     * moves it - a repeat of the same message is a NEW object - so a UI
+     * can show a transient, visible refusal instead of a key press that
+     * silently does nothing. Shared like `zoom`.
+     */
+    lastError: Accessor<EditorError | undefined>;
+    /**
+     * Issue #388 - the previous page generation's unsaved session, set
+     * aside at boot and waiting for Recover / Discard
+     * (`engine.recoverPreviousSession` / `discardPreviousSession`);
+     * `undefined` when there is none. Shared like `zoom`.
+     */
+    previousSession: Accessor<PreviousSessionInfo | undefined>;
 }
 
 /**
@@ -211,12 +271,38 @@ export interface EditorState {
  * lazily under a detached root; the subscription lives as long as the
  * engine handle, which the shell keeps for the page lifetime.
  */
+/** Issue #364 - see `EditorState.lastError`. */
+export interface EditorError {
+    /** The typed class (`Event::Error.kind`), when the engine set one. */
+    kind: ErrorKind | undefined;
+    /** The command that was refused, parsed from the engine's
+     *  `<Command>: <reason>` message prefix; `undefined` when absent. */
+    command: string | undefined;
+    /** The engine's message, verbatim. */
+    message: string;
+    /** Errors seen so far this session (this one included). */
+    count: number;
+    /** When it arrived (ms since the epoch). */
+    at: number;
+}
+
+/** Issue #390 - see `EditorState.checkpointState`. */
+export interface CheckpointHealth {
+    ok: boolean;
+    failures: number;
+    journalFailing: boolean;
+    lastError: string | undefined;
+}
+
 interface ViewState {
     zoom: Accessor<number>;
     deviceScale: Accessor<number | undefined>;
     rendererDowngrade: Accessor<RendererDowngrade | undefined>;
     lastRecovery: Accessor<RecoveryReport | undefined>;
     checkpointFailing: Accessor<boolean>;
+    checkpointState: Accessor<CheckpointHealth>;
+    lastError: Accessor<EditorError | undefined>;
+    previousSession: Accessor<PreviousSessionInfo | undefined>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -247,11 +333,39 @@ function viewStateFor(engine: EngineHandle): ViewState {
         );
         engine.onRecovery?.((report) => setLastRecovery(() => report));
         /* Issue #333 - checkpoint health, seeded then fed by the client. */
-        const [checkpointFailing, setCheckpointFailing] = createSignal(
-            engine.checkpointStatus?.failing === true,
+        const toHealth = (s: CheckpointStatus | undefined): CheckpointHealth => ({
+            ok: s?.failing !== true,
+            failures: s?.failures ?? 0,
+            journalFailing: s?.journalFailing === true,
+            lastError: s?.lastError,
+        });
+        const [checkpointState, setCheckpointState] = createSignal<CheckpointHealth>(
+            toHealth(engine.checkpointStatus),
         );
-        engine.onCheckpointStatus?.((s) => setCheckpointFailing(s.failing));
+        /* Issue #390 - fed by the client's status feed (it also resets on
+           a respawned worker) AND by the typed bridge event itself. */
+        engine.onCheckpointStatus?.((s) => setCheckpointState(toHealth(s)));
+        const checkpointFailing: Accessor<boolean> = () => !checkpointState().ok;
+        /* Issue #388 - the unsaved previous session, seeded then fed. */
+        const [previousSession, setPreviousSession] = createSignal<
+            PreviousSessionInfo | undefined
+        >(engine.previousSession);
+        engine.onPreviousSession?.((p) => setPreviousSession(p));
+        /* Issue #364 - every `Event::Error` reply, with its command. */
+        const [lastError, setLastError] = createSignal<EditorError | undefined>(undefined);
+        let errorCount = 0;
         engine.subscribe((evt: Event) => {
+            if (evt.type === 'ERROR') {
+                errorCount += 1;
+                const prefix = /^([A-Za-z][A-Za-z0-9]*): /.exec(evt.message);
+                setLastError({
+                    kind: evt.kind,
+                    command: prefix?.[1],
+                    message: evt.message,
+                    count: errorCount,
+                    at: Date.now(),
+                });
+            }
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
             } else if (evt.type === 'ZOOM_PENDING') {
@@ -264,6 +378,13 @@ function viewStateFor(engine: EngineHandle): ViewState {
                    boot `RENDER_PAGE` + its `SELECTION_CHANGED` land. */
                 setZoom(roundZoom(evt.zoom));
                 if (evt.device_scale !== undefined) setDeviceScale(evt.device_scale);
+            } else if (evt.type === 'CHECKPOINT_STATE') {
+                setCheckpointState({
+                    ok: evt.ok,
+                    failures: evt.failures,
+                    journalFailing: evt.journal_failing === true,
+                    lastError: evt.last_error,
+                });
             } else if (evt.type === 'RECOVERED') {
                 /* Issue #97 — the respawned engine folded the replayed
                    SET_ZOOM / SET_DEVICE_SCALE into its restored config (or
@@ -277,7 +398,16 @@ function viewStateFor(engine: EngineHandle): ViewState {
                 setRendererDowngrade(evt.renderer_downgrade);
             }
         });
-        return { zoom, deviceScale, rendererDowngrade, lastRecovery, checkpointFailing };
+        return {
+            zoom,
+            deviceScale,
+            rendererDowngrade,
+            lastRecovery,
+            checkpointFailing,
+            checkpointState,
+            lastError,
+            previousSession,
+        };
     });
     viewStates.set(engine, state);
     return state;
@@ -292,6 +422,11 @@ export function createEditorState(): EditorState {
     const [rects, setRects] = createSignal<Rect[]>([]);
     const [attrsAtCaret, setAttrsAtCaret] = createSignal<TextAttrs | undefined>(undefined);
     const [attrsMixed, setAttrsMixed] = createSignal<AttrsMixed | undefined>(undefined);
+    const [resolvedFontLatin, setResolvedFontLatin] = createSignal<string | undefined>(undefined);
+    const [resolvedFontCs, setResolvedFontCs] = createSignal<string | undefined>(undefined);
+    const [fontSource, setFontSource] = createSignal<BridgeFontSources | undefined>(undefined);
+    const [slotFormats, setSlotFormats] = createSignal<BridgeSlotFormats | undefined>(undefined);
+    const [caretFontSlot, setCaretFontSlot] = createSignal<FontSlot | undefined>(undefined);
     const [paragraphAlignment, setParagraphAlignment] = createSignal<Alignment | undefined>(undefined);
     const [paragraphDirection, setParagraphDirection] = createSignal<Direction | undefined>(undefined);
     const [selectionKind, setSelectionKind] = createSignal<SelectionKind | undefined>(undefined);
@@ -333,6 +468,14 @@ export function createEditorState(): EditorState {
                 setRects(evt.rects);
                 setAttrsAtCaret(evt.attrs_at_caret);
                 setAttrsMixed(evt.attrs_mixed);
+                /* Issue #423 — an engine predating the per-slot read-back
+                   sends empty names (serde default); surface those as
+                   "unknown", not as a family called "". */
+                setResolvedFontLatin(evt.resolved_font_latin || undefined);
+                setResolvedFontCs(evt.resolved_font_cs || undefined);
+                setFontSource(evt.font_source);
+                setSlotFormats(evt.slot_formats);
+                setCaretFontSlot(evt.caret_font_slot);
                 setParagraphAlignment(evt.paragraph_alignment);
                 setParagraphDirection(evt.paragraph_direction);
                 setSelectionKind(evt.selection_kind);
@@ -400,6 +543,11 @@ export function createEditorState(): EditorState {
         rects,
         attrsAtCaret,
         attrsMixed,
+        resolvedFontLatin,
+        resolvedFontCs,
+        fontSource,
+        slotFormats,
+        caretFontSlot,
         paragraphAlignment,
         paragraphDirection,
         selectionKind,
@@ -427,5 +575,8 @@ export function createEditorState(): EditorState {
         rendererDowngrade: view.rendererDowngrade,
         lastRecovery: view.lastRecovery,
         checkpointFailing: view.checkpointFailing,
+        checkpointState: view.checkpointState,
+        lastError: view.lastError,
+        previousSession: view.previousSession,
     };
 }

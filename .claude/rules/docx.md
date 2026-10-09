@@ -344,7 +344,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   (`concat` keeps the tail's `section_end`), and the dropped section's
   header / footer refs backfill the surviving terminal's EMPTY slots
   (owned slots win) — so an own inserted break is removed, not marked.
-  Harness: `tools/roundtrip` step 49 (`section_break_revision.docx`).
+  Harness: `tools/roundtrip` step 51 (`section_break_revision.docx`).
   Issue #305 — the single `AcceptRevision` / `RejectRevision` is the
   SAME resolver (`DocumentTree::resolve_revisions` with a
   `RevisionPick::Only`, addressed by `engine::RevisionRef`); text leaves

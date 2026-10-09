@@ -120,3 +120,16 @@ hard failure so CI catches a new loop instead of a silent recovery.
 - Position every glyph with an explicit text matrix, not the PDF font's
   advances: our `x_advance` carries justification + Kashida adjustments the
   font's intrinsic widths do not.
+- **Tagging is opt-in and byte-neutral when off (issue #360).** Only
+  `PdfExportOptions::tagged` (always on for `PdfProfile::Ua1`, the tagged
+  PDF/A-2u) writes marked content, the structure tree and the PDF/UA
+  identification; every other profile must stay byte-identical — sha256
+  the tier-a exports before/after (`write_tier_a_exports` in
+  `engine-wasm/src/pdf_semantics_tests.rs`). In a tagged export every
+  painting operator is inside either a `BDC` with an `/MCID` (real content,
+  recorded through `SemCtx` — `tagging.rs`) or an `/Artifact` sequence;
+  a new paint pass must pick one (`artifact_begin` / `decoration_pass`),
+  or veraPDF's PDF/UA-1 §7.1 check fails. A tagged PDF 1.5+ file is
+  re-laid out by `objstm::pack` (object stream + xref stream), so tests
+  that search a tagged file for dictionary text go through
+  `test_support::searchable_text`.

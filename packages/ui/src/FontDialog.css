@@ -1,0 +1,101 @@
+/*
+ * FontDialog — sibling stylesheet (issue #420). The two script-slot
+ * sections sit side by side and stack on a narrow viewport; every value
+ * comes from the theme tokens.
+ */
+
+.nge-font-dialog__slots {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: var(--nge-space-3);
+}
+
+.nge-font-dialog__slot {
+    display: grid;
+    gap: var(--nge-space-2);
+    align-content: start;
+    min-width: 0;
+    margin: 0;
+    padding: var(--nge-space-3);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    background: var(--nge-color-surface);
+}
+
+.nge-font-dialog__legend {
+    padding: 0 var(--nge-space-1);
+    color: var(--nge-color-text);
+    font: 600 var(--nge-font-size-sm)/1.2 var(--nge-font-ui);
+}
+
+.nge-font-dialog__hint {
+    margin: 0;
+}
+
+.nge-font-dialog__field {
+    display: grid;
+    gap: var(--nge-space-1);
+}
+
+.nge-font-dialog__family {
+    display: flex;
+    align-items: center;
+    gap: var(--nge-space-2);
+    min-width: 0;
+}
+
+.nge-font-dialog__family .nge-form__select {
+    flex: 1;
+    min-width: 0;
+}
+
+/* Issue #423 — the seeded family comes from the document theme. */
+.nge-font-dialog__source {
+    color: var(--nge-color-text-muted);
+    font: 500 var(--nge-font-size-xs)/1 var(--nge-font-ui);
+    white-space: nowrap;
+}
+
+.nge-font-dialog__size {
+    max-width: 96px;
+    font-variant-numeric: tabular-nums;
+}
+
+.nge-font-dialog__styles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--nge-space-3);
+}
+
+.nge-font-dialog__check {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+    cursor: pointer;
+}
+
+.nge-font-dialog__check input {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: var(--nge-color-primary);
+    cursor: pointer;
+}
+
+.nge-font-dialog__check-label--bold {
+    font-weight: 700;
+}
+
+.nge-font-dialog__check-label--italic {
+    font-style: italic;
+}
+
+.nge-font-dialog__error {
+    margin-top: var(--nge-space-2);
+    color: var(--nge-color-danger);
+}
+
+/* The toolbar opener (`FontPickers`). */
+.nge-font__more {
+    white-space: nowrap;
+}

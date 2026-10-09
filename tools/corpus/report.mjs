@@ -5,6 +5,10 @@
  * Reads the JSONL `corpus-native` produces (one record per document — see
  * `tools/corpus-native/src/pipeline.rs` for the schema) and:
  *   - counts outcomes (ok / error / panic / crash / timeout),
+ *   - flags a timeout only when it is CONFIRMED (issue #418): corpus-native
+ *     retries a timed-out document once, alone, and records `timeout` only
+ *     when the retry times out too; a first-attempt timeout the retry
+ *     cleared is reported as load noise, never as a failure,
  *   - buckets every non-`ok` record into a stable *signature* (mirrors
  *     `corpus-native`'s own `panics::normalize_signature`: digit runs
  *     collapse to `N` so the same underlying bug at different byte offsets
@@ -77,9 +81,36 @@ function main() {
     }
 
     /* --- Failure buckets (panic signature when present, else outcome@stage). --- */
+    /* Issue #418 - a `timeout` record is CONFIRMED when the lone retry also
+    timed out (`timeout_retry.recovered === false`). A record from before
+    the retry existed carries no `timeout_retry`: it is UNVERIFIED (it may
+    be load noise) and is listed, not bucketed as a failure. */
+    const isTimeout = (r) => r.outcome === 'timeout';
+    const isConfirmedTimeout = (r) => isTimeout(r) && r.timeout_retry && r.timeout_retry.recovered === false;
+    const confirmedTimeouts = records.filter(isConfirmedTimeout);
+    const unverifiedTimeouts = records.filter((r) => isTimeout(r) && !r.timeout_retry);
+    const clearedTimeouts = records.filter((r) => r.timeout_retry && r.timeout_retry.recovered === true);
+    console.log('\n=== Timeouts (#418) ===');
+    console.log(`  confirmed (the retry, alone, also timed out): ${confirmedTimeouts.length}`);
+    for (const r of confirmedTimeouts) {
+        console.log(
+            `    ${r.path} (${r.stage ?? 'whole document'}; cpu ${r.engine_layout_cpu_ms ?? '?'} ms, wall ${r.engine_layout_wall_ms ?? '?'} ms)`,
+        );
+    }
+    console.log(`  cleared by the lone retry (load noise, not flagged): ${clearedTimeouts.length}`);
+    for (const r of clearedTimeouts) {
+        const t = r.timeout_retry;
+        console.log(`    ${r.path} (first attempt: cpu ${t.first_cpu_ms ?? '?'} ms, wall ${t.first_wall_ms ?? '?'} ms)`);
+    }
+    if (unverifiedTimeouts.length > 0) {
+        console.log(`  unverified (record predates the retry; re-run to confirm): ${unverifiedTimeouts.length}`);
+        for (const r of unverifiedTimeouts) console.log(`    ${r.path}`);
+    }
+
     const buckets = new Map(); // signature -> { count, examplePath, exampleBytes, message, outcome, stage }
     for (const r of records) {
         if (r.outcome === 'ok') continue;
+        if (isTimeout(r) && !isConfirmedTimeout(r)) continue; // #418: only confirmed timeouts are failures
         const sig = r.panic_signature || normalizeSignature(r.outcome, r.stage, r.message);
         const existing = buckets.get(sig);
         if (!existing) {
@@ -197,6 +228,11 @@ function main() {
         total_documents: records.length,
         outcome_counts: outcomeCounts,
         failure_buckets: sortedBuckets,
+        timeouts: {
+            confirmed: confirmedTimeouts.map((r) => r.path),
+            cleared_by_retry: clearedTimeouts.map((r) => r.path),
+            unverified: unverifiedTimeouts.map((r) => r.path),
+        },
         round_trip_violations: {
             document_xml_drifted: xmlDrifted.map((r) => r.path),
             sibling_drifted: siblingDrifted.map((r) => r.path),

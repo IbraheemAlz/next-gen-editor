@@ -704,6 +704,10 @@ pub struct MarkerBox {
     /// Total advance of `run.glyphs` — pre-computed so the renderer doesn't
     /// have to re-sum.
     pub width: f32,
+    /// The marker text `run` was shaped from (`"1."`, `"•"`): the run's
+    /// glyph clusters index it (`run.source_range` is empty — a marker has
+    /// no source-paragraph bytes). The PDF exporter's `/ToUnicode` source.
+    pub text: String,
 }
 
 /// Top-level page child — Phase 5 PR 2. The page-build pipeline emits one

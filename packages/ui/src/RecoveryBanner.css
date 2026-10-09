@@ -65,3 +65,10 @@
     flex: none;
     align-self: flex-start;
 }
+
+/* Issue #388 - Recover / Discard choices of the previous-session offer. */
+.nge-recovery-banner__choices {
+    display: flex;
+    gap: var(--nge-space-2);
+    margin-top: var(--nge-space-2);
+}
