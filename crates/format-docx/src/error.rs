@@ -97,13 +97,21 @@ pub enum DocxWarning {
     /// Issue #350 — complex fields nested deeper than `limit`: the extra
     /// levels are not modeled (their text stays hidden code).
     FieldNestingTooDeep { limit: u32 },
-    /// Issue #325 — the main part binds WordprocessingML under a prefix
-    /// (or as the default namespace) the literal-qname reader does not
-    /// match. `normalized` = the part was re-prefixed into the canonical
-    /// spelling and read; it is then **regenerate-only** (a zero-edit
-    /// save re-emits the normalised bytes, not the source's). `false` =
+    /// Issue #325 — a WordprocessingML part binds WordprocessingML under a
+    /// prefix (or as the default namespace) the literal-qname reader does
+    /// not match. `part` is the archive entry (issue #394: the main part
+    /// and every sibling the reader walks — headers, footers, footnotes,
+    /// endnotes, comments, styles, numbering, settings). `normalized` =
+    /// the part was re-prefixed into the canonical spelling and read; it
+    /// is then **regenerate-only** (its source bytes are not reused: a
+    /// zero-edit save re-emits the normalised bytes, and every passthrough
+    /// / in-place patch of the part starts from them). `false` =
     /// normalisation itself failed and the part read as-is (likely empty).
-    NonCanonicalNamespaces { detail: String, normalized: bool },
+    NonCanonicalNamespaces {
+        part: String,
+        detail: String,
+        normalized: bool,
+    },
     /// Issue #325 — the main part's root is not a WordprocessingML element
     /// in either namespace family; it reads as an empty document.
     NotWordprocessingMl,

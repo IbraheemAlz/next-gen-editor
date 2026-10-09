@@ -61,6 +61,33 @@ paths:
   `error::warn` into the read's sink (`collect_read_warnings`; a no-op in
   the writer's re-parses). Verified-reuse equality never uses float `==`:
   `writer::same_section_props` compares geometry by bits.
+- **Namespace prefixes (issues #325 / #394).** The parsers match literal
+  qnames (`w:p`), so every WordprocessingML part the reader walks — the
+  main part, `styles.xml`, `numbering.xml`, `settings.xml`, the note
+  parts, `comments.xml` and every header / footer the main part's rels
+  name — has its root classified first (`NamespaceScope::classify_root`).
+  A part binding WordprocessingML to another prefix (or as the default
+  namespace) is rewritten by `schema::ns_normalize::canonicalize_prefixes`
+  and reported as `DocxWarning::NonCanonicalNamespaces { part, .. }`; a
+  sibling's normalised bytes REPLACE its `other_entries` row, so the
+  parsers, the verbatim passthrough, in-place patches (`comments.xml`)
+  and the tree's source package all see one spelling. Such a part is
+  regenerate-only (its zero-edit save is not byte-identical to the
+  source — `tools/corpus-native`'s `normalized_parts`); canonical parts
+  and parts the reader never walks stay verbatim.
+- **Paragraph borders (issues #352 / #395).** `<w:pBdr>` is read by
+  `schema::ct_pbdr` for paragraphs AND styles / docDefaults
+  (`parts::styles`). Borders cascade PER EDGE (`ParaProperties::
+  merged_with`); an explicit `w:val="nil"` / `"none"` is a set
+  `BorderStyle::None` edge (painted by nothing) so it removes an
+  inherited one. A logical `<w:start>` / `<w:end>` edge is stored in the
+  slot its OWN properties' `direction` names (+ `border_spelling`), and
+  every cascade — the reader's `StyleResolver::resolve_paragraph`, the
+  engine's `recompute_paragraph_props` / `resolve_style_cascade` — goes
+  through `ParaProperties::cascade`, which re-orients each level to the
+  paragraph's FINAL direction (`oriented_borders`) before folding, so a
+  style's `<w:start>` lands where the paragraph's (cascaded) `<w:bidi>`
+  says. Never fold paragraph properties with a bare `merged_with` loop.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:
@@ -84,9 +111,10 @@ The `tools/roundtrip/` harness asserts:
   `TableProperties`, `RowProperties`, `CellProperties`) and the writer
   re-emits it, interleaved with the modeled children **in schema order**
   (rank tables in `schema/ct_rpr.rs`, `ct_ppr.rs`, `ct_tbl.rs`).
-- The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole; its
-  modeled children still seed the run baseline (`fold_rpr_fragment`).
-  Issue #293 — they are also modeled as `Paragraph::mark_style`
+- The paragraph-mark `<w:pPr>/<w:rPr>` rides the pPr bag whole. Issue
+  #369 — Word applies it to the mark (the pilcrow) ONLY: it is never
+  folded into the paragraph's runs (a bold mark over plain runs reads
+  plain runs). Issue #293 — its modeled children are `Paragraph::mark_style`
   (`schema::ct_rpr::mark_rpr_style`; `None` = not modeled, the bag is the
   truth): typing into an empty paragraph inherits it, `split_at` gives an
   EMPTY half the insertion formatting at the split point, `concat` keeps

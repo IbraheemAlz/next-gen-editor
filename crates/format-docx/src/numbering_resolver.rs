@@ -74,7 +74,9 @@ fn resolve_markers_inner(paragraphs: &mut [&mut Paragraph], defs: &NumberingDefi
 
         /* Initialise or increment this level's counter. */
         match counters.get_mut(&(num_id, ilvl)) {
-            Some(c) => *c += 1,
+            /* Issue #422 — `<w:start w:val="2147483647"/>` is untrusted:
+            saturate instead of overflowing on the next item. */
+            Some(c) => *c = c.saturating_add(1),
             None => {
                 let start = defs.start_for(num_id, ilvl).unwrap_or(1);
                 counters.insert((num_id, ilvl), start);
@@ -155,8 +157,14 @@ pub fn format_counter(n: i32, fmt: &NumFmt) -> String {
 /// the next-cycle uppercase repeated-letter form (1 → A, 27 → AA, not AB),
 /// so this is *not* a base-26 conversion — repeated letters are an
 /// off-by-one cycle.
+///
+/// Issue #422 — the repeat count grows with `n`, and `n` comes from an
+/// untrusted `<w:start w:val>`: `2147483647` asked for an 82 MB marker on
+/// EVERY paragraph of the list. Counters above [`MAX_LETTER_COUNTER`]
+/// fall back to decimal, as out-of-range roman numerals already do — the
+/// marker stays at most 1 261 letters.
 fn letter(n: i32, upper: bool) -> String {
-    if n < 1 {
+    if !(1..=MAX_LETTER_COUNTER).contains(&n) {
         return n.to_string();
     }
     let base = if upper { b'A' } else { b'a' };
@@ -166,6 +174,10 @@ fn letter(n: i32, upper: bool) -> String {
     let ch = base + ((n - 1) % 26) as u8;
     std::iter::repeat_n(ch as char, cycle).collect()
 }
+
+/// Issue #422 — the largest counter [`letter`] spells as repeated letters
+/// (Word's own largest "start at" value); above it the marker is decimal.
+pub const MAX_LETTER_COUNTER: i32 = 32_767;
 
 /// Roman numeral 1..=3999. Out-of-range falls back to decimal.
 fn roman(mut n: i32, upper: bool) -> String {
@@ -317,6 +329,25 @@ mod tests {
         assert_eq!(format_counter(27, &NumFmt::LowerLetter), "aa");
         assert_eq!(format_counter(52, &NumFmt::LowerLetter), "zz");
         assert_eq!(format_counter(53, &NumFmt::LowerLetter), "aaa");
+    }
+
+    /// Issue #422 — a hostile `<w:start w:val="2147483647"/>` used to spell
+    /// an 82 MB marker per list paragraph; past `MAX_LETTER_COUNTER` the
+    /// marker is decimal, and at the cap it is still bounded.
+    #[test]
+    fn letter_markers_are_bounded_for_hostile_counters() {
+        let at_cap = format_counter(MAX_LETTER_COUNTER, &NumFmt::UpperLetter);
+        assert_eq!(at_cap.len(), 1261);
+        assert!(at_cap.bytes().all(|b| b == at_cap.as_bytes()[0]));
+        assert_eq!(
+            format_counter(MAX_LETTER_COUNTER + 1, &NumFmt::LowerLetter),
+            "32768"
+        );
+        assert_eq!(
+            format_counter(i32::MAX, &NumFmt::LowerLetter),
+            i32::MAX.to_string()
+        );
+        assert_eq!(format_counter(0, &NumFmt::LowerLetter), "0");
     }
 
     #[test]

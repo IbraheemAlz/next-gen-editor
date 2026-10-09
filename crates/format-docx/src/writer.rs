@@ -492,9 +492,9 @@ struct RunSource<'a> {
 /// `<w:r …>` start tag + `<w:rPr>` (+ the source run's leading content)
 /// for a run regenerated inside `src`: the source attributes always; the
 /// source `<w:rPr>` bytes verbatim while the style is still the one they
-/// produced (a verified passthrough — the paragraph-mark formatting the
-/// reader folds into a span never leaks into a run that had no rPr),
-/// else a regenerated rPr that adopts the source spelling per child.
+/// produced (a verified passthrough — a span's character-style chain
+/// never leaks into a run as direct formatting), else a regenerated rPr
+/// that adopts the source spelling per child.
 fn open_source_run(style: &SpanStyle, src: Option<RunSource<'_>>, out: &mut String) {
     let Some(RunSource { run, first }) = src else {
         out.push_str("<w:r>");
@@ -2214,13 +2214,14 @@ fn emit_inline_object(
             `<w:object>`): byte-for-byte while the model agrees with it.
             An object without a picture (a text box, shape, chart, OLE
             object) has no typed regeneration and is ALWAYS written from
-            its bytes — never dropped. */
+            its bytes — never dropped. Issue #358 — bytes that are not
+            UTF-8 (junk the reader never decoded) are written lossily
+            instead of dropping the object. */
             if let Some(bytes) = obj.source_xml.as_deref()
-                && let Ok(verbatim) = std::str::from_utf8(bytes)
                 && (rel_id.is_empty() || preserved_drawing_is_current(obj, bytes))
             {
                 open_source_run(style, src, out);
-                out.push_str(verbatim);
+                out.push_str(&String::from_utf8_lossy(bytes));
                 out.push_str("</w:r>");
                 return;
             }
@@ -3264,12 +3265,16 @@ fn emit_trailing_sect_pr(doc: &DocumentTree, captured: bool, out: &mut String) {
     }
 }
 
-/// Append raw source bytes (valid UTF-8 by construction — they were
-/// sliced out of a part quick-xml decoded); anything else is skipped.
+/// Append raw source bytes. They are sliced out of a part quick-xml
+/// parsed, but quick-xml only decodes what the reader asks it to (`<w:t>`
+/// text, attribute values): character data the reader never decodes — junk
+/// inside an unselected `mc:Fallback`, say — may be invalid UTF-8. Issue
+/// #358 — such bytes used to be SKIPPED, which dropped a whole marker (an
+/// `mc:AlternateContent` closer) and wrote an ill-formed part the reader
+/// then refused; they are now written lossily (U+FFFD per invalid
+/// sequence), so the structure always survives.
 fn push_utf8(bytes: &[u8], out: &mut String) {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        out.push_str(s);
-    }
+    out.push_str(&String::from_utf8_lossy(bytes));
 }
 
 /// Issue #112 — `true` when a re-parse of the section's source bytes
@@ -6066,17 +6071,23 @@ mod tests {
         /* Scrambled source order; a `<w:pPrChange>` carrying a stale
         `<w:jc w:val="right"/>` that must not override the live centre
         alignment; the paragraph-mark `<w:rPr>` rides the bag as one
-        fragment while its `<w:b/>` still seeds the run baseline. */
+        fragment — and (issue #369) formats the mark only: its `<w:b/>`
+        never reaches the plain run. */
         let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:cnfStyle w:val="000000100000"/><w:jc w:val="center"/><w:pPrChange w:id="2" w:author="A" w:date="2026-01-01T00:00:00Z"><w:pPr><w:jc w:val="right"/></w:pPr></w:pPrChange><w:framePr w:w="2880"/><w:keepNext/><w:rPr><w:b/><w:lang w:val="ar-SA"/></w:rPr></w:pPr><w:r><w:t xml:space="preserve">x</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
         let (parsed, xml) = regenerate_dirty(document_xml);
         let para = parsed.document.nth_paragraph(0).unwrap();
         assert_eq!(para.props.alignment, Some(engine::Alignment::Center));
         assert_eq!(para.props.keep_next, Some(true));
+        assert!(
+            para.spans.is_empty(),
+            "issue #369 — the mark's <w:b/> is not folded into the run: {:?}",
+            para.spans
+        );
         assert_eq!(
-            para.spans[0].style.bold,
+            para.mark_style.as_deref().and_then(|m| m.bold),
             Some(true),
-            "paragraph-mark rPr still seeds the run baseline"
+            "the mark keeps it"
         );
         assert_eq!(
             para.direct_overrides.grab_bag, para.props.grab_bag,

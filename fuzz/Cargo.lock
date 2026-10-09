@@ -349,6 +349,7 @@ dependencies = [
  "format-docx",
  "format-pdf",
  "layout",
+ "libc",
  "libfuzzer-sys",
  "render",
  "zip",
