@@ -126,6 +126,144 @@ pub struct EditCheck {
     pub rewrite_cause: Option<String>,
 }
 
+/// Issue #282 — a comment added to an untouched paragraph and a comment
+/// deleted from the source, each saved on its own: the anchors of a new
+/// comment must be spliced into the replayed source bytes (a pure
+/// insertion) and survive a re-read on the same text with their body in
+/// `comments.xml`; a deleted comment's anchors must leave every replayed
+/// byte (a pure deletion) and its body the comment parts.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CommentCheck {
+    /// Top-level block index of the paragraph the comment was added to
+    /// (the first untouched one with three characters); `None` when the
+    /// document has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_block: Option<u32>,
+    /// `document.xml` of the save is the original plus insertions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_pure_insertion: Option<bool>,
+    /// [`EditCheck::source_bytes_rewritten`] of that save (the single-
+    /// region metric: two separate insertions count the bytes between).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_source_bytes_rewritten: Option<u64>,
+    /// The re-read range covers the same text and the body round-tripped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_anchored: Option<bool>,
+    /// The source comment deleted (the first ranged one), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_id: Option<u32>,
+    /// `document.xml` of that save is the original minus deletions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_pure_deletion: Option<bool>,
+    /// Anchor pieces of the deleted id left in the saved `document.xml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_anchors_left: Option<u32>,
+    /// The deleted comment re-reads as gone (no def, no range).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_gone: Option<bool>,
+}
+
+/// Issue #282 — `edited` is `orig` plus insertions only (a byte-level
+/// minimal diff with no deletion; prefix and suffix are trimmed first, so
+/// a local edit of a large part stays cheap).
+fn is_pure_insertion(orig: &[u8], edited: &[u8]) -> bool {
+    let Some(budget) = edited.len().checked_sub(orig.len()) else {
+        return false;
+    };
+    format_docx::schema::anchor_patch::diff_by(
+        orig.len(),
+        edited.len(),
+        |i, j| orig[i] == edited[j],
+        budget,
+    )
+    .is_some_and(|ops| {
+        !ops.iter()
+            .any(|o| matches!(o, format_docx::schema::anchor_patch::Op::Delete(_)))
+    })
+}
+
+/// Issue #282 — see [`CommentCheck`]. `None` when the document has
+/// neither an untouched top-level paragraph with three characters to
+/// comment on nor a source comment to delete.
+fn comment_check(archive: &DocxArchive, orig_xml: &[u8]) -> Option<CommentCheck> {
+    let doc = &archive.document;
+    let mut check = CommentCheck::default();
+    let target = doc.blocks.iter().enumerate().find_map(|(i, b)| match b {
+        engine::Block::Paragraph(p)
+            if !p.dirty && p.source_xml.is_some() && p.text.chars().count() >= 3 =>
+        {
+            Some((i as u32, p))
+        }
+        _ => None,
+    });
+    if let Some((block, p)) = target
+        && let Some(lo) = p.text.char_indices().nth(1).map(|(i, _)| i as u32)
+        && let Some(hi) = p.text.char_indices().last().map(|(i, _)| i as u32)
+    {
+        let path = engine::BlockPath::top(block);
+        let (with_comment, id) = doc.insert_comment(
+            engine::LogicalPos::new(path.clone(), lo),
+            engine::LogicalPos::new(path, hi),
+            "corpus-native probe".into(),
+            "corpus-native".into(),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        let expected = with_comment
+            .comment_ranges
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| {
+                with_comment
+                    .paragraph_at_path(&r.start.path)?
+                    .text
+                    .get(r.start.offset as usize..r.end.offset as usize)
+                    .map(str::to_string)
+            });
+        check.insert_block = Some(block);
+        if let Ok(bytes) = format_docx::write_docx(archive, &with_comment)
+            && let Ok(xml) = extract_doc_xml(&bytes)
+        {
+            check.insert_pure_insertion = Some(is_pure_insertion(orig_xml, &xml));
+            check.insert_source_bytes_rewritten = Some(rewritten_region(orig_xml, &xml).1);
+            check.insert_anchored = Some(format_docx::read_docx(&bytes).is_ok_and(|back| {
+                let d = &back.document;
+                d.comment_defs.contains_key(&id)
+                    && d.comment_ranges.iter().any(|r| {
+                        r.id == id
+                            && d.paragraph_at_path(&r.start.path).and_then(|p| {
+                                p.text.get(r.start.offset as usize..r.end.offset as usize)
+                            }) == expected.as_deref()
+                    })
+            }));
+        }
+    }
+    if let Some(victim) = doc
+        .comment_ranges
+        .iter()
+        .map(|r| r.id)
+        .find(|id| doc.comment_defs.contains_key(id))
+    {
+        check.delete_id = Some(victim);
+        let without = doc.delete_comment(victim);
+        if let Ok(bytes) = format_docx::write_docx(archive, &without)
+            && let Ok(xml) = extract_doc_xml(&bytes)
+        {
+            check.delete_pure_deletion = Some(is_pure_insertion(&xml, orig_xml));
+            let text = String::from_utf8_lossy(&xml);
+            let left = ["commentRangeStart", "commentRangeEnd", "commentReference"]
+                .iter()
+                .map(|el| text.matches(&format!("<w:{el} w:id=\"{victim}\"")).count() as u32)
+                .sum();
+            check.delete_anchors_left = Some(left);
+            check.delete_gone = Some(format_docx::read_docx(&bytes).is_ok_and(|back| {
+                !back.document.comment_defs.contains_key(&victim)
+                    && back.document.comment_ranges.iter().all(|r| r.id != victim)
+            }));
+        }
+    }
+    (check.insert_block.is_some() || check.delete_id.is_some()).then_some(check)
+}
+
 /// Issue #250 — `Some(in step)` for the paragraph at `pos`, `None` when it
 /// carries no source markup.
 fn markup_in_step(doc: &engine::DocumentTree, pos: &engine::LogicalPos) -> Option<bool> {
@@ -361,6 +499,9 @@ pub struct DocResult {
     /// save and — with the scripted edit — the edited one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_save_matches_write_docx: Option<bool>,
+    /// Issue #282 — see [`CommentCheck`] (with the scripted edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_check: Option<CommentCheck>,
     /// Issue #318 — wall-clock ms of the PRODUCTION layout
     /// (`engine-wasm`'s `Engine::build_pages`: the real table grid +
     /// autofit, header/footer bands, notes, wrap convergence), driven
@@ -535,6 +676,7 @@ impl DocResult {
             edit_check: None,
             ui_save_siblings_identical: None,
             ui_save_matches_write_docx: None,
+            comment_check: None,
             engine_layout_ms: None,
             engine_page_count: None,
             engine_fingerprint: None,
@@ -872,6 +1014,9 @@ pub fn run_one(
                 within_secondary_bound,
                 rewrite_cause,
             });
+            /* Issue #282 — comments on untouched paragraphs. */
+            rec.comment_check =
+                stage_infallible!("comment_check", comment_check(&archive_a, &doc_xml_orig));
         }
     }
 

@@ -37,6 +37,9 @@ pub const FOOTNOTES_XML: &str = "word/footnotes.xml";
 pub const ENDNOTES_XML: &str = "word/endnotes.xml";
 pub const COMMENTS_XML: &str = "word/comments.xml";
 pub const COMMENTS_EXTENDED_XML: &str = "word/commentsExtended.xml";
+/// Issue #282 — Word 2019+ comment side parts keyed by paraId / durable id.
+pub const COMMENTS_IDS_XML: &str = "word/commentsIds.xml";
+pub const COMMENTS_EXTENSIBLE_XML: &str = "word/commentsExtensible.xml";
 pub const SETTINGS_XML: &str = "word/settings.xml";
 /// Issue #355 — where Word puts the theme (`a:theme`); read-only (font +
 /// colour schemes), always passthrough.

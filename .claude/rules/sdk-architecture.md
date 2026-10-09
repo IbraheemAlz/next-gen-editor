@@ -107,9 +107,21 @@ visibly gate itself. The canonical pattern:
                                             // toast surfaces the gap
 >
     <span>Label</span>
-    <span class="nge-feature__badge">Engine pending</span>
+    <span
+        class="nge-feature__badge"
+        data-nge-command="SOME_COMMAND"
+        data-nge-pending-issue="123"
+    >
+        Engine pending
+    </span>
 </button>
 ```
+
+Issue #342 — the two `data-nge-*` attributes are mandatory on every badge:
+`tools/parity` checks them against `crates/bridge/src/meta.rs` (the command
+must be `Partial { issue: 123 }` or `Stub { issue: 123 }` there) and fails
+CI on a bare "Engine pending" text, a stale badge, or a stub exposed
+without one.
 
 The matching CSS chip:
 

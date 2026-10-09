@@ -6,6 +6,7 @@ import type {
     Event,
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import { commandMeta } from '@nge/core/command-meta';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
 import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
@@ -181,12 +182,10 @@ let pendingPackage: { hash: string; bytes: Uint8Array } | undefined;
    base did not restore. */
 let pinNextSnapshot = false;
 /* Issue #268 — commands that replace the whole document: the snapshot
-   after one is the new document's pinned base. */
-const DOCUMENT_REPLACING: ReadonlySet<Command['type']> = new Set([
-    'OPEN_DOCUMENT',
-    'LOAD_DOCX',
-    'RENDER_PAGE',
-]);
+   after one is the new document's pinned base. Issue #342 — derived from
+   `bridge::meta` (`CommandMeta.new_document`: OPEN_DOCUMENT, LOAD_DOCX,
+   RENDER_PAGE, CLOSE_DOCUMENT), not a hand-kept list. */
+const startsNewDocument = (cmd: Command): boolean => commandMeta(cmd.type).new_document;
 
 /** Issue #268 — how good a recovery base is, best first:
  *  4 — full tail, package present (or none needed);
@@ -1241,32 +1240,22 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
  * Whether a successfully dispatched command belongs in the durable event
  * log. Recovery replays the tail through `dispatch`, so anything that moves
  * engine state a later logged command depends on must be kept — document
- * mutations, selection/caret moves (caret-relative
- * edits like `INSERT_TEXT` at `undefined` replay wrong without them),
- * composition, font loads, and view state. Pure read-back queries are
- * skipped: they replay as no-ops, and the per-pointermove `HIT_TEST` alone
- * would grow the commands store without bound. `PING` stays logged — the
- * D2.6 exit gate (e2e/event-log-replay.spec.ts) drives the sequence with it.
+ * mutations, selection/caret moves (caret-relative edits like `INSERT_TEXT`
+ * at `undefined` replay wrong without them), composition, font loads, and
+ * view state. Pure read-back queries are skipped: they replay as no-ops, and
+ * the per-pointermove `HIT_TEST` alone would grow the commands store without
+ * bound; the recovery primitives (`SNAPSHOT` / `RECOVER`, issue #85) are
+ * never part of the history they persist / restore. `PING` stays logged —
+ * the D2.6 exit gate (e2e/event-log-replay.spec.ts) drives the sequence
+ * with it.
+ *
+ * Issue #342 — the answer is `CommandMeta.logged`, generated from the
+ * single classification list in `crates/bridge/src/meta.rs` (the same list
+ * `EngineClient.writesInFlight` and the engine's `story_gate` read), not a
+ * hand-kept switch that could drift from them.
  */
 function shouldLogCommand(cmd: Command): boolean {
-    switch (cmd.type) {
-        case 'HIT_TEST':
-        case 'HIT_TEST_IN_PAGE':
-        case 'REQUEST_PAINT':
-        case 'REQUEST_ACCESSIBILITY_DELTA':
-        case 'GET_SELECTION_AS_CLIPBOARD':
-        case 'REQUEST_STATS':
-        case 'SAVE_DOCX':
-        case 'SAVE_DOCUMENT':
-        case 'EXPORT_PDF':
-        /* Issue #85 — the recovery primitives are never part of the
-           history they persist / restore. */
-        case 'SNAPSHOT':
-        case 'RECOVER':
-            return false;
-        default:
-            return true;
-    }
+    return commandMeta(cmd.type).logged;
 }
 
 async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
@@ -1286,7 +1275,7 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         if (shouldLogCommand(msg.cmd)) {
             const seq = logCommand(msg.cmd);
             /* Issue #268 — a new document: its first snapshot is pinned. */
-            if (DOCUMENT_REPLACING.has(msg.cmd.type) && evt.type !== 'ERROR') {
+            if (startsNewDocument(msg.cmd) && evt.type !== 'ERROR') {
                 pinNextSnapshot = true;
             }
             /* Issue #85 — cadence snapshot, taken HERE (still inside this

@@ -29,6 +29,7 @@
 //!
 //! Exit 0 on PASS, non-zero on FAIL.
 
+mod comments;
 mod inline_spans;
 mod note_containers;
 mod package_families;
@@ -348,6 +349,7 @@ fn run_default() -> Result<()> {
     package_families::run_package_families_roundtrip()?;
     reader_hardening::run_field_phases_roundtrip()?;
     reader_hardening::run_alternate_content_roundtrip()?;
+    comments::run_comment_patch_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
 
     println!("\nPASS");

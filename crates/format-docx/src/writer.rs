@@ -27,8 +27,8 @@ use crate::schema::wp_anchor::emit_anchor_open;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
     FontFamily, Hyperlink, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph,
-    Revision, RevisionKind, RowHeight, SourceMarkup, SourcePPr, SourceRun, SpanStyle, Table,
-    TableCell, TableRow, TextDirection, UnderlineStyle, VMergeRole,
+    PathStep, Revision, RevisionKind, RowHeight, SourceMarkup, SourcePPr, SourceRun, SpanStyle,
+    Table, TableCell, TableRow, TextDirection, UnderlineStyle, VMergeRole,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -1354,13 +1354,13 @@ fn emit_styled_runs_with_objects(
         if let Some(c) = comment
             && c.kind == engine::CommentAnchorKind::RangeEnd
         {
-            comment_anchors::after_range_end(c.id, out);
+            comment_anchors::after_range_end(c.id, false, out);
         }
     };
     let push_synth = |a: &comment_anchors::TreeAnchor, out: &mut String| {
         comment_anchors::push_range_marker(a.kind, a.id, out);
         if a.kind == engine::CommentAnchorKind::RangeEnd {
-            comment_anchors::after_range_end(a.id, out);
+            comment_anchors::after_range_end(a.id, true, out);
         }
     };
     for r in source_runs {
@@ -2354,9 +2354,19 @@ fn emit_paragraph(para: &Paragraph, out: &mut String, hyperlink_rel_map: &HashMa
                     }
                 };
                 match crate::parts::textbox::splice_host(s, para, &emit_blocks) {
+                    /* Issue #282 — a comment endpoint lands in it too. */
+                    Some(spliced) if comment_anchors::needs_patch(para) => {
+                        out.push_str(&patch_clean_paragraph(para, &spliced, hyperlink_rel_map));
+                    }
                     Some(spliced) => out.push_str(&spliced),
                     None => serialize_paragraph(para, out, hyperlink_rel_map),
                 }
+            }
+            /* Issue #282 — a comment endpoint no source byte carries (a
+            comment added to this untouched paragraph, a reply): splice
+            it into the source bytes. */
+            Ok(s) if comment_anchors::needs_patch(para) => {
+                out.push_str(&patch_clean_paragraph(para, s, hyperlink_rel_map));
             }
             Ok(s) => out.push_str(s),
             Err(_) => serialize_paragraph(para, out, hyperlink_rel_map),
@@ -2364,6 +2374,124 @@ fn emit_paragraph(para: &Paragraph, out: &mut String, hyperlink_rel_map: &HashMa
     } else {
         serialize_paragraph(para, out, hyperlink_rel_map);
     }
+}
+
+/// Issue #282 — clean paragraph `para` (written from `src`, its source
+/// bytes) with the comment endpoints no verbatim byte carries spliced in
+/// as a pure insertion: the regenerate path places them
+/// ([`comment_anchors::AnchorMode::Patch`]) and
+/// [`crate::schema::anchor_patch::transplant`] re-applies what it inserted
+/// to `src`. The splice is verified by re-reading it — same text,
+/// formatting, links, fields and objects as `src`, and exactly the
+/// expected anchor pieces at the expected offsets; when it cannot be
+/// verified the regenerated paragraph is written instead (the anchors
+/// are never lost, the paragraph is respelled like an edited one).
+fn patch_clean_paragraph(
+    para: &Paragraph,
+    src: &str,
+    hyperlink_rel_map: &HashMap<String, String>,
+) -> String {
+    let synth = comment_anchors::paragraph_anchors(para).synthesize;
+    let regen = |mode| {
+        comment_anchors::with_mode(mode, || {
+            let mut o = String::new();
+            serialize_paragraph(para, &mut o, hyperlink_rel_map);
+            o
+        })
+    };
+    let r0 = regen(comment_anchors::AnchorMode::Verbatim);
+    let r1 = regen(comment_anchors::AnchorMode::Patch);
+    if r0 == src {
+        return r1;
+    }
+    crate::schema::anchor_patch::transplant(src, &r0, &r1)
+        .filter(|patched| splice_is_faithful(src, patched, &synth))
+        .unwrap_or(r1)
+}
+
+/// Issue #282 — re-read `src` and `patched` (one `<w:p>` each): the splice
+/// is faithful when the paragraph content is unchanged and the anchor
+/// pieces are `src`'s plus exactly the `synth` range markers (reference
+/// runs may only be added).
+fn splice_is_faithful(src: &str, patched: &str, synth: &[comment_anchors::TreeAnchor]) -> bool {
+    let root = comment_anchors::root_attrs();
+    /* Issue #295 — a piece the splice inserted may carry an annotation-id
+    token (a run split inside a tracked change re-opens its wrapper /
+    `<w:rPrChange>`); the save resolves it later, the re-read here sees
+    the number it stands for. */
+    let patched = revision_ids::detokenize(patched);
+    let (Some((a, a_events)), Some((b, b_events))) = (
+        crate::parts::document::reparse_paragraph(src.as_bytes(), &root),
+        crate::parts::document::reparse_paragraph(patched.as_bytes(), &root),
+    ) else {
+        return false;
+    };
+    if paragraph_content(&a) != paragraph_content(&b) {
+        return false;
+    }
+    let top = [PathStep::Block(0)];
+    let synth: Vec<(&[PathStep], comment_anchors::TreeAnchor)> =
+        synth.iter().map(|t| (&top[..], *t)).collect();
+    anchor_pieces_are_faithful(&a_events, &b_events, &synth)
+}
+
+/// Issues #282 / #351 — a re-read paragraph's content for the splice
+/// checks: everything but its source bytes, with equally styled adjacent
+/// spans joined (a split run comes back as two).
+fn paragraph_content(p: &Paragraph) -> String {
+    let mut p = p.clone();
+    p.source_xml = None;
+    p.source_markup = None;
+    p.body_xml = None;
+    let mut spans: Vec<engine::StyleRun> = Vec::with_capacity(p.spans.len());
+    for r in std::mem::take(&mut p.spans) {
+        match spans.last_mut() {
+            Some(last) if last.end == r.start && last.style == r.style => last.end = r.end,
+            _ => spans.push(r),
+        }
+    }
+    p.spans = spans;
+    format!("{p:?}")
+}
+
+/// Issue #282 — the re-read anchor pieces `after` a splice are the ones
+/// `before` it plus exactly the `synth` range markers (each at its path);
+/// reference runs may only be added.
+fn anchor_pieces_are_faithful(
+    before: &[crate::parts::document::CommentEvent],
+    after: &[crate::parts::document::CommentEvent],
+    synth: &[(&[PathStep], comment_anchors::TreeAnchor)],
+) -> bool {
+    /* A sortable spelling of a path. */
+    fn key(steps: &[PathStep]) -> Vec<(u32, u32, u32)> {
+        steps
+            .iter()
+            .map(|s| match *s {
+                PathStep::Block(i) => (0, i, 0),
+                PathStep::Cell { row, col } => (1, row, col),
+            })
+            .collect()
+    }
+    type Piece = (u8, u32, Vec<(u32, u32, u32)>, u32);
+    let pieces = |events: &[crate::parts::document::CommentEvent], kind_is_ref: bool| {
+        let mut v: Vec<Piece> = events
+            .iter()
+            .filter(|e| (e.kind == engine::CommentAnchorKind::Reference) == kind_is_ref)
+            .map(|e| (e.kind as u8, e.id, key(&e.pos.path.steps), e.pos.offset))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let mut expected = pieces(before, false);
+    expected.extend(
+        synth
+            .iter()
+            .map(|(path, t)| (t.kind as u8, t.id, key(path), t.at)),
+    );
+    expected.sort_unstable();
+    let refs_before = pieces(before, true);
+    let refs_after = pieces(after, true);
+    expected == pieces(after, false) && refs_before.iter().all(|r| refs_after.contains(r))
 }
 
 /// Issue #120 — emit one block container's block list with the
@@ -2411,6 +2539,15 @@ fn emit_table(t: &Table, out: &mut String, hyperlink_rel_map: &HashMap<String, S
         valid UTF-8 from `quick_xml`. Same defensive fall-back as
         `emit_paragraph`. */
         match std::str::from_utf8(raw) {
+            /* Issue #282 — a comment endpoint lands in one of its
+            paragraphs: splice that paragraph's patched bytes in. */
+            Ok(s) if comment_anchors::table_needs_patch(t) => {
+                match patch_clean_table(t, s, hyperlink_rel_map) {
+                    Some(patched) => out.push_str(&patched),
+                    None => regenerate_table(t, out, hyperlink_rel_map),
+                }
+                return;
+            }
             Ok(s) => {
                 out.push_str(s);
                 return;
@@ -2419,6 +2556,127 @@ fn emit_table(t: &Table, out: &mut String, hyperlink_rel_map: &HashMap<String, S
         }
     }
     regenerate_table(t, out, hyperlink_rel_map);
+}
+
+/// Issue #282 — clean table `t` (source bytes `src`) with every paragraph
+/// that [`comment_anchors::needs_patch`] replaced by its patched bytes
+/// ([`patch_clean_paragraph`]). A cell paragraph's `source_xml` is the
+/// verbatim slice of the table's bytes, and the paragraphs appear in
+/// those bytes in depth-first order, so each one is located as the first
+/// occurrence of its bytes after the previous one — a prediction, checked
+/// by re-reading the result (issue #351: an unselected `mc:Choice` the
+/// reader skips may spell the same bytes first). `None` (the caller
+/// regenerates the table) when a paragraph is not clean or cannot be
+/// located — decided before any paragraph is patched — or when the
+/// re-read disagrees, after rolling back what the attempt synthesized, so
+/// nothing is synthesized twice or lost.
+fn patch_clean_table(
+    t: &Table,
+    src: &str,
+    hyperlink_rel_map: &HashMap<String, String>,
+) -> Option<String> {
+    let mut cursor = 0usize;
+    let mut hits: Vec<(usize, usize, &Paragraph)> = Vec::new();
+    let mut synth: Vec<(Vec<PathStep>, comment_anchors::TreeAnchor)> = Vec::new();
+    for (path, p) in table_paragraphs(t) {
+        if p.dirty {
+            return None;
+        }
+        let bytes = std::str::from_utf8(p.source_xml.as_deref()?).ok()?;
+        let at = cursor + src.get(cursor..)?.find(bytes)?;
+        cursor = at + bytes.len();
+        if comment_anchors::needs_patch(p) {
+            hits.push((at, bytes.len(), p));
+            synth.extend(
+                comment_anchors::paragraph_anchors(p)
+                    .synthesize
+                    .into_iter()
+                    .map(|a| (path.clone(), a)),
+            );
+        }
+    }
+    let checkpoint = comment_anchors::checkpoint();
+    let mut out = String::with_capacity(src.len() + 256 * hits.len());
+    let mut copied = 0usize;
+    for (at, len, p) in hits {
+        out.push_str(&src[copied..at]);
+        out.push_str(&patch_clean_paragraph(
+            p,
+            &src[at..at + len],
+            hyperlink_rel_map,
+        ));
+        copied = at + len;
+    }
+    out.push_str(&src[copied..]);
+    let synth: Vec<(&[PathStep], comment_anchors::TreeAnchor)> =
+        synth.iter().map(|(p, a)| (p.as_slice(), *a)).collect();
+    if table_splice_is_faithful(src, &out, &synth) {
+        Some(out)
+    } else {
+        comment_anchors::rollback(checkpoint);
+        None
+    }
+}
+
+/// Every cell paragraph of `t`, depth first, with its path under a table
+/// at `top(0)` (the path a [`crate::parts::document::reparse_block`] of
+/// the table gives it).
+fn table_paragraphs(t: &Table) -> Vec<(Vec<PathStep>, &Paragraph)> {
+    fn walk<'a>(
+        t: &'a Table,
+        prefix: &mut Vec<PathStep>,
+        out: &mut Vec<(Vec<PathStep>, &'a Paragraph)>,
+    ) {
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, cell) in row.cells.iter().enumerate() {
+                for (i, b) in cell.blocks.iter().enumerate() {
+                    prefix.push(PathStep::Cell {
+                        row: r as u32,
+                        col: c as u32,
+                    });
+                    prefix.push(PathStep::Block(i as u32));
+                    match b {
+                        Block::Paragraph(p) => out.push((prefix.clone(), p)),
+                        Block::Table(inner) => walk(inner, prefix, out),
+                    }
+                    prefix.truncate(prefix.len() - 2);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(t, &mut vec![PathStep::Block(0)], &mut out);
+    out
+}
+
+/// Issue #351 × #282 — re-read `src` and `patched` (one `<w:tbl>` each):
+/// the table splice is faithful when every cell paragraph's content is
+/// unchanged and the anchor pieces are `src`'s plus exactly `synth`.
+/// [`patch_clean_table`] locates a cell paragraph by searching for its
+/// bytes, and a branch the reader skips (an unselected `mc:Choice` of a
+/// row- or cell-level `mc:AlternateContent`, an opaque over-deep nested
+/// table) can spell the same bytes first: the re-read is what tells
+/// whether the splice landed in the paragraph the reader reads.
+fn table_splice_is_faithful(
+    src: &str,
+    patched: &str,
+    synth: &[(&[PathStep], comment_anchors::TreeAnchor)],
+) -> bool {
+    let root = comment_anchors::root_attrs();
+    let patched = revision_ids::detokenize(patched);
+    let (Some((Block::Table(a), a_events)), Some((Block::Table(b), b_events))) = (
+        crate::parts::document::reparse_block(src.as_bytes(), &root),
+        crate::parts::document::reparse_block(patched.as_bytes(), &root),
+    ) else {
+        return false;
+    };
+    let contents = |t: &Table| -> Vec<(Vec<PathStep>, String)> {
+        table_paragraphs(t)
+            .into_iter()
+            .map(|(path, p)| (path, paragraph_content(p)))
+            .collect()
+    };
+    contents(&a) == contents(&b) && anchor_pieces_are_faithful(&a_events, &b_events, synth)
 }
 
 /// Phase 5 PR 3 — full table regeneration. Emits `<w:tbl>` with
@@ -2882,8 +3140,12 @@ fn build_document_xml_with_root(
     let mut body = String::with_capacity(2048);
     /* Issue #243 — comment anchors of regenerated paragraphs come from
     the tree (verified source bytes where they still match). */
-    let comment_scope = comment_anchors::publish(doc);
+    let comment_scope = comment_anchors::publish(doc, root_attrs);
     emit_blocks(doc.blocks.iter(), &mut body, hyperlink_rel_map);
+    /* Issue #282 — a deleted comment's anchors still ride replayed
+    source bytes (clean paragraphs and tables, block-level fragments,
+    always-kept spans); strip them from the whole body. */
+    comment_anchors::strip_deleted(&mut body);
     drop(comment_scope);
     emit_trailing_sect_pr(doc, captured, &mut body);
     if captured {
@@ -3386,16 +3648,39 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         `commentsExtended.xml` row can refer to them. Existing
         Word-authored `comments.xml` is never overwritten — the writer
         continues to ride the OPC passthrough. */
-        let any_unminted_resolved = doc
-            .comment_defs
-            .values()
-            .any(|c| (c.resolved || c.parent_id.is_some()) && c.first_para_id.is_none());
+        /* Issue #282 — every comment the tree holds must reach the file:
+        a fresh document synthesizes the part for ANY comment (an anchor
+        whose comment is missing from `comments.xml` is a dangling
+        reference), and a source `comments.xml` is patched in place — the
+        comments added in the editor appended, the deleted ones
+        ([`DocumentTree::deleted_comments`]) removed, every other byte
+        kept. */
+        let comments_src = archive
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == names.comments.as_str())
+            .map(|(_, b)| b.as_slice());
+        let deleted_comments: Vec<u32> = doc
+            .deleted_comments
+            .iter()
+            .copied()
+            .filter(|id| !doc.comment_defs.contains_key(id))
+            .collect();
+        let comments_patch = comments_src.and_then(|src| {
+            crate::parts::comments::patch_comments_xml(src, &doc.comment_defs, &deleted_comments)
+        });
+        let removed_para_ids: std::collections::HashSet<String> = comments_patch
+            .as_ref()
+            .map(|p| p.removed_para_ids.clone())
+            .unwrap_or_default();
         let (comments_bytes, minted_paraids): (Option<Vec<u8>>, HashMap<u32, String>) =
-            if any_unminted_resolved && !comments_already_present {
-                let (bytes, map) = build_comments_xml(&doc.comment_defs);
-                (Some(mint_root(bytes)), map)
-            } else {
-                (None, HashMap::new())
+            match comments_patch {
+                Some(p) => (Some(p.bytes), p.minted),
+                None if !comments_already_present && !doc.comment_defs.is_empty() => {
+                    let (bytes, map) = build_comments_xml(&doc.comment_defs);
+                    (Some(mint_root(bytes)), map)
+                }
+                None => (None, HashMap::new()),
             };
 
         /* Sprint 9 — regenerate `word/commentsExtended.xml` only when
@@ -3417,6 +3702,55 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         } else {
             None
         };
+        /* Issue #282 — a removed comment's rows in the side parts keyed by
+        its paragraphs' paraIds (`commentsExtended.xml` when it rides the
+        passthrough, `commentsIds.xml`) and, through the latter's durable
+        ids, `commentsExtensible.xml`. */
+        let mut comment_side_parts: HashMap<&str, Vec<u8>> = HashMap::new();
+        if !removed_para_ids.is_empty() {
+            let part = |name: &str| {
+                archive
+                    .other_entries
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, b)| b.as_slice())
+            };
+            use crate::parts::comments::remove_comment_rows;
+            if extended_bytes.is_none()
+                && let Some(src) = part(&names.comments_extended)
+                && let Some((bytes, _)) = remove_comment_rows(
+                    src,
+                    b"w15:commentEx",
+                    b"w15:paraId",
+                    &removed_para_ids,
+                    None,
+                )
+            {
+                comment_side_parts.insert(names.comments_extended.as_str(), bytes);
+            }
+            if let Some(src) = part(&names.comments_ids)
+                && let Some((bytes, durable)) = remove_comment_rows(
+                    src,
+                    b"w16cid:commentId",
+                    b"w16cid:paraId",
+                    &removed_para_ids,
+                    Some(b"w16cid:durableId"),
+                )
+            {
+                comment_side_parts.insert(names.comments_ids.as_str(), bytes);
+                if let Some(src) = part(&names.comments_extensible)
+                    && let Some((bytes, _)) = remove_comment_rows(
+                        src,
+                        b"w16cex:commentExtensible",
+                        b"w16cex:durableId",
+                        &durable,
+                        None,
+                    )
+                {
+                    comment_side_parts.insert(names.comments_extensible.as_str(), bytes);
+                }
+            }
+        }
 
         /* Sprint 13 (#12) — regenerate `word/numbering.xml` only when
         `doc.numbering.dirty` is `true` (an in-engine synth flipped
@@ -3527,7 +3861,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         `<Override>` / `<Relationship>` rows into the passthrough OPC
         entries additively. Both helpers are no-ops when the row is
         already present, so untouched documents stay byte-identical. */
-        let synth_comments = comments_bytes.is_some();
+        let synth_comments = !comments_already_present && comments_bytes.is_some();
         let synth_extended = !extended_already_present && extended_bytes.is_some();
 
         /* Issue #60 — resolve every dirty paragraph's hyperlinks to an
@@ -3845,10 +4179,11 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
             } else if name == names.comments.as_str()
                 && let Some(new_bytes) = comments_bytes.as_deref()
             {
-                /* Synthesis path is guarded behind `!comments_already_present`;
-                if comments.xml IS in `other_entries`, `comments_bytes` is
-                `None` and this branch is unreachable. Kept defensive for
-                the case where the gate evolves. */
+                /* Issue #282 — the source part, patched (comments added /
+                deleted in the editor). */
+                zip.write_all(new_bytes)?;
+            } else if let Some(new_bytes) = comment_side_parts.get(name.as_str()) {
+                /* Issue #282 — a deleted comment's side-part rows. */
                 zip.write_all(new_bytes)?;
             } else if name == names.numbering.as_str()
                 && let Some(new_bytes) = numbering_bytes.as_deref()
@@ -4093,7 +4428,7 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         }
         /* L1.2 (#18) — append comments.xml when synthesized fresh.
         Content_Types + rels were patched in the write loop above. */
-        if let Some(new_bytes) = comments_bytes.as_deref() {
+        if synth_comments && let Some(new_bytes) = comments_bytes.as_deref() {
             zip.start_file(names.comments.as_str(), opts)?;
             zip.write_all(new_bytes)?;
         }
@@ -5067,26 +5402,36 @@ fn open_hyperlink(
 /// from the `Paragraph.hyperlinks` overlay (which carries the resolved
 /// target URL; the source `r:id` rides `Hyperlink::attrs`, issue #242)
 /// needs a verified, reused or fresh id resolved.
+///
+/// Issue #282 — a clean paragraph a comment endpoint must be spliced into
+/// is regenerated too (`patch_clean_paragraph`, at least as the baseline
+/// it diffs against), so its links resolve like a dirty paragraph's.
 fn collect_dirty_hyperlinks(doc: &DocumentTree) -> Vec<&Hyperlink> {
-    fn walk<'a>(blocks: impl IntoIterator<Item = &'a Block>, out: &mut Vec<&'a Hyperlink>) {
+    fn walk<'a>(
+        blocks: impl IntoIterator<Item = &'a Block>,
+        plan: Option<&comment_anchors::CommentPlan>,
+        out: &mut Vec<&'a Hyperlink>,
+    ) {
         for b in blocks {
             match b {
-                Block::Paragraph(p) if p.dirty => {
+                Block::Paragraph(p) if p.dirty || plan.is_some_and(|plan| plan.needs_patch(p)) => {
                     out.extend(p.hyperlinks.iter().filter(|h| !h.target.starts_with('#')));
                 }
                 Block::Paragraph(_) => {}
                 Block::Table(t) => {
                     for row in &t.rows {
                         for cell in &row.cells {
-                            walk(&cell.blocks, out);
+                            walk(&cell.blocks, plan, out);
                         }
                     }
                 }
             }
         }
     }
+    let plan = (!doc.comment_ranges.is_empty())
+        .then(|| comment_anchors::CommentPlan::for_document(doc, &[]));
     let mut out = Vec::new();
-    walk(&doc.blocks, &mut out);
+    walk(&doc.blocks, plan.as_ref(), &mut out);
     out
 }
 
@@ -10676,6 +11021,11 @@ mod paragraph_format_tests;
 #[cfg(test)]
 #[path = "writer_revision_id_tests.rs"]
 mod revision_id_tests;
+
+/// Issue #282 — comments on paragraphs written from their source bytes.
+#[cfg(test)]
+#[path = "writer_comment_patch_tests.rs"]
+mod comment_patch_tests;
 
 /// Issue #355 — `<w:rFonts>` theme bindings.
 #[cfg(test)]

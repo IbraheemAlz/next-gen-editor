@@ -84,6 +84,7 @@ export type {
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 import type {
+    BlockPath,
     Command,
     Event,
     RendererDowngrade,
@@ -220,10 +221,19 @@ export interface CommentSnapshot {
     author: string;
     date: string;
     text: string;
+    /** The LAST block index of the start path — flat, kept for
+     *  compatibility; for a comment inside a table cell it is the cell
+     *  paragraph's index, not a top-level block. Use `start_path`. */
     start_block: number;
     start_offset: number;
     end_block: number;
     end_offset: number;
+    /** Issue #254 — the full anchor paths (a comment inside a table cell
+     *  is `[BLOCK t, CELL r/c, BLOCK i]`), ready for a `SET_SELECTION`
+     *  `LogicalPos`. Optional — implementations that pre-date #254 omit
+     *  them (consumers then fall back to the flat index). */
+    start_path?: BlockPath;
+    end_path?: BlockPath;
     /** Optional — implementations that pre-date Sprint 7 omit it. */
     resolved?: boolean;
     /** Issue #27 — parent comment `w:id` when this row is a threaded

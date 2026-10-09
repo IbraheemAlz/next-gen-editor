@@ -1290,29 +1290,36 @@ impl Engine {
     /// span. The TS shell renders these in a sidebar; no canvas
     /// drawing of comment overlays in this MVP.
     pub fn comments_snapshot(&self) -> Result<JsValue, JsValue> {
-        let doc = self.undo.current();
-        let comments: Vec<CommentOut> = doc
-            .comment_ranges
-            .iter()
-            .map(|r| {
-                let def = doc.comment_defs.get(&r.id).cloned().unwrap_or_default();
-                CommentOut {
-                    id: r.id,
-                    author: def.author,
-                    date: def.date,
-                    text: def.paragraphs.join("\n"),
-                    resolved: def.resolved,
-                    parent_id: def.parent_id,
-                    start_block: r.start.path.last_block_index().unwrap_or(0),
-                    start_offset: r.start.offset,
-                    end_block: r.end.path.last_block_index().unwrap_or(0),
-                    end_offset: r.end.offset,
-                }
-            })
-            .collect();
-        serde_wasm_bindgen::to_value(&comments)
+        serde_wasm_bindgen::to_value(&comment_rows(self.undo.current()))
             .map_err(|e| JsValue::from_str(&format!("encode comments: {e}")))
     }
+}
+
+/// The [`Engine::comments_snapshot`] rows of `doc`, one per comment range
+/// (`comment_ranges` order). Issue #254 — each carries its full anchor
+/// paths next to the flat `last_block_index` (a cell comment's flat index
+/// is its paragraph's index inside the cell, not a top-level block).
+fn comment_rows(doc: &engine::DocumentTree) -> Vec<CommentOut> {
+    doc.comment_ranges
+        .iter()
+        .map(|r| {
+            let def = doc.comment_defs.get(&r.id).cloned().unwrap_or_default();
+            CommentOut {
+                id: r.id,
+                author: def.author,
+                date: def.date,
+                text: def.paragraphs.join("\n"),
+                resolved: def.resolved,
+                parent_id: def.parent_id,
+                start_block: r.start.path.last_block_index().unwrap_or(0),
+                start_offset: r.start.offset,
+                end_block: r.end.path.last_block_index().unwrap_or(0),
+                end_offset: r.end.offset,
+                start_path: engine_to_bridge_path(r.start.path.clone()),
+                end_path: engine_to_bridge_path(r.end.path.clone()),
+            }
+        })
+        .collect()
 }
 
 #[derive(::serde::Serialize)]
@@ -1444,6 +1451,12 @@ struct CommentOut {
     start_offset: u32,
     end_block: u32,
     end_offset: u32,
+    /// Issue #254 — the full anchor paths (the `LogicalPos` wire shape a
+    /// `SET_SELECTION` takes), so a comment inside a table cell is listed
+    /// and navigated at its cell; `start_block` / `end_block` keep the
+    /// flat index for older consumers.
+    start_path: BridgeBlockPath,
+    end_path: BridgeBlockPath,
 }
 
 /// Serialization surface for [`Engine::media_entries`]. Mirrors
@@ -6720,6 +6733,96 @@ fn file_base_name(name: &str) -> String {
         .to_string()
 }
 
+/// Issue #339 — decode a `.txt` / `.html` file's bytes: a UTF-8 BOM is
+/// dropped, a UTF-16 LE / BE BOM selects UTF-16, everything else is UTF-8
+/// with invalid sequences replaced by U+FFFD (no `encoding_rs` in the tree,
+/// so legacy code pages — cp1252, cp1256 — are not detected).
+fn decode_text_file(bytes: &[u8]) -> String {
+    fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
+        let units = bytes.chunks_exact(2).map(|c| unit([c[0], c[1]]));
+        char::decode_utf16(units)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, u16::from_be_bytes);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Issue #339 — one paragraph per line (`\r\n`, `\n` or `\r`). A single
+/// trailing line break ends the last line rather than opening an empty
+/// paragraph (the POSIX text-file convention); an empty file is one empty
+/// paragraph.
+fn plain_text_paragraphs(text: &str) -> Vec<String> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let body = normalized.strip_suffix('\n').unwrap_or(&normalized);
+    body.split('\n').map(str::to_owned).collect()
+}
+
+/// Issue #339 — give every paragraph without an explicit direction its
+/// first-strong one, as a direct override (so it reaches the `.docx`
+/// writer's `<w:bidi>` and survives `ApplyStyle`, #218): Arabic text opens
+/// RTL. A paragraph with no strong character (blank lines, numbers)
+/// follows the paragraph before it — or, before the first strong one, that
+/// first strong direction — so an Arabic file's blank lines are RTL too.
+/// Table-cell paragraphs are walked in document order.
+fn stamp_auto_directions(doc: &mut DocumentTree) {
+    fn resolve(p: &engine::Paragraph) -> Option<engine::TextDirection> {
+        p.props.direction.or_else(|| {
+            first_strong_direction(&p.text).map(|d| match d {
+                ShapingDirection::Rtl => engine::TextDirection::Rtl,
+                ShapingDirection::Ltr => engine::TextDirection::Ltr,
+            })
+        })
+    }
+    fn first(block: &engine::Block) -> Option<engine::TextDirection> {
+        match block {
+            engine::Block::Paragraph(p) => resolve(p),
+            engine::Block::Table(t) => t
+                .rows
+                .iter()
+                .flat_map(|r| r.cells.iter())
+                .flat_map(|c| c.blocks.iter())
+                .find_map(first),
+        }
+    }
+    fn stamp(block: &mut engine::Block, last: &mut Option<engine::TextDirection>) {
+        match block {
+            engine::Block::Paragraph(p) => {
+                if p.props.direction.is_none() {
+                    if let Some(d) = resolve(p).or(*last) {
+                        p.props.direction = Some(d);
+                        p.direct_overrides.direction = Some(d);
+                    }
+                }
+                if p.props.direction.is_some() {
+                    *last = p.props.direction;
+                }
+            }
+            engine::Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        for b in &mut cell.blocks {
+                            stamp(b, last);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut last = doc.blocks.iter().find_map(first);
+    for block in doc.blocks.iter_mut() {
+        stamp(block, &mut last);
+    }
+}
+
 /// Issue #348 — the reader's resource limits under the host's
 /// `OpenDocument.limits` overrides; every unset bound keeps
 /// `format_docx::PackageLimits::DEFAULT`.
@@ -6735,6 +6838,22 @@ fn package_limits(o: Option<bridge::PackageLimitsOverride>) -> format_docx::Pack
         max_xml_depth: o.max_xml_depth.map_or(d.max_xml_depth, |v| v as usize),
         max_xml_elements: o.max_xml_elements.unwrap_or(d.max_xml_elements),
     }
+}
+
+/// Issues #339 / #348 — a `.txt` / `.html` file is one "part": refuse it,
+/// before decoding, when it is larger than the host's `max_part_bytes` or
+/// `max_total_bytes` (`PackageLimits::DEFAULT` when unset). The previous
+/// document stays open, exactly like an oversized `.docx`.
+fn text_file_over_limits(
+    len: usize,
+    limits: Option<bridge::PackageLimitsOverride>,
+) -> Option<Event> {
+    let l = package_limits(limits);
+    let cap = l.max_part_bytes.min(l.max_total_bytes);
+    (len as u64 > cap).then(|| Event::Error {
+        message: format!("OpenDocument: the file is {len} bytes, over the {cap}-byte limit"),
+        kind: Some(bridge::ErrorKind::PackageTooLarge),
+    })
 }
 
 /// Clamp a position into `doc` — `path` resolved to a real paragraph
@@ -7406,152 +7525,46 @@ fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
 
 impl Engine {
     /// Phase 3 (#39) — story-mode command firewall. While a
-    /// header/footer story is active, commands split three ways:
-    /// - STORY-SCOPED (typing, deletes, splits, formatting, plain
-    ///   paste, selection/caret/hit-test) — handled by their normal
-    ///   arms; the handlers themselves branch into the story twins,
-    ///   and the geometry + selection-doc adapters re-root the rest.
-    /// - GLOBAL (paint, viewport, zoom, stats, undo/redo, save/export,
-    ///   fonts, a11y, enter/exit) — fall through unchanged.
-    /// - EVERYTHING ELSE (tables, images, comments, hyperlinks,
-    ///   sections, page setup, styles, lists, track-changes, IME
-    ///   composition, rich clipboard) — rejected loudly. The UI
-    ///   disables these controls in story mode (Honest UX); this is
-    ///   the engine-side backstop, never the primary affordance.
+    /// header/footer, note or text-box story is active, every command's
+    /// [`bridge::StoryPolicy`] (issue #342 — `crates/bridge/src/meta.rs`,
+    /// the single source of truth that replaced this match's hand list)
+    /// decides:
+    /// - `Allowed` — STORY-SCOPED commands (typing, deletes, splits,
+    ///   formatting, paragraph/list/style/table edits, fields, IME,
+    ///   selection/caret/hit-test, rich copy) whose handlers branch into
+    ///   the story twins or re-root through the geometry + selection-doc
+    ///   adapters (#72), and GLOBAL ones (paint, viewport, zoom, stats,
+    ///   undo/redo, save/export, fonts, a11y, enter/exit, snapshot /
+    ///   recover) — fall through unchanged.
+    /// - `TextBoxOnly` — picture edits carry an explicit, body-rooted
+    ///   address and never move a text byte, so they are allowed while a
+    ///   text box is open (#206), rejected in other stories.
+    /// - `ExitsStory` — document loads / close tear the story's ground
+    ///   away: exit to the body first, then handle normally.
+    /// - `BodyOnly` — everything else (images, comments, sections, page
+    ///   setup, track-changes, notes, rich paste, …) is rejected loudly.
+    ///   The UI disables these controls in story mode (Honest UX); this
+    ///   is the engine-side backstop, never the primary affordance.
     ///
     /// Returns `Some(Event::Error)` for a rejected command; `None`
-    /// lets `apply`'s normal dispatch proceed. Document loads exit the
-    /// story first (their ground is being torn away) and proceed.
+    /// lets `apply`'s normal dispatch proceed.
     fn story_gate(&mut self, cmd: &Command) -> Option<Event> {
         if !self.story_active() {
             return None;
         }
-        match cmd {
-            Command::Ping
-            | Command::LoadFont { .. }
-            | Command::InsertText { .. }
-            | Command::DeleteAtCaret { .. }
-            | Command::SplitParagraph { .. }
-            | Command::ApplyFormatting { .. }
-            | Command::ToggleFormatting { .. }
-            | Command::PastePlain { .. }
-            | Command::SetSelection { .. }
-            | Command::ExtendSelection { .. }
-            | Command::SelectAll
-            | Command::SelectWordAt { .. }
-            | Command::SelectParagraphAt { .. }
-            | Command::MoveCaret { .. }
-            | Command::HitTest { .. }
-            | Command::HitTestInPage { .. }
-            | Command::PlaceCaretAtPoint { .. }
-            | Command::ExtendSelectionToPoint { .. }
-            | Command::Undo
-            | Command::Redo
-            | Command::SetViewport { .. }
-            | Command::SetZoom { .. }
-            | Command::SetDeviceScale { .. }
-            | Command::RequestPaint { .. }
-            | Command::ExpandLayout { .. }
-            | Command::RequestStats
-            | Command::RequestAccessibilityDelta
-            | Command::SaveDocx
-            | Command::SaveDocument { .. }
-            | Command::ExportPdf { .. }
-            | Command::EnterHeaderFooter { .. }
-            | Command::ExitHeaderFooter
-            /* Issue #70/#74/#43 — story-scoped by design (link toggle)
-            or story-safe (section toggles re-anchor; field authoring
-            routes through the story adapter; the render date is
-            global state). */
-            | Command::SetHeaderFooterLink { .. }
-            | Command::SetTitlePage { .. }
-            | Command::SetEvenOddHeaders { .. }
-            | Command::InsertField { .. }
-            | Command::SetRenderDate { .. }
-            /* Issue #77 — F9 is document-wide (the active part
-            included), the code view is display state, and the
-            instruction edit routes through the story adapter. */
-            | Command::UpdateFields
-            | Command::SetFieldCodeView { .. }
-            | Command::SetFieldInstruction { .. }
-            /* Issue #72 — paragraph-property family. Each handler below
-            routes through `story_mutate` against the synthetic story
-            tree when a story is active. */
-            | Command::SetParagraphAlign { .. }
-            | Command::SetParagraphDirection { .. }
-            | Command::SetParagraphIndent { .. }
-            | Command::SetLineSpacing { .. }
-            | Command::SetParagraphShading { .. }
-            | Command::SetParagraphBorders { .. }
-            | Command::SetTabStops { .. }
-            /* Issue #72 — styles. `ApplyStyle` sets a paragraph's
-            `style_id` and routes through `story_mutate`. `ModifyStyle`
-            mutates the style TABLE, which is doc-global (shared by body
-            + every story) and already carried into the story tree by
-            `story_doc()`/merged back by `story_mutate`'s callers — but
-            `do_modify_style` itself writes straight to the real
-            `self.undo` tree, which is correct as-is in story mode (the
-            style table lives there, not in the story's block list), so
-            no handler change is needed for it. */
-            | Command::ApplyStyle { .. }
-            | Command::ModifyStyle { .. }
-            /* Issue #72 — lists. */
-            | Command::ToggleList { .. }
-            | Command::ChangeListLevel { .. }
-            /* Issue #72 — tables. Headers/footers can now hold tables
-            (`story_blocks` widened to `Vec<Block>`), so every table
-            mutation command routes through `story_mutate` the same way. */
-            | Command::InsertTable { .. }
-            | Command::DeleteTable { .. }
-            | Command::InsertRow { .. }
-            | Command::DeleteRow { .. }
-            | Command::InsertColumn { .. }
-            | Command::DeleteColumn { .. }
-            | Command::MergeCells { .. }
-            | Command::SplitCell { .. }
-            | Command::SetCellShading { .. }
-            | Command::SetCellBorders { .. }
-            /* Issue #79 — routes through `story_mutate` like the cell
-            property family above. */
-            | Command::SetTableProperties { .. }
-            /* Issue #72 — `SelectCellAt` resolves through
-            `document_geometry` (already story-aware) plus
-            `cell_content_span`, which now reads `self.selection_doc()`
-            instead of the body tree. */
-            | Command::SelectCellAt { .. }
-            /* Issue #72 — IME. The commit path already routes through
-            `do_insert_text_interactive`, which is story-aware; the
-            in-progress preview never touches the document tree. */
-            | Command::BeginComposition { .. }
-            | Command::UpdateComposition { .. }
-            | Command::EndComposition { .. }
-            /* Issue #72 — rich copy. `do_get_selection_as_clipboard` now
-            reads `self.selection_doc()` so a copy from inside a story
-            serializes the story's paragraphs, not the body's. */
-            | Command::GetSelectionAsClipboard { .. }
-            /* Issue #85 — a snapshot is a read of the whole session (the
-            active story included) and recovery rebuilds it wholesale. */
-            | Command::Snapshot { .. }
-            | Command::Recover { .. }
-            /* Issue #206 — the image-geometry query is a pure read of the
-            whole layout (text-box pictures included). */
-            | Command::GetImageRects => None,
-            /* Issue #206 — picture edits carry an explicit, body-rooted
-            address (`story` chain + path) and never move a text byte, so
-            the open box's `(host, at)` and its selection stay valid:
-            a picture in a box is edited while that box is open. */
-            Command::ResizeImage { .. } | Command::MoveImage { .. } | Command::SetImageWrap { .. }
+        match cmd.meta().story {
+            bridge::StoryPolicy::Allowed => None,
+            bridge::StoryPolicy::TextBoxOnly
                 if matches!(self.active_story, StoryTarget::TextBox { .. }) =>
             {
                 None
             }
-            /* Loading a document tears the story's ground away —
-            exit first, then handle normally. */
-            Command::LoadDocx { .. } | Command::OpenDocument { .. } => {
+            bridge::StoryPolicy::ExitsStory => {
                 self.exit_story_to_body();
                 None
             }
-            _ => Some(Event::error(match &self.active_story {
+            bridge::StoryPolicy::BodyOnly | bridge::StoryPolicy::TextBoxOnly => {
+                Some(Event::error(match &self.active_story {
                     StoryTarget::Note { .. } => {
                         "This action isn't available while editing a footnote or endnote \
                          — click back into the document body first."
@@ -7564,8 +7577,8 @@ impl Engine {
                         "This action isn't available while editing a header or footer \
                          — exit the header/footer first."
                     }
-                }
-                )),
+                }))
+            }
         }
     }
 
@@ -7577,9 +7590,18 @@ impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         let seq_before = self.mutation_seq;
         let revision_before = self.undo.revision();
-        let evt = self.apply_command(cmd).await;
+        let mut evt = self.apply_command(cmd).await;
         if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
             self.mutation_seq += 1;
+        }
+        /* Issue #260 — a handler builds its `SelectionChanged` reply
+        before the bump above lands, so stamp the revision the command
+        actually left the document at. */
+        if let Event::SelectionChanged {
+            document_revision, ..
+        } = &mut evt
+        {
+            *document_revision = self.mutation_seq;
         }
         evt
     }
@@ -7733,9 +7755,37 @@ impl Engine {
                         .filter(|n| !n.is_empty());
                     self.load_docx_bytes_with_limits(&bytes, "OpenDocument", defaults, limits)
                 }
-                other => Event::error(format!(
-                    "OpenDocument: format {other:?} not supported — only Docx ships today"
-                )),
+                /* Issue #339 — `.txt` / `.html` open through the engine's
+                own plain-text model and the rich-paste HTML parser; no
+                source package is retained (nothing to preserve), so a
+                later `.docx` save uses the minimal-package writer. Issue
+                #348 — the host's `limits` bound the file like a package
+                part (`max_part_bytes` / `max_total_bytes`). */
+                DocFormat::PlainText | DocFormat::Html => {
+                    if let Some(refused) = text_file_over_limits(bytes.len(), limits) {
+                        return refused;
+                    }
+                    self.document_name = name
+                        .as_deref()
+                        .map(file_base_name)
+                        .filter(|n| !n.is_empty());
+                    let text = decode_text_file(&bytes);
+                    let doc = if matches!(format, DocFormat::Html) {
+                        let parsed = engine::html::from_html_document(&text);
+                        if parsed.blocks.is_empty() {
+                            DocumentTree::from_text("")
+                        } else {
+                            DocumentTree::from_blocks(parsed.blocks)
+                        }
+                    } else {
+                        DocumentTree::from_paragraphs(plain_text_paragraphs(&text))
+                    };
+                    self.open_synthesized_document(doc, defaults)
+                }
+                DocFormat::Pdf => Event::error(
+                    "OpenDocument: PDF is an export format — open a .docx, .txt or .html \
+                     file (use ExportPdf to write PDF)",
+                ),
             },
             Command::SaveDocument { format } => match format {
                 DocFormat::Docx => self.save_docx_bytes("SaveDocument"),
@@ -7748,7 +7798,7 @@ impl Engine {
                 PdfConformance::A2u => format_pdf::PdfProfile::A2u,
                 PdfConformance::X3 => format_pdf::PdfProfile::X3,
             }),
-            Command::CloseDocument => phase3_stub("CloseDocument"),
+            Command::CloseDocument => self.do_close_document(),
             Command::DeleteRange { range } => self.do_delete_range(range),
             Command::ReplaceRange { range, text } => self.do_replace_range(range, text),
             Command::ApplyFormatting { range, attrs } => self.apply_formatting(range, attrs),
@@ -12577,6 +12627,9 @@ impl Engine {
             field_code_view: self.field_code_view,
             field_at_caret: self.field_ref_at_selection(&sel),
             zoom: self.user_zoom(),
+            /* Issue #260 — `apply` re-stamps this after the command's own
+            mutation bump; outside `apply` (replay) it is already final. */
+            document_revision: self.mutation_seq,
         }
     }
 
@@ -16196,6 +16249,105 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #51 / #338 / #339 — install `doc` as a brand-new document:
+    /// a fresh undo stack (a mutation — issue #194), the caret at the
+    /// start, and every piece of per-document state reset, then repaint.
+    /// Shared by `.docx` loads, `CloseDocument` and the plain-text / HTML
+    /// `OpenDocument` paths, so a reset can never forget a field one of
+    /// them remembers.
+    ///
+    /// Issue #51 — leaving `lazy_layout` alone carried the previous doc's
+    /// scroll high-water mark into the new doc, so the first paint laid
+    /// out from page 1 down to wherever the OLD document was scrolled.
+    /// Keep `viewport_h` (a property of the canvas, not the document) so
+    /// `lazy_runway` stays calibrated, but restart the band at the top.
+    /// Stale `composition` / `pending_format` could splice preview text or
+    /// styling into the new doc; stale `image_cache` bitmaps collide on
+    /// reused rel ids (`rId4` exists in most .docx files); a stale
+    /// `a11y_cache` would diff against the old tree. (`do_recover` resets
+    /// the same set for the same reason.)
+    fn install_new_document(&mut self, doc: DocumentTree) -> Result<(), Box<Event>> {
+        self.install_undo_stack(UndoStack::new(doc, UNDO_CAP));
+        self.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.lazy_layout = LazyLayoutState {
+            viewport_y: 0.0,
+            viewport_h: self.lazy_layout.viewport_h,
+            min_target_y: INITIAL_COLD_OPEN_BUDGET_PT.max(self.lazy_layout.viewport_h),
+        };
+        self.composition = None;
+        self.pending_format = None;
+        self.caret_affinity = CaretAffinity::default();
+        self.a11y_cache = None;
+        self.image_cache.clear();
+        self.last_paint_dims = LastPaintDims::default();
+        self.layout_cache.get_mut().clear();
+        /* Issue #77 — a document opens in the result view. */
+        self.field_code_view = false;
+        /* A fresh UndoStack restarts revision at 0, which the memo key
+        cannot distinguish from the old stack's 0. */
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        self.maybe_repaint_result()
+    }
+
+    /// Issue #339 — install a document built in memory from a `.txt` /
+    /// `.html` file: the host's `defaults` (page size, widow control —
+    /// what `read_docx_with_settings` applies to a `.docx`) are applied,
+    /// every paragraph gets its auto direction, and the document replaces
+    /// the current one exactly like a `.docx` load. Answers
+    /// `DocumentLoaded`.
+    fn open_synthesized_document(
+        &mut self,
+        mut doc: DocumentTree,
+        defaults: Option<DocumentDefaults>,
+    ) -> Event {
+        let page_size = match defaults.as_ref().and_then(|d| d.page_size) {
+            Some(BridgeDefaultPageSize::A4) => engine::DefaultPageSize::A4,
+            Some(BridgeDefaultPageSize::Letter) => engine::DefaultPageSize::Letter,
+            None => engine::DefaultPageSize::default(),
+        };
+        doc.body_section.geometry = page_size.geometry();
+        doc.settings.default_page_size = page_size;
+        doc.settings.widow_control_default = defaults.and_then(|d| d.widow_control).unwrap_or(true);
+        stamp_auto_directions(&mut doc);
+        let paragraph_count = doc.paragraph_count();
+        self.tracking_changes = false;
+        *self.detached_package.borrow_mut() = None;
+        if let Err(e) = self.install_new_document(doc) {
+            return *e;
+        }
+        Event::DocumentLoaded { paragraph_count }
+    }
+
+    /// Issue #338 — `Command::CloseDocument`: back to the seeded empty
+    /// document (the interactive boot's `RenderPage { text: "" }` tree —
+    /// one empty paragraph, default section), keeping the session (fonts,
+    /// layout config, zoom, review identity, render clock). Selection,
+    /// undo history, comments, revisions, media, the retained source
+    /// package (#134 — the next save goes through the minimal-package
+    /// writer) and the document name all go; track-changes recording
+    /// turns off, as in a new Word document. An active story was already
+    /// exited by `story_gate` (`StoryPolicy::ExitsStory`). Answers
+    /// `SelectionChanged`; the worker sees `mutation_seq` move and
+    /// broadcasts the accessibility delta + `Painted`, and pins the next
+    /// snapshot as the new document's base (`CommandMeta.new_document`).
+    fn do_close_document(&mut self) -> Event {
+        self.document_name = None;
+        self.tracking_changes = false;
+        self.stashed_body_selection = None;
+        *self.detached_package.borrow_mut() = None;
+        if let Err(e) = self.install_new_document(DocumentTree::from_text("")) {
+            return *e;
+        }
+        self.announce(AnnouncementPriority::Polite, "Document closed");
+        self.selection_changed()
+    }
+
     /// Sprint 3 (UI Edition) — shared body for the legacy
     /// `LoadDocx` and the new `OpenDocument { format: Docx }`
     /// commands. Replaces the active document, resets the caret,
@@ -16241,52 +16393,13 @@ impl Engine {
         ) {
             Ok(archive) => {
                 let paragraph_count = archive.document.paragraph_count();
-                self.install_undo_stack(UndoStack::new(archive.document, 100));
-                self.selection = Some(SelectionState {
-                    anchor: bpos_top(0, 0),
-                    caret: bpos_top(0, 0),
-                    ideal_x: None,
-                    kind: SelectionKind::Linear,
-                });
-                /* Issue #51 — a document swap invalidates every piece of
-                per-document state, not just the layout cache. Leaving
-                `lazy_layout` alone carried the previous doc's scroll
-                high-water mark into the new doc, so the first paint laid
-                out from page 1 down to wherever the OLD document was
-                scrolled. Keep `viewport_h` (a property of the canvas,
-                not the document) so `lazy_runway` stays calibrated, but
-                restart the band at the top. Stale `composition` /
-                `pending_format` could splice preview text or styling
-                into the new doc; stale `image_cache` bitmaps collide on
-                reused rel ids (`rId4` exists in most .docx files);
-                a stale `a11y_cache` would diff against the old tree.
-                (do_recover resets the same set for the same reason.) */
-                self.lazy_layout = LazyLayoutState {
-                    viewport_y: 0.0,
-                    viewport_h: self.lazy_layout.viewport_h,
-                    min_target_y: INITIAL_COLD_OPEN_BUDGET_PT.max(self.lazy_layout.viewport_h),
-                };
-                self.composition = None;
-                self.pending_format = None;
-                self.caret_affinity = CaretAffinity::default();
-                self.a11y_cache = None;
-                self.image_cache.clear();
-                self.last_paint_dims = LastPaintDims::default();
-                self.layout_cache.get_mut().clear();
-                /* Issue #77 — a document opens in the result view. */
-                self.field_code_view = false;
-                /* A fresh UndoStack restarts revision at 0, which the
-                memo key cannot distinguish from the old stack's 0. */
-                self.invalidate_layout_snapshot();
-                self.dirty.invalidate(full_page_rect(self.scale()));
-                /* Issue #51/#54 — this was the only repaint in the file
-                that DISCARDED its Result. A failed post-load paint
-                (missing font, backend error) previously returned
-                `DocumentLoaded` anyway, leaving every canvas showing the
-                previous document while the status bar reported the new
-                one. Surface the error; the document itself is loaded,
-                and the shell decides how to present the failure. */
-                if let Err(e) = self.maybe_repaint_result() {
+                /* Issue #51/#54 — a failed post-load paint (missing font,
+                backend error) previously returned `DocumentLoaded` anyway,
+                leaving every canvas showing the previous document while
+                the status bar reported the new one. Surface the error; the
+                document itself is loaded, and the shell decides how to
+                present the failure. */
+                if let Err(e) = self.install_new_document(archive.document) {
                     return *e;
                 }
                 Event::DocumentLoaded { paragraph_count }
@@ -27839,6 +27952,9 @@ mod story_tab_tests;
 mod theme_layout_tests;
 
 #[cfg(test)]
+mod document_lifecycle_tests;
+
+#[cfg(test)]
 mod wire_validation_tests {
     use super::*;
     use bridge::{BlockPath as WirePath, InsertSide, SelectionModifier};
@@ -28546,6 +28662,44 @@ mod wire_validation_tests {
         let now = now_iso8601();
         assert_eq!(now.len(), 24, "{now}");
         assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
+    }
+
+    /// Issue #254 — the comments snapshot carries each anchor's full path:
+    /// a comment inside a table cell is addressed by its cell, not by the
+    /// cell paragraph's index masquerading as a top-level block.
+    #[test]
+    fn comment_rows_carry_full_anchor_paths() {
+        let doc =
+            engine::DocumentTree::from_text("intro").insert_table(engine::BlockPath::top(1), 2, 2);
+        let cell = engine::BlockPath {
+            steps: vec![
+                EnginePathStep::Block(1),
+                EnginePathStep::Cell { row: 1, col: 1 },
+                EnginePathStep::Block(0),
+            ],
+        };
+        let doc = doc.insert_text(engine::LogicalPos::new(cell.clone(), 0), "in cell");
+        let (doc, id) = doc.insert_comment(
+            engine::LogicalPos::new(cell.clone(), 3),
+            engine::LogicalPos::new(cell, 7),
+            "c".into(),
+            "A".into(),
+            String::new(),
+        );
+        let rows = comment_rows(&doc);
+        let row = rows.iter().find(|r| r.id == id).expect("row");
+        let want = BridgeBlockPath {
+            steps: vec![
+                BridgePathStep::Block { idx: 1 },
+                BridgePathStep::Cell { row: 1, col: 1 },
+                BridgePathStep::Block { idx: 0 },
+            ],
+        };
+        assert_eq!(row.start_path, want);
+        assert_eq!(row.end_path, want);
+        assert_eq!((row.start_offset, row.end_offset), (3, 7));
+        /* The flat index stays for compatibility. */
+        assert_eq!(row.start_block, 0);
     }
 
     #[test]
