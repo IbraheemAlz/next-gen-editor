@@ -14,6 +14,9 @@ jobs:
   rust-native:
     name: Native (fmt + clippy + test)
     runs-on: ubuntu-24.04
+    # Issue #287 — explicit cap now that the job also runs the release-
+    # profile shape-regression + roundtrip harnesses (~45 s warm).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -33,6 +36,35 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --release
+
+      # Issue #287 — both harnesses are documented gates and run by every
+      # local merge gate; nothing in CI ran them, so a rustybuzz shaping
+      # change or a `.docx` round-trip drift would have passed. Release
+      # profile (the same one `cargo test --release` above just warmed in
+      # the cached target dir). Measured locally on a warm cache:
+      # shape-regression ~4 s, roundtrip ~40 s, `--fixtures` <1 s.
+      - name: shape-regression (rustybuzz snapshots)
+        run: cargo run -p shape-regression --release
+
+      - name: roundtrip harness (default + fixtures)
+        run: |
+          set -euo pipefail
+          mkdir -p roundtrip-dump
+          cargo run -p roundtrip --release 2>&1 | tee roundtrip-dump/default.log
+          cargo run -p roundtrip --release -- --fixtures 2>&1 | tee roundtrip-dump/fixtures.log
+
+      # The harness reports a drift as `FAIL: <step>: <inline diff>` on
+      # stderr; the logs above are its full diff dump.
+      - name: Upload roundtrip diff dump on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roundtrip-dump
+          path: |
+            roundtrip-dump/
+            fuzz-native-test.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       # D5.5 (issue #90) / issue #229 — `fuzz/` is its own workspace (its
       # own `[workspace]` in `fuzz/Cargo.toml`) so it's excluded from the

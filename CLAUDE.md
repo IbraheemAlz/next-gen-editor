@@ -293,7 +293,12 @@ Engine backlog" references a real issue.
 - `wasm-pack test --headless --chrome crates/engine-wasm` (browser unit tests).
 - `wasm-pack build --release` then assert artifact `< 15728640` bytes.
 - `cargo run -p shape-regression --release` — 0 failed on the corpus.
-- `cargo run -p roundtrip --release` — PASS.
+  **CI-enforced since issue #287** (`rust-native`, ~4 s warm).
+- `cargo run -p roundtrip --release` — PASS, and `-- --fixtures` (33
+  fixtures). **CI-enforced since issue #287** (`rust-native`, ~40 s warm +
+  <1 s); the step tees its output to `roundtrip-dump/*.log`, uploaded as the
+  `roundtrip-dump` artifact on failure (the harness has no separate
+  diff-file dump — its `FAIL:` line carries the inline diff).
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
 - `pnpm exec playwright test` (from `ts/`) — the full e2e suite in `ts/e2e/`
   (`workers: 1`, well under a minute locally) all green.
@@ -313,7 +318,8 @@ Engine backlog" references a real issue.
   checks. Both run inside `ci.yml`'s blocking `rust-native` job, alongside
   fmt/clippy/`cargo test --workspace` — not a separate silent lane.
 - CI (`ci.yml`), blocking: `rust-native` (fmt + clippy + `cargo test
-  --workspace` + the two fuzz-crate steps above), `wasm` (build + size
+  --workspace` + shape-regression + roundtrip + the two fuzz-crate steps
+  above; 30 min cap), `wasm` (build + size
   budget + `wasm-pack test` + the `engine-wasm-pkg` artifact upload),
   `e2e` (this suite, issue #230). Non-blocking (`continue-on-error: true`):
   `qa-harness` runs `tools/visual-diff --tier A` (capped at 3 min) then
