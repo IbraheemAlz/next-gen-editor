@@ -1017,10 +1017,13 @@ fn serialize_paragraph_body(
     `para.text`; the structural `<w:r><w:br/></w:r>` emission needs
     the cut-point walk. The fast path stays open for plain
     paragraphs that carry no overlays AND no break characters. */
-    let has_break = para
-        .text
-        .chars()
-        .any(|c| c == '\u{2028}' || c == '\u{000C}');
+    let has_break = para.text.chars().any(|c| {
+        c == '\u{2028}'
+            || c == '\u{000C}'
+            /* Issue #335 — a hyphen element is a leaf of its own. */
+            || c == engine::run_content::SOFT_HYPHEN
+            || c == engine::run_content::NON_BREAKING_HYPHEN
+    });
     let has_source_runs = markup.is_some_and(|m| {
         if m.offsets_valid(para.text.len()) {
             !(m.runs.is_empty() && m.markers.is_empty())
@@ -1448,7 +1451,11 @@ fn emit_styled_runs_with_objects(
     U+0009 byte at every tab anchor; the writer reinjects the structural
     `<w:r><w:tab/></w:r>` run at the same offset. Tabs sit alongside
     `<w:br>` in the cut set because the same boundary mechanic applies. */
-    let mut tab_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    /* Issue #335 — the soft / non-breaking hyphen characters ride the same
+    mechanic: each is its own leaf (`<w:softHyphen/>` /
+    `<w:noBreakHyphen/>`), never the raw character inside a `<w:t>`. */
+    let mut leaf_at: std::collections::HashMap<usize, &'static str> =
+        std::collections::HashMap::new();
     for (idx, ch) in para.text.char_indices() {
         let kind = match ch {
             '\u{2028}' => Some(BreakKind::Line),
@@ -1460,8 +1467,8 @@ fn emit_styled_runs_with_objects(
             cuts.insert(idx);
             cuts.insert(idx + ch.len_utf8());
         }
-        if ch == '\u{0009}' {
-            tab_at.insert(idx);
+        if let Some(leaf) = run_leaf_element(ch) {
+            leaf_at.insert(idx, leaf);
             cuts.insert(idx);
             cuts.insert(idx + ch.len_utf8());
         }
@@ -1707,8 +1714,8 @@ fn emit_styled_runs_with_objects(
                     BreakKind::Line => "<w:br/>",
                     BreakKind::Page => "<w:br w:type=\"page\"/>",
                 });
-            } else if tab_at.contains(&lo) {
-                sink.push_str("<w:tab/>");
+            } else if let Some(leaf) = leaf_at.get(&lo) {
+                sink.push_str(leaf);
             } else {
                 push_text_element(&para.text[lo..hi], in_del, Some(src.run), sink);
             }
@@ -1718,11 +1725,12 @@ fn emit_styled_runs_with_objects(
             U+2028 / U+000C character — emit the structural element so
             Word doesn't render the bare Unicode char as a tofu box. */
             emit_br_run(kind, out);
-        } else if tab_at.contains(&lo) {
+        } else if let Some(leaf) = leaf_at.get(&lo) {
             /* Audit gap A.M5 — emit the structural `<w:tab/>` element
             instead of a literal HT byte; the rPr applies to the tab
-            run so an inherited bold/italic style still survives. */
-            emit_tab_run(&style_at(lo), out);
+            run so an inherited bold/italic style still survives. Issue
+            #335 — the hyphen elements likewise. */
+            emit_leaf_run(&style_at(lo), leaf, out);
         } else {
             serialize_run_kind(&para.text[lo..hi], &style_at(lo), in_del, out);
         }
@@ -2145,10 +2153,23 @@ fn emit_br_run(kind: BreakKind, out: &mut String) {
 /// when the tab sits inside a `<w:del>` block — the tab element itself
 /// has no body so it does not switch tag names, only the enclosing
 /// run picks up `<w:delText>` semantics for any neighbouring text.
-fn emit_tab_run(style: &SpanStyle, out: &mut String) {
+fn emit_leaf_run(style: &SpanStyle, leaf: &str, out: &mut String) {
     out.push_str("<w:r>");
     emit_rpr(style, out);
-    out.push_str("<w:tab/></w:r>");
+    out.push_str(leaf);
+    out.push_str("</w:r>");
+}
+
+/// The empty run-content element a text character stands for (audit gap
+/// A.M5 — `<w:tab/>`; issue #335 — `<w:softHyphen/>` /
+/// `<w:noBreakHyphen/>`, see [`engine::run_content`]). `None` for text.
+fn run_leaf_element(ch: char) -> Option<&'static str> {
+    match ch {
+        '\u{0009}' => Some("<w:tab/>"),
+        engine::run_content::SOFT_HYPHEN => Some("<w:softHyphen/>"),
+        engine::run_content::NON_BREAKING_HYPHEN => Some("<w:noBreakHyphen/>"),
+        _ => None,
+    }
 }
 
 /// UTF-8 encoding of U+FFFC OBJECT REPLACEMENT CHARACTER (the byte
@@ -11108,3 +11129,8 @@ mod complex_script_tests;
 #[cfg(test)]
 #[path = "writer_theme_tests.rs"]
 mod theme_tests;
+
+/// Issues #335 / #357 — run-content elements with no text of their own.
+#[cfg(test)]
+#[path = "writer_run_content_tests.rs"]
+mod run_content_tests;

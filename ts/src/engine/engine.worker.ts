@@ -18,6 +18,8 @@ import DUAL_URL from '../../fonts/Amiri-Regular.ttf?url';
 /* Issue #355 — the `theme-fonts` golden opens a committed fixture generated
    by `tools/roundtrip --gen-seed` (our own builder, no foreign bytes). */
 import THEME_DOCX_URL from '../../../crates/format-docx/tests/fixtures/theme_loaded_faces.docx?url';
+/* Issue #335 — the `soft-hyphen` golden (soft + non-breaking hyphens). */
+import SOFT_HYPHEN_DOCX_URL from '../../../crates/format-docx/tests/fixtures/soft_hyphen.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -939,6 +941,30 @@ async function handleInit(msg: InitMsg): Promise<void> {
             paintEvt = await dispatch({
                 type: 'LOAD_DOCX',
                 bytes: await fetchBytes(THEME_DOCX_URL),
+            } as Command);
+            break;
+        }
+
+        case 'soft-hyphen': {
+            /* Issue #335 — a justified paragraph whose long words carry
+               author-placed soft hyphens (`<w:softHyphen/>`): a line that
+               breaks at one ends with a drawn hyphen, every other soft
+               hyphen stays invisible; the second paragraph's non-breaking
+               hyphens (`<w:noBreakHyphen/>`) render and never split their
+               word. Zoom 2 so the 11 pt text is legible in the golden. */
+            await dispatch({ type: 'SET_ZOOM', scale: 2 } as Command);
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 15,
+                line_height: 22,
+                align: 'START',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'LOAD_DOCX',
+                bytes: await fetchBytes(SOFT_HYPHEN_DOCX_URL),
             } as Command);
             break;
         }

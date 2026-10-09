@@ -245,6 +245,20 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "soft_hyphen.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "Typesetters mark optional breaks in long words: extra­ordinary, in­com­pre­hen­si­bil­i­ties, coun­ter­rev­o­lu­tion­ary and elec­tro­en­ceph­a­lo­graph­ic all wrap at a marked point, while the drawn hyphen never enters the text, the caret or the copied char­ac­ters of the para­graph that holds them.",
+          "An e‑mail address, the X‑ray of a well‑known case and the twenty‑first‑century reader never split at a non‑breaking hyphen, however the line falls."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "style_cascade.docx": {
       "generator": "handcrafted",
       "phase_introduced": 3,

@@ -2330,7 +2330,18 @@ pub(crate) fn parse_document_xml_with_events(
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
                     /* Issue #350 — inside field code: not visible. */
-                    b"w:tab" | b"w:br" if in_run && field_code_hidden(&field_stack, &field_cap) => {
+                    b"w:tab" | b"w:br" | b"w:softHyphen" | b"w:noBreakHyphen"
+                        if in_run && field_code_hidden(&field_stack, &field_cap) => {}
+                    /* Issue #335 — `<w:softHyphen/>` (ECMA-376 §17.3.3.29,
+                    an optional hyphen: a break opportunity that shows a
+                    hyphen only when the line breaks there) and
+                    `<w:noBreakHyphen/>` (§17.3.3.18, a hyphen that never
+                    breaks) enter the text as U+00AD SOFT HYPHEN / U+2011
+                    NON-BREAKING HYPHEN. The writer turns both characters
+                    back into the elements (never the raw characters). */
+                    b"w:softHyphen" if in_run => run_text.push(engine::run_content::SOFT_HYPHEN),
+                    b"w:noBreakHyphen" if in_run => {
+                        run_text.push(engine::run_content::NON_BREAKING_HYPHEN)
                     }
                     b"w:tab" if in_run => {
                         /* Audit gap A.M5 — `<w:tab/>` inside a `<w:r>`.

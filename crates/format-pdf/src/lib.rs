@@ -2149,6 +2149,7 @@ fn collect_to_unicode_pages(
                     add_run_mappings(run, text, map);
                     add_leader_mappings(run, fonts, map);
                     add_kashida_mappings(run, fonts, map);
+                    add_hyphen_mappings(line, run, fonts, map);
                 }
             }
         };
@@ -2217,9 +2218,74 @@ fn add_run_mappings(run: &VisualRun, text: &str, map: &mut BTreeMap<u16, Vec<cha
             continue;
         }
         let chars: Vec<char> = text[start..end].chars().collect();
-        if !chars.is_empty() {
-            map.entry(g.id).or_insert(chars);
+        if chars.is_empty() {
+            continue;
         }
+        /* Issue #335 — a hidden default-ignorable character (an unbroken
+        U+00AD soft hyphen, a bidi control) shapes to a zero-width glyph
+        that is usually the SPACE glyph. Its decode is weak: it only fills
+        a glyph id nothing visible claimed, and a visible decode replaces
+        it — otherwise every space of the document could extract as a
+        soft hyphen. */
+        match map.entry(g.id) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(chars);
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+                if is_weak_decode(o.get()) && !is_weak_decode(&chars) {
+                    o.insert(chars);
+                }
+            }
+        }
+    }
+}
+
+/// Issue #335 — `true` when every character of a glyph's decode is
+/// invisible formatting (soft hyphen, bidi controls, zero-width
+/// joiners / spaces, word joiner, BOM): such a decode yields to any
+/// visible one for the same glyph id.
+fn is_weak_decode(chars: &[char]) -> bool {
+    chars.iter().all(|&c| {
+        matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+    })
+}
+
+/// Issues #335 / #326 — a hyphenated line ends with a synthetic break
+/// hyphen (`layout::hyphen::append_break_hyphen`): no source cluster, so
+/// `add_run_mappings` skips it. Map its glyph id to the character it
+/// draws (U+002D, or U+2010 when the face has no hyphen-minus) so PDF/A
+/// text extraction holds and copying the line yields the hyphen Word's
+/// own export shows.
+fn add_hyphen_mappings(
+    line: &layout::LineBox,
+    run: &VisualRun,
+    fonts: &FontStack,
+    map: &mut BTreeMap<u16, Vec<char>>,
+) {
+    if line.hyphen.is_none() {
+        return;
+    }
+    let Some(face) = fonts.face(&run.font) else {
+        return;
+    };
+    let Some((gid, _, ch)) = layout::hyphen::hyphen_glyph(face, run.attrs.px_size) else {
+        return;
+    };
+    if run
+        .glyphs
+        .iter()
+        .any(|g| g.synthetic && g.leader.is_none() && g.id == gid)
+    {
+        map.entry(gid).or_insert_with(|| vec![ch]);
     }
 }
 

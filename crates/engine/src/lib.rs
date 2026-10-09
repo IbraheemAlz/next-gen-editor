@@ -80,6 +80,7 @@ pub use tracked::{TrackedDeletion, TrackedEditError};
 pub mod html;
 pub mod numbering;
 pub mod package;
+pub mod run_content;
 pub mod snapshot;
 pub mod theme;
 

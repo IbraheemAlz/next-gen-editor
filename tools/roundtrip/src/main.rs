@@ -38,6 +38,7 @@ mod paragraph_format;
 mod reader_hardening;
 mod revision_ids;
 mod revisions;
+mod run_content;
 mod table_markup;
 mod theme;
 
@@ -353,6 +354,7 @@ fn run_default() -> Result<()> {
     comments::run_comment_patch_roundtrip()?;
     complex_script::run_complex_script_roundtrip()?;
     theme::run_theme_fonts_roundtrip()?;
+    run_content::run_soft_hyphen_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4986,6 +4988,27 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             name: "theme_loaded_faces.docx",
             bytes: format_docx::test_fixtures::theme_loaded_faces_docx(),
             entry: theme_fixture_entry(),
+        },
+        /* Issue #335 — `<w:softHyphen/>` / `<w:noBreakHyphen/>` (the
+        visual-diff `soft-hyphen` golden loads it). Zero-edit drift 0;
+        the default harness's step 47 edits it. */
+        PrebuiltFixture {
+            name: "soft_hyphen.docx",
+            bytes: format_docx::test_fixtures::soft_hyphen_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec![
+                        format_docx::test_fixtures::SOFT_HYPHEN_TEXT.into(),
+                        format_docx::test_fixtures::NB_HYPHEN_TEXT.into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
         },
     ]
 }

@@ -5619,6 +5619,19 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
     for run in &line.runs {
         let run_start_x = line_abs_x + pen;
         let run_advance: f32 = run.glyphs.iter().map(|g| g.x_advance).sum();
+        /* Issues #335 / #326 — a hyphenated line's drawn hyphen sits at its
+        logical end (the trailing glyph of an LTR run, the leading one of an
+        RTL run): the end-of-run caret stops BEFORE it, at the last
+        character, not past ink that is not text. */
+        let hyphen_adv = |glyphs: &mut dyn Iterator<Item = &layout::PositionedGlyph>| -> f32 {
+            if line.hyphen.is_none() {
+                return 0.0;
+            }
+            glyphs
+                .take_while(|g| g.synthetic)
+                .map(|g| g.x_advance)
+                .sum()
+        };
         let mut slots: Vec<CaretSlot> = Vec::new();
         match run.direction {
             ShapingDirection::Ltr => {
@@ -5635,7 +5648,7 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
                     cum += g.x_advance;
                 }
                 slots.push(CaretSlot {
-                    x: run_start_x + run_advance,
+                    x: run_start_x + run_advance - hyphen_adv(&mut run.glyphs.iter().rev()),
                     byte: run.source_range.end,
                 });
             }
@@ -5653,7 +5666,7 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
                     cum += g.x_advance;
                 }
                 slots.push(CaretSlot {
-                    x: run_start_x,
+                    x: run_start_x + hyphen_adv(&mut run.glyphs.iter()),
                     byte: run.source_range.end,
                 });
             }
@@ -18425,6 +18438,7 @@ mod tests {
             source_start: 0,
             segments: Vec::new(),
             segment: 0,
+            hyphen: layout::LineHyphen::None,
         };
         let geom = build_line_run_geom(&line, 0.0);
         assert_eq!(geom.len(), 1);
@@ -28059,6 +28073,10 @@ mod toggle_formatting_tests;
 
 #[cfg(test)]
 mod complex_script_tests;
+
+/// Issues #335 / #357 / #326 — run-content elements and hyphenation.
+#[cfg(test)]
+mod run_content_tests;
 
 /// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
 /// `format_pdf::export_pdf` path, end to end (not the #144 acceptance

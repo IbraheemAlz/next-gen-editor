@@ -78,6 +78,7 @@ mod tests {
                     source_start: 0,
                     segments: Vec::new(),
                     segment: 0,
+                    hyphen: crate::boxes::LineHyphen::None,
                 })
                 .collect(),
             direction: ShapingDirection::Rtl,

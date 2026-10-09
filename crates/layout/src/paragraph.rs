@@ -10,9 +10,10 @@
 //! opportunities. Acceptable for the PoC; Phase 3 will cache widths.
 
 use crate::boxes::{
-    LineBox, LineSegment, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, SpanFace,
-    StyleSpan, TabLeaderKind, TextAttrs, VisualRun,
+    LineBox, LineHyphen, LineSegment, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size,
+    SpanFace, StyleSpan, TabLeaderKind, TextAttrs, VisualRun,
 };
+use crate::hyphen::{append_break_hyphen, break_hyphen_advance, ends_at_soft_hyphen};
 use std::borrow::Cow;
 use std::mem::take;
 use text_pipeline::{
@@ -344,6 +345,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             source_start: 0,
             segments: Vec::new(),
             segment: 0,
+            hyphen: crate::boxes::LineHyphen::None,
         });
         y = cfg.line_height;
     }
@@ -586,17 +588,21 @@ fn compose_band(
     let mut ended_paragraph = false;
     for &(si, seg) in &usable {
         let (_, hi) = soft[soft_idx];
-        let (end, broke) = if start >= hi {
+        let (end, broke, hyphen) = if start >= hi {
             /* An empty hard segment (doubled / edge soft break): one
             zero-width placeholder line for the caret. */
-            (hi, false)
+            (hi, false, LineHyphen::None)
         } else {
             match fit_segment_line(cfg, breaks, start, hi, seg.width(), full) {
                 Some(fit) => fit,
                 None => continue,
             }
         };
-        band.push((build_line(cfg, start, end), broke, si, seg));
+        let mut line = build_line(cfg, start, end);
+        if !hyphen.is_none() {
+            append_break_hyphen(&mut line, cfg.fonts, end, hyphen);
+        }
+        band.push((line, broke, si, seg));
         start = end;
         if start >= hi {
             /* The hard segment is exhausted: the next one (after a U+2028
@@ -660,11 +666,13 @@ fn compose_band(
 
 /// Issue #82 — greedy fit of ONE line starting at `start` into a segment
 /// `width` px wide, never past the hard-segment end `hi`. Returns the
-/// line end and whether it ended at a break opportunity (`true`, the
-/// justify-eligible case) rather than at `hi`. `None` when not even the
-/// first word fits and `force` is off (a cut band: the caller tries the
-/// next segment / band). With `force` (a full-width band) an overlong
-/// word is broken at a character boundary, like [`compose_width_lines`].
+/// line end, whether it ended at a break opportunity (`true`, the
+/// justify-eligible case) rather than at `hi`, and the break hyphen the
+/// line draws (issue #335: a break right after a U+00AD). `None` when not
+/// even the first word fits and `force` is off (a cut band: the caller
+/// tries the next segment / band). With `force` (a full-width band) an
+/// overlong word is broken at a character boundary, like
+/// [`compose_width_lines`].
 fn fit_segment_line(
     cfg: &ParagraphConfig<'_>,
     breaks: &[usize],
@@ -672,7 +680,7 @@ fn fit_segment_line(
     hi: usize,
     width: f32,
     force: bool,
-) -> Option<(usize, bool)> {
+) -> Option<(usize, bool, LineHyphen)> {
     let mut last_fit = start;
     let mut seg_from = start;
     let mut acc = 0.0_f32;
@@ -691,8 +699,13 @@ fn fit_segment_line(
         );
         if acc + w <= width {
             acc += w;
-            last_fit = b;
             seg_from = b;
+            /* Issue #335 — see `compose_width_lines`. */
+            if !ends_at_soft_hyphen(cfg.text, b)
+                || acc + break_hyphen_advance(cfg, start, b) <= width
+            {
+                last_fit = b;
+            }
         } else {
             overflow = true;
             break;
@@ -712,10 +725,15 @@ fn fit_segment_line(
         }
     }
     if last_fit >= hi {
-        return Some((hi, false));
+        return Some((hi, false, LineHyphen::None));
     }
     if last_fit > start {
-        return Some((last_fit, true));
+        let hyphen = if ends_at_soft_hyphen(cfg.text, last_fit) {
+            LineHyphen::Soft
+        } else {
+            LineHyphen::None
+        };
+        return Some((last_fit, true, hyphen));
     }
     if force {
         let next_break = breaks
@@ -723,7 +741,11 @@ fn fit_segment_line(
             .copied()
             .find(|&b| b > start && b <= hi)
             .unwrap_or(hi);
-        return Some((char_break_fit_width(cfg, start, next_break, width), true));
+        return Some((
+            char_break_fit_width(cfg, start, next_break, width),
+            true,
+            LineHyphen::None,
+        ));
     }
     None
 }
@@ -1354,13 +1376,20 @@ fn compose_width_lines(
         );
 
         if line_width + seg_width <= cfg.max_width {
-            last_fit_end = b;
             line_width += seg_width;
             seg_from = b;
+            /* Issue #335 — a line may END right after a U+00AD only when
+            the hyphen it then draws fits too; the text still continues
+            past it at its natural (invisible) width. */
+            if !ends_at_soft_hyphen(cfg.text, b)
+                || line_width + break_hyphen_advance(cfg, start, b) <= cfg.max_width
+            {
+                last_fit_end = b;
+            }
         } else {
             /* Overflow. Commit whatever fit so far. */
             if last_fit_end > start {
-                lines.push((build_line(cfg, start, last_fit_end), true));
+                lines.push((broken_line(cfg, start, last_fit_end), true));
                 start = last_fit_end;
                 seg_from = start;
                 line_width = 0.0;
@@ -1405,6 +1434,17 @@ fn compose_width_lines(
         }
     }
     lines
+}
+
+/// Issue #335 — [`build_line`] for a line that ended at a break
+/// opportunity: one ending right after a U+00AD SOFT HYPHEN draws the
+/// synthetic break hyphen ([`crate::hyphen::append_break_hyphen`]).
+fn broken_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
+    let mut line = build_line(cfg, start, end);
+    if ends_at_soft_hyphen(cfg.text, end) {
+        append_break_hyphen(&mut line, cfg.fonts, end, LineHyphen::Soft);
+    }
+    line
 }
 
 /// Largest character-boundary position in `[start..hard_end]` whose
@@ -1688,6 +1728,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
         source_start: start as u32,
         segments: Vec::new(),
         segment: 0,
+        hyphen: crate::boxes::LineHyphen::None,
     }
 }
 
@@ -2335,6 +2376,7 @@ mod tests {
             source_start: 0,
             segments: Vec::new(),
             segment: 0,
+            hyphen: crate::boxes::LineHyphen::None,
         }
     }
 

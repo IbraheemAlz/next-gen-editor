@@ -791,3 +791,8 @@ pub fn theme_loaded_faces_docx() -> Vec<u8> {
         ("Amiri", "Amiri"),
     ))
 }
+
+/* Issues #335 / #357 / #326 — run-content elements and hyphenation. */
+#[path = "test_fixtures_run_content.rs"]
+mod run_content;
+pub use run_content::*;
