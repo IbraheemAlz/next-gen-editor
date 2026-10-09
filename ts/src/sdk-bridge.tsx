@@ -41,6 +41,7 @@ import {
     StatusBar,
     TrapOverlay,
     RecoveryBanner,
+    OpenWarningsBanner,
     ErrorToast,
     Ruler,
     ZoomControls,
@@ -151,6 +152,10 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 {/* Issue #315 — a degraded crash recovery says what was
                     lost and what to do; a normal one stays silent. */}
                 <RecoveryBanner />
+                {/* Issue #406 - a document that opened degraded (clamped
+                    margins, a normalised part, ...) says so; a clean open
+                    stays silent. */}
+                <OpenWarningsBanner />
                 {/* Issue #364 - a visible, transient refusal for an engine
                     error the user's key press caused (tracked deletion across
                     a table cell, ...). */}

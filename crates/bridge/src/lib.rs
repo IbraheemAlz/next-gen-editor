@@ -10,6 +10,8 @@
 //! - [`command`] — the `Command` enum + command-only payload types.
 //! - [`event`] — the `Event` enum + event-only payload types.
 //! - [`telemetry`] — the D5.7 telemetry schema (§11).
+//! - [`finite`] — issue #407 the command-boundary finiteness guard
+//!   ([`Command::first_non_finite`]).
 //! - [`meta`] — issue #342 per-`Command` metadata (`CommandMeta`), the one
 //!   source of truth for logged / read-only / story-safe / status.
 //!
@@ -21,11 +23,13 @@
 mod command;
 mod common;
 mod event;
+mod finite;
 mod meta;
 mod telemetry;
 
 pub use command::*;
 pub use common::*;
 pub use event::*;
+pub use finite::*;
 pub use meta::*;
 pub use telemetry::*;

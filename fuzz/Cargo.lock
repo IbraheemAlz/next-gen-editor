@@ -352,6 +352,7 @@ dependencies = [
  "libc",
  "libfuzzer-sys",
  "render",
+ "rmp-serde",
  "zip",
 ]
 

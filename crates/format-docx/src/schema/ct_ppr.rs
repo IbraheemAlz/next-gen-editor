@@ -118,7 +118,8 @@ fn attr_utwips(e: &BytesStart, key: &[u8]) -> Option<i32> {
 }
 
 /// `<w:ind w:start|left="…" w:end|right="…" w:firstLine="…" w:hanging="…"/>`.
-fn apply_ind(e: &BytesStart, ind: &mut Indent) {
+/// Also the numbering-level `<w:ind>` reader (`parts::numbering`).
+pub(crate) fn apply_ind(e: &BytesStart, ind: &mut Indent) {
     if let Some(v) = attr_twips(e, b"w:start").or_else(|| attr_twips(e, b"w:left")) {
         ind.start_twips = v;
     }
