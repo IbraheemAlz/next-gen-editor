@@ -18,6 +18,7 @@
  * dispatched `Command.type` tags (e.g. `"INSERT_TEXT"`), never a command's
  * payload (which, for `InsertText`, IS document content). */
 import type { Command, Event } from '../engine/types';
+import { installDevHook } from '../dev-hooks';
 
 type ErrorCode =
     | 'ENGINE_TRAP'
@@ -442,7 +443,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
     document.addEventListener('visibilitychange', onVisibilityChange);
 
     const timer = window.setInterval(() => void flush(), FLUSH_INTERVAL_MS);
-    window.__telemetryFlush = flush;
+    installDevHook('__telemetryFlush', flush);
 
     return () => {
         window.clearInterval(timer);

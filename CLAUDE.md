@@ -97,7 +97,7 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - `tsify-next` renders `Option<T>` as `T | undefined`. Pass **`undefined`**, not `null`, from TS.
 - `web-sys 0.3.98+`: `set_fill_style_str(&str)`, not the deprecated `set_fill_style(&JsValue)`.
 - Worker boot via wasm-pack `--target web` output. `init({ module_or_path: new URL(...) })` — the bare-URL form is deprecated.
-- Worker ↔ main RPC: the production path is **`EngineClient`** (`ts/src/engine/engine-client.ts`) — `id`-routed `{ id, cmd }` requests, `{ id, ok, evt }` replies, a `pending` map, `subscribe()` for unidirectional events (the a11y tree rides this). The Phase-1 `{ type: 'COMMAND', id, cmd }` / `{ type: 'COMMAND_RESULT', id, event }` harness path still lives in the worker (visual-diff `?test=` cases only), driven by `ts/src/harness/visual-diff.ts`. Expose `window.__dispatch` for tests.
+- Worker ↔ main RPC: the production path is **`EngineClient`** (`ts/src/engine/engine-client.ts`) — `id`-routed `{ id, cmd }` requests, `{ id, ok, evt }` replies, a `pending` map, `subscribe()` for unidirectional events (the a11y tree rides this). The Phase-1 `{ type: 'COMMAND', id, cmd }` / `{ type: 'COMMAND_RESULT', id, event }` harness path still lives in the worker (visual-diff `?test=` cases only), driven by `ts/src/harness/visual-diff.ts`. Expose `window.__dispatch` for tests — but only through `ts/src/dev-hooks.ts` (issue #340, see "Live validation hooks" below); never assign engine handles to `window` unconditionally.
 - Hidden `<textarea>` (`components/HiddenInput.tsx`) is the only legitimate text-input source. `beforeinput` is the canonical event; when `e.isComposing` is set, defer to the composition handlers.
 
 ## Phase 2 — worker bridge, event log, crash recovery
@@ -367,6 +367,25 @@ artifact — **not an engine bug. Do not re-investigate it.**
 
 **Verify interactive-app rendering in a real browser — never via a headless
 screenshot.** Headless screenshots are valid only for the `?test=` harness.
+
+### Live validation hooks (issue #340)
+
+`window.__dispatch`, `__engineClient`, `__fontRegistry`,
+`__setTelemetryEnabled`, `__telemetryFlush` and `__clipboardPrefetch` — and
+the `?telemetryEndpoint=` URL parameter — are installed/honoured **only**
+when `devHooksEnabled()` (`ts/src/dev-hooks.ts`): the Vite dev server
+(`import.meta.env.DEV`), a `?test=` page, or a build made with
+**`VITE_NGE_DEV_HOOKS=1`**. Live validation against a **built** bundle
+(`vite build` + `vite preview`, or any non-dev deploy) therefore needs
+`VITE_NGE_DEV_HOOKS=1 pnpm exec vite build`; a plain release build exposes no
+engine handle on `window` (`ts/e2e/prod-build.spec.ts` builds both ways and
+asserts it). The passive status flags (`__paintIdle`, `__engineReady`,
+`__renderer`, `__recovered`, `__bootMs`, `__lastStats`) stay unconditional —
+they are not capabilities and a production smoke test waits on them.
+`playwright.config.ts` sets the flag on its dev server. The telemetry
+collector endpoint is the build constant `VITE_NGE_TELEMETRY_ENDPOINT` (or
+`<EngineProvider telemetryEndpoint>`); the URL parameter works only under the
+flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
 
 ## Editor invariants
 

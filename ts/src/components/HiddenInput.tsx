@@ -16,6 +16,7 @@ import {
 } from '../state/engine-store';
 import { ClipboardWriteError, copy, cut, paste, writeSync } from '../input/clipboard';
 import { createClipboardPrefetch } from '../input/clipboard-cache';
+import { installDevHook } from '../dev-hooks';
 
 /** Map a non-composition `InputEvent` to an engine command. */
 function mapInputEventToCommand(e: InputEvent): Command | null {
@@ -358,7 +359,7 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         props.store,
         new URLSearchParams(window.location.search).get('clipboardPrefetch') !== '0',
     );
-    window.__clipboardPrefetch = prefetch;
+    installDevHook('__clipboardPrefetch', prefetch);
 
     const onCopy = (e: ClipboardEvent): void => {
         e.preventDefault();
