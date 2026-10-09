@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page, type Worker as PwWorker } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { appendStoredEntry, pseudoRandomBytes } from './zip-append';
 
@@ -455,8 +455,11 @@ test('embedded-font document: snapshots stay small, the package is stored once, 
     expect(r.postHash, 'recovered session saves the identical file').toBe(r.preHash);
 });
 
-/* Issue #268 — a failed `packages` write leaves later snapshots naming a
-   package the store does not hold. They still restore, but save through
+/* Issue #268 — a `packages` row lost after the snapshots naming it landed
+   (before #314 a failed write could do this; now only damaged / evicted
+   storage can, which the row deletion below simulates) leaves those
+   snapshots naming a package the store does not hold. They still
+   restore, but save through
    the minimal writer — silently dropping the `.docx`'s sibling parts.
    Recovery must prefer an OLDER snapshot whose package is present.
    Document A is opened and snapshotted (package hA stored), then document
@@ -626,4 +629,181 @@ test('a missing package row: recovery prefers an older snapshot that still has i
     expect(r.info.snapshotFallbacks).toBe(0);
     expect(r.postHasSibling, 'the recovered save keeps the sibling part').toBe(true);
     expect(r.postHash, 'recovered session saves the identical file').toBe(r.preHash);
+});
+
+/* Issue #314 — the worker used to mark a detached package as stored when
+   its `packages` write was ISSUED. A snapshot taken while that write was
+   still in flight then named the hash without carrying the bytes; when
+   the write failed, that snapshot row landed pointing at nothing. Now a
+   hash counts as stored only once a transaction holding it committed,
+   and a snapshot taken during an in-flight write carries the bytes
+   itself (written only if still absent).
+   Reproduced with a mocked IndexedDB failure inside the engine worker:
+   the FIRST `packages` put keeps its transaction open for a few seconds
+   and then aborts it — long enough for the idle snapshot after one more
+   edit to be taken in between, which is exactly the race. */
+async function engineWorker(page: Page): Promise<PwWorker> {
+    for (let i = 0; i < 100; i++) {
+        const w = page.workers().find((x) => x.url().includes('engine.worker'));
+        if (w) return w;
+        await page.waitForTimeout(50);
+    }
+    throw new Error('engine worker not found');
+}
+
+test('a failed package write never leaves a snapshot naming a missing package (#314)', async ({
+    page,
+}) => {
+    test.setTimeout(120_000);
+    const docx = appendStoredEntry(
+        readFileSync(PACKAGE_FIXTURE),
+        'word/fonts/font1.odttf',
+        pseudoRandomBytes(64 * 1024),
+    );
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+
+    /* The mock: count `packages` puts; the first one's transaction is
+       held open (chained no-op requests) for HOLD_MS, then aborted. */
+    const HOLD_MS = 4_000;
+    const worker = await engineWorker(page);
+    await worker.evaluate((holdMs: number) => {
+        const g = globalThis as any;
+        g.__pkgPuts = 0;
+        g.__pkgFailing = false;
+        g.__pkgFailed = false;
+        const realPut = IDBObjectStore.prototype.put;
+        IDBObjectStore.prototype.put = function (
+            this: IDBObjectStore,
+            value: unknown,
+            key?: IDBValidKey,
+        ): IDBRequest<IDBValidKey> {
+            const req = realPut.call(this, value, key);
+            if (this.name === 'packages' && ++g.__pkgPuts === 1) {
+                g.__pkgFailing = true;
+                const store = this;
+                const tx = this.transaction;
+                const deadline = Date.now() + holdMs;
+                const spin = (): void => {
+                    if (Date.now() >= deadline) {
+                        tx.abort();
+                        g.__pkgFailed = true;
+                        return;
+                    }
+                    store.count().onsuccess = spin;
+                };
+                spin();
+            }
+            return req;
+        };
+    }, HOLD_MS);
+    const workerFlag = (name: string): Promise<unknown> =>
+        worker.evaluate((n: string) => (globalThis as any)[n], name);
+
+    /* 1. Open the document: its first snapshot ships the package — and
+          that write is the one the mock fails, late. */
+    await page.evaluate(async (b64: string) => {
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const evt = await (window as any).__dispatch({
+            type: 'OPEN_DOCUMENT',
+            bytes,
+            format: 'docx',
+            name: 'race-314.docx',
+        });
+        if (evt.type === 'ERROR') throw new Error(`open: ${evt.message}`);
+    }, Buffer.from(docx).toString('base64'));
+    await expect.poll(() => workerFlag('__pkgFailing'), { timeout: 15_000 }).toBe(true);
+
+    /* 2. One more edit while that write is in flight: its idle snapshot
+          is taken before the write fails. */
+    await page.evaluate(() =>
+        (window as any).__dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'R' }),
+    );
+    await expect.poll(() => workerFlag('__pkgFailed'), { timeout: 15_000 }).toBe(true);
+
+    /* 3. The event log once that second snapshot landed. */
+    const log = await page.evaluate(async () => {
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        type Log = { snaps: { seq: number; packageHash?: string }[]; packages: string[] };
+        const read = () =>
+            new Promise<Log>((resolve, reject) => {
+                const open = indexedDB.open('engine-log');
+                open.onsuccess = () => {
+                    const db = open.result;
+                    const tx = db.transaction(['snapshots', 'packages'], 'readonly');
+                    const snaps = tx.objectStore('snapshots').getAll();
+                    const packages = tx.objectStore('packages').getAllKeys();
+                    tx.oncomplete = () => {
+                        db.close();
+                        resolve({
+                            snaps: snaps.result.map((r: any) => ({
+                                seq: r.seq,
+                                packageHash: r.packageHash,
+                            })),
+                            packages: packages.result as string[],
+                        });
+                    };
+                    tx.onerror = () => reject(tx.error);
+                };
+                open.onerror = () => reject(open.error);
+            });
+        for (let i = 0; i < 200; i++) {
+            const l = await read();
+            if (l.snaps.some((s) => s.packageHash !== undefined)) return l;
+            await sleep(50);
+        }
+        throw new Error('no package-bearing snapshot landed');
+    });
+    const puts = await workerFlag('__pkgPuts');
+    console.log(
+        `[recovery #314] snaps=${log.snaps
+            .map((s) => `${s.seq}:${(s.packageHash ?? '-').slice(0, 14)}`)
+            .join(',')} packages=${log.packages.length} packagePuts=${String(puts)}`,
+    );
+    /* No snapshot row names a package the store does not hold… */
+    const named = log.snaps.filter((s) => s.packageHash !== undefined);
+    expect(named.length).toBeGreaterThanOrEqual(1);
+    for (const s of named) {
+        expect(log.packages, `snapshot @${s.seq} names a stored package`).toContain(s.packageHash);
+    }
+    /* …because the snapshot after the failed write shipped the bytes again. */
+    expect(puts, 'the package was written again after the failed write').toBeGreaterThanOrEqual(2);
+
+    /* 4. A trap now: recovery restores that snapshot WITH its package. */
+    const r = await page.evaluate(async () => {
+        const w = window as any;
+        const dispatch = w.__dispatch as (cmd: unknown) => Promise<any>;
+        const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+        const sha256 = async (bytes: Uint8Array): Promise<string> => {
+            const digest = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
+            return Array.from(new Uint8Array(digest))
+                .map((b) => b.toString(16).padStart(2, '0'))
+                .join('');
+        };
+        const save = async (): Promise<Uint8Array> => {
+            const evt = await dispatch({ type: 'SAVE_DOCUMENT', format: 'docx' });
+            if (evt.type !== 'DOCUMENT_SAVED') throw new Error(`save: ${evt.type}`);
+            return evt.bytes;
+        };
+        const preHash = await sha256(await save());
+        await w.__engineClient.armTrap(1);
+        await dispatch({ type: 'PING' }).catch(() => undefined);
+        for (let i = 0; i < 600 && w.__recovered !== true; i++) await sleep(50);
+        if (w.__recovered !== true) return { failed: 'recovery did not complete' };
+        return {
+            info: w.__engineClient.lastRecovery,
+            preHash,
+            postHash: await sha256(await save()),
+        };
+    });
+    expect((r as any).failed, 'in-page failure').toBeUndefined();
+    const info = (r as any).info;
+    expect(info.restored).toBe(true);
+    expect(info.packageLost, 'package_lost is unreachable for this document').toBe(false);
+    expect(info.packageFallbacks).toBe(0);
+    expect((r as any).postHash, 'recovered session saves the identical file').toBe(
+        (r as any).preHash,
+    );
 });
