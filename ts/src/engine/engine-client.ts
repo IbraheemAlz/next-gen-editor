@@ -222,6 +222,15 @@ function takeCarryOver(documentId: string): boolean {
     }
 }
 
+/** Issue #333 — whether the worker's event-log checkpoints are landing.
+ *  `failing` is set once the bounded snapshot-write retries are exhausted
+ *  and cleared by the next successful write. */
+export interface CheckpointStatus {
+    failing: boolean;
+    /** Consecutive failed snapshot writes in the current run. */
+    failures: number;
+}
+
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
  *  stops re-probing the GPU and forces Canvas2D (so a persistently failing
  *  driver / shader path costs at most N + 1 worker generations). */
@@ -339,6 +348,12 @@ export class EngineClient {
     private retiring = false;
     /** Issue #270 — why the NEXT `recover()` runs (`RecoveryInfo.cause`). */
     private pendingCause: RecoveryCause = 'trap';
+    /** Issue #333 — checkpoint (snapshot write) health, fed by the
+     *  worker's `CHECKPOINT` notices. */
+    private checkpoint: CheckpointStatus = { failing: false, failures: 0 };
+    private checkpointListeners = new Set<(s: CheckpointStatus) => void>();
+    private checkpointFailureListeners = new Set<(failures: number) => void>();
+    private checkpointFailureTotal = 0;
     /** Issue #330 — set from the moment the shell is asked to remount a
      *  canvas and call `recover()` until that recovery settles. Lets
      *  "Reload engine" join a recovery already under way instead of
@@ -428,6 +443,7 @@ export class EngineClient {
         }
         this.pending.clear();
         this.generations += 1;
+        this.setCheckpoint({ failing: false, failures: 0 });
         this.worker = new Worker(new URL('./engine.worker.ts', import.meta.url), {
             type: 'module',
         });
@@ -642,6 +658,55 @@ export class EngineClient {
             }
         }
         writeCarryOver(this.documentId);
+    }
+
+    /** Issue #333 — current checkpoint health (`failing` once the retries
+     *  of a failed snapshot write are exhausted). */
+    get checkpointStatus(): CheckpointStatus {
+        return this.checkpoint;
+    }
+
+    /** Issue #333 — failed snapshot writes seen this session (the
+     *  telemetry counter). */
+    get checkpointFailures(): number {
+        return this.checkpointFailureTotal;
+    }
+
+    /** Issue #333 — observe checkpoint health changes. */
+    onCheckpointStatus(fn: (s: CheckpointStatus) => void): () => void {
+        this.checkpointListeners.add(fn);
+        return () => {
+            this.checkpointListeners.delete(fn);
+        };
+    }
+
+    /** Issue #333 — fires once per failed snapshot write (every retry
+     *  counts), with the length of the current failure run. */
+    onCheckpointFailure(fn: (failures: number) => void): () => void {
+        this.checkpointFailureListeners.add(fn);
+        return () => {
+            this.checkpointFailureListeners.delete(fn);
+        };
+    }
+
+    private setCheckpoint(next: CheckpointStatus): void {
+        if (next.failing === this.checkpoint.failing && next.failures === this.checkpoint.failures) {
+            return;
+        }
+        this.checkpoint = next;
+        for (const fn of this.checkpointListeners) fn(next);
+    }
+
+    private onCheckpointNotice(msg: { state?: string; failures?: number }): void {
+        const failures = typeof msg.failures === 'number' ? msg.failures : 0;
+        if (msg.state === 'failed') {
+            this.checkpointFailureTotal += 1;
+            for (const fn of this.checkpointFailureListeners) fn(failures);
+        } else if (msg.state === 'exhausted') {
+            this.setCheckpoint({ failing: true, failures });
+        } else if (msg.state === 'ok') {
+            this.setCheckpoint({ failing: false, failures: 0 });
+        }
     }
 
     /** Worker generations spawned so far (1 = boot; +1 per recovery). */
@@ -1008,6 +1073,11 @@ export class EngineClient {
     }
 
     private handle(msg: any): void {
+        /* Issue #333 — an unsolicited worker notice (no id, no reply). */
+        if (msg.notice === 'CHECKPOINT') {
+            this.onCheckpointNotice(msg);
+            return;
+        }
         const cb = this.pending.get(msg.id);
         if (cb) {
             this.pending.delete(msg.id);

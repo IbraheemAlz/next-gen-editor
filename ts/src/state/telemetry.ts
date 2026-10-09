@@ -19,7 +19,13 @@
  * payload (which, for `InsertText`, IS document content). */
 import type { Command, Event } from '../engine/types';
 
-type ErrorCode = 'ENGINE_TRAP' | 'DOCUMENT_PARSE' | 'FONT_LOAD' | 'RPC' | 'UNKNOWN';
+type ErrorCode =
+    | 'ENGINE_TRAP'
+    | 'DOCUMENT_PARSE'
+    | 'FONT_LOAD'
+    | 'RPC'
+    | 'CHECKPOINT_FAILED'
+    | 'UNKNOWN';
 type RecoveryOutcome = 'RECOVERED' | 'FAILED' | 'PENDING';
 /** Mirror of `bridge::RendererDowngrade` (issue #99). */
 interface RendererDowngrade {
@@ -120,6 +126,10 @@ export interface TelemetryClient {
      *  client folded the worker reply into its report). Without it the
      *  CRASH sample settles on the bare `RECOVERED` event, flag-less. */
     onRecovery?(fn: (report: TelemetryRecoveryReport) => void): () => void;
+    /** Issue #333 - optional: fires once per failed event-log snapshot
+     *  write; the collector counts each as an `ERROR / CHECKPOINT_FAILED`
+     *  sample (no document content, only the fact). */
+    onCheckpointFailure?(fn: (failures: number) => void): () => void;
 }
 
 const FLUSH_INTERVAL_MS = 60_000;
@@ -296,6 +306,11 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
         }, RECOVERY_TIMEOUT_MS);
     };
 
+    const offCheckpoint = client.onCheckpointFailure?.(() => {
+        if (!isEnabled()) return;
+        pending.push(sample({ type: 'ERROR', code: 'CHECKPOINT_FAILED', recoverable: true }));
+    });
+
     const unsubscribe = client.subscribe((e: Event) => {
         if (!isEnabled()) return;
         if (e.type === 'PAINTED') {
@@ -433,6 +448,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
         window.clearInterval(timer);
         document.removeEventListener('visibilitychange', onVisibilityChange);
         unsubscribe();
+        offCheckpoint?.();
         client.dispatch = originalDispatch;
     };
 }

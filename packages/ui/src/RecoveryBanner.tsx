@@ -16,8 +16,9 @@
  * included — the Dev HUD shows those). A newer recovery replaces a
  * dismissed banner's content and shows it again.
  */
-import { createMemo, createSignal, For, Show, type Component } from 'solid-js';
+import { createEffect, createMemo, createSignal, For, Show, type Component } from 'solid-js';
 import {
+    checkpointNotices,
     createEditorState,
     recoveryNotices,
     type RecoveryNoticeOptions,
@@ -35,14 +36,23 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
     const state = createEditorState();
     /* The report the user dismissed; a newer report shows again. */
     const [dismissed, setDismissed] = createSignal<RecoveryReport | undefined>(undefined);
+    /* Issue #333 - the checkpoint warning is dismissed per failure run:
+       a recovery to "ok" and a later failure shows it again. */
+    const [checkpointDismissed, setCheckpointDismissed] = createSignal(false);
+    createEffect(() => {
+        if (!state.checkpointFailing()) setCheckpointDismissed(false);
+    });
     const notices = createMemo(() => {
         const options: RecoveryNoticeOptions = {};
         if (props.formatTime) options.formatTime = props.formatTime;
-        return recoveryNotices(state.lastRecovery(), options);
+        const recovery =
+            dismissed() === state.lastRecovery() && state.lastRecovery() !== undefined
+                ? []
+                : recoveryNotices(state.lastRecovery(), options);
+        const checkpoint = checkpointDismissed() ? [] : checkpointNotices(state.checkpointFailing());
+        return [...recovery, ...checkpoint];
     });
-    const visible = createMemo(
-        () => notices().length > 0 && dismissed() !== state.lastRecovery(),
-    );
+    const visible = createMemo(() => notices().length > 0);
 
     return (
         <Show when={visible()}>
@@ -76,7 +86,10 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
                     class="nge-btn nge-recovery-banner__dismiss"
                     type="button"
                     aria-label="Dismiss recovery notice"
-                    onClick={() => setDismissed(() => state.lastRecovery())}
+                    onClick={() => {
+                        setDismissed(() => state.lastRecovery());
+                        setCheckpointDismissed(true);
+                    }}
                 >
                     Dismiss
                 </button>

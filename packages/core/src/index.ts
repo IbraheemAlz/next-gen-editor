@@ -53,9 +53,10 @@ export type {
     RevisionSnapshot,
     CommentSnapshot,
     RecoveryReport,
+    CheckpointStatus,
 } from './types';
 
-export { recoveryNotices, recoveryDegraded } from './recovery';
+export { recoveryNotices, recoveryDegraded, checkpointNotices } from './recovery';
 export type { RecoveryNotice, RecoveryNoticeKind, RecoveryNoticeOptions } from './recovery';
 
 export type {

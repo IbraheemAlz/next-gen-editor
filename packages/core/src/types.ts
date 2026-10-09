@@ -121,6 +121,15 @@ export interface EngineClientLike {
      * session and clears the log, so the overlay offers these buttons
      * only when the client supplies them.
      */
+    /**
+     * Issue #333 - optional checkpoint health: whether the worker's
+     * snapshot writes are landing. `failing` is set once the bounded
+     * retries of a failed write are exhausted (the replay tail is then
+     * growing) and cleared by the next successful write. The recovery
+     * banner turns it into a "save your work" warning.
+     */
+    readonly checkpointStatus?: CheckpointStatus;
+    onCheckpointStatus?(fn: (s: CheckpointStatus) => void): () => void;
     restartInPlace?(): Promise<void>;
     prepareCarryOver?(): Promise<void>;
     /**
@@ -132,6 +141,13 @@ export interface EngineClientLike {
      */
     readonly lastRecovery?: RecoveryReport | undefined;
     onRecovery?(fn: (report: RecoveryReport) => void): () => void;
+}
+
+/** Issue #333 - see `EngineClientLike.checkpointStatus`. */
+export interface CheckpointStatus {
+    failing: boolean;
+    /** Consecutive failed snapshot writes in the current run. */
+    failures: number;
 }
 
 /**
