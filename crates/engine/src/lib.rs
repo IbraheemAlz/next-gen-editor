@@ -1709,6 +1709,18 @@ pub struct SourceRun {
     /// `xml:space="preserve"` to text it did not change the meaning of.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub bare_edge_ws: bool,
+    /// Issue #335 — the source spelled this run's U+00AD / U+2011 as
+    /// literal characters inside its `<w:t>` (not as `<w:softHyphen/>` /
+    /// `<w:noBreakHyphen/>` elements, which the reader maps onto the same
+    /// characters): a regenerated piece of the run keeps them as text, so
+    /// an edit elsewhere does not respell them. Set only when the run held
+    /// no hyphen element (a mixed run writes elements). Text typed into the
+    /// run travels with it and is spelled the same way (Word reads a
+    /// literal U+00AD / U+2011 in `<w:t>` as the same optional /
+    /// non-breaking hyphen). Skipped when `false`, so a pre-#335 snapshot
+    /// encodes unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub literal_hyphens: bool,
 }
 
 /// Issue #245 — whitespace between the children of a pretty-printed

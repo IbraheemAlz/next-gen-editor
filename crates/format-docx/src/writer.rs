@@ -1632,7 +1632,9 @@ fn emit_styled_runs_with_objects(
     `<w:br>` in the cut set because the same boundary mechanic applies. */
     /* Issue #335 — the soft / non-breaking hyphen characters ride the same
     mechanic: each is its own leaf (`<w:softHyphen/>` /
-    `<w:noBreakHyphen/>`), never the raw character inside a `<w:t>`. */
+    `<w:noBreakHyphen/>`), never the raw character inside a `<w:t>` —
+    except inside a source run that spelled them literally
+    ([`SourceRun::literal_hyphens`]), which keeps its spelling. */
     let mut leaf_at: std::collections::HashMap<usize, &'static str> =
         std::collections::HashMap::new();
     let mut bidi_ctrl_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -1648,7 +1650,10 @@ fn emit_styled_runs_with_objects(
             cuts.insert(idx);
             cuts.insert(idx + ch.len_utf8());
         }
-        if let Some(leaf) = run_leaf_element(ch) {
+        if let Some(leaf) = run_leaf_element(ch)
+            && !(engine::run_content::is_hyphen_character(ch)
+                && run_source(idx).is_some_and(|s| s.run.literal_hyphens))
+        {
             leaf_at.insert(idx, leaf);
             cuts.insert(idx);
             cuts.insert(idx + ch.len_utf8());

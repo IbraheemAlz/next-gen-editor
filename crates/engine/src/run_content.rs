@@ -31,6 +31,12 @@ pub const SOFT_HYPHEN: char = '\u{00AD}';
 /// (UAX #14 class GL).
 pub const NON_BREAKING_HYPHEN: char = '\u{2011}';
 
+/// `true` for [`SOFT_HYPHEN`] / [`NON_BREAKING_HYPHEN`] — the characters
+/// the two hyphen elements are read into.
+pub fn is_hyphen_character(ch: char) -> bool {
+    ch == SOFT_HYPHEN || ch == NON_BREAKING_HYPHEN
+}
+
 /// U+000D CARRIAGE RETURN — `<w:cr/>` (ECMA-376 §17.3.3.4): a line break
 /// inside the paragraph, laid out exactly like `<w:br/>` (U+2028) but kept
 /// apart so a regenerated run writes the element it was read from.

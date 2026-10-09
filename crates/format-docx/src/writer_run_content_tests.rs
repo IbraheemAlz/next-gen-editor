@@ -83,6 +83,71 @@ fn a_regenerated_paragraph_re_emits_the_elements() {
     assert_ne!(out, xml);
 }
 
+/// A source that spelled the characters LITERALLY inside its `<w:t>`
+/// (`SourceRun::literal_hyphens`) keeps that spelling when the paragraph
+/// regenerates: the probe finds it byte-identical, and typing at the end
+/// is a pure insertion — no `<w:softHyphen/>` minted for a character the
+/// source never wrote as one. (Text typed outside those runs still gets
+/// the elements: `engine_authored_hyphen_characters_write_as_elements`.)
+#[test]
+fn literal_hyphen_characters_keep_their_source_spelling() {
+    let body = format!(
+        concat!(
+            r#"<w:p><w:r><w:t>Extra{s}ordinary</w:t></w:r>"#,
+            r#"<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> e{n}mail</w:t></w:r></w:p>"#,
+        ),
+        s = SOFT_HYPHEN,
+        n = NON_BREAKING_HYPHEN
+    );
+    let (xml, archive) = open(&body);
+    let p = archive.document.nth_paragraph(0).unwrap();
+    assert_eq!(
+        p.text,
+        format!("Extra{SOFT_HYPHEN}ordinary e{NON_BREAKING_HYPHEN}mail")
+    );
+    let runs = &p.source_markup.as_deref().expect("markup").runs;
+    assert!(runs.iter().all(|r| r.literal_hyphens), "{runs:?}");
+    let report = super::regen_check::regen_check(&archive, &archive.document).expect("probe");
+    assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
+
+    let len = p.text.len();
+    let edited = archive.document.insert_text(at(len), " today");
+    let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+    assert!(
+        !out.contains("<w:softHyphen/>") && !out.contains("<w:noBreakHyphen/>"),
+        "elements minted for literal characters:\n{out}"
+    );
+    let want = format!(r#"<w:t xml:space="preserve"> e{NON_BREAKING_HYPHEN}mail today</w:t>"#);
+    assert!(out.contains(&want), "{out}");
+    let prefix = xml
+        .bytes()
+        .zip(out.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = xml
+        .bytes()
+        .rev()
+        .zip(out.bytes().rev())
+        .take(xml.len() - prefix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert_eq!(
+        xml.len() - prefix - suffix,
+        0,
+        "source bytes rewritten:\n{out}"
+    );
+
+    /* Text typed into the run travels with it (an insertion at its start
+    joins it) and is spelled the run's way. */
+    let fresh = edited.insert_text(at(0), "co\u{AD}op ");
+    let out = document_xml_of(&write_docx(&archive, &fresh).expect("write"));
+    assert!(!out.contains("<w:softHyphen/>"), "{out}");
+    assert!(
+        out.contains("<w:t>co\u{AD}op Extra\u{AD}ordinary</w:t>"),
+        "{out}"
+    );
+}
+
 /// A run holding nothing but a soft hyphen is a text run now (it used to
 /// be kept as an opaque marker): typing elsewhere still re-emits it.
 #[test]
@@ -362,4 +427,36 @@ fn a_language_only_style_writes_no_run_properties() {
             .iter()
             .any(|f| f.starts_with(b"<w:lang"))
     );
+}
+
+/// Issue #384 × #335 / #357 / #326 — the regeneration probe
+/// (`regen_check`) finds every paragraph of the run-content and
+/// hyphenation fixtures byte-identical to its source: the hyphen, symbol,
+/// carriage-return and positional-tab leaves come back as their elements
+/// inside their source runs, the `<w:dir>` / `<w:bdo>` controls as their
+/// wrappers, and the read-only `<w:lang>` / `<w:suppressAutoHyphens/>`
+/// from the grab bags — never as characters or baked-in properties.
+#[test]
+fn run_content_fixtures_regenerate_byte_identically() {
+    use crate::test_fixtures::{hyphenation_docx, run_content_docx, soft_hyphen_docx};
+    for (name, bytes) in [
+        ("soft_hyphen", soft_hyphen_docx()),
+        ("run_content", run_content_docx()),
+        ("hyphenation_on", hyphenation_docx(true)),
+        ("hyphenation_off", hyphenation_docx(false)),
+    ] {
+        let archive = read_docx(&bytes).expect("read");
+        let report =
+            super::regen_check::regen_check(&archive, &archive.document).expect("regen check");
+        assert!(report.checked > 0, "{name}: nothing probed");
+        for m in &report.mismatches {
+            eprintln!("{name}\nSOURCE: {}\nREGEN:  {}", m.source, m.regenerated);
+        }
+        assert!(
+            report.mismatches.is_empty(),
+            "{name}: {} of {} paragraphs regenerate differently",
+            report.mismatches.len(),
+            report.checked
+        );
+    }
 }

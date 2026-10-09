@@ -2428,9 +2428,13 @@ pub(crate) fn parse_document_xml_with_events(
                     breaks) enter the text as U+00AD SOFT HYPHEN / U+2011
                     NON-BREAKING HYPHEN. The writer turns both characters
                     back into the elements (never the raw characters). */
-                    b"w:softHyphen" if in_run => run_text.push(engine::run_content::SOFT_HYPHEN),
+                    b"w:softHyphen" if in_run => {
+                        run_text.push(engine::run_content::SOFT_HYPHEN);
+                        markup.run_hyphen_element();
+                    }
                     b"w:noBreakHyphen" if in_run => {
-                        run_text.push(engine::run_content::NON_BREAKING_HYPHEN)
+                        run_text.push(engine::run_content::NON_BREAKING_HYPHEN);
+                        markup.run_hyphen_element();
                     }
                     b"w:tab" if in_run => {
                         /* Audit gap A.M5 — `<w:tab/>` inside a `<w:r>`.
