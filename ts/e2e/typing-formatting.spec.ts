@@ -1,17 +1,11 @@
 import { test, expect, type Page } from '@playwright/test';
+import { boot, burst, documentText } from './helpers/editor';
 
 /* Issue #276 — typing after a formatted run continues its formatting (the
  * character before the caret; at a paragraph start the one after it), and
  * the toolbar's `attrs_at_caret` reports exactly what the next keystroke
  * produces — before and after typing. Pending (sticky) formatting still
  * overrides the inherited style. */
-
-async function boot(page: Page): Promise<void> {
-    await page.goto('/');
-    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
-        timeout: 30_000,
-    });
-}
 
 test('typing after a bold run is bold; pending bold-off types plain', async ({ page }) => {
     await boot(page);
@@ -102,57 +96,6 @@ async function boldOf(page: Page, ranges: Array<[number, number]>) {
         },
         { ranges, p0: pos(0) },
     );
-}
-
-async function documentText(page: Page): Promise<string> {
-    return page.evaluate(async () => {
-        const dispatch = (window as any).__dispatch;
-        await dispatch({ type: 'SELECT_ALL' });
-        const clip = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
-        return clip.type === 'CLIPBOARD_PAYLOAD' ? (clip.plain as string) : `<${clip.type}>`;
-    });
-}
-
-/** Fire `steps` as ONE synchronous burst on the main thread: `'B'` is a
- *  Ctrl/Cmd+B keydown on the hidden textarea, `'BTN'` a click on the
- *  toolbar Bold button, anything else an `insertText` beforeinput. No
- *  engine reply can land between two steps (the main thread never
- *  yields), so the shell's mirrored toolbar state is guaranteed stale for
- *  every toggle after the first — the deterministic form of "typing
- *  speed". Playwright's `keyboard.type` round-trips through CDP per key,
- *  which is slow enough for the reply to win and hide the #286 race. */
-async function burst(page: Page, steps: string[]): Promise<void> {
-    await page.evaluate((steps) => {
-        const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-nge-hidden-input]');
-        const btn = document.querySelector<HTMLButtonElement>('.nge-tfmt__btn--bold');
-        if (!ta || !btn) throw new Error('editor input / bold button missing');
-        const mac = /Mac|iPhone|iPad/.test(navigator.platform);
-        for (const s of steps) {
-            if (s === 'B') {
-                ta.dispatchEvent(
-                    new KeyboardEvent('keydown', {
-                        key: 'b',
-                        code: 'KeyB',
-                        ctrlKey: !mac,
-                        metaKey: mac,
-                        bubbles: true,
-                        cancelable: true,
-                    }),
-                );
-            } else if (s === 'BTN') {
-                btn.click();
-            } else {
-                ta.dispatchEvent(
-                    new InputEvent('beforeinput', {
-                        inputType: 'insertText',
-                        data: s,
-                        bubbles: true,
-                        cancelable: true,
-                    }),
-                );
-            }
-        }
-    }, steps);
 }
 
 async function expectBoldThenPlain(page: Page): Promise<void> {

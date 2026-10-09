@@ -78,3 +78,10 @@
 .nge-hud__retry:hover {
     border-color: var(--nge-color-warning);
 }
+
+/* Issue #315 — the last recovery's losses row; amber when anything was
+   lost (a separate modifier so `.nge-hud__warn` keeps naming the
+   renderer-fallback row alone). */
+.nge-hud__recovery-losses--warn {
+    color: var(--nge-color-warning);
+}

@@ -143,6 +143,61 @@ pub fn resolve_page_floats(page: &PageBox, columns: ColumnLayout) -> Vec<FloatBo
     out
 }
 
+/// Issue #141 — the region of a page a body float must stay clear of:
+/// the footnote band, its separator gap included. Page-relative px.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NoteBandKeepOut {
+    /// Horizontal extent of the band (the content area).
+    pub x0: f32,
+    pub x1: f32,
+    /// The body limit: the band's top minus its separator gap — the
+    /// lowest edge a float's rect may reach.
+    pub top: f32,
+    /// The band's bottom edge (an object entirely below it, in the
+    /// bottom margin, does not overlap the band).
+    pub bottom: f32,
+    /// The body area's top: a clamped float never moves above it (one
+    /// that already starts higher keeps its own top).
+    pub floor: f32,
+}
+
+/// Issue #141 — keep body floats clear of the page's footnote band.
+/// Word keeps a floating object inside the body area unless it sits
+/// behind the text, so a painted, in-front, body-anchored object whose
+/// resolved rect reaches into the band (horizontally overlapping it,
+/// vertically between `top` and `bottom`) moves UP until its bottom
+/// edge meets `top`. `behindDoc` objects paint under the text by design;
+/// header / footer objects belong to their bands — both are untouched.
+///
+/// Pure and single-pass: the paginator reserves the band line by line
+/// before the page flushes, so the band is final when floats resolve
+/// (a band that grows on a later wrap pass is clamped against afresh on
+/// that pass — `WrapConvergence` bounds the passes). An object taller
+/// than the room between `floor` and `top` cannot clear the band: it is
+/// pinned at `floor` (painted, never dropped) and counted in the return
+/// value — the caller reports `DegradeReason::FloatClampedByNotes`.
+pub fn clamp_floats_above_band(floats: &mut [FloatBox], band: NoteBandKeepOut) -> usize {
+    let mut stuck = 0;
+    for f in floats.iter_mut() {
+        if f.behind_doc || f.hidden || !matches!(f.anchor, FloatAnchorRef::Body { .. }) {
+            continue;
+        }
+        let (x0, x1) = (f.origin.x, f.origin.x + f.size.width);
+        let (y0, y1) = (f.origin.y, f.origin.y + f.size.height);
+        let overlaps = x1 > band.x0 && x0 < band.x1 && y1 > band.top && y0 < band.bottom;
+        if !overlaps {
+            continue;
+        }
+        let floor = band.floor.min(y0);
+        let y = (band.top - f.size.height).max(floor);
+        f.origin.y = y;
+        if y + f.size.height > band.top {
+            stuck += 1;
+        }
+    }
+    stuck
+}
+
 /// Issue #165 — a text box's content rect as a margin-less pseudo page:
 /// `size` is the content rect, `blocks` the laid-out story (origins
 /// relative to the content rect). Feeding it to [`resolve_page_floats`]
@@ -673,5 +728,81 @@ mod tests {
         }
         let pg = page(vec![LayoutBlock::Paragraph(p)], 1);
         assert!(resolve_page_floats(&pg, ColumnLayout::default()).is_empty());
+    }
+
+    /// Issue #141 — the keep-out of a 600 × 800 page (content x 80..540)
+    /// whose footnote band opens at y = 650 (separator gap from 638) and
+    /// ends at 730; the body starts at 50.
+    fn keep_out() -> NoteBandKeepOut {
+        NoteBandKeepOut {
+            x0: 80.0,
+            x1: 540.0,
+            top: 638.0,
+            bottom: 730.0,
+            floor: 50.0,
+        }
+    }
+
+    /// A 100 × 50 body float resolved at page-relative `(x, y)`.
+    fn float_at(x: f32, y: f32) -> FloatBox {
+        let s = spec(
+            HRelativeFrom::Page,
+            FloatOffsetPx::Px(x),
+            VRelativeFrom::Page,
+            FloatOffsetPx::Px(y),
+        );
+        let p = para_with_float(Point::default(), s);
+        let pg = page(vec![LayoutBlock::Paragraph(p)], 1);
+        resolve_page_floats(&pg, ColumnLayout::default()).remove(0)
+    }
+
+    #[test]
+    fn a_float_reaching_into_the_footnote_band_is_lifted_above_it() {
+        let mut floats = vec![float_at(200.0, 620.0), float_at(200.0, 700.0)];
+        assert_eq!(clamp_floats_above_band(&mut floats, keep_out()), 0);
+        for f in &floats {
+            assert_eq!(f.origin.y, 638.0 - 50.0, "bottom edge meets the limit");
+            assert_eq!(f.origin.x, 200.0, "x never moves");
+        }
+    }
+
+    #[test]
+    fn floats_clear_of_the_band_or_exempt_are_untouched() {
+        let mut behind = float_at(200.0, 700.0);
+        behind.behind_doc = true;
+        let mut hidden = float_at(200.0, 700.0);
+        hidden.hidden = true;
+        let mut header = float_at(200.0, 700.0);
+        header.anchor = FloatAnchorRef::Header;
+        let mut floats = vec![
+            /* Above the limit. */
+            float_at(200.0, 500.0),
+            /* Below the band, in the bottom margin. */
+            float_at(200.0, 740.0),
+            /* In the left margin, beside the band. */
+            float_at(-25.0, 700.0),
+            behind,
+            hidden,
+            header,
+        ];
+        let before: Vec<Point> = floats.iter().map(|f| f.origin).collect();
+        assert_eq!(clamp_floats_above_band(&mut floats, keep_out()), 0);
+        let after: Vec<Point> = floats.iter().map(|f| f.origin).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_float_too_tall_for_the_body_is_pinned_at_the_body_top_and_counted() {
+        let mut tall = float_at(200.0, 100.0);
+        tall.size.height = 700.0;
+        let mut floats = vec![tall];
+        assert_eq!(clamp_floats_above_band(&mut floats, keep_out()), 1);
+        assert_eq!(floats[0].origin.y, 50.0, "pinned at the body top");
+        /* One that already starts above the body top keeps its top. */
+        let mut high = float_at(200.0, 10.0);
+        high.size.height = 700.0;
+        let mut floats = vec![high];
+        assert_eq!(clamp_floats_above_band(&mut floats, keep_out()), 1);
+        assert_eq!(floats[0].origin.y, 10.0);
     }
 }

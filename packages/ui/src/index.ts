@@ -72,6 +72,9 @@ export { SettingsMenu } from './SettingsMenu';
 export { TrapOverlay } from './TrapOverlay';
 export type { TrapOverlayProps } from './TrapOverlay';
 
+export { RecoveryBanner } from './RecoveryBanner';
+export type { RecoveryBannerProps } from './RecoveryBanner';
+
 export { Ruler } from './Ruler';
 export type { RulerProps } from './Ruler';
 

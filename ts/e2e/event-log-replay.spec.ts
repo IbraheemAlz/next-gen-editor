@@ -226,6 +226,7 @@ for (const corrupt of ['newest', 'all'] as const) {
         expect(Math.min(...regular)).toBeGreaterThan(r.before.pruned);
         expect(r.before.snap).toContain(r.before.pinned);
 
+        const banner = page.locator('.nge-recovery-banner');
         if (corrupt === 'newest') {
             expect(r.info.snapshotFallbacks).toBe(1);
             expect(r.info.restored).toBe(true);
@@ -234,10 +235,19 @@ for (const corrupt of ['newest', 'all'] as const) {
             expect(r.info.pinnedBase).toBe(false);
             expect(r.info.tailDropped).toBe(false);
             expect(r.text).toBe(`KEEP-241 ${SEED}`);
+            /* Issue #315 — a fallback that still replayed its full tail
+               lost nothing: no banner. */
+            await expect(banner).toHaveCount(0);
         } else {
             expect(r.info.snapshotFallbacks).toBe(r.before.snap.length);
             expect(r.info.restored).toBe(false);
             expect(r.info.logTruncated).toBe(true);
+            /* Issue #315 — the total loss is visible, with what to do. */
+            await expect(banner).toBeVisible();
+            await expect(banner).toHaveAttribute('role', 'alert');
+            await expect(banner).toHaveAttribute('data-kinds', 'log-truncated');
+            await expect(banner).toContainText('Your document could not be recovered');
+            await expect(banner).toContainText('Open your last saved copy');
         }
     });
 }
@@ -403,4 +413,156 @@ test('pruned log + all but the pinned base unreadable: the pinned base restores'
     expect(r.text).not.toContain('LOST');
     /* Re-based at the log head: the next recovery replays nothing stale. */
     expect(Math.max(...r.after.snap)).toBeGreaterThanOrEqual(r.preMaxSeq);
+
+    /* Issue #315 — the lost edits are visible: a dismissible alert names
+       the snapshot time the document came back from and what to do. */
+    expect(typeof r.info.baseSnapshotAt).toBe('number');
+    const banner = page.locator('.nge-recovery-banner');
+    await expect(banner).toBeVisible();
+    await expect(banner).toHaveAttribute('role', 'alert');
+    await expect(banner).toHaveAttribute('data-kinds', 'tail-dropped');
+    await expect(banner).toContainText('Recovered an earlier version of your document');
+    await expect(banner).toContainText('changes made after that were lost');
+    const hhmm = await page.evaluate(
+        (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        r.info.baseSnapshotAt as number,
+    );
+    await expect(banner).toContainText(`as it was at ${hhmm}`);
+    /* …and the Dev HUD carries the raw flags. */
+    await page.evaluate(() => window.dispatchEvent(new Event('nge-toggle-hud')));
+    await expect(page.locator('.nge-hud__recovery-base')).toContainText('pinned snapshot');
+    await expect(page.locator('.nge-hud__recovery-losses')).toHaveText('tail dropped');
+    await expect(page.locator('.nge-hud__recovery-losses')).toHaveClass(/nge-hud__recovery-losses--warn/);
+    /* Dismissible. */
+    await banner.getByRole('button', { name: 'Dismiss recovery notice' }).click();
+    await expect(banner).toHaveCount(0);
+});
+
+/* Issue #315 — package lost. An opened `.docx` is snapshotted detached
+   (#212); pruning then drops the logged `OPEN_DOCUMENT` (so the bare log
+   cannot re-open the file), and the `packages` row is lost (damaged /
+   evicted storage — #314 keeps a failed write from doing this). Every
+   retained base restores only WITHOUT the package: the recovered session
+   would save through the minimal writer, dropping the original file's
+   sibling parts. That must be visible, with what to do about it. */
+test('pruned log + the package row lost: the recovered loss is visible (#315)', async ({
+    page,
+}) => {
+    test.setTimeout(90_000);
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+
+    const result = await page.evaluate(async (b64: string) => {
+        const w = window as any;
+        const dispatch = w.__dispatch as (cmd: unknown) => Promise<any>;
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        const withDb = <T,>(fn: (db: IDBDatabase) => Promise<T>): Promise<T> =>
+            new Promise((resolve, reject) => {
+                const open = indexedDB.open('engine-log');
+                open.onsuccess = () => {
+                    const db = open.result;
+                    fn(db).then(
+                        (v) => {
+                            db.close();
+                            resolve(v);
+                        },
+                        (e) => {
+                            db.close();
+                            reject(e);
+                        },
+                    );
+                };
+                open.onerror = () => reject(open.error);
+            });
+        type Log = { snap: number[]; pruned: number; packages: string[] };
+        const readLog = () =>
+            withDb(
+                (db) =>
+                    new Promise<Log>((resolve, reject) => {
+                        const tx = db.transaction(['snapshots', 'meta', 'packages'], 'readonly');
+                        const snap = tx.objectStore('snapshots').getAllKeys();
+                        const pruned = tx.objectStore('meta').get('pruned');
+                        const packages = tx.objectStore('packages').getAllKeys();
+                        tx.oncomplete = () =>
+                            resolve({
+                                snap: snap.result as number[],
+                                pruned: (pruned.result?.through as number) ?? 0,
+                                packages: packages.result as string[],
+                            });
+                        tx.onerror = () => reject(tx.error);
+                    }),
+            );
+        const documentText = async (): Promise<string> => {
+            await dispatch({ type: 'SELECT_ALL' });
+            const p = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+            return p.type === 'CLIPBOARD_PAYLOAD' ? p.plain : `<${p.type}>`;
+        };
+
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const opened = await dispatch({ type: 'OPEN_DOCUMENT', bytes, format: 'docx', name: 'k.docx' });
+        if (opened.type === 'ERROR') return { failed: `open: ${opened.message}` };
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'PKG-315 ' });
+        /* Cadence snapshots past the open: pruning drops it. */
+        for (let i = 0; i < 850; i++) await dispatch({ type: 'PING' });
+        await sleep(2_500);
+        let log = await readLog();
+        for (let i = 0; i < 100 && (log.pruned < 200 || log.packages.length === 0); i++) {
+            await sleep(50);
+            log = await readLog();
+        }
+        const before = log;
+        const textBefore = await documentText();
+
+        /* The package row is lost. */
+        await withDb(
+            (db) =>
+                new Promise<void>((resolve, reject) => {
+                    const tx = db.transaction('packages', 'readwrite');
+                    tx.objectStore('packages').clear();
+                    tx.oncomplete = () => resolve();
+                    tx.onerror = () => reject(tx.error);
+                }),
+        );
+
+        await w.__engineClient.armTrap(1);
+        await dispatch({ type: 'PING' }).catch(() => undefined);
+        for (let i = 0; i < 600 && w.__recovered !== true; i++) await sleep(50);
+        if (w.__recovered !== true) return { failed: 'recovery did not complete' };
+        return {
+            before,
+            textBefore,
+            info: w.__engineClient.lastRecovery,
+            text: await documentText(),
+        };
+    }, readFileSync(PIN_FIXTURE).toString('base64'));
+
+    expect((result as any).failed, 'in-page failure').toBeUndefined();
+    const r = result as any;
+    console.log(
+        `[event-log #315] snaps=${r.before.snap.join(',')} pruned<=${r.before.pruned} ` +
+            `packages=${r.before.packages.length} restored=${r.info.restored} ` +
+            `packageLost=${r.info.packageLost} packageFallbacks=${r.info.packageFallbacks}`,
+    );
+    /* Set-up: pruned past the open, and the package had been stored. */
+    expect(r.before.pruned).toBeGreaterThanOrEqual(200);
+    expect(r.before.packages).toHaveLength(1);
+
+    expect(r.info.restored).toBe(true);
+    expect(r.info.packageLost).toBe(true);
+    expect(r.info.tailDropped).toBe(false);
+    expect(r.info.logTruncated).toBe(false);
+    /* The text itself survived — only the original file's other parts did not. */
+    expect(r.text).toBe(r.textBefore);
+    expect(r.text).toContain('PKG-315 ');
+
+    const banner = page.locator('.nge-recovery-banner');
+    await expect(banner).toBeVisible();
+    await expect(banner).toHaveAttribute('role', 'alert');
+    await expect(banner).toHaveAttribute('data-kinds', 'package-lost');
+    await expect(banner).toContainText('Parts of the original file could not be restored');
+    await expect(banner).toContainText('Save As');
+    await page.evaluate(() => window.dispatchEvent(new Event('nge-toggle-hud')));
+    await expect(page.locator('.nge-hud__recovery-losses')).toHaveText('package lost');
 });
