@@ -232,10 +232,11 @@ jobs:
             sudo apt-get install -y google-chrome-stable
           fi
 
+      # Issue #438 - no `version:` input: the action reads the root
+      # package.json `packageManager` pin, so CI and local dev run the same
+      # pnpm (pnpm-workspace.yaml uses pnpm 11 settings).
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -314,8 +315,6 @@ jobs:
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - name: Build engine-wasm (release)
         run: wasm-pack build --target web --release crates/engine-wasm
