@@ -405,8 +405,12 @@ struct LazyLayoutInfo {
     /// next section (L2.3, #8), so the page is laid out unbalanced here
     /// and balanced in any band that gets further; pages from this index
     /// on are excluded from the verified prefix (`layout::
-    /// verify_prefix_open`). `None` — every page is final (up to the
-    /// usual partial last page).
+    /// verify_prefix_open`). Issue #181 — likewise when the cull stopped
+    /// while a footnote cut on that page still waits for its
+    /// continuation (`Paginator::has_pending_note_continuation`): the
+    /// band drains it onto notes-only pages that a longer band shares
+    /// with body text. `None` — every page is final (up to the usual
+    /// partial last page).
     open_from_page: Option<usize>,
 }
 
@@ -503,6 +507,7 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::WrapPolygonFallback => LayoutDegradeReason::WrapPolygonFallback,
         R::PageRefCap => LayoutDegradeReason::PageRefCap,
         R::NoteRestartCap => LayoutDegradeReason::NoteRestartCap,
+        R::FloatClampedByNotes => LayoutDegradeReason::FloatClampedByNotes,
     };
     LayoutDegraded {
         reason,
@@ -9335,7 +9340,17 @@ impl Engine {
                             && sections.get(sect_idx + 1).is_some_and(|next| {
                                 matches!(next.section_type, engine::SectionType::Continuous)
                             });
-                        if balance_pending {
+                        /* Issue #181 — stopping while a footnote cut on
+                        the in-progress page still waits for its
+                        continuation: `finish` drains it onto notes-only
+                        pages a longer band fills with body text, so the
+                        page is provisional too. (Document-end endnotes
+                        need no flag: they trail the last body block, so
+                        a band that ends before them is a plain prefix.) */
+                        let notes_pending = paginator
+                            .as_ref()
+                            .is_some_and(Paginator::has_pending_note_continuation);
+                        if balance_pending || notes_pending {
                             open_from_page = Some(
                                 emitted_pages.len()
                                     + paginator.as_ref().map_or(0, |p| p.page_count_emitted()),
@@ -27060,6 +27075,16 @@ mod a11y_object_tests;
 /// footer bands: numbering, band placement, a11y, HTML export.
 #[cfg(test)]
 mod note_container_tests;
+
+/// Issues #317 / #181 / #141 — the `#[ignore]`d whole-corpus note-band
+/// probe (one `.docx` per process, driven by `NGE_PROBE_FILE`).
+#[cfg(test)]
+mod note_corpus_probe_tests;
+
+/// Issues #181 / #141 — note bands vs. the viewport-culled band and
+/// floating objects.
+#[cfg(test)]
+mod note_band_tests;
 
 #[cfg(test)]
 mod part_media_tests;
