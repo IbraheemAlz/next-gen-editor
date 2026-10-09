@@ -56,6 +56,7 @@ import {
     CapsButtons,
 } from '@nge/ui';
 import type { EngineClient } from './engine/engine-client';
+import { devHooksEnabled } from './dev-hooks';
 
 import '@nge/ui/theme.css';
 
@@ -91,7 +92,11 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
     const ready = () => (props.engineReady ? props.engineReady() : true);
 
     return (
-        <EngineProvider client={handle} telemetryEndpoint={props.telemetryEndpoint}>
+        <EngineProvider
+            client={handle}
+            telemetryEndpoint={props.telemetryEndpoint}
+            debugSurfaces={devHooksEnabled()}
+        >
           <FontRegistryProvider registry={props.fontRegistry}>
           <TelemetryProvider config={props.telemetry}>
             <div class="nge-root nge-shell">

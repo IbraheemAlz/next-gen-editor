@@ -33,8 +33,9 @@
  * Load: the prefetch fires ~150 ms after the selection SETTLES (trailing
  * debounce — a drag-selection emits no GET_SELECTION_AS_CLIPBOARD until it
  * pauses), only for non-collapsed selections, and asks the engine to skip
- * the `.docx` fragment ZIP (`include_docx: false`). Kill switch:
- * `?clipboardPrefetch=0`. */
+ * the `.docx` fragment ZIP (`include_docx: false`). Kill switch: the build
+ * constant `VITE_NGE_CLIPBOARD_PREFETCH=0`, or `?clipboardPrefetch=0` under
+ * the dev-hooks flag only (issue #389). */
 import { createEffect, createMemo, on, onCleanup } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type { Event, LogicalPos } from '../engine/types';

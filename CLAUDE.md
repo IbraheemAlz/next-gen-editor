@@ -390,17 +390,25 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 ### Live validation hooks (issue #340)
 
 `window.__dispatch`, `__engineClient`, `__fontRegistry`,
-`__setTelemetryEnabled`, `__telemetryFlush` and `__clipboardPrefetch` — and
-the `?telemetryEndpoint=` URL parameter — are installed/honoured **only**
+`__setTelemetryEnabled`, `__telemetryFlush`, `__clipboardPrefetch` and
+`__lastStats` — and the `?telemetryEndpoint=` and `?clipboardPrefetch=0`
+URL parameters, and the `@nge/ui` `SettingsMenu`'s URL-driven renderer
+switch (`<EngineProvider debugSurfaces>`, issue #389) — are
+installed/honoured **only**
 when `devHooksEnabled()` (`ts/src/dev-hooks.ts`): the Vite dev server
 (`import.meta.env.DEV`), a `?test=` page, or a build made with
 **`VITE_NGE_DEV_HOOKS=1`**. Live validation against a **built** bundle
 (`vite build` + `vite preview`, or any non-dev deploy) therefore needs
 `VITE_NGE_DEV_HOOKS=1 pnpm exec vite build`; a plain release build exposes no
 engine handle on `window` (`ts/e2e/prod-build.spec.ts` builds both ways and
-asserts it). The passive status flags (`__paintIdle`, `__engineReady`,
-`__renderer`, `__recovered`, `__bootMs`, `__lastStats`) stay unconditional —
-they are not capabilities and a production smoke test waits on them.
+asserts it, plus no `#stats` box, `?clipboardPrefetch=0` ignored, no renderer
+switch). The passive status flags — exactly `__paintIdle`, `__engineReady`,
+`__renderer`, `__recovered` and `__bootMs` — are the ONLY unconditional
+`window.__*` values: they are not capabilities and a production smoke test
+waits on them. The visible stats readout is the Dev HUD (Ctrl+Shift+D), not a
+fixed `#stats` box; production kill switches are build constants
+(`VITE_NGE_CLIPBOARD_PREFETCH=0`, `VITE_NGE_UNLOAD_GUARD=0`) or provider
+props, never URL parameters.
 `playwright.config.ts` sets the flag on its dev server. The telemetry
 collector endpoint is the build constant `VITE_NGE_TELEMETRY_ENDPOINT` (or
 `<EngineProvider telemetryEndpoint>`); the URL parameter works only under the

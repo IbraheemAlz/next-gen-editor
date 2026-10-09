@@ -26,6 +26,7 @@ export {
     useEngine,
     useDocumentDefaults,
     useTelemetryEndpoint,
+    useDebugSurfaces,
 } from './EngineProvider';
 export type { EngineProviderProps, EngineHandle } from './EngineProvider';
 
