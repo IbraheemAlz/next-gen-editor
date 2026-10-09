@@ -109,6 +109,7 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **Crash recovery**: a WASM trap (`/RuntimeError|unreachable/`) → worker posts `{ trap: true }` + `self.close()` → `EngineClient.onTrap` rejects pending + fires the UI `onCrash` callback → `App` bumps the `canvasGen` signal, remounting `EditorCanvas` with a fresh `<canvas>`, and calls `recover()` → respawn + `Command::Recover`. `loadRecoveryLog` returns every retained snapshot (newest first, then the snapshot-less base) + the command rows + `lastSeq`, so the recovered worker resumes `logSequence` (never restarts at 0) and falls back to an older snapshot when the newest will not restore (issue #241). Pruning only ever drops commands at or before a *pruned* snapshot, in the same transaction — never without a retained snapshot — so every retained snapshot keeps its full tail. Issue #268 — candidates are **scored**, not just tried until one restores: full tail + package present > full tail with its package lost (a failed `packages` write; `Event::Recovered.package_lost`) > the pinned base alone > nothing, and `RecoveryInfo` reports `packageFallbacks` / `packageLost` / `pinnedBase` / `tailDropped`. Each document's first snapshot is **pinned** (`meta` row `pinned`, re-pinned after `OPEN_DOCUMENT` / `LOAD_DOCX` / `RENDER_PAGE`): exempt from pruning (its tail is not), so an all-but-pinned-unreadable log restores the document as of that snapshot instead of losing it.
 - **Recovery = base snapshot + replayed tail (issue #85).** `Command::Snapshot` → `Event::Snapshot { bytes }` is the versioned `engine::snapshot` envelope (`NGES` magic + format-version byte + named-field MessagePack; every model struct is `#[serde(default)]`, maps serialize sorted so equal states are byte-identical). It carries the document tree (styles, numbering, header/footer stories, media, comments), a size-bounded undo window, the selection, the active story, sticky formatting, review flags and the layout config. The worker snapshots every `SNAPSHOT_EVERY` logged commands *inside* the command task after the reply (so the seq is exact) and on a 1.5 s idle timer; the IndexedDB write stays off the critical path. `Command::Recover { snapshot, log_tail }` restores, then replays the tail through `apply` with the layout config stashed (no fonts yet → nothing may paint), and answers `Recovered { applied_commands, snapshot_restored, renderer }` — the renderer is re-probed on the fresh canvas and reported by the engine itself (#66). `setupEngine(restored = true)` re-loads fonts and re-asserts the device scale instead of re-seeding. `ARM_TRAP` (`EngineClient.armTrap`) is the fault-injection hook: a real `Engine.debug_force_trap` after K logged commands, log flushed first. The #99 Vello crash-loop streak is **persisted** (issue #240, `meta` row `renderer-streak`: count + timestamp + renderer + a `live` token; a clean `pagehide` leaves the token in `localStorage`, so only a generation that died with its tab counts): a boot within 24 h of reaching `VELLO_TRAP_LIMIT` starts on Canvas2D without probing (`INIT.forceRenderer`), and the Dev HUD shows the sticky fallback with a "Retry vello (reload)" action (`EngineClient.retryGpuRenderer`).
 - **e2e suite**: `ts/e2e/*.spec.ts` + `ts/playwright.config.ts` — `@playwright/test` with `channel: 'chrome'` (system Chrome, no download); `webServer` auto-boots Vite. Run: `pnpm exec playwright test` from `ts/`.
+- **Race-class e2e specs use the synchronous `burst` helper (issue #310).** `page.keyboard` / `page.mouse` round-trip through CDP per event — slow enough that the worker answers between two simulated inputs and the shell's mirrored state is already fresh, so a spec passes against the very race it targets (the #286 real-keyboard spec did). `ts/e2e/helpers/editor.ts` exports `burst(page, steps)`, which fires the whole sequence (`'B'` Ctrl+B, `'BTN'` Bold button, `'ENTER'`, `{ pointerdown: { x, y, shift? } }` / `{ pointerup }` on a page canvas through the real `pointer.ts`, or any other string as `insertText`) from ONE synchronous `page.evaluate`, so no engine reply can interleave; read results via `documentText` / `settle` (worker round-trips, FIFO behind the burst). Calling `__dispatch` directly is NOT a race test — it bypasses `pointer.ts` / `HiddenInput`. **A new race spec must be shown to fail** against a deliberately re-introduced deferral in the shell (e.g. `setTimeout(…, 0)` around `placeCaret`/`extendTo`/the Enter dispatch/`toggleFormat`/`cmd.toggleFormatting`); a bare delay needs a trailing keystroke queued behind it in the burst (the readback arrives too late to notice a delay on its own). Keep one slow real-input smoke per scenario, but never as the only guard. The engine ignores a stale `at` on `SPLIT_PARAGRAPH` when a selection exists, so "stale mirror" regressions of Enter surface only as shell-side deferral.
 
 ## Phase 3 — rendering, RTL, box model
 
@@ -289,11 +290,22 @@ Engine backlog" references a real issue.
 
 - `cargo fmt --all -- --check` clean.
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- `cargo test --workspace` (native unit tests).
+- `cargo test --workspace` (native unit tests), **plus** `cargo test -p
+  engine-wasm --features fuzz-native` (issue #321): the bridge-level tests
+  that drive real `Command`s through `Engine::apply` natively
+  (`fuzz_native_surface_drives_engine_end_to_end`, the two `OpenDocument.defaults`
+  bridge tests) are `cfg`-gated on that off-by-default
+  feature, so `--workspace` alone collects 0 of them. CI's `rust-native`
+  job runs it and fails if the named tests did not execute.
 - `wasm-pack test --headless --chrome crates/engine-wasm` (browser unit tests).
 - `wasm-pack build --release` then assert artifact `< 15728640` bytes.
 - `cargo run -p shape-regression --release` — 0 failed on the corpus.
-- `cargo run -p roundtrip --release` — PASS.
+  **CI-enforced since issue #287** (`rust-native`, ~4 s warm).
+- `cargo run -p roundtrip --release` — PASS, and `-- --fixtures` (33
+  fixtures). **CI-enforced since issue #287** (`rust-native`, ~40 s warm +
+  <1 s); the step tees its output to `roundtrip-dump/*.log`, uploaded as the
+  `roundtrip-dump` artifact on failure (the harness has no separate
+  diff-file dump — its `FAIL:` line carries the inline diff).
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
 - `pnpm exec playwright test` (from `ts/`) — the full e2e suite in `ts/e2e/`
   (`workers: 1`, well under a minute locally) all green.
@@ -313,7 +325,8 @@ Engine backlog" references a real issue.
   checks. Both run inside `ci.yml`'s blocking `rust-native` job, alongside
   fmt/clippy/`cargo test --workspace` — not a separate silent lane.
 - CI (`ci.yml`), blocking: `rust-native` (fmt + clippy + `cargo test
-  --workspace` + the two fuzz-crate steps above), `wasm` (build + size
+  --workspace` + `--features fuzz-native` + shape-regression + roundtrip + the two fuzz-crate steps
+  above; 30 min cap), `wasm` (build + size
   budget + `wasm-pack test` + the `engine-wasm-pkg` artifact upload),
   `e2e` (this suite, issue #230). Non-blocking (`continue-on-error: true`):
   `qa-harness` runs `tools/visual-diff --tier A` (capped at 3 min) then

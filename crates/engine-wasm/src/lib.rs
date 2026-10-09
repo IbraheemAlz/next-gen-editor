@@ -25295,9 +25295,13 @@ mod tests {
     /// `apply` dispatcher, runs the real layout pipeline, and the
     /// invariant accessors read back sane values. This is a native
     /// smoke test for `fuzz/fuzz_targets/rpc_command.rs` /
-    /// `layout_paginate.rs`, exercised here where `cargo test --workspace`
-    /// already runs it — the fuzz crate itself is a *separate* cargo
-    /// workspace `cargo test` never touches (see `fuzz/Cargo.toml`).
+    /// `layout_paginate.rs`. NOTE (issue #321): `fuzz-native` is off by
+    /// default, so a plain `cargo test --workspace` compiles this test out
+    /// and collects ZERO of the feature-gated tests. They only run under
+    /// `cargo test -p engine-wasm --features fuzz-native` — a dedicated
+    /// step in `ci.yml`'s `rust-native` job and in the `ci-gate` skill.
+    /// (The fuzz crate itself is a *separate* cargo workspace — see
+    /// `fuzz/Cargo.toml` — that enables the same feature.)
     #[cfg(feature = "fuzz-native")]
     #[test]
     fn fuzz_native_surface_drives_engine_end_to_end() {
