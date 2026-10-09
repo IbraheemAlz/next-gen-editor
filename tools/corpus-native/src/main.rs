@@ -339,17 +339,35 @@ fn signal_name(sig: i32) -> &'static str {
 /// Recursively collect every `*.docx` path under `root`, sorted for
 /// deterministic run order (bisecting a regression across two runs relies
 /// on stable ordering).
+///
+/// Issue #421 — symlinks are followed (a corpus assembled from symlinks to
+/// `/data/corpus/files` subsets is the natural way to select a slice): the
+/// entry type comes from `fs::metadata` (which resolves the link), not
+/// `DirEntry::file_type` (which reports the link itself). A symlinked
+/// directory is descended too, guarded against loops by the set of
+/// canonical directories already walked (a link back up the tree, or two
+/// links to one directory, is walked once). A dangling link is skipped.
+/// Files keep the path they were reached through, so the JSONL label is the
+/// name in the corpus dir, not the link target.
 fn collect_docx_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    visited.insert(std::fs::canonicalize(root)?);
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue; // dangling symlink / vanished entry
+            };
+            if meta.is_dir() {
+                if let Ok(real) = std::fs::canonicalize(&path)
+                    && visited.insert(real)
+                {
+                    stack.push(path);
+                } // else: a directory already walked (symlink loop / alias)
+            } else if meta.is_file()
                 && path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -361,6 +379,62 @@ fn collect_docx_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #421 — a corpus dir made of symlinks (to files, to a
+    /// directory, a loop back up the tree, a dangling link) yields the
+    /// `.docx` files, each once per link, and terminates.
+    #[cfg(unix)]
+    #[test]
+    fn collect_docx_files_follows_symlinks_with_a_loop_guard() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "corpus-native-symlinks-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let sub = real.join("sub");
+        let corpus = base.join("corpus");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(real.join("a.docx"), b"a").unwrap();
+        std::fs::write(sub.join("b.DOCX"), b"b").unwrap();
+        std::fs::write(real.join("notes.txt"), b"x").unwrap();
+        // File symlinks, one with a non-docx target name but docx link name.
+        symlink(real.join("a.docx"), corpus.join("link-a.docx")).unwrap();
+        symlink(sub.join("b.DOCX"), corpus.join("link-b.docx")).unwrap();
+        // A link to a .txt named .docx still counts by the link's name.
+        symlink(real.join("notes.txt"), corpus.join("not-a-doc.txt")).unwrap();
+        // A directory symlink, and a loop back to the corpus root.
+        symlink(&sub, corpus.join("dirlink")).unwrap();
+        symlink(&corpus, sub.join("loop")).unwrap();
+        symlink(&corpus, corpus.join("self")).unwrap();
+        // Dangling.
+        symlink(base.join("missing.docx"), corpus.join("dangling.docx")).unwrap();
+
+        let found = collect_docx_files(&corpus).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&corpus)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["dirlink/b.DOCX", "link-a.docx", "link-b.docx"],
+            "found {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 fn main() -> ExitCode {
