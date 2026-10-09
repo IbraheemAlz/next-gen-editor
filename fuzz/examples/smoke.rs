@@ -3,7 +3,7 @@
 //! Nightly Rust is not installed in this environment and must not be
 //! installed (binding rule 1) — `cargo +nightly fuzz run` is the real
 //! libFuzzer flow, exercised only in CI (`.github/workflows/fuzz-nightly.yml`).
-//! This binary proves the five targets' generators + `run_*` bodies work
+//! This binary proves the six targets' generators + `run_*` bodies work
 //! *right now* on stable, in two passes per target:
 //!
 //! 1. **Corpus pass** — every file under `fuzz/corpus/<target>/` (binding
@@ -642,7 +642,7 @@ fn main() {
     if timeout_secs != 0 {
         println!("smoke: per-input timeout = {timeout_secs} s (SMOKE_TIMEOUT_SECS)");
     }
-    let targets: [(&str, &str, TargetFn); 5] = [
+    let targets: [(&str, &str, TargetFn); 6] = [
         ("docx_reader", "docx_reader", engine_fuzz::run_docx_reader),
         (
             "docx_roundtrip",
@@ -654,6 +654,11 @@ fn main() {
             "layout_paginate",
             "layout_paginate",
             engine_fuzz::run_layout_paginate,
+        ),
+        (
+            "snapshot_decode",
+            "snapshot_decode",
+            engine_fuzz::run_snapshot_decode,
         ),
         (
             "format_pdf_image_decode",

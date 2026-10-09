@@ -8,7 +8,7 @@
 # Run (nightly, see .github/workflows/fuzz-nightly.yml):
 #   cargo +nightly fuzz run <target> -- -max_total_time=1800
 #
-# Five structure-aware targets (`src/lib.rs` holds the generators + the
+# Six structure-aware targets (`src/lib.rs` holds the generators + the
 # `run_*` bodies each `fuzz_targets/*.rs` wraps in a `fuzz_target!`):
 #   - docx_reader:      schema-shaped WML in a minimal OPC package -> read_docx
 #   - docx_roundtrip:   read -> write -> read must be stable, never panic
@@ -17,6 +17,9 @@
 #   - layout_paginate:  random paragraph/table/section trees straight into
 #                       the paginator, with a page-count bound as the
 #                       termination watchdog
+#   - snapshot_decode (issue #341): engine::snapshot envelopes, valid and
+#                       structure-aware mutated, through Engine::restore /
+#                       Command::Recover; Ok or a typed error, never a panic
 #   - format_pdf_image_decode (issue #227): raw bytes -> format_pdf::
 #                       prepare_image for every enabled decoder (PNG/JPEG/
 #                       GIF/WebP/BMP/TIFF, sniffing decides); asserts the
@@ -90,6 +93,13 @@ bench = false
 [[bin]]
 name = "layout_paginate"
 path = "fuzz_targets/layout_paginate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
 test = false
 doc = false
 bench = false

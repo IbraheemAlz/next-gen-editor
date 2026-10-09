@@ -1,6 +1,7 @@
 name: fuzz-nightly
 
-# D5.5 scaled up (issue #90; the 5th target added by issue #227) — nightly
+# D5.5 scaled up (issue #90; the 5th target added by issue #227, the 6th —
+# `snapshot_decode` — by issue #341) — nightly
 # `cargo +nightly fuzz run` for each structure-aware target in `fuzz/`.
 # `ci.yml`'s `rust-native` job only compile-checks `fuzz/` on stable
 # (`cargo check --manifest-path fuzz/Cargo.toml`); running the targets for
@@ -75,6 +76,10 @@ jobs:
             corpus_dir: rpc_command
           - target: layout_paginate
             corpus_dir: layout_paginate
+          # Issue #341 — engine::snapshot envelopes through Engine::restore
+          # / Command::Recover.
+          - target: snapshot_decode
+            corpus_dir: snapshot_decode
           - target: format_pdf_image_decode
             corpus_dir: image_decode
     steps:

@@ -156,7 +156,7 @@ D5.10 are external/human sign-offs, not code.
   `crates/format-pdf/build.rs` synthesizes the sRGB ICC profile — no binary
   blob in the tree. `tools/pdf-validate` is the veraPDF harness.
 - **Fuzzing (D5.5, scaled up by issue #90).** `fuzz/` is a cargo-fuzz crate
-  in its **own workspace** with four structure-aware targets, all
+  in its **own workspace** with six structure-aware targets, all
   compile-checked on stable via `cargo check --manifest-path fuzz/Cargo.toml`
   (`cargo +nightly fuzz run` is the nightly flow, `.github/workflows/
   fuzz-nightly.yml`, ≥ 30 min/target with `-fork=4` so one already-known
@@ -174,13 +174,28 @@ D5.10 are external/human sign-offs, not code.
     needed: `Engine::new_headless` skips the `OffscreenCanvas` requirement,
     and `apply`'s auto-repaint still runs the full layout pipeline (only
     the final canvas blit is unreachable, and already skipped whenever no
-    canvas is registered).
+    canvas is registered). Issue #341: a command answered with
+    `Event::Error` must leave the document, selection, active story,
+    document name and undo depth unchanged
+    (`Engine::state_fingerprint_for_fuzzing`; the only exception is a
+    reply-stage error after a committed edit on a never-painted headless
+    engine, `is_post_commit_report_error`).
+  - `snapshot_decode` (issue #341) — `fuzz/src/snapshot_gen.rs` takes the
+    engine's own snapshot of a generated session, parses the MessagePack
+    into a tree and mutates it (hostile ints / floats, truncated or lying
+    containers, dangling stories, v1 / v2 / forged package keys, a wrong
+    magic / version byte), ≤ 4 MB; `Engine::restore` must answer `Ok` or a
+    typed error, then one `apply` round keeps
+    `Engine::check_invariants_for_fuzzing`, and `Command::Recover` must
+    answer `Recovered`. Seeds (`corpus/snapshot_decode/`, v1 FNV + v2
+    `sha256-` detached packages, hostile envelopes) come from
+    `examples/regen-seeds`.
   - `layout_paginate` (new) — `fuzz/src/layout_gen.rs` builds random
     paragraph/table/section trees straight into the paginator; a page-count
     bound stands in for a termination watchdog (`Engine::
     layout_page_count_for_fuzzing`).
   - `fuzz/examples/smoke.rs` is a stable-only driver (no nightly needed)
-    proving all four work: `systemd-run --user --scope -p MemoryMax=16G
+    proving all six work: `systemd-run --user --scope -p MemoryMax=16G
     --quiet -- cargo run --manifest-path fuzz/Cargo.toml --example smoke
     --release` — always under the cap (issue #422, see "Bash / agent
     ergonomics"); it prints `smoke: peak RSS …` (keep it < 4 GB) and
