@@ -188,6 +188,29 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   through `positioned_markers` with every other marker; anchors inside
   always-kept markup (a #244 content span, a #245 sdt end) count as
   already carried, so nothing is duplicated.
+- **Comments on replayed paragraphs (issue #282).** The plan covers clean
+  paragraphs too. A tree endpoint no verbatim byte carries (a comment
+  added to an untouched paragraph / cell, a reply) is SPLICED into the
+  source bytes: the paragraph is regenerated twice
+  (`comment_anchors::AnchorMode::Verbatim` = no anchor work, `Patch` =
+  plus the missing endpoints) and `schema::anchor_patch::transplant`
+  re-applies exactly what `Patch` inserted to the source, aligned over
+  XML tokens (a tag never matches part of another tag); the splice is
+  verified by re-reading it and falls back to the regenerated paragraph
+  (anchors never lost, only respelled). A clean table splices its
+  patched cell paragraphs into its own bytes (`patch_clean_table`).
+  `delete_comment` tombstones the thread (`DocumentTree::
+  deleted_comments`; new ids are minted above every tombstone) and the
+  writer strips exactly those ids from the whole written body
+  (`comment_anchors::strip_deleted` — replayed paragraphs, block-level
+  fragments, always-kept spans; an empty reference run goes whole), so a
+  dangling anchor the SOURCE had still round-trips. `comments.xml` is
+  patched in place (`parts::comments::patch_comments_xml`: new comments
+  appended with minted paraIds, tombstoned ones removed, their
+  `commentsExtended` / `commentsIds` / `commentsExtensible` rows too), and
+  synthesized for ANY comment on a package without one.
+  `tools/corpus-native` reports the `comment_check` (pure insertion /
+  re-read anchored / pure deletion).
 - `<w:hyperlink>` attributes ride the link itself (`Hyperlink::attrs`,
   issue #242) and re-emit in source order. The source `r:id` is kept only
   while the rels part still maps it to the link's target (*verified* —

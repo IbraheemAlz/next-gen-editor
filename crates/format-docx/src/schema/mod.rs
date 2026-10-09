@@ -5,6 +5,7 @@
 //! shared between every `parts::*` parser — writer-side serialization stays
 //! local to each part for now.
 
+pub mod anchor_patch;
 pub mod block_envelope;
 pub mod comment_anchors;
 pub mod ct_ppr;

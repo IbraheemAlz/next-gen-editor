@@ -29,6 +29,7 @@
 //!
 //! Exit 0 on PASS, non-zero on FAIL.
 
+mod comments;
 mod inline_spans;
 mod note_containers;
 mod revisions;
@@ -335,6 +336,7 @@ fn run_default() -> Result<()> {
     run_hyperlink_identity_roundtrip()?;
     run_comment_anchor_roundtrip()?;
     note_containers::run_note_containers_roundtrip()?;
+    comments::run_comment_patch_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
