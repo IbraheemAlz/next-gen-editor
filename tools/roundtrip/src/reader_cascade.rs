@@ -1,8 +1,9 @@
 //! Reader correctness on Word-shaped packages: issue #369 (the
 //! paragraph mark's `<w:pPr><w:rPr>` formats the mark only, never the
-//! paragraph's runs) and issue #394 (every WordprocessingML sibling part
+//! paragraph's runs), issue #394 (every WordprocessingML sibling part
 //! with a non-canonical namespace prefix is normalised before it is
-//! parsed).
+//! parsed) and issue #395 (paragraph borders defined on styles cascade
+//! per edge and resolve logical edges by the paragraph's direction).
 
 use super::{WORD_ROOT, assert_document_xml_well_formed, extract_doc_xml, read_docx, write_docx};
 use anyhow::{Context, Result, bail};
@@ -277,5 +278,112 @@ pub(crate) fn run_sibling_prefix_roundtrip() -> Result<()> {
     println!(
         "[roundtrip] step 48b OK — the normalised parts are regenerate-only and re-read silently; body edits stay pure insertions"
     );
+    Ok(())
+}
+
+/* ================================== style paragraph borders (#395) ==== */
+
+/// The painted edges of every paragraph (`T` / `L` / `B` / `R` + colour;
+/// `BorderStyle::None` strokes paint nothing).
+fn painted_borders(doc: &engine::DocumentTree) -> Vec<String> {
+    (0..doc.paragraph_count())
+        .map(|i| {
+            let Some(b) = doc.nth_paragraph(i).and_then(|p| p.props.borders.clone()) else {
+                return String::new();
+            };
+            [("T", b.top), ("L", b.left), ("B", b.bottom), ("R", b.right)]
+                .into_iter()
+                .filter_map(|(side, edge)| {
+                    let s = edge?;
+                    if s.style == engine::BorderStyle::None {
+                        return None;
+                    }
+                    let [r, g, bl, _] = s.color.unwrap_or([0, 0, 0, 255]);
+                    Some(format!("{side}:{r:02X}{g:02X}{bl:02X}"))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// What `styled_paragraph_borders_docx` paints, paragraph by paragraph.
+const STYLE_BORDERS: [&str; 7] = [
+    "B:4F81BD",
+    "T:FF0000 L:FF0000 B:FF0000",
+    "L:FF0000 B:FF0000",
+    "L:0000FF",
+    "R:0000FF",
+    "R:0000FF",
+    "L:0000FF",
+];
+
+/// Issue #395 — step 49 (`format_docx::test_fixtures::
+/// styled_paragraph_borders_docx`: the corpus' Word `Title` style, a
+/// `basedOn` box, a direct nil, logical start edges on LTR / RTL styles
+/// and paragraphs).
+///
+/// a. The style borders read per edge, by the paragraph's direction; a
+///    zero-edit save is byte-identical (`document.xml`, `styles.xml`).
+/// b. Typing into the Title is a pure insertion that re-reads the same
+///    borders.
+/// c. ModifyStyle regenerates `styles.xml` WITH the borders (they used
+///    to be lost — never read), which re-read into the same edges.
+pub(crate) fn run_style_borders_roundtrip() -> Result<()> {
+    let fixture = format_docx::test_fixtures::styled_paragraph_borders_docx();
+    let a = read_docx(&fixture).context("read style-borders fixture")?;
+    if painted_borders(&a.document) != STYLE_BORDERS {
+        bail!("style borders: {:?}", painted_borders(&a.document));
+    }
+    let zero = save_both(&a, &a.document)?;
+    if extract_doc_xml(&zero)? != extract_doc_xml(&fixture)? {
+        bail!("document.xml drifted on a zero-edit save");
+    }
+    let z = read_docx(&zero).context("re-read zero-edit save")?;
+    let src = read_docx(&fixture)?;
+    if super::entry_bytes(&z, "word/styles.xml") != super::entry_bytes(&src, "word/styles.xml") {
+        bail!("styles.xml drifted on a zero-edit save");
+    }
+    println!(
+        "[roundtrip] step 49a OK — style borders cascade per edge, by the paragraph's direction; zero-edit save byte-identical"
+    );
+
+    let typed = a.document.insert_text(at(0, 5), " page");
+    let bytes = save_both(&a, &typed)?;
+    let want =
+        String::from_utf8(extract_doc_xml(&fixture)?)?.replacen(">Title<", ">Title page<", 1);
+    if extract_doc_xml(&bytes)? != want.as_bytes() {
+        bail!("typing into the Title is not a pure insertion");
+    }
+    let b = read_docx(&bytes).context("re-read the typed Title")?;
+    if painted_borders(&b.document) != STYLE_BORDERS {
+        bail!("re-read borders: {:?}", painted_borders(&b.document));
+    }
+    println!("[roundtrip] step 49b OK — typing into a bordered Title is a pure insertion");
+
+    let modified = a.document.modify_style(
+        "Box",
+        Some(engine::ParaProperties {
+            keep_next: Some(true),
+            ..Default::default()
+        }),
+        None,
+        None,
+        None,
+    );
+    let bytes = save_both(&a, &modified)?;
+    let b = read_docx(&bytes).context("re-read the style edit")?;
+    let styles =
+        std::str::from_utf8(super::entry_bytes(&b, "word/styles.xml").context("styles.xml")?)?;
+    if !styles.contains("<w:pBdr>") || !styles.contains("<w:start ") {
+        bail!("the regenerated styles.xml lost the borders:\n{styles}");
+    }
+    if painted_borders(&b.document) != STYLE_BORDERS {
+        bail!(
+            "borders after ModifyStyle: {:?}",
+            painted_borders(&b.document)
+        );
+    }
+    println!("[roundtrip] step 49c OK — ModifyStyle writes the style borders back");
     Ok(())
 }

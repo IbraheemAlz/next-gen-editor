@@ -15,6 +15,7 @@ use crate::error::{DocxError, DocxWarning};
 use crate::parts::table::parse_table_bytes_with_events;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
+use crate::schema::ct_pbdr::{PbdrLogical, apply_pbdr_edge};
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
 use crate::schema::ct_rpr::{apply_rpr, attr_val, mark_rpr_style, rpr_child_is_modeled};
 use crate::schema::drawing::scan_drawing;
@@ -772,115 +773,6 @@ fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
     }
 }
 
-/// Audit gap A.M4 — parse one `<w:pBdr>` per-edge child into the
-/// matching `CellBorders` slot. Reuses the table-border parser via
-/// `parse_border_stroke` on `<w:top w:val w:sz w:color>`. Unknown
-/// edge names are silently ignored — defensive against future spec
-/// extensions.
-pub(crate) fn apply_pbdr_edge(
-    name: &[u8],
-    e: &quick_xml::events::BytesStart,
-    props: &mut engine::ParaProperties,
-) {
-    let stroke = parse_border_stroke(e);
-    if stroke.is_none() {
-        return;
-    }
-    let borders = props
-        .borders
-        .get_or_insert_with(engine::CellBorders::default);
-    match name {
-        b"w:top" => borders.top = stroke,
-        b"w:left" => borders.left = stroke,
-        b"w:bottom" => borders.bottom = stroke,
-        b"w:right" => borders.right = stroke,
-        b"w:between" => {
-            /* `<w:between>` is the "inside-horizontal" border between
-            consecutive same-pBdr paragraphs. The engine has no
-            multi-paragraph border collapse yet — store on `inside_h`
-            for round-trip; renderer ignores it. */
-            borders.inside_h = stroke;
-        }
-        _ => {}
-    }
-}
-
-/// Issue #352 — the logical `<w:start>` / `<w:end>` edges of a `<w:pBdr>`
-/// (ISO 29500; ECMA-376 2nd ed. and later accept them in Transitional
-/// too), collected during the parse and mapped to a physical side only
-/// once the paragraph's direction is final.
-#[derive(Default)]
-pub(crate) struct PbdrLogical {
-    start: Option<engine::BorderStroke>,
-    end: Option<engine::BorderStroke>,
-    /// The element was present (even with `w:val="none"`): the source
-    /// spelled that edge logically.
-    start_seen: bool,
-    end_seen: bool,
-}
-
-impl PbdrLogical {
-    /// Take `<w:start>` / `<w:end>`; `false` for every other edge name
-    /// (the caller then applies the physical-edge path).
-    pub(crate) fn accept(&mut self, name: &[u8], e: &quick_xml::events::BytesStart) -> bool {
-        match name {
-            b"w:start" => {
-                self.start = parse_border_stroke(e);
-                self.start_seen = true;
-                true
-            }
-            b"w:end" => {
-                self.end = parse_border_stroke(e);
-                self.end_seen = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Land the collected edges on `props` (the resolved paragraph
-    /// properties) and `overrides` (the direct pPr kept for a later
-    /// re-cascade): start = left in a left-to-right paragraph and right
-    /// in a right-to-left one, end the opposite. The spelling flags record
-    /// which edges the source wrote logically, for the writer.
-    pub(crate) fn fold_into(
-        self,
-        props: &mut engine::ParaProperties,
-        overrides: &mut engine::ParaProperties,
-    ) {
-        if !self.start_seen && !self.end_seen {
-            return;
-        }
-        let rtl = props.direction == Some(engine::TextDirection::Rtl);
-        for target in [props, overrides] {
-            if self.start.is_some() {
-                let borders = target
-                    .borders
-                    .get_or_insert_with(engine::CellBorders::default);
-                let slot = if rtl {
-                    &mut borders.right
-                } else {
-                    &mut borders.left
-                };
-                *slot = self.start.clone();
-            }
-            if self.end.is_some() {
-                let borders = target
-                    .borders
-                    .get_or_insert_with(engine::CellBorders::default);
-                let slot = if rtl {
-                    &mut borders.left
-                } else {
-                    &mut borders.right
-                };
-                *slot = self.end.clone();
-            }
-            target.border_spelling.start |= self.start_seen;
-            target.border_spelling.end |= self.end_seen;
-        }
-    }
-}
-
 /// Audit gap A.M3 — parse one `<w:tab w:val w:pos/>` child.
 /// `w:val` defaults to `left`; `w:pos` is twips (signed integer per
 /// spec). Returns `None` for malformed entries (missing pos) so they
@@ -902,40 +794,6 @@ pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine
         leader: attr_val(e, b"w:leader")
             .map(|v| engine::TabLeader::from_ooxml(&v))
             .unwrap_or_default(),
-    })
-}
-
-/// Audit gap A.M4 — parse `<w:top|left|bottom|right|between
-/// w:val w:sz w:color w:space/>` into a `BorderStroke`. Mirrors the
-/// table-cell border parser semantics; `w:val="none"` returns `None`
-/// so the edge stays absent in the engine model.
-fn parse_border_stroke(e: &quick_xml::events::BytesStart) -> Option<engine::BorderStroke> {
-    use crate::schema::ct_rpr::{attr_val, parse_hex_color};
-    let val = attr_val(e, b"w:val")?.trim().to_ascii_lowercase();
-    if val == "none" || val == "nil" {
-        return None;
-    }
-    let style = match val.as_str() {
-        "single" => engine::BorderStyle::Single,
-        "double" => engine::BorderStyle::Double,
-        "dotted" => engine::BorderStyle::Dotted,
-        "dashed" => engine::BorderStyle::Dashed,
-        other => engine::BorderStyle::Other(other.to_string()),
-    };
-    let size_eighth_pt: u16 = attr_val(e, b"w:sz")
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(4);
-    let color = attr_val(e, b"w:color").and_then(|v| {
-        if v.trim().eq_ignore_ascii_case("auto") {
-            None
-        } else {
-            parse_hex_color(&v)
-        }
-    });
-    Some(engine::BorderStroke {
-        style,
-        size_eighth_pt,
-        color,
     })
 }
 
@@ -3107,18 +2965,18 @@ pub(crate) fn parse_document_xml_with_events(
                         the originals to produce the up-front resolved
                         view; we clone before consumption. */
                         let style_id_for_paragraph = p_style_id.clone();
-                        let mut direct_overrides_for_paragraph = direct_ppr.clone();
+                        /* Issues #352 / #395 — logical `<w:start>` /
+                        `<w:end>` border edges join the direct pPr by its
+                        OWN direction; the cascade turns them to the side
+                        the RESOLVED direction names. */
+                        std::mem::take(&mut pbdr_logical).fold_into(&mut direct_ppr);
+                        let direct_overrides_for_paragraph = direct_ppr.clone();
                         /* Paragraph cascade: bake direct_ppr on top of doc
                         defaults + pStyle chain. */
-                        let (mut props, _) = resolver.resolve_paragraph(
+                        let (props, _) = resolver.resolve_paragraph(
                             p_style_id.take().as_deref(),
                             std::mem::take(&mut direct_ppr),
                         );
-                        /* Issue #352 — logical `<w:start>` / `<w:end>`
-                        border edges land on the physical side the
-                        RESOLVED direction names. */
-                        std::mem::take(&mut pbdr_logical)
-                            .fold_into(&mut props, &mut direct_overrides_for_paragraph);
                         /* Compose `ListItem` from the per-paragraph numPr
                         accumulators; partial refs (numId without ilvl, or
                         vice versa) default the missing field to 0 — Word

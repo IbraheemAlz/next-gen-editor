@@ -64,6 +64,8 @@ pub mod fields;
 mod revision_refs;
 pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};
 #[cfg(test)]
+mod para_border_cascade_tests;
+#[cfg(test)]
 mod paragraph_mark_tests;
 #[cfg(test)]
 mod paragraph_merge_tests;
@@ -3592,6 +3594,14 @@ impl ParaProperties {
     /// stylesheets virtually never set 0 explicitly, so the trade-off is
     /// acceptable for Phase 3; Phase 4+ may widen to `Option`.
     pub fn merged_with(self, patch: ParaProperties) -> ParaProperties {
+        /* Issue #395 — borders cascade PER EDGE (evaluated first: the
+        struct literal below moves both sides' borders). */
+        let rtl = patch.direction.or(self.direction) == Some(TextDirection::Rtl);
+        let border_spelling = merged_border_spelling(
+            (&self.borders, self.border_spelling),
+            (&patch.borders, patch.border_spelling),
+            rtl,
+        );
         ParaProperties {
             shading: patch.shading.or(self.shading),
             alignment: patch.alignment.or(self.alignment),
@@ -3613,16 +3623,13 @@ impl ParaProperties {
             keep_next: patch.keep_next.or(self.keep_next),
             keep_lines: patch.keep_lines.or(self.keep_lines),
             page_break_before: patch.page_break_before || self.page_break_before,
-            /* Audit gap A.M4 — `<w:pBdr>` overlay: patch's borders win
-            when set; otherwise inherit. */
-            /* Issue #352 — the spelling travels with the borders it
-            describes (evaluated first: `or` below moves `patch.borders`). */
-            border_spelling: if patch.borders.is_some() {
-                patch.border_spelling
-            } else {
-                self.border_spelling
-            },
-            borders: patch.borders.or(self.borders),
+            /* Audit gap A.M4 / issue #395 — `<w:pBdr>` overlay, per edge:
+            each edge the patch sets wins (an explicit `w:val="nil"` /
+            `"none"` is a set edge — a `BorderStyle::None` stroke — so it
+            REMOVES the inherited one); the others inherit. Issue #352 —
+            the logical spelling travels with the edge it describes. */
+            border_spelling,
+            borders: merged_borders(self.borders, patch.borders),
             /* Audit gap A.M3 — `<w:tabs>` overlay: patch's stops
             REPLACE the parent's (Word's documented behaviour — child
             `<w:tabs>` is not additive, it shadows the cascade).
@@ -3641,6 +3648,138 @@ impl ParaProperties {
             grab_bag: patch.grab_bag.or(self.grab_bag),
             outline_level: patch.outline_level.or(self.outline_level),
             widow_control: patch.widow_control.or(self.widow_control),
+        }
+    }
+
+    /// Issue #395 — `self` with its logically spelled border edges
+    /// (`border_spelling`, issue #352) re-oriented from its OWN direction
+    /// to a paragraph whose resolved direction is `rtl`.
+    ///
+    /// Convention: a `ParaProperties` stores a `<w:start>` / `<w:end>`
+    /// edge in the physical slot its own `direction` names (start = left
+    /// unless it is right-to-left). That holds for a paragraph's resolved
+    /// `props` (own = resolved direction), its `direct_overrides` (own =
+    /// the direct `<w:bidi>`, if any), a style definition and the
+    /// docDefaults (own = their `<w:bidi>`). A cascade re-orients every
+    /// level to the paragraph's final direction before folding it
+    /// ([`Self::cascade`]): a style's `<w:start>` is the start of the
+    /// paragraph it formats, not of the style. Physical edges never move;
+    /// on a collision (`<w:start>` and `<w:right>` naming one side) the
+    /// logical edge wins, as in the reader.
+    pub fn oriented_borders(mut self, rtl: bool) -> ParaProperties {
+        let own_rtl = self.direction == Some(TextDirection::Rtl);
+        let sp = self.border_spelling;
+        if own_rtl == rtl || !(sp.start || sp.end) {
+            return self;
+        }
+        let Some(b) = self.borders.as_mut() else {
+            return self;
+        };
+        /* Under the own orientation the start edge sits in `lead`, the
+        end edge in `trail`; the target orientation mirrors both sides.
+        A logical edge follows its name to the mirrored slot. A physical
+        edge stays on its side — which is the slot the OTHER logical edge
+        moves into, so it yields to it; the side the logical edge left
+        held nothing else. */
+        let (lead, trail) = if own_rtl {
+            (b.right.take(), b.left.take())
+        } else {
+            (b.left.take(), b.right.take())
+        };
+        let (to_lead, to_trail) = match (sp.start, sp.end) {
+            (true, true) => (lead, trail),
+            (true, false) => (lead, None),
+            _ => (None, trail),
+        };
+        if rtl {
+            (b.right, b.left) = (to_lead, to_trail);
+        } else {
+            (b.left, b.right) = (to_lead, to_trail);
+        }
+        self
+    }
+
+    /// Issue #395 — fold a paragraph's property cascade, `levels` root
+    /// first (docDefaults, the `<w:basedOn>` chain root → leaf, then the
+    /// direct `<w:pPr>`): [`Self::merged_with`] level by level, except
+    /// that the borders are folded per edge AFTER every level's logical
+    /// edges were re-oriented to the FINAL direction
+    /// ([`Self::oriented_borders`]), which is only known once every level
+    /// has been seen (a direct `<w:bidi>` turns a style's `<w:start>`
+    /// edge around).
+    pub fn cascade<'a>(levels: impl IntoIterator<Item = &'a ParaProperties>) -> ParaProperties {
+        let levels: Vec<&ParaProperties> = levels.into_iter().collect();
+        let mut out = ParaProperties::default();
+        for level in &levels {
+            out = out.merged_with((*level).clone());
+        }
+        let rtl = out.direction == Some(TextDirection::Rtl);
+        let mut borders: Option<CellBorders> = None;
+        let mut spelling = BorderSpelling::default();
+        for level in &levels {
+            if level.borders.is_none() {
+                continue;
+            }
+            let oriented = (*level).clone().oriented_borders(rtl);
+            spelling = merged_border_spelling(
+                (&borders, spelling),
+                (&oriented.borders, oriented.border_spelling),
+                rtl,
+            );
+            borders = merged_borders(borders, oriented.borders);
+        }
+        out.borders = borders;
+        out.border_spelling = spelling;
+        out
+    }
+}
+
+/// Issue #395 — per-edge overlay of `patch` onto `base` (see
+/// [`ParaProperties::merged_with`]).
+fn merged_borders(base: Option<CellBorders>, patch: Option<CellBorders>) -> Option<CellBorders> {
+    match (base, patch) {
+        (Some(b), Some(p)) => Some(CellBorders {
+            top: p.top.or(b.top),
+            left: p.left.or(b.left),
+            bottom: p.bottom.or(b.bottom),
+            right: p.right.or(b.right),
+            inside_h: p.inside_h.or(b.inside_h),
+            inside_v: p.inside_v.or(b.inside_v),
+        }),
+        (b, None) => b,
+        (None, p) => p,
+    }
+}
+
+/// Issues #352 / #395 — the logical spelling of [`merged_borders`]: each
+/// flag comes from whichever side supplied the edge it describes (start =
+/// the leading slot: left, or right when `rtl`).
+fn merged_border_spelling(
+    base: (&Option<CellBorders>, BorderSpelling),
+    patch: (&Option<CellBorders>, BorderSpelling),
+    rtl: bool,
+) -> BorderSpelling {
+    match (base.0, patch.0) {
+        (_, None) => base.1,
+        (None, Some(_)) => patch.1,
+        (Some(_), Some(p)) => {
+            let (lead, trail) = if rtl {
+                (&p.right, &p.left)
+            } else {
+                (&p.left, &p.right)
+            };
+            BorderSpelling {
+                start: if lead.is_some() {
+                    patch.1.start
+                } else {
+                    base.1.start
+                },
+                end: if trail.is_some() {
+                    patch.1.end
+                } else {
+                    base.1.end
+                },
+            }
         }
     }
 }
@@ -8064,9 +8203,8 @@ impl DocumentTree {
     /// [`Self::recompute_paragraph_props`] (on every style mutation)
     /// and by the reader's first-pass cascade.
     pub fn resolve_style_cascade(&self, style_id: Option<&str>) -> ParaProperties {
-        let mut out = self.style_defaults.clone();
         let Some(leaf) = style_id else {
-            return out;
+            return ParaProperties::cascade([&self.style_defaults]);
         };
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut chain: Vec<&ParagraphStyle> = Vec::new();
@@ -8081,10 +8219,11 @@ impl DocumentTree {
             chain.push(def);
             current = def.based_on.as_deref();
         }
-        for def in chain.iter().rev() {
-            out = out.clone().merged_with(def.para.clone());
-        }
-        out
+        /* Issue #395 — through the direction-aware cascade, so a
+        style's logical border edges land by the chain's direction. */
+        ParaProperties::cascade(
+            std::iter::once(&self.style_defaults).chain(chain.iter().rev().map(|d| &d.para)),
+        )
     }
 
     /// Issue #29 — the RUN half of the cascade: fold
@@ -11041,7 +11180,6 @@ pub fn recompute_paragraph_props(
     styles: &std::collections::HashMap<String, ParagraphStyle>,
     style_defaults: &ParaProperties,
 ) {
-    let mut resolved = style_defaults.clone();
     /* Walk the style chain leaf → root with the same cycle / depth
     guard as `DocumentTree::resolve_style_cascade` (kept here as a
     free fn so callers without a borrowed `DocumentTree` can still
@@ -11060,11 +11198,17 @@ pub fn recompute_paragraph_props(
             chain.push(def);
             current = def.based_on.as_deref();
         }
-        for def in chain.iter().rev() {
-            resolved = resolved.merged_with(def.para.clone());
-        }
+        /* Issue #395 — defaults → chain → direct in ONE direction-
+        aware cascade: the logical border edges of every level land on
+        the side the paragraph's final direction names. */
+        para.props = ParaProperties::cascade(
+            std::iter::once(style_defaults)
+                .chain(chain.iter().rev().map(|d| &d.para))
+                .chain(std::iter::once(&para.direct_overrides)),
+        );
+        return;
     }
-    para.props = resolved.merged_with(para.direct_overrides.clone());
+    para.props = ParaProperties::cascade([style_defaults, &para.direct_overrides]);
 }
 
 /// Sprint 11 — UAX-#29 word count for one paragraph's text. Shares

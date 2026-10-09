@@ -75,6 +75,19 @@ paths:
   regenerate-only (its zero-edit save is not byte-identical to the
   source — `tools/corpus-native`'s `normalized_parts`); canonical parts
   and parts the reader never walks stay verbatim.
+- **Paragraph borders (issues #352 / #395).** `<w:pBdr>` is read by
+  `schema::ct_pbdr` for paragraphs AND styles / docDefaults
+  (`parts::styles`). Borders cascade PER EDGE (`ParaProperties::
+  merged_with`); an explicit `w:val="nil"` / `"none"` is a set
+  `BorderStyle::None` edge (painted by nothing) so it removes an
+  inherited one. A logical `<w:start>` / `<w:end>` edge is stored in the
+  slot its OWN properties' `direction` names (+ `border_spelling`), and
+  every cascade — the reader's `StyleResolver::resolve_paragraph`, the
+  engine's `recompute_paragraph_props` / `resolve_style_cascade` — goes
+  through `ParaProperties::cascade`, which re-orients each level to the
+  paragraph's FINAL direction (`oriented_borders`) before folding, so a
+  style's `<w:start>` lands where the paragraph's (cascaded) `<w:bidi>`
+  says. Never fold paragraph properties with a bare `merged_with` loop.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:

@@ -58,20 +58,25 @@ impl<'a> StyleResolver<'a> {
         p_style: Option<&str>,
         direct_ppr: ParaProperties,
     ) -> (ParaProperties, SpanStyle) {
-        let mut para = self.table.defaults.para.clone();
         let mut run = self.table.defaults.run.clone();
-        if let Some(id) = p_style {
-            let chain = self.collect_chain(id, StyleKind::Paragraph);
-            /* Chain is leaf-first; reverse so the most distant ancestor
-            applies first and the leaf overrides last. */
-            for s in chain.iter().rev() {
-                para = para.merged_with(s.para.clone());
-                run = run.merged_with(s.run.clone());
-            }
+        let chain = p_style
+            .map(|id| self.collect_chain(id, StyleKind::Paragraph))
+            .unwrap_or_default();
+        /* Chain is leaf-first; reverse so the most distant ancestor
+        applies first and the leaf overrides last. */
+        for s in chain.iter().rev() {
+            run = run.merged_with(s.run.clone());
         }
         /* Direct `<w:pPr>` is the highest specificity for paragraph
-        properties. */
-        para = para.merged_with(direct_ppr);
+        properties. Issue #395 — one direction-aware cascade: borders
+        fold per edge, and every level's logical `<w:start>` / `<w:end>`
+        edge lands on the side the paragraph's FINAL direction (the
+        cascaded `<w:bidi>`) names. */
+        let para = ParaProperties::cascade(
+            std::iter::once(&self.table.defaults.para)
+                .chain(chain.iter().rev().map(|s| &s.para))
+                .chain(std::iter::once(&direct_ppr)),
+        );
         (para, run)
     }
 
