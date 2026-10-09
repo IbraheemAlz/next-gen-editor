@@ -15,7 +15,13 @@ import {
     Show,
     type Component,
 } from 'solid-js';
-import { createEditorCommands, createEditorState, type RecoveryReport } from '@nge/core';
+import {
+    createEditorCommands,
+    createEditorState,
+    openWarningCount,
+    type ReadWarning,
+    type RecoveryReport,
+} from '@nge/core';
 import './DevHud.css';
 
 export interface DevHudProps {
@@ -43,6 +49,13 @@ function recoveryBase(r: RecoveryReport): string {
             ? ` @ ${new Date(r.baseSnapshotAt).toLocaleTimeString()}`
             : '';
     return `${cause}${base}${at} +${r.appliedCommands} cmds`;
+}
+
+/** Issue #406 — the open document's reader warnings, per kind. */
+function openWarningKinds(ws: readonly ReadWarning[]): string {
+    const byKind = new Map<string, number>();
+    for (const w of ws) byKind.set(w.kind, (byKind.get(w.kind) ?? 0) + Math.max(1, w.count ?? 1));
+    return [...byKind].map(([k, n]) => `${k} ×${n}`).join(', ');
 }
 
 /** Issue #315 — every way the last recovery degraded (`[]` = none). */
@@ -200,6 +213,20 @@ export const DevHud: Component<DevHudProps> = (props) => {
                             : state.checkpointState().journalFailing
                               ? 'journal failing'
                               : 'checkpoints failing'}
+                    </dd>
+
+                    {/* Issue #406 - the reader's warning report for the open
+                        document (the same report the open-issues banner
+                        and the telemetry DOC_OPEN sample carry). */}
+                    <dt>Open issues</dt>
+                    <dd
+                        class="nge-hud__open-warnings"
+                        classList={{ 'nge-hud__warn': state.openWarnings().length > 0 }}
+                        title={openWarningKinds(state.openWarnings())}
+                    >
+                        {state.openWarnings().length > 0
+                            ? `${openWarningCount(state.openWarnings())} (${openWarningKinds(state.openWarnings())})`
+                            : 'none'}
                     </dd>
 
                     {/* Issue #364 - the last engine error any command

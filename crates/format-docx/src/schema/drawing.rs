@@ -31,6 +31,7 @@ use quick_xml::reader::Reader;
 
 use super::ct_rpr::attr_val;
 use super::grab_bag::slice_fragment;
+use super::measure::{EMU_COORD, EMU_EXTENT, attr_emu, css_length_emu};
 use super::wp_anchor::{
     AnchorAxis, AnchorOffsetKind, anchor_from_start_tag, apply_wrap_fragment, h_relative_from,
     is_wrap_element, parse_offset, v_relative_from, wrap_kind_of,
@@ -210,11 +211,11 @@ fn scan_element(fragment: &[u8]) -> DrawingScan {
                         out.rel_id = attr_val(&e, b"r:embed");
                     }
                     b"wp:simplePos" if in_anchor => {
+                        /* Issue #407 — `ST_Coordinate` through the EMU
+                        reader (unusable → 0, reported; clamped ±22 in). */
                         if let Some(a) = out.anchor.as_mut() {
-                            a.simple_pos_x_emu =
-                                attr_val(&e, b"x").and_then(|v| v.parse().ok()).unwrap_or(0);
-                            a.simple_pos_y_emu =
-                                attr_val(&e, b"y").and_then(|v| v.parse().ok()).unwrap_or(0);
+                            a.simple_pos_x_emu = attr_emu(&e, b"x", EMU_COORD).unwrap_or(0);
+                            a.simple_pos_y_emu = attr_emu(&e, b"y", EMU_COORD).unwrap_or(0);
                         }
                     }
                     n if in_anchor && is_wrap_element(n) => {
@@ -290,21 +291,15 @@ fn scan_element(fragment: &[u8]) -> DrawingScan {
     out
 }
 
-/// The largest `ST_PositiveCoordinate` (ECMA-376 §20.1.10.42), in EMU.
-const MAX_POSITIVE_COORDINATE: i64 = 27_273_042_316_900;
-
 fn apply_extent(e: &BytesStart, out: &mut DrawingScan) {
     if out.cx.is_none() && out.cy.is_none() {
-        /* Issue #358 — `cx` / `cy` are `ST_PositiveCoordinate`: a negative
-        (or out-of-range) extent from a hostile package is clamped into the
-        schema range instead of reaching layout as a negative size. */
-        let coord = |name: &[u8]| {
-            attr_val(e, name)
-                .and_then(|v| v.trim().parse::<i64>().ok())
-                .map(|v| v.clamp(0, MAX_POSITIVE_COORDINATE))
-        };
-        out.cx = coord(b"cx");
-        out.cy = coord(b"cy");
+        /* Issue #358 — `cx` / `cy` are `ST_PositiveCoordinate`: a hostile
+        extent never reaches layout as a negative or absurd size. Issue
+        #407 — through the EMU reader: a negative / NaN / garbage extent is
+        unusable (the object declares no size, reserving nothing) and an
+        extent past Word's 22 in shape limit is clamped, both reported. */
+        out.cx = attr_emu(e, b"cx", EMU_EXTENT);
+        out.cy = attr_emu(e, b"cy", EMU_EXTENT);
     }
 }
 
@@ -318,7 +313,9 @@ fn is_vml_shape(qname: &[u8]) -> bool {
 
 /// Lift `width:` / `height:` (and `position:absolute`) out of a VML
 /// `style` attribute (`"width:468pt;height:1.5pt"`). Units: pt, in, cm,
-/// mm, px, emu; a bare number is points.
+/// mm, px, emu; a bare number is points. Issue #407 — a non-finite or
+/// negative size is unusable and an out-of-range one clamped, both
+/// reported (`v:shape/@style width`).
 fn apply_vml_style(e: &BytesStart, out: &mut DrawingScan, absolute: &mut bool) {
     let Some(style) = attr_val(e, b"style") else {
         return;
@@ -330,32 +327,30 @@ fn apply_vml_style(e: &BytesStart, out: &mut DrawingScan, absolute: &mut bool) {
         let key = key.trim().to_ascii_lowercase();
         let value = value.trim();
         match key.as_str() {
-            "width" => out.cx = vml_length_emu(value),
-            "height" => out.cy = vml_length_emu(value),
+            "width" | "height" => {
+                let len = vml_length_emu(value, || {
+                    format!(
+                        "{}/@style {key}",
+                        String::from_utf8_lossy(e.name().as_ref())
+                    )
+                });
+                if key == "width" {
+                    out.cx = len;
+                } else {
+                    out.cy = len;
+                }
+            }
             "position" if value.eq_ignore_ascii_case("absolute") => *absolute = true,
             _ => {}
         }
     }
 }
 
-/// A CSS-style VML length to EMU.
-pub fn vml_length_emu(value: &str) -> Option<i64> {
-    let value = value.trim();
-    let split = value
-        .find(|c: char| c.is_ascii_alphabetic() || c == '%')
-        .unwrap_or(value.len());
-    let (num, unit) = value.split_at(split);
-    let num: f64 = num.trim().parse().ok()?;
-    let per_unit = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "pt" => EMU_PER_PT,
-        "in" => 914_400.0,
-        "cm" => 360_000.0,
-        "mm" => 36_000.0,
-        "px" => 9_525.0,
-        "emu" => 1.0,
-        _ => return None,
-    };
-    Some((num * per_unit).round() as i64)
+/// A CSS-style VML size to EMU (a bare number is points), reported to
+/// the reader as `attr` when unusable or clamped — issue #407: the old
+/// `as i64` cast turned `NaN` into 0 and `inf` into `i64::MAX`.
+fn vml_length_emu(value: &str, attr: impl FnOnce() -> String) -> Option<i64> {
+    css_length_emu(value, EMU_PER_PT, EMU_EXTENT, attr)
 }
 
 #[cfg(test)]
@@ -473,15 +468,93 @@ mod tests {
 
     #[test]
     fn vml_lengths_convert_to_emu() {
-        assert_eq!(vml_length_emu("72pt"), Some(914_400));
-        assert_eq!(vml_length_emu("1in"), Some(914_400));
-        assert_eq!(vml_length_emu("2.54cm"), Some(914_400));
-        assert_eq!(vml_length_emu("25.4mm"), Some(914_400));
-        assert_eq!(vml_length_emu("96px"), Some(914_400));
-        assert_eq!(vml_length_emu("914400emu"), Some(914_400));
-        assert_eq!(vml_length_emu("0"), Some(0));
-        assert_eq!(vml_length_emu("50%"), None);
-        assert_eq!(vml_length_emu("x"), None);
+        let len = |v: &str| vml_length_emu(v, String::new);
+        assert_eq!(len("72pt"), Some(914_400));
+        assert_eq!(len("1in"), Some(914_400));
+        assert_eq!(len("2.54cm"), Some(914_400));
+        assert_eq!(len("25.4mm"), Some(914_400));
+        assert_eq!(len("96px"), Some(914_400));
+        assert_eq!(len("914400emu"), Some(914_400));
+        assert_eq!(len("72"), Some(914_400), "a bare number is points");
+        assert_eq!(len("0"), Some(0));
+        assert_eq!(len("50%"), None);
+        assert_eq!(len("x"), None);
+        /* Issue #407 — NaN no longer becomes 0, inf no longer i64::MAX. */
+        assert_eq!(len("NaN"), None);
+        assert_eq!(len("infpt"), None);
+        assert_eq!(len("-5pt"), None, "a size is never negative");
+        assert_eq!(len("1e30pt"), Some(20_116_800), "clamped to 22 in");
+    }
+
+    /// Issue #407 — hostile DrawingML / VML numbers are validated, clamped
+    /// and reported, never cast: a NaN extent declares no size, a huge one
+    /// is clamped to 22 in, a NaN `simplePos` / `posOffset` / wrap
+    /// distance falls back to 0, a VML `NaN` width is dropped.
+    #[test]
+    fn hostile_drawing_numbers_are_validated_and_reported() {
+        let xml = format!(
+            concat!(
+                r#"<w:drawing><wp:anchor distT="NaN" distB="1e30" distL="-5" distR="40" simplePos="0" relativeHeight="3" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">"#,
+                r#"<wp:simplePos x="inf" y="200"/>"#,
+                r#"<wp:positionH relativeFrom="column"><wp:posOffset>NaN</wp:posOffset></wp:positionH>"#,
+                r#"<wp:positionV relativeFrom="page"><wp:posOffset>99999999999</wp:posOffset></wp:positionV>"#,
+                r#"<wp:extent cx="NaN" cy="99999999999"/><wp:docPr id="1" name="P"/>"#,
+                "{pic}</wp:anchor></w:drawing>"
+            ),
+            pic = PIC
+        );
+        let mut warnings = Vec::new();
+        let s =
+            crate::error::collect_read_warnings(&mut warnings, |_| scan_drawing(xml.as_bytes()));
+        assert_eq!((s.cx, s.cy), (None, Some(20_116_800)));
+        let a = s.anchor.as_deref().expect("anchor");
+        assert_eq!(
+            (
+                a.dist_top_emu,
+                a.dist_bottom_emu,
+                a.dist_left_emu,
+                a.dist_right_emu
+            ),
+            (0, 20_116_800, 0, 40)
+        );
+        assert_eq!((a.simple_pos_x_emu, a.simple_pos_y_emu), (0, 200));
+        assert_eq!(
+            a.position_h.offset,
+            FloatOffset::Emu(0),
+            "NaN keeps the stock offset"
+        );
+        assert_eq!(a.position_v.offset, FloatOffset::Emu(20_116_800));
+        let details: Vec<String> = warnings.iter().map(|w| w.detail()).collect();
+        for want in [
+            "wp:anchor/@distT = \"NaN\"",
+            "wp:anchor/@distB = \"1e30\" → 20116800 EMU",
+            "wp:anchor/@distL = \"-5\"",
+            "wp:simplePos/@x = \"inf\"",
+            "wp:posOffset = \"NaN\"",
+            "wp:posOffset = \"99999999999\" → 20116800 EMU",
+            "wp:extent/@cx = \"NaN\"",
+            "wp:extent/@cy = \"99999999999\" → 20116800 EMU",
+        ] {
+            assert!(
+                details.iter().any(|d| d == want),
+                "missing {want:?} in {details:#?}"
+            );
+        }
+        assert_eq!(warnings.len(), 8, "{details:#?}");
+
+        let pict = r#"<w:pict><v:shape style="width:NaN;height:1e30pt"><v:imagedata r:id="rId8"/></v:shape></w:pict>"#;
+        let mut warnings = Vec::new();
+        let s =
+            crate::error::collect_read_warnings(&mut warnings, |_| scan_drawing(pict.as_bytes()));
+        assert_eq!((s.cx, s.cy), (None, Some(20_116_800)));
+        let details: Vec<String> = warnings.iter().map(|w| w.detail()).collect();
+        assert_eq!(
+            details,
+            [
+                "v:shape/@style width = \"NaN\"",
+                "v:shape/@style height = \"1e30pt\" → 20116800 EMU"
+            ]
+        );
     }
 
     #[test]

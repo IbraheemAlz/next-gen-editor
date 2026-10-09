@@ -201,6 +201,9 @@ pub fn run_rpc_command(data: &[u8]) {
         dedup) tells triage WHICH command broke an invariant. Formatted
         lazily — `assert!`'s message arguments run only on failure. */
         let keep = cmd.clone();
+        /* Issue #407 — a command carrying a NaN / ±inf number anywhere
+        must be refused by the dispatcher's finite() guard. */
+        let non_finite = cmd.first_non_finite();
         /* Issue #341 — "error => no mutation": the document, selection,
         active story and undo depth before the command. */
         let before = engine.state_fingerprint_for_fuzzing();
@@ -211,6 +214,21 @@ pub fn run_rpc_command(data: &[u8]) {
                 "[rpc_command]   -> {} in {} ms",
                 format!("{evt:?}").chars().take(80).collect::<String>(),
                 t.elapsed().as_millis()
+            );
+        }
+        if let Some(bad) = &non_finite {
+            assert!(
+                matches!(
+                    &evt,
+                    bridge::Event::Error {
+                        kind: Some(bridge::ErrorKind::InvalidArgument),
+                        ..
+                    }
+                ),
+                "{} carried a non-finite {} but was not refused: {}",
+                variant_name(&keep),
+                bad.field,
+                format!("{evt:?}").chars().take(160).collect::<String>()
             );
         }
         if let bridge::Event::Error { message, .. } = &evt

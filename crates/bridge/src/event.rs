@@ -84,6 +84,20 @@ pub enum Event {
     },
     DocumentLoaded {
         paragraph_count: u32,
+        /// Issue #406 — the reader's non-fatal diagnostics for the package
+        /// just opened (`format_docx::DocxWarning`, coalesced: identical
+        /// warnings ride one entry with a `count`). Non-empty means the
+        /// file opened DEGRADED — a clamped page margin, a measure that
+        /// was ignored, a part read through namespace normalisation (which
+        /// costs that part's byte preservation), a field closed early, … —
+        /// and the shell must say so (`@nge/core` `openWarnings()`).
+        /// Additive: skipped on the wire when empty (every clean open, the
+        /// `.txt` / `.html` opens and the Phase-1 `LoadDocx` harness keep
+        /// the pre-#406 `{ type, paragraph_count }` shape), and a pre-#406
+        /// payload decodes with no warnings.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[tsify(optional)]
+        warnings: Vec<ReadWarning>,
     },
     DocumentSaved {
         #[serde(with = "serde_bytes")]
@@ -635,7 +649,8 @@ pub enum ErrorKind {
     /// for this input (PDF as an open format, a TOC outside the body, ...).
     UnsupportedHere,
     /// A numeric argument is outside its allowed range (table dimensions,
-    /// text-box extent, zoom, device scale, render date).
+    /// text-box extent, render date). A `NaN` / infinite one is
+    /// [`ErrorKind::InvalidArgument`] (issue #407).
     OutOfRange,
     /// A required text argument is empty (a field code, a glyph string).
     EmptyInput,
@@ -652,6 +667,12 @@ pub enum ErrorKind {
     /// The file is not a readable document (a corrupt package that is not
     /// one of the typed open refusals above).
     InvalidDocument,
+    /// Issue #407 — a numeric argument of the command was `NaN` or
+    /// infinite (`Command::first_non_finite`; the message names the
+    /// field). Nothing was applied. A host / shell bug rather than a user
+    /// mistake, but like every #427 refusal it is shown (toast copy), never
+    /// silent.
+    InvalidArgument,
 }
 
 /// Issue #345 — an enforced editing restriction (`w:documentProtection`
@@ -715,6 +736,7 @@ impl ErrorKind {
         ErrorKind::Unimplemented,
         ErrorKind::Internal,
         ErrorKind::InvalidDocument,
+        ErrorKind::InvalidArgument,
     ];
 
     /// The wire name (the variant name, as `Event::Error.kind` carries it).
@@ -740,8 +762,90 @@ impl ErrorKind {
             ErrorKind::Unimplemented => "Unimplemented",
             ErrorKind::Internal => "Internal",
             ErrorKind::InvalidDocument => "InvalidDocument",
+            ErrorKind::InvalidArgument => "InvalidArgument",
         }
     }
+}
+
+/// Issue #406 — one coalesced reader diagnostic on
+/// [`Event::DocumentLoaded::warnings`].
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct ReadWarning {
+    /// The stable class (also the telemetry code, see
+    /// [`crate::ReadWarningCount`]).
+    pub kind: ReadWarningKind,
+    /// The archive entry the warning concerns (`word/styles.xml`,
+    /// `_rels/.rels`), when the reader knows it; `None` for diagnostics
+    /// raised deep inside a part walk (measures, fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub part: Option<String>,
+    /// The specifics, for the details list and the Dev HUD: the attribute
+    /// and its raw value (`w:pgMar/@w:top = "99999" → 31680 twips`), the
+    /// limit that was hit, the relationship target. Never document text;
+    /// never sent to telemetry (which carries `kind` counts only).
+    pub detail: String,
+    /// How many identical warnings (same kind, part and detail) this entry
+    /// stands for; at least 1.
+    #[serde(default = "one_warning")]
+    pub count: u32,
+}
+
+/// `serde(default)` for [`ReadWarning::count`].
+fn one_warning() -> u32 {
+    1
+}
+
+/// Issue #406 — the class of a [`ReadWarning`]: one variant per
+/// `format_docx::DocxWarning` class, PascalCase on the wire like
+/// [`ErrorKind`]. The spelling is a stable telemetry code — never rename a
+/// variant, only add.
+#[derive(
+    Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+pub enum ReadWarningKind {
+    /// Issue #111 — a table nested past the reader's depth cap was kept as
+    /// an opaque block (its bytes survive a save; its inner structure is
+    /// not editable).
+    TableNestingTooDeep,
+    /// Issue #349 / #407 — a measure attribute held an unusable value (not
+    /// a number, `NaN`, infinite, a unit its type does not allow, negative
+    /// where only non-negative values are legal); the default applies.
+    InvalidMeasure,
+    /// Issue #349 / #407 — a measure attribute (twips, or a DrawingML /
+    /// VML EMU coordinate) held a finite value outside its range; it is
+    /// used clamped.
+    MeasureClamped,
+    /// Issue #350 — complex fields still open in their instruction part
+    /// when their paragraph ended were closed there.
+    UnclosedField,
+    /// Issue #350 — a field `separate` / `end` with no open field was
+    /// ignored.
+    StrayFieldChar,
+    /// Issue #350 — complex fields nested past the reader's cap; the extra
+    /// levels stay hidden code.
+    FieldNestingTooDeep,
+    /// Issues #325 / #394 — a WordprocessingML part binds the namespace
+    /// under a non-canonical prefix; it was normalised and read, and is
+    /// regenerate-only on save (its bytes are no longer reused verbatim).
+    NonCanonicalNamespaces,
+    /// Issue #325 — the main part is not WordprocessingML; it reads as an
+    /// empty document.
+    NotWordprocessingMl,
+    /// Issue #353 — the package's `officeDocument` relationship names a
+    /// part the archive lacks; the conventional `word/document.xml` was
+    /// used.
+    MainPartFallback,
+    /// Issue #353 — a relationship target escapes the package and was
+    /// ignored.
+    UnsafeRelationshipTarget,
+    /// Issues #439 / #434 / #435 — a WordprocessingML part is not
+    /// well-formed XML (bytes that are not UTF-8, a raw `&`, an excluded
+    /// character, an undeclared namespace prefix, a truncated part, …).
+    /// Repaired up front where a faithful repair exists — the part is then
+    /// regenerate-only on save — else read as it is (the detail says
+    /// which).
+    MalformedPart,
 }
 
 impl Event {
@@ -1371,6 +1475,13 @@ mod a11y_note_wire_tests {
         })
         .unwrap();
         assert_eq!(encrypted["kind"], "EncryptedDocument");
+        /* Issue #407 — the non-finite argument refusal. */
+        let invalid = serde_json::to_value(Event::Error {
+            message: "SetZoom: scale is NaN".into(),
+            kind: Some(ErrorKind::InvalidArgument),
+        })
+        .unwrap();
+        assert_eq!(invalid["kind"], "InvalidArgument");
     }
 
     /// Issue #345 — protection modes spell `w:edit`; the typed refusal.
@@ -1392,6 +1503,63 @@ mod a11y_note_wire_tests {
         })
         .unwrap();
         assert_eq!(refused["kind"], "Protected");
+    }
+
+    /// Issue #406 — `DocumentLoaded.warnings` is additive: a clean open
+    /// keeps the pre-#406 shape, an old payload decodes, and a degraded
+    /// open carries PascalCase kinds with an optional `part` and a `count`
+    /// that defaults to 1.
+    #[test]
+    fn document_loaded_warnings_are_additive_on_the_wire() {
+        let clean = serde_json::to_value(Event::DocumentLoaded {
+            paragraph_count: 3,
+            warnings: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            clean,
+            serde_json::json!({ "type": "DOCUMENT_LOADED", "paragraph_count": 3 })
+        );
+        let back: Event = serde_json::from_value(clean).unwrap();
+        assert!(
+            matches!(back, Event::DocumentLoaded { paragraph_count: 3, warnings } if warnings.is_empty())
+        );
+        let degraded = serde_json::to_value(Event::DocumentLoaded {
+            paragraph_count: 1,
+            warnings: vec![
+                ReadWarning {
+                    kind: ReadWarningKind::MeasureClamped,
+                    part: None,
+                    detail: "w:pgMar/@w:top = \"99999\" → 31680 twips".into(),
+                    count: 2,
+                },
+                ReadWarning {
+                    kind: ReadWarningKind::NonCanonicalNamespaces,
+                    part: Some("word/styles.xml".into()),
+                    detail: "x".into(),
+                    count: 1,
+                },
+            ],
+        })
+        .unwrap();
+        assert_eq!(
+            degraded,
+            serde_json::json!({
+                "type": "DOCUMENT_LOADED",
+                "paragraph_count": 1,
+                "warnings": [
+                    { "kind": "MeasureClamped", "detail": "w:pgMar/@w:top = \"99999\" → 31680 twips", "count": 2 },
+                    { "kind": "NonCanonicalNamespaces", "part": "word/styles.xml", "detail": "x", "count": 1 },
+                ],
+            })
+        );
+        let no_count: ReadWarning = serde_json::from_value(serde_json::json!({
+            "kind": "InvalidMeasure",
+            "detail": "d",
+        }))
+        .unwrap();
+        assert_eq!(no_count.count, 1);
+        assert_eq!(no_count.part, None);
     }
 
     /// Issue #364 - the tracked-deletion refusal is a typed error kind.

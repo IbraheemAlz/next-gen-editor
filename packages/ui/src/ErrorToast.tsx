@@ -57,6 +57,8 @@ export const ERROR_TOAST_COPY: Partial<Record<ErrorKind, string>> = {
     Unimplemented: 'That feature is not available yet — nothing was changed.',
     Internal:
         'Something went wrong inside the editor and nothing was changed — try again, and save your work if it persists.',
+    InvalidArgument:
+        'A value was not a valid number, so nothing was changed — try again, and save your work if it keeps happening.',
 };
 
 /** Kinds the toast deliberately does not cover: a surface of their own
@@ -89,6 +91,7 @@ export const ERROR_KIND_PRESENTATION: Record<ErrorKind, 'toast' | 'own'> = {
     NotReady: 'toast',
     Unimplemented: 'toast',
     Internal: 'toast',
+    InvalidArgument: 'toast',
     PackageTooLarge: 'own',
     EncryptedDocument: 'own',
     WrongPassword: 'own',

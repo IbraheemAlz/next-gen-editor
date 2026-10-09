@@ -45,6 +45,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod pdf_semantics;
+mod read_report;
 /// Issue #379 — the content-keyed table layout cache that survives
 /// between paints.
 mod table_cache;
@@ -8079,6 +8080,16 @@ impl Engine {
     }
 
     async fn apply_command(&mut self, cmd: Command) -> Event {
+        /* Issue #407 — argument validation first: a NaN / infinite number
+        anywhere in the command (a JS `NaN` crosses `serde-wasm-bindgen`
+        into an `f32` unchanged, and `f32::clamp` passes it through) is
+        refused before any gate or handler can act on it. */
+        if let Some(bad) = cmd.first_non_finite() {
+            return Event::Error {
+                message: format!("{}: {bad}", cmd.kind().name()),
+                kind: Some(bridge::ErrorKind::InvalidArgument),
+            };
+        }
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
         }
@@ -9128,9 +9139,14 @@ impl Engine {
         let mut pending_zoom: Option<f32> = None;
         let mut applied_commands: u32 = 0;
         for cmd in log_tail {
+            /* Issue #407 — a logged non-finite scale is refused by the
+            replayed `apply` below; never let it reach the stashed config
+            (`f32::clamp` keeps NaN). */
             match &cmd {
-                Command::SetDeviceScale { scale } => pending_base_scale = Some(*scale),
-                Command::SetZoom { scale } => pending_zoom = Some(*scale),
+                Command::SetDeviceScale { scale } if scale.is_finite() => {
+                    pending_base_scale = Some(*scale)
+                }
+                Command::SetZoom { scale } if scale.is_finite() => pending_zoom = Some(*scale),
                 _ => {}
             }
             /* Replayed events are not observable: the shell rebuilds its
@@ -17155,7 +17171,10 @@ impl Engine {
         if let Err(e) = self.install_new_document(doc) {
             return *e;
         }
-        Event::DocumentLoaded { paragraph_count }
+        Event::DocumentLoaded {
+            paragraph_count,
+            warnings: Vec::new(),
+        }
     }
 
     /// Issue #338 — `Command::CloseDocument`: back to the seeded empty
@@ -17253,10 +17272,18 @@ impl Engine {
                 the status bar reported the new one. Surface the error; the
                 document itself is loaded, and the shell decides how to
                 present the failure. */
+                /* Issue #406 — the reader's warning report rides the
+                reply: an open that clamped a margin or normalised a part
+                is visibly degraded, never indistinguishable from a clean
+                one. */
+                let warnings = read_report::bridge_read_warnings(&archive.warnings);
                 if let Err(e) = self.install_new_document(archive.document) {
                     return *e;
                 }
-                Event::DocumentLoaded { paragraph_count }
+                Event::DocumentLoaded {
+                    paragraph_count,
+                    warnings,
+                }
             }
             Err(e) => {
                 let kind = match e {
@@ -17353,8 +17380,10 @@ impl Engine {
     /// leaves NaN untouched). A finite value outside `[0.25, 4.0]` is
     /// still silently clamped, same as before.
     fn do_set_zoom(&mut self, zoom: f32) -> Event {
+        /* Unreachable through `apply` since #407 (the finite() guard
+        refuses first, with the same kind); kept for direct callers. */
         if let Err(e) = engine::validate_finite_scale(zoom) {
-            return Event::error_kind(bridge::ErrorKind::OutOfRange, format!("SetZoom: {e}"));
+            return Event::error_kind(bridge::ErrorKind::InvalidArgument, format!("SetZoom: {e}"));
         }
         let zoom = zoom.clamp(0.25, 4.0);
         let Some(cfg) = self.layout_cfg.as_mut() else {
@@ -17386,7 +17415,7 @@ impl Engine {
     fn do_set_device_scale(&mut self, scale: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(scale) {
             return Event::error_kind(
-                bridge::ErrorKind::OutOfRange,
+                bridge::ErrorKind::InvalidArgument,
                 format!("SetDeviceScale: {e}"),
             );
         }
@@ -29179,6 +29208,10 @@ mod document_protection_tests;
 
 /// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
 mod protection_gate;
+
+/// Issue #407 — the command-boundary finiteness guard (`InvalidArgument`).
+#[cfg(test)]
+mod finite_guard_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

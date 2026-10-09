@@ -172,6 +172,183 @@ fn universal_measure_units_are_honoured() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Issue #407 — the attributes #349 left on ad hoc parses              */
+/* ------------------------------------------------------------------ */
+
+/// Tab stops, `w:cols w:space`, cell margins, row heights, a DrawingML
+/// extent and a VML `style` size, every one carrying the hostile `v`.
+fn hostile_attribute_document(v: &str) -> String {
+    let tabs = format!(
+        r#"<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="{v}"/><w:tab w:val="right" w:pos="720"/></w:tabs></w:pPr><w:r><w:t>tabs</w:t></w:r></w:p>"#
+    );
+    let table = format!(
+        r#"<w:tbl><w:tblPr><w:tblCellMar><w:top w:w="{v}" w:type="dxa"/><w:left w:w="{v}" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:trPr><w:trHeight w:val="{v}" w:hRule="exact"/></w:trPr><w:tc><w:tcPr><w:tcMar><w:bottom w:w="{v}" w:type="dxa"/></w:tcMar></w:tcPr><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+    );
+    let drawing = format!(
+        r#"<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{v}" cy="{v}"/><wp:docPr id="1" name="Shape 1"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"/></a:graphic></wp:inline></w:drawing></w:r><w:r><w:pict><v:rect style="width:{v};height:{v}pt" stroked="f"/></w:pict></w:r></w:p>"#
+    );
+    let sect = format!(
+        r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:cols w:num="2" w:space="{v}"/></w:sectPr>"#
+    );
+    document(
+        &format!("{tabs}{table}{drawing}<w:p><w:r><w:t>tail</w:t></w:r></w:p>"),
+        &sect,
+    )
+}
+
+/// Issue #407 — the remaining numeric attributes read into finite,
+/// in-range model values (never `NaN as i64` = 0 or `inf as i64` =
+/// `i64::MAX`), every bad value is reported, and the zero-edit save stays
+/// byte-identical.
+#[test]
+fn hostile_remaining_attributes_read_finite_and_round_trip_byte_identical() {
+    for v in HOSTILE_NUMBERS {
+        let xml = hostile_attribute_document(v);
+        let archive = assert_zero_edit_identity(&xml);
+        let doc = &archive.document;
+
+        let p = doc.blocks[0].as_paragraph().expect("paragraph");
+        for stop in &p.props.tab_stops {
+            assert!(stop.position_pt.is_finite(), "{v}: {stop:?}");
+            assert!(stop.position_pt.abs() <= 1584.0, "{v}: {stop:?}");
+        }
+        assert!(
+            p.props.tab_stops.iter().any(|t| t.position_pt == 36.0),
+            "{v}: the good stop survives"
+        );
+
+        let t = doc.blocks[1].as_table().expect("table");
+        let m = &t.props.cell_margins;
+        for x in [m.top_twips, m.left_twips].into_iter().flatten() {
+            assert!((0..=31_680).contains(&x), "{v}: tblCellMar {x}");
+        }
+        let row = &t.rows[0];
+        match row.props.height {
+            Some(engine::RowHeight::Exact { twips } | engine::RowHeight::AtLeast { twips }) => {
+                assert!((0..=31_680).contains(&twips), "{v}: trHeight {twips}")
+            }
+            Some(engine::RowHeight::Auto) | None => {}
+        }
+        if let Some(cm) = &row.cells[0].props.cell_margins {
+            for x in [cm.top_twips, cm.bottom_twips].into_iter().flatten() {
+                assert!((0..=31_680).contains(&x), "{v}: tcMar {x}");
+            }
+        }
+
+        let p = doc.blocks[2].as_paragraph().expect("drawing paragraph");
+        for obj in &p.inline_objects {
+            if let engine::InlineKind::Image {
+                width_emu,
+                height_emu,
+                ..
+            } = &obj.kind
+            {
+                assert!((0..=20_116_800).contains(width_emu), "{v}: cx {width_emu}");
+                assert!(
+                    (0..=20_116_800).contains(height_emu),
+                    "{v}: cy {height_emu}"
+                );
+            }
+        }
+
+        let cols = doc.body_section.columns;
+        assert!(
+            cols.gutter_pt.is_finite() && (0.0..=1584.0).contains(&cols.gutter_pt),
+            "{v}: {cols:?}"
+        );
+
+        if !v.is_empty() {
+            assert!(
+                archive.warnings.iter().any(|w| matches!(
+                    w,
+                    DocxWarning::InvalidMeasure { .. }
+                        | DocxWarning::MeasureClamped { .. }
+                        | DocxWarning::EmuClamped { .. }
+                )),
+                "{v}: no reader warning in {:?}",
+                archive.warnings
+            );
+        }
+    }
+}
+
+/// Issue #407 — each attribute names itself in the report.
+#[test]
+fn hostile_remaining_attributes_are_reported_by_name() {
+    let archive = assert_zero_edit_identity(&hostile_attribute_document("NaN"));
+    let details: Vec<String> = archive.warnings.iter().map(DocxWarning::detail).collect();
+    for want in [
+        "w:tab/@w:pos = \"NaN\"",
+        "w:top/@w:w = \"NaN\"",
+        "w:left/@w:w = \"NaN\"",
+        "w:trHeight/@w:val = \"NaN\"",
+        "w:bottom/@w:w = \"NaN\"",
+        "wp:extent/@cx = \"NaN\"",
+        "wp:extent/@cy = \"NaN\"",
+        "v:rect/@style width = \"NaN\"",
+        "v:rect/@style height = \"NaNpt\"",
+        "w:cols/@w:space = \"NaN\"",
+    ] {
+        assert!(
+            details.iter().any(|d| d == want),
+            "missing {want:?} in {details:#?}"
+        );
+    }
+    let clamped = assert_zero_edit_identity(&hostile_attribute_document("1e30"));
+    let details: Vec<String> = clamped.warnings.iter().map(DocxWarning::detail).collect();
+    assert!(
+        details
+            .iter()
+            .any(|d| d == "w:tab/@w:pos = \"1e30\" → 31680 twips"),
+        "{details:#?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d == "wp:extent/@cx = \"1e30\" → 20116800 EMU"),
+        "{details:#?}"
+    );
+}
+
+/// Issue #407 — `<w:defaultTabStop>` and a numbering level's `<w:ind>`
+/// (read from their own parts) go through the measure reader too.
+#[test]
+fn default_tab_stop_and_numbering_indents_are_validated() {
+    let mut warnings = Vec::new();
+    let settings = crate::error::collect_read_warnings(&mut warnings, |_| {
+        crate::parts::settings::parse_settings_xml(
+            br#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:defaultTabStop w:val="NaN"/></w:settings>"#,
+        )
+    })
+    .expect("settings");
+    assert_eq!(settings.default_tab_stop_twips, None);
+    let settings = crate::parts::settings::parse_settings_xml(
+        br#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:defaultTabStop w:val="0.5in"/></w:settings>"#,
+    )
+    .expect("settings");
+    assert_eq!(settings.default_tab_stop_twips, Some(720));
+
+    let numbering = crate::error::collect_read_warnings(&mut warnings, |_| {
+        crate::parts::numbering::parse_numbering_xml(
+            br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:pPr><w:ind w:left="inf" w:hanging="1e30"/></w:pPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        )
+    })
+    .expect("numbering");
+    let ind = numbering.abstract_nums[&0].levels[0].indent;
+    assert_eq!(ind.start_twips, 0, "an unusable left keeps the default");
+    assert_eq!(ind.hanging_twips, 31_680, "clamped to 22 in");
+    let details: Vec<String> = warnings.iter().map(DocxWarning::detail).collect();
+    assert_eq!(
+        details,
+        [
+            "w:defaultTabStop/@w:val = \"NaN\"",
+            "w:ind/@w:left = \"inf\"",
+            "w:ind/@w:hanging = \"1e30\" → 31680 twips",
+        ]
+    );
+}
+
+/* ------------------------------------------------------------------ */
 /* Issue #350 — field phases                                           */
 /* ------------------------------------------------------------------ */
 
