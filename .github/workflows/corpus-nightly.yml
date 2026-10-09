@@ -29,6 +29,8 @@ permissions:
   # `file-issue.mjs` files/updates/reopens/comments on issues for new
   # panic + crash signatures.
   issues: write
+  # `gh run download` of the previous nightly artifact (issue #380).
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -79,11 +81,27 @@ jobs:
             --out ~/corpus-cache/results.jsonl \
             --timeout-secs 90
 
+      # Issue #380 - the previous nightly's artifact feeds the report's
+      # page-count diff and its layout-regression flag. Best effort: a first
+      # run / expired artifact just skips the comparison.
+      - name: Fetch previous nightly results
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/corpus-prev
+          run_id=$(gh run list --workflow corpus-nightly.yml --repo "${{ github.repository }}" \
+            --status completed --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" --repo "${{ github.repository }}" -n corpus-results -D ~/corpus-prev || true
+          fi
+
       - name: Triage report
         if: always()
         run: |
           node tools/corpus/report.mjs \
             --in ~/corpus-cache/results.jsonl \
+            --prev ~/corpus-prev/results.jsonl \
             --json ~/corpus-cache/summary.json \
             --top 30 \
             | tee -a "$GITHUB_STEP_SUMMARY"

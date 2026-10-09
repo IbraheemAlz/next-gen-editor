@@ -2,7 +2,7 @@
 /**
  * Performance harness — Phase 5 D5.3.
  *
- * Measures three §6 budgets against the live editor:
+ * Measures the §6 budgets (+ the D2.1 worker-boot gate, issue #425) against the live editor:
  *   - cold start to first paint
  *   - insert char @ caret, p95 over 100 keystrokes (one-page seeded document)
  *   - open a 50-page .docx
@@ -40,8 +40,13 @@ const strict = argv.includes('--strict');
 
 /* Performance budgets — Phase 5 §6. */
 const BUDGETS = {
-    'tier-1': { coldStartMs: 3000, insertP95Ms: 8, openDocMs: 1000 },
-    'tier-2': { coldStartMs: 8000, insertP95Ms: 16, openDocMs: 2500 },
+    /* `workerBootMs` = D2.1 exit gate (issue #425): the engine worker boots
+       cold (spawn + WASM load + engine construction) in < 500 ms. It lives
+       here, on a quiet runner, and NOT in the blocking e2e suite
+       (`ts/e2e/boot.spec.ts` is only a smoke) - a wall-clock budget there
+       fails under machine load with the code unchanged. */
+    'tier-1': { coldStartMs: 3000, workerBootMs: 500, insertP95Ms: 8, openDocMs: 1000 },
+    'tier-2': { coldStartMs: 8000, workerBootMs: 500, insertP95Ms: 16, openDocMs: 2500 },
 };
 const budget = BUDGETS[hardware];
 if (!budget) {
@@ -61,6 +66,7 @@ console.log(`[perf] origin=${ORIGIN} hardware=${hardware} mode=${strict ? 'stric
 
 const browser = await chromium.launch({ headless: true, channel: 'chrome' });
 let coldStartMs = 0;
+let workerBootMs = null;
 let samples = [];
 let openDocMs = null;
 try {
@@ -71,6 +77,9 @@ try {
     await page.goto(ORIGIN, { waitUntil: 'load', timeout: 30000 });
     await page.waitForFunction(() => window.__paintIdle === true, { timeout: 30000 });
     coldStartMs = Date.now() - t0;
+    workerBootMs = await page.evaluate(() =>
+        typeof window.__bootMs === 'number' ? window.__bootMs : null,
+    );
 
     /* --- Insert char @ caret, p95 (one-page seeded document) --- */
     samples = await page.evaluate(async (n) => {
@@ -115,6 +124,11 @@ const maxInsert = Math.max(...samples);
 
 console.log(`[perf] cold start to first paint : ${coldStartMs} ms (budget ${budget.coldStartMs} ms)`);
 console.log(
+    `[perf] worker boot (__bootMs)    : ` +
+        `${workerBootMs === null ? 'NOT REPORTED' : `${workerBootMs.toFixed(1)} ms`} ` +
+        `(budget ${budget.workerBootMs} ms)`,
+);
+console.log(
     `[perf] insert @ caret x${INSERT_KEYSTROKES}     : ` +
         `p50 ${p50.toFixed(2)} ms · p95 ${p95.toFixed(2)} ms · max ${maxInsert.toFixed(2)} ms ` +
         `(p95 budget ${budget.insertP95Ms} ms)`,
@@ -128,6 +142,8 @@ if (openDocMs !== null) {
    regression must fail on. */
 const breaches = [];
 if (coldStartMs >= budget.coldStartMs) breaches.push(`cold start ${coldStartMs}ms`);
+if (workerBootMs === null) breaches.push('worker boot never reported (__bootMs)');
+else if (workerBootMs >= budget.workerBootMs) breaches.push(`worker boot ${workerBootMs.toFixed(1)}ms`);
 if (p95 >= budget.insertP95Ms) breaches.push(`insert p95 ${p95.toFixed(2)}ms`);
 
 /* Open-doc on a multi-page document is dominated by the engine's

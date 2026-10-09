@@ -150,6 +150,12 @@ export interface EditorCommands {
      *  recovery generation (no reload), so the document, selection, undo
      *  and zoom survive. A no-op when `canRetryGpuRenderer` is false. */
     retryGpuRenderer(): Promise<void>;
+    /** Issue #428 - whether the engine offers an in-place `setRenderer`. */
+    readonly canSetRenderer: boolean;
+    /** Issue #428 - switch the render backend in place (same path as
+     *  `retryGpuRenderer`, #270): no reload, the document survives. A
+     *  no-op when `canSetRenderer` is false. */
+    setRenderer(kind: 'vello' | 'canvas2d'): Promise<void>;
     requestPaint(viewport: Rect, dirty?: Rect): Promise<Event>;
 
     /* Viewport */
@@ -633,6 +639,8 @@ function build(
         requestStats: () => dispatch({ type: 'REQUEST_STATS' }),
         canRetryGpuRenderer: typeof engine.retryGpuRenderer === 'function',
         retryGpuRenderer: () => engine.retryGpuRenderer?.() ?? Promise.resolve(),
+        canSetRenderer: typeof engine.setRenderer === 'function',
+        setRenderer: (kind) => engine.setRenderer?.(kind) ?? Promise.resolve(),
         requestPaint: (viewport, dirty) =>
             dispatch({ type: 'REQUEST_PAINT', viewport, dirty }),
 

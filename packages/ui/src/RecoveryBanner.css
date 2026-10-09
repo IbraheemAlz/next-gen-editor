@@ -69,6 +69,13 @@
 /* Issue #388 - Recover / Discard choices of the previous-session offer. */
 .nge-recovery-banner__choices {
     display: flex;
+    align-items: center;
     gap: var(--nge-space-2);
     margin-top: var(--nge-space-2);
+}
+
+/* Issue #426 - which ring entry a Recover / Discard pair belongs to. */
+.nge-recovery-banner__session {
+    color: var(--nge-color-text-muted);
+    font-size: var(--nge-font-size-xs);
 }

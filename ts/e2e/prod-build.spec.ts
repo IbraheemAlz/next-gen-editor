@@ -85,10 +85,19 @@ test('a production build exposes no engine hooks on window (#340)', async ({ pag
     try {
         const requests: string[] = [];
         page.on('request', (r) => requests.push(r.url()));
+        await page.addInitScript(() => {
+            const w = window as any;
+            w.__initMsgs = [];
+            const post = Worker.prototype.postMessage;
+            Worker.prototype.postMessage = function (this: Worker, msg: any, ...rest: any[]) {
+                if (msg && msg.type === 'INIT') w.__initMsgs.push({ mockBackend: msg.mockBackend });
+                return (post as any).call(this, msg, ...rest);
+            } as typeof Worker.prototype.postMessage;
+        });
         /* The URL tries to choose a telemetry sink: a production page must
            ignore it (and telemetry is opt-in anyway). */
         await page.goto(
-            `${server.url}?telemetryEndpoint=http://127.0.0.1:9/evil&clipboardPrefetch=0`,
+            `${server.url}?telemetryEndpoint=http://127.0.0.1:9/evil&clipboardPrefetch=0&mockBackend=vello`,
         );
         await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
             timeout: 60_000,
@@ -110,12 +119,17 @@ test('a production build exposes no engine hooks on window (#340)', async ({ pag
             'data-clipboard-prefetch',
             'on',
         );
-        /* ... and the Settings menu offers no URL-driven renderer switch. */
+        /* Issue #428 - the Settings renderer switch is a real in-place
+           switch now (not a URL toggle), so production offers it too; it
+           must not be a link/reload. */
         await page.getByRole('button', { name: 'Settings' }).click();
         await expect(page.locator('.nge-settings__menu')).toBeVisible();
-        await expect(page.getByRole('button', { name: /Switch to (Vello|Canvas2D)/ })).toHaveCount(
-            0,
-        );
+        await expect(page.getByRole('button', { name: /Switch to Vello/ })).toBeVisible();
+        /* Issue #428 - `?mockBackend=` is gated like the other debug URL
+           parameters: the production INIT message never carries it. */
+        const init = await page.evaluate(() => (window as any).__initMsgs as Array<Record<string, unknown>>);
+        expect(init.length).toBeGreaterThan(0);
+        expect(init.every((m) => m.mockBackend === undefined)).toBe(true);
     } finally {
         server.stop();
         rmSync(outDir, { recursive: true, force: true });
@@ -127,7 +141,16 @@ test('a build made with VITE_NGE_DEV_HOOKS=1 installs the hooks (#340)', async (
     const outDir = mkdtempSync(join(tmpdir(), 'nge-prod-build-hooks-'));
     const server = await buildAndServe(outDir, { ...process.env, VITE_NGE_DEV_HOOKS: '1' });
     try {
-        await page.goto(`${server.url}?clipboardPrefetch=0`);
+        await page.addInitScript(() => {
+            const w = window as any;
+            w.__initMsgs = [];
+            const post = Worker.prototype.postMessage;
+            Worker.prototype.postMessage = function (this: Worker, msg: any, ...rest: any[]) {
+                if (msg && msg.type === 'INIT') w.__initMsgs.push({ mockBackend: msg.mockBackend });
+                return (post as any).call(this, msg, ...rest);
+            } as typeof Worker.prototype.postMessage;
+        });
+        await page.goto(`${server.url}?clipboardPrefetch=0&mockBackend=vello`);
         await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
             timeout: 60_000,
         });
@@ -151,6 +174,9 @@ test('a build made with VITE_NGE_DEV_HOOKS=1 installs the hooks (#340)', async (
         });
         await page.getByRole('button', { name: 'Settings' }).click();
         await expect(page.getByRole('button', { name: /Switch to Vello/ })).toBeVisible();
+        /* Issue #428 - under the flag the INIT message does carry it. */
+        const init = await page.evaluate(() => (window as any).__initMsgs as Array<Record<string, unknown>>);
+        expect(init.some((m) => m.mockBackend === 'vello')).toBe(true);
     } finally {
         server.stop();
         rmSync(outDir, { recursive: true, force: true });

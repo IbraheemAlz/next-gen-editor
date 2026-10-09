@@ -28,6 +28,10 @@ import {
 } from '@nge/core';
 import './RecoveryBanner.css';
 
+function localTime(ms: number): string {
+    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 export interface RecoveryBannerProps {
     /** Wall-clock formatter for "changes after HH:MM" (default: the
      *  locale's hour + minute). */
@@ -44,12 +48,12 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
     createEffect(() => {
         if (state.previousSession() === undefined) setPreviousDismissed(false);
     });
-    const decide = async (action: 'recover' | 'discard'): Promise<void> => {
+    const decide = async (action: 'recover' | 'discard', id?: string): Promise<void> => {
         if (busy()) return;
         setBusy(true);
         try {
-            if (action === 'recover') await engine.recoverPreviousSession?.();
-            else await engine.discardPreviousSession?.();
+            if (action === 'recover') await engine.recoverPreviousSession?.(id);
+            else await engine.discardPreviousSession?.(id);
         } catch (e: unknown) {
             console.error(`[recovery] previous session ${action} failed`, e);
         } finally {
@@ -79,7 +83,7 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
             : checkpointNotices(!health.ok, health.journalFailing);
         const previous = previousDismissed()
             ? []
-            : previousSessionNotice(state.previousSession(), options);
+            : previousSessionNotice(state.previousSessions(), options);
         return [...previous, ...recovery, ...checkpoint];
     });
     const visible = createMemo(() => notices().length > 0);
@@ -109,24 +113,38 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
                                 <p class="nge-recovery-banner__detail">{notice.detail}</p>
                                 <p class="nge-recovery-banner__action">{notice.action}</p>
                                 <Show when={notice.kind === 'previous-session'}>
-                                    <div class="nge-recovery-banner__choices">
-                                        <button
-                                            class="nge-btn nge-recovery-banner__recover"
-                                            type="button"
-                                            disabled={busy()}
-                                            onClick={() => void decide('recover')}
-                                        >
-                                            Recover
-                                        </button>
-                                        <button
-                                            class="nge-btn nge-recovery-banner__discard"
-                                            type="button"
-                                            disabled={busy()}
-                                            onClick={() => void decide('discard')}
-                                        >
-                                            Discard
-                                        </button>
-                                    </div>
+                                    <For each={state.previousSessions()}>
+                                        {(entry) => (
+                                            <div
+                                                class="nge-recovery-banner__choices"
+                                                data-session-id={entry.id}
+                                            >
+                                                <Show when={state.previousSessions().length > 1}>
+                                                    <span class="nge-recovery-banner__session">
+                                                        {`Last edit ${(props.formatTime ?? localTime)(
+                                                            entry.lastEditAt ?? entry.archivedAt,
+                                                        )} \u00b7 ${entry.commandCount} edits`}
+                                                    </span>
+                                                </Show>
+                                                <button
+                                                    class="nge-btn nge-recovery-banner__recover"
+                                                    type="button"
+                                                    disabled={busy()}
+                                                    onClick={() => void decide('recover', entry.id)}
+                                                >
+                                                    Recover
+                                                </button>
+                                                <button
+                                                    class="nge-btn nge-recovery-banner__discard"
+                                                    type="button"
+                                                    disabled={busy()}
+                                                    onClick={() => void decide('discard', entry.id)}
+                                                >
+                                                    Discard
+                                                </button>
+                                            </div>
+                                        )}
+                                    </For>
                                 </Show>
                             </section>
                         )}
@@ -140,6 +158,7 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
                         setDismissed(() => state.lastRecovery());
                         setCheckpointDismissed(true);
                         setPreviousDismissed(true);
+                        void engine.dismissPreviousSessions?.();
                     }}
                 >
                     Dismiss

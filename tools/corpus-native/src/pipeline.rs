@@ -849,19 +849,36 @@ pub fn run_one(
         }
     };
 
+    /* Issue #380 - the production layout needs only a document that READS.
+    `read_doc` is set the moment `read_docx_1` succeeds; every early return
+    below (a failed or panicked later stage) runs the engine-layout stage
+    first, so a document that dies at the round trip still reports its
+    layout time / page count / degradations. `n/a` (all columns `None`)
+    stays reserved for files `read_docx` itself rejects. */
+    let mut read_doc: Option<engine::DocumentTree> = None;
+    macro_rules! bail_with_layout {
+        () => {{
+            if engine_opts.enabled
+                && let Some(doc) = read_doc.as_ref()
+            {
+                engine_layout(&mut rec, doc, engine_opts.budget);
+            }
+            rec.elapsed_ms = overall_start.elapsed().as_millis();
+            return rec;
+        }};
+    }
+
     macro_rules! stage {
         ($stage:literal, $expr:expr) => {{
             match panics::catch(|| $expr) {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     rec.mark_error($stage, &e.to_string());
-                    rec.elapsed_ms = overall_start.elapsed().as_millis();
-                    return rec;
+                    bail_with_layout!();
                 }
                 Err(p) => {
                     rec.mark_panic($stage, &p);
-                    rec.elapsed_ms = overall_start.elapsed().as_millis();
-                    return rec;
+                    bail_with_layout!();
                 }
             }
         }};
@@ -872,8 +889,7 @@ pub fn run_one(
                 Ok(v) => v,
                 Err(p) => {
                     rec.mark_panic($stage, &p);
-                    rec.elapsed_ms = overall_start.elapsed().as_millis();
-                    return rec;
+                    bail_with_layout!();
                 }
             }
         }};
@@ -881,6 +897,7 @@ pub fn run_one(
 
     /* 1. read_docx. */
     let archive_a: DocxArchive = stage!("read_docx_1", format_docx::read_docx(bytes));
+    read_doc = Some(archive_a.document.clone());
     rec.paragraph_count = Some(archive_a.document.paragraph_count());
     rec.theme_fonts = Some(ThemeFontCensus::of(&archive_a.document));
     rec.normalized_parts = archive_a
@@ -1091,7 +1108,6 @@ pub fn run_one(
     if engine_opts.enabled {
         engine_layout(&mut rec, &archive_a.document, engine_opts.budget);
     }
-
     rec.elapsed_ms = overall_start.elapsed().as_millis();
     rec
 }

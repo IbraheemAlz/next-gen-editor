@@ -260,6 +260,11 @@ export interface EditorState {
      * `undefined` when there is none. Shared like `zoom`.
      */
     previousSession: Accessor<PreviousSessionInfo | undefined>;
+    /**
+     * Issue #426 - every previous session still waiting for a decision
+     * (the archive ring, newest first); `previousSession` is the first.
+     */
+    previousSessions: Accessor<PreviousSessionInfo[]>;
 }
 
 /**
@@ -303,6 +308,7 @@ interface ViewState {
     checkpointState: Accessor<CheckpointHealth>;
     lastError: Accessor<EditorError | undefined>;
     previousSession: Accessor<PreviousSessionInfo | undefined>;
+    previousSessions: Accessor<PreviousSessionInfo[]>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -351,6 +357,10 @@ function viewStateFor(engine: EngineHandle): ViewState {
             PreviousSessionInfo | undefined
         >(engine.previousSession);
         engine.onPreviousSession?.((p) => setPreviousSession(p));
+        const [previousSessions, setPreviousSessions] = createSignal<PreviousSessionInfo[]>(
+            engine.previousSessions ?? (engine.previousSession ? [engine.previousSession] : []),
+        );
+        engine.onPreviousSessions?.((p) => setPreviousSessions(p));
         /* Issue #364 - every `Event::Error` reply, with its command. */
         const [lastError, setLastError] = createSignal<EditorError | undefined>(undefined);
         let errorCount = 0;
@@ -407,6 +417,7 @@ function viewStateFor(engine: EngineHandle): ViewState {
             checkpointState,
             lastError,
             previousSession,
+            previousSessions,
         };
     });
     viewStates.set(engine, state);
@@ -578,5 +589,6 @@ export function createEditorState(): EditorState {
         checkpointState: view.checkpointState,
         lastError: view.lastError,
         previousSession: view.previousSession,
+        previousSessions: view.previousSessions,
     };
 }

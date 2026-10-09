@@ -1,13 +1,13 @@
 /**
  * SettingsMenu — gear-icon popover with engine lifecycle controls.
  *
- * Active renderer (Canvas2D / Vello) is read-only at runtime: the
- * choice is baked at `Engine::new` vs `Engine::with_vello` boot.
- * Issue #389 - the "Switch to Vello" / "Switch to Canvas2D" buttons
- * reload the page with `?renderer=...`; that URL-driven toggle is a debug
- * surface, rendered only when the host opted in
- * (`<EngineProvider debugSurfaces>`, which the reference shell ties to
- * its dev-hooks flag). A production page shows the active renderer only.
+ * Active renderer (Canvas2D / Vello) is shown, and - issue #428 - switchable
+ * IN PLACE when the engine offers `setRenderer` (`cmd.canSetRenderer`): the
+ * #270 retire-respawn path restarts the engine as a recovery generation, so
+ * the document, selection, undo history and zoom survive and the page never
+ * reloads. (The old `?renderer=` URL toggle was never honoured by the
+ * interactive app and is gone.) An engine without `setRenderer` shows the
+ * active renderer only.
  *
  * Toggle Dev HUD action mirrors the `Ctrl+Shift+D` shortcut so the
  * keyboard-averse can still find it. The HUD itself owns its
@@ -15,19 +15,26 @@
  * `window` that the HUD subscribes to.
  */
 import { createSignal, onCleanup, Show, type Component } from 'solid-js';
-import { useDebugSurfaces, useEngine, useTelemetryConfig } from '@nge/core';
+import { createEditorCommands, createEditorState, useEngine, useTelemetryConfig } from '@nge/core';
 import './SettingsMenu.css';
 
 export const SettingsMenu: Component = () => {
     const engine = useEngine();
     const telemetry = useTelemetryConfig();
-    const debugSurfaces = useDebugSurfaces();
+    const cmd = createEditorCommands();
+    const state = createEditorState();
+    const [switching, setSwitching] = createSignal(false);
     const [open, setOpen] = createSignal(false);
 
-    const switchRenderer = (target: 'vello' | 'canvas2d') => {
-        const url = new URL(window.location.href);
-        url.searchParams.set('renderer', target);
-        window.location.assign(url.toString());
+    const switchRenderer = async (target: 'vello' | 'canvas2d') => {
+        setSwitching(true);
+        try {
+            await cmd.setRenderer(target);
+        } catch (e: unknown) {
+            console.error('[settings] renderer switch failed', e);
+        } finally {
+            setSwitching(false);
+        }
     };
 
     const toggleHud = () => {
@@ -44,7 +51,15 @@ export const SettingsMenu: Component = () => {
     window.addEventListener('mousedown', onAway);
     onCleanup(() => window.removeEventListener('mousedown', onAway));
 
-    const isVello = () => engine.renderer === 'vello';
+    /* Reads the engine's live value (the editor-state signal is seeded at
+     * mount, possibly before INIT answered) but also tracks that signal and
+     * `switching`, so the buttons re-evaluate on the `RECOVERED` re-report
+     * and when an in-place switch settles. */
+    const isVello = () => {
+        state.renderer();
+        switching();
+        return engine.renderer === 'vello';
+    };
 
     return (
         <div class="nge-settings">
@@ -67,28 +82,30 @@ export const SettingsMenu: Component = () => {
                                 Active: <strong>{isVello() ? 'Vello (WebGPU)' : 'Canvas2D'}</strong>
                             </span>
                         </div>
-                        <Show when={debugSurfaces}>
+                        <Show when={cmd.canSetRenderer}>
                             <div class="nge-settings__row">
                                 <button
                                     class="nge-btn nge-settings__action"
                                     type="button"
-                                    disabled={isVello()}
-                                    onClick={() => switchRenderer('vello')}
+                                    data-nge-renderer-target="vello"
+                                    disabled={isVello() || switching()}
+                                    onClick={() => void switchRenderer('vello')}
                                 >
                                     Switch to Vello…
                                 </button>
                                 <button
                                     class="nge-btn nge-settings__action"
                                     type="button"
-                                    disabled={!isVello()}
-                                    onClick={() => switchRenderer('canvas2d')}
+                                    data-nge-renderer-target="canvas2d"
+                                    disabled={!isVello() || switching()}
+                                    onClick={() => void switchRenderer('canvas2d')}
                                 >
                                     Switch to Canvas2D…
                                 </button>
                             </div>
                             <div class="nge-settings__hint">
-                                Switching reloads the page so the worker
-                                can pick a fresh backend at boot.
+                                Switching restarts the engine in place; your
+                                document, selection and undo history are kept.
                             </div>
                         </Show>
                     </div>
