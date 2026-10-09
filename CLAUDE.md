@@ -329,6 +329,12 @@ Engine backlog" references a real issue.
   `roundtrip-dump` artifact on failure (the harness has no separate
   diff-file dump — its `FAIL:` line carries the inline diff).
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
+- **Timing budgets live in `tools/perf`, never in the blocking e2e suite**
+  (issue #425). A wall-clock assertion in Playwright fails under machine load
+  with the code unchanged (`boot.spec.ts` once read 717 ms at load 43-58).
+  `ts/e2e/boot.spec.ts` is a smoke (`__bootMs` / `__engineReady` reported);
+  the D2.1 worker-boot < 500 ms gate is `workerBootMs` in
+  `node tools/perf/run.mjs --strict`, alongside cold start and insert p95.
 - `pnpm exec playwright test` (from `ts/`) — the full e2e suite in `ts/e2e/`
   (`workers: 1`, well under a minute locally) all green.
   **Blocking since issue #230**: `ci.yml`'s `e2e` job reuses the `wasm`
