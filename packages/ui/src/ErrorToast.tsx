@@ -42,13 +42,21 @@ export interface ErrorToastProps {
     copy?: Partial<Record<ErrorKind, string>>;
 }
 
-/** The toast text for an error, or `undefined` when it is not toasted. */
+/** The toast text for an error, or `undefined` when it is not toasted.
+ *  Issue #345 — a `Protected` refusal (the open document's enforced
+ *  `w:documentProtection`) without host copy shows the engine's own,
+ *  mode-specific explanation ("This document is protected (filling in
+ *  forms): only form fields …"), its `<Command>: ` prefix dropped. */
 export function toastMessageFor(
     error: EditorError | undefined,
     copy: Partial<Record<ErrorKind, string>> = ERROR_TOAST_COPY,
 ): string | undefined {
     if (!error || error.kind === undefined) return undefined;
-    return copy[error.kind];
+    const text = copy[error.kind];
+    if (text === undefined && error.kind === 'Protected') {
+        return error.message.replace(/^[A-Za-z][A-Za-z0-9]*: /, '');
+    }
+    return text;
 }
 
 export const ErrorToast: Component<ErrorToastProps> = (props) => {

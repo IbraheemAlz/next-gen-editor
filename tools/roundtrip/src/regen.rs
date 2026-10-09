@@ -14,7 +14,7 @@ use engine::{Block, BlockPath, LogicalPos};
 use format_docx::test_fixtures::regen_classes_docx;
 use format_docx::writer::regen_check::regen_check;
 
-/// Step 55:
+/// Step 56:
 ///
 /// a. A zero-edit save is byte-identical, and the regeneration probe
 ///    (`format_docx::writer::regen_check`) regenerates all ten paragraphs
@@ -44,7 +44,7 @@ pub fn run_regen_classes_roundtrip() -> Result<()> {
         );
     }
     println!(
-        "[roundtrip] step 55a OK — zero-edit identity; all {} paragraphs regenerate byte-identically",
+        "[roundtrip] step 56a OK — zero-edit identity; all {} paragraphs regenerate byte-identically",
         report.checked
     );
 
@@ -70,7 +70,7 @@ pub fn run_regen_classes_roundtrip() -> Result<()> {
         edited_paragraphs += 1;
     }
     println!(
-        "[roundtrip] step 55b OK — typing into each of {edited_paragraphs} paragraphs is a pure insertion"
+        "[roundtrip] step 56b OK — typing into each of {edited_paragraphs} paragraphs is a pure insertion"
     );
 
     let heading = doc
@@ -96,6 +96,6 @@ pub fn run_regen_classes_roundtrip() -> Result<()> {
     {
         bail!("split heading: bookmark not balanced:\n{out}");
     }
-    println!("[roundtrip] step 55c OK — a split keeps one _Toc bookmark start and end, left");
+    println!("[roundtrip] step 56c OK — a split keeps one _Toc bookmark start and end, left");
     Ok(())
 }

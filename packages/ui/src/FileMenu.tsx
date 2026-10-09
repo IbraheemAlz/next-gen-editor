@@ -23,6 +23,13 @@
  *     bytes flow back through `DOCUMENT_SAVED` and the auto-download
  *     subscriber picks the right MIME + extension.
  *
+ * Issue #345 — an encrypted (password-protected) `.docx` picked here
+ * answers `ERROR { kind: 'EncryptedDocument' }`; the menu then asks for
+ * the password in a dialog and re-opens the file with it
+ * (`openDocument(…, { password })`), saying so on a wrong one. The
+ * password is never stored, and the dialog says that a save writes the
+ * document WITHOUT one (writing encrypted packages is not supported).
+ *
  * Download trigger: subscribes to `DOCUMENT_SAVED` / `PDF_EXPORTED`
  * events, wraps the returned `bytes` in a `Blob`, and synthesises a
  * download anchor click. The active document name (set by the most
@@ -38,8 +45,11 @@ import {
 import {
     createEditorCommands,
     useEngine,
+    type ErrorKind,
+    type Event,
     type PdfConformance,
 } from '@nge/core';
+import { Dialog } from './Dialog';
 import './FileMenu.css';
 
 /** Issue #339 — every format `OpenDocument` implements (see
@@ -85,6 +95,25 @@ function triggerDownload(bytes: Uint8Array, mime: string, filename: string): voi
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/** The banner text for an engine `ERROR`: typed refusals (issues #348 /
+ *  #345) get a plain-language lead, everything else shows the engine's
+ *  own message. */
+function errorMessage(kind: ErrorKind | undefined, message: string): string {
+    switch (kind) {
+        case 'PackageTooLarge':
+            return `This document is too large or too deeply nested to open safely. ${message}`;
+        case 'EncryptedDocument':
+            return (
+                'This document is encrypted with a password. Open it from the File menu to ' +
+                `enter the password. ${message}`
+            );
+        case 'WrongPassword':
+            return `The password does not open this document. ${message}`;
+        default:
+            return message;
+    }
+}
+
 export const FileMenu: Component<FileMenuProps> = (props) => {
     const cmd = createEditorCommands();
     const engine = useEngine();
@@ -94,6 +123,16 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
     const [docName, setDocName] = createSignal<string | undefined>(undefined);
     const [error, setError] = createSignal<string | null>(null);
     let fileInput: HTMLInputElement | undefined;
+    /* Issue #345 — the encrypted file waiting for its password. The File
+     * itself is kept: `openDocument` TRANSFERS its bytes, so each attempt
+     * re-reads them. */
+    const [locked, setLocked] = createSignal<File | null>(null);
+    const [password, setPassword] = createSignal('');
+    const [passwordError, setPasswordError] = createSignal<string | null>(null);
+    const [unlocking, setUnlocking] = createSignal(false);
+    /* While an open from the picker / the password dialog is in flight,
+     * its encryption errors belong to the dialog, not the banner. */
+    let dialogOwnsErrors = false;
 
     const stem = () => {
         const name = docName() ?? props.defaultFilename ?? 'document';
@@ -130,12 +169,20 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                 case 'ERROR':
                     /* Issue #348 — a refused open (the package exceeded
                        the reader's resource limits) says so plainly; the
-                       previous document stays open. */
-                    setError(
-                        evt.kind === 'PackageTooLarge'
-                            ? `This document is too large or too deeply nested to open safely. ${evt.message}`
-                            : evt.message,
-                    );
+                       previous document stays open. Issue #345 — so does
+                       an encrypted package opened through the API (an
+                       open from File → Open prompts for the password
+                       instead, and its errors belong to that dialog); a
+                       protection refusal is toasted by the ErrorToast
+                       (engine copy), not here. */
+                    if (evt.kind === 'Protected') break;
+                    if (
+                        dialogOwnsErrors &&
+                        (evt.kind === 'EncryptedDocument' || evt.kind === 'WrongPassword')
+                    ) {
+                        break;
+                    }
+                    setError(errorMessage(evt.kind, evt.message));
                     setPendingExportFormat(null);
                     setTimeout(() => setError(null), 6000);
                     break;
@@ -175,12 +222,54 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
         onCleanup(() => window.removeEventListener('keydown', handler));
     });
 
-    const onPickFile = async (file: File) => {
+    /** Open `file` (with `pw` when given); the reply. */
+    const openFile = async (file: File, pw?: string): Promise<Event> => {
         const bytes = new Uint8Array(await file.arrayBuffer());
+        dialogOwnsErrors = true;
+        try {
+            return await cmd.openDocument(
+                bytes,
+                file.name,
+                pw === undefined ? undefined : { password: pw },
+            );
+        } finally {
+            dialogOwnsErrors = false;
+        }
+    };
+
+    const onPickFile = async (file: File) => {
         setDocName(file.name);
-        await cmd.openDocument(bytes, file.name);
+        const evt = await openFile(file);
         closeAll();
         if (fileInput) fileInput.value = '';
+        /* Issue #345 — encrypted: ask for the password. */
+        if (evt.type === 'ERROR' && evt.kind === 'EncryptedDocument') {
+            setPassword('');
+            setPasswordError(null);
+            setLocked(file);
+        }
+    };
+
+    const unlock = async () => {
+        const file = locked();
+        if (!file || unlocking() || password() === '') return;
+        setUnlocking(true);
+        let evt: Event;
+        try {
+            evt = await openFile(file, password());
+        } finally {
+            setUnlocking(false);
+        }
+        if (evt.type === 'ERROR') {
+            setPasswordError(
+                evt.kind === 'WrongPassword'
+                    ? 'That password is incorrect. Try again.'
+                    : evt.message,
+            );
+            return;
+        }
+        setPassword('');
+        setLocked(null);
     };
 
     const onSave = async () => {
@@ -345,6 +434,62 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
             <Show when={error()}>
                 <div class="nge-fm__error" role="alert">{error()}</div>
             </Show>
+
+            {/* Issue #345 — the password prompt for an encrypted file. */}
+            <Dialog
+                open={locked() !== null}
+                title="Password required"
+                size="sm"
+                onClose={() => setLocked(null)}
+                footer={
+                    <>
+                        <button class="nge-btn" type="button" onClick={() => setLocked(null)}>
+                            Cancel
+                        </button>
+                        <button
+                            class="nge-btn nge-btn--primary nge-fm__unlock"
+                            type="button"
+                            disabled={unlocking() || password() === ''}
+                            onClick={() => void unlock()}
+                        >
+                            Open
+                        </button>
+                    </>
+                }
+            >
+                <form
+                    class="nge-fm__pw"
+                    onSubmit={(e) => {
+                        e.preventDefault();
+                        void unlock();
+                    }}
+                >
+                    <p class="nge-fm__pw-text">
+                        “{locked()?.name}” is encrypted. Enter its password to open it.
+                    </p>
+                    <input
+                        class="nge-fm__pw-input"
+                        type="password"
+                        autofocus
+                        autocomplete="off"
+                        aria-label="Document password"
+                        value={password()}
+                        onInput={(e) => {
+                            setPassword(e.currentTarget.value);
+                            setPasswordError(null);
+                        }}
+                    />
+                    <Show when={passwordError()}>
+                        <p class="nge-fm__pw-error" role="alert">
+                            {passwordError()}
+                        </p>
+                    </Show>
+                    <p class="nge-fm__pw-note">
+                        The password is not stored. Saving writes this document without a
+                        password.
+                    </p>
+                </form>
+            </Dialog>
         </>
     );
 };

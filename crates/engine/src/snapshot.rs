@@ -1008,6 +1008,36 @@ mod tests {
         assert_eq!(old.payload.font_size_cs, None);
     }
 
+    /// Issue #345 — a protected document's restriction survives crash
+    /// recovery byte-stably; an unprotected one encodes exactly as before
+    /// the field existed (no `protection` key).
+    #[test]
+    fn document_protection_round_trips_and_stays_absent_when_unset() {
+        let has_key = |bytes: &[u8], key: &[u8]| bytes.windows(key.len()).any(|w| w == key);
+        let plain = DocumentTree::from_text("x");
+        let plain_bytes = encode(&plain).unwrap();
+        assert!(!has_key(&plain_bytes, b"protection"));
+        let mut protected = plain.clone();
+        protected.settings.protection = Some(crate::DocumentProtection {
+            edit: Some(crate::ProtectionEdit::Forms),
+            enforcement: true,
+            hash: Some("aGFzaA==".into()),
+            salt: Some("c2FsdA==".into()),
+            spin_count: Some(100_000),
+            algorithm: Some("SHA-512".into()),
+        });
+        let bytes = encode(&protected).unwrap();
+        let back: Decoded<DocumentTree> = decode(&bytes).unwrap();
+        assert_eq!(back.payload.settings, protected.settings);
+        assert_eq!(
+            back.payload.protection_mode(),
+            Some(crate::ProtectionEdit::Forms)
+        );
+        assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
+        let old: Decoded<DocumentTree> = decode(&plain_bytes).unwrap();
+        assert_eq!(old.payload.settings.protection, None);
+    }
+
     /// Issue #79 — the `<w:bidiVisual>` flag survives crash recovery.
     #[test]
     fn table_bidi_visual_round_trips() {

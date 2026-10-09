@@ -279,7 +279,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   `shadow` / `frame` (`w:space` / `w:shadow` / `w:frame`, every border),
   `ParaProperties::shading_pattern` (`<w:shd w:val w:color>` beside the
   fill; clearing the shading clears it). Harness: `tools/roundtrip` step
-  56 (`ppr_attributes.docx`); `tools/corpus-native`'s `ppr_check` (an
+  57 (`ppr_attributes.docx`); `tools/corpus-native`'s `ppr_check` (an
   indent change on the first pPr paragraph respells only `<w:ind>`).
 - Positioned verbatim markers (`<w:proofErr/>`, non-TOC bookmarks,
   permission / move ranges, an empty `<w:fldSimple/>`, text-less runs with
@@ -561,7 +561,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
     whitespace between a run's children; an empty `<w:pict/>` run is kept
     verbatim; a source paragraph with no text mints no empty run and stays
     self-closing when nothing is inside.
-  Harness: `tools/roundtrip` step 55 (`regen_classes.docx`).
+  Harness: `tools/roundtrip` step 56 (`regen_classes.docx`).
 
 ## `styles.xml` is patched, not regenerated (issue #371)
 
@@ -589,7 +589,7 @@ Only the LAST source element of an id is compared (the parsed table's).
 numbering styles are not mirrored into the engine model: the part's own
 bytes are the source of truth, and format-docx's `StyleTable` already
 models their id / name / type / `basedOn` for the read-time cascade.
-Harness: `tools/roundtrip` step 57 (`styles_patch.docx`);
+Harness: `tools/roundtrip` step 58 (`styles_patch.docx`);
 `tools/corpus-native`'s `style_check` (bold toggled on `Heading1` or the
 first paragraph style: only that element of `styles.xml` may change).
 

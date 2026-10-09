@@ -132,3 +132,40 @@
     max-width: 480px;
     word-break: break-word;
 }
+
+/* Issue #345 — the password prompt for an encrypted document. */
+.nge-fm__pw {
+    display: flex;
+    flex-direction: column;
+    gap: var(--nge-space-2);
+}
+
+.nge-fm__pw-text,
+.nge-fm__pw-note,
+.nge-fm__pw-error {
+    margin: 0;
+    font: 400 var(--nge-font-size-sm)/1.4 var(--nge-font-ui);
+}
+
+.nge-fm__pw-note {
+    color: var(--nge-color-text-muted);
+}
+
+.nge-fm__pw-error {
+    color: var(--nge-color-danger);
+}
+
+.nge-fm__pw-input {
+    height: 32px;
+    padding: 0 var(--nge-space-2);
+    border: 1px solid var(--nge-color-border-strong);
+    border-radius: var(--nge-radius-sm);
+    background: var(--nge-color-bg);
+    color: var(--nge-color-text);
+    font: 400 var(--nge-font-size-sm)/1 var(--nge-font-ui);
+}
+
+.nge-fm__pw-input:focus-visible {
+    outline: 2px solid var(--nge-color-primary);
+    outline-offset: 1px;
+}
