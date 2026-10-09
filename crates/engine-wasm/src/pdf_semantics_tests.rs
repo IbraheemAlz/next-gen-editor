@@ -115,7 +115,7 @@ fn pdf_text(pdf: &[u8]) -> String {
 
 /// The semantic sample documents, by name.
 fn sample_docs() -> Vec<(&'static str, DocumentTree)> {
-    vec![("links", linked_doc())]
+    vec![("links", linked_doc()), ("metadata", metadata_doc())]
 }
 
 /// Local veraPDF probe: every [`sample_docs`] document × {1b, 2u, x3}
@@ -276,5 +276,73 @@ fn toc_hyperlink_entries_jump_to_their_headings() {
     assert!(
         pdf.matches("/Dest [").count() >= links,
         "every link has a /Dest"
+    );
+}
+
+/* ================================================================
+Task 3 — core properties become /Info + XMP.
+================================================================ */
+
+const CORE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>تقرير &amp; Report</dc:title><dc:subject>Accessibility</dc:subject><dc:creator>Ibrahim Z.</dc:creator><cp:keywords>pdf; ua</cp:keywords><dc:language>ar-SA</dc:language></cp:coreProperties>"#;
+
+/// A two-paragraph document whose retained package carries `CORE_XML`
+/// under a renamed part, reached through the package-root relationship.
+fn metadata_doc() -> DocumentTree {
+    let mut doc = doc_of(vec![
+        styled("Accessible export", Some("Heading1")),
+        styled("Body text.", None),
+    ]);
+    let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core2.xml"/></Relationships>"#;
+    doc.source_package = Some(Arc::new(engine::SourcePackage::from_entries([
+        ("_rels/.rels".to_string(), rels.as_bytes().to_vec()),
+        (
+            "docProps/core2.xml".to_string(),
+            CORE_XML.as_bytes().to_vec(),
+        ),
+    ])));
+    doc
+}
+
+#[test]
+fn core_properties_reach_info_and_xmp() {
+    let engine = engine_with(metadata_doc());
+    let meta = pdf_semantics::document_metadata(engine.undo.current());
+    assert_eq!(meta.title.as_deref(), Some("تقرير & Report"));
+    assert_eq!(meta.author.as_deref(), Some("Ibrahim Z."));
+    assert_eq!(meta.subject.as_deref(), Some("Accessibility"));
+    assert_eq!(meta.keywords.as_deref(), Some("pdf; ua"));
+    assert_eq!(meta.lang.as_deref(), Some("ar-SA"));
+    for profile in [
+        format_pdf::PdfProfile::A1b,
+        format_pdf::PdfProfile::A2u,
+        format_pdf::PdfProfile::X3,
+    ] {
+        let pdf = pdf_text(&export(&engine, profile));
+        assert!(pdf.contains("/Author (Ibrahim Z.)"), "{profile:?}");
+        assert!(pdf.contains("/Subject (Accessibility)"), "{profile:?}");
+        assert!(pdf.contains("<rdf:li>Ibrahim Z.</rdf:li>"), "{profile:?}");
+        assert!(
+            pdf.contains("<rdf:li xml:lang=\"x-default\">تقرير &amp; Report</rdf:li>"),
+            "{profile:?}"
+        );
+    }
+}
+
+#[test]
+fn author_falls_back_to_the_modeled_setting_and_lang_to_doc_defaults() {
+    let mut doc = doc_of(vec![styled("x", None)]);
+    doc.settings.author = Some("Modeled Author".into());
+    engine::GrabBag::push_into(
+        &mut doc.style_run_defaults.grab_bag,
+        br#"<w:lang w:val="en-GB" w:eastAsia="zh-CN" w:bidi="ar-EG"/>"#.to_vec(),
+    );
+    let meta = pdf_semantics::document_metadata(&doc);
+    assert_eq!(meta.author.as_deref(), Some("Modeled Author"));
+    assert_eq!(meta.title, None);
+    assert_eq!(meta.lang.as_deref(), Some("en-GB"));
+    assert_eq!(
+        pdf_semantics::default_lang(&doc, "w:bidi").as_deref(),
+        Some("ar-EG")
     );
 }

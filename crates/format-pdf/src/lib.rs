@@ -67,8 +67,8 @@
 //! - `/CreationDate`, `/ModDate` and the XMP dates are a **fixed, documented
 //!   timestamp** (`X3_DATE_XMP`) so exports stay byte-deterministic
 //!   (reproducible-build convention); they do not reflect wall-clock time.
-//! - `/Title` is a fixed string (`X3_TITLE`) — the export API carries no
-//!   document title today.
+//! - `/Title` is the document's `docProps/core.xml` title (issue #360),
+//!   else a fixed string (`X3_TITLE`).
 //!
 //! # Images (issue #121)
 //!
@@ -113,6 +113,14 @@
 //!   requires it) and `/Contents` (the link text). PDF/X-3 writes none: a
 //!   print-exchange file has no use for interactive annotations, and
 //!   ISO 15930 restricts annotations inside the trim area.
+//! - **Document information.** [`DocumentMetadata`] (the source package's
+//!   `docProps/core.xml`) becomes an `/Info` dictionary — `/Title`,
+//!   `/Author`, `/Subject`, `/Keywords` — and, in every conformant
+//!   profile, the matching XMP `dc:title` / `dc:creator` /
+//!   `dc:description` / `pdf:Keywords` (ISO 19005 requires every Info
+//!   entry with an XMP analogue to agree with it). PDF/X-3's `/Title` is
+//!   the real title when there is one. No core properties → no `/Info`
+//!   (X-3 aside) and the unchanged XMP packet.
 //!
 //! Every object it adds is allocated after the pre-#360 ones and only
 //! when the document has the feature, so an empty side table (what
@@ -162,7 +170,7 @@ pub use image::test_images;
 /// just not nameable from outside).
 pub use image::{AlphaMode, ImageColor, ImageEncoding, PreparedImage, prepare_image};
 pub use image::{ImageSkipReason, MAX_IMAGE_PIXELS};
-pub use semantic::{LinkSpan, LinkTarget, ParagraphSemantics, PdfSemantics};
+pub use semantic::{DocumentMetadata, LinkSpan, LinkTarget, ParagraphSemantics, PdfSemantics};
 
 /// Issue #258 — the shared PDF content-stream / string-literal decoder.
 /// See the module's own doc comment for why it lives here rather than in
@@ -175,12 +183,20 @@ pub mod test_support;
 const SRGB_ICC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/srgb-v2-micro.icc"));
 
 /// XMP metadata packet for a PDF/A document. The `pdfaid` keys are the
-/// conformance claim veraPDF checks; no Info dictionary is written, so there is
-/// nothing this must be kept consistent with (ISO 19005-1 §6.7.3 / 19005-2
-/// §6.6.4). `part` / `conformance` are `1`/`B` for A-1b and `2`/`U` for A-2u —
-/// the packet bytes for `(1, 'B')` are identical to the pre-A2u constant, so
-/// the A-1b output stays byte-stable.
-fn pdfa_xmp(part: u8, conformance: char) -> String {
+/// conformance claim veraPDF checks. `part` / `conformance` are `1`/`B` for
+/// A-1b and `2`/`U` for A-2u. Issue #360 — `meta`'s document information
+/// adds `dc:title` / `dc:creator` / `dc:description` / `pdf:Keywords`,
+/// kept equal to the `/Info` entries written beside it (ISO 19005-1
+/// §6.7.3 / 19005-2 §6.6.2.3 — every Info entry with an XMP analogue must
+/// match it). Without document information no Info dictionary is written
+/// and the packet bytes are identical to the pre-#360 constant, so
+/// existing output stays byte-stable.
+fn pdfa_xmp(part: u8, conformance: char, meta: &DocumentMetadata) -> String {
+    let pdf_ns = if meta.keywords.is_some() {
+        "    xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\"\n"
+    } else {
+        ""
+    };
     format!(
         concat!(
             "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
@@ -188,11 +204,13 @@ fn pdfa_xmp(part: u8, conformance: char) -> String {
             " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
             "  <rdf:Description rdf:about=\"\"\n",
             "    xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"\n",
+            "{pdf_ns}",
             "    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n",
             "    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">\n",
             "   <pdfaid:part>{part}</pdfaid:part>\n",
             "   <pdfaid:conformance>{conformance}</pdfaid:conformance>\n",
             "   <dc:format>application/pdf</dc:format>\n",
+            "{dc}",
             "   <xmp:CreatorTool>next-gen-editor</xmp:CreatorTool>\n",
             "  </rdf:Description>\n",
             " </rdf:RDF>\n",
@@ -201,12 +219,55 @@ fn pdfa_xmp(part: u8, conformance: char) -> String {
         ),
         part = part,
         conformance = conformance,
+        pdf_ns = pdf_ns,
+        dc = xmp_document_info(meta, true),
     )
 }
 
-/// `/Title` for the PDF/X-3 Info dictionary — the export API carries no
-/// document title, so a fixed honest placeholder keeps the required key
-/// present *and* the output byte-deterministic.
+/// Issue #360 — the XMP twins of the `/Info` document-information entries
+/// (`dc:title` only when `with_title`; X-3 writes its own). Empty for a
+/// document without core properties.
+fn xmp_document_info(meta: &DocumentMetadata, with_title: bool) -> String {
+    let mut out = String::new();
+    if with_title && let Some(t) = &meta.title {
+        out.push_str(&xmp_alt("dc:title", t));
+    }
+    if let Some(a) = &meta.author {
+        out.push_str(&format!(
+            "   <dc:creator>\n    <rdf:Seq>\n     <rdf:li>{}</rdf:li>\n    </rdf:Seq>\n   </dc:creator>\n",
+            xml_escape(a)
+        ));
+    }
+    if let Some(s) = &meta.subject {
+        out.push_str(&xmp_alt("dc:description", s));
+    }
+    if let Some(k) = &meta.keywords {
+        out.push_str(&format!(
+            "   <pdf:Keywords>{}</pdf:Keywords>\n",
+            xml_escape(k)
+        ));
+    }
+    out
+}
+
+/// One `rdf:Alt` language-alternative property with an `x-default` item.
+fn xmp_alt(tag: &str, value: &str) -> String {
+    format!(
+        "   <{tag}>\n    <rdf:Alt>\n     <rdf:li xml:lang=\"x-default\">{}</rdf:li>\n    </rdf:Alt>\n   </{tag}>\n",
+        xml_escape(value)
+    )
+}
+
+/// XML character data: `&`, `<`, `>` escaped (the packet's text nodes).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// `/Title` for the PDF/X-3 Info dictionary when the document has no
+/// core-properties title (issue #360) — a fixed honest placeholder keeps
+/// the required key present *and* the output byte-deterministic.
 const X3_TITLE: &str = "next-gen-editor document";
 
 /// The fixed timestamp PDF/X-3 output stamps into `/CreationDate`, `/ModDate`
@@ -230,8 +291,10 @@ fn x3_date() -> Date {
 /// XMP metadata packet for a PDF/X-3 document, kept consistent with the Info
 /// dictionary (`dc:title` ↔ `/Title`, `pdfxid:GTS_PDFXVersion` ↔
 /// `/GTS_PDFXVersion`, `pdf:Trapped` ↔ `/Trapped`, dates ↔
-/// `/CreationDate` + `/ModDate`).
-fn x3_xmp() -> String {
+/// `/CreationDate` + `/ModDate`; issue #360 — `dc:creator` ↔ `/Author`,
+/// `dc:description` ↔ `/Subject`, `pdf:Keywords` ↔ `/Keywords`). `title`
+/// is the document's core-properties title, else [`X3_TITLE`].
+fn x3_xmp(title: &str, meta: &DocumentMetadata) -> String {
     format!(
         concat!(
             "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
@@ -250,6 +313,7 @@ fn x3_xmp() -> String {
             "     <rdf:li xml:lang=\"x-default\">{title}</rdf:li>\n",
             "    </rdf:Alt>\n",
             "   </dc:title>\n",
+            "{dc}",
             "   <xmp:CreatorTool>next-gen-editor</xmp:CreatorTool>\n",
             "   <xmp:CreateDate>{date}</xmp:CreateDate>\n",
             "   <xmp:ModifyDate>{date}</xmp:ModifyDate>\n",
@@ -258,7 +322,8 @@ fn x3_xmp() -> String {
             "</x:xmpmeta>\n",
             "<?xpacket end=\"r\"?>",
         ),
-        title = X3_TITLE,
+        title = xml_escape(title),
+        dc = xmp_document_info(meta, false),
         date = X3_DATE_XMP,
     )
 }
@@ -442,6 +507,8 @@ impl PdfExportOptions {
 ///   becomes one `/Link` annotation per laid-out line it touches (`/URI`
 ///   or `/Dest` to a [`ParagraphSemantics::bookmarks`] paragraph); none
 ///   under PDF/X-3. See the module docs.
+/// - **Document information.** [`PdfSemantics::metadata`] → `/Info` +
+///   the XMP twins of its entries.
 ///
 /// An empty `semantics` produces exactly [`export_pdf_with_media`]'s bytes.
 pub fn export_pdf_document(
@@ -660,6 +727,14 @@ pub fn export_pdf_document(
     it keeps its object numbering (and bytes). */
     let outline = collected.plan_outline(&mut alloc);
     let annots = collected.plan_links(&mut alloc);
+    /* X-3 always has its Info dictionary (allocated above); the other
+    profiles get one only for a document with core properties. */
+    let meta = semantics.metadata.cleaned();
+    let doc_info_id = if !pdfx && meta.has_info() {
+        Some(alloc())
+    } else {
+        None
+    };
     if conformant {
         let mut hash_in: Vec<u8> = Vec::new();
         for c in &contents {
@@ -781,25 +856,36 @@ pub fn export_pdf_document(
             .filter(Filter::FlateDecode);
     }
 
+    let x3_title = meta.title.as_deref().unwrap_or(X3_TITLE);
     if let Some(info_id) = info_id {
         /* X-3 Info dictionary — every key mirrored into the XMP packet so
         the two stay consistent. The dates are the fixed deterministic
         timestamp; see `X3_DATE_XMP`. */
         let mut info = pdf.document_info(info_id);
-        info.title(TextStr(X3_TITLE));
+        info.title(TextStr(x3_title));
+        write_document_info(&mut info, &meta);
         info.creation_date(x3_date());
         info.modified_date(x3_date());
         info.trapped(TrappingStatus::NotTrapped);
         info.pair(Name(b"GTS_PDFXVersion"), TextStr("PDF/X-3:2003"));
+    }
+    if let Some(info_id) = doc_info_id {
+        /* Issue #360 — core properties as `/Info`; under PDF/A every
+        entry has its XMP twin in the packet below. */
+        let mut info = pdf.document_info(info_id);
+        if let Some(t) = &meta.title {
+            info.title(TextStr(t));
+        }
+        write_document_info(&mut info, &meta);
     }
 
     if conformant {
         pdf.icc_profile(icc_id.expect("icc id allocated for conformance"), SRGB_ICC)
             .n(3);
         let xmp = match profile {
-            PdfProfile::A1b => pdfa_xmp(1, 'B'),
-            PdfProfile::A2u => pdfa_xmp(2, 'U'),
-            PdfProfile::X3 => x3_xmp(),
+            PdfProfile::A1b => pdfa_xmp(1, 'B', &meta),
+            PdfProfile::A2u => pdfa_xmp(2, 'U', &meta),
+            PdfProfile::X3 => x3_xmp(x3_title, &meta),
             PdfProfile::Plain => unreachable!("Plain writes no metadata stream"),
         };
         pdf.metadata(
@@ -822,6 +908,20 @@ pub fn export_pdf_document(
 
     out.extend_from_slice(&pdf.finish());
     Ok(report)
+}
+
+/// Issue #360 — `/Author`, `/Subject`, `/Keywords` from the document's
+/// core properties (the caller writes `/Title`: X-3 always has one).
+fn write_document_info(info: &mut pdf_writer::writers::DocumentInfo<'_>, meta: &DocumentMetadata) {
+    if let Some(a) = &meta.author {
+        info.author(TextStr(a));
+    }
+    if let Some(s) = &meta.subject {
+        info.subject(TextStr(s));
+    }
+    if let Some(k) = &meta.keywords {
+        info.keywords(TextStr(k));
+    }
 }
 
 /// Issue #121 — one embedded image: its XObject ref, optional soft-mask

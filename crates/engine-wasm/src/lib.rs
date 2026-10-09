@@ -10433,7 +10433,10 @@ impl Engine {
         `para_texts`: every walk below runs beside the matching
         `walk_block_texts`; stories that carry no semantics (header /
         footer bands, text boxes) are padded with defaults. */
-        let mut semantics = format_pdf::PdfSemantics::default();
+        let mut semantics = format_pdf::PdfSemantics {
+            metadata: pdf_semantics::document_metadata(doc),
+            ..Default::default()
+        };
         for b in doc.blocks.iter() {
             walk_block_texts(b, &mut para_texts);
             pdf_semantics::walk_block_semantics(

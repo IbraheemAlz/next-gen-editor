@@ -181,6 +181,7 @@ fn outline_doc(stack: &FontStack) -> (Vec<PageBox>, Vec<&'static str>, PdfSemant
             heading(3, "Sub"),
             heading(1, "Next"),
         ],
+        ..Default::default()
     };
     (vec![p1, p2], texts, sem)
 }
@@ -240,6 +241,7 @@ fn a_heading_split_across_pages_gets_one_entry_at_its_first_fragment() {
     ];
     let sem = PdfSemantics {
         paragraphs: vec![heading(1, "Title")],
+        ..Default::default()
     };
     let pdf = export_with(
         &pages,
@@ -283,6 +285,7 @@ fn an_empty_heading_title_gets_no_entry() {
     ))])];
     let sem = PdfSemantics {
         paragraphs: vec![heading(1, "  ")],
+        ..Default::default()
     };
     let pdf = export_with(
         &pages,
@@ -336,6 +339,7 @@ fn an_external_link_gets_a_uri_annotation_over_its_glyphs() {
             links: vec![uri(10, 22, "https://example.com/a b?q=é")],
             ..Default::default()
         }],
+        ..Default::default()
     };
     for profile in [PdfProfile::Plain, PdfProfile::A1b, PdfProfile::A2u] {
         let pdf = export_with(
@@ -387,6 +391,7 @@ fn a_link_wrapping_over_lines_gets_one_annotation_per_line() {
             links: vec![uri(16, text.len() as u32, "https://example.com/")],
             ..Default::default()
         }],
+        ..Default::default()
     };
     let pdf = export_with(
         &pages,
@@ -434,6 +439,7 @@ fn an_internal_link_targets_the_bookmarked_paragraph() {
                 ..Default::default()
             },
         ],
+        ..Default::default()
     };
     let pdf = export_with(
         &[p1, p2],
@@ -465,6 +471,7 @@ fn script_uris_and_pdfx3_get_no_annotation() {
             links: vec![uri(0, 5, target)],
             ..Default::default()
         }],
+        ..Default::default()
     };
     for bad in [
         "javascript:alert(1)",
@@ -509,6 +516,7 @@ fn rtl_link_rect_covers_the_visual_glyphs() {
             links: vec![uri(start, end, "https://example.org")],
             ..Default::default()
         }],
+        ..Default::default()
     };
     let pdf = export_with(
         &pages,
@@ -546,4 +554,181 @@ fn sanitize_uri_percent_encodes_and_refuses_scripts() {
     );
     assert_eq!(sanitize_uri("VBScript:msgbox"), None);
     assert_eq!(sanitize_uri(""), None);
+}
+
+/* ================================================================
+Task 3 — document information (/Info + XMP) from core properties.
+================================================================ */
+
+/// The decoded bytes of the string right after the first `key`: a hex
+/// string `<…>` or a literal `(…)` with `\\`-escapes and octal codes.
+pub(crate) fn literal_after(pdf: &[u8], key: &[u8]) -> Vec<u8> {
+    let at = pdf
+        .windows(key.len())
+        .position(|w| w == key)
+        .unwrap_or_else(|| panic!("{}", String::from_utf8_lossy(key)))
+        + key.len();
+    if pdf[at] == b'<' {
+        let end = at + pdf[at..].iter().position(|&b| b == b'>').expect(">");
+        let hex: Vec<u8> = pdf[at + 1..end]
+            .iter()
+            .copied()
+            .filter(u8::is_ascii_hexdigit)
+            .collect();
+        return hex
+            .chunks(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect();
+    }
+    assert_eq!(pdf[at], b'(', "a literal string");
+    let (mut out, mut i, mut depth) = (Vec::new(), at + 1, 0);
+    loop {
+        match pdf[i] {
+            b'\\' => {
+                i += 1;
+                match pdf[i] {
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'b' => out.push(8),
+                    b'f' => out.push(12),
+                    d @ b'0'..=b'7' => {
+                        let mut v = u32::from(d - b'0');
+                        for _ in 0..2 {
+                            if matches!(pdf[i + 1], b'0'..=b'7') {
+                                i += 1;
+                                v = v * 8 + u32::from(pdf[i] - b'0');
+                            }
+                        }
+                        out.push(v as u8);
+                    }
+                    c => out.push(c),
+                }
+            }
+            b'(' => {
+                depth += 1;
+                out.push(b'(');
+            }
+            b')' if depth == 0 => return out,
+            b')' => {
+                depth -= 1;
+                out.push(b')');
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+}
+
+fn meta_sem() -> PdfSemantics {
+    PdfSemantics {
+        metadata: DocumentMetadata {
+            title: Some("Q3 <Report> & Plan".into()),
+            author: Some("إبراهيم\tZ.".into()),
+            subject: Some("Finance".into()),
+            keywords: Some("budget; Q3".into()),
+            lang: Some("ar-SA".into()),
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn core_properties_become_info_and_matching_xmp() {
+    let stack = stack();
+    let text = "Body text.";
+    let pages = vec![page(vec![LayoutBlock::Paragraph(para(
+        &stack, text, 0, None, false,
+    ))])];
+    for profile in [PdfProfile::A1b, PdfProfile::A2u, PdfProfile::X3] {
+        let pdf = export_with(
+            &pages,
+            &stack,
+            &[text],
+            &meta_sem(),
+            PdfExportOptions::new(profile),
+        );
+        let s = String::from_utf8_lossy(&pdf);
+        /* Info: the title in PDFDocEncoding, the Arabic author as UTF-16BE
+        (the tab became a space in both representations). */
+        assert!(s.contains("/Title (Q3 <Report> & Plan)"), "{profile:?}");
+        assert!(s.contains("/Subject (Finance)"), "{profile:?}");
+        assert!(s.contains("/Keywords (budget; Q3)"), "{profile:?}");
+        let utf16: Vec<u8> = std::iter::once(0xFEFF_u16)
+            .chain("إبراهيم Z.".encode_utf16())
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        assert_eq!(
+            literal_after(&pdf, b"/Author "),
+            utf16,
+            "{profile:?}: UTF-16BE /Author"
+        );
+        /* XMP twins, XML-escaped. */
+        assert!(s.contains("<rdf:li xml:lang=\"x-default\">Q3 &lt;Report&gt; &amp; Plan</rdf:li>"));
+        assert!(s.contains("<rdf:li>إبراهيم Z.</rdf:li>"), "{profile:?}");
+        assert!(s.contains("<dc:description>"), "{profile:?}");
+        assert!(
+            s.contains("<pdf:Keywords>budget; Q3</pdf:Keywords>"),
+            "{profile:?}"
+        );
+        assert!(
+            s.contains("xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\""),
+            "{profile:?}"
+        );
+        assert_eq!(s.matches("/Title").count(), 1, "{profile:?}: one Info dict");
+    }
+    /* X-3's fixed placeholder title gives way to the real one. */
+    let x3 = export_with(
+        &pages,
+        &stack,
+        &[text],
+        &meta_sem(),
+        PdfExportOptions::new(PdfProfile::X3),
+    );
+    assert!(!contains(&x3, X3_TITLE.as_bytes()));
+    /* Plain: an Info dictionary, no metadata stream. */
+    let plain = export_with(
+        &pages,
+        &stack,
+        &[text],
+        &meta_sem(),
+        PdfExportOptions::new(PdfProfile::Plain),
+    );
+    assert!(contains(&plain, b"/Title (Q3 <Report> & Plan)"));
+    assert!(!contains(&plain, b"/Metadata"));
+}
+
+#[test]
+fn without_core_properties_nothing_changes() {
+    let stack = stack();
+    let text = "Body text.";
+    let pages = vec![page(vec![LayoutBlock::Paragraph(para(
+        &stack, text, 0, None, false,
+    ))])];
+    /* Only a language (no Info entry): still the pre-#360 bytes. */
+    let lang_only = PdfSemantics {
+        metadata: DocumentMetadata {
+            lang: Some("en-GB".into()),
+            title: Some("  \t ".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for profile in [
+        PdfProfile::Plain,
+        PdfProfile::A1b,
+        PdfProfile::A2u,
+        PdfProfile::X3,
+    ] {
+        let mut base = Vec::new();
+        export_pdf(&pages, &stack, &[text], profile, &mut base).expect("export");
+        let got = export_with(
+            &pages,
+            &stack,
+            &[text],
+            &lang_only,
+            PdfExportOptions::new(profile),
+        );
+        assert!(base == got, "{profile:?}: byte-identical");
+    }
 }

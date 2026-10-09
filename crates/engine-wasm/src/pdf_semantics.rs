@@ -1,7 +1,7 @@
 //! Issue #360 — the document-model side table `format_pdf::
 //! export_pdf_document` consumes: what the PDF needs (headings for the
-//! outline, hyperlinks and bookmarks for link annotations) that the layout
-//! box tree does not carry.
+//! outline, hyperlinks and bookmarks for link annotations, core
+//! properties for `/Info` + XMP) that the layout box tree does not carry.
 //!
 //! The table is indexed like `do_export_pdf`'s `para_texts` — by
 //! `ParagraphBox::source_paragraph_id` — so every walk here mirrors the
@@ -74,6 +74,50 @@ fn paragraph_semantics(
             .collect(),
         bookmarks: bookmark_names(p),
     }
+}
+
+/// The document information `format_pdf` writes as `/Info` + XMP: the
+/// source package's core-properties part (`docProps/core.xml`, located
+/// through the package-root relationship — the part itself rides the OPC
+/// passthrough verbatim; this only reads it), with the modeled
+/// `settings.author` as the author fallback (a document whose package was
+/// detached). The language is `dc:language`, else the `<w:docDefaults>`
+/// run properties' `<w:lang w:val>` (an unmodeled grab-bag child — see
+/// issue #344).
+pub(crate) fn document_metadata(doc: &engine::DocumentTree) -> format_pdf::DocumentMetadata {
+    let core = doc
+        .source_package
+        .as_deref()
+        .and_then(|pkg| {
+            let get = |name: &str| pkg.entry(name);
+            let name = format_docx::opc::part_names::PartNames::core_props_name(&get);
+            pkg.entry(&name)
+        })
+        .and_then(|xml| format_docx::parts::core_props::parse_core_props_xml(xml).ok())
+        .unwrap_or_default();
+    format_pdf::DocumentMetadata {
+        title: core.title,
+        author: core.creator.or_else(|| doc.settings.author.clone()),
+        subject: core.subject,
+        keywords: core.keywords,
+        lang: core.language.or_else(|| default_lang(doc, "w:val")),
+    }
+}
+
+/// An attribute (`w:val` / `w:bidi` / `w:eastAsia`) of the `<w:lang>`
+/// element in the document's default run properties, when present.
+pub(crate) fn default_lang(doc: &engine::DocumentTree, key: &str) -> Option<String> {
+    engine::GrabBag::fragments_of(&doc.style_run_defaults.grab_bag)
+        .iter()
+        .find_map(|frag| {
+            let xml = String::from_utf8_lossy(frag);
+            let tag = xml.trim_start().strip_prefix("<w:lang")?;
+            if !tag.starts_with(|c: char| c.is_whitespace() || c == '/' || c == '>') {
+                return None;
+            }
+            let end = tag.find('>').unwrap_or(tag.len());
+            attr(&tag[..end], key).filter(|v| !v.trim().is_empty())
+        })
 }
 
 /// Every bookmark name anchored in `p`: the modeled `_Toc*` bookmarks

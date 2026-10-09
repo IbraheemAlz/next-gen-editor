@@ -72,6 +72,61 @@ pub struct PdfSemantics {
     /// Indexed by `ParagraphBox::source_paragraph_id` (the same flat
     /// table `para_texts` is).
     pub paragraphs: Vec<ParagraphSemantics>,
+    /// Document information (`docProps/core.xml`).
+    pub metadata: DocumentMetadata,
+}
+
+/// Issue #360 — document information from the source package's core
+/// properties (`docProps/core.xml`). Every field is optional; a document
+/// with none of title / author / subject / keywords writes no `/Info`
+/// (X-3 excepted — it always has one) and an unchanged XMP packet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentMetadata {
+    /// `dc:title` → `/Title` + XMP `dc:title`.
+    pub title: Option<String>,
+    /// `dc:creator` → `/Author` + XMP `dc:creator`.
+    pub author: Option<String>,
+    /// `dc:subject` → `/Subject` + XMP `dc:description` (the ISO 19005
+    /// Info ↔ XMP pairing).
+    pub subject: Option<String>,
+    /// `cp:keywords` → `/Keywords` + XMP `pdf:Keywords`.
+    pub keywords: Option<String>,
+    /// The document's natural language (BCP 47 — `dc:language`, else the
+    /// `<w:docDefaults>` `w:lang`): a tagged export's catalog `/Lang`.
+    pub lang: Option<String>,
+}
+
+impl DocumentMetadata {
+    /// Whether any `/Info` entry exists.
+    pub(crate) fn has_info(&self) -> bool {
+        self.title.is_some()
+            || self.author.is_some()
+            || self.subject.is_some()
+            || self.keywords.is_some()
+    }
+
+    /// Every value with control characters (not representable in the XMP
+    /// packet's XML) turned into spaces and trimmed, blanks dropped — so
+    /// `/Info` and XMP carry the same string.
+    pub(crate) fn cleaned(&self) -> Self {
+        let clean = |v: &Option<String>| {
+            v.as_deref().and_then(|s| {
+                let t: String = s
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
+                let t = t.trim();
+                (!t.is_empty()).then(|| t.to_string())
+            })
+        };
+        Self {
+            title: clean(&self.title),
+            author: clean(&self.author),
+            subject: clean(&self.subject),
+            keywords: clean(&self.keywords),
+            lang: clean(&self.lang),
+        }
+    }
 }
 
 impl PdfSemantics {
