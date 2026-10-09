@@ -185,3 +185,133 @@ pub fn no_pgsz_docx(paragraph_text: &str) -> Vec<u8> {
     }
     buf
 }
+
+/* ============================================================
+Issue #355 — theme fixtures. Our own XML (no part copied from a
+Word package): the structure of Word's stock "Office" theme (2013+)
+with its documented font and colour values.
+============================================================ */
+
+/// Relationship type of a theme part.
+pub const THEME_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+/// Relationship type of the settings part.
+pub const SETTINGS_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings";
+
+/// A theme part with the given body (`minor`) / heading (`major`) fonts —
+/// `(latin, arab)` typefaces per collection — laid out the way Word writes
+/// its stock theme (empty `a:ea` / `a:cs`, the complex-script and East
+/// Asian faces per script), with Word's stock colour scheme.
+/// [`word_default_theme_xml`] is the stock instance.
+pub fn theme_xml(minor: (&str, &str), major: (&str, &str)) -> String {
+    let collection = |tag: &str, (latin, arab): (&str, &str), cjk: &str| {
+        format!(
+            "<a:{tag}><a:latin typeface=\"{latin}\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/>\
+             <a:font script=\"Jpan\" typeface=\"{cjk}\"/><a:font script=\"Arab\" typeface=\"{arab}\"/>\
+             <a:font script=\"Hebr\" typeface=\"{arab}\"/><a:font script=\"Thai\" typeface=\"Tahoma\"/></a:{tag}>"
+        )
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+         <a:theme xmlns:a=\"{A_NS}\" name=\"Office Theme\"><a:themeElements>\
+         <a:clrScheme name=\"Office\">\
+         <a:dk1><a:sysClr val=\"windowText\" lastClr=\"000000\"/></a:dk1>\
+         <a:lt1><a:sysClr val=\"window\" lastClr=\"FFFFFF\"/></a:lt1>\
+         <a:dk2><a:srgbClr val=\"44546A\"/></a:dk2><a:lt2><a:srgbClr val=\"E7E6E6\"/></a:lt2>\
+         <a:accent1><a:srgbClr val=\"4472C4\"/></a:accent1><a:accent2><a:srgbClr val=\"ED7D31\"/></a:accent2>\
+         <a:accent3><a:srgbClr val=\"A5A5A5\"/></a:accent3><a:accent4><a:srgbClr val=\"FFC000\"/></a:accent4>\
+         <a:accent5><a:srgbClr val=\"5B9BD5\"/></a:accent5><a:accent6><a:srgbClr val=\"70AD47\"/></a:accent6>\
+         <a:hlink><a:srgbClr val=\"0563C1\"/></a:hlink><a:folHlink><a:srgbClr val=\"954F72\"/></a:folHlink>\
+         </a:clrScheme><a:fontScheme name=\"Office\">{major}{minor}</a:fontScheme>\
+         <a:fmtScheme name=\"Office\"><a:fillStyleLst><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill>\
+         </a:fillStyleLst></a:fmtScheme></a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>",
+        major = collection("majorFont", major, "游ゴシック Light"),
+        minor = collection("minorFont", minor, "游明朝"),
+    )
+}
+
+/// Word's stock theme fonts: Calibri / Calibri Light for Latin, Arial /
+/// Times New Roman for Arabic (`+Body CS` / `+Headings CS`).
+pub fn word_default_theme_xml() -> String {
+    theme_xml(("Calibri", "Arial"), ("Calibri Light", "Times New Roman"))
+}
+
+/// The `<w:settings>` Word writes beside a theme: `<w:themeFontLang>`
+/// (here with an Arabic `w:bidi`) and the identity `<w:clrSchemeMapping>`.
+pub fn theme_settings_xml() -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+         <w:settings xmlns:w=\"{W_NS}\"><w:zoom w:percent=\"100\"/><w:defaultTabStop w:val=\"720\"/>\
+         <w:themeFontLang w:val=\"en-US\" w:bidi=\"ar-SA\"/>\
+         <w:clrSchemeMapping w:bg1=\"light1\" w:t1=\"dark1\" w:bg2=\"light2\" w:t2=\"dark2\" \
+         w:accent1=\"accent1\" w:accent2=\"accent2\" w:accent3=\"accent3\" w:accent4=\"accent4\" \
+         w:accent5=\"accent5\" w:accent6=\"accent6\" w:hyperlink=\"hyperlink\" \
+         w:followedHyperlink=\"followedHyperlink\"/></w:settings>"
+    )
+}
+
+/// Add a theme part (and optionally a settings part) to a package such as
+/// a `build_minimal_docx` output: the parts are appended under Word's
+/// names, related from `word/_rels/document.xml.rels` and declared in
+/// `[Content_Types].xml`. Every other entry keeps its bytes and order.
+pub fn with_theme_parts(docx: &[u8], theme_xml: &str, settings_xml: Option<&str>) -> Vec<u8> {
+    use std::io::Read;
+    let mut zin = zip::ZipArchive::new(Cursor::new(docx)).expect("read package");
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zin.len() + 2);
+    for i in 0..zin.len() {
+        let mut f = zin.by_index(i).expect("zip entry");
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).expect("read entry");
+        entries.push((f.name().to_owned(), buf));
+    }
+    let insert_before = |xml: &[u8], close: &str, add: &str| -> Vec<u8> {
+        let xml = std::str::from_utf8(xml).expect("utf8 part");
+        let at = xml.rfind(close).expect("closing tag");
+        format!("{}{add}{}", &xml[..at], &xml[at..]).into_bytes()
+    };
+    for (name, buf) in &mut entries {
+        if name == "word/_rels/document.xml.rels" {
+            let mut add = format!(
+                "<Relationship Id=\"rIdTheme1\" Type=\"{THEME_REL}\" Target=\"theme/theme1.xml\"/>"
+            );
+            if settings_xml.is_some() {
+                add.push_str(&format!(
+                    "<Relationship Id=\"rIdSettings1\" Type=\"{SETTINGS_REL}\" Target=\"settings.xml\"/>"
+                ));
+            }
+            *buf = insert_before(buf, "</Relationships>", &add);
+        } else if name == "[Content_Types].xml" {
+            let mut add = String::from(
+                "<Override PartName=\"/word/theme/theme1.xml\" \
+                 ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/>",
+            );
+            if settings_xml.is_some() {
+                add.push_str(
+                    "<Override PartName=\"/word/settings.xml\" \
+                     ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>",
+                );
+            }
+            *buf = insert_before(buf, "</Types>", &add);
+        }
+    }
+    entries.push((
+        "word/theme/theme1.xml".into(),
+        theme_xml.as_bytes().to_vec(),
+    ));
+    if let Some(s) = settings_xml {
+        entries.push(("word/settings.xml".into(), s.as_bytes().to_vec()));
+    }
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(Cursor::new(&mut out));
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in &entries {
+            zip.start_file(name.as_str(), opts).expect("zip entry");
+            zip.write_all(bytes).expect("zip write");
+        }
+        zip.finish().expect("zip finish");
+    }
+    out
+}

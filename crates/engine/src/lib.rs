@@ -74,6 +74,7 @@ pub mod html;
 pub mod numbering;
 pub mod package;
 pub mod snapshot;
+pub mod theme;
 
 pub mod toc;
 pub use fields::{
@@ -81,6 +82,10 @@ pub use fields::{
     TypedField, render_date_time_picture,
 };
 pub use package::{MediaRef, PackageEntry, SourcePackage};
+pub use theme::{
+    ColorScheme, ColorSchemeMapping, DocumentTheme, FontScheme, SchemeColor, ThemeFontLang,
+    ThemeFonts,
+};
 pub use toc::{TocEntry, TocHeading};
 
 /// Top-level document block (Phase 5 PR 1). Tables sit alongside
@@ -317,6 +322,16 @@ pub struct DocumentTree {
     /// the `Arc`; never mutated after open.
     #[serde(with = "package::arc_option", skip_serializing_if = "Option::is_none")]
     pub source_package: Option<std::sync::Arc<SourcePackage>>,
+    /// Issue #355 — the parsed `word/theme/theme1.xml` (+ the
+    /// `<w:themeFontLang>` / `<w:clrSchemeMapping>` settings that select
+    /// into it). Read-only: the part itself rides [`Self::source_package`]
+    /// verbatim; layout resolves `<w:rFonts>` theme attributes and
+    /// `<w:color w:themeColor>` against this model. `None` for an
+    /// engine-authored document or a package without a theme part.
+    /// Shared by every undo state via the `Arc`; skipped when `None`, so a
+    /// theme-less snapshot encodes byte-identically to a pre-#355 one.
+    #[serde(with = "theme::arc_option", skip_serializing_if = "Option::is_none")]
+    pub theme: Option<std::sync::Arc<DocumentTheme>>,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -5032,6 +5047,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5084,6 +5100,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5138,6 +5155,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5173,6 +5191,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5208,6 +5227,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -5296,6 +5316,7 @@ impl DocumentTree {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         }
     }
 
@@ -6420,6 +6441,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -6480,6 +6502,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -6608,6 +6631,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         if let Some(e) = edit {
             out.remap_text_edit_record(&target, e);
@@ -6675,6 +6699,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -6727,6 +6752,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -6786,6 +6812,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -6851,6 +6878,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -6921,6 +6949,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7061,6 +7090,7 @@ impl DocumentTree {
             part_root_attrs: split.part_root_attrs.clone(),
             document_envelope: split.document_envelope.clone(),
             source_package: split.source_package.clone(),
+            theme: split.theme.clone(),
         }
     }
 
@@ -7169,6 +7199,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7276,6 +7307,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         if let Some(e) = removed_edit {
             out.remap_text_edit_record(&path, e);
@@ -7349,6 +7381,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         (doc, new_id)
     }
@@ -7430,6 +7463,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         Some((doc, new_id))
     }
@@ -7490,6 +7524,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7526,6 +7561,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7615,6 +7651,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7726,6 +7763,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7835,6 +7873,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7920,6 +7959,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -7981,6 +8021,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8039,6 +8080,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8165,6 +8207,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8240,6 +8283,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8294,6 +8338,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -8413,6 +8458,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         if let Some(e) = edit {
             out.remap_text_edit_record(&target, e);
@@ -8474,6 +8520,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8806,6 +8853,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 
@@ -8859,6 +8907,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             };
             if let Some(e) = edit {
                 out.remap_text_edit_record(&start.path, e);
@@ -9000,6 +9049,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         /* Issue #252 — the merge removed blocks `sp+1..=ep` and spliced
         `ep`'s tail onto `sp`: anchors follow their text. */
@@ -9041,6 +9091,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -9092,6 +9143,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         /* Issue #152 — the right half is a new block: comment anchors
         behind the split point (and in every later block) follow it. */
@@ -9296,6 +9348,7 @@ impl DocumentTree {
                     part_root_attrs: self.part_root_attrs.clone(),
                     document_envelope: self.document_envelope.clone(),
                     source_package: self.source_package.clone(),
+                    theme: self.theme.clone(),
                 }
                 .with_list_markers_refreshed(),
                 caret,
@@ -9348,6 +9401,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -9587,6 +9641,7 @@ impl DocumentTree {
                 part_root_attrs: self.part_root_attrs.clone(),
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
+                theme: self.theme.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -9764,6 +9819,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         /* Issue #152 — the table (+ its escape paragraph) slid every
         later block down: keep comment anchors on their paragraphs. */
@@ -9807,6 +9863,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         };
         /* Issue #152 — later blocks slid up by one. */
         if removed {
@@ -10392,6 +10449,7 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+            theme: self.theme.clone(),
         }
     }
 }
@@ -14967,6 +15025,7 @@ mod tests {
             part_root_attrs: Default::default(),
             document_envelope: Default::default(),
             source_package: None,
+            theme: None,
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

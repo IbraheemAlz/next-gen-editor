@@ -580,17 +580,23 @@ pub fn read_docx_with_settings(
     /* Phase 2 audit — `word/settings.xml` rides `other_entries`
     verbatim for round-trip; the typed read just lifts the
     `even_and_odd_headers` toggle the paginator needs. */
-    if let Some(bytes) = other_entries
+    let settings_part = other_entries
         .iter()
         .find(|(n, _)| n == SETTINGS_XML)
-        .map(|(_, b)| b.as_slice())
-        && let Ok(settings) = crate::parts::settings::parse_settings_xml(bytes)
-    {
+        .and_then(|(_, b)| crate::parts::settings::parse_settings_xml(b).ok());
+    if let Some(settings) = &settings_part {
         document.settings.even_and_odd_headers = settings.even_and_odd_headers;
         /* Issue #80 — document-level note properties. */
         document.footnote_props = settings.footnote_props;
         document.endnote_props = settings.endnote_props;
     }
+
+    /* Issue #355 — the theme part rides `other_entries` verbatim; the
+    typed read (+ the settings that select into it) feeds theme-font and
+    theme-colour resolution at layout time. */
+    document.theme =
+        crate::parts::theme::read_document_theme(&other_entries, settings_part.as_ref())
+            .map(std::sync::Arc::new);
 
     /* Issue #77 — `docProps/core.xml` rides `other_entries` verbatim;
     the typed read lifts `<dc:creator>` so `AUTHOR` fields resolve. */

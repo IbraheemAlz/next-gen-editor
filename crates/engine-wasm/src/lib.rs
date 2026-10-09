@@ -229,6 +229,17 @@ struct EngineSnapshotV1 {
     /// snapshots, so their bytes are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     package_hash: Option<String>,
+    /// Issue #355 — the current document's theme (`DocumentTree::theme`),
+    /// persisted ONCE like [`Self::source_package`]: every history entry
+    /// of one undo stack shares it (read at open, never mutated), so
+    /// [`Engine::capture_snapshot`] strips it from the entries and
+    /// [`Engine::restore_snapshot`] re-attaches it. Absent for a
+    /// theme-less document, so those snapshots' bytes are unchanged.
+    #[serde(
+        with = "engine::theme::arc_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    theme: Option<Arc<engine::DocumentTheme>>,
 }
 
 /// Issue #212 — the cached detached package (see `Engine::detached_package`).
@@ -8675,6 +8686,18 @@ impl Engine {
                 }
             }
         }
+        /* Issue #355 — the theme rides the envelope once, like the package. */
+        let theme = doc_history.get(undo_cursor).and_then(|d| d.theme.clone());
+        if let Some(theme) = &theme {
+            for d in &mut doc_history {
+                if d.theme
+                    .as_ref()
+                    .is_some_and(|t| Arc::ptr_eq(t, theme) || **t == **theme)
+                {
+                    d.theme = None;
+                }
+            }
+        }
         EngineSnapshotV1 {
             source_package: persisted_package,
             doc_history,
@@ -8690,6 +8713,7 @@ impl Engine {
             layout_cfg: self.layout_cfg.as_ref().map(LayoutCfgSnapshot::capture),
             document_name: self.document_name.clone(),
             package_hash: None,
+            theme,
         }
     }
 
@@ -8805,6 +8829,14 @@ impl Engine {
             for d in &mut s.doc_history {
                 if d.source_package.is_none() {
                     d.source_package = Some(pkg.clone());
+                }
+            }
+        }
+        /* Issue #355 — re-attach the once-persisted theme. */
+        if let Some(theme) = s.theme.take() {
+            for d in &mut s.doc_history {
+                if d.theme.is_none() {
+                    d.theme = Some(theme.clone());
                 }
             }
         }
@@ -27029,6 +27061,47 @@ mod snapshot_tests {
         assert!(pkg.entry("word/settings.xml").is_some());
         let current_pkg = e.undo.current().source_package.clone().unwrap();
         assert_eq!(**pkg, *current_pkg);
+    }
+
+    /// Issue #355 — the parsed theme rides the snapshot envelope ONCE
+    /// (like the package), is re-attached to every history entry on
+    /// restore, and the re-snapshot is byte-stable.
+    #[test]
+    fn snapshot_persists_the_theme_once() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let theme = e.undo.current().theme.clone().expect("fixture has a theme");
+        assert_eq!(theme.fonts.minor.latin, "Calibri");
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(4, 0),
+            caret: bpos_top(4, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        for word in ["a", "b", "c"] {
+            let evt = apply(&mut e, insert(word));
+            assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        }
+        let bytes = e.snapshot_bytes().unwrap();
+        /* `by_script` is a model key (one per font collection) — the theme
+        part's own XML never spells it. */
+        let needle = b"by_script";
+        let hits = bytes.windows(needle.len()).filter(|w| w == needle).count();
+        assert_eq!(hits, 2, "one theme (major + minor) for the whole window");
+
+        let mut b = engine();
+        b.restore_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            b.snapshot_bytes().unwrap(),
+            bytes,
+            "byte-stable re-snapshot"
+        );
+        assert_eq!(b.undo.current().theme, Some(theme.clone()));
+        apply(&mut b, Command::Undo);
+        assert_eq!(
+            b.undo.current().theme,
+            Some(theme),
+            "re-attached to history"
+        );
     }
 
     /// Issue #213 — the clipboard `.docx` fragment always went through
