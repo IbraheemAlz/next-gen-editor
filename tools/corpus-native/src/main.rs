@@ -31,7 +31,16 @@
 //! [`DEFAULT_LAYOUT_BUDGET_MS`]): a layout still running past it reports
 //! `outcome: "timeout"`, `stage: "engine_layout"` with every other column
 //! intact, instead of stalling the run until `--timeout-secs` kills the
-//! worker. `--no-engine-layout` skips the stage; `--time` prints one
+//! worker.
+//!
+//! Issue #418 — the budget is **CPU time** (`getrusage`), not wall clock: a
+//! loaded machine stretches wall time but not the CPU a layout needs, so
+//! it no longer produces false timeouts (a wall-clock backstop of 8x the
+//! budget still ends a layout that blocks without burning CPU). The record
+//! carries both `engine_layout_cpu_ms` and `engine_layout_wall_ms`. A
+//! document that times out is run once more, alone, and recorded as
+//! `timeout` only if the retry times out too (`timeout_retry` holds the
+//! first attempt; `recovered: true` means the first timeout was noise). `--no-engine-layout` skips the stage; `--time` prints one
 //! timing line per document and the slowest production layouts at the
 //! end.
 //!
@@ -467,6 +476,8 @@ fn main() -> ExitCode {
     documents that blew the budget, and a degradation-reason histogram. */
     let mut engine_times: Vec<(u128, String)> = Vec::new();
     let mut engine_over_budget: Vec<String> = Vec::new();
+    /* Issue #418 — first-attempt timeouts that the lone retry cleared. */
+    let mut timeouts_recovered = 0usize;
     let mut engine_reasons: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     /* Issue #355 — theme-font resolution: documents with a theme part,
@@ -486,7 +497,29 @@ fn main() -> ExitCode {
             .replace('\\', "/");
         let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-        let rec = run_in_subprocess(&exe, path, &label, size_bytes, timeout, &args);
+        let mut rec = run_in_subprocess(&exe, path, &label, size_bytes, timeout, &args);
+        /* Issue #418 — a timeout under machine load says little about the
+        document (two different documents "timed out" at load 30-60 and lay
+        out in 2-3.5 s alone). Run it once more, alone - the driver is
+        serial, so nothing of ours competes - and record `timeout` only if
+        that attempt times out too. The first attempt's numbers ride along
+        in `timeout_retry`. */
+        if rec.outcome == pipeline::Outcome::Timeout {
+            let first = pipeline::TimeoutRetry {
+                first_stage: rec.stage.clone(),
+                first_wall_ms: rec.engine_layout_wall_ms,
+                first_cpu_ms: rec.engine_layout_cpu_ms,
+                recovered: false,
+            };
+            eprintln!("[corpus-native] {label}: timeout, retrying once alone");
+            let mut second = run_in_subprocess(&exe, path, &label, size_bytes, timeout, &args);
+            let recovered = second.outcome != pipeline::Outcome::Timeout;
+            second.timeout_retry = Some(pipeline::TimeoutRetry { recovered, ..first });
+            if recovered {
+                timeouts_recovered += 1;
+            }
+            rec = second;
+        }
         match rec.outcome {
             pipeline::Outcome::Ok => ok += 1,
             pipeline::Outcome::Error => errors += 1,
@@ -513,9 +546,10 @@ fn main() -> ExitCode {
             let ms = |v: Option<u128>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
             eprintln!(
                 "[corpus-native] time {label}: outcome={:?} engine_layout_ms={} \
-                 engine_pages={} reduced_layout_ms={} elapsed_ms={}",
+                 engine_layout_cpu_ms={} engine_pages={} reduced_layout_ms={} elapsed_ms={}",
                 rec.outcome,
                 ms(rec.engine_layout_ms),
+                ms(rec.engine_layout_cpu_ms),
                 rec.engine_page_count
                     .map_or_else(|| "-".to_string(), |v| v.to_string()),
                 ms(rec.layout_ms),
@@ -691,13 +725,13 @@ fn main() -> ExitCode {
         let total: u128 = engine_times.iter().map(|(ms, _)| ms).sum();
         println!(
             "[corpus-native] production layout (#318): {} laid out, {total} ms total, \
-             {} over the {} ms budget",
+             {} over the {} ms CPU budget (#418)",
             engine_times.len(),
             engine_over_budget.len(),
             args.engine.budget.as_millis()
         );
         for label in &engine_over_budget {
-            println!("[corpus-native]   over budget: {label}");
+            println!("[corpus-native]   over budget (confirmed on retry): {label}");
         }
         if args.time {
             for (ms, label) in engine_times.iter().take(10) {
@@ -711,6 +745,7 @@ fn main() -> ExitCode {
             }
         }
     }
+    println!("[corpus-native] timeouts cleared by the lone retry (#418): {timeouts_recovered}");
     println!("[corpus-native] JSONL written to {}", args.out.display());
     ExitCode::SUCCESS
 }
