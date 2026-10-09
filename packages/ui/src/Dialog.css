@@ -81,13 +81,17 @@
     background: var(--nge-color-surface);
 }
 
-.nge-btn--primary {
+/* Issue #429 - the doubled class lifts this above theme.css's `.nge-btn`
+ * (+ `:hover`), which the shell imports AFTER the component sheets: at equal
+ * specificity the later base rule used to win and every dialog's primary
+ * action rendered as a plain button. Keep the compound selector. */
+.nge-btn.nge-btn--primary {
     background: var(--nge-color-primary);
     border-color: var(--nge-color-primary);
     color: #ffffff;
 }
 
-.nge-btn--primary:hover {
+.nge-btn.nge-btn--primary:hover {
     background: var(--nge-color-primary-hover);
     border-color: var(--nge-color-primary-hover);
 }
