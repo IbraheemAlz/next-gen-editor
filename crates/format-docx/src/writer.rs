@@ -334,11 +334,30 @@ fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String)
     if style.strike == Some(true) {
         ch.push(rank(b"w:strike"), "<w:strike/>".into());
     }
-    if let Some([r, g, b, _]) = style.color {
-        ch.push(
-            rank(b"w:color"),
-            format!("<w:color w:val=\"{r:02X}{g:02X}{b:02X}\"/>"),
-        );
+    if style.color.is_some() || style.color_theme.is_some() {
+        /* Issue #355 — `w:val` stays the cached RGB (`auto` when only the
+        theme half is known); the theme attributes follow as read. */
+        let mut s = match style.color {
+            Some([r, g, b, _]) => format!("<w:color w:val=\"{r:02X}{g:02X}{b:02X}\""),
+            None => String::from("<w:color w:val=\"auto\""),
+        };
+        if let Some(t) = style.color_theme.as_deref() {
+            for (attr, value) in [
+                ("w:themeColor", Some(&t.color)),
+                ("w:themeTint", t.tint.as_ref()),
+                ("w:themeShade", t.shade.as_ref()),
+            ] {
+                if let Some(v) = value {
+                    s.push(' ');
+                    s.push_str(attr);
+                    s.push_str("=\"");
+                    push_escaped_attr(v, &mut s);
+                    s.push('"');
+                }
+            }
+        }
+        s.push_str("/>");
+        ch.push(rank(b"w:color"), s);
     }
     /* `<w:sz>` / `<w:szCs>` — Word's half-point encoding; round to nearest.
     Emit both elements so ASCII + complex-script runs (Arabic, Hebrew,

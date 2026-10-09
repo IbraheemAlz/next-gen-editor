@@ -84,7 +84,8 @@ pub use fields::{
 pub use package::{MediaRef, PackageEntry, SourcePackage};
 pub use theme::{
     ColorScheme, ColorSchemeMapping, DocumentTheme, FontBinding, FontClass, FontScheme,
-    ResolvedFont, RunFontBindings, SchemeColor, ThemeFontLang, ThemeFontRef, ThemeFonts,
+    ResolvedFont, RunFontBindings, SchemeColor, ThemeColorRef, ThemeFontLang, ThemeFontRef,
+    ThemeFonts,
 };
 pub use toc::{TocEntry, TocHeading};
 
@@ -2149,6 +2150,13 @@ pub struct SpanStyle {
     /// snapshot bytes are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_bindings: Option<Box<RunFontBindings>>,
+    /// Issue #355 — `<w:color w:themeColor w:themeTint w:themeShade>`:
+    /// the theme colour layout paints with ([`SpanStyle::resolve_color`])
+    /// in place of [`Self::color`] (the `w:val` producers cache), and the
+    /// writer re-emits. Travels with `color`: a level that sets a colour
+    /// replaces both. Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_theme: Option<Box<ThemeColorRef>>,
 }
 
 impl SpanStyle {
@@ -2187,6 +2195,13 @@ impl SpanStyle {
         } else {
             patch.font_theme.or(self.font_theme)
         };
+        /* Issue #355 — a level that sets a colour (`<w:color>`, the colour
+        picker) replaces the theme binding with its own (or none). */
+        let color_theme = if patch.color.is_some() || patch.color_theme.is_some() {
+            patch.color_theme
+        } else {
+            self.color_theme
+        };
         SpanStyle {
             font_size: patch.font_size.or(self.font_size),
             color: patch.color.or(self.color),
@@ -2211,6 +2226,7 @@ impl SpanStyle {
                 patch.font_bindings,
                 names_family,
             ),
+            color_theme,
         }
     }
 }

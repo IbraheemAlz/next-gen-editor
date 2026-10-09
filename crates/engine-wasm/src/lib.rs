@@ -2843,7 +2843,8 @@ fn build_style_spans(
             start,
             end,
             px_size: base_px,
-            color: style.color.unwrap_or(default_color),
+            /* Issue #355 — a theme colour supersedes the cached `w:val`. */
+            color: style.resolve_color(sctx.theme).unwrap_or(default_color),
             bold: style.bold.unwrap_or(false),
             italic: style.italic.unwrap_or(false),
             underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
@@ -3048,7 +3049,7 @@ fn composition_layout_spans(
         start: off,
         end: off + comp_len,
         px_size: st.font_size.unwrap_or(default_size) * scale,
-        color: st.color.unwrap_or([0, 0, 0, 255]),
+        color: st.resolve_color(sctx.theme).unwrap_or([0, 0, 0, 255]),
         bold: st.bold.unwrap_or(false),
         italic: st.italic.unwrap_or(false),
         underline: engine::UnderlineStyle::Single,
@@ -3096,6 +3097,7 @@ fn paragraph_layout_key(
     font ids, and the theme decides what a binding names. */
     run_base.font_family.hash(&mut h);
     run_base.font_bindings.hash(&mut h);
+    run_base.color_theme.hash(&mut h);
     sctx.theme_key.hash(&mut h);
     run_base.caps.hash(&mut h);
     run_base.small_caps.hash(&mut h);
@@ -3118,6 +3120,7 @@ fn paragraph_layout_key(
         run.style.font_family.hash(&mut h);
         run.style.raw_font_family.hash(&mut h);
         run.style.font_bindings.hash(&mut h);
+        run.style.color_theme.hash(&mut h);
         /* Without these three, flipping `<w:caps>`, `<w:smallCaps>`, or
         `<w:vertAlign>` produces the same hash as the prior state and
         the cache returns a stale `ParagraphBox` — the visible bug the
@@ -7352,8 +7355,10 @@ fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
         run's own bag survives the merge (`SpanStyle::merged_with`). */
         grab_bag: None,
         /* Issue #355 — a patch naming a family claims the slots its
-        writer spells (`SpanStyle::merged_with`). */
+        writer spells, one setting a colour drops the theme colour
+        (`SpanStyle::merged_with`). */
         font_bindings: None,
+        color_theme: None,
     }
 }
 
@@ -15957,6 +15962,7 @@ impl Engine {
             font_theme: None,
             grab_bag: None,
             font_bindings: None,
+            color_theme: None,
         });
         let based_on = if props.clear_based_on == Some(true) {
             Some(None)

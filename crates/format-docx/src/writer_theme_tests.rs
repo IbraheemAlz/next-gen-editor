@@ -184,3 +184,58 @@ fn a_legacy_single_binding_still_writes() {
         r#"<w:rPr><w:rFonts w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi" w:cstheme="minorHAnsi"/></w:rPr>"#
     );
 }
+
+/// Issue #355 — `<w:color w:themeColor w:themeShade>`: the reader keeps
+/// the theme half next to the cached `w:val`; a regenerated run writes
+/// both back as read; the colour picker writes a plain `w:val`.
+#[test]
+fn theme_colours_round_trip_and_yield_to_a_picked_colour() {
+    const COLOR: &str = r#"<w:color w:val="2F5496" w:themeColor="accent1" w:themeShade="BF"/>"#;
+    let xml = document(&format!(
+        "<w:p><w:r><w:rPr><w:b/>{COLOR}</w:rPr><w:t>Heading</w:t></w:r></w:p>"
+    ));
+    let archive = read_docx(&build_docx_with_styles(STYLES_XML, &xml)).expect("read");
+    let style = archive.document.nth_paragraph(0).unwrap().style_at(0);
+    let t = style.color_theme.as_deref().expect("theme colour");
+    assert_eq!(
+        (t.color.as_str(), t.tint.as_deref(), t.shade.as_deref()),
+        ("accent1", None, Some("BF"))
+    );
+    assert_eq!(style.color, Some([0x2F, 0x54, 0x96, 255]));
+
+    let italic = SpanStyle {
+        italic: Some(true),
+        ..Default::default()
+    };
+    let edited = archive.document.apply_style(at(0), at(7), italic);
+    let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+    assert!(out.contains(COLOR), "{out}");
+    assert!(out.contains("<w:i/>"), "{out}");
+
+    let red = SpanStyle {
+        color: Some([200, 0, 0, 255]),
+        ..Default::default()
+    };
+    let edited = archive.document.apply_style(at(0), at(7), red);
+    let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+    assert!(out.contains(r#"<w:color w:val="C80000"/>"#), "{out}");
+    assert!(!out.contains("themeColor"), "{out}");
+
+    /* Only the theme half known (`w:val="auto"`) — still written. */
+    let mut s = String::new();
+    emit_rpr(
+        &SpanStyle {
+            color_theme: Some(Box::new(engine::ThemeColorRef {
+                color: "text1".into(),
+                tint: Some("A6".into()),
+                shade: None,
+            })),
+            ..Default::default()
+        },
+        &mut s,
+    );
+    assert_eq!(
+        s,
+        r#"<w:rPr><w:color w:val="auto" w:themeColor="text1" w:themeTint="A6"/></w:rPr>"#
+    );
+}

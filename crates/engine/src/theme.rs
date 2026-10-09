@@ -495,6 +495,167 @@ impl crate::SpanStyle {
     }
 }
 
+/* ============================================================
+Theme colours for text (§17.3.2.6 `w:color`, §17.18.97 `ST_ThemeColor`).
+============================================================ */
+
+/// Issue #355 — the theme half of a run's `<w:color>`: `w:themeColor`
+/// plus `w:themeTint` / `w:themeShade`, verbatim (the writer re-emits the
+/// attributes as read). Per §17.3.2.6 the theme colour supersedes the
+/// `w:val` RGB, which producers cache as the resolved value.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[serde(default)]
+pub struct ThemeColorRef {
+    /// `ST_ThemeColor`: `dark1` … `followedHyperlink`, `text1` /
+    /// `background1` / `text2` / `background2`, or `none`.
+    pub color: String,
+    /// `w:themeTint` — hex byte (`"99"`).
+    pub tint: Option<String>,
+    /// `w:themeShade` — hex byte (`"BF"`).
+    pub shade: Option<String>,
+}
+
+impl DocumentTheme {
+    /// The scheme slot an `ST_ThemeColor` names: the logical colours
+    /// (`text1`, `background1`, …, and the accents / hyperlink colours)
+    /// through `<w:clrSchemeMapping>` (absent attribute → the identity
+    /// mapping Word writes), the scheme-direct ones (`dark1` …) as is.
+    fn scheme_slot(&self, color: &str) -> Option<SchemeColor> {
+        let mapped = |key: &str, default: &'static str| {
+            self.color_map
+                .entries
+                .get(key)
+                .map_or(default, String::as_str)
+                .to_string()
+        };
+        let index = match color {
+            "text1" => mapped("t1", "dark1"),
+            "background1" => mapped("bg1", "light1"),
+            "text2" => mapped("t2", "dark2"),
+            "background2" => mapped("bg2", "light2"),
+            "accent1" => mapped("accent1", "accent1"),
+            "accent2" => mapped("accent2", "accent2"),
+            "accent3" => mapped("accent3", "accent3"),
+            "accent4" => mapped("accent4", "accent4"),
+            "accent5" => mapped("accent5", "accent5"),
+            "accent6" => mapped("accent6", "accent6"),
+            "hyperlink" => mapped("hyperlink", "hyperlink"),
+            "followedHyperlink" => mapped("followedHyperlink", "followedHyperlink"),
+            direct => direct.to_string(),
+        };
+        SchemeColor::from_wml_index(&index)
+    }
+
+    /// Issue #355 — the RGBA a `w:themeColor` (+ tint / shade) resolves
+    /// to; `None` for `none`, an unknown value or a slot the scheme does
+    /// not define (the caller then keeps `w:val`). Shade wins when both
+    /// modifiers appear. See [`apply_theme_tint`] / [`apply_theme_shade`]
+    /// for the formula.
+    pub fn resolve_color(&self, r: &ThemeColorRef) -> Option<[u8; 4]> {
+        let rgb = self.colors.get(self.scheme_slot(&r.color)?)?;
+        let byte = |v: &Option<String>| {
+            v.as_deref()
+                .and_then(|s| u8::from_str_radix(s.trim(), 16).ok())
+        };
+        let [red, green, blue] = match (byte(&r.shade), byte(&r.tint)) {
+            (Some(s), _) => apply_theme_shade(rgb, s),
+            (None, Some(t)) => apply_theme_tint(rgb, t),
+            (None, None) => rgb,
+        };
+        Some([red, green, blue, 255])
+    }
+}
+
+/// `w:themeShade` (§17.3.2.6): darken toward black by scaling the HSL
+/// lightness — `L' = L · s`, `s = shade / 255` — computed on the sRGB
+/// values (not linear light), channels truncated.
+///
+/// Measured against the `w:val` Word caches next to the attributes in the
+/// real-document corpus (`/data/corpus/files`, 147 shaded and 76 tinted
+/// runs over 30 documents): every tint exact, 96 / 147 shades exact and
+/// every shade within ±1 per channel. The off-by-one cases are all the
+/// Office 2007 palette (`4F81BD` / `5B9BD5`), where Word's own caches
+/// disagree with each other for the same input (`4F81BD` + `BF` cached
+/// as both `365F91` and `376092`). Linear-light scaling misses by up to
+/// 42 (shade) / 87 (tint) levels, rounding instead of truncating matches
+/// only 34 / 147 shades.
+pub fn apply_theme_shade(rgb: [u8; 3], shade: u8) -> [u8; 3] {
+    let s = f64::from(shade) / 255.0;
+    scale_lightness(rgb, |l| l * s)
+}
+
+/// `w:themeTint` (§17.3.2.6): lighten toward white — `L' = L · t + (1 −
+/// t)`, `t = tint / 255` — same space and truncation as
+/// [`apply_theme_shade`].
+pub fn apply_theme_tint(rgb: [u8; 3], tint: u8) -> [u8; 3] {
+    let t = f64::from(tint) / 255.0;
+    scale_lightness(rgb, |l| l * t + (1.0 - t))
+}
+
+fn scale_lightness(rgb: [u8; 3], f: impl Fn(f64) -> f64) -> [u8; 3] {
+    let [r, g, b] = rgb.map(|c| f64::from(c) / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    let (h, s) = if d == 0.0 {
+        (0.0, 0.0)
+    } else {
+        let s = if l > 0.5 {
+            d / (2.0 - max - min)
+        } else {
+            d / (max + min)
+        };
+        let h = if max == r {
+            (g - b) / d + if g < b { 6.0 } else { 0.0 }
+        } else if max == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        };
+        (h / 6.0, s)
+    };
+    let l = f(l).clamp(0.0, 1.0);
+    let channel = |t: f64| -> u8 {
+        let v = if s == 0.0 {
+            l
+        } else {
+            let q = if l < 0.5 {
+                l * (1.0 + s)
+            } else {
+                l + s - l * s
+            };
+            let p = 2.0 * l - q;
+            let t = t.rem_euclid(1.0);
+            if t < 1.0 / 6.0 {
+                p + (q - p) * 6.0 * t
+            } else if t < 0.5 {
+                q
+            } else if t < 2.0 / 3.0 {
+                p + (q - p) * (2.0 / 3.0 - t) * 6.0
+            } else {
+                p
+            }
+        };
+        /* Truncate; the epsilon absorbs float noise on exact levels. */
+        (v * 255.0 + 1e-9).floor().clamp(0.0, 255.0) as u8
+    };
+    [channel(h + 1.0 / 3.0), channel(h), channel(h - 1.0 / 3.0)]
+}
+
+impl crate::SpanStyle {
+    /// Issue #355 — the colour this (cascade-merged) style paints text
+    /// in: the theme colour when it resolves through `theme`, else the
+    /// `w:val` RGB, else `None` (the caller's default).
+    pub fn resolve_color(&self, theme: Option<&DocumentTheme>) -> Option<[u8; 4]> {
+        self.color_theme
+            .as_deref()
+            .zip(theme)
+            .and_then(|(r, t)| t.resolve_color(r))
+            .or(self.color)
+    }
+}
+
 /// Serde for `Option<Arc<DocumentTheme>>` (the workspace builds serde
 /// without its `rc` feature) — the snapshot encodes the theme inline.
 pub mod arc_option {
@@ -832,5 +993,164 @@ mod tests {
             crate::SpanStyle::default().merged_with(plain).font_bindings,
             None
         );
+    }
+
+    fn hex(v: &str) -> [u8; 3] {
+        let d = |i: usize| u8::from_str_radix(&v[i..i + 2], 16).unwrap();
+        [d(0), d(2), d(4)]
+    }
+
+    /// The `(kind, base, modifier, w:val Word cached)` combinations found
+    /// in the real-document corpus (see [`apply_theme_shade`]): exact for
+    /// every tint and the shades listed first; within ±1 per channel for
+    /// the Office 2007 palette, where Word's own caches disagree.
+    #[test]
+    fn tint_and_shade_match_the_values_word_caches() {
+        let exact = [
+            ("shade", "4472C4", 0xBF, "2F5496"),
+            ("shade", "156082", 0xBF, "0F4761"),
+            ("shade", "1F497D", 0xBF, "17365D"),
+            ("shade", "001E4E", 0xBF, "00163A"),
+            ("shade", "9BBB59", 0xBF, "76923C"),
+            ("shade", "000000", 0xBF, "000000"),
+            ("tint", "000000", 0xA6, "595959"),
+            ("tint", "000000", 0xD8, "272727"),
+            ("tint", "000000", 0x80, "7F7F7F"),
+            ("tint", "000000", 0xBF, "404040"),
+            ("tint", "1F497D", 0x99, "548DD4"),
+            /* Word's "Lighter 80% / 40%" swatches of 4472C4. */
+            ("tint", "4472C4", 0x33, "D9E2F3"),
+            ("tint", "4472C4", 0x66, "B4C6E7"),
+        ];
+        let near = [
+            ("shade", "4F81BD", 0xBF, "365F91"),
+            ("shade", "4F81BD", 0xBF, "376092"),
+            ("shade", "4F81BD", 0x7F, "243F60"),
+            ("shade", "4F81BD", 0xB5, "345A8A"),
+            ("shade", "5B9BD5", 0x7F, "1F4D78"),
+            ("shade", "5B9BD5", 0xBF, "2E74B5"),
+        ];
+        let apply = |kind: &str, base: &str, m: u8| match kind {
+            "shade" => apply_theme_shade(hex(base), m),
+            _ => apply_theme_tint(hex(base), m),
+        };
+        for (kind, base, m, want) in exact {
+            assert_eq!(apply(kind, base, m), hex(want), "{kind} {base} {m:02X}");
+        }
+        for (kind, base, m, want) in near {
+            let got = apply(kind, base, m);
+            let dev = (0..3)
+                .map(|i| (i16::from(got[i]) - i16::from(hex(want)[i])).abs())
+                .max()
+                .unwrap();
+            assert!(dev <= 1, "{kind} {base} {m:02X}: {got:02X?} vs {want}");
+        }
+        assert_eq!(
+            apply_theme_tint([0x12, 0x34, 0x56], 0xFF),
+            [0x12, 0x34, 0x56]
+        );
+        assert_eq!(apply_theme_shade([0xFF, 0xFF, 0xFF], 0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn theme_colours_resolve_through_the_mapping() {
+        let mut t = DocumentTheme::default();
+        t.colors.set(SchemeColor::Dark1, [0, 0, 0]);
+        t.colors.set(SchemeColor::Light1, [255, 255, 255]);
+        t.colors.set(SchemeColor::Dark2, [0x44, 0x54, 0x6A]);
+        t.colors.set(SchemeColor::Accent1, [0x44, 0x72, 0xC4]);
+        t.colors.set(SchemeColor::Accent2, [0xED, 0x7D, 0x31]);
+        fn resolve(
+            t: &DocumentTheme,
+            color: &str,
+            tint: Option<&str>,
+            shade: Option<&str>,
+        ) -> Option<[u8; 4]> {
+            t.resolve_color(&ThemeColorRef {
+                color: color.into(),
+                tint: tint.map(Into::into),
+                shade: shade.map(Into::into),
+            })
+        }
+        assert_eq!(resolve(&t, "text1", None, None), Some([0, 0, 0, 255]));
+        assert_eq!(
+            resolve(&t, "background1", None, None),
+            Some([255, 255, 255, 255])
+        );
+        assert_eq!(
+            resolve(&t, "dark2", None, None),
+            Some([0x44, 0x54, 0x6A, 255])
+        );
+        assert_eq!(
+            resolve(&t, "accent1", None, Some("BF")),
+            Some([0x2F, 0x54, 0x96, 255])
+        );
+        assert_eq!(
+            resolve(&t, "accent1", Some("33"), Some("BF")),
+            Some([0x2F, 0x54, 0x96, 255]),
+            "shade wins"
+        );
+        assert_eq!(resolve(&t, "none", None, None), None);
+        assert_eq!(
+            resolve(&t, "accent3", None, None),
+            None,
+            "slot not in the scheme"
+        );
+        assert_eq!(resolve(&t, "bogus", None, None), None);
+        /* A remapped document (dark background): text1 → light1. */
+        t.color_map.entries.insert("t1".into(), "light1".into());
+        t.color_map
+            .entries
+            .insert("accent1".into(), "accent2".into());
+        assert_eq!(resolve(&t, "text1", None, None), Some([255, 255, 255, 255]));
+        assert_eq!(
+            resolve(&t, "accent1", None, None),
+            Some([0xED, 0x7D, 0x31, 255])
+        );
+        assert_eq!(
+            resolve(&t, "dark1", None, None),
+            Some([0, 0, 0, 255]),
+            "direct"
+        );
+    }
+
+    /// The theme colour supersedes the cached `w:val`; it travels with
+    /// the colour through the cascade, and the colour picker drops it.
+    #[test]
+    fn span_colour_prefers_the_theme_and_travels_with_the_colour() {
+        let mut t = DocumentTheme::default();
+        t.colors.set(SchemeColor::Accent1, [0x44, 0x72, 0xC4]);
+        let themed = crate::SpanStyle {
+            color: Some([1, 2, 3, 255]),
+            color_theme: Some(Box::new(ThemeColorRef {
+                color: "accent1".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            themed.resolve_color(Some(&t)),
+            Some([0x44, 0x72, 0xC4, 255])
+        );
+        assert_eq!(
+            themed.resolve_color(None),
+            Some([1, 2, 3, 255]),
+            "no theme: w:val"
+        );
+        let bold = crate::SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            themed.clone().merged_with(bold).color_theme,
+            themed.color_theme
+        );
+        let picked = crate::SpanStyle {
+            color: Some([200, 0, 0, 255]),
+            ..Default::default()
+        };
+        let eff = themed.merged_with(picked);
+        assert_eq!(eff.color_theme, None);
+        assert_eq!(eff.resolve_color(Some(&t)), Some([200, 0, 0, 255]));
     }
 }

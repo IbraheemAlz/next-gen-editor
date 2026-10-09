@@ -11,7 +11,7 @@
 //! as the default (`<theme xmlns="…/drawingml/2006/main">`) is legal.
 
 use crate::error::DocxError;
-use engine::{DocumentTheme, FontBinding, RunFontBindings, SchemeColor, ThemeFonts};
+use engine::{DocumentTheme, FontBinding, RunFontBindings, SchemeColor, ThemeColorRef, ThemeFonts};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
@@ -102,6 +102,18 @@ pub fn rfonts_bindings(e: &BytesStart) -> Option<Box<RunFontBindings>> {
     let named = Some(FontBinding::Name);
     let canonical = b.ascii == named && b.h_ansi == named && b.cs == named && b.east_asia.is_none();
     (!b.is_empty() && !canonical).then(|| Box::new(b))
+}
+
+/// Issue #355 — the theme half of a `<w:color>` (§17.3.2.6), verbatim:
+/// `Some` whenever `w:themeColor` is present (`none` included, so it
+/// round-trips).
+pub fn theme_color_ref(e: &BytesStart) -> Option<Box<ThemeColorRef>> {
+    let w_attr = |key: &[u8]| crate::schema::ct_rpr::attr_val(e, key);
+    Some(Box::new(ThemeColorRef {
+        color: w_attr(b"w:themeColor")?,
+        tint: w_attr(b"w:themeTint"),
+        shade: w_attr(b"w:themeShade"),
+    }))
 }
 
 /// Which font collection a `typeface` child belongs to.
