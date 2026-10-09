@@ -1249,10 +1249,11 @@ impl Engine {
                         mark: false,
                     });
                 }
-                /* Issue #262 — the paragraph-mark revision, addressed as
+                /* Issue #262 — the paragraph-mark revisions, addressed as
                 the empty range at the paragraph end (what
-                `AcceptRevision` / `RejectRevision` resolve it by). */
-                if let Some(r) = &p.mark_revision {
+                `AcceptRevision` / `RejectRevision` resolve it by — the
+                FIRST of several, issue #303: one row each, in order). */
+                for r in &p.mark_revisions {
                     let end = p.text.len() as u32;
                     rows.push(RevisionOut {
                         block: block_idx as u32,
@@ -1971,9 +1972,11 @@ const REVISION_MOVE_COLOR: [u8; 4] = [0x6A, 0x1B, 0x9A, 0xFF];
 
 /// Issue #262 — the pilcrow colour of a paragraph whose MARK carries a
 /// tracked change (paint-only review decoration), in the same tint as
-/// the matching text revision.
+/// the matching text revision. Issue #303 — a mark carrying several
+/// changes shows its LATEST state (an inserted-then-deleted mark reads
+/// as deleted).
 fn review_mark_color(para: &engine::Paragraph) -> Option<[u8; 4]> {
-    para.mark_revision.as_ref().map(|r| match r.kind {
+    para.mark_revisions.last().map(|r| match r.kind {
         engine::RevisionKind::Insert => REVISION_INSERT_COLOR,
         engine::RevisionKind::Delete => REVISION_DELETE_COLOR,
         engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => REVISION_MOVE_COLOR,
@@ -14253,13 +14256,12 @@ impl Engine {
             self.undo.current().clone()
         } else if tracking {
             /* Sprint 14 (#14) — replacing a selection while tracking
-            = mark-old-as-delete + insert-new-as-insert. */
-            self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end),
-                author.clone(),
-                date.clone(),
-            )
+            = mark-old-as-delete + insert-new-as-insert (issue #298:
+            across paragraphs too). */
+            match self.tracked_delete("InsertText", &start, &end) {
+                Ok(t) => t.doc,
+                Err(e) => return *e,
+            }
         } else {
             self.undo
                 .current()
@@ -14319,12 +14321,10 @@ impl Engine {
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
-            self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end),
-                author.clone(),
-                date.clone(),
-            )
+            match self.tracked_delete("ReplaceRange", &start, &end) {
+                Ok(t) => t.doc,
+                Err(e) => return *e,
+            }
         } else {
             self.undo
                 .current()
@@ -14351,15 +14351,15 @@ impl Engine {
             Err(e) => return *e,
         };
         let (new_doc, caret) = if self.tracking_changes {
-            let d = self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end.clone()),
-                self.review_author.clone(),
-                self.current_review_date(),
-            );
             /* Marker-only tracked delete keeps text; caret lands at
-            the end of the marked range so further typing extends past. */
-            (d, end)
+            the end of the marked range (where the reviewer's own
+            removed insertions moved it) so further typing extends
+            past. Issue #298 — across paragraphs too; a refused range
+            answers an error. */
+            match self.tracked_delete("DeleteRange", &start, &end) {
+                Ok(t) => (t.doc, to_bridge_pos(t.end)),
+                Err(e) => return *e,
+            }
         } else {
             let d = self
                 .undo
@@ -14393,11 +14393,23 @@ impl Engine {
         if self.story_active() {
             return self.story_split_paragraph(at);
         }
+        let tracking = self.tracking_changes;
+        let author = self.review_author.clone();
+        let date = self.current_review_date();
         let (base, split_at) = match self.selection.clone() {
             Some(s) => {
                 let (start, end) = ordered(s.anchor, s.caret);
                 let doc = if start == end {
                     self.undo.current().clone()
+                } else if tracking {
+                    /* Issue #301 — replacing a selection with a break
+                    while tracking = mark the selection deleted, then
+                    the tracked break at its start (the typed-replacement
+                    path's order). */
+                    match self.tracked_delete("SplitParagraph", &start, &end) {
+                        Ok(t) => t.doc,
+                        Err(e) => return *e,
+                    }
                 } else {
                     self.undo
                         .current()
@@ -14407,7 +14419,13 @@ impl Engine {
             }
             None => (self.undo.current().clone(), at),
         };
-        let new_doc = base.split_paragraph(to_engine_pos(split_at.clone()));
+        /* Issue #301 — with review mode on, the new paragraph mark is a
+        tracked insertion (reject merges the halves back). */
+        let new_doc = if tracking {
+            base.tracked_split_paragraph(to_engine_pos(split_at.clone()), &author, &date)
+        } else {
+            base.split_paragraph(to_engine_pos(split_at.clone()))
+        };
         let next_path = engine::bump_last_block_index(&bridge_to_engine_path(split_at.path));
         let caret = BridgeLogicalPos {
             path: engine_to_bridge_path(next_path),
@@ -14429,41 +14447,71 @@ impl Engine {
         };
         let (start, end) = ordered(sel.anchor, sel.caret.clone());
         if start != end {
-            let (new_doc, caret) = self.delete_or_mark(start.clone(), end);
-            return self.commit_edit(new_doc, caret);
+            return match self.delete_or_mark(start.clone(), end, false) {
+                Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
+                Err(e) => *e,
+            };
         }
         let Some((del_start, del_end)) = self.delete_target(sel.caret, forward, by_word) else {
             /* Caret at a document edge — nothing to delete. */
             return self.selection_changed();
         };
-        let (new_doc, caret) = self.delete_or_mark(del_start, del_end);
-        self.commit_edit(new_doc, caret)
+        match self.delete_or_mark(del_start, del_end, !forward) {
+            Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
+            Err(e) => *e,
+        }
     }
 
     /// Sprint 14 (#14) — shared dispatch for "delete a logical range":
-    /// route through `tracked_delete_range` when tracking is on
-    /// (marker-only, caret lands at end), else the plain `delete_range`
-    /// (text removed, caret lands at start).
+    /// route through the tracked deletion when tracking is on (marker-
+    /// only: the caret lands at the end of the marked range — or, for a
+    /// collapsed Backspace (`backward`), at its start, stepping over the
+    /// struck text the way Word does, so the next Backspace reaches the
+    /// character before it), else the plain `delete_range` (text removed,
+    /// caret lands at start). Issue #298 — a tracked range the engine
+    /// refuses (across a table-cell boundary, over a table) is an
+    /// `Event::Error`, never a silent no-op.
     fn delete_or_mark(
         &self,
         start: BridgeLogicalPos,
         end: BridgeLogicalPos,
-    ) -> (engine::DocumentTree, BridgeLogicalPos) {
+        backward: bool,
+    ) -> Result<(engine::DocumentTree, BridgeLogicalPos), Box<Event>> {
         if self.tracking_changes {
-            let d = self.undo.current().tracked_delete_range(
-                to_engine_pos(start.clone()),
-                to_engine_pos(end.clone()),
-                self.review_author.clone(),
-                self.current_review_date(),
-            );
-            (d, end)
+            let t = self.tracked_delete("DeleteAtCaret", &start, &end)?;
+            let caret = if backward { t.start } else { t.end };
+            Ok((t.doc, to_bridge_pos(caret)))
         } else {
             let d = self
                 .undo
                 .current()
                 .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
-            (d, start)
+            Ok((d, start))
         }
+    }
+
+    /// Issue #298 — the tracked deletion of `[start, end)` on the current
+    /// document by the review identity, or the engine's refusal as a
+    /// typed `Event::Error` (`<cmd>: <reason>`).
+    fn tracked_delete(
+        &self,
+        cmd: &str,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+    ) -> Result<engine::TrackedDeletion, Box<Event>> {
+        self.undo
+            .current()
+            .try_tracked_delete_range(
+                to_engine_pos(start.clone()),
+                to_engine_pos(end.clone()),
+                &self.review_author,
+                &self.current_review_date(),
+            )
+            .map_err(|e| {
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                })
+            })
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching
@@ -15062,6 +15110,7 @@ impl Engine {
     fn do_accept_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
         let new_doc = self.undo.current().accept_revision_at(block, start, end);
         self.undo.push(new_doc);
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15071,10 +15120,25 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// A review decision merged or shortened paragraphs (issue #262 / #301 —
+    /// a resolved paragraph mark merges two): keep the caret on real text.
+    fn clamp_selection_to_document(&mut self) {
+        if let Some(sel) = self.selection.clone() {
+            let doc = self.undo.current();
+            self.selection = Some(SelectionState {
+                anchor: clamp_pos(doc, sel.anchor),
+                caret: clamp_pos(doc, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+        }
+    }
+
     /// `Command::RejectRevision` (Sprint 7 UI Edition).
     fn do_reject_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
         let new_doc = self.undo.current().reject_revision_at(block, start, end);
         self.undo.push(new_doc);
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15097,16 +15161,7 @@ impl Engine {
         }
         let new_doc = doc.resolve_all_revisions(accept);
         self.undo.push(new_doc);
-        /* Merged / shortened paragraphs: keep the caret on real text. */
-        if let Some(sel) = self.selection.clone() {
-            let doc = self.undo.current();
-            self.selection = Some(SelectionState {
-                anchor: clamp_pos(doc, sel.anchor),
-                caret: clamp_pos(doc, sel.caret),
-                ideal_x: None,
-                kind: sel.kind,
-            });
-        }
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -17630,7 +17685,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -17785,7 +17840,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -17824,7 +17879,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
-            mark_revision: None,
+            mark_revisions: Vec::new(),
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -18999,7 +19054,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
-                mark_revision: None,
+                mark_revisions: Vec::new(),
             })],
             source_markup: None,
         }
@@ -27057,6 +27112,9 @@ mod text_remap_tests;
 
 #[cfg(test)]
 mod revision_command_tests;
+
+#[cfg(test)]
+mod tracked_command_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
