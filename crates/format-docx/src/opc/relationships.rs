@@ -45,8 +45,14 @@ impl Relationships {
 
     /// All relationships of a given `rel_type` (the schema URL). Useful for
     /// e.g. "give me every `…/image` relationship" once Phase 7 lands.
+    ///
+    /// Issue #325 — family-aware: a Transitional `rel_type` also matches
+    /// the Strict spelling (`http://purl.oclc.org/ooxml/officeDocument/
+    /// relationships/…`) and vice versa.
     pub fn by_type<'a>(&'a self, rel_type: &'a str) -> impl Iterator<Item = &'a Relationship> {
-        self.items.iter().filter(move |r| r.rel_type == rel_type)
+        self.items
+            .iter()
+            .filter(move |r| crate::schema::family::same_uri(&r.rel_type, rel_type))
     }
 }
 

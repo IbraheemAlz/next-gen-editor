@@ -21,6 +21,11 @@ pub enum DocxError {
     /// well-formed document (unclosed elements at EOF, no root element).
     #[error("malformed XML: {0}")]
     MalformedXml(String),
+    /// Issue #353 — a relationship target (or archive path) resolves
+    /// outside the package (`../../x`) or carries a NUL: refused instead
+    /// of being clamped into some other part's name.
+    #[error("unsafe part name: {0}")]
+    UnsafePartName(String),
 }
 
 /// Non-fatal reader diagnostics. The document opened, but some subtree was
@@ -34,6 +39,22 @@ pub enum DocxWarning {
     /// `deep-table-cell.docx` nests 5000 tables; unbounded recursion
     /// overflowed the stack.
     TableNestingTooDeep { limit: u32 },
+    /// Issue #325 — the main part binds WordprocessingML under a prefix
+    /// (or as the default namespace) the literal-qname reader does not
+    /// match. `normalized` = the part was re-prefixed into the canonical
+    /// spelling and read; it is then **regenerate-only** (a zero-edit
+    /// save re-emits the normalised bytes, not the source's). `false` =
+    /// normalisation itself failed and the part read as-is (likely empty).
+    NonCanonicalNamespaces { detail: String, normalized: bool },
+    /// Issue #325 — the main part's root is not a WordprocessingML element
+    /// in either namespace family; it reads as an empty document.
+    NotWordprocessingMl,
+    /// Issue #353 — `_rels/.rels` names an `officeDocument` part the
+    /// archive does not contain; the fixed `word/document.xml` was used.
+    MainPartFallback { target: String },
+    /// Issue #353 — a relationship target of a sibling part escapes the
+    /// package; it was ignored (the fixed sibling name applies).
+    UnsafeRelationshipTarget { target: String },
 }
 
 /// Issues #244 / #245 — non-fatal writer diagnostics: a best-effort

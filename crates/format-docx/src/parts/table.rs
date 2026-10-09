@@ -1002,13 +1002,36 @@ fn handle_property_inner(
 
 fn parse_cell_width(e: &BytesStart) -> Option<CellWidth> {
     let typ = attr_val(e, b"w:type").unwrap_or_else(|| "dxa".into());
-    let val: Option<i32> = attr_val(e, b"w:w").and_then(|v| v.parse().ok());
+    let raw = attr_val(e, b"w:w");
+    let val: Option<i32> = raw.as_deref().and_then(|v| v.trim().parse().ok());
     match typ.as_str() {
         "auto" => Some(CellWidth::Auto),
         "nil" => Some(CellWidth::Nil),
-        "pct" => val.map(|v| CellWidth::Pct(v as u16)),
-        _ => val.map(CellWidth::Dxa),
+        "pct" => raw.as_deref().and_then(parse_pct_width).map(CellWidth::Pct),
+        /* Issue #353 — a literal percentage on a dxa-typed width (ISO
+        29500 ST_MeasurementOrPercent) is still a percentage. */
+        _ => match raw.as_deref().map(str::trim) {
+            Some(v) if v.ends_with('%') => parse_pct_width(v).map(CellWidth::Pct),
+            _ => val.map(CellWidth::Dxa),
+        },
     }
+}
+
+/// Issue #353 — a `w:type="pct"` width in fiftieths of a percent
+/// (`5000` = 100 %). ISO 29500 (and Strict producers) also write the
+/// universal form `50%` / `33.5%`, which is converted (×50). The result
+/// is clamped to `0..=u16::MAX` instead of the old `as u16` truncation
+/// (which turned `70000` into `4464` and `-1` into `65535`).
+fn parse_pct_width(raw: &str) -> Option<u16> {
+    let raw = raw.trim();
+    let fifties = match raw.strip_suffix('%') {
+        Some(num) => num.trim().parse::<f64>().ok()? * 50.0,
+        None => raw.parse::<f64>().ok()?,
+    };
+    if !fifties.is_finite() {
+        return None;
+    }
+    Some(fifties.round().clamp(0.0, f64::from(u16::MAX)) as u16)
 }
 
 fn parse_border_stroke(e: &BytesStart) -> BorderStroke {
@@ -1067,6 +1090,32 @@ mod tests {
         assert_eq!(cell_text(&rows[0].cells[0]), "A1");
         assert_eq!(cell_text(&rows[0].cells[1]), "B1");
         assert_eq!(cell_text(&rows[1].cells[1]), "B2");
+    }
+
+    #[test]
+    fn pct_widths_accept_percent_literals_and_clamp() {
+        assert_eq!(parse_pct_width("5000"), Some(5000));
+        assert_eq!(parse_pct_width("50%"), Some(2500));
+        assert_eq!(parse_pct_width(" 33.5% "), Some(1675));
+        assert_eq!(parse_pct_width("100%"), Some(5000));
+        /* Out of range clamps instead of wrapping (`70000 as u16` = 4464). */
+        assert_eq!(parse_pct_width("70000"), Some(u16::MAX));
+        assert_eq!(parse_pct_width("-1"), Some(0));
+        assert_eq!(parse_pct_width("5000000%"), Some(u16::MAX));
+        assert_eq!(parse_pct_width("abc"), None);
+        assert_eq!(parse_pct_width("inf%"), None);
+
+        let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="50%" w:type="pct"/></w:tcPr><w:p/></w:tc><w:tc><w:tcPr><w:tcW w:w="70000" w:type="pct"/></w:tcPr><w:p/></w:tc><w:tc><w:tcPr><w:tcW w:w="25%" w:type="dxa"/></w:tcPr><w:p/></w:tc></w:tr></w:tbl>"#;
+        let (_, _, rows) = parse_table_bytes(
+            xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+        )
+        .expect("parse");
+        let w = |i: usize| rows[0].cells[i].props.width;
+        assert_eq!(w(0), Some(CellWidth::Pct(2500)));
+        assert_eq!(w(1), Some(CellWidth::Pct(u16::MAX)));
+        assert_eq!(w(2), Some(CellWidth::Pct(1250)));
     }
 
     #[test]
