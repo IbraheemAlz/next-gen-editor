@@ -178,6 +178,167 @@ pub struct CommentCheck {
     pub delete_gone: Option<bool>,
 }
 
+/// Issue #419 — the paragraph-property probe: the first untouched
+/// top-level paragraph with a source `<w:pPr>` gets its start indent
+/// moved by half an inch and is saved on its own. The per-child splice
+/// must respell nothing but the `<w:ind>` element (or insert one).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PprCheck {
+    /// Top-level block index of the probed paragraph.
+    pub block: u32,
+    /// [`EditCheck::source_bytes_rewritten`] of that save.
+    pub source_bytes_rewritten: u64,
+    /// Bytes of the edited part inside the rewritten span.
+    pub edited_region_bytes: u64,
+    /// The whole difference lies inside one `<w:ind …/>` element.
+    pub ind_only: bool,
+    /// The re-read paragraph has the new indent.
+    pub reread_ok: bool,
+}
+
+/// Issue #419 — see [`PprCheck`]. `None` when no paragraph qualifies.
+fn ppr_check(archive: &DocxArchive, orig_xml: &[u8]) -> Option<PprCheck> {
+    let doc = &archive.document;
+    let (block, p) = doc.blocks.iter().enumerate().find_map(|(i, b)| match b {
+        engine::Block::Paragraph(p)
+            if !p.dirty
+                && p.source_xml.is_some()
+                && p.section_end.is_none()
+                && p.source_markup
+                    .as_deref()
+                    .and_then(|m| m.ppr.as_ref())
+                    .is_some_and(|sp| sp.xml.windows(6).any(|w| w == b"<w:pPr")) =>
+        {
+            Some((i as u32, p))
+        }
+        _ => None,
+    })?;
+    let ind = &p.props.indent;
+    let pt = |twips: i32| twips as f32 / 20.0;
+    let first_line = if ind.hanging_twips > 0 {
+        -pt(ind.hanging_twips)
+    } else {
+        pt(ind.first_line_twips)
+    };
+    let new_start = pt(ind.start_twips) + 36.0;
+    let at = engine::LogicalPos::new(engine::BlockPath::top(block), 0);
+    let edited = doc.set_paragraph_indent(at.clone(), at, new_start, pt(ind.end_twips), first_line);
+    let bytes = format_docx::write_docx(archive, &edited).ok()?;
+    let xml = extract_doc_xml(&bytes).ok()?;
+    let (prefix, rewritten, inserted) = rewritten_region(orig_xml, &xml);
+    /* The whole difference is ONE `<w:ind …/>` element replaced (or
+    inserted) at the point the two parts start to differ. */
+    let ind_only = (|| {
+        let from = prefix.saturating_sub(64);
+        let pos = from + xml.get(from..)?.windows(7).position(|w| w == b"<w:ind ")?;
+        let element_len = |x: &[u8]| x.iter().position(|&b| b == b'>').map(|e| e + 1);
+        let new_len = element_len(&xml[pos..])?;
+        let old_len = if orig_xml.get(pos..)?.starts_with(b"<w:ind ") {
+            element_len(&orig_xml[pos..])?
+        } else {
+            0
+        };
+        Some(
+            pos <= prefix
+                && orig_xml[..pos] == xml[..pos]
+                && orig_xml.get(pos + old_len..)? == xml.get(pos + new_len..)?,
+        )
+    })()
+    .unwrap_or(false);
+    let reread_ok = format_docx::read_docx(&bytes).is_ok_and(|back| {
+        matches!(
+            back.document.blocks.get(block as usize),
+            Some(engine::Block::Paragraph(q))
+                if q.props.indent.start_twips == (new_start * 20.0).round() as i32
+        )
+    });
+    Some(PprCheck {
+        block,
+        source_bytes_rewritten: rewritten,
+        edited_region_bytes: inserted,
+        ind_only,
+        reread_ok,
+    })
+}
+
+/// Issue #371 — the `ModifyStyle` probe: one paragraph style (`Heading1`
+/// when the document has it, else the first by id) gets its bold toggled
+/// and the document is saved. Only that style's `<w:style>` element of
+/// `styles.xml` may change.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct StyleCheck {
+    pub style_id: String,
+    /// `styles.xml` bytes the save added or removed overall.
+    pub styles_xml_delta_bytes: u64,
+    /// The edited element's own size change.
+    pub element_delta_bytes: u64,
+    /// Every byte outside the edited element is unchanged.
+    pub only_element: bool,
+    /// The re-read style carries the new bold.
+    pub reread_ok: bool,
+}
+
+/// Byte range of the top-level `<w:style … w:styleId="id">` element of a
+/// `styles.xml` (a literal scan: the attribute as Word writes it).
+fn style_element_range(xml: &[u8], id: &str) -> Option<(usize, usize)> {
+    let needle = format!("w:styleId=\"{id}\"");
+    let at = xml
+        .windows(needle.len())
+        .position(|w| w == needle.as_bytes())?;
+    let start = xml[..at].windows(8).rposition(|w| w == b"<w:style")?;
+    let close = b"</w:style>";
+    let end = start + xml[start..].windows(close.len()).position(|w| w == close)? + close.len();
+    Some((start, end))
+}
+
+/// Issue #371 — see [`StyleCheck`]. `None` when the document has no
+/// styles part or no paragraph style.
+fn style_check(archive: &DocxArchive) -> Option<StyleCheck> {
+    let doc = &archive.document;
+    let styles_name = archive.part_names.styles.as_str();
+    let orig = archive
+        .other_entries
+        .iter()
+        .find(|(n, _)| n == styles_name)
+        .map(|(_, b)| b.clone())?;
+    let mut ids: Vec<&String> = doc.styles.keys().collect();
+    ids.sort();
+    let id = if doc.styles.contains_key("Heading1") {
+        "Heading1".to_string()
+    } else {
+        (*ids.first()?).clone()
+    };
+    let (el_start, el_end) = style_element_range(&orig, &id)?;
+    let bold = !doc.styles[&id].run.bold.unwrap_or(false);
+    let patch = engine::SpanStyle {
+        bold: Some(bold),
+        ..Default::default()
+    };
+    let edited = doc.modify_style(&id, None, Some(patch), None, None);
+    let bytes = format_docx::write_docx(archive, &edited).ok()?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).ok()?;
+    let mut new = Vec::new();
+    zip.by_name(styles_name).ok()?.read_to_end(&mut new).ok()?;
+    let tail = orig.len() - el_end;
+    let only_element = new.len() >= el_start + tail
+        && orig[..el_start] == new[..el_start]
+        && orig[el_end..] == new[new.len() - tail..];
+    let new_el_len = new.len().saturating_sub(el_start + tail);
+    let reread_ok = format_docx::read_docx(&bytes).is_ok_and(|back| {
+        back.document
+            .styles
+            .get(&id)
+            .is_some_and(|s| s.run.bold == Some(bold))
+    });
+    Some(StyleCheck {
+        style_id: id,
+        styles_xml_delta_bytes: new.len().abs_diff(orig.len()) as u64,
+        element_delta_bytes: new_el_len.abs_diff(el_end - el_start) as u64,
+        only_element,
+        reread_ok,
+    })
+}
+
 /// Issue #282 — `edited` is `orig` plus insertions only (a byte-level
 /// minimal diff with no deletion; prefix and suffix are trimmed first, so
 /// a local edit of a large part stays cheap).
@@ -383,6 +544,9 @@ fn classify_rewrite(orig: &[u8], region_start: usize, region_len: u64) -> &'stat
     if let Some(shape) = classify_one_byte_rewrite(orig, region_start, region_len) {
         return shape;
     }
+    if let Some(shape) = classify_regen_shape(orig, region_start, region_len) {
+        return shape;
+    }
     let win_start = region_start.saturating_sub(REWRITE_CAUSE_WINDOW);
     let win_end = (region_start + region_len as usize + REWRITE_CAUSE_WINDOW).min(orig.len());
     let window = orig.get(win_start..win_end.max(win_start)).unwrap_or(&[]);
@@ -425,6 +589,36 @@ fn classify_one_byte_rewrite(
         b'>' if before.ends_with(b"<w:t") => Some("t preserve"),
         _ => None,
     }
+}
+
+/// Issue #384 — the regeneration classes of `--regen-check`
+/// ([`crate::regen`]), recognised by the shape of the rewritten region of
+/// the ORIGINAL itself (never by a nearby construct, which would blame
+/// every paragraph with a `<w:proofErr/>`): inside an `<w:instrText>`
+/// (`instrText-space`), only whitespace (`whitespace`), holding a
+/// `<w:proofErr/>` (`proofErr-order`) or an inline `<w:smartTag>` /
+/// `<w:customXml>` tag (`smartTag`, issue #272).
+fn classify_regen_shape(orig: &[u8], region_start: usize, region_len: u64) -> Option<&'static str> {
+    let end = region_start.checked_add(region_len as usize)?;
+    let region = orig.get(region_start..end)?;
+    if region.is_empty() {
+        return None;
+    }
+    let has = |needle: &[u8]| region.windows(needle.len()).any(|w| w == needle);
+    if has(b"<w:smartTag") || has(b"</w:smartTag") || has(b"<w:customXml ") {
+        return Some("smartTag");
+    }
+    let before = orig.get(..region_start)?;
+    let last = |needle: &[u8]| before.windows(needle.len()).rposition(|w| w == needle);
+    if let Some(open) = last(b"<w:instrText")
+        && last(b"</w:instrText>").is_none_or(|close| close < open)
+    {
+        return Some("instrText-space");
+    }
+    if region.iter().all(u8::is_ascii_whitespace) {
+        return Some("whitespace");
+    }
+    has(b"<w:proofErr").then_some("proofErr-order")
 }
 
 /// Issue #199 / #251 — `(prefix_len, original_span, edited_span)`: the
@@ -517,6 +711,12 @@ pub struct DocResult {
     /// Issue #282 — see [`CommentCheck`] (with the scripted edit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_check: Option<CommentCheck>,
+    /// Issue #419 — see [`PprCheck`] (with the scripted edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppr_check: Option<PprCheck>,
+    /// Issue #371 — see [`StyleCheck`] (with the scripted edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_check: Option<StyleCheck>,
     /// Issue #318 — wall-clock ms of the PRODUCTION layout
     /// (`engine-wasm`'s `Engine::build_pages`: the real table grid +
     /// autofit, header/footer bands, notes, wrap convergence), driven
@@ -562,6 +762,16 @@ pub struct DocResult {
     /// reported (`Event::Painted.layout_degraded`), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engine_degradations: Vec<String>,
+    /// Issue #379 — ms a second full production layout took with every
+    /// cross-paint layout cache warm (paragraph LRU + content-keyed table
+    /// cache): the repaint an edit elsewhere triggers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_repaint_ms: Option<u128>,
+    /// Issue #379 — whether that warm repaint reproduced the cold layout
+    /// exactly (page count, geometry fingerprint, degradations). `false`
+    /// is a cache bug — `tools/corpus/report.mjs` flags it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_repaint_consistent: Option<bool>,
     /// Issue #355 — how the document's runs resolve theme fonts. Absent
     /// when the read failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,6 +784,10 @@ pub struct DocResult {
     /// archive as read) do not show. Empty for canonical packages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub normalized_parts: Vec<String>,
+    /// Issue #384 — `--regen-check`: every clean paragraph regenerated
+    /// with no edit and compared with its source bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regen_check: Option<crate::regen::RegenCheck>,
 }
 
 /// Issue #355 — theme-font resolution over every paragraph (body, table
@@ -726,6 +940,8 @@ impl DocResult {
             ui_save_siblings_identical: None,
             ui_save_matches_write_docx: None,
             comment_check: None,
+            ppr_check: None,
+            style_check: None,
             engine_layout_ms: None,
             engine_layout_cpu_ms: None,
             engine_layout_wall_ms: None,
@@ -734,7 +950,10 @@ impl DocResult {
             engine_fingerprint: None,
             theme_fonts: None,
             engine_degradations: Vec::new(),
+            engine_repaint_ms: None,
+            engine_repaint_consistent: None,
             normalized_parts: Vec::new(),
+            regen_check: None,
         }
     }
 
@@ -831,6 +1050,7 @@ pub fn run_one(
     with_edit: bool,
     dump_drift: Option<&std::path::Path>,
     engine_opts: EngineLayoutOpts,
+    regen_check: bool,
 ) -> DocResult {
     let mut rec = DocResult::new(path_label, bytes.len() as u64);
     let overall_start = Instant::now();
@@ -1099,7 +1319,29 @@ pub fn run_one(
             /* Issue #282 — comments on untouched paragraphs. */
             rec.comment_check =
                 stage_infallible!("comment_check", comment_check(&archive_a, &doc_xml_orig));
+            /* Issue #419 — a paragraph-property change. */
+            rec.ppr_check = stage_infallible!("ppr_check", ppr_check(&archive_a, &doc_xml_orig));
+            /* Issue #371 — a style edit. */
+            rec.style_check = stage_infallible!("style_check", style_check(&archive_a));
         }
+    }
+
+    /* 7b. Issue #384 — `--regen-check`: regenerate every clean paragraph
+    with no edit; `--dump-drift DIR` also writes each mismatching pair. */
+    if regen_check {
+        let report = stage!(
+            "regen_check",
+            format_docx::writer::regen_check::regen_check(&archive_a, &archive_a.document)
+        );
+        for (i, m) in report.mismatches.iter().enumerate() {
+            let class = crate::regen::classify(&m.source, &m.regenerated);
+            dump(&format!("regen-{i}-{class}.orig"), m.source.as_bytes());
+            dump(
+                &format!("regen-{i}-{class}.regen"),
+                m.regenerated.as_bytes(),
+            );
+        }
+        rec.regen_check = Some(crate::regen::RegenCheck::of(&report));
     }
 
     /* 8. Issue #318 — the production layout, timed under the budget.
@@ -1118,8 +1360,14 @@ pub fn run_one(
 /// below what the worker's main thread gets, so ask for plenty.
 const ENGINE_LAYOUT_STACK_BYTES: usize = 256 << 20;
 
-/// What the production-layout thread reports back.
-type EngineLayoutReport = Result<Result<engine_wasm::LayoutProbe, String>, CaughtPanic>;
+/// What the production-layout thread reports back: the cold layout's
+/// probe and, issue #379, the warm repaint's probe + duration.
+type EngineLayoutReport =
+    Result<Result<(engine_wasm::LayoutProbe, WarmRepaint), String>, CaughtPanic>;
+
+/// Issue #379 — the warm repaint's probe and how long it took (`Err`
+/// when it failed outright).
+type WarmRepaint = Result<(engine_wasm::LayoutProbe, Duration), String>;
 
 /// Issue #418 — the wall-clock backstop is this many times the (CPU)
 /// budget: generous enough that a machine at load 8x its core count still
@@ -1149,16 +1397,31 @@ fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Durati
         .stack_size(ENGINE_LAYOUT_STACK_BYTES)
         .spawn(move || {
             let t0 = Instant::now();
-            let report = panics::catch(move || {
-                let mut engine = engine_wasm::Engine::new_headless(doc);
-                match engine.ensure_layout_for_fuzzing() {
-                    Ok(()) => engine
-                        .layout_probe_for_fuzzing()
-                        .ok_or_else(|| "no layout snapshot after layout".to_string()),
-                    Err(e) => Err(format!("{e:?}")),
-                }
-            });
-            let _ = tx.send((report, t0.elapsed()));
+            let cold_took = std::cell::Cell::new(Duration::ZERO);
+            let report = panics::catch(
+                || -> Result<(engine_wasm::LayoutProbe, WarmRepaint), String> {
+                    let mut engine = engine_wasm::Engine::new_headless(doc);
+                    let probe = |engine: &engine_wasm::Engine| {
+                        engine
+                            .layout_probe_for_fuzzing()
+                            .ok_or_else(|| "no layout snapshot after layout".to_string())
+                    };
+                    engine
+                        .ensure_layout_for_fuzzing()
+                        .map_err(|e| format!("{e:?}"))?;
+                    cold_took.set(t0.elapsed());
+                    let cold = probe(&engine)?;
+                    /* Issue #379 — the same layout again, caches warm. */
+                    let t1 = Instant::now();
+                    let warm = engine
+                        .relayout_warm_for_fuzzing()
+                        .map_err(|e| format!("{e:?}"))
+                        .and_then(|()| probe(&engine))
+                        .map(|p| (p, t1.elapsed()));
+                    Ok((cold, warm))
+                },
+            );
+            let _ = tx.send((report, cold_took.get()));
         });
     if let Err(e) = spawned {
         rec.mark_error("engine_layout", &format!("spawn failed: {e}"));
@@ -1193,8 +1456,15 @@ fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Durati
     rec.engine_layout_cpu_ms = cpu_ms;
     rec.engine_layout_wall_ms = Some(wall_ms);
     match received {
-        Some((Ok(Ok(probe)), took)) => {
+        Some((Ok(Ok((probe, warm))), took)) => {
             rec.engine_layout_ms = Some(took.as_millis());
+            match warm {
+                Ok((warm, warm_took)) => {
+                    rec.engine_repaint_ms = Some(warm_took.as_millis());
+                    rec.engine_repaint_consistent = Some(warm == probe);
+                }
+                Err(_) => rec.engine_repaint_consistent = Some(false),
+            }
             rec.engine_page_count = Some(probe.page_count);
             rec.engine_fingerprint = Some(format!("{:#018x}", probe.fingerprint));
             rec.engine_degradations = probe.degradations;
@@ -1337,6 +1607,22 @@ mod tests {
         let pr = br#"<w:tbl><w:tblPr/></w:tbl>"#;
         let slash = pr.windows(2).position(|w| w == b"/>").unwrap();
         assert_eq!(classify_rewrite(pr, slash, 1), "table");
+    }
+
+    /// Issue #384 — the regeneration classes, by the rewritten region's
+    /// own shape.
+    #[test]
+    fn classify_rewrite_tags_regeneration_shapes() {
+        let pretty = b"<w:p>\n  <w:r><w:t>x</w:t></w:r>\n</w:p>";
+        assert_eq!(classify_rewrite(pretty, 5, 3), "whitespace");
+        let instr = br#"<w:r><w:instrText> PAGE </w:instrText></w:r>"#;
+        let space = instr.windows(5).position(|w| w == b" PAGE").unwrap();
+        assert_eq!(classify_rewrite(instr, space, 1), "instrText-space");
+        let proof = br#"<w:r><w:t>x</w:t></w:r><w:proofErr w:type="spellEnd"/></w:hyperlink>"#;
+        let at = proof.windows(11).position(|w| w == b"<w:proofErr").unwrap();
+        assert_eq!(classify_rewrite(proof, at, 20), "proofErr-order");
+        let tag = br#"<w:smartTag w:uri="u"><w:r><w:t>x</w:t></w:r></w:smartTag>"#;
+        assert_eq!(classify_rewrite(tag, 0, 12), "smartTag");
     }
 
     #[test]

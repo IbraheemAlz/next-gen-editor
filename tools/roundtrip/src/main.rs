@@ -35,11 +35,14 @@ mod inline_spans;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod ppr_splice;
 mod protection;
 mod reader_cascade;
 mod reader_hardening;
+mod regen;
 mod revision_ids;
 mod revisions;
+mod styles_patch;
 mod table_markup;
 mod theme;
 mod tracked_coverage;
@@ -365,6 +368,9 @@ fn run_default() -> Result<()> {
     tracked_coverage::run_tracked_table_rows_roundtrip()?;
     tracked_coverage::run_section_break_revision_roundtrip()?;
     protection::run_document_protection_roundtrip()?;
+    regen::run_regen_classes_roundtrip()?;
+    ppr_splice::run_ppr_splice_roundtrip()?;
+    styles_patch::run_styles_patch_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

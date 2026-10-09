@@ -792,6 +792,7 @@ fn parse_border_shorthand(v: &str) -> Option<BorderStroke> {
         style,
         size_eighth_pt: size_eighth_pt.unwrap_or(4),
         color,
+        ..Default::default()
     })
 }
 
@@ -1572,6 +1573,7 @@ mod tests {
                 style: BorderStyle::Single,
                 size_eighth_pt: 8, // 1pt
                 color: Some(red),
+                ..Default::default()
             }),
             ..Default::default()
         });

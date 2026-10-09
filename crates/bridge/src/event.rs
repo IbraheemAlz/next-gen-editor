@@ -654,6 +654,49 @@ pub enum ErrorKind {
     /// Issue #345 — `OpenDocument.password` does not open the encrypted
     /// package. The previous document stays open.
     WrongPassword,
+    /* Issue #427 - the remaining refusals, typed. Closed and additive: a
+    new refusal either reuses one of these or adds a variant AND its
+    `ERROR_TOAST_COPY` entry (`tools/parity` fails on a kind with neither
+    copy nor a declared own presentation). */
+    /// The command needs a selection / caret and the engine has none.
+    NoSelection,
+    /// The position does not address a paragraph (a stale or out-of-range
+    /// address).
+    NotInParagraph,
+    /// The command is body-only (or text-box-only) and a note, text box,
+    /// header or footer is being edited.
+    InStory,
+    /// The command is not supported inside a table cell (fields, notes,
+    /// text boxes, page / section breaks).
+    InTableCell,
+    /// `SetFieldInstruction` found no field at the caret.
+    NoFieldAtCaret,
+    /// The command's target (a comment, style, picture, field, table, text
+    /// box chain) does not exist (any more).
+    NoSuchTarget,
+    /// `SetHeaderFooterLink` while no header or footer is being edited.
+    NotInHeaderFooter,
+    /// A well-formed command the engine does not support at this place or
+    /// for this input (PDF as an open format, a TOC outside the body, ...).
+    UnsupportedHere,
+    /// A numeric argument is outside its allowed range (table dimensions,
+    /// text-box extent, zoom, device scale, render date).
+    OutOfRange,
+    /// A required text argument is empty (a field code, a glyph string).
+    EmptyInput,
+    /// Text boxes nest deeper than the layout allows.
+    NestingTooDeep,
+    /// The engine is not ready for the command yet (no layout config, a
+    /// font not loaded).
+    NotReady,
+    /// The command is accepted by the schema but not implemented.
+    Unimplemented,
+    /// An internal failure (paint, rasterize, serialize, export); nothing
+    /// the user can fix by changing their input.
+    Internal,
+    /// The file is not a readable document (a corrupt package that is not
+    /// one of the typed open refusals above).
+    InvalidDocument,
 }
 
 /// Issue #345 — an enforced editing restriction (`w:documentProtection`
@@ -691,7 +734,70 @@ impl ProtectionMode {
     }
 }
 
+impl ErrorKind {
+    /// Every kind, in declaration order (issue #427). `tools/parity`
+    /// joins it with the shell's `ERROR_TOAST_COPY`; [`ErrorKind::name`]
+    /// is an exhaustive `match`, so a new variant cannot compile without
+    /// being named, and parity flags a name missing from this list.
+    pub const ALL: &'static [ErrorKind] = &[
+        ErrorKind::PackageTooLarge,
+        ErrorKind::TrackedDeletionRefused,
+        ErrorKind::EncryptedDocument,
+        ErrorKind::Protected,
+        ErrorKind::WrongPassword,
+        ErrorKind::NoSelection,
+        ErrorKind::NotInParagraph,
+        ErrorKind::InStory,
+        ErrorKind::InTableCell,
+        ErrorKind::NoFieldAtCaret,
+        ErrorKind::NoSuchTarget,
+        ErrorKind::NotInHeaderFooter,
+        ErrorKind::UnsupportedHere,
+        ErrorKind::OutOfRange,
+        ErrorKind::EmptyInput,
+        ErrorKind::NestingTooDeep,
+        ErrorKind::NotReady,
+        ErrorKind::Unimplemented,
+        ErrorKind::Internal,
+        ErrorKind::InvalidDocument,
+    ];
+
+    /// The wire name (the variant name, as `Event::Error.kind` carries it).
+    pub fn name(self) -> &'static str {
+        match self {
+            ErrorKind::PackageTooLarge => "PackageTooLarge",
+            ErrorKind::TrackedDeletionRefused => "TrackedDeletionRefused",
+            ErrorKind::EncryptedDocument => "EncryptedDocument",
+            ErrorKind::Protected => "Protected",
+            ErrorKind::WrongPassword => "WrongPassword",
+            ErrorKind::NoSelection => "NoSelection",
+            ErrorKind::NotInParagraph => "NotInParagraph",
+            ErrorKind::InStory => "InStory",
+            ErrorKind::InTableCell => "InTableCell",
+            ErrorKind::NoFieldAtCaret => "NoFieldAtCaret",
+            ErrorKind::NoSuchTarget => "NoSuchTarget",
+            ErrorKind::NotInHeaderFooter => "NotInHeaderFooter",
+            ErrorKind::UnsupportedHere => "UnsupportedHere",
+            ErrorKind::OutOfRange => "OutOfRange",
+            ErrorKind::EmptyInput => "EmptyInput",
+            ErrorKind::NestingTooDeep => "NestingTooDeep",
+            ErrorKind::NotReady => "NotReady",
+            ErrorKind::Unimplemented => "Unimplemented",
+            ErrorKind::Internal => "Internal",
+            ErrorKind::InvalidDocument => "InvalidDocument",
+        }
+    }
+}
+
 impl Event {
+    /// An [`Event::Error`] carrying its [`ErrorKind`] (issue #427).
+    pub fn error_kind(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Event::Error {
+            message: message.into(),
+            kind: Some(kind),
+        }
+    }
+
     /// A plain [`Event::Error`] (no [`ErrorKind`]).
     pub fn error(message: impl Into<String>) -> Self {
         Event::Error {
@@ -998,6 +1104,11 @@ pub enum LayoutDegradeReason {
     /// flattened to its paragraphs (stacked, in document order, in the
     /// cell holding it) instead of laid out as a grid.
     NestingCapped,
+    /// Issue #379 — a TABLE layout-cache entry (the nested-table memo or
+    /// the content-keyed table cache that survives between paints) failed
+    /// its post-conditions and the table was re-laid from scratch.
+    /// Distinct from `CacheMismatch` (the paragraph cache).
+    TableCacheMismatch,
 }
 
 /// Issue #87 — one degradation note on `Event::Painted`. `page` is the
@@ -1289,6 +1400,15 @@ mod a11y_note_wire_tests {
             typed,
             serde_json::json!({ "type": "ERROR", "message": "too big", "kind": "PackageTooLarge" })
         );
+        /* Issue #427 - `ErrorKind::ALL` / `name()` agree with the wire. */
+        let mut seen = std::collections::BTreeSet::new();
+        for k in ErrorKind::ALL {
+            let wire = serde_json::to_value(k).unwrap();
+            assert_eq!(wire, serde_json::json!(k.name()), "{k:?}");
+            assert!(seen.insert(k.name()), "duplicate {k:?}");
+            let e = Event::error_kind(*k, "x");
+            assert!(matches!(e, Event::Error { kind: Some(got), .. } if got == *k));
+        }
         /* Issue #345 — the encrypted-package refusal. */
         let encrypted = serde_json::to_value(Event::Error {
             message: "locked".into(),

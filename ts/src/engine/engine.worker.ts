@@ -18,9 +18,16 @@ import {
     clearJournalGap,
 } from './event-log';
 import { nextCleanState } from './clean-state';
-import { nextRetry } from './retry-schedule';
+import {
+    buildCheckpointState,
+    createJournalRetry,
+    createSnapshotRetry,
+    realTimers,
+} from './checkpoint-retry';
+import { newSnapshotState, takeSnapshotFlow } from './snapshot-flow';
+import { countJournalGap, pickRecoveryBase } from './recovery-plan';
 import { journalSafe } from './journal-safe';
-import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-log';
+import type { LoggedCommand, RecoveryCandidate } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
    GitHub Pages /next-gen-editor/); `?url` imports are hashed + base-aware. */
@@ -152,7 +159,6 @@ let engine: Engine | null = null;
 
 /* Phase 2 §6 — event-log sequencing for the EngineClient command path. */
 let logSequence = 0;
-let lastSnapshotAt = 0;
 /* Issue #388 - whether the document equals what the user last saved (or
    opened / seeded); mirrored into the event log's `clean` marker so a
    later boot can offer an unsaved session back. */
@@ -170,23 +176,34 @@ const SNAPSHOT_IDLE_MS = 1500;
    until they typed again. Bounded exponential backoff; the attempt after
    the last delay failing raises the "not being checkpointed" notice. A
    success resets everything. */
-/* The schedule itself lives in `retry-schedule.ts` (unit-tested). */
-let snapshotWriteFailures = 0;
-let snapshotRetryTimer: ReturnType<typeof setTimeout> | undefined;
-let checkpointWarned = false;
-/* Issue #390 - the command journal (`appendCommand`) gets the same
-   bounded 2/4/8 s retry clock as the snapshot writes. A failed row waits
-   in `journalBacklog` (seq -> command) and is re-written by `drainJournal`;
-   a run of failures is counted in ROUNDS (a burst of keystrokes failing
-   together is one round, not one per key). After the last delay fails the
-   journal is `journalExhausted`: the shell is told commands are not being
-   journaled and a recovery would miss them (`Event::CheckpointState`). */
-const JOURNAL_BACKLOG_MAX = 5000;
-const journalBacklog = new Map<number, Command>();
-let journalFailures = 0;
-let journalRetryTimer: ReturnType<typeof setTimeout> | undefined;
-let journalExhausted = false;
-let journalDraining = false;
+/* Issue #438 - the retry machines live in `checkpoint-retry.ts` (the
+   2/4/8 s schedule in `retry-schedule.ts`) with an injectable clock and
+   writer, unit-tested; the worker wires them to the real timers, the
+   IndexedDB writers and `postMessage`. The journal (`appendCommand`)
+   backlog is re-written by `journal.drain()`; a run of failures is counted
+   in ROUNDS (a burst of keystrokes failing together is one round); after
+   the last delay the journal is `exhausted`: the shell is told commands
+   are not being journaled and a recovery would miss them
+   (`Event::CheckpointState`). */
+const snapshotRetry = createSnapshotRetry({
+    timers: realTimers,
+    /* Like the idle timer: read the head INSIDE the queued task. */
+    retrySnapshot: () => void enqueue(() => takeSnapshot(logSequence)),
+    onHealth: (failures) => postCheckpointState(failures),
+    onError: (m) => {
+        lastCheckpointError = m;
+    },
+});
+const journal = createJournalRetry<Command>({
+    timers: realTimers,
+    write: appendCommand,
+    recordGap: writeJournalGap,
+    clearGap: clearJournalGap,
+    onHealth: (failures) => postCheckpointState(failures),
+    onError: (m) => {
+        lastCheckpointError = m;
+    },
+});
 /* Issue #390 - the latest failure's message, carried on the event. */
 let lastCheckpointError: string | undefined;
 let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
@@ -197,60 +214,18 @@ let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingLogWrites: Promise<unknown> = Promise.resolve();
 /* Issue #85 — fault-injection countdown; `null` = disarmed. */
 let trapAfterCommands: number | null = null;
-/* Issue #212 — content key of the detached source package the event
-   log's `packages` store holds, passed as `known_package_hash` so the
-   engine ships the package bytes only when they changed.
-   Issue #314 — set only once a snapshot transaction holding that
-   package COMMITTED (never when the write is merely issued: a snapshot
-   taken while that write is in flight would otherwise name a hash whose
-   bytes may never land), and cleared when one fails, so the next
-   snapshot re-ships the bytes. */
-let committedPackageHash: string | undefined;
-/* Issue #314 — package bytes the engine shipped whose write has not
-   committed yet. A snapshot taken meanwhile carries THESE bytes in its
-   own transaction (written only if still absent — `persistSnapshot`),
-   so it never depends on the in-flight one succeeding, and the engine
-   does not re-encode a multi-MB package for it. Dropped once a
-   transaction holding it settles (committed → `committedPackageHash`;
-   failed → the next snapshot re-ships from the engine). */
-let pendingPackage: { hash: string; bytes: Uint8Array } | undefined;
-/* Issue #268 — the next persisted snapshot becomes the document's pinned
-   base (never pruned; see `event-log.ts`). Set when the log opens, after
-   every document-replacing command, and after a recovery whose pinned
-   base did not restore. */
-let pinNextSnapshot = false;
+/* Issue #85 / #212 / #268 / #314 - the snapshot bookkeeping
+   (`lastSnapshotAt`, the committed / in-flight package, the pin flag) is
+   one `SnapshotState` driven by `takeSnapshotFlow` (`snapshot-flow.ts`,
+   unit-tested). `committedPackageHash` is passed as `known_package_hash`
+   so the engine ships the package bytes only when they changed - set only
+   once a snapshot transaction holding it COMMITTED. */
+const snap = newSnapshotState();
 /* Issue #268 — commands that replace the whole document: the snapshot
    after one is the new document's pinned base. Issue #342 — derived from
    `bridge::meta` (`CommandMeta.new_document`: OPEN_DOCUMENT, LOAD_DOCX,
    RENDER_PAGE, CLOSE_DOCUMENT), not a hand-kept list. */
 const startsNewDocument = (cmd: Command): boolean => commandMeta(cmd.type).new_document;
-
-/** Issue #268 — how good a recovery base is, best first:
- *  4 — full tail, package present (or none needed);
- *  3 — full tail, but the snapshot's source package was lost (the session
- *      saves through the minimal writer — sibling parts gone);
- *  2 — a pinned base whose tail pruning has passed (restored alone:
- *      edits after it are lost), package present;
- *  1 — the same, package lost;
- *  0 — nothing restored and the log is truncated (the document is lost);
- *  -1 — the snapshot did not restore at all. */
-function recoveryRank(candidate: RecoveryCandidate, evt: Event): number {
-    if (evt.type !== 'RECOVERED') return -1;
-    const isLogBase = candidate.snapshot.length === 0;
-    if (!evt.snapshot_restored && !isLogBase) return -1;
-    const tailComplete = candidate.tailComplete !== false;
-    if (isLogBase) return tailComplete ? 4 : 0;
-    return (tailComplete ? 3 : 1) + (evt.package_lost ? 0 : 1);
-}
-
-/** Issue #268 — the best rank a candidate could reach, before trying it:
- *  a package the store no longer holds is predictably lost. */
-function recoveryRankCeiling(candidate: RecoveryCandidate): number {
-    const tailComplete = candidate.tailComplete !== false;
-    if (candidate.snapshot.length === 0) return tailComplete ? 4 : 0;
-    const packageMissing = candidate.packageHash !== undefined && !candidate.package;
-    return (tailComplete ? 3 : 1) + (packageMissing ? 0 : 1);
-}
 
 /* Issue #96 — every OffscreenCanvas this worker generation was handed, by
    page index (0 = the INIT / RECOVER surface). Only the DEV paint probe
@@ -1078,10 +1053,10 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         if (msg.logDb) setActiveLogDb(msg.logDb);
         await openEventLog(msg.documentId);
         cleanState = true;
-        committedPackageHash = undefined;
-        pendingPackage = undefined;
+        snap.committedPackageHash = undefined;
+        snap.pendingPackage = undefined;
         /* Issue #268 — the session's first snapshot is its pinned base. */
-        pinNextSnapshot = true;
+        snap.pinNextSnapshot = true;
         /* Issue #43 — inject today's date so DATE fields resolve at
            layout time (Word updates DATE on open/print). Single
            injection site: the engine core never reads a wall clock, so
@@ -1174,52 +1149,15 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                 /* Issue #212 — the detached package the snapshot names. */
                 ...(candidate.package ? { package: candidate.package } : {}),
             });
-        let evt: Event | undefined;
-        let base: RecoveryCandidate | undefined;
-        let bestRank = -2;
-        let current: RecoveryCandidate | undefined;
-        let snapshotFallbacks = 0;
-        let pinnedFailed = false;
-        const packageLostAttempts: RecoveryCandidate[] = [];
-        for (const candidate of msg.candidates) {
-            if (bestRank >= 4) break;
-            if (recoveryRankCeiling(candidate) <= bestRank) continue;
-            const result = await attempt(candidate);
-            current = candidate;
-            const rank = recoveryRank(candidate, result);
-            if (rank < 0) {
-                snapshotFallbacks += 1;
-                if (candidate.pinned) pinnedFailed = true;
-                console.warn(
-                    `[worker] recovery: snapshot @${candidate.seq} did not restore; ` +
-                        'falling back to the next older base',
-                );
-            } else if (result.type === 'RECOVERED' && result.package_lost) {
-                packageLostAttempts.push(candidate);
-                console.warn(
-                    `[worker] recovery: snapshot @${candidate.seq} restores without its ` +
-                        'source package; looking for an older base that has it',
-                );
-            }
-            if (rank > bestRank) {
-                bestRank = rank;
-                evt = result;
-                base = candidate;
-            }
-        }
-        if (!evt || !base) throw new Error('recovery: no base to recover from');
-        if (current !== base) {
-            /* A later, worse attempt holds the engine: restore the best. */
-            evt = await attempt(base);
-        }
-        /* Readable snapshots passed over for an older base with its package. */
-        const chosen = base;
-        const packageFallbacks =
-            evt.type === 'RECOVERED' && !evt.package_lost
-                ? packageLostAttempts.filter((c) => c !== chosen).length
-                : 0;
+        const {
+            evt,
+            base,
+            snapshotFallbacks,
+            pinnedFailed,
+            packageFallbacks,
+        } = await pickRecoveryBase(msg.candidates, attempt, (m) => console.warn(m));
         const tailDropped = base.tailComplete === false && base.snapshot.length > 0;
-        const journalGap = countJournalGap(base, msg);
+        const journalGap = countJournalGap(base, msg.commands, msg.journalGapSeqs);
         const packageLost = evt.type === 'RECOVERED' && evt.package_lost;
         if (packageLost) {
             console.warn(
@@ -1231,22 +1169,22 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            one actually restored (0 = none: the next logged command then
            takes a snapshot straight away — `seq - 0 ≥ SNAPSHOT_EVERY`
            once the log is long). */
-        lastSnapshotAt = evt.type === 'RECOVERED' && evt.snapshot_restored ? base.seq : 0;
+        snap.lastSnapshotAt = evt.type === 'RECOVERED' && evt.snapshot_restored ? base.seq : 0;
         /* Issue #212 — the store holds the package the restored snapshot
            named (the engine re-attached it and primed its key), so the
            next snapshot need not ship it again. Anything else ships.
            Issue #268 — unless the engine could not attach it.
            Issue #314 — the bytes were READ from the store, so it is a
            committed package (and `persistSnapshot` re-verifies it). */
-        committedPackageHash =
-            lastSnapshotAt > 0 && base.package !== undefined && !packageLost
+        snap.committedPackageHash =
+            snap.lastSnapshotAt > 0 && base.package !== undefined && !packageLost
                 ? base.packageHash
                 : undefined;
-        pendingPackage = undefined;
+        snap.pendingPackage = undefined;
         /* Issue #268 — re-pin when the pinned base proved unreadable or
            nothing was restored (the document now descends from no
            persisted base). */
-        pinNextSnapshot = pinnedFailed || lastSnapshotAt === 0;
+        snap.pinNextSnapshot = pinnedFailed || snap.lastSnapshotAt === 0;
         /* Issue #43 — a recovered engine needs the render date again.
            Dispatched AFTER `RECOVER`: its session reset wipes the clock
            half (TIME fields), so an injection ahead of it was lost. */
@@ -1322,7 +1260,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            Queued (this task holds the queue); it reads `logSequence` when
            it RUNS, so commands queued ahead of it are both applied and
            counted — the stamp matches the state it captures. */
-        if (tailDropped && logSequence > lastSnapshotAt) {
+        if (tailDropped && logSequence > snap.lastSnapshotAt) {
             void enqueue(() => takeSnapshot(logSequence));
         }
     } catch (e: unknown) {
@@ -1373,13 +1311,13 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
             const seq = logCommand(msg.cmd);
             /* Issue #268 — a new document: its first snapshot is pinned. */
             if (startsNewDocument(msg.cmd) && evt.type !== 'ERROR') {
-                pinNextSnapshot = true;
+                snap.pinNextSnapshot = true;
             }
             /* Issue #85 — cadence snapshot, taken HERE (still inside this
                command's queue task, reply already posted) so its bytes
                describe exactly the state after `seq`: a command queued
                behind us cannot slip in between and get replayed twice. */
-            if (seq - lastSnapshotAt >= SNAPSHOT_EVERY) {
+            if (seq - snap.lastSnapshotAt >= SNAPSHOT_EVERY) {
                 await takeSnapshot(seq);
             }
             armIdleSnapshot();
@@ -1624,8 +1562,11 @@ function logCommand(command: Command): number {
     const cmd = journalSafe(command);
     const seq = ++logSequence;
     const write = appendCommand(seq, cmd).then(
-        () => noteJournalWriteOk(),
-        (e: unknown) => noteJournalWriteFailed(seq, cmd, e),
+        () => journal.noteWriteOk(),
+        (e: unknown) => {
+            console.warn('[worker] event-log append failed', e);
+            journal.noteWriteFailed(seq, cmd, e);
+        },
     );
     pendingLogWrites = pendingLogWrites.then(() => write);
     return seq;
@@ -1644,242 +1585,36 @@ function logCommand(command: Command): number {
  * synchronous cost; the IndexedDB write settles off the critical path.
  */
 async function takeSnapshot(seq: number): Promise<void> {
-    if (!engine || seq <= lastSnapshotAt) return;
-    try {
-        /* Issue #212 — detached: the retained source package is persisted
-           once per document (`packages` store), not inside every snapshot.
-           Issue #314 — "known" is a COMMITTED package, or one whose bytes
-           this worker still holds from an in-flight write (attached
-           below): never a hash whose bytes might not land. */
-        const known = committedPackageHash ?? pendingPackage?.hash;
-        const evt = await dispatch({
-            type: 'SNAPSHOT',
-            seq,
-            detach_package: true,
-            ...(known !== undefined ? { known_package_hash: known } : {}),
-        });
-        if (evt.type !== 'SNAPSHOT') {
-            console.warn('[worker] engine snapshot failed', evt);
-            /* Issue #390 - retried on the same clock as a failed write
-               (the replay tail keeps growing until a snapshot lands). */
-            noteSnapshotFailed(evt.type === 'ERROR' ? evt.message : `unexpected ${evt.type}`);
-            return;
-        }
-        const previousSnapshotAt = lastSnapshotAt;
-        lastSnapshotAt = seq;
-        const hash = evt.package_hash;
-        let pkg: SnapshotPackage | undefined;
-        if (hash !== undefined) {
-            if (evt.package) {
-                pendingPackage = { hash, bytes: evt.package };
-                pkg = { hash, bytes: evt.package };
-            } else if (hash !== committedPackageHash && pendingPackage?.hash === hash) {
-                /* Issue #314 — the engine skipped the bytes because an
-                   earlier snapshot shipped them, but that write has not
-                   committed: carry them, so this row cannot outlive a
-                   failure of that one. */
-                pkg = { hash, bytes: pendingPackage.bytes };
-            } else {
-                /* Committed: `persistSnapshot` verifies the store still
-                   holds it and aborts the write otherwise. */
-                pkg = { hash };
-            }
-        }
-        /* Issue #268 — the document's first snapshot is its pinned base. */
-        const pin = pinNextSnapshot;
-        pinNextSnapshot = false;
-        const write = persistSnapshot(seq, evt.bytes, pkg, { pin }).then(
-            () => {
-                noteSnapshotWriteOk();
-                if (hash === undefined) return;
-                /* Issue #314 — only now is the package known stored. */
-                committedPackageHash = hash;
-                if (pendingPackage?.hash === hash) pendingPackage = undefined;
-            },
-            (e: unknown) => {
-                console.warn('[worker] event-log snapshot failed', e);
-                /* Issue #333 - nothing was checkpointed at `seq`: let a
-                   retry (or the next command) snapshot this position
-                   again instead of skipping it as "already taken". */
-                if (lastSnapshotAt === seq) lastSnapshotAt = previousSnapshotAt;
-                noteSnapshotFailed(e);
-                /* Issue #314 — the package may not be stored (this write
-                   carried it, or the store lost it: `PackageMissingError`):
-                   forget it, so the next snapshot re-ships the bytes. */
-                if (hash !== undefined) {
-                    if (committedPackageHash === hash) committedPackageHash = undefined;
-                    if (pendingPackage?.hash === hash) pendingPackage = undefined;
-                }
-                /* Nor the pin: pin the next one instead. */
-                if (pin) pinNextSnapshot = true;
-            },
-        );
-        pendingLogWrites = pendingLogWrites.then(() => write);
-    } catch (e: unknown) {
-        console.warn('[worker] snapshot dispatch failed', e);
-        noteSnapshotFailed(e);
-    }
-}
-
-/** Issue #390 - how many logged commands after `base` could not be
- *  replayed because their row was never written: seqs the best-effort
- *  `journal-gap` record names that are still absent, plus holes inside the
- *  retained tail. A base restored WITHOUT its pruned tail replays nothing,
- *  so it has no journal gap to report (its loss is `tailDropped`). */
-function countJournalGap(base: RecoveryCandidate, msg: ClientRecoverMsg): number {
-    if (base.tailComplete === false) return 0;
-    const present = new Set(msg.commands.map((c) => c.seq));
-    const missing = new Set<number>();
-    for (const seq of msg.journalGapSeqs ?? []) {
-        if (seq > base.seq && !present.has(seq)) missing.add(seq);
-    }
-    let prev = base.seq;
-    for (const c of msg.commands) {
-        if (c.seq <= base.seq) continue;
-        /* Bounded: a hole this wide is a different failure (pruning). */
-        for (let s = prev + 1; s < c.seq && s - prev <= 10_000; s++) missing.add(s);
-        prev = c.seq;
-    }
-    return missing.size;
-}
-
-/** Issue #390 - a human-readable failure message (no document content:
- *  IndexedDB / engine error text only). */
-function failureText(e: unknown): string {
-    if (e instanceof Error) return e.message || e.name;
-    return typeof e === 'string' ? e : 'unknown error';
+    await takeSnapshotFlow(seq, snap, {
+        hasEngine: () => engine !== null,
+        engineSnapshot: (at, known) =>
+            dispatch({
+                type: 'SNAPSHOT',
+                seq: at,
+                detach_package: true,
+                ...(known !== undefined ? { known_package_hash: known } : {}),
+            }),
+        persist: persistSnapshot,
+        retry: snapshotRetry,
+        track: (write) => {
+            pendingLogWrites = pendingLogWrites.then(() => write);
+        },
+        warn: (m, d) => console.warn(m, d),
+    });
 }
 
 /** Issue #390 - broadcast the event log's health as a typed
  *  `Event::CheckpointState` (id-less, unsolicited, like the a11y delta).
  *  Every event with `failures > 0` reports exactly one failed attempt. */
 function postCheckpointState(failures: number): void {
-    const ok = !checkpointWarned && !journalExhausted;
     self.postMessage({
-        evt: {
-            type: 'CHECKPOINT_STATE',
-            ok,
+        evt: buildCheckpointState({
+            snapshotWarned: snapshotRetry.warned,
+            journalExhausted: journal.exhausted,
             failures,
-            journal_failing: journalExhausted,
-            ...(lastCheckpointError !== undefined && failures > 0
-                ? { last_error: lastCheckpointError }
-                : {}),
-        } satisfies Event,
+            lastError: lastCheckpointError,
+        }) satisfies Event,
     });
-}
-
-/** Issue #333 — a snapshot write landed: the failure run is over. */
-function noteSnapshotWriteOk(): void {
-    const hadFailures = snapshotWriteFailures > 0;
-    snapshotWriteFailures = 0;
-    if (snapshotRetryTimer !== undefined) {
-        clearTimeout(snapshotRetryTimer);
-        snapshotRetryTimer = undefined;
-    }
-    if (hadFailures || checkpointWarned) {
-        checkpointWarned = false;
-        postCheckpointState(0);
-    }
-}
-
-/** Issue #333 — a snapshot (the engine-side `SNAPSHOT` dispatch, issue
- *  #390, or its IndexedDB write) failed: schedule the next bounded retry,
- *  or, once the last one failed too, tell the shell. Every failure is
- *  reported so the shell can count it. */
-function noteSnapshotFailed(reason: unknown): void {
-    snapshotWriteFailures += 1;
-    lastCheckpointError = failureText(reason);
-    const decision = nextRetry(snapshotWriteFailures);
-    if (decision.retry) {
-        const delay = decision.delayMs;
-        postCheckpointState(snapshotWriteFailures);
-        if (snapshotRetryTimer !== undefined) clearTimeout(snapshotRetryTimer);
-        snapshotRetryTimer = setTimeout(() => {
-            snapshotRetryTimer = undefined;
-            /* Like the idle timer: read the head INSIDE the queued task. */
-            void enqueue(() => takeSnapshot(logSequence));
-        }, delay);
-        return;
-    }
-    /* Retries exhausted. A later command-driven snapshot may still land
-       (and reset); until then the user must know the log is not
-       checkpointing. The exhausting failure is ONE event (`ok: false`). */
-    checkpointWarned = true;
-    postCheckpointState(snapshotWriteFailures);
-}
-
-/** Issue #390 - a command row was written: if the journal had fallen
- *  behind (exhausted), the store works again - drain what is missing. */
-function noteJournalWriteOk(): void {
-    if (journalExhausted && journalBacklog.size > 0 && !journalDraining) {
-        void drainJournal();
-    }
-}
-
-/** Issue #390 - a command row could not be written. The row waits in the
- *  backlog; the first failure of a run starts the retry clock, later ones
- *  (a burst) just join the backlog. */
-function noteJournalWriteFailed(seq: number, cmd: Command, e: unknown): void {
-    console.warn('[worker] event-log append failed', e);
-    journalBacklog.set(seq, cmd);
-    if (journalBacklog.size > JOURNAL_BACKLOG_MAX) {
-        const oldest = journalBacklog.keys().next();
-        if (!oldest.done) journalBacklog.delete(oldest.value);
-    }
-    lastCheckpointError = failureText(e);
-    /* Best effort, on the `meta` store (the `commands` store may be the
-       broken one): lets a later recovery report the gap. */
-    void writeJournalGap([...journalBacklog.keys()]).catch(() => undefined);
-    if (journalExhausted || journalRetryTimer !== undefined || journalDraining) return;
-    failJournalRound();
-}
-
-/** One round of journal attempts failed: retry later, or give up loudly. */
-function failJournalRound(): void {
-    if (journalExhausted) return;
-    journalFailures += 1;
-    const decision = nextRetry(journalFailures);
-    if (decision.retry) {
-        const delay = decision.delayMs;
-        postCheckpointState(journalFailures);
-        journalRetryTimer = setTimeout(() => {
-            journalRetryTimer = undefined;
-            void drainJournal();
-        }, delay);
-        return;
-    }
-    journalExhausted = true;
-    postCheckpointState(journalFailures);
-}
-
-/** Issue #390 - re-write every backlogged command row; all landed =
- *  healthy again, any failure = the next round. */
-async function drainJournal(): Promise<void> {
-    if (journalDraining) return;
-    journalDraining = true;
-    try {
-        if (journalRetryTimer !== undefined) {
-            clearTimeout(journalRetryTimer);
-            journalRetryTimer = undefined;
-        }
-        for (const [seq, cmd] of [...journalBacklog]) {
-            try {
-                await appendCommand(seq, cmd);
-                journalBacklog.delete(seq);
-            } catch (e: unknown) {
-                lastCheckpointError = failureText(e);
-                failJournalRound();
-                return;
-            }
-        }
-        const wasFailing = journalFailures > 0 || journalExhausted;
-        journalFailures = 0;
-        journalExhausted = false;
-        void clearJournalGap().catch(() => undefined);
-        if (wasFailing) postCheckpointState(0);
-    } finally {
-        journalDraining = false;
-    }
 }
 
 /** Issue #85 — (re)arm the idle snapshot timer after a logged command. */
@@ -2034,14 +1769,11 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
                 idleSnapshotTimer = undefined;
             }
             trapAfterCommands = null;
-            if (snapshotRetryTimer !== undefined) {
-                clearTimeout(snapshotRetryTimer);
-                snapshotRetryTimer = undefined;
-            }
+            snapshotRetry.cancel();
             /* The respawned generation replays from here: snapshot the
                log head so its tail is empty (the commands are logged
                regardless — recovery would replay them without it). */
-            if (engine && logSequence > lastSnapshotAt) {
+            if (engine && logSequence > snap.lastSnapshotAt) {
                 await takeSnapshot(logSequence);
             }
             /* Every event-log write issued so far has landed (or failed
@@ -2050,7 +1782,7 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
             /* Issue #390 - one last attempt at rows still waiting for a
                retry, so a planned restart does not leave a gap the store
                would have accepted by now. */
-            if (journalBacklog.size > 0) await drainJournal();
+            if (journal.size > 0) await journal.drain();
             self.postMessage({ id: msg.id, ok: true });
             self.close();
         });

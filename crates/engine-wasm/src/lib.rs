@@ -37,6 +37,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use table_cache::LayoutCache;
 use text_pipeline::{
     Alignment, FontStack, LoadedFont, ShapingDirection, first_strong_direction, shape_text,
 };
@@ -44,6 +45,9 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod pdf_semantics;
+/// Issue #379 — the content-keyed table layout cache that survives
+/// between paints.
+mod table_cache;
 
 #[wasm_bindgen(start)]
 pub fn boot() {
@@ -510,8 +514,8 @@ thread_local! {
 }
 
 /// Issue #318 — test-only: while alive, every sub-paginator degradation
-/// note on this thread (`NestingCapped`, `AutofitCap`, `CacheMismatch`)
-/// panics, the way a strict `layout::Watchdog` turns its notes into hard
+/// note on this thread (`NestingCapped`, `AutofitCap`, `CacheMismatch`,
+/// `TableCacheMismatch`) panics, the way a strict `layout::Watchdog` turns its notes into hard
 /// failures — CI catches a new recovery instead of a silent note.
 #[cfg(test)]
 struct StrictLayoutNotes(bool);
@@ -557,6 +561,7 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::NoteRestartCap => LayoutDegradeReason::NoteRestartCap,
         R::FloatClampedByNotes => LayoutDegradeReason::FloatClampedByNotes,
         R::NestingCapped => LayoutDegradeReason::NestingCapped,
+        R::TableCacheMismatch => LayoutDegradeReason::TableCacheMismatch,
     };
     LayoutDegraded {
         reason,
@@ -864,9 +869,12 @@ pub struct Engine {
     pending_format: Option<SpanStyle>,
     /// Incremental-relayout cache (Backlog #13): memoizes `layout_paragraph`
     /// keyed by a content + render-config hash. An edit only re-shapes the
-    /// changed paragraph; the rest are clones shifted by a Y delta. `RefCell`
-    /// because `build_page` populates it behind a `&self` borrow.
-    layout_cache: RefCell<LruCache<u64, ParagraphBox>>,
+    /// changed paragraph; the rest are clones shifted by a Y delta. Issue
+    /// #379 — it also holds the content-keyed table layout cache
+    /// ([`table_cache`]), so a repaint no longer re-lays unchanged tables;
+    /// `clear()` drops both. `RefCell` because `build_page` populates it
+    /// behind a `&self` borrow.
+    layout_cache: RefCell<LayoutCache>,
     /// Issue #34/#51 — memo of the last `build_pages` run (see
     /// [`LayoutSnapshot`]). `RefCell` because `document_geometry` and
     /// friends populate it behind `&self`.
@@ -1033,9 +1041,9 @@ pub struct Engine {
 /// document (1000 paragraphs) plus edit churn.
 const LAYOUT_CACHE_CAP: usize = 4096;
 
-/// A fresh, empty paragraph layout cache.
-fn new_layout_cache() -> RefCell<LruCache<u64, ParagraphBox>> {
-    RefCell::new(LruCache::new(
+/// A fresh, empty paragraph + table layout cache.
+fn new_layout_cache() -> RefCell<LayoutCache> {
+    RefCell::new(LayoutCache::new(
         NonZeroUsize::new(LAYOUT_CACHE_CAP).expect("LAYOUT_CACHE_CAP is non-zero"),
     ))
 }
@@ -1837,9 +1845,10 @@ fn derive_selection_kind(anchor: &BridgeLogicalPos, caret: &BridgeLogicalPos) ->
 /// pipeline. Returns a descriptive error so callers fail loudly rather than
 /// silently no-op'ing.
 fn phase3_stub(name: &str) -> Event {
-    Event::error(format!(
-        "{name}: accepted by the Phase 2 schema, implemented in Phase 3"
-    ))
+    Event::error_kind(
+        bridge::ErrorKind::Unimplemented,
+        format!("{name}: accepted by the Phase 2 schema, implemented in Phase 3"),
+    )
 }
 
 /// Current WASM linear-memory size in bytes (PHASE_2_BRIDGE_MEMORY.md §8.2).
@@ -2563,7 +2572,7 @@ fn story_has_frame_float(blocks: &[engine::Block], boxes: bool) -> bool {
 fn lay_text_box_frame(
     f: &mut layout::FloatBox,
     ctx: &TextBoxLayoutCtx<'_>,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     comp: Option<&CompositionState>,
     nested_comp: Option<(&EngineBlockPath, u32, &CompositionState)>,
     depth: u32,
@@ -2577,7 +2586,7 @@ fn lay_text_box_frame(
     let inner_w = (width - l - r).max(1.0);
     let inner_h = (height - t - b).max(0.0);
     let story = Arc::clone(&tb.source.story);
-    let lay = |plan: &layout::WrapPlan, cache: &mut LruCache<u64, ParagraphBox>| {
+    let lay = |plan: &layout::WrapPlan, cache: &mut LayoutCache| {
         layout_story_blocks_cut(
             &story.body,
             inner_w,
@@ -3568,7 +3577,7 @@ fn layout_note_blocks(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     composition: Option<&CompositionState>,
 ) -> Vec<LayoutBlock> {
     layout_story_blocks_cut(
@@ -3597,7 +3606,7 @@ fn layout_story_blocks_cut(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     composition: Option<&CompositionState>,
     plan: &layout::WrapPlan,
 ) -> Vec<LayoutBlock> {
@@ -3763,7 +3772,7 @@ fn build_note_bodies(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     active_comp: Option<(engine::NoteAnchor, &CompositionState)>,
 ) -> (
     HashMap<engine::NoteAnchor, layout::NoteBody>,
@@ -3860,7 +3869,7 @@ fn note_table_at<'t>(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     active_comp: Option<(engine::NoteAnchor, &CompositionState)>,
 ) -> &'t NoteTable {
     tables.entry(width.to_bits()).or_insert_with(|| {
@@ -3933,7 +3942,7 @@ fn reshape_resolved_fields(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     story_skip: Option<(u32, bool)>,
 ) {
     for (page_idx, page) in pages.iter_mut().enumerate() {
@@ -4085,7 +4094,7 @@ fn build_header_footer_box(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
     source_rid: Option<&str>,
     composition: Option<&CompositionState>,
 ) -> Option<layout::HeaderFooterBox> {
@@ -4528,13 +4537,20 @@ const MAX_TABLE_LAYOUT_DEPTH: u32 = 32;
 /// outlives the call (an address is meaningless after it). Hits are
 /// still verified (issue #87 doctrine: a fast path is a prediction) —
 /// [`cached_table_is_consistent`] and friends — and a hit that fails is
-/// re-laid from scratch with a `CacheMismatch` note.
+/// re-laid from scratch with a `TableCacheMismatch` note (issue #379;
+/// `CacheMismatch` is the paragraph LRU's).
+///
+/// Issue #379 — beneath this per-call memo sits the CONTENT-keyed
+/// [`table_cache`] (`cache.tables`), which survives between paints: a
+/// memo miss looks the table (and a cell's intrinsic widths) up by its
+/// content fingerprint before laying it out.
 struct TableLayout<'r, 'a> {
     fonts: &'r FontStack,
     cfg: &'r RenderConfig,
     scale: f32,
     sctx: StyleContext<'a>,
-    cache: &'r mut LruCache<u64, ParagraphBox>,
+    /// The paragraph LRU + the content-keyed table cache.
+    cache: &'r mut LayoutCache,
     /// `(inner table address, available width bits)` → its laid-out box.
     boxes: HashMap<(usize, u32), TableBox>,
     /// `(table address, available width bits, grid hint given)` → the
@@ -4548,6 +4564,12 @@ struct TableLayout<'r, 'a> {
     flat_intrinsic: HashMap<usize, (f32, f32)>,
     /// A table past [`MAX_TABLE_LAYOUT_DEPTH`] was flattened.
     nesting_capped: bool,
+    /// Issue #379 — `(table address, depth)` → its content key and
+    /// nesting-cap flag ([`table_cache::table_content_key`]).
+    content_keys: HashMap<(usize, u32), (u64, bool)>,
+    /// Issue #379 — `(cell blocks address, block count, depth)` → their
+    /// content key and nesting-cap flag ([`table_cache::cell_blocks_key`]).
+    cell_keys: HashMap<(usize, usize, u32), (u64, bool)>,
 }
 
 impl<'r, 'a> TableLayout<'r, 'a> {
@@ -4556,7 +4578,7 @@ impl<'r, 'a> TableLayout<'r, 'a> {
         cfg: &'r RenderConfig,
         scale: f32,
         sctx: StyleContext<'a>,
-        cache: &'r mut LruCache<u64, ParagraphBox>,
+        cache: &'r mut LayoutCache,
     ) -> Self {
         Self {
             fonts,
@@ -4569,6 +4591,8 @@ impl<'r, 'a> TableLayout<'r, 'a> {
             intrinsic: HashMap::new(),
             flat_intrinsic: HashMap::new(),
             nesting_capped: false,
+            content_keys: HashMap::new(),
+            cell_keys: HashMap::new(),
         }
     }
 }
@@ -4603,10 +4627,11 @@ fn layout_table_box(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
 ) -> TableBox {
     let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
-    let laid = layout_table_box_uncached(&mut tl, table, available_width_px, 0);
+    /* Issue #379 — through the content-keyed cache that outlives the call. */
+    let laid = table_cache::layout_table_box_persistent(&mut tl, table, available_width_px, 0);
     if tl.nesting_capped {
         note_layout_degradation(LayoutDegradeReason::NestingCapped);
     }
@@ -4632,9 +4657,10 @@ fn layout_table_box_at(
             return hit.clone();
         }
         tl.boxes.remove(&key);
-        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+        note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
-    let laid = layout_table_box_uncached(tl, table, available_width_px, depth);
+    /* Issue #379 — a memo miss asks the content-keyed cache first. */
+    let laid = table_cache::layout_table_box_persistent(tl, table, available_width_px, depth);
     tl.boxes.insert(key, laid.clone());
     laid
 }
@@ -4981,7 +5007,7 @@ fn autofit_distribute_uncached(
     #[cfg(test)]
     AUTOFIT_SOLVES.with(|n| n.set(n.get() + 1));
     let scale = tl.scale;
-    let n_cols = autofit_column_count(table, grid_hint);
+    let n_cols = autofit_column_count(table, grid_hint.len());
     if n_cols == 0 {
         return Vec::new();
     }
@@ -5134,8 +5160,9 @@ fn autofit_distribute_uncached(
 }
 
 /// Number of autofit columns: max(grid, max row's cell-count). The grid
-/// might be empty; cells might over-/under-shoot it; take the union.
-fn autofit_column_count(table: &engine::Table, grid_hint: &[f32]) -> usize {
+/// (`grid_len` columns) might be empty; cells might over-/under-shoot it;
+/// take the union.
+fn autofit_column_count(table: &engine::Table, grid_len: usize) -> usize {
     let max_cols_in_rows = table
         .rows
         .iter()
@@ -5147,7 +5174,7 @@ fn autofit_column_count(table: &engine::Table, grid_hint: &[f32]) -> usize {
         })
         .max()
         .unwrap_or(0);
-    grid_hint.len().max(max_cols_in_rows)
+    grid_len.max(max_cols_in_rows)
 }
 
 /// Issue #318 — [`autofit_distribute_uncached`] once per (table, width,
@@ -5168,11 +5195,11 @@ fn autofit_distribute_at(
         !grid_hint.is_empty(),
     );
     if let Some(hit) = tl.columns.get(&key) {
-        if hit.len() == autofit_column_count(table, grid_hint) {
+        if hit.len() == autofit_column_count(table, grid_hint.len()) {
             return hit.clone();
         }
         tl.columns.remove(&key);
-        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+        note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
     let widths = autofit_distribute_uncached(tl, table, available_width_px, grid_hint, depth);
     tl.columns.insert(key, widths.clone());
@@ -5191,7 +5218,7 @@ fn autofit_distribute(
     scale: f32,
     grid_hint: &[f32],
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
 ) -> Vec<f32> {
     let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
     autofit_distribute_at(&mut tl, table, available_width_px, grid_hint, 0)
@@ -5206,7 +5233,7 @@ fn measure_unbreakable_width(
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut LayoutCache,
 ) -> (f32, f32) {
     let mut tl = TableLayout::new(fonts, cfg, scale, sctx, cache);
     measure_unbreakable_width_at(&mut tl, blocks, 1)
@@ -5227,9 +5254,10 @@ fn measure_unbreakable_width_at(
             return (lo, hi);
         }
         tl.intrinsic.remove(&key);
-        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+        note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
-    let measured = measure_unbreakable_width_uncached(tl, blocks, depth);
+    /* Issue #379 — a memo miss asks the content-keyed cache first. */
+    let measured = table_cache::measure_unbreakable_width_persistent(tl, blocks, depth);
     tl.intrinsic.insert(key, measured);
     measured
 }
@@ -5416,7 +5444,7 @@ fn flattened_intrinsic_width(tl: &mut TableLayout<'_, '_>, table: &engine::Table
             return (lo, hi);
         }
         tl.flat_intrinsic.remove(&key);
-        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
+        note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
     let (mut lo, mut hi) = (0.0_f32, 0.0_f32);
     for para in flatten_table_paragraphs(table) {
@@ -5939,8 +5967,9 @@ fn collect_paragraph_line_geom(
 }
 
 /// Walk a table's rows/cells and emit `LineGeom`s for every paragraph
-/// inside a cell. Continue cells are skipped — their visual content
-/// is owned by the Restart cell above them.
+/// inside a cell — and, issue #377, inside every table nested in a
+/// cell. Continue cells are skipped — their visual content is owned by
+/// the Restart cell above them.
 fn collect_table_line_geom(
     table_box: &TableBox,
     table_block_idx: u32,
@@ -5948,6 +5977,47 @@ fn collect_table_line_geom(
     table_origin_y: f32,
     out: &mut Vec<LineGeom>,
 ) {
+    collect_table_line_geom_at(
+        table_box,
+        &[BridgePathStep::Block {
+            idx: table_block_idx,
+        }],
+        table_origin_x,
+        table_origin_y,
+        0,
+        out,
+    );
+}
+
+/// Issue #377 — [`collect_table_line_geom`] for a table at nesting
+/// `level` (0 = the outermost table of its story) whose path is
+/// `table_path`. A table nested in a cell recurses with its origin
+/// accumulated onto the cell's (the renderer's own walk: cell origin +
+/// the inner table's `origin`, which carries its cell-local stacking
+/// and `place_table` offset) and its path extended by
+/// `[Cell{r,c}, Block(b)]`, so a click inside it resolves to the inner
+/// paragraph instead of the nearest outer-cell line.
+///
+/// Bounded by the layout's nesting cap: only tables at a level below
+/// [`MAX_TABLE_LAYOUT_DEPTH`] are grids, so the recursion is at most
+/// that deep. The cells of a table at the LAST grid level
+/// (`MAX_TABLE_LAYOUT_DEPTH - 1`) are not mapped: their content may hold
+/// the paragraphs of a flattened deeper table (#318, `NestingCapped`),
+/// which are not 1:1 with the cell's model blocks, so a `Block(b)` step
+/// derived from the box index could name the wrong paragraph. A click
+/// there resolves to the nearest mapped line instead — the pre-#377
+/// behaviour, on a document the layout already reported as degraded.
+fn collect_table_line_geom_at(
+    table_box: &TableBox,
+    table_path: &[BridgePathStep],
+    table_origin_x: f32,
+    table_origin_y: f32,
+    level: u32,
+    out: &mut Vec<LineGeom>,
+) {
+    if level + 1 >= MAX_TABLE_LAYOUT_DEPTH {
+        return;
+    }
     for row in &table_box.rows {
         let row_x = table_origin_x + row.origin.x;
         let row_y = table_origin_y + row.origin.y;
@@ -5957,41 +6027,51 @@ fn collect_table_line_geom(
             }
             let cell_x = row_x + cell.origin.x;
             let cell_y = row_y + cell.origin.y;
+            /* The renderer paints a cell's content from its padded
+            content origin (`render::scene::paint_table`: `<w:tcMar>` /
+            `<w:tblCellMar>`, resolved by the layout); the hit map must
+            invert exactly that walk. Before #377 it used the cell's
+            border-box origin, so every caret, highlight and click in a
+            cell sat one left padding (Word's stock 5.4 pt) off its
+            glyphs — and a nested table would compound that per level. */
+            let content_x = cell_x + cell.padding_left;
+            let content_y = cell_y + cell.padding_top;
             for (block_idx, content) in cell.content.iter().enumerate() {
-                let LayoutBlock::Paragraph(para_box) = content else {
-                    continue;
-                };
-                let path = BridgeBlockPath {
-                    steps: vec![
-                        BridgePathStep::Block {
-                            idx: table_block_idx,
-                        },
-                        /* Issue #91 — a split table's fragments re-base
-                        their rows (and a row split inside its cells
-                        re-bases the cell content): map back to the
-                        model row / cell block. */
-                        BridgePathStep::Cell {
-                            row: row.source_row,
-                            col: c as u32,
-                        },
-                        BridgePathStep::Block {
-                            idx: cell.content_offset + block_idx as u32,
-                        },
-                    ],
-                };
-                collect_paragraph_line_geom(
-                    para_box,
-                    cell_x,
-                    cell_y,
-                    /* Hit-target = the entire cell rectangle, so a
-                    click anywhere in the cell lands on this
-                    paragraph's lines — not the leftmost cell that
-                    happens to share `y_top`. */
-                    cell_x,
-                    cell.size.width,
-                    &path,
-                    out,
-                );
+                let mut steps = Vec::with_capacity(table_path.len() + 2);
+                steps.extend_from_slice(table_path);
+                /* Issue #91 — a split table's fragments re-base their
+                rows (and a row split inside its cells re-bases the cell
+                content): map back to the model row / cell block. */
+                steps.push(BridgePathStep::Cell {
+                    row: row.source_row,
+                    col: c as u32,
+                });
+                steps.push(BridgePathStep::Block {
+                    idx: cell.content_offset + block_idx as u32,
+                });
+                match content {
+                    LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
+                        para_box,
+                        content_x,
+                        content_y,
+                        /* Hit-target = the entire cell rectangle, so a
+                        click anywhere in the cell lands on this
+                        paragraph's lines — not the leftmost cell that
+                        happens to share `y_top`. */
+                        cell_x,
+                        cell.size.width,
+                        &BridgeBlockPath { steps },
+                        out,
+                    ),
+                    LayoutBlock::Table(inner) => collect_table_line_geom_at(
+                        inner,
+                        &steps,
+                        content_x + inner.origin.x,
+                        content_y + inner.origin.y,
+                        level + 1,
+                        out,
+                    ),
+                }
             }
         }
     }
@@ -6187,7 +6267,15 @@ fn collect_table_image_rects(
                         },
                     ],
                 };
-                collect_paragraph_image_rects(para_box, cell_x, cell_y, &path, out);
+                /* Issue #377 — from the padded content origin, where the
+                renderer paints the picture (see `collect_table_line_geom_at`). */
+                collect_paragraph_image_rects(
+                    para_box,
+                    cell_x + cell.padding_left,
+                    cell_y + cell.padding_top,
+                    &path,
+                    out,
+                );
             }
         }
     }
@@ -7986,20 +8074,23 @@ impl Engine {
             document name alone ("`Event::Error` => no mutation"). */
             bridge::StoryPolicy::ExitsStory => None,
             bridge::StoryPolicy::BodyOnly | bridge::StoryPolicy::TextBoxOnly => {
-                Some(Event::error(match &self.active_story {
-                    StoryTarget::Note { .. } => {
-                        "This action isn't available while editing a footnote or endnote \
+                Some(Event::error_kind(
+                    bridge::ErrorKind::InStory,
+                    match &self.active_story {
+                        StoryTarget::Note { .. } => {
+                            "This action isn't available while editing a footnote or endnote \
                          — click back into the document body first."
-                    }
-                    StoryTarget::TextBox { .. } => {
-                        "This action isn't available while editing a text box \
+                        }
+                        StoryTarget::TextBox { .. } => {
+                            "This action isn't available while editing a text box \
                          — click outside the box first."
-                    }
-                    _ => {
-                        "This action isn't available while editing a header or footer \
+                        }
+                        _ => {
+                            "This action isn't available while editing a header or footer \
                          — exit the header/footer first."
-                    }
-                }))
+                        }
+                    },
+                ))
             }
         }
     }
@@ -8075,7 +8166,7 @@ impl Engine {
                         metrics: bridge_metrics,
                     }
                 }
-                Err(e) => Event::error(format!("LoadFont: {e}")),
+                Err(e) => Event::error_kind(bridge::ErrorKind::Internal, format!("LoadFont: {e}")),
             },
 
             Command::RasterizeGlyph {
@@ -8226,14 +8317,18 @@ impl Engine {
                     };
                     self.open_synthesized_document(doc, defaults)
                 }
-                DocFormat::Pdf => Event::error(
+                DocFormat::Pdf => Event::error_kind(
+                    bridge::ErrorKind::UnsupportedHere,
                     "OpenDocument: PDF is an export format — open a .docx, .txt or .html \
                      file (use ExportPdf to write PDF)",
                 ),
             },
             Command::SaveDocument { format } => match format {
                 DocFormat::Docx => self.save_docx_bytes("SaveDocument"),
-                DocFormat::Pdf => Event::error("SaveDocument: use ExportPdf for PDF output"),
+                DocFormat::Pdf => Event::error_kind(
+                    bridge::ErrorKind::UnsupportedHere,
+                    "SaveDocument: use ExportPdf for PDF output",
+                ),
                 DocFormat::Html => self.save_html_bytes(),
                 DocFormat::PlainText => self.save_plain_text_bytes(),
             },
@@ -8493,25 +8588,34 @@ impl Engine {
         let ch = match ch.chars().next() {
             Some(c) => c,
             None => {
-                return Event::error("RasterizeGlyph: empty char string");
+                return Event::error_kind(
+                    bridge::ErrorKind::EmptyInput,
+                    "RasterizeGlyph: empty char string",
+                );
             }
         };
         let font = match self.fonts.get(&font_id) {
             Some(f) => f.clone(),
             None => {
-                return Event::error(format!("font `{font_id}` not loaded"));
+                return Event::error_kind(
+                    bridge::ErrorKind::NotReady,
+                    format!("font `{font_id}` not loaded"),
+                );
             }
         };
         let gm = match font.glyph_metrics(ch, px_size) {
             Ok(g) => g,
             Err(e) => {
-                return Event::error(format!("glyph_metrics: {e}"));
+                return Event::error_kind(
+                    bridge::ErrorKind::Internal,
+                    format!("glyph_metrics: {e}"),
+                );
             }
         };
         let raster = match font.rasterize(ch, px_size) {
             Ok(r) => r,
             Err(e) => {
-                return Event::error(format!("rasterize: {e}"));
+                return Event::error_kind(bridge::ErrorKind::Internal, format!("rasterize: {e}"));
             }
         };
         let scaled = font.metrics(px_size);
@@ -8524,7 +8628,7 @@ impl Engine {
                 [0, 0, 0],
                 None,
             ) {
-                return Event::error(format!("paint: {e:?}"));
+                return Event::error_kind(bridge::ErrorKind::Internal, format!("paint: {e:?}"));
             }
         }
         Event::GlyphPainted {
@@ -8551,7 +8655,10 @@ impl Engine {
         let font = match self.fonts.get(&font_id) {
             Some(f) => f.clone(),
             None => {
-                return Event::error(format!("font `{font_id}` not loaded"));
+                return Event::error_kind(
+                    bridge::ErrorKind::NotReady,
+                    format!("font `{font_id}` not loaded"),
+                );
             }
         };
         let shaped = shape_text(&font, &text, dir, px_size);
@@ -8582,7 +8689,7 @@ impl Engine {
                     [0, 0, 0],
                     None,
                 ) {
-                    return Event::error(format!("paint: {e:?}"));
+                    return Event::error_kind(bridge::ErrorKind::Internal, format!("paint: {e:?}"));
                 }
                 pen_x += g.x_advance as f64;
             }
@@ -8692,7 +8799,10 @@ impl Engine {
                     BridgeLogicalRange { start, end }
                 }
                 None => {
-                    return Event::error("ApplyFormatting: no range given and no active selection");
+                    return Event::error_kind(
+                        bridge::ErrorKind::NoSelection,
+                        "ApplyFormatting: no range given and no active selection",
+                    );
                 }
             },
         };
@@ -8781,7 +8891,10 @@ impl Engine {
     ) -> Event {
         use bridge::FormattingToggle as T;
         let Some(sel) = self.selection.clone() else {
-            return Event::error("ToggleFormatting: no active selection");
+            return Event::error_kind(
+                bridge::ErrorKind::NoSelection,
+                "ToggleFormatting: no active selection",
+            );
         };
         let (start, end) = ordered(sel.anchor, sel.caret);
         let collapsed = start == end;
@@ -9136,7 +9249,7 @@ impl Engine {
                 package_hash,
                 package,
             },
-            Err(e) => Event::error(format!("Snapshot: {e}")),
+            Err(e) => Event::error_kind(bridge::ErrorKind::Internal, format!("Snapshot: {e}")),
         }
     }
 
@@ -9934,16 +10047,17 @@ impl Engine {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
-                return Err(Box::new(Event::error(
+                return Err(Box::new(Event::error_kind(
+                    bridge::ErrorKind::NotReady,
                     "build_pages: no layout config cached",
                 )));
             }
         };
         if !self.fonts.contains_key(&cfg.font_id) {
-            return Err(Box::new(Event::error(format!(
-                "font `{}` not loaded",
-                cfg.font_id
-            ))));
+            return Err(Box::new(Event::error_kind(
+                bridge::ErrorKind::NotReady,
+                format!("font `{}` not loaded", cfg.font_id),
+            )));
         }
 
         /* Per-script font stack; the cached `font_id` is the fallback root. */
@@ -10892,7 +11006,12 @@ impl Engine {
                     .get(id)
                     .map(|f| render::vello_backend::font_data(f.data_static()))
             })
-            .map_err(|e| Box::new(Event::error(format!("vello paint: {e}"))))?;
+            .map_err(|e| {
+                Box::new(Event::error_kind(
+                    bridge::ErrorKind::Internal,
+                    format!("vello paint: {e}"),
+                ))
+            })?;
             self.last_paint_ms = (now_ms() - paint_t0) as f32;
             self.last_paint_dims = LastPaintDims {
                 document_height: stats.document_height,
@@ -10953,7 +11072,10 @@ impl Engine {
                 |rel| image_cache.get(rel).cloned(),
                 clip_rect,
             ) {
-                return Err(Box::new(Event::error(format!("paint page {idx}: {e:?}"))));
+                return Err(Box::new(Event::error_kind(
+                    bridge::ErrorKind::Internal,
+                    format!("paint page {idx}: {e:?}"),
+                )));
             }
         }
 
@@ -11207,7 +11329,7 @@ impl Engine {
                 }
             }
             Err(e) => {
-                return Event::error(format!("ExportPdf: {e}"));
+                return Event::error_kind(bridge::ErrorKind::Internal, format!("ExportPdf: {e}"));
             }
         }
         let pages_count = pages.len() as u32;
@@ -11579,7 +11701,10 @@ impl Engine {
     fn do_set_field_instruction(&mut self, at: BridgeLogicalPos, instruction: String) -> Event {
         let instruction = instruction.trim().to_string();
         if instruction.is_empty() {
-            return Event::error("SetFieldInstruction: the field code is empty");
+            return Event::error_kind(
+                bridge::ErrorKind::EmptyInput,
+                "SetFieldInstruction: the field code is empty",
+            );
         }
         let epath = bridge_to_engine_path(at.path.clone());
         let index = self.with_selection_doc(|d| {
@@ -11587,14 +11712,20 @@ impl Engine {
                 .and_then(|p| p.field_index_at(at.offset))
         });
         let Some(index) = index else {
-            return Event::error("SetFieldInstruction: no field at the caret");
+            return Event::error_kind(
+                bridge::ErrorKind::NoFieldAtCaret,
+                "SetFieldInstruction: no field at the caret",
+            );
         };
         if self.story_active() {
             let Some(temp) = self.story_doc() else {
                 return self.story_vanished();
             };
             let Some(mutated) = temp.set_field_instruction_at(&epath, index, &instruction) else {
-                return Event::error("SetFieldInstruction: no field at the caret");
+                return Event::error_kind(
+                    bridge::ErrorKind::NoFieldAtCaret,
+                    "SetFieldInstruction: no field at the caret",
+                );
             };
             self.announce(AnnouncementPriority::Polite, "Field code updated");
             return self.story_mutate(|_| mutated, at, true);
@@ -11604,7 +11735,10 @@ impl Engine {
                 .current()
                 .set_field_instruction_at(&epath, index, &instruction)
         else {
-            return Event::error("SetFieldInstruction: no field at the caret");
+            return Event::error_kind(
+                bridge::ErrorKind::NoFieldAtCaret,
+                "SetFieldInstruction: no field at the caret",
+            );
         };
         self.undo.push(new_doc);
         if let Some(sel) = self.selection.clone() {
@@ -13061,7 +13195,10 @@ impl Engine {
     /// Assemble a `SelectionChanged` event from the current selection.
     fn selection_changed(&self) -> Event {
         let Some(sel) = self.selection.clone() else {
-            return Event::error("selection_changed: no active selection");
+            return Event::error_kind(
+                bridge::ErrorKind::NoSelection,
+                "selection_changed: no active selection",
+            );
         };
         let geom = match self.document_geometry() {
             Ok(g) => g,
@@ -13875,7 +14012,10 @@ impl Engine {
                 host, at, inner, ..
             } => StoryPart::TextBox(host.clone(), *at, inner.clone()),
             StoryTarget::Body => {
-                return Event::error("commit_story_edit outside a story");
+                return Event::error_kind(
+                    bridge::ErrorKind::Internal,
+                    "commit_story_edit outside a story",
+                );
             }
         };
         let mut blocks: Vec<engine::Block> = mutated.blocks.iter().cloned().collect();
@@ -13980,7 +14120,10 @@ impl Engine {
     /// cross-paragraph semantics.
     fn story_delete_at_caret(&mut self, forward: bool, by_word: bool) -> Event {
         let Some(sel) = self.selection.clone() else {
-            return Event::error("DeleteAtCaret: no active selection");
+            return Event::error_kind(
+                bridge::ErrorKind::NoSelection,
+                "DeleteAtCaret: no active selection",
+            );
         };
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
@@ -14106,7 +14249,10 @@ impl Engine {
     /// Story `PastePlain` — multiline plain-text paste into the band.
     fn story_paste_plain(&mut self, text: String) -> Event {
         let Some(sel) = self.selection.clone() else {
-            return Event::error("PastePlain: no active selection");
+            return Event::error_kind(
+                bridge::ErrorKind::NoSelection,
+                "PastePlain: no active selection",
+            );
         };
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
@@ -14355,21 +14501,24 @@ impl Engine {
             engine::NoteKind::Endnote => "endnote",
         };
         if self.story_active() {
-            return Event::error(format!(
-                "Insert {what}: notes can only be inserted from the document body"
-            ));
+            return Event::error_kind(
+                bridge::ErrorKind::InStory,
+                format!("Insert {what}: notes can only be inserted from the document body"),
+            );
         }
         if at.path.steps.len() != 1 {
-            return Event::error(format!(
-                "Insert {what}: notes inside table cells aren't supported yet"
-            ));
+            return Event::error_kind(
+                bridge::ErrorKind::InTableCell,
+                format!("Insert {what}: notes inside table cells aren't supported yet"),
+            );
         }
         let pos = to_engine_pos(at.clone());
         let doc = self.undo.current();
         if doc.paragraph_at_path(&pos.path).is_none() {
-            return Event::error(format!(
-                "Insert {what}: the caret does not address a paragraph"
-            ));
+            return Event::error_kind(
+                bridge::ErrorKind::NotInParagraph,
+                format!("Insert {what}: the caret does not address a paragraph"),
+            );
         }
         let (new_doc, id) = doc.insert_note_at(pos, kind);
         self.undo.push(new_doc);
@@ -14668,24 +14817,30 @@ impl Engine {
         layout. */
         const MAX_EMU: i64 = 22 * 914_400;
         if self.story_active() {
-            return Event::error(
+            return Event::error_kind(
+                bridge::ErrorKind::InStory,
                 "Insert text box: text boxes can only be inserted from the document body",
             );
         }
         if at.path.steps.len() != 1 {
-            return Event::error(
+            return Event::error_kind(
+                bridge::ErrorKind::InTableCell,
                 "Insert text box: text boxes inside table cells aren't supported yet",
             );
         }
         if width_emu <= 0 || height_emu <= 0 || width_emu > MAX_EMU || height_emu > MAX_EMU {
-            return Event::error(format!(
-                "Insert text box: size {width_emu}×{height_emu} EMU is out of range"
-            ));
+            return Event::error_kind(
+                bridge::ErrorKind::OutOfRange,
+                format!("Insert text box: size {width_emu}×{height_emu} EMU is out of range"),
+            );
         }
         let pos = to_engine_pos(at.clone());
         let doc = self.undo.current();
         if doc.paragraph_at_path(&pos.path).is_none() {
-            return Event::error("Insert text box: the caret does not address a paragraph");
+            return Event::error_kind(
+                bridge::ErrorKind::NotInParagraph,
+                "Insert text box: the caret does not address a paragraph",
+            );
         }
         let (new_doc, host, box_at) = doc.insert_text_box_at(pos, width_emu, height_emu);
         self.undo.push(new_doc);
@@ -14828,13 +14983,15 @@ impl Engine {
             area,
             bridge::HeaderFooterArea::Footnote | bridge::HeaderFooterArea::Endnote
         ) {
-            return Event::error(
+            return Event::error_kind(
+                bridge::ErrorKind::UnsupportedHere,
                 "EnterHeaderFooter: notes are entered by clicking into the note \
                           or with InsertFootnote / InsertEndnote, not by page zone",
             );
         }
         if matches!(area, bridge::HeaderFooterArea::TextBox) {
-            return Event::error(
+            return Event::error_kind(
+                bridge::ErrorKind::UnsupportedHere,
                 "EnterHeaderFooter: text boxes are entered by clicking into the box \
                           or with InsertTextBox, not by page zone",
             );
@@ -14958,7 +15115,10 @@ impl Engine {
     fn do_set_header_footer_link(&mut self, linked: bool) -> Event {
         let (is_header, page, section_block, role, cur_rid) = match &self.active_story {
             StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => {
-                return Event::error("SetHeaderFooterLink: no header or footer is being edited");
+                return Event::error_kind(
+                    bridge::ErrorKind::NotInHeaderFooter,
+                    "SetHeaderFooterLink: no header or footer is being edited",
+                );
             }
             StoryTarget::Header {
                 rid,
@@ -15019,7 +15179,8 @@ impl Engine {
         } else {
             /* RELINK — clear the own slot; the section inherits again. */
             if section_idx == 0 {
-                return Event::error(
+                return Event::error_kind(
+                    bridge::ErrorKind::UnsupportedHere,
                     "SetHeaderFooterLink: the first section cannot link to previous",
                 );
             }
@@ -15211,7 +15372,10 @@ impl Engine {
     /// lands at the start of the paragraph after the TOC.
     fn do_insert_toc(&mut self, at: BridgeLogicalPos, switches: bridge::TocSwitches) -> Event {
         if self.story_active() {
-            return Event::error("InsertToc: a table of contents belongs in the document body");
+            return Event::error_kind(
+                bridge::ErrorKind::InStory,
+                "InsertToc: a table of contents belongs in the document body",
+            );
         }
         let sw = toc_switches_from_bridge(&switches);
         let Some((stub_doc, first)) = self
@@ -15219,7 +15383,8 @@ impl Engine {
             .current()
             .insert_toc_at(&to_engine_pos(at.clone()), &sw)
         else {
-            return Event::error(
+            return Event::error_kind(
+                bridge::ErrorKind::UnsupportedHere,
                 "InsertToc: place the caret in a body paragraph outside tables and \
                           other tables of contents",
             );
@@ -15258,7 +15423,10 @@ impl Engine {
     /// cells (the cell reader cannot round-trip fields yet).
     fn do_insert_field(&mut self, at: BridgeLogicalPos, kind: bridge::FieldKind) -> Event {
         if at.path.steps.len() != 1 {
-            return Event::error("InsertField: fields inside table cells aren't supported yet");
+            return Event::error_kind(
+                bridge::ErrorKind::InTableCell,
+                "InsertField: fields inside table cells aren't supported yet",
+            );
         }
         let (instruction, cached) = match kind {
             bridge::FieldKind::Page => ("PAGE".to_string(), "1".to_string()),
@@ -15342,7 +15510,10 @@ impl Engine {
                 host, at, inner, ..
             } => StoryPart::TextBox(host.clone(), *at, inner.clone()),
             StoryTarget::Body => {
-                return Event::error("story_mutate outside a story");
+                return Event::error_kind(
+                    bridge::ErrorKind::Internal,
+                    "story_mutate outside a story",
+                );
             }
         };
         let Some(temp) = self.story_doc() else {
@@ -15419,10 +15590,13 @@ impl Engine {
                 path: pos.path,
                 offset,
             }),
-            None => Err(Box::new(Event::error(format!(
-                "{cmd}: position {:?} does not address a paragraph",
-                pos.path.steps
-            )))),
+            None => Err(Box::new(Event::error_kind(
+                bridge::ErrorKind::NotInParagraph,
+                format!(
+                    "{cmd}: position {:?} does not address a paragraph",
+                    pos.path.steps
+                ),
+            ))),
         }
     }
 
@@ -15597,7 +15771,8 @@ impl Engine {
                 Err(e) => return *e,
             },
             (None, None) => {
-                return Event::error(
+                return Event::error_kind(
+                    bridge::ErrorKind::NoSelection,
                     "SplitParagraph: no caret (pass `at` or set a selection first)",
                 );
             }
@@ -15653,7 +15828,10 @@ impl Engine {
             return self.story_delete_at_caret(forward, by_word);
         }
         let Some(sel) = self.selection.clone() else {
-            return Event::error("DeleteAtCaret: no active selection");
+            return Event::error_kind(
+                bridge::ErrorKind::NoSelection,
+                "DeleteAtCaret: no active selection",
+            );
         };
         let (start, end) = ordered(sel.anchor, sel.caret.clone());
         if start != end {
@@ -16519,9 +16697,10 @@ impl Engine {
             .current()
             .reply_to_comment(parent_id, text, author, date)
         else {
-            return Event::error(format!(
-                "ReplyToComment: unknown parent comment id {parent_id}"
-            ));
+            return Event::error_kind(
+                bridge::ErrorKind::NoSuchTarget,
+                format!("ReplyToComment: unknown parent comment id {parent_id}"),
+            );
         };
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
@@ -16677,7 +16856,10 @@ impl Engine {
     /// `do_apply_style`'s invalidation discipline.
     fn do_modify_style(&mut self, style_id: String, props: BridgeStyleProperties) -> Event {
         if !self.undo.current().styles.contains_key(&style_id) {
-            return Event::error(format!("ModifyStyle: unknown style id {style_id}"));
+            return Event::error_kind(
+                bridge::ErrorKind::NoSuchTarget,
+                format!("ModifyStyle: unknown style id {style_id}"),
+            );
         }
         let para_patch = props.para_props.map(|p| {
             let mut out = engine::ParaProperties {
@@ -17178,7 +17360,7 @@ impl Engine {
                         Some(bridge::ErrorKind::EncryptedDocument)
                     }
                     format_docx::DocxError::WrongPassword => Some(bridge::ErrorKind::WrongPassword),
-                    _ => None,
+                    _ => Some(bridge::ErrorKind::InvalidDocument),
                 };
                 Event::Error {
                     message: format!("{origin}: {e}"),
@@ -17206,7 +17388,7 @@ impl Engine {
                 let size = bytes.len() as u32;
                 Event::DocumentSaved { bytes, size }
             }
-            Err(e) => Event::error(format!("{origin}: {e}")),
+            Err(e) => Event::error_kind(bridge::ErrorKind::Internal, format!("{origin}: {e}")),
         }
     }
 
@@ -17262,7 +17444,7 @@ impl Engine {
     /// still silently clamped, same as before.
     fn do_set_zoom(&mut self, zoom: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(zoom) {
-            return Event::error(format!("SetZoom: {e}"));
+            return Event::error_kind(bridge::ErrorKind::OutOfRange, format!("SetZoom: {e}"));
         }
         let zoom = zoom.clamp(0.25, 4.0);
         let Some(cfg) = self.layout_cfg.as_mut() else {
@@ -17293,7 +17475,10 @@ impl Engine {
     /// Issue #186 — same NaN/±∞ rejection as `do_set_zoom`.
     fn do_set_device_scale(&mut self, scale: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(scale) {
-            return Event::error(format!("SetDeviceScale: {e}"));
+            return Event::error_kind(
+                bridge::ErrorKind::OutOfRange,
+                format!("SetDeviceScale: {e}"),
+            );
         }
         let base = scale.clamp(0.5, 8.0);
         let Some(cfg) = self.layout_cfg.as_mut() else {
@@ -17331,7 +17516,7 @@ impl Engine {
         minute: Option<u32>,
     ) -> Event {
         if let Err(e) = engine::validate_render_date(year, month, day, hour, minute) {
-            return Event::error(format!("SetRenderDate: {e}"));
+            return Event::error_kind(bridge::ErrorKind::OutOfRange, format!("SetRenderDate: {e}"));
         }
         self.render_date = Some((year, month, day));
         /* Issue #77 — the clock half is optional; both parts or nothing
@@ -17450,9 +17635,10 @@ impl Engine {
         at: u32,
     ) -> Result<StoryImage, Box<Event>> {
         if story.len() > MAX_TEXT_BOX_LAYOUT_DEPTH as usize {
-            return Err(Box::new(Event::error(format!(
-                "{origin}: text boxes nest at most {MAX_TEXT_BOX_LAYOUT_DEPTH} deep"
-            ))));
+            return Err(Box::new(Event::error_kind(
+                bridge::ErrorKind::NestingTooDeep,
+                format!("{origin}: text boxes nest at most {MAX_TEXT_BOX_LAYOUT_DEPTH} deep"),
+            )));
         }
         let hops: Vec<(EngineBlockPath, u32)> = story
             .iter()
@@ -17471,9 +17657,10 @@ impl Engine {
             find(doc)
         } else {
             let Some(tree) = doc.text_box_story_tree(&hops) else {
-                return Err(Box::new(Event::error(format!(
-                    "{origin}: the story chain addresses no text box"
-                ))));
+                return Err(Box::new(Event::error_kind(
+                    bridge::ErrorKind::NoSuchTarget,
+                    format!("{origin}: the story chain addresses no text box"),
+                )));
             };
             find(&tree)
         };
@@ -17490,7 +17677,10 @@ impl Engine {
         edit: impl FnOnce(&DocumentTree) -> DocumentTree,
     ) -> Event {
         let Some(new_doc) = self.undo.current().with_text_box_story_edit(hops, edit) else {
-            return Event::error("Image edit: the story chain addresses no text box");
+            return Event::error_kind(
+                bridge::ErrorKind::NoSuchTarget,
+                "Image edit: the story chain addresses no text box",
+            );
         };
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
@@ -17519,7 +17709,10 @@ impl Engine {
         let hops = match self.resolve_story_image("ResizeImage", &story, &epath, at) {
             Ok((hops, io)) => {
                 if !hops.is_empty() && io.is_none() {
-                    return Event::error("ResizeImage: no picture at that address in the text box");
+                    return Event::error_kind(
+                        bridge::ErrorKind::NoSuchTarget,
+                        "ResizeImage: no picture at that address in the text box",
+                    );
                 }
                 hops
             }
@@ -17551,7 +17744,8 @@ impl Engine {
         let hops = match self.resolve_story_image("MoveImage", &story, &epath, at) {
             Ok((hops, Some(io))) if io.is_floating() => hops,
             Ok(_) => {
-                return Event::error(
+                return Event::error_kind(
+                    bridge::ErrorKind::NoSuchTarget,
                     "MoveImage: no floating image at that address — inline images \
                               flow with the text and have no free position (issue #69)",
                 );
@@ -17583,7 +17777,8 @@ impl Engine {
         let hops = match self.resolve_story_image("SetImageWrap", &story, &epath, at) {
             Ok((hops, Some(io))) if io.is_floating() => hops,
             Ok(_) => {
-                return Event::error(
+                return Event::error_kind(
+                    bridge::ErrorKind::NoSuchTarget,
                     "SetImageWrap: no floating image at that address — an inline image \
                               flows with the text and has no wrap mode (issue #82)",
                 );
@@ -17648,7 +17843,8 @@ impl Engine {
             .map(|sel| ordered(sel.anchor.clone(), sel.caret.clone()));
         let (start, end) = replacing.clone().unwrap_or((at.clone(), at.clone()));
         if start.path.steps.len() != 1 || end.path.steps.len() != 1 {
-            return Event::error(
+            return Event::error_kind(
+                bridge::ErrorKind::InTableCell,
                 "InsertPageBreak: page breaks inside table cells are not supported",
             );
         }
@@ -17677,7 +17873,8 @@ impl Engine {
     /// affordance).
     fn do_insert_section_break(&mut self, at: BridgeLogicalPos, kind: SectionBreakKind) -> Event {
         if at.path.steps.len() != 1 {
-            return Event::error(
+            return Event::error_kind(
+                bridge::ErrorKind::InTableCell,
                 "InsertSectionBreak: section breaks inside table cells are not supported",
             );
         }
@@ -17774,7 +17971,12 @@ impl Engine {
     ) -> Result<(), Box<Event>> {
         let epath = bridge_to_engine_path(path.clone());
         self.with_selection_doc(|d| d.resolve_table_target(&epath, row, col).and_then(extra))
-            .map_err(|e| Box::new(Event::error(format!("{cmd}: {e}"))))
+            .map_err(|e| {
+                Box::new(Event::error_kind(
+                    bridge::ErrorKind::NoSuchTarget,
+                    format!("{cmd}: {e}"),
+                ))
+            })
     }
 
     fn do_insert_table(&mut self, at: bridge::BlockPath, rows: u32, cols: u32) -> Event {
@@ -17783,7 +17985,7 @@ impl Engine {
         defence, but the shell gets a typed rejection rather than a
         silently smaller table. */
         if let Err(e) = engine::check_table_dims(rows, cols) {
-            return Event::error(format!("InsertTable: {e}"));
+            return Event::error_kind(bridge::ErrorKind::OutOfRange, format!("InsertTable: {e}"));
         }
         /* Issue #117 — Word parks the caret in the new table's first cell.
         Doing so explicitly (instead of leaving the caret on the block
@@ -18428,6 +18630,18 @@ impl Engine {
             .map_or(0, |s| s.pages.len())
     }
 
+    /// Issue #379 — lay the document out again, in full, with every
+    /// layout cache that survives a paint still warm (the paragraph LRU
+    /// and the content-keyed table cache): only the layout-snapshot memo
+    /// is dropped, so this is the repaint an edit elsewhere in the
+    /// document triggers, minus the edit. The corpus probe times it and
+    /// checks it reproduces the cold layout exactly
+    /// ([`Self::layout_probe_for_fuzzing`] before == after).
+    pub fn relayout_warm_for_fuzzing(&mut self) -> Result<(), Box<Event>> {
+        self.layout_snapshot.replace(None);
+        self.ensure_layout_for_fuzzing()
+    }
+
     /// Issue #318 — what a whole-corpus layout probe compares across two
     /// builds of the engine: the most recent layout snapshot's page count,
     /// its [`layout::geometry_fingerprint`] and the degradation reasons it
@@ -18554,6 +18768,7 @@ fn bridge_to_engine_stroke(s: bridge::BridgeBorderStroke) -> engine::BorderStrok
         style,
         size_eighth_pt: s.size_eighth_pt,
         color: s.color.map(|c| [c.r, c.g, c.b, c.a]),
+        ..Default::default()
     }
 }
 
@@ -27456,6 +27671,59 @@ mod tests {
         assert!(matches!(evt, Event::Error { .. }), "table-cell TOC refused");
     }
 
+    /// Issue #427 - the refusals carry a closed `ErrorKind` the shell can
+    /// present, not just a message.
+    #[test]
+    fn refusals_are_typed_with_an_error_kind() {
+        use bridge::ErrorKind as K;
+        fn kind_of(e: Event) -> Option<K> {
+            match e {
+                Event::Error { kind, .. } => kind,
+                other => panic!("expected an Event::Error, got {other:?}"),
+            }
+        }
+        let mut engine = test_engine_with_doc(five_heading_doc());
+        let cell = BridgeLogicalPos {
+            path: BridgeBlockPath {
+                steps: vec![
+                    bridge::PathStep::Block { idx: 0 },
+                    bridge::PathStep::Cell { row: 0, col: 0 },
+                    bridge::PathStep::Block { idx: 0 },
+                ],
+            },
+            offset: 0,
+        };
+        assert_eq!(
+            kind_of(engine.do_insert_field(cell, bridge::FieldKind::Page)),
+            Some(K::InTableCell)
+        );
+        assert_eq!(
+            kind_of(engine.do_insert_toc(bpos_top(99, 0), bridge::TocSwitches::default())),
+            Some(K::UnsupportedHere)
+        );
+        assert_eq!(
+            kind_of(engine.do_set_field_instruction(bpos_top(0, 0), "  ".into())),
+            Some(K::EmptyInput)
+        );
+        assert_eq!(
+            kind_of(engine.do_set_field_instruction(bpos_top(0, 0), "PAGE".into())),
+            Some(K::NoFieldAtCaret)
+        );
+        assert_eq!(
+            kind_of(engine.do_modify_style("no-such-style".into(), Default::default())),
+            Some(K::NoSuchTarget)
+        );
+        assert_eq!(
+            kind_of(engine.do_set_header_footer_link(true)),
+            Some(K::NotInHeaderFooter)
+        );
+        engine.selection = None;
+        assert_eq!(
+            kind_of(engine.do_delete_at_caret(false, false)),
+            Some(K::NoSelection)
+        );
+    }
+
     #[test]
     fn caret_in_a_toc_reports_the_field_and_code_view_shows_the_instruction() {
         let mut engine = test_engine_with_doc(five_heading_doc());
@@ -28934,6 +29202,15 @@ mod note_band_tests;
 /// (linear in nesting depth, verified hits) and the nesting cap.
 #[cfg(test)]
 mod nested_table_tests;
+
+/// Issue #377 — hit-testing, caret / selection rects, word selection and
+/// drags inside tables nested in table cells.
+#[cfg(test)]
+mod nested_table_hit_tests;
+
+/// Issue #379 — the content-keyed table layout cache across repaints.
+#[cfg(test)]
+mod table_cache_tests;
 
 #[cfg(test)]
 mod part_media_tests;

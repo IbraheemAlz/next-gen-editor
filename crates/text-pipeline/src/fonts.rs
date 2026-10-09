@@ -33,8 +33,28 @@ pub enum FontError {
 /// px keeps one mask at most ~16 MB; it is 3072 pt at 100 % zoom on a 1×
 /// display (Word's own maximum font size is 1638 pt) and ~300 pt at the
 /// 450 % zoom on a 3× display. A larger glyph is not rasterized — the
-/// renderer skips it as it skips a glyph the font cannot draw.
+/// Canvas2D renderer fills its [`LoadedFont::glyph_outline`] as a path
+/// instead (issue #436).
 pub const MAX_RASTER_PX: f32 = 4096.0;
+
+/// Issue #436 — the largest pixel size [`LoadedFont::glyph_outline`] scales
+/// an outline to. An outline's memory is its point count, independent of
+/// the size, so this only keeps the scaled coordinates inside what `f32`
+/// and a canvas path represent exactly (2^20 px); a glyph between
+/// [`MAX_RASTER_PX`] and this is drawn as a filled path instead of a mask.
+pub const MAX_OUTLINE_PX: f32 = 1_048_576.0;
+
+/// One path element of a scaled glyph outline, in pixels relative to the
+/// pen position with **y up** (the font's own orientation; the consumer
+/// flips). Quadratic and cubic segments are kept as authored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutlineCmd {
+    MoveTo([f32; 2]),
+    LineTo([f32; 2]),
+    QuadTo([f32; 2], [f32; 2]),
+    CurveTo([f32; 2], [f32; 2], [f32; 2]),
+    Close,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct FontMetrics {
@@ -204,6 +224,34 @@ impl LoadedFont {
             gid
         };
         self.rasterize_glyph(gid, px_size)
+    }
+
+    /// Issue #436 — the glyph's scaled (unhinted) outline at `px_size`, for
+    /// a glyph too large for [`rasterize_glyph`](Self::rasterize_glyph).
+    /// `Err(SizeOutOfRange)` outside `(0, MAX_OUTLINE_PX]`; `Err(NoImage)`
+    /// when the font has no outline for the glyph. A blank glyph (a space)
+    /// yields an empty command list.
+    pub fn glyph_outline(&self, gid: u16, px_size: f32) -> Result<Vec<OutlineCmd>, FontError> {
+        use swash::zeno::{Command, PathData};
+        if !(px_size.is_finite() && px_size > 0.0 && px_size <= MAX_OUTLINE_PX) {
+            return Err(FontError::SizeOutOfRange);
+        }
+        let face = self.face();
+        let mut ctx = ScaleContext::new();
+        let mut scaler = ctx.builder(face).size(px_size).hint(false).build();
+        let outline = scaler.scale_outline(gid).ok_or(FontError::NoImage)?;
+        let xy = |p: swash::zeno::Point| [p.x, p.y];
+        Ok(outline
+            .path()
+            .commands()
+            .map(|c| match c {
+                Command::MoveTo(p) => OutlineCmd::MoveTo(xy(p)),
+                Command::LineTo(p) => OutlineCmd::LineTo(xy(p)),
+                Command::QuadTo(a, b) => OutlineCmd::QuadTo(xy(a), xy(b)),
+                Command::CurveTo(a, b, c) => OutlineCmd::CurveTo(xy(a), xy(b), xy(c)),
+                Command::Close => OutlineCmd::Close,
+            })
+            .collect())
     }
 
     /// Rasterize a glyph by its glyph id (skipping the charmap lookup;
@@ -407,6 +455,31 @@ mod tests {
             .rasterize('H', MAX_RASTER_PX)
             .expect("the cap rasterizes");
         assert!((at_cap.width as usize) * (at_cap.height as usize) <= 4096 * 4096 * 2);
+    }
+
+    /* Issue #436 — above the raster cap the glyph still has an outline. */
+    #[test]
+    fn outline_covers_sizes_above_the_raster_cap() {
+        let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("lib".to_string(), bytes).expect("font");
+        let gid = font.face().charmap().map('H');
+        let big = MAX_RASTER_PX * 2.0;
+        assert!(font.rasterize_glyph(gid, big).is_err());
+        let cmds = font.glyph_outline(gid, big).expect("outline");
+        assert!(matches!(cmds.first(), Some(OutlineCmd::MoveTo(_))));
+        let ys = cmds.iter().flat_map(|c| match *c {
+            OutlineCmd::MoveTo(p) | OutlineCmd::LineTo(p) => vec![p[1]],
+            _ => vec![],
+        });
+        let top = ys.fold(0.0_f32, f32::max);
+        /* Cap height of 'H' is ~0.7 em, y-up. */
+        assert!(top > big * 0.6 && top < big * 0.8, "{top}");
+        for px in [f32::NAN, 0.0, -1.0, MAX_OUTLINE_PX * 2.0] {
+            assert!(matches!(
+                font.glyph_outline(gid, px),
+                Err(FontError::SizeOutOfRange)
+            ));
+        }
     }
 
     /* Issue #23 — a dynamically-registered custom font (here `cairo`, the
