@@ -46,9 +46,7 @@ pub const FUZZ_PACKAGE_LIMITS: format_docx::PackageLimits = format_docx::Package
 
 /// Issue #348 — `data` read directly as a `.docx` package under
 /// [`FUZZ_PACKAGE_LIMITS`].
-pub fn read_raw_package(
-    data: &[u8],
-) -> Result<format_docx::DocxArchive, format_docx::DocxError> {
+pub fn read_raw_package(data: &[u8]) -> Result<format_docx::DocxArchive, format_docx::DocxError> {
     format_docx::read_docx_with_limits(
         data,
         engine::DefaultPageSize::A4,
@@ -322,7 +320,10 @@ mod tests {
         for (name, bytes, expect) in hostile_docx_seeds() {
             let committed = std::fs::read(dir.join(name))
                 .unwrap_or_else(|e| panic!("{name}: {e} — run examples/regen-seeds"));
-            assert!(committed == bytes, "{name} is stale — run examples/regen-seeds");
+            assert!(
+                committed == bytes,
+                "{name} is stale — run examples/regen-seeds"
+            );
             run_docx_reader(&bytes);
             let got = read_raw_package(&bytes);
             match expect {
@@ -344,11 +345,7 @@ mod tests {
 /// name, package bytes, the limit [`read_raw_package`] must refuse it with
 /// — `None` when it must read)`. Built by `format_docx::test_fixtures`, so
 /// no blob is hand-maintained; `examples/regen-seeds` writes them.
-pub fn hostile_docx_seeds() -> Vec<(
-    &'static str,
-    Vec<u8>,
-    Option<format_docx::PackageLimit>,
-)> {
+pub fn hostile_docx_seeds() -> Vec<(&'static str, Vec<u8>, Option<format_docx::PackageLimit>)> {
     use format_docx::PackageLimit;
     use format_docx::test_fixtures as fx;
     vec![
