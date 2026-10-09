@@ -85,3 +85,13 @@
 .nge-hud__recovery-losses--warn {
     color: var(--nge-color-warning);
 }
+
+/* Issue #329 — font substitutions, one per line; closest-style (not
+   metric-compatible) picks muted. */
+.nge-hud__substitution {
+    display: block;
+}
+
+.nge-hud__substitution--approx {
+    color: var(--nge-color-text-muted);
+}

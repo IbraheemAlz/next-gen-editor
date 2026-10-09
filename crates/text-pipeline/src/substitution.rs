@@ -237,4 +237,99 @@ mod tests {
             assert!(!a.substitutes.is_empty(), "{} has no substitute", a.family);
         }
     }
+
+    /* Issue #329 — every substitute the editor ships (`ts/public/fonts/`,
+    registered under its `fonts.json` id) answers to the spelling the
+    table uses, through its `name` table, and covers its row's class:
+    a typo in a row or a renamed font file fails here, not as a silent
+    fallback in the field. Scheherazade New is the one listed substitute
+    not shipped. */
+    #[test]
+    fn every_shipped_substitute_resolves_through_its_name_table() {
+        use crate::{FamilyMatch, FontStack, LoadedFont, Script};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let shipped: &[(&str, &[u8])] = &[
+            (
+                "amiri",
+                include_bytes!("../../../ts/public/fonts/Amiri-Regular.ttf"),
+            ),
+            (
+                "liberation",
+                include_bytes!("../../../ts/public/fonts/LiberationSans-Regular.ttf"),
+            ),
+            (
+                "noto-naskh",
+                include_bytes!("../../../ts/public/fonts/NotoNaskhArabic-Regular.ttf"),
+            ),
+            (
+                "carlito",
+                include_bytes!("../../../ts/public/fonts/Carlito-Regular.ttf"),
+            ),
+            (
+                "caladea",
+                include_bytes!("../../../ts/public/fonts/Caladea-Regular.ttf"),
+            ),
+            (
+                "liberation-serif",
+                include_bytes!("../../../ts/public/fonts/LiberationSerif-Regular.ttf"),
+            ),
+            (
+                "liberation-mono",
+                include_bytes!("../../../ts/public/fonts/LiberationMono-Regular.ttf"),
+            ),
+            (
+                "gelasio",
+                include_bytes!("../../../ts/public/fonts/Gelasio-Regular.ttf"),
+            ),
+            (
+                "selawik",
+                include_bytes!("../../../ts/public/fonts/Selawik-Regular.ttf"),
+            ),
+        ];
+        let faces: HashMap<String, Arc<LoadedFont>> = shipped
+            .iter()
+            .map(|(id, bytes)| {
+                let face = LoadedFont::parse(id.to_string(), bytes.to_vec()).expect("parse");
+                (id.to_string(), Arc::new(face))
+            })
+            .collect();
+        let stack = FontStack::from_faces(faces, "liberation");
+        for row in SUBSTITUTIONS {
+            let script = match row.class {
+                ScriptClass::Latin => Script::Latin,
+                ScriptClass::ComplexScript => Script::Arabic,
+            };
+            let r = stack
+                .resolve_family(row.family, script, false, false)
+                .unwrap_or_else(|| {
+                    panic!("{} / {:?} has no shipped substitute", row.family, row.class)
+                });
+            assert!(
+                matches!(r.matched, FamilyMatch::Substituted(m) if std::ptr::eq(m, row)),
+                "{} / {:?} resolved {:?}",
+                row.family,
+                row.class,
+                r.matched
+            );
+            assert!(r.face.covers(row.class.probe()));
+            /* The first listed substitute is the one shipped (Scheherazade
+            New only ever follows Amiri). */
+            assert_eq!(
+                family_key(row.substitutes[0]),
+                family_key(&r.face.family_names()[0]),
+                "{}",
+                row.family
+            );
+            if let Some(m) = row.metrics_from {
+                let id = r
+                    .metrics_id
+                    .unwrap_or_else(|| panic!("{}: {m} not shipped", row.family));
+                assert_eq!(
+                    family_key(m),
+                    family_key(&stack.face(id).unwrap().family_names()[0])
+                );
+            }
+        }
+    }
 }

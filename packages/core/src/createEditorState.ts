@@ -37,6 +37,7 @@ import type {
     ErrorKind,
     Event,
     FontSlot,
+    FontSubstitution,
     LayoutDegraded,
     PreviousSessionInfo,
     LogicalRange,
@@ -74,7 +75,9 @@ export interface EditorState {
      *  entry): what Arabic / Hebrew text at the caret is shaped with. */
     resolvedFontCs: Accessor<string | undefined>;
     /** Issue #423 — where each slot's family came from (`Explicit` /
-     *  `Theme` / `Style` / `Default`); a picker marks `Theme` fonts. */
+     *  `Theme` / `Style` / `Default`, and — issue #329 — `Substituted`
+     *  when a substitute face serves the named family); a picker marks
+     *  `Theme` fonts. */
     fontSource: Accessor<BridgeFontSources | undefined>;
     /** Issue #420 — the caret run's resolved family id / size / bold /
      *  italic PER SCRIPT SLOT — the Font dialog's "Latin text" and
@@ -273,6 +276,16 @@ export interface EditorState {
      * (the archive ring, newest first); `previousSession` is the first.
      */
     previousSessions: Accessor<PreviousSessionInfo[]>;
+    /**
+     * Issue #329 - the font substitutions the open document's layout
+     * makes (a family it names that the editor does not ship, and the
+     * loaded face standing in for it: Calibri -> Carlito, Simplified
+     * Arabic -> Noto Naskh Arabic), sorted by slot then family; `[]` when
+     * nothing is substituted. Fed by `DOCUMENT_LOADED` and by every
+     * `FONT_LOADED` (a newly loaded face can start serving a family).
+     * Shared like `zoom`.
+     */
+    fontSubstitutions: Accessor<FontSubstitution[]>;
 }
 
 /**
@@ -317,6 +330,7 @@ interface ViewState {
     lastError: Accessor<EditorError | undefined>;
     previousSession: Accessor<PreviousSessionInfo | undefined>;
     previousSessions: Accessor<PreviousSessionInfo[]>;
+    fontSubstitutions: Accessor<FontSubstitution[]>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -369,6 +383,8 @@ function viewStateFor(engine: EngineHandle): ViewState {
             engine.previousSessions ?? (engine.previousSession ? [engine.previousSession] : []),
         );
         engine.onPreviousSessions?.((p) => setPreviousSessions(p));
+        /* Issue #329 - what the open document's layout substitutes. */
+        const [fontSubstitutions, setFontSubstitutions] = createSignal<FontSubstitution[]>([]);
         /* Issue #364 - every `Event::Error` reply, with its command. */
         const [lastError, setLastError] = createSignal<EditorError | undefined>(undefined);
         let errorCount = 0;
@@ -383,6 +399,9 @@ function viewStateFor(engine: EngineHandle): ViewState {
                     count: errorCount,
                     at: Date.now(),
                 });
+            }
+            if (evt.type === 'DOCUMENT_LOADED' || evt.type === 'FONT_LOADED') {
+                setFontSubstitutions(evt.substituted ?? []);
             }
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
@@ -426,6 +445,7 @@ function viewStateFor(engine: EngineHandle): ViewState {
             lastError,
             previousSession,
             previousSessions,
+            fontSubstitutions,
         };
     });
     viewStates.set(engine, state);
@@ -601,5 +621,6 @@ export function createEditorState(): EditorState {
         lastError: view.lastError,
         previousSession: view.previousSession,
         previousSessions: view.previousSessions,
+        fontSubstitutions: view.fontSubstitutions,
     };
 }

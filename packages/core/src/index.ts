@@ -160,6 +160,7 @@ export type {
     TextAttrs,
     AttrsMixed,
     FontSource,
+    FontSubstitution,
     BridgeFontSources,
     BridgeSlotFormat,
     BridgeSlotFormats,

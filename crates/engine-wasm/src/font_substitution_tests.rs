@@ -196,3 +196,90 @@ fn a_latin_family_substitutes_its_metric_clone() {
     assert_eq!(font_source.latin, FontSource::Substituted);
     assert_eq!(font_source.complex_script, FontSource::Style);
 }
+
+/// Issue #329 — every face the shell's boot sequence loads (`fonts.json`
+/// `defaults` + `substitutes`), under its manifest id: what an opened
+/// document lays out against in the editor.
+pub(crate) fn engine_with_editor_faces(doc: DocumentTree) -> Engine {
+    let mut e = tests::test_engine_with_doc(doc);
+    for (id, bytes) in EDITOR_FACES {
+        let face = LoadedFont::parse(id.to_string(), bytes.to_vec()).expect("parse face");
+        e.fonts.insert(id.to_string(), Arc::new(face));
+    }
+    e
+}
+
+/// `fonts.json`'s boot faces (`defaults` then `substitutes`).
+pub(crate) const EDITOR_FACES: &[(&str, &[u8])] = &[
+    (
+        "amiri",
+        include_bytes!("../../../ts/public/fonts/Amiri-Regular.ttf"),
+    ),
+    (
+        "liberation",
+        include_bytes!("../../../ts/public/fonts/LiberationSans-Regular.ttf"),
+    ),
+    (
+        "noto-naskh",
+        include_bytes!("../../../ts/public/fonts/NotoNaskhArabic-Regular.ttf"),
+    ),
+    (
+        "carlito",
+        include_bytes!("../../../ts/public/fonts/Carlito-Regular.ttf"),
+    ),
+    (
+        "caladea",
+        include_bytes!("../../../ts/public/fonts/Caladea-Regular.ttf"),
+    ),
+    (
+        "liberation-serif",
+        include_bytes!("../../../ts/public/fonts/LiberationSerif-Regular.ttf"),
+    ),
+    (
+        "liberation-mono",
+        include_bytes!("../../../ts/public/fonts/LiberationMono-Regular.ttf"),
+    ),
+    (
+        "gelasio",
+        include_bytes!("../../../ts/public/fonts/Gelasio-Regular.ttf"),
+    ),
+    (
+        "selawik",
+        include_bytes!("../../../ts/public/fonts/Selawik-Regular.ttf"),
+    ),
+];
+
+/// With the editor's boot faces, Word's stock theme substitutes on both
+/// slots: Calibri and Calibri Light take Carlito (Calibri's metric clone;
+/// Calibri Light only by family), Arial and Times New Roman Arabic take
+/// Noto Naskh Arabic — and layout shapes the body Latin with Carlito.
+#[test]
+fn the_editor_faces_substitute_the_word_default_theme() {
+    let doc = format_docx::read_docx(&theme_word_default_docx())
+        .expect("theme fixture")
+        .document;
+    let e = engine_with_editor_faces(doc);
+    let mut want = vec![
+        sub("Calibri", FontSlot::Latin, "Carlito", "carlito", true),
+        sub(
+            "Calibri Light",
+            FontSlot::Latin,
+            "Carlito",
+            "carlito",
+            false,
+        ),
+    ];
+    want.extend(arabic_theme_substitutions());
+    assert_eq!(e.font_substitutions(), want);
+
+    let (pages, _, _, _) = e.build_pages(1.0, false, None).expect("layout");
+    let body = pages[0].blocks[1].as_paragraph().expect("paragraph");
+    let text = THEME_FIXTURE_TEXTS[1];
+    let calibri_run = body
+        .lines
+        .iter()
+        .flat_map(|l| &l.runs)
+        .find(|r| text[r.source_range.start as usize..].starts_with("Body"))
+        .expect("the body's first run");
+    assert_eq!(calibri_run.font, "carlito");
+}

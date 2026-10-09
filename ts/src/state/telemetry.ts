@@ -104,7 +104,17 @@ type TelemetryKind =
            *  Rust `skip_serializing_if`). */
           recovery?: RecoveryFlags;
       }
-    | { type: 'DOC_OPEN'; size_bytes: number; page_count: number; open_ms: number; backend: string };
+    | {
+          type: 'DOC_OPEN';
+          size_bytes: number;
+          page_count: number;
+          open_ms: number;
+          backend: string;
+          /** Issue #329 — how many (family, slot) font substitutions the
+           *  opened document's layout makes (`DOCUMENT_LOADED.substituted`);
+           *  a count, never the family names. */
+          font_substitutions?: number;
+      };
 
 interface TelemetryEvent {
     doc_id: string;
@@ -242,7 +252,12 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
     /* Issue #390 - one JOURNAL_FAILED sample per exhausted-journal run. */
     let journalFailedReported = false;
     const recentCommands: string[] = [];
-    let pendingDocOpen: { sizeBytes: number; openMs: number; deadlineMs: number } | null = null;
+    let pendingDocOpen: {
+        sizeBytes: number;
+        openMs: number;
+        deadlineMs: number;
+        substitutions: number;
+    } | null = null;
 
     const sample = (kind: TelemetryKind): TelemetryEvent => ({
         doc_id: docId,
@@ -340,6 +355,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                             page_count: e.page_count,
                             open_ms: pendingDocOpen.openMs,
                             backend: client.renderer,
+                            font_substitutions: pendingDocOpen.substitutions,
                         }),
                     );
                 }
@@ -398,6 +414,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                 sizeBytes: openSizeBytes,
                 openMs: performance.now() - openStart,
                 deadlineMs: performance.now() + DOC_OPEN_CORRELATION_MS,
+                substitutions: result.substituted?.length ?? 0,
             };
         }
         return result;

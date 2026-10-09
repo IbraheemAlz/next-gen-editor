@@ -14,6 +14,12 @@
  *     pushes them to the engine via the `LOAD_FONT` bridge command, exactly
  *     once per session. Concurrent calls for the same id share one in-flight
  *     Promise; a font already resident short-circuits.
+ *   - `loadSubstitutes()` (boot, issue #329) pushes the manifest's
+ *     `substitutes` — the faces the engine's font-substitution table maps
+ *     document families to (Carlito for Calibri, Noto Naskh Arabic for
+ *     Simplified Arabic, …) — so an opened document lays out in
+ *     metric-compatible faces from its first paint. A substitute that fails
+ *     to load only loses its substitution (warned, never thrown).
  *   - `reset()` clears the resident set — call it on crash recovery, since
  *     `Command::Recover` wipes the engine's font map and the boot `loadDefaults`
  *     must re-push.
@@ -53,6 +59,9 @@ export interface FontDescriptor {
 export interface FontManifest {
     /** Font ids loaded at boot (kept minimal — one Latin + one Arabic). */
     defaults: string[];
+    /** Issue #329 — substitute faces loaded at boot next to `defaults`
+     *  (optional: a manifest without the key loads none). */
+    substitutes?: string[];
     /** Every declared font. */
     fonts: FontDescriptor[];
 }
@@ -75,6 +84,8 @@ export interface FontRegistry {
     fonts: Accessor<FontDescriptor[]>;
     /** Reactive boot-default ids. */
     defaults: Accessor<string[]>;
+    /** Issue #329 — reactive substitute-face ids (`substitutes`). */
+    substitutes: Accessor<string[]>;
     /** True once `fonts.json` has been fetched + parsed. */
     manifestReady: Accessor<boolean>;
     /** Reactive residency state of one font. */
@@ -87,6 +98,10 @@ export interface FontRegistry {
     ensureFont: (id: string) => Promise<void>;
     /** Boot: load the manifest's `defaults` set into the engine. */
     loadDefaults: () => Promise<void>;
+    /** Issue #329 — boot: load the manifest's `substitutes` into the
+     *  engine. Never rejects: a face that fails is warned about and skipped
+     *  (its family falls back to the per-script default). */
+    loadSubstitutes: () => Promise<void>;
     /** Forget every resident font — call on crash recovery (engine wiped them). */
     reset: () => void;
 }
@@ -106,6 +121,7 @@ export function createFontRegistry(
 
     const [fonts, setFonts] = createSignal<FontDescriptor[]>([]);
     const [defaults, setDefaults] = createSignal<string[]>([]);
+    const [substitutes, setSubstitutes] = createSignal<string[]>([]);
     const [manifestReady, setManifestReady] = createSignal(false);
 
     /* Per-id residency, fine-grained reactive so a dropdown row re-renders
@@ -132,6 +148,7 @@ export function createFontRegistry(
                 .then((m) => {
                     setFonts(m.fonts ?? []);
                     setDefaults(m.defaults ?? []);
+                    setSubstitutes(m.substitutes ?? []);
                     setManifestReady(true);
                     return m;
                 });
@@ -187,6 +204,17 @@ export function createFontRegistry(
         await Promise.all(manifest.defaults.map((id) => ensureFont(id)));
     };
 
+    const loadSubstitutes = async (): Promise<void> => {
+        const manifest = await loadManifest();
+        await Promise.all(
+            (manifest.substitutes ?? []).map((id) =>
+                ensureFont(id).catch((e: unknown) => {
+                    console.warn(`[@nge/core] substitute font '${id}' not loaded:`, e);
+                }),
+            ),
+        );
+    };
+
     const reset = (): void => {
         inflight.clear();
         /* Drop every residency flag back to idle. The store has no `clear`,
@@ -199,12 +227,14 @@ export function createFontRegistry(
     return {
         fonts,
         defaults,
+        substitutes,
         manifestReady,
         stateOf: (id) => states[id] ?? 'idle',
         isLoaded: (id) => states[id] === 'loaded',
         loadManifest,
         ensureFont,
         loadDefaults,
+        loadSubstitutes,
         reset,
     };
 }

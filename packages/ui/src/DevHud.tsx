@@ -11,11 +11,17 @@
 import {
     createEffect,
     createSignal,
+    For,
     onCleanup,
     Show,
     type Component,
 } from 'solid-js';
-import { createEditorCommands, createEditorState, type RecoveryReport } from '@nge/core';
+import {
+    createEditorCommands,
+    createEditorState,
+    type FontSubstitution,
+    type RecoveryReport,
+} from '@nge/core';
 import './DevHud.css';
 
 export interface DevHudProps {
@@ -56,6 +62,13 @@ function recoveryLosses(r: RecoveryReport): string[] {
     }
     if (r.rendererDowngraded) losses.push('renderer downgraded');
     return losses;
+}
+
+/** Issue #329 — one substitution row: `Calibri → Carlito`, the
+ *  complex-script slot marked `(CS)`. */
+function substitutionLabel(s: FontSubstitution): string {
+    const slot = s.slot === 'ComplexScript' ? ' (CS)' : '';
+    return `${s.family}${slot} → ${s.substitute}`;
 }
 
 export const DevHud: Component<DevHudProps> = (props) => {
@@ -233,6 +246,40 @@ export const DevHud: Component<DevHudProps> = (props) => {
 
                     <dt>Fonts</dt>
                     <dd>{state.stats()?.fonts_resident ?? '–'}</dd>
+
+                    {/* Issue #329 — the families the open document names
+                        that the editor does not ship, and the faces
+                        standing in for them (metric-compatible clones keep
+                        the original's line breaks; the Arabic rows are a
+                        closest-style pick). */}
+                    <dt>Substituted</dt>
+                    <dd class="nge-hud__substitutions">
+                        <Show
+                            when={state.fontSubstitutions().length > 0}
+                            fallback={'none'}
+                        >
+                            <For each={state.fontSubstitutions()}>
+                                {(sub) => (
+                                    <span
+                                        class="nge-hud__substitution"
+                                        classList={{
+                                            'nge-hud__substitution--approx':
+                                                !sub.metric_compatible,
+                                        }}
+                                        data-family={sub.family}
+                                        data-slot={sub.slot}
+                                        title={
+                                            sub.metric_compatible
+                                                ? 'metric-compatible substitute'
+                                                : 'closest-style substitute (widths differ)'
+                                        }
+                                    >
+                                        {substitutionLabel(sub)}
+                                    </span>
+                                )}
+                            </For>
+                        </Show>
+                    </dd>
 
                     <dt>Last paint</dt>
                     <dd>{state.lastPaintMs().toFixed(2)} ms</dd>

@@ -70,30 +70,34 @@ async function pickerLabel(page: Page): Promise<string | undefined> {
         .evaluate((el: HTMLSelectElement) => el.selectedOptions[0]?.textContent?.trim());
 }
 
-test('#423: the picker shows the theme-resolved family, marked (theme); Arabic text shows the cs family', async ({
+test('#423 / #329: the picker shows the theme-resolved family, marked with its substitute; Arabic text shows the cs family', async ({
     page,
 }) => {
     test.setTimeout(45_000);
     await boot(page);
     await openDocx(page, THEME_FIXTURE, 'theme_word_default.docx');
 
-    /* Body paragraph: Calibri through docDefaults' theme binding. */
+    /* Body paragraph: Calibri through docDefaults' theme binding — not
+     * shipped, so (issue #329) laid out with its metric clone Carlito,
+     * which the shell boots with; the picker keeps the document's name
+     * and marks the substitute. */
     const body = await caretAt(page, 1, 3);
     expect(body.type).toBe('SELECTION_CHANGED');
     expect(body.resolved_font_latin).toBe('Calibri');
     expect(body.resolved_font_cs).toBe('Arial');
-    expect(body.font_source).toEqual({ latin: 'Theme', complex_script: 'Theme' });
+    expect(body.font_source).toEqual({ latin: 'Substituted', complex_script: 'Substituted' });
     expect(body.caret_font_slot).toBe('Latin');
     expect(body.slot_formats.latin.font_family).toBe('calibri');
     await expect.poll(() => pickerLabel(page)).toBe('Calibri');
-    await expect(page.locator('.nge-font__source')).toHaveText('(theme)');
+    await expect(page.locator('.nge-font__source')).toHaveText('(Carlito)');
 
-    /* Arabic paragraph: the complex-script slot is the active one. */
+    /* Arabic paragraph: the complex-script slot is the active one; Arial
+     * Arabic is laid out with the Naskh substitute. */
     const arabic = await caretAt(page, 2, byteOffset(ARABIC, 'عربي', 2));
     expect(arabic.caret_font_slot).toBe('ComplexScript');
     expect(arabic.resolved_font_cs).toBe('Arial');
     await expect.poll(() => pickerLabel(page)).toBe('Arial');
-    await expect(page.locator('.nge-font__source')).toHaveText('(theme)');
+    await expect(page.locator('.nge-font__source')).toHaveText('(Noto Naskh Arabic)');
 
     /* The run that rebinds only its cs slot (`w:cstheme="majorBidi"`). */
     const rebound = await caretAt(page, 2, byteOffset(ARABIC, 'العناوين', 4));
