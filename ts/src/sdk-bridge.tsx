@@ -41,6 +41,7 @@ import {
     StatusBar,
     TrapOverlay,
     RecoveryBanner,
+    ErrorToast,
     Ruler,
     ZoomControls,
     TextFormatButtons,
@@ -56,6 +57,7 @@ import {
     CapsButtons,
 } from '@nge/ui';
 import type { EngineClient } from './engine/engine-client';
+import { devHooksEnabled } from './dev-hooks';
 
 import '@nge/ui/theme.css';
 
@@ -91,7 +93,11 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
     const ready = () => (props.engineReady ? props.engineReady() : true);
 
     return (
-        <EngineProvider client={handle} telemetryEndpoint={props.telemetryEndpoint}>
+        <EngineProvider
+            client={handle}
+            telemetryEndpoint={props.telemetryEndpoint}
+            debugSurfaces={devHooksEnabled()}
+        >
           <FontRegistryProvider registry={props.fontRegistry}>
           <TelemetryProvider config={props.telemetry}>
             <div class="nge-root nge-shell">
@@ -145,6 +151,10 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 {/* Issue #315 — a degraded crash recovery says what was
                     lost and what to do; a normal one stays silent. */}
                 <RecoveryBanner />
+                {/* Issue #364 - a visible, transient refusal for an engine
+                    error the user's key press caused (tracked deletion across
+                    a table cell, ...). */}
+                <ErrorToast />
             </div>
           </TelemetryProvider>
           </FontRegistryProvider>

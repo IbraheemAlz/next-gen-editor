@@ -55,6 +55,21 @@ pub enum Outcome {
     Crash,
 }
 
+/// Issue #418 — what the first (timed-out) attempt looked like, and
+/// whether the lone retry got through.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TimeoutRetry {
+    /// The stage that timed out on the first attempt (`engine_layout`, or
+    /// absent for the driver's whole-document wall-clock kill).
+    pub first_stage: Option<String>,
+    /// Wall / CPU ms at the first abandonment, when the worker reported them.
+    pub first_wall_ms: Option<u128>,
+    pub first_cpu_ms: Option<u128>,
+    /// The retry finished inside the budget: the first timeout was a load
+    /// artefact, not a property of the document.
+    pub recovered: bool,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct EditCheck {
     pub inserted_bytes: usize,
@@ -515,6 +530,29 @@ pub struct DocResult {
     /// Issue #318 — page count of the production layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_page_count: Option<usize>,
+    /// Issue #418 — CPU milliseconds (user + system) the production
+    /// layout consumed. THIS is what `--layout-budget-ms` bounds: wall
+    /// clock stretches under machine load (two different documents
+    /// "timed out" at load 30-60 and lay out in 2-3.5 s alone), CPU time
+    /// does not. Also set on a timeout (the CPU spent when the layout
+    /// was abandoned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_layout_cpu_ms: Option<u128>,
+    /// Issue #418 — wall-clock ms the production layout was observed to
+    /// take: the full duration when it finished (same value as
+    /// [`Self::engine_layout_ms`]), the time at which it was abandoned on
+    /// a timeout. Together with the CPU column it tells a load-inflated
+    /// run (wall >> cpu) from a genuinely slow one (cpu ~ wall).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_layout_wall_ms: Option<u128>,
+    /// Issue #418 — present when the first attempt at this document
+    /// timed out and it was run a second time, alone. If `recovered`,
+    /// the record IS the second (non-timeout) attempt and the first was
+    /// a false timeout (load); otherwise the record is the second
+    /// timeout too, i.e. a CONFIRMED one - the only kind
+    /// `tools/corpus/report.mjs` flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_retry: Option<TimeoutRetry>,
     /// Issue #318 — `layout::geometry_fingerprint` of the production
     /// layout (hex), so two corpus runs on two builds of the engine can
     /// be diffed document by document.
@@ -638,8 +676,11 @@ impl ThemeFontCensus {
 pub struct EngineLayoutOpts {
     /// Run the stage at all (`--no-engine-layout` turns it off).
     pub enabled: bool,
-    /// Per-document budget (`--layout-budget-ms`). A layout still running
-    /// past it is reported as [`Outcome::Timeout`] with stage
+    /// Per-document budget (`--layout-budget-ms`), in **CPU** time since
+    /// issue #418 (wall-clock only where the OS gives no process CPU
+    /// clock), with a wall-clock backstop of [`WALL_BUDGET_FACTOR`] x the
+    /// budget so a layout that blocks without burning CPU still ends. A
+    /// layout still running past it is reported as [`Outcome::Timeout`] with stage
     /// `engine_layout` — every other column of the record is kept — and
     /// the worker process exits, abandoning the layout thread. The
     /// driver's `--timeout-secs` stays the hard backstop for the rest of
@@ -678,6 +719,9 @@ impl DocResult {
             ui_save_matches_write_docx: None,
             comment_check: None,
             engine_layout_ms: None,
+            engine_layout_cpu_ms: None,
+            engine_layout_wall_ms: None,
+            timeout_retry: None,
             engine_page_count: None,
             engine_fingerprint: None,
             theme_fonts: None,
@@ -1040,14 +1084,29 @@ const ENGINE_LAYOUT_STACK_BYTES: usize = 256 << 20;
 /// What the production-layout thread reports back.
 type EngineLayoutReport = Result<Result<engine_wasm::LayoutProbe, String>, CaughtPanic>;
 
-/// Issue #318 — run `engine-wasm`'s production layout over `doc` on a
-/// helper thread and wait at most `budget` for it. A layout cannot be
-/// cancelled from outside, so a blown budget marks the record
+/// Issue #418 — the wall-clock backstop is this many times the (CPU)
+/// budget: generous enough that a machine at load 8x its core count still
+/// finishes a layout that needs the whole budget, tight enough that a
+/// layout blocked without burning CPU (a lock, a sleeping dependency)
+/// still ends well before the driver's `--timeout-secs`.
+const WALL_BUDGET_FACTOR: u32 = 8;
+
+/// How often the waiter re-reads the CPU clock while the layout runs.
+const CPU_POLL: Duration = Duration::from_millis(25);
+
+/// Issue #318 / #418 - run `engine-wasm`'s production layout over `doc` on
+/// a helper thread and wait for it, bounded by `budget` of CPU time (and
+/// the wall-clock backstop, see [`WALL_BUDGET_FACTOR`]). A layout cannot
+/// be cancelled from outside, so a blown budget marks the record
 /// [`Outcome::Timeout`] (stage `engine_layout`) and leaves the thread
-/// behind — the worker process exits right after printing the record.
+/// behind - the worker process exits right after printing the record.
 fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Duration) {
     let doc = doc.clone();
     let (tx, rx) = mpsc::channel::<(EngineLayoutReport, Duration)>();
+    /* The worker process runs nothing else concurrently with the layout
+    thread, so the process CPU clock's delta from here is the layout's. */
+    let cpu_base = cputime::process_cpu();
+    let wall_start = Instant::now();
     let spawned = std::thread::Builder::new()
         .name("engine-layout".into())
         .stack_size(ENGINE_LAYOUT_STACK_BYTES)
@@ -1068,27 +1127,89 @@ fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Durati
         rec.mark_error("engine_layout", &format!("spawn failed: {e}"));
         return;
     }
+    let cpu_used = || match (cpu_base, cputime::process_cpu()) {
+        (Some(base), Some(now)) => Some(now.saturating_sub(base)),
+        _ => None,
+    };
+    /* Without a CPU clock the budget degrades to the old wall-clock rule. */
+    let wall_cap = if cpu_base.is_some() {
+        budget.saturating_mul(WALL_BUDGET_FACTOR)
+    } else {
+        budget
+    };
     /* A failure an earlier stage recorded outranks anything found here. */
     let first_failure = rec.outcome == Outcome::Ok;
-    match rx.recv_timeout(budget) {
-        Ok((Ok(Ok(probe)), took)) => {
+    let received = loop {
+        match rx.recv_timeout(CPU_POLL) {
+            Ok(msg) => break Some(msg),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let over_cpu = cpu_used().is_some_and(|c| c > budget);
+                if over_cpu || wall_start.elapsed() > wall_cap {
+                    break None;
+                }
+            }
+        }
+    };
+    let cpu_ms = cpu_used().map(|c| c.as_millis());
+    let wall_ms = wall_start.elapsed().as_millis();
+    rec.engine_layout_cpu_ms = cpu_ms;
+    rec.engine_layout_wall_ms = Some(wall_ms);
+    match received {
+        Some((Ok(Ok(probe)), took)) => {
             rec.engine_layout_ms = Some(took.as_millis());
             rec.engine_page_count = Some(probe.page_count);
             rec.engine_fingerprint = Some(format!("{:#018x}", probe.fingerprint));
             rec.engine_degradations = probe.degradations;
         }
-        Ok((Ok(Err(e)), _)) if first_failure => rec.mark_error("engine_layout", &e),
-        Ok((Err(p), _)) if first_failure => rec.mark_panic("engine_layout", &p),
-        Ok(_) => {}
-        Err(_) if first_failure => {
+        Some((Ok(Err(e)), _)) if first_failure => rec.mark_error("engine_layout", &e),
+        Some((Err(p), _)) if first_failure => rec.mark_panic("engine_layout", &p),
+        Some(_) => {}
+        None if first_failure => {
             rec.outcome = Outcome::Timeout;
             rec.stage = Some("engine_layout".into());
             rec.message = Some(format!(
-                "production layout exceeded the {} ms per-document budget",
-                budget.as_millis()
+                "production layout exceeded the {} ms per-document budget \
+                 (cpu {} ms, wall {wall_ms} ms)",
+                budget.as_millis(),
+                cpu_ms.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
             ));
         }
-        Err(_) => {}
+        None => {}
+    }
+}
+
+/// Issue #418 - process CPU time, the load-independent half of the layout
+/// budget.
+mod cputime {
+    use std::time::Duration;
+
+    /// User + system CPU time this process has consumed so far, `None`
+    /// where the platform has no such clock (the budget then falls back to
+    /// wall-clock).
+    #[cfg(unix)]
+    pub fn process_cpu() -> Option<Duration> {
+        let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `getrusage` writes a full `rusage` through the pointer
+        // and reads nothing else; `RUSAGE_SELF` is always valid.
+        let ru = unsafe {
+            if libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) != 0 {
+                return None;
+            }
+            ru.assume_init()
+        };
+        let tv = |t: libc::timeval| {
+            Duration::new(
+                u64::try_from(t.tv_sec).unwrap_or(0),
+                u32::try_from(t.tv_usec).unwrap_or(0).saturating_mul(1000),
+            )
+        };
+        Some(tv(ru.ru_utime) + tv(ru.ru_stime))
+    }
+
+    #[cfg(not(unix))]
+    pub fn process_cpu() -> Option<Duration> {
+        None
     }
 }
 

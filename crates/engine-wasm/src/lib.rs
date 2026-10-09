@@ -43,6 +43,8 @@ use text_pipeline::{
 use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
+mod pdf_semantics;
+
 #[wasm_bindgen(start)]
 pub fn boot() {
     console_error_panic_hook::set_once();
@@ -7976,6 +7978,7 @@ impl Engine {
                 PdfConformance::A1b => format_pdf::PdfProfile::A1b,
                 PdfConformance::A2u => format_pdf::PdfProfile::A2u,
                 PdfConformance::X3 => format_pdf::PdfProfile::X3,
+                PdfConformance::Ua1 => format_pdf::PdfProfile::Ua1,
             }),
             Command::CloseDocument => self.do_close_document(),
             Command::DeleteRange { range } => self.do_delete_range(range),
@@ -10746,8 +10749,23 @@ impl Engine {
         source text. */
         let doc = self.undo.current();
         let mut para_texts: Vec<&str> = Vec::new();
+        /* Issue #360 — the semantic side table (headings → outline,
+        hyperlinks + bookmarks → link annotations) is indexed like
+        `para_texts`: every walk below runs beside the matching
+        `walk_block_texts`; stories that carry no semantics (header /
+        footer bands, text boxes) are padded with defaults. */
+        let mut semantics = format_pdf::PdfSemantics {
+            metadata: pdf_semantics::document_metadata(doc),
+            ..Default::default()
+        };
         for b in doc.blocks.iter() {
             walk_block_texts(b, &mut para_texts);
+            pdf_semantics::walk_block_semantics(
+                doc,
+                b,
+                pdf_semantics::Story::Body,
+                &mut semantics.paragraphs,
+            );
         }
         /* Issue #71 — band paragraphs join the SAME table: per
         referenced part (headers rid-sorted, then footers — the
@@ -10815,8 +10833,19 @@ impl Engine {
                     }
                     _ => continue,
                 }
+                /* Issue #360 — header / footer entries (artifacts, no
+                semantics) pad the side table up to this story's base. */
+                semantics
+                    .paragraphs
+                    .resize_with(para_texts.len(), Default::default);
                 for b in &story.body {
                     walk_block_texts(b, &mut para_texts);
+                    pdf_semantics::walk_block_semantics(
+                        doc,
+                        b,
+                        pdf_semantics::Story::Note,
+                        &mut semantics.paragraphs,
+                    );
                 }
             }
         }
@@ -10900,12 +10929,13 @@ impl Engine {
         /* Issue #121 — images embed from the document's media parts. A
         skipped image (missing / Tier-3 format / corrupt) is a console
         warning, never a failed export. */
-        match format_pdf::export_pdf_with_media(
+        match format_pdf::export_pdf_document(
             &pages,
             &font_stack,
             &para_texts,
             &doc.media,
-            profile,
+            &semantics,
+            format_pdf::PdfExportOptions::new(profile),
             &mut bytes,
         ) {
             Ok(report) => {
@@ -15369,7 +15399,13 @@ impl Engine {
                 &self.review_author,
                 &self.current_review_date(),
             )
-            .map_err(|e| Box::new(Event::error(format!("{cmd}: {e}"))))
+            .map_err(|e| {
+                /* Issue #364 - typed, so the shell shows a visible refusal. */
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                    kind: Some(bridge::ErrorKind::TrackedDeletionRefused),
+                })
+            })
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching
@@ -28255,6 +28291,10 @@ mod toc_pdf_export_tests;
 /// as `toc_pdf_export_tests`'s own fixture generator.
 #[cfg(test)]
 mod pdf_validate_fixtures_tests;
+
+/// Issue #360 — PDF outline / links / XMP / tagging, end to end.
+#[cfg(test)]
+mod pdf_semantics_tests;
 
 #[cfg(test)]
 mod a11y_note_tests;
