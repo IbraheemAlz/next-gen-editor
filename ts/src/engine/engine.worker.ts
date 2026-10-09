@@ -14,6 +14,9 @@ import type { LoggedCommand, RecoveryCandidate, SnapshotPackage } from './event-
 import LATIN_URL from '../../fonts/LiberationSans-Regular.ttf?url';
 import ARABIC_URL from '../../fonts/NotoNaskhArabic-Regular.ttf?url';
 import DUAL_URL from '../../fonts/Amiri-Regular.ttf?url';
+/* Issue #355 — the `theme-fonts` golden opens a committed fixture generated
+   by `tools/roundtrip --gen-seed` (our own builder, no foreign bytes). */
+import THEME_DOCX_URL from '../../../crates/format-docx/tests/fixtures/theme_loaded_faces.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -386,6 +389,22 @@ async function handleInit(msg: InitMsg): Promise<void> {
             bytes: await fetchBytes(LATIN_URL),
         } as Command);
         self.postMessage({ type: 'FONT_LOADED_RESULT', event: latin });
+    } else if (testCase === 'theme-fonts') {
+        /* Issue #355 — the three shipped faces under their `FontFamily` ids
+           (what a theme typeface resolves to: "Liberation Sans" →
+           `liberation`, "Noto Naskh Arabic" → `noto-naskh`). */
+        for (const [id, url] of [
+            ['liberation', LATIN_URL],
+            ['amiri', DUAL_URL],
+            ['noto-naskh', ARABIC_URL],
+        ] as const) {
+            const e = await dispatch({
+                type: 'LOAD_FONT',
+                id,
+                bytes: await fetchBytes(url),
+            } as Command);
+            self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
+        }
     } else if (
         testCase === 'hello-arabic' ||
         testCase === 'editing-arabic' ||
@@ -845,6 +864,32 @@ async function handleInit(msg: InitMsg): Promise<void> {
                 type: 'SET_TAB_STOPS',
                 range: wholeRange,
                 stops: [{ position_pt: 250, kind: 'Decimal', leader: undefined }],
+            } as Command);
+            break;
+        }
+
+        case 'theme-fonts': {
+            /* Issue #355 — a Word default-template document whose theme
+               names faces the editor ships: body Latin in Liberation Sans,
+               body Arabic (`+Body CS`, the theme's `Arab` row) in Noto
+               Naskh, the heading (`+Headings`, accent1 shaded BF) in Amiri;
+               one run naming Amiri explicitly, one Arabic run rebound to
+               `majorBidi`, two theme-coloured runs. Without theme
+               resolution every run would paint in the stack default.
+               Zoom 2 so the 11 pt body text is legible in the golden. */
+            await dispatch({ type: 'SET_ZOOM', scale: 2 } as Command);
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: 'liberation',
+                base_direction: 'LTR',
+                px_size: 15,
+                line_height: 22,
+                align: 'START',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'LOAD_DOCX',
+                bytes: await fetchBytes(THEME_DOCX_URL),
             } as Command);
             break;
         }
