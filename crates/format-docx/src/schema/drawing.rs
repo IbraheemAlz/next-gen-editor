@@ -290,10 +290,21 @@ fn scan_element(fragment: &[u8]) -> DrawingScan {
     out
 }
 
+/// The largest `ST_PositiveCoordinate` (ECMA-376 §20.1.10.42), in EMU.
+const MAX_POSITIVE_COORDINATE: i64 = 27_273_042_316_900;
+
 fn apply_extent(e: &BytesStart, out: &mut DrawingScan) {
     if out.cx.is_none() && out.cy.is_none() {
-        out.cx = attr_val(e, b"cx").and_then(|v| v.trim().parse().ok());
-        out.cy = attr_val(e, b"cy").and_then(|v| v.trim().parse().ok());
+        /* Issue #358 — `cx` / `cy` are `ST_PositiveCoordinate`: a negative
+        (or out-of-range) extent from a hostile package is clamped into the
+        schema range instead of reaching layout as a negative size. */
+        let coord = |name: &[u8]| {
+            attr_val(e, name)
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .map(|v| v.clamp(0, MAX_POSITIVE_COORDINATE))
+        };
+        out.cx = coord(b"cx");
+        out.cy = coord(b"cy");
     }
 }
 

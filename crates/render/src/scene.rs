@@ -861,7 +861,18 @@ fn push_tab_leader(
                 baseline - px * 0.3
             };
             let mut x = (lo / step).ceil() * step;
-            while x + dot <= hi {
+            /* Issue #422 — bounded tiling; an untileable advance (huge or
+            non-finite) paints as a rule instead. */
+            let Some(bound) = layout::pattern_tile_bound(x, hi, step) else {
+                if lo.is_finite() && hi.is_finite() {
+                    rect(cmds, lo, y, hi, y + dot);
+                }
+                return;
+            };
+            for _ in 0..bound {
+                if x + dot > hi {
+                    break;
+                }
                 rect(cmds, x, y, x + dot, y + dot);
                 x += step;
             }
@@ -871,7 +882,16 @@ fn push_tab_leader(
             let dash = px * 0.25;
             let y = baseline - px * 0.28;
             let mut x = (lo / step).ceil() * step;
-            while x + dash <= hi {
+            let Some(bound) = layout::pattern_tile_bound(x, hi, step) else {
+                if lo.is_finite() && hi.is_finite() {
+                    rect(cmds, lo, y, hi, y + dot);
+                }
+                return;
+            };
+            for _ in 0..bound {
+                if x + dash > hi {
+                    break;
+                }
                 rect(cmds, x, y, x + dash, y + dot);
                 x += step;
             }
@@ -903,6 +923,11 @@ fn push_tab_leader(
 ///   bands `2 * thickness` apart. Cheap visual approximation of the
 ///   sinusoidal stroke Word draws; round-trips faithfully because the
 ///   variant is preserved on the model side.
+///
+/// Issue #422 — the patterned variants tile at most
+/// [`layout::MAX_PATTERN_TILES`] fills; a span that needs more (a run
+/// stretched by a giant inline image) or has a non-finite edge paints as
+/// one solid stroke. A non-finite span paints nothing.
 fn push_underline_pattern(
     cmds: &mut Vec<DisplayCmd>,
     style: engine::UnderlineStyle,
@@ -913,6 +938,9 @@ fn push_underline_pattern(
     paint_color: peniko::Color,
 ) {
     use engine::UnderlineStyle::*;
+    if !(x0.is_finite() && x1.is_finite() && top.is_finite() && thickness.is_finite()) {
+        return;
+    }
     let solid = |cmds: &mut Vec<DisplayCmd>, lo: f64, hi: f64, t: f64| {
         if hi > lo {
             cmds.push(DisplayCmd::FillRect {
@@ -930,8 +958,14 @@ fn push_underline_pattern(
         }
         Dotted => {
             let pitch = (thickness * 2.0).max(2.0);
+            let Some(bound) = layout::pattern_tile_bound(x0, x1, pitch) else {
+                return solid(cmds, x0, x1, top);
+            };
             let mut x = x0;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + thickness).min(x1);
                 solid(cmds, x, end, top);
                 x += pitch;
@@ -940,8 +974,14 @@ fn push_underline_pattern(
         Dashed => {
             let dash = (thickness * 4.0).max(3.0);
             let gap = dash;
+            let Some(bound) = layout::pattern_tile_bound(x0, x1, dash + gap) else {
+                return solid(cmds, x0, x1, top);
+            };
             let mut x = x0;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + dash).min(x1);
                 solid(cmds, x, end, top);
                 x += dash + gap;
@@ -951,11 +991,17 @@ fn push_underline_pattern(
             /* Sawtooth: tile pairs of short rects on alternating rows.
             Period = `4 * thickness`; each half-period is one short rect. */
             let half = (thickness * 2.0).max(2.0);
+            let Some(bound) = layout::pattern_tile_bound(x0, x1, half) else {
+                return solid(cmds, x0, x1, top);
+            };
             let top_band = top - thickness;
             let bottom_band = top + thickness;
             let mut x = x0;
             let mut up = true;
-            while x < x1 {
+            for _ in 0..bound {
+                if x >= x1 {
+                    break;
+                }
                 let end = (x + half).min(x1);
                 let band_top = if up { top_band } else { bottom_band };
                 solid(cmds, x, end, band_top);
@@ -1015,5 +1061,87 @@ mod leader_tests {
             black,
         );
         assert_eq!(line.len(), 1);
+    }
+
+    fn fills(cmds: &[DisplayCmd]) -> Vec<Rect> {
+        cmds.iter()
+            .map(|c| match c {
+                DisplayCmd::FillRect { rect, .. } => *rect,
+                other => panic!("decorations paint fills only, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Issue #422 — the OOM reproducer's shape: a wavy (dotted, dashed)
+    /// underline under a run stretched to 640 730 085 px by an inline image
+    /// used to tile ~320 million fills. It now paints ONE solid stroke over
+    /// the whole span; non-finite spans paint nothing and terminate.
+    #[test]
+    fn patterned_underline_over_a_giant_span_is_one_stroke() {
+        let black = Color::from_rgba8(0, 0, 0, 255);
+        for style in [
+            engine::UnderlineStyle::Wavy,
+            engine::UnderlineStyle::Dotted,
+            engine::UnderlineStyle::Dashed,
+        ] {
+            let mut cmds = Vec::new();
+            push_underline_pattern(&mut cmds, style, 10.0, 640_730_085.0, 50.0, 1.0, black);
+            let rects = fills(&cmds);
+            assert_eq!(rects.len(), 1, "{style:?}");
+            assert_eq!((rects[0].x0, rects[0].x1), (10.0, 640_730_085.0));
+            for (x0, x1) in [
+                (0.0, f64::INFINITY),
+                (f64::NEG_INFINITY, 5.0),
+                (f64::NAN, 5.0),
+                (1e17, 1e17 + 64.0),
+            ] {
+                let mut cmds = Vec::new();
+                push_underline_pattern(&mut cmds, style, x0, x1, 50.0, 1.0, black);
+                assert!(cmds.len() <= 64, "{style:?} {x0}..{x1}: {}", cmds.len());
+            }
+        }
+    }
+
+    /// Issue #422 — under the cap the tiling is exactly the pre-bound loop
+    /// (same accumulation, same stop), so goldens cannot move.
+    #[test]
+    fn patterned_underline_under_the_cap_matches_the_unbounded_loop() {
+        let black = Color::from_rgba8(0, 0, 0, 255);
+        let (x0, x1, t) = (12.3, 912.7, 1.37);
+        let mut cmds = Vec::new();
+        push_underline_pattern(
+            &mut cmds,
+            engine::UnderlineStyle::Wavy,
+            x0,
+            x1,
+            40.0,
+            t,
+            black,
+        );
+        let mut expect = Vec::new();
+        let half = (t * 2.0f64).max(2.0);
+        let mut x = x0;
+        let mut up = true;
+        while x < x1 {
+            let y = if up { 40.0 - t } else { 40.0 + t };
+            expect.push(Rect::new(x, y, (x + half).min(x1), y + t));
+            up = !up;
+            x += half;
+        }
+        assert_eq!(fills(&cmds), expect);
+    }
+
+    /// Issue #422 — the same bound on dot / hyphen tab leaders.
+    #[test]
+    fn tab_leader_over_a_giant_advance_is_one_rule() {
+        let black = Color::from_rgba8(0, 0, 0, 255);
+        for kind in [layout::TabLeaderKind::Dot, layout::TabLeaderKind::Hyphen] {
+            let mut cmds = Vec::new();
+            push_tab_leader(&mut cmds, kind, 0.0, 1e12, 50.0, 12.0, black);
+            assert_eq!(fills(&cmds).len(), 1, "{kind:?}");
+            let mut cmds = Vec::new();
+            push_tab_leader(&mut cmds, kind, 0.0, f64::INFINITY, 50.0, 12.0, black);
+            assert!(cmds.is_empty(), "{kind:?}");
+        }
     }
 }
