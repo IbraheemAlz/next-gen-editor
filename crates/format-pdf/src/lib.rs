@@ -4232,6 +4232,9 @@ mod tests {
             (PdfProfile::A1b, "1b"),
             (PdfProfile::A2u, "2u"),
             (PdfProfile::X3, "x3"),
+            /* Issue #360 — tagged; `--profile ua1` also size-compares
+            each file against its `2u` twin. */
+            (PdfProfile::Ua1, "ua1"),
         ] {
             let dir = root.join(dir);
             std::fs::create_dir_all(&dir).expect("create output dir");
