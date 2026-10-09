@@ -91,6 +91,22 @@
 //! WebP with their feature off) and corrupt or oversized images are skipped
 //! with a [`PdfWarning`].
 //!
+//! # Document semantics (issue #360)
+//!
+//! [`export_pdf_document`] takes a [`PdfSemantics`] side table — what the
+//! document model knows that the box tree does not, indexed like
+//! `para_texts` by `ParagraphBox::source_paragraph_id` — and writes:
+//!
+//! - **Outline.** One `/Outlines` item per heading paragraph (`Heading N`
+//!   / outline level), nested by level, each `/Dest [page /XYZ left top
+//!   0]` at the laid-out paragraph's top-left (zoom `0` = keep the
+//!   viewer's), and `/PageMode /UseOutlines` — only when a heading exists.
+//!
+//! Every object it adds is allocated after the pre-#360 ones and only
+//! when the document has the feature, so an empty side table (what
+//! [`export_pdf`] / [`export_pdf_with_media`] pass) reproduces the
+//! earlier output byte for byte.
+//!
 //! # Stream compression & text extraction
 //!
 //! Content streams and the embedded `FontFile2` programs are zlib-compressed
@@ -105,8 +121,8 @@ use flate2::write::ZlibEncoder;
 use font_program::{FontProgram, GlyphCodes, Outlines};
 use layout::{LayoutBlock, PageBox, ParagraphBox, TabLeaderKind, TableBox, VisualRun};
 use pdf_writer::types::{
-    CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, TextRenderingMode, TrappingStatus,
-    UnicodeCmap,
+    CidFontType, FontFlags, OutputIntentSubtype, PageMode, SystemInfo, TextRenderingMode,
+    TrappingStatus, UnicodeCmap,
 };
 use pdf_writer::{Content, Date, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
 use std::cell::RefCell;
@@ -120,6 +136,9 @@ mod font_program;
 mod image;
 #[cfg(test)]
 mod image_export_tests;
+mod semantic;
+#[cfg(test)]
+mod semantic_tests;
 #[doc(hidden)]
 pub use image::test_images;
 /// Issue #227 — the `format_pdf_image_decode` fuzz target drives
@@ -131,6 +150,7 @@ pub use image::test_images;
 /// just not nameable from outside).
 pub use image::{AlphaMode, ImageColor, ImageEncoding, PreparedImage, prepare_image};
 pub use image::{ImageSkipReason, MAX_IMAGE_PIXELS};
+pub use semantic::{ParagraphSemantics, PdfSemantics};
 
 /// Issue #258 — the shared PDF content-stream / string-literal decoder.
 /// See the module's own doc comment for why it lives here rather than in
@@ -296,6 +316,9 @@ struct Res<'a> {
     fonts: &'a [(String, FontObj)],
     images: &'a HashMap<String, String>,
     stack: &'a FontStack,
+    /// Issue #360 — the semantic collector (outline destinations); `None`
+    /// for the content-only test driver.
+    sem: Option<&'a semantic::SemCtx<'a>>,
 }
 
 /// A non-fatal export note (the `DocxWarning` counterpart): the PDF is
@@ -367,6 +390,54 @@ pub fn export_pdf_with_media(
     profile: PdfProfile,
     out: &mut Vec<u8>,
 ) -> Result<PdfExportReport, String> {
+    export_pdf_document(
+        pages,
+        fonts,
+        para_texts,
+        media,
+        &PdfSemantics::default(),
+        PdfExportOptions::new(profile),
+        out,
+    )
+}
+
+/// Issue #360 — how [`export_pdf_document`] writes the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfExportOptions {
+    /// The conformance target.
+    pub profile: PdfProfile,
+}
+
+impl PdfExportOptions {
+    /// The options for `profile`.
+    pub fn new(profile: PdfProfile) -> Self {
+        Self { profile }
+    }
+}
+
+/// Export `pages` with the document-model semantics the box tree does not
+/// carry (issue #360), appending the bytes to `out`.
+///
+/// [`export_pdf_with_media`]'s contract, plus `semantics` — a side table
+/// indexed like `para_texts` (by `ParagraphBox::source_paragraph_id`):
+///
+/// - **Outline.** Every heading paragraph ([`ParagraphSemantics::heading`])
+///   that reaches a page becomes an `/Outlines` item, nested by level,
+///   whose `/Dest` is `[page /XYZ left top 0]` at the laid-out
+///   paragraph's top-left; the catalog then opens with `/PageMode
+///   /UseOutlines`. No heading → no outline and no page mode.
+///
+/// An empty `semantics` produces exactly [`export_pdf_with_media`]'s bytes.
+pub fn export_pdf_document(
+    pages: &[PageBox],
+    fonts: &FontStack,
+    para_texts: &[&str],
+    media: &HashMap<String, engine::ImageBlob>,
+    semantics: &PdfSemantics,
+    options: PdfExportOptions,
+    out: &mut Vec<u8>,
+) -> Result<PdfExportReport, String> {
+    let profile = options.profile;
     let pdfa = matches!(profile, PdfProfile::A1b | PdfProfile::A2u);
     let pdfx = profile == PdfProfile::X3;
     /* Every conformance target shares the ICC output intent, the XMP
@@ -515,15 +586,23 @@ pub fn export_pdf_with_media(
     switched to the full-embedding identity codes and the contents are
     rebuilt — every round converts at least one more font, so this runs
     at most `font_objs.len() + 1` times, and in practice once. */
-    let (contents, programs) = loop {
+    let (contents, programs, collected) = loop {
+        /* Issue #360 — a fresh collector per round: a rebuilt round
+        re-reports every placement. */
+        let sem_ctx = semantic::SemCtx::new(semantics);
         let res = Res {
             fonts: &font_objs,
             images: &image_names,
             stack: fonts,
+            sem: Some(&sem_ctx),
         };
         let contents: Vec<Vec<u8>> = pages
             .iter()
-            .map(|page| build_page_content(page, &res))
+            .enumerate()
+            .map(|(i, page)| {
+                sem_ctx.begin_page(i, page.size.height);
+                build_page_content(page, &res)
+            })
             .collect();
         let mut programs: Vec<FontProgram> = Vec::with_capacity(font_objs.len());
         let mut rejected = false;
@@ -544,7 +623,7 @@ pub fn export_pdf_with_media(
             }
         }
         if !rejected {
-            break (contents, programs);
+            break (contents, programs, sem_ctx.finish());
         }
         for (_, fo) in &font_objs {
             let mut codes = fo.codes.borrow_mut();
@@ -560,6 +639,10 @@ pub fn export_pdf_with_media(
         .iter()
         .map(|p| (profile == PdfProfile::A1b && p.subset_tag.is_some()).then(&mut alloc))
         .collect();
+    /* Issue #360 — every object below is allocated only when the document
+    has the feature, AFTER every pre-#360 object, so a document without
+    it keeps its object numbering (and bytes). */
+    let outline = collected.plan_outline(&mut alloc);
     if conformant {
         let mut hash_in: Vec<u8> = Vec::new();
         for c in &contents {
@@ -577,6 +660,10 @@ pub fn export_pdf_with_media(
     {
         let mut catalog = pdf.catalog(catalog_id);
         catalog.pages(pages_id);
+        if let Some(plan) = &outline {
+            catalog.outlines(plan.root);
+            catalog.page_mode(PageMode::UseOutlines);
+        }
         if conformant {
             catalog.metadata(metadata_id.expect("metadata id allocated for conformance"));
             let mut intents = catalog.output_intents();
@@ -697,6 +784,11 @@ pub fn export_pdf_with_media(
 
     for x in &xobjs {
         write_image_xobject(&mut pdf, x);
+    }
+
+    if let Some(plan) = &outline {
+        let page_ids: Vec<Ref> = page_refs.iter().map(|(p, _)| *p).collect();
+        plan.write(&mut pdf, &page_ids);
     }
 
     out.extend_from_slice(&pdf.finish());
@@ -846,6 +938,7 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)], fonts: &FontSt
             fonts: font_objs,
             images: &HashMap::new(),
             stack: fonts,
+            sem: None,
         },
     )
 }
@@ -1234,6 +1327,9 @@ fn emit_paragraph_text(
 ) {
     let para_x = origin_x + para.origin.x;
     let para_y = origin_y + para.origin.y;
+    if let Some(sem) = res.sem {
+        sem.paragraph_placed(para, para_x, para_y);
+    }
 
     /* Background highlights — a run's `bg_color` fills the line's full
     height across the run's advance so adjacent highlights tile. */
