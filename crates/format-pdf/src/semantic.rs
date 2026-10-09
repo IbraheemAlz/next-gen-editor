@@ -15,7 +15,9 @@
 //! its absolute top-left once, so the outline's `/Dest` points at the
 //! laid-out paragraph rather than a re-derived position.
 
-use pdf_writer::{Pdf, Ref, TextStr};
+use pdf_writer::types::{ActionType, AnnotationFlags, AnnotationType};
+use pdf_writer::writers::Destination;
+use pdf_writer::{Name, Pdf, Rect, Ref, Str, TextStr};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -32,6 +34,34 @@ pub struct ParagraphSemantics {
     /// outline entry title. A heading with an empty title gets no entry
     /// (Word parity: empty headings are not bookmarked).
     pub title: String,
+    /// Hyperlink ranges over the paragraph's source text (`<w:hyperlink>`,
+    /// `engine::Hyperlink`), non-overlapping — one `/Link` annotation per
+    /// laid-out line each range touches.
+    pub links: Vec<LinkSpan>,
+    /// Bookmark names anchored in this paragraph (`<w:bookmarkStart
+    /// w:name>`) — the destinations of internal links. A bookmark resolves
+    /// to the top-left of the paragraph's first laid-out fragment.
+    pub bookmarks: Vec<String>,
+}
+
+/// Issue #360 — one hyperlink range: `[start, end)` byte offsets into the
+/// paragraph's source text (the `para_texts` entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSpan {
+    pub start: u32,
+    pub end: u32,
+    pub target: LinkTarget,
+}
+
+/// Issue #360 — where a hyperlink goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// An external target (the relationship's `Target`): a `/URI` action.
+    Uri(String),
+    /// An internal target (`<w:hyperlink w:anchor>`): a `/Dest` at the
+    /// bookmark's paragraph. A name no paragraph carries gets no
+    /// annotation (never a dead link).
+    Bookmark(String),
 }
 
 /// Issue #360 — the semantic side table [`crate::export_pdf_document`]
@@ -63,12 +93,25 @@ pub(crate) struct Placement {
     pub top: f32,
 }
 
+/// One laid-out line's share of a hyperlink: the union of the link's
+/// glyph boxes on that line, PDF space `[x0, y0, x1, y1]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LinkHit {
+    pub para: u32,
+    pub link: usize,
+    pub page: usize,
+    pub rect: [f32; 4],
+}
+
 #[derive(Default)]
 struct State {
     page: usize,
     page_h: f32,
-    /// First placement of every heading paragraph, by source id.
+    /// First placement of every heading / bookmarked paragraph, by
+    /// source id.
     placements: HashMap<u32, Placement>,
+    /// Every line × link rectangle, in paint order.
+    links: Vec<LinkHit>,
 }
 
 /// Issue #360 — the collector the content emitters report into. One per
@@ -76,13 +119,20 @@ struct State {
 /// contents; a fresh context per round keeps the record exact).
 pub(crate) struct SemCtx<'s> {
     sem: &'s PdfSemantics,
+    texts: &'s [&'s str],
+    /// `false` for PDF/X-3 (no link annotations — see [`plan_links`]).
+    ///
+    /// [`plan_links`]: Collected::plan_links
+    links: bool,
     st: RefCell<State>,
 }
 
 impl<'s> SemCtx<'s> {
-    pub fn new(sem: &'s PdfSemantics) -> Self {
+    pub fn new(sem: &'s PdfSemantics, texts: &'s [&'s str], links: bool) -> Self {
         Self {
             sem,
+            texts,
+            links,
             st: RefCell::new(State::default()),
         }
     }
@@ -95,30 +145,70 @@ impl<'s> SemCtx<'s> {
     }
 
     /// A paragraph box is being emitted with its layout-space (`y` down)
-    /// top-left at `(x, top)`. Records the first fragment of a heading.
+    /// top-left at `(x, top)`. Records the first fragment of a heading or
+    /// bookmarked paragraph, and every line's share of each hyperlink:
+    /// the union of the glyph boxes (pen position × `x_advance`, the line
+    /// box's full height) whose source byte falls in the link — BiDi runs
+    /// are visual, so this is a per-glyph test, not a range clip.
     pub fn paragraph_placed(&self, para: &layout::ParagraphBox, x: f32, top: f32) {
-        let Some(meta) = self.sem.paragraph(para.source_paragraph_id) else {
+        let id = para.source_paragraph_id;
+        let Some(meta) = self.sem.paragraph(id) else {
             return;
         };
-        if meta.heading.is_none() {
+        let mut st = self.st.borrow_mut();
+        let (page, page_h) = (st.page, st.page_h);
+        if meta.heading.is_some() || !meta.bookmarks.is_empty() {
+            let placement = Placement {
+                page,
+                x,
+                top: page_h - top,
+            };
+            st.placements.entry(id).or_insert(placement);
+        }
+        if !self.links || meta.links.is_empty() {
             return;
         }
-        let mut st = self.st.borrow_mut();
-        let placement = Placement {
-            page: st.page,
-            x,
-            top: st.page_h - top,
-        };
-        st.placements
-            .entry(para.source_paragraph_id)
-            .or_insert(placement);
+        for line in &para.lines {
+            let line_x = x + line.origin.x;
+            let line_top = top + line.origin.y;
+            /* Per link: [min x, max x] on this line. */
+            let mut spans: Vec<Option<(f32, f32)>> = vec![None; meta.links.len()];
+            let mut pen = 0.0_f32;
+            for run in &line.runs {
+                for g in &run.glyphs {
+                    let at = run.source_range.start + g.cluster;
+                    if let Some(i) = meta.links.iter().position(|l| l.start <= at && at < l.end)
+                        && g.x_advance > 0.0
+                    {
+                        let (x0, x1) = (line_x + pen, line_x + pen + g.x_advance);
+                        let span = spans[i].get_or_insert((x0, x1));
+                        span.0 = span.0.min(x0);
+                        span.1 = span.1.max(x1);
+                    }
+                    pen += g.x_advance;
+                }
+            }
+            for (link, span) in spans.into_iter().enumerate() {
+                if let Some((x0, x1)) = span {
+                    st.links.push(LinkHit {
+                        para: id,
+                        link,
+                        page,
+                        rect: [x0, page_h - (line_top + line.height), x1, page_h - line_top],
+                    });
+                }
+            }
+        }
     }
 
     /// Close the round: what the writers need once every page is built.
     pub fn finish(self) -> Collected<'s> {
+        let st = self.st.into_inner();
         Collected {
             sem: self.sem,
-            placements: self.st.into_inner().placements,
+            texts: self.texts,
+            placements: st.placements,
+            links: st.links,
         }
     }
 }
@@ -126,7 +216,91 @@ impl<'s> SemCtx<'s> {
 /// What one content-building round collected, for the object writers.
 pub(crate) struct Collected<'s> {
     sem: &'s PdfSemantics,
+    texts: &'s [&'s str],
     placements: HashMap<u32, Placement>,
+    links: Vec<LinkHit>,
+}
+
+/// One planned `/Link` annotation.
+pub(crate) struct AnnotPlan {
+    pub id: Ref,
+    pub page: usize,
+    pub rect: [f32; 4],
+    /// `/Contents` — the link's visible text (the target when it has none).
+    pub contents: String,
+    pub action: LinkAction,
+}
+
+/// What activating a planned link does.
+pub(crate) enum LinkAction {
+    /// `/A << /S /URI /URI (…) >>` — 7-bit ASCII, percent-encoded.
+    Uri(Vec<u8>),
+    /// `/Dest [page /XYZ left top 0]`.
+    Dest(Placement),
+}
+
+impl AnnotPlan {
+    /// Write the `/Link` annotation (ISO 32000-1 §12.5.6.5): no border
+    /// (`/Border [0 0 0]` — the text keeps its own styling), `/F 4`
+    /// (Print — PDF/A requires it; never Hidden / NoView), `/Contents`,
+    /// and a `/URI` action or a `/Dest`. No JavaScript, no appearance
+    /// stream (a link is never drawn). `struct_parent` is the annotation's
+    /// key in the structure parent tree when the export is tagged.
+    pub fn write(&self, pdf: &mut Pdf, page_refs: &[Ref], struct_parent: Option<i32>) {
+        let [x0, y0, x1, y1] = self.rect;
+        let mut annot = pdf.annotation(self.id);
+        annot.subtype(AnnotationType::Link);
+        annot.rect(Rect::new(x0, y0, x1, y1));
+        annot.border(0.0, 0.0, 0.0, None);
+        annot.flags(AnnotationFlags::PRINT);
+        annot.contents(TextStr(&self.contents));
+        if let Some(key) = struct_parent {
+            annot.struct_parent(key);
+        }
+        match &self.action {
+            LinkAction::Uri(bytes) => {
+                annot.action().action_type(ActionType::Uri).uri(Str(bytes));
+            }
+            LinkAction::Dest(p) => {
+                annot
+                    .insert(Name(b"Dest"))
+                    .start::<Destination>()
+                    .page(page_refs[p.page])
+                    .xyz(p.x, p.top, None);
+            }
+        }
+    }
+}
+
+/// Issue #360 — a hyperlink target as a PDF `/URI` byte string: trimmed,
+/// every byte outside printable ASCII percent-encoded (ISO 32000-1 §12.6.4.7
+/// — a URI is 7-bit ASCII). `None` for an empty target and for script
+/// schemes (`javascript:`, `vbscript:`, `data:`) — PDF/A forbids
+/// JavaScript, and a `javascript:` URI is JavaScript by another name.
+pub(crate) fn sanitize_uri(target: &str) -> Option<Vec<u8>> {
+    let t = target.trim();
+    let lower: String = t
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if t.is_empty()
+        || ["javascript:", "vbscript:", "data:"]
+            .iter()
+            .any(|s| lower.starts_with(s))
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(t.len());
+    for &b in t.as_bytes() {
+        if (0x21..0x7f).contains(&b) {
+            out.push(b);
+        } else {
+            out.extend_from_slice(format!("%{b:02X}").as_bytes());
+        }
+    }
+    Some(out)
 }
 
 /// One outline entry before its objects are written.
@@ -137,6 +311,71 @@ struct OutlineEntry {
 }
 
 impl Collected<'_> {
+    /// Where bookmark `name` resolves: the first placed paragraph (in
+    /// document order) carrying it.
+    fn bookmark(&self, name: &str) -> Option<Placement> {
+        let mut ids: Vec<u32> = self.placements.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().find_map(|id| {
+            let meta = self.sem.paragraph(id)?;
+            meta.bookmarks
+                .iter()
+                .any(|b| b == name)
+                .then(|| self.placements[&id])
+        })
+    }
+
+    /// Allocate one `/Link` annotation per collected line × link, in paint
+    /// order. A bookmark no placed paragraph carries, and a URI
+    /// [`sanitize_uri`] refuses, plan nothing — the text stays, unlinked.
+    pub fn plan_links(&self, alloc: &mut impl FnMut() -> Ref) -> Vec<AnnotPlan> {
+        let mut out = Vec::new();
+        for hit in &self.links {
+            let Some(span) = self
+                .sem
+                .paragraph(hit.para)
+                .and_then(|m| m.links.get(hit.link))
+            else {
+                continue;
+            };
+            let action = match &span.target {
+                LinkTarget::Uri(uri) => match sanitize_uri(uri) {
+                    Some(bytes) => LinkAction::Uri(bytes),
+                    None => continue,
+                },
+                LinkTarget::Bookmark(name) => match self.bookmark(name) {
+                    Some(p) => LinkAction::Dest(p),
+                    None => continue,
+                },
+            };
+            let text = self
+                .texts
+                .get(hit.para as usize)
+                .and_then(|t| t.get(span.start as usize..span.end as usize))
+                .unwrap_or("");
+            let text: String = text
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .filter(|&c| c != '\u{FFFC}')
+                .collect();
+            let contents = match text.trim() {
+                "" => match &span.target {
+                    LinkTarget::Uri(u) => u.trim().to_string(),
+                    LinkTarget::Bookmark(b) => b.clone(),
+                },
+                t => t.to_string(),
+            };
+            out.push(AnnotPlan {
+                id: alloc(),
+                page: hit.page,
+                rect: hit.rect,
+                contents,
+                action,
+            });
+        }
+        out
+    }
+
     /// Every heading that reached a page, in document order (source id
     /// order — the body walk that numbers paragraphs is document order).
     fn outline_entries(&self) -> Vec<OutlineEntry> {

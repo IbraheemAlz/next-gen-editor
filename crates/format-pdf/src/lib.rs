@@ -101,6 +101,18 @@
 //!   / outline level), nested by level, each `/Dest [page /XYZ left top
 //!   0]` at the laid-out paragraph's top-left (zoom `0` = keep the
 //!   viewer's), and `/PageMode /UseOutlines` — only when a heading exists.
+//! - **Links.** One `/Link` annotation per laid-out line a hyperlink
+//!   touches (a link wrapping over three lines is three annotations), its
+//!   `/Rect` the union of the link's glyph boxes on that line (pen ×
+//!   advance × line height — per glyph, so BiDi-reordered runs are
+//!   covered). External targets get a `/URI` action (7-bit ASCII,
+//!   percent-encoded; `javascript:` / `vbscript:` / `data:` are dropped —
+//!   PDF/A forbids JavaScript), internal ones (`w:anchor`) a `/Dest` at the
+//!   bookmarked paragraph's top-left; an unresolvable bookmark gets no
+//!   annotation. Every link has `/Border [0 0 0]`, `/F 4` (Print — PDF/A
+//!   requires it) and `/Contents` (the link text). PDF/X-3 writes none: a
+//!   print-exchange file has no use for interactive annotations, and
+//!   ISO 15930 restricts annotations inside the trim area.
 //!
 //! Every object it adds is allocated after the pre-#360 ones and only
 //! when the document has the feature, so an empty side table (what
@@ -150,7 +162,7 @@ pub use image::test_images;
 /// just not nameable from outside).
 pub use image::{AlphaMode, ImageColor, ImageEncoding, PreparedImage, prepare_image};
 pub use image::{ImageSkipReason, MAX_IMAGE_PIXELS};
-pub use semantic::{ParagraphSemantics, PdfSemantics};
+pub use semantic::{LinkSpan, LinkTarget, ParagraphSemantics, PdfSemantics};
 
 /// Issue #258 — the shared PDF content-stream / string-literal decoder.
 /// See the module's own doc comment for why it lives here rather than in
@@ -426,6 +438,10 @@ impl PdfExportOptions {
 ///   whose `/Dest` is `[page /XYZ left top 0]` at the laid-out
 ///   paragraph's top-left; the catalog then opens with `/PageMode
 ///   /UseOutlines`. No heading → no outline and no page mode.
+/// - **Links.** Every hyperlink range ([`ParagraphSemantics::links`])
+///   becomes one `/Link` annotation per laid-out line it touches (`/URI`
+///   or `/Dest` to a [`ParagraphSemantics::bookmarks`] paragraph); none
+///   under PDF/X-3. See the module docs.
 ///
 /// An empty `semantics` produces exactly [`export_pdf_with_media`]'s bytes.
 pub fn export_pdf_document(
@@ -589,7 +605,7 @@ pub fn export_pdf_document(
     let (contents, programs, collected) = loop {
         /* Issue #360 — a fresh collector per round: a rebuilt round
         re-reports every placement. */
-        let sem_ctx = semantic::SemCtx::new(semantics);
+        let sem_ctx = semantic::SemCtx::new(semantics, para_texts, !pdfx);
         let res = Res {
             fonts: &font_objs,
             images: &image_names,
@@ -643,6 +659,7 @@ pub fn export_pdf_document(
     has the feature, AFTER every pre-#360 object, so a document without
     it keeps its object numbering (and bytes). */
     let outline = collected.plan_outline(&mut alloc);
+    let annots = collected.plan_links(&mut alloc);
     if conformant {
         let mut hash_in: Vec<u8> = Vec::new();
         for c in &contents {
@@ -714,6 +731,15 @@ pub fn export_pdf_document(
             p.trim_box(media);
         }
         p.contents(*content_id);
+        /* Issue #360 — this page's link annotations. */
+        let page_annots: Vec<Ref> = annots
+            .iter()
+            .filter(|a| a.page == page_idx)
+            .map(|a| a.id)
+            .collect();
+        if !page_annots.is_empty() {
+            p.annotations(page_annots);
+        }
         let mut resources = p.resources();
         {
             let mut font_dict = resources.fonts();
@@ -786,9 +812,12 @@ pub fn export_pdf_document(
         write_image_xobject(&mut pdf, x);
     }
 
+    let page_ids: Vec<Ref> = page_refs.iter().map(|(p, _)| *p).collect();
     if let Some(plan) = &outline {
-        let page_ids: Vec<Ref> = page_refs.iter().map(|(p, _)| *p).collect();
         plan.write(&mut pdf, &page_ids);
+    }
+    for annot in &annots {
+        annot.write(&mut pdf, &page_ids, None);
     }
 
     out.extend_from_slice(&pdf.finish());

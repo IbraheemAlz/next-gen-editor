@@ -113,6 +113,34 @@ fn pdf_text(pdf: &[u8]) -> String {
     String::from_utf8_lossy(pdf).into_owned()
 }
 
+/// The semantic sample documents, by name.
+fn sample_docs() -> Vec<(&'static str, DocumentTree)> {
+    vec![("links", linked_doc())]
+}
+
+/// Local veraPDF probe: every [`sample_docs`] document × {1b, 2u, x3}
+/// into `$PDF_SEMANTICS_OUT/<profile>/<name>.pdf`.
+#[test]
+#[ignore]
+fn write_semantics_samples() {
+    let Ok(out) = std::env::var("PDF_SEMANTICS_OUT") else {
+        eprintln!("PDF_SEMANTICS_OUT unset — nothing written");
+        return;
+    };
+    for (label, profile) in [
+        ("1b", format_pdf::PdfProfile::A1b),
+        ("2u", format_pdf::PdfProfile::A2u),
+        ("x3", format_pdf::PdfProfile::X3),
+    ] {
+        let dir = std::path::Path::new(&out).join(label);
+        std::fs::create_dir_all(&dir).expect("out dir");
+        for (name, doc) in sample_docs() {
+            let pdf = export(&engine_with(doc), profile);
+            std::fs::write(dir.join(format!("{name}.pdf")), &pdf).expect("write pdf");
+        }
+    }
+}
+
 /* ================================================================
 Task 1 — outline from `Heading N` paragraphs.
 ================================================================ */
@@ -156,4 +184,97 @@ fn a_document_without_headings_has_no_outline() {
     let pdf = pdf_text(&export(&engine, format_pdf::PdfProfile::A1b));
     assert!(!pdf.contains("/Outlines"));
     assert!(!pdf.contains("/PageMode"));
+}
+
+/* ================================================================
+Task 2 — hyperlinks become link annotations.
+================================================================ */
+
+fn link(start: u32, end: u32, target: &str) -> engine::Hyperlink {
+    engine::Hyperlink {
+        start,
+        end,
+        target: target.into(),
+        attrs: Vec::new(),
+    }
+}
+
+/// "See example.com or the appendix." — an external link over
+/// "example.com" and an internal one over "appendix" → `_Toc42`, whose
+/// heading sits on page 2.
+fn linked_doc() -> DocumentTree {
+    let text = "See example.com or the appendix.\u{000C}";
+    let body = engine::Paragraph {
+        text: text.into(),
+        hyperlinks: vec![link(4, 15, "https://example.com/"), link(23, 31, "#_Toc42")],
+        ..Default::default()
+    };
+    let target = engine::Paragraph {
+        text: "Appendix".into(),
+        style_id: Some("Heading1".into()),
+        bookmarks: vec![engine::Bookmark {
+            name: "_Toc42".into(),
+            id: None,
+        }],
+        ..Default::default()
+    };
+    doc_of(vec![
+        engine::Block::Paragraph(body),
+        engine::Block::Paragraph(target),
+    ])
+}
+
+#[test]
+fn hyperlinks_become_uri_and_dest_annotations() {
+    let engine = engine_with(linked_doc());
+    for profile in [format_pdf::PdfProfile::A1b, format_pdf::PdfProfile::A2u] {
+        let pdf = pdf_text(&export(&engine, profile));
+        assert_eq!(pdf.matches("/Subtype /Link").count(), 2, "{profile:?}");
+        assert!(pdf.contains("/URI (https://example.com/)"), "{profile:?}");
+        assert!(pdf.contains("/Contents (example.com)"), "{profile:?}");
+        assert!(pdf.contains("/Contents (appendix)"), "{profile:?}");
+        /* The internal link lands on the heading's page — the same page
+        object the outline entry for "Appendix" names. */
+        let outline = pdf.find("/Title (Appendix)").expect("outline entry");
+        let o = outline + pdf[outline..].find("/Dest [").unwrap() + 7;
+        let heading_page = pdf[o..].split_whitespace().next().unwrap();
+        let annot = pdf.find("/Contents (appendix)").expect("annot");
+        let obj = &pdf[annot..annot + pdf[annot..].find("endobj").unwrap()];
+        assert!(
+            obj.contains(&format!("/Dest [{heading_page} 0 R /XYZ")),
+            "{profile:?}: {obj}"
+        );
+    }
+    /* PDF/X-3: no annotations. */
+    let x3 = pdf_text(&export(&engine, format_pdf::PdfProfile::X3));
+    assert!(!x3.contains("/Annots"));
+}
+
+#[test]
+fn toc_hyperlink_entries_jump_to_their_headings() {
+    let mut engine = engine_with(doc_of(vec![
+        styled("Introduction", Some("Heading1")),
+        styled("Intro body.\u{000C}", None),
+        styled("Background", Some("Heading2")),
+    ]));
+    let switches = bridge::TocSwitches {
+        outline_min: 1,
+        outline_max: 3,
+        hyperlinks: true,
+        hide_in_web: true,
+        use_outline_levels: true,
+        page_numbers: true,
+    };
+    let evt = engine.do_insert_toc(bpos_top(0, 0), switches);
+    assert!(!matches!(evt, Event::Error { .. }), "InsertToc: {evt:?}");
+    let evt = engine.do_update_fields();
+    assert!(!matches!(evt, Event::Error { .. }), "UpdateFields: {evt:?}");
+    let pdf = pdf_text(&export(&engine, format_pdf::PdfProfile::A2u));
+    let links = pdf.matches("/Subtype /Link").count();
+    assert!(links >= 2, "one link per TOC entry line: {links}");
+    assert!(!pdf.contains("/S /URI"), "TOC links are internal");
+    assert!(
+        pdf.matches("/Dest [").count() >= links,
+        "every link has a /Dest"
+    );
 }

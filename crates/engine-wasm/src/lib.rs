@@ -10428,14 +10428,20 @@ impl Engine {
         source text. */
         let doc = self.undo.current();
         let mut para_texts: Vec<&str> = Vec::new();
-        /* Issue #360 — the semantic side table (headings → outline) is
-        indexed like `para_texts`: every walk below runs beside the
-        matching `walk_block_texts`; stories that carry no semantics are
-        padded with defaults. */
+        /* Issue #360 — the semantic side table (headings → outline,
+        hyperlinks + bookmarks → link annotations) is indexed like
+        `para_texts`: every walk below runs beside the matching
+        `walk_block_texts`; stories that carry no semantics (header /
+        footer bands, text boxes) are padded with defaults. */
         let mut semantics = format_pdf::PdfSemantics::default();
         for b in doc.blocks.iter() {
             walk_block_texts(b, &mut para_texts);
-            pdf_semantics::walk_block_semantics(doc, b, &mut semantics.paragraphs);
+            pdf_semantics::walk_block_semantics(
+                doc,
+                b,
+                pdf_semantics::Story::Body,
+                &mut semantics.paragraphs,
+            );
         }
         /* Issue #71 — band paragraphs join the SAME table: per
         referenced part (headers rid-sorted, then footers — the
@@ -10503,8 +10509,19 @@ impl Engine {
                     }
                     _ => continue,
                 }
+                /* Issue #360 — header / footer entries (artifacts, no
+                semantics) pad the side table up to this story's base. */
+                semantics
+                    .paragraphs
+                    .resize_with(para_texts.len(), Default::default);
                 for b in &story.body {
                     walk_block_texts(b, &mut para_texts);
+                    pdf_semantics::walk_block_semantics(
+                        doc,
+                        b,
+                        pdf_semantics::Story::Note,
+                        &mut semantics.paragraphs,
+                    );
                 }
             }
         }
