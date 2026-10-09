@@ -861,6 +861,7 @@ fn build_marker(
             },
         },
         width,
+        text: text.to_string(),
     })
 }
 

@@ -210,10 +210,11 @@ D5.10 are external/human sign-offs, not code.
   (their heavier fixtures blew the runner's time cap — run them locally or
   on a nightly schedule). Issue #258 added `tools/pdf-validate --corpus
   tier-a --profile 1b` to the same job (~9 s locally for all 6 documents,
-  reusing the wasm build the visual-diff step already needs) — veraPDF
-  itself is not installed on the runner, so only the structural PDF/A
-  marker check runs there; the full veraPDF conformance gate is local-only
-  (`node tools/pdf-validate/run.mjs`). The Playwright e2e suite (`ts/e2e/`)
+  reusing the wasm build the visual-diff step already needs). Issue #393
+  installs veraPDF 1.30.2 on the runner (pinned official installer zip +
+  SHA-256, headless IzPack install into `~/verapdf`, `actions/cache`d), so
+  both pdf-validate steps run the real conformance checks under `--strict`
+  (a missing veraPDF fails instead of skipping). The Playwright e2e suite (`ts/e2e/`)
   became a **blocking** `e2e` job later, issue #230 — see the Validation
   section.
 
@@ -305,6 +306,8 @@ Engine backlog" references a real issue.
 ## Validation (CI gates, all -D warnings)
 
 - `cargo fmt --all -- --check` clean.
+- `cargo fmt --manifest-path fuzz/Cargo.toml -- --check` clean (issue #412 —
+  `fuzz/` is its own workspace, so `--all` does not reach it).
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo test --workspace` (native unit tests), **plus** `cargo test -p
   engine-wasm --features fuzz-native` (issue #321): the bridge-level tests
@@ -350,9 +353,12 @@ Engine backlog" references a real issue.
   budget + `wasm-pack test` + the `engine-wasm-pkg` artifact upload),
   `e2e` (this suite, issue #230). Non-blocking (`continue-on-error: true`):
   `qa-harness` runs `tools/visual-diff --tier A` (capped at 3 min) then
-  `tools/pdf-validate --corpus tier-a --profile 1b` (issue #258, capped at
-  1 min; structural-only on this runner — no veraPDF installed) — the whole
-  job stays non-blocking because golden pixel-reproducibility on the GitHub
+  `tools/pdf-validate --corpus tier-a --profile 1b --strict` (issue #258,
+  capped at 1 min; real veraPDF 1.30.2 since issue #393) then
+  `tools/pdf-validate --native --strict` (issue #393, browserless Rust
+  export of the Latin + Arabic CFF / TrueType fixtures, capped at 2 min;
+  its `cargo test -p format-pdf --lib --no-run` pre-build is a separate
+  uncapped step) — the whole job stays non-blocking because golden pixel-reproducibility on the GitHub
   runner's Chrome is still unproven across machines. `tools/memory-profile`
   and `tools/perf` are **not** wired into `ci.yml` at all — the heavier
   fixtures (100p/250p/500p) blew the runner's time cap; run them locally

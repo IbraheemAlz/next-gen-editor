@@ -31,7 +31,16 @@
 //! [`DEFAULT_LAYOUT_BUDGET_MS`]): a layout still running past it reports
 //! `outcome: "timeout"`, `stage: "engine_layout"` with every other column
 //! intact, instead of stalling the run until `--timeout-secs` kills the
-//! worker. `--no-engine-layout` skips the stage; `--time` prints one
+//! worker.
+//!
+//! Issue #418 — the budget is **CPU time** (`getrusage`), not wall clock: a
+//! loaded machine stretches wall time but not the CPU a layout needs, so
+//! it no longer produces false timeouts (a wall-clock backstop of 8x the
+//! budget still ends a layout that blocks without burning CPU). The record
+//! carries both `engine_layout_cpu_ms` and `engine_layout_wall_ms`. A
+//! document that times out is run once more, alone, and recorded as
+//! `timeout` only if the retry times out too (`timeout_retry` holds the
+//! first attempt; `recovered: true` means the first timeout was noise). `--no-engine-layout` skips the stage; `--time` prints one
 //! timing line per document and the slowest production layouts at the
 //! end.
 //!
@@ -330,17 +339,35 @@ fn signal_name(sig: i32) -> &'static str {
 /// Recursively collect every `*.docx` path under `root`, sorted for
 /// deterministic run order (bisecting a regression across two runs relies
 /// on stable ordering).
+///
+/// Issue #421 — symlinks are followed (a corpus assembled from symlinks to
+/// `/data/corpus/files` subsets is the natural way to select a slice): the
+/// entry type comes from `fs::metadata` (which resolves the link), not
+/// `DirEntry::file_type` (which reports the link itself). A symlinked
+/// directory is descended too, guarded against loops by the set of
+/// canonical directories already walked (a link back up the tree, or two
+/// links to one directory, is walked once). A dangling link is skipped.
+/// Files keep the path they were reached through, so the JSONL label is the
+/// name in the corpus dir, not the link target.
 fn collect_docx_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    visited.insert(std::fs::canonicalize(root)?);
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue; // dangling symlink / vanished entry
+            };
+            if meta.is_dir() {
+                if let Ok(real) = std::fs::canonicalize(&path)
+                    && visited.insert(real)
+                {
+                    stack.push(path);
+                } // else: a directory already walked (symlink loop / alias)
+            } else if meta.is_file()
                 && path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -467,6 +494,8 @@ fn main() -> ExitCode {
     documents that blew the budget, and a degradation-reason histogram. */
     let mut engine_times: Vec<(u128, String)> = Vec::new();
     let mut engine_over_budget: Vec<String> = Vec::new();
+    /* Issue #418 — first-attempt timeouts that the lone retry cleared. */
+    let mut timeouts_recovered = 0usize;
     let mut engine_reasons: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     /* Issue #355 — theme-font resolution: documents with a theme part,
@@ -486,7 +515,29 @@ fn main() -> ExitCode {
             .replace('\\', "/");
         let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-        let rec = run_in_subprocess(&exe, path, &label, size_bytes, timeout, &args);
+        let mut rec = run_in_subprocess(&exe, path, &label, size_bytes, timeout, &args);
+        /* Issue #418 — a timeout under machine load says little about the
+        document (two different documents "timed out" at load 30-60 and lay
+        out in 2-3.5 s alone). Run it once more, alone - the driver is
+        serial, so nothing of ours competes - and record `timeout` only if
+        that attempt times out too. The first attempt's numbers ride along
+        in `timeout_retry`. */
+        if rec.outcome == pipeline::Outcome::Timeout {
+            let first = pipeline::TimeoutRetry {
+                first_stage: rec.stage.clone(),
+                first_wall_ms: rec.engine_layout_wall_ms,
+                first_cpu_ms: rec.engine_layout_cpu_ms,
+                recovered: false,
+            };
+            eprintln!("[corpus-native] {label}: timeout, retrying once alone");
+            let mut second = run_in_subprocess(&exe, path, &label, size_bytes, timeout, &args);
+            let recovered = second.outcome != pipeline::Outcome::Timeout;
+            second.timeout_retry = Some(pipeline::TimeoutRetry { recovered, ..first });
+            if recovered {
+                timeouts_recovered += 1;
+            }
+            rec = second;
+        }
         match rec.outcome {
             pipeline::Outcome::Ok => ok += 1,
             pipeline::Outcome::Error => errors += 1,
@@ -513,9 +564,10 @@ fn main() -> ExitCode {
             let ms = |v: Option<u128>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
             eprintln!(
                 "[corpus-native] time {label}: outcome={:?} engine_layout_ms={} \
-                 engine_pages={} reduced_layout_ms={} elapsed_ms={}",
+                 engine_layout_cpu_ms={} engine_pages={} reduced_layout_ms={} elapsed_ms={}",
                 rec.outcome,
                 ms(rec.engine_layout_ms),
+                ms(rec.engine_layout_cpu_ms),
                 rec.engine_page_count
                     .map_or_else(|| "-".to_string(), |v| v.to_string()),
                 ms(rec.layout_ms),
@@ -691,13 +743,13 @@ fn main() -> ExitCode {
         let total: u128 = engine_times.iter().map(|(ms, _)| ms).sum();
         println!(
             "[corpus-native] production layout (#318): {} laid out, {total} ms total, \
-             {} over the {} ms budget",
+             {} over the {} ms CPU budget (#418)",
             engine_times.len(),
             engine_over_budget.len(),
             args.engine.budget.as_millis()
         );
         for label in &engine_over_budget {
-            println!("[corpus-native]   over budget: {label}");
+            println!("[corpus-native]   over budget (confirmed on retry): {label}");
         }
         if args.time {
             for (ms, label) in engine_times.iter().take(10) {
@@ -711,6 +763,63 @@ fn main() -> ExitCode {
             }
         }
     }
+    println!("[corpus-native] timeouts cleared by the lone retry (#418): {timeouts_recovered}");
     println!("[corpus-native] JSONL written to {}", args.out.display());
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #421 — a corpus dir made of symlinks (to files, to a
+    /// directory, a loop back up the tree, a dangling link) yields the
+    /// `.docx` files, each once per link, and terminates.
+    #[cfg(unix)]
+    #[test]
+    fn collect_docx_files_follows_symlinks_with_a_loop_guard() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "corpus-native-symlinks-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let sub = real.join("sub");
+        let corpus = base.join("corpus");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(real.join("a.docx"), b"a").unwrap();
+        std::fs::write(sub.join("b.DOCX"), b"b").unwrap();
+        std::fs::write(real.join("notes.txt"), b"x").unwrap();
+        // File symlinks, one with a non-docx target name but docx link name.
+        symlink(real.join("a.docx"), corpus.join("link-a.docx")).unwrap();
+        symlink(sub.join("b.DOCX"), corpus.join("link-b.docx")).unwrap();
+        // A link to a .txt named .docx still counts by the link's name.
+        symlink(real.join("notes.txt"), corpus.join("not-a-doc.txt")).unwrap();
+        // A directory symlink, and a loop back to the corpus root.
+        symlink(&sub, corpus.join("dirlink")).unwrap();
+        symlink(&corpus, sub.join("loop")).unwrap();
+        symlink(&corpus, corpus.join("self")).unwrap();
+        // Dangling.
+        symlink(base.join("missing.docx"), corpus.join("dangling.docx")).unwrap();
+
+        let found = collect_docx_files(&corpus).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&corpus)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["dirlink/b.DOCX", "link-a.docx", "link-b.docx"],
+            "found {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
