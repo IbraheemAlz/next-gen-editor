@@ -8,6 +8,7 @@
 pub mod anchor_patch;
 pub mod block_envelope;
 pub mod comment_anchors;
+pub(crate) mod ct_pbdr;
 pub mod ct_ppr;
 pub mod ct_rpr;
 pub mod ct_tbl;

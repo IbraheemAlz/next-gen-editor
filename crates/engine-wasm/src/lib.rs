@@ -28343,6 +28343,9 @@ mod nested_table_tests;
 mod part_media_tests;
 #[cfg(test)]
 mod pbdr_start_end_tests;
+/// Issue #395 — paragraph borders defined on styles, on canvas.
+#[cfg(test)]
+mod pbdr_style_cascade_tests;
 
 #[cfg(test)]
 mod block_remap_tests;

@@ -566,6 +566,14 @@ pub struct DocResult {
     /// when the read failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme_fonts: Option<ThemeFontCensus>,
+    /// Issues #325 / #394 — the parts the reader re-prefixed into the
+    /// canonical namespace spelling (`DocxWarning::NonCanonicalNamespaces`
+    /// with `normalized`): each is regenerate-only, so its zero-edit save
+    /// re-emits the normalised bytes, not the source's — a fidelity cost
+    /// the sibling / `document.xml` identity columns (which compare the
+    /// archive as read) do not show. Empty for canonical packages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normalized_parts: Vec<String>,
 }
 
 /// Issue #355 — theme-font resolution over every paragraph (body, table
@@ -726,6 +734,7 @@ impl DocResult {
             engine_fingerprint: None,
             theme_fonts: None,
             engine_degradations: Vec::new(),
+            normalized_parts: Vec::new(),
         }
     }
 
@@ -874,6 +883,18 @@ pub fn run_one(
     let archive_a: DocxArchive = stage!("read_docx_1", format_docx::read_docx(bytes));
     rec.paragraph_count = Some(archive_a.document.paragraph_count());
     rec.theme_fonts = Some(ThemeFontCensus::of(&archive_a.document));
+    rec.normalized_parts = archive_a
+        .warnings
+        .iter()
+        .filter_map(|w| match w {
+            format_docx::DocxWarning::NonCanonicalNamespaces {
+                part,
+                normalized: true,
+                ..
+            } => Some(part.clone()),
+            _ => None,
+        })
+        .collect();
 
     /* 2. Full layout (native — `crates/layout`, no browser). */
     let layout_t0 = Instant::now();

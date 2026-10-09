@@ -15,10 +15,9 @@ use crate::error::{DocxError, DocxWarning};
 use crate::parts::table::parse_table_bytes_with_events;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
+use crate::schema::ct_pbdr::{PbdrLogical, apply_pbdr_edge};
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
-use crate::schema::ct_rpr::{
-    apply_rpr, attr_val, fold_rpr_fragment, mark_rpr_style, rpr_child_is_modeled,
-};
+use crate::schema::ct_rpr::{apply_rpr, attr_val, mark_rpr_style, rpr_child_is_modeled};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
@@ -774,115 +773,6 @@ fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
     }
 }
 
-/// Audit gap A.M4 — parse one `<w:pBdr>` per-edge child into the
-/// matching `CellBorders` slot. Reuses the table-border parser via
-/// `parse_border_stroke` on `<w:top w:val w:sz w:color>`. Unknown
-/// edge names are silently ignored — defensive against future spec
-/// extensions.
-pub(crate) fn apply_pbdr_edge(
-    name: &[u8],
-    e: &quick_xml::events::BytesStart,
-    props: &mut engine::ParaProperties,
-) {
-    let stroke = parse_border_stroke(e);
-    if stroke.is_none() {
-        return;
-    }
-    let borders = props
-        .borders
-        .get_or_insert_with(engine::CellBorders::default);
-    match name {
-        b"w:top" => borders.top = stroke,
-        b"w:left" => borders.left = stroke,
-        b"w:bottom" => borders.bottom = stroke,
-        b"w:right" => borders.right = stroke,
-        b"w:between" => {
-            /* `<w:between>` is the "inside-horizontal" border between
-            consecutive same-pBdr paragraphs. The engine has no
-            multi-paragraph border collapse yet — store on `inside_h`
-            for round-trip; renderer ignores it. */
-            borders.inside_h = stroke;
-        }
-        _ => {}
-    }
-}
-
-/// Issue #352 — the logical `<w:start>` / `<w:end>` edges of a `<w:pBdr>`
-/// (ISO 29500; ECMA-376 2nd ed. and later accept them in Transitional
-/// too), collected during the parse and mapped to a physical side only
-/// once the paragraph's direction is final.
-#[derive(Default)]
-pub(crate) struct PbdrLogical {
-    start: Option<engine::BorderStroke>,
-    end: Option<engine::BorderStroke>,
-    /// The element was present (even with `w:val="none"`): the source
-    /// spelled that edge logically.
-    start_seen: bool,
-    end_seen: bool,
-}
-
-impl PbdrLogical {
-    /// Take `<w:start>` / `<w:end>`; `false` for every other edge name
-    /// (the caller then applies the physical-edge path).
-    pub(crate) fn accept(&mut self, name: &[u8], e: &quick_xml::events::BytesStart) -> bool {
-        match name {
-            b"w:start" => {
-                self.start = parse_border_stroke(e);
-                self.start_seen = true;
-                true
-            }
-            b"w:end" => {
-                self.end = parse_border_stroke(e);
-                self.end_seen = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Land the collected edges on `props` (the resolved paragraph
-    /// properties) and `overrides` (the direct pPr kept for a later
-    /// re-cascade): start = left in a left-to-right paragraph and right
-    /// in a right-to-left one, end the opposite. The spelling flags record
-    /// which edges the source wrote logically, for the writer.
-    pub(crate) fn fold_into(
-        self,
-        props: &mut engine::ParaProperties,
-        overrides: &mut engine::ParaProperties,
-    ) {
-        if !self.start_seen && !self.end_seen {
-            return;
-        }
-        let rtl = props.direction == Some(engine::TextDirection::Rtl);
-        for target in [props, overrides] {
-            if self.start.is_some() {
-                let borders = target
-                    .borders
-                    .get_or_insert_with(engine::CellBorders::default);
-                let slot = if rtl {
-                    &mut borders.right
-                } else {
-                    &mut borders.left
-                };
-                *slot = self.start.clone();
-            }
-            if self.end.is_some() {
-                let borders = target
-                    .borders
-                    .get_or_insert_with(engine::CellBorders::default);
-                let slot = if rtl {
-                    &mut borders.left
-                } else {
-                    &mut borders.right
-                };
-                *slot = self.end.clone();
-            }
-            target.border_spelling.start |= self.start_seen;
-            target.border_spelling.end |= self.end_seen;
-        }
-    }
-}
-
 /// Audit gap A.M3 — parse one `<w:tab w:val w:pos/>` child.
 /// `w:val` defaults to `left`; `w:pos` is twips (signed integer per
 /// spec). Returns `None` for malformed entries (missing pos) so they
@@ -904,40 +794,6 @@ pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine
         leader: attr_val(e, b"w:leader")
             .map(|v| engine::TabLeader::from_ooxml(&v))
             .unwrap_or_default(),
-    })
-}
-
-/// Audit gap A.M4 — parse `<w:top|left|bottom|right|between
-/// w:val w:sz w:color w:space/>` into a `BorderStroke`. Mirrors the
-/// table-cell border parser semantics; `w:val="none"` returns `None`
-/// so the edge stays absent in the engine model.
-fn parse_border_stroke(e: &quick_xml::events::BytesStart) -> Option<engine::BorderStroke> {
-    use crate::schema::ct_rpr::{attr_val, parse_hex_color};
-    let val = attr_val(e, b"w:val")?.trim().to_ascii_lowercase();
-    if val == "none" || val == "nil" {
-        return None;
-    }
-    let style = match val.as_str() {
-        "single" => engine::BorderStyle::Single,
-        "double" => engine::BorderStyle::Double,
-        "dotted" => engine::BorderStyle::Dotted,
-        "dashed" => engine::BorderStyle::Dashed,
-        other => engine::BorderStyle::Other(other.to_string()),
-    };
-    let size_eighth_pt: u16 = attr_val(e, b"w:sz")
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(4);
-    let color = attr_val(e, b"w:color").and_then(|v| {
-        if v.trim().eq_ignore_ascii_case("auto") {
-            None
-        } else {
-            parse_hex_color(&v)
-        }
-    });
-    Some(engine::BorderStroke {
-        style,
-        size_eighth_pt,
-        color,
     })
 }
 
@@ -1427,13 +1283,13 @@ pub(crate) fn parse_document_xml_with_events(
     /* Per-paragraph parser state. */
     let mut p_style_id: Option<String> = None;
     let mut direct_ppr = ParaProperties::default();
-    let mut pmark_rpr = SpanStyle::default();
     /* Issues #262 / #303 — the tracked changes on the paragraph mark
     (`<w:pPr><w:rPr><w:ins/><w:del/>`), lifted out of the mark's rPr grab
     bag. */
     let mut para_mark_revisions: Vec<engine::Revision> = Vec::new();
     /* Issue #293 — the paragraph mark's modeled run properties (the
-    `<w:pPr><w:rPr>` fragment the bag carries, folded). */
+    `<w:pPr><w:rPr>` fragment the bag carries, folded). Issue #369 — they
+    format the pilcrow only: they never seed the paragraph's runs. */
     let mut para_mark_style: Option<Box<SpanStyle>> = None;
     /* Phase 4 — `<w:numPr>/<w:numId>` + `<w:ilvl>` accumulators. We don't
     inherit either field from a paragraph style here; that's a separate
@@ -1889,7 +1745,6 @@ pub(crate) fn parse_document_xml_with_events(
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pbdr_logical = PbdrLogical::default();
-                        pmark_rpr = SpanStyle::default();
                         para_mark_revisions.clear();
                         para_mark_style = None;
                     }
@@ -1904,15 +1759,14 @@ pub(crate) fn parse_document_xml_with_events(
                     }
                     b"w:rPr" if in_ppr && !in_run => {
                         /* Issue #84 — paragraph-mark run properties
-                        (`<w:pPr>/<w:rPr>`). The writer never regenerates
-                        this element, so the WHOLE subtree rides the
-                        paragraph's grab bag verbatim; its modeled children
-                        still seed the run baseline (`pmark_rpr`) exactly
-                        as before via `fold_rpr_fragment`, which also
-                        stops a nested `<w:rPrChange>/<w:rPr>` history from
-                        overriding the live formatting. */
+                        (`<w:pPr>/<w:rPr>`). The WHOLE subtree rides the
+                        paragraph's grab bag verbatim. Issue #369 — Word
+                        applies them to the paragraph mark (the pilcrow)
+                        only, never to the paragraph's runs, so they are
+                        modeled as `Paragraph::mark_style` alone (#293:
+                        typing into an EMPTY paragraph inherits them) and
+                        no longer folded into every run's span style. */
                         if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
-                            fold_rpr_fragment(&frag, &mut pmark_rpr);
                             /* Issues #262 / #303 — the mark's tracked
                             changes are modeled (`Paragraph::mark_revisions`,
                             all of them); the bag keeps the rest and the
@@ -2129,7 +1983,7 @@ pub(crate) fn parse_document_xml_with_events(
                             if n == b"w:rPrChange" {
                                 run_format_change =
                                     Some(crate::parts::format_change::format_change_revision(
-                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                        &e, &frag, &ns, resolver,
                                     ));
                             }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
@@ -2257,11 +2111,8 @@ pub(crate) fn parse_document_xml_with_events(
                         let end = reader.buffer_position() as usize;
                         envelopes.note_block_start(prev_pos);
                         let source_xml = slice_element(xml, prev_pos, end, b"w:p");
-                        let (props, _) = resolver.resolve_paragraph(
-                            None,
-                            ParaProperties::default(),
-                            SpanStyle::default(),
-                        );
+                        let (props, _) =
+                            resolver.resolve_paragraph(None, ParaProperties::default());
                         let list_item = props.list_item;
                         markup.open_paragraph(&e, &ns, end);
                         let source_markup = markup.finish(0, &props, &None, list_item);
@@ -2631,7 +2482,7 @@ pub(crate) fn parse_document_xml_with_events(
                             if n == b"w:rPrChange" {
                                 run_format_change =
                                     Some(crate::parts::format_change::format_change_revision(
-                                        &e, &frag, &ns, resolver, &pmark_rpr,
+                                        &e, &frag, &ns, resolver,
                                     ));
                             }
                             stash(&mut direct_rpr.grab_bag, frag, &ns);
@@ -3042,17 +2893,20 @@ pub(crate) fn parse_document_xml_with_events(
                             continue;
                         }
                         /* Issue #29 — spans carry only what the STYLE TABLE
-                        cannot re-derive: paragraph-mark rPr + character-style
-                        chain + direct rPr. The docDefaults <w:rPr> and the
-                        pStyle-chain <w:rPr> are deliberately NOT baked here —
-                        the engine folds them at span-materialize time
+                        cannot re-derive: character-style chain + direct
+                        rPr. The docDefaults <w:rPr> and the pStyle-chain
+                        <w:rPr> are deliberately NOT baked here — the engine
+                        folds them at span-materialize time
                         (`build_style_spans`), which is what lets ModifyStyle
                         re-cascade loaded documents and stops dirty-paragraph
                         saves from writing style-derived props as direct
-                        formatting. Final precedence is unchanged:
-                        defaults → pStyle chain → pmark → rStyle → direct. */
+                        formatting. Final precedence:
+                        defaults → pStyle chain → rStyle → direct. Issue
+                        #369 — the paragraph mark's `<w:pPr><w:rPr>` is NOT
+                        in this cascade: Word formats only the pilcrow with
+                        it (`Paragraph::mark_style`). */
                         let mut style = resolver.resolve_run(
-                            pmark_rpr.clone(),
+                            SpanStyle::default(),
                             r_style_id.as_deref(),
                             direct_rpr.clone(),
                         );
@@ -3111,20 +2965,18 @@ pub(crate) fn parse_document_xml_with_events(
                         the originals to produce the up-front resolved
                         view; we clone before consumption. */
                         let style_id_for_paragraph = p_style_id.clone();
-                        let mut direct_overrides_for_paragraph = direct_ppr.clone();
+                        /* Issues #352 / #395 — logical `<w:start>` /
+                        `<w:end>` border edges join the direct pPr by its
+                        OWN direction; the cascade turns them to the side
+                        the RESOLVED direction names. */
+                        std::mem::take(&mut pbdr_logical).fold_into(&mut direct_ppr);
+                        let direct_overrides_for_paragraph = direct_ppr.clone();
                         /* Paragraph cascade: bake direct_ppr on top of doc
-                        defaults + pStyle chain. The baseline rPr we computed
-                        per-run is informational here. */
-                        let (mut props, _) = resolver.resolve_paragraph(
+                        defaults + pStyle chain. */
+                        let (props, _) = resolver.resolve_paragraph(
                             p_style_id.take().as_deref(),
                             std::mem::take(&mut direct_ppr),
-                            std::mem::take(&mut pmark_rpr),
                         );
-                        /* Issue #352 — logical `<w:start>` / `<w:end>`
-                        border edges land on the physical side the
-                        RESOLVED direction names. */
-                        std::mem::take(&mut pbdr_logical)
-                            .fold_into(&mut props, &mut direct_overrides_for_paragraph);
                         /* Compose `ListItem` from the per-paragraph numPr
                         accumulators; partial refs (numId without ilvl, or
                         vice versa) default the missing field to 0 — Word
