@@ -10,6 +10,7 @@
 
 use crate::error::{DocxError, DocxWarning};
 use crate::numbering_resolver::resolve_markers_blocks;
+use crate::opc::part_names::{PartNames, rels_entry_name, target_candidates};
 use crate::parts::comments::{parse_comments_extended_xml, parse_comments_xml};
 use crate::parts::document::parse_document_xml_with_warnings;
 use crate::parts::endnotes::parse_endnotes_xml;
@@ -62,6 +63,10 @@ pub struct DocxArchive {
     /// `parts::table::MAX_TABLE_NESTING_DEPTH` kept as an opaque block).
     /// Empty when the whole part landed in the typed model.
     pub warnings: Vec<DocxWarning>,
+    /// Issue #353 — where the main part and its special siblings live,
+    /// discovered from the package's relationships (fixed `word/…` names
+    /// are the fallback). The writer uses these, never the constants.
+    pub part_names: PartNames,
 }
 
 /// Issue #110 — strict well-formedness check of a saved package's
@@ -78,7 +83,27 @@ pub struct DocxArchive {
 /// that forgot to re-declare `xmlns:w14` is well-formed XML 1.0 but NOT
 /// namespace-well-formed, and Word refuses (or "repairs") the file.
 pub fn check_document_xml_well_formed(docx: &[u8]) -> Result<(), DocxError> {
-    check_part_xml_well_formed(docx, DOC_XML)
+    /* Issue #353 — the main part is whatever `_rels/.rels` says. */
+    let main = main_part_name(docx).unwrap_or_else(|| DOC_XML.to_string());
+    check_part_xml_well_formed(docx, &main)
+}
+
+/// Issue #353 — the main part's entry name in a packaged `.docx`
+/// (`_rels/.rels` → `officeDocument`), `None` when it cannot be resolved
+/// to an entry the archive holds.
+pub fn main_part_name(docx: &[u8]) -> Option<String> {
+    let mut archive = ZipArchive::new(Cursor::new(docx)).ok()?;
+    let mut rels = Vec::new();
+    archive
+        .by_name("_rels/.rels")
+        .ok()?
+        .read_to_end(&mut rels)
+        .ok()?;
+    let entries = vec![("_rels/.rels".to_string(), rels)];
+    let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+    PartNames::discover(&entries, &|n| names.iter().any(|e| e == n), &mut Vec::new())
+        .ok()
+        .map(|p| p.main)
 }
 
 /// [`check_document_xml_well_formed`] for any XML part of the package
@@ -252,36 +277,46 @@ pub fn read_docx_with_settings(
     widow_control_default: bool,
 ) -> Result<DocxArchive, DocxError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
-    let mut other_entries: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut document_xml: Option<Vec<u8>> = None;
-
+    let mut all_entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         let name = file.name().to_owned();
         let mut buf = Vec::with_capacity(file.size() as usize);
         file.read_to_end(&mut buf)?;
-        if name == DOC_XML {
-            document_xml = Some(buf);
-        } else {
-            other_entries.push((name, buf));
-        }
+        all_entries.push((name, buf));
     }
 
-    let xml = document_xml.ok_or_else(|| DocxError::MissingEntry(DOC_XML.into()))?;
+    let mut warnings: Vec<DocxWarning> = Vec::new();
+    /* Issue #353 — the main part and its siblings come from the package's
+    relationships (fixed `word/…` names are the fallback). */
+    let part_names = PartNames::discover(
+        &all_entries,
+        &|n| all_entries.iter().any(|(e, _)| e == n),
+        &mut warnings,
+    )?;
+    let main_at = all_entries
+        .iter()
+        .position(|(n, _)| *n == part_names.main)
+        .ok_or_else(|| DocxError::MissingEntry(part_names.main.clone()))?;
+    let (_, xml) = all_entries.remove(main_at);
+    let mut other_entries = all_entries;
+    other_entries.shrink_to_fit();
+    /* Issue #325 — validate the root's namespace bindings; a non-canonical
+    spelling is normalised (regenerate-only) instead of reading empty. */
+    let xml = canonical_main_part(xml, &mut warnings);
 
     /* Phase 3 — `word/styles.xml` rides the pass-through but feeds the
     cascade resolver. Absent or malformed → empty table (all paragraphs
     just see direct formatting; behaviour matches pre-Phase-3). */
     let style_table: StyleTable = match other_entries
         .iter()
-        .find(|(n, _)| n == STYLES_XML)
+        .find(|(n, _)| *n == part_names.styles)
         .map(|(_, b)| parse_styles_xml(b))
     {
         Some(Ok(t)) => t,
         _ => StyleTable::default(),
     };
     let resolver = StyleResolver::new(&style_table);
-    let mut warnings: Vec<DocxWarning> = Vec::new();
     let mut document = parse_document_xml_with_warnings(
         &xml,
         &resolver,
@@ -296,7 +331,7 @@ pub fn read_docx_with_settings(
     list paragraph's `resolved_marker`. */
     let numbering: NumberingDefinitions = match other_entries
         .iter()
-        .find(|(n, _)| n == NUMBERING_XML)
+        .find(|(n, _)| *n == part_names.numbering)
         .map(|(_, b)| parse_numbering_xml(b))
     {
         Some(Ok(t)) => t,
@@ -325,14 +360,14 @@ pub fn read_docx_with_settings(
     to an empty band so a partial archive still renders. */
     let rels = other_entries
         .iter()
-        .find(|(n, _)| n == RELS_XML)
+        .find(|(n, _)| *n == part_names.main_rels)
         .and_then(|(_, b)| parse_rels_xml(b).ok())
         .unwrap_or_default();
     let mut headers: HashMap<String, Vec<engine::Block>> = HashMap::new();
     let mut footers: HashMap<String, Vec<engine::Block>> = HashMap::new();
     let fetch_part = |rid: &str| -> Option<&[u8]> {
         let target = rels.get(rid)?;
-        let entry = resolve_target(target);
+        let entry = resolve_in_package(&other_entries, &part_names.main, target);
         other_entries
             .iter()
             .find(|(n, _)| n == &entry)
@@ -399,13 +434,13 @@ pub fn read_docx_with_settings(
     relationship `Type` would be the canonical filter (`.../image`), but
     the pass is lenient — any rel resolving into `word/media/` counts. */
     let mut media: HashMap<String, ImageBlob> = HashMap::new();
-    let body_media_keys = register_part_media(&other_entries, DOC_XML, &rels, &mut media);
+    let body_media_keys = register_part_media(&other_entries, &part_names.main, &rels, &mut media);
     for (rid, blocks) in headers.iter_mut().chain(footers.iter_mut()) {
         if !numbering.num_instances.is_empty() {
             resolve_markers_blocks(blocks, &numbering);
         }
         if let Some(target) = rels.get(rid.as_str()) {
-            let entry = resolve_target(target);
+            let entry = resolve_in_package(&other_entries, &part_names.main, target);
             let rels_name = part_rels_entry_name(&entry);
             let part_rels = other_entries
                 .iter()
@@ -486,8 +521,8 @@ pub fn read_docx_with_settings(
     resolve against `numbering.xml`; hyperlink rel ids resolve against
     the PART's own rels file (`word/_rels/footnotes.xml.rels`). */
     for (entry, kind) in [
-        (FOOTNOTES_XML, engine::NoteKind::Footnote),
-        (ENDNOTES_XML, engine::NoteKind::Endnote),
+        (part_names.footnotes.as_str(), engine::NoteKind::Footnote),
+        (part_names.endnotes.as_str(), engine::NoteKind::Endnote),
     ] {
         let Some(bytes) = other_entries
             .iter()
@@ -541,7 +576,7 @@ pub fn read_docx_with_settings(
     // writer round-trips it byte-identical.
     if let Some(bytes) = other_entries
         .iter()
-        .find(|(n, _)| n == COMMENTS_XML)
+        .find(|(n, _)| *n == part_names.comments)
         .map(|(_, b)| b.as_slice())
         && let Ok(defs) = parse_comments_xml(bytes)
     {
@@ -558,7 +593,7 @@ pub fn read_docx_with_settings(
     comments". */
     if let Some(bytes) = other_entries
         .iter()
-        .find(|(n, _)| n == COMMENTS_EXTENDED_XML)
+        .find(|(n, _)| *n == part_names.comments_extended)
         .map(|(_, b)| b.as_slice())
         && let Ok(entries) = parse_comments_extended_xml(bytes)
     {
@@ -588,7 +623,7 @@ pub fn read_docx_with_settings(
     `even_and_odd_headers` toggle the paginator needs. */
     if let Some(bytes) = other_entries
         .iter()
-        .find(|(n, _)| n == SETTINGS_XML)
+        .find(|(n, _)| *n == part_names.settings)
         .map(|(_, b)| b.as_slice())
         && let Ok(settings) = crate::parts::settings::parse_settings_xml(bytes)
     {
@@ -602,7 +637,7 @@ pub fn read_docx_with_settings(
     the typed read lifts `<dc:creator>` so `AUTHOR` fields resolve. */
     if let Some(bytes) = other_entries
         .iter()
-        .find(|(n, _)| n == CORE_PROPS_XML)
+        .find(|(n, _)| *n == part_names.core_props)
         .map(|(_, b)| b.as_slice())
         && let Ok(props) = crate::parts::core_props::parse_core_props_xml(bytes)
     {
@@ -628,7 +663,44 @@ pub fn read_docx_with_settings(
         document,
         document_root_attrs,
         warnings,
+        part_names,
     })
+}
+
+/// Issue #325 — gate the main part on its root's namespace bindings
+/// ([`crate::schema::grab_bag::NamespaceScope::classify_root`]). Canonical
+/// roots (either family) are returned untouched — the byte-identical fast
+/// path. A non-canonical root is re-prefixed
+/// ([`crate::schema::ns_normalize::canonicalize_prefixes`]) and reported;
+/// when even that fails, or the root is no WordprocessingML at all, the
+/// part is returned as-is with a typed warning — never a silent empty
+/// document.
+fn canonical_main_part(xml: Vec<u8>, warnings: &mut Vec<DocxWarning>) -> Vec<u8> {
+    use crate::schema::family::RootBinding;
+    use crate::schema::ns_normalize::{canonicalize_prefixes, inspect_root};
+    match inspect_root(&xml) {
+        RootBinding::Canonical(_) => xml,
+        RootBinding::NotWordprocessingMl => {
+            warnings.push(DocxWarning::NotWordprocessingMl);
+            xml
+        }
+        RootBinding::NonCanonical { detail } => match canonicalize_prefixes(&xml) {
+            Ok(normalised) => {
+                warnings.push(DocxWarning::NonCanonicalNamespaces {
+                    detail,
+                    normalized: true,
+                });
+                normalised
+            }
+            Err(e) => {
+                warnings.push(DocxWarning::NonCanonicalNamespaces {
+                    detail: format!("{detail}; normalisation failed: {e}"),
+                    normalized: false,
+                });
+                xml
+            }
+        },
+    }
 }
 
 /// Guess a MIME type from a `word/media/*` archive entry name. The OOXML
@@ -692,6 +764,14 @@ fn register_part_media(
     let exists = |name: &str| entries.iter().any(|(n, _)| n == name);
     for (rid, target) in rels {
         let mut entry = resolve_part_relative_target(source_part, target);
+        /* Issue #353 — a percent-encoded target (`my%20pic.png`) names the
+        decoded entry. */
+        if !exists(&entry)
+            && let Ok(candidates) = target_candidates(source_part, target)
+            && let Some(found) = candidates.into_iter().find(|c| exists(c))
+        {
+            entry = found;
+        }
         /* Pre-#188 leniency: a malformed `word/media/…` target written
         package-relative without its leading slash still resolves. */
         if !exists(&entry) {
@@ -700,7 +780,9 @@ fn register_part_media(
                 entry = legacy;
             }
         }
-        if !entry.starts_with("word/media/") {
+        /* Issue #353 — media live in a `media/` directory next to the
+        main part, which is `word/media/` unless the main part moved. */
+        if !(entry.starts_with("media/") || entry.contains("/media/")) {
             continue;
         }
         if !media.contains_key(&entry) {
@@ -746,10 +828,27 @@ fn stamp_media_keys(blocks: &mut [engine::Block], keys: &HashMap<String, String>
 /// `word/header1.xml` live at `word/_rels/header1.xml.rels` (the part's
 /// directory + `_rels/` + basename + `.rels`).
 fn part_rels_entry_name(part_entry: &str) -> String {
-    match part_entry.rsplit_once('/') {
-        Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
-        None => format!("_rels/{part_entry}.rels"),
+    rels_entry_name(part_entry)
+}
+
+/// Issue #353 — the archive entry a relationship `target` of `source_part`
+/// denotes: the OPC resolution (`..`, `/`-absolute, `%20`) when the
+/// archive holds it, else the pre-#353 `word/`-anchored guess. An escaping
+/// target resolves to the legacy guess too (a missing entry — nothing
+/// outside the archive is ever opened).
+pub(crate) fn resolve_in_package(
+    entries: &[(String, Vec<u8>)],
+    source_part: &str,
+    target: &str,
+) -> String {
+    if let Ok(candidates) = target_candidates(source_part, target)
+        && let Some(found) = candidates
+            .into_iter()
+            .find(|c| entries.iter().any(|(n, _)| n == c))
+    {
+        return found;
     }
+    resolve_target(target)
 }
 
 /// Walk a block, rewriting every paragraph's hyperlink `target` from the

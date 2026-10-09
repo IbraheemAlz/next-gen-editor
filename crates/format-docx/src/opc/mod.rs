@@ -11,5 +11,6 @@
 
 pub mod archive;
 pub mod content_types;
+pub mod part_names;
 pub mod relationships;
 pub mod splice;

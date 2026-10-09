@@ -32,6 +32,7 @@
 mod comments;
 mod inline_spans;
 mod note_containers;
+mod package_families;
 mod paragraph_format;
 mod revision_ids;
 mod revisions;
@@ -343,6 +344,7 @@ fn run_default() -> Result<()> {
     revisions::run_tracked_cross_paragraph_delete_roundtrip()?;
     revision_ids::run_revision_ids_roundtrip()?;
     paragraph_format::run_paragraph_format_roundtrip()?;
+    package_families::run_package_families_roundtrip()?;
     comments::run_comment_patch_roundtrip()?;
 
     println!("\nPASS");

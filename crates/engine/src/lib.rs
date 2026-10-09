@@ -3289,6 +3289,10 @@ pub struct ParaProperties {
     /// border (the implicit default). Renderer reuses the cell-border
     /// drawing primitive at paragraph-rect bounds.
     pub borders: Option<CellBorders>,
+    /// Issue #352 — which `borders` edges the source spelled `<w:start>` /
+    /// `<w:end>` (see [`BorderSpelling`]). Not serialized when default.
+    #[serde(skip_serializing_if = "BorderSpelling::is_default")]
+    pub border_spelling: BorderSpelling,
     /// Audit gap A.M3 — `<w:pPr><w:tabs>` custom tab stops in
     /// document order. Empty list ⇒ fall back to the 0.5-inch default
     /// grid the line builder uses. Position is layout pt at scale=1
@@ -3389,6 +3393,13 @@ impl ParaProperties {
             page_break_before: patch.page_break_before || self.page_break_before,
             /* Audit gap A.M4 — `<w:pBdr>` overlay: patch's borders win
             when set; otherwise inherit. */
+            /* Issue #352 — the spelling travels with the borders it
+            describes (evaluated first: `or` below moves `patch.borders`). */
+            border_spelling: if patch.borders.is_some() {
+                patch.border_spelling
+            } else {
+                self.border_spelling
+            },
             borders: patch.borders.or(self.borders),
             /* Audit gap A.M3 — `<w:tabs>` overlay: patch's stops
             REPLACE the parent's (Word's documented behaviour — child
@@ -4503,6 +4514,26 @@ pub struct BorderStroke {
     pub style: BorderStyle,
     pub size_eighth_pt: u16,
     pub color: Option<[u8; 4]>,
+}
+
+/// Issue #352 — which paragraph-border edges the source spelled with the
+/// logical `<w:start>` / `<w:end>` (ISO 29500) instead of the physical
+/// `<w:left>` / `<w:right>`. The reader maps a logical edge to the
+/// physical side by the paragraph's direction (start = left in LTR, right
+/// in RTL); the writer re-emits the leading / trailing edge under the
+/// logical name while the flag is set, so a regenerated paragraph keeps
+/// the source spelling. Default (both `false`) is invisible to snapshots.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct BorderSpelling {
+    pub start: bool,
+    pub end: bool,
+}
+
+impl BorderSpelling {
+    pub fn is_default(&self) -> bool {
+        !self.start && !self.end
+    }
 }
 
 /// Per-edge border strokes for a `<w:tcBorders>` or `<w:tblBorders>`.
