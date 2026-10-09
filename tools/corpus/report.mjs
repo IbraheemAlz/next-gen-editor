@@ -169,6 +169,20 @@ function main() {
         for (const r of unverifiedTimeouts) console.log(`    ${r.path}`);
     }
 
+    /* --- Issue #379 - warm repaint: a second full production layout with
+    every cross-paint layout cache warm must reproduce the cold layout. A
+    mismatch is a cache bug (a stale or colliding entry served). --- */
+    const withRepaint = records.filter((r) => typeof r.engine_repaint_consistent === 'boolean');
+    const repaintInconsistent = withRepaint.filter((r) => r.engine_repaint_consistent === false);
+    const sumMs = (rs, key) => rs.reduce((acc, r) => acc + (r[key] ?? 0), 0);
+    console.log('\n=== Warm repaint (#379) ===');
+    console.log(
+        `  ${withRepaint.length} documents: cold layout ${sumMs(withRepaint, 'engine_layout_ms')} ms total, ` +
+            `warm repaint ${sumMs(withRepaint, 'engine_repaint_ms')} ms total`,
+    );
+    console.log(`  inconsistent (warm != cold - a layout-cache bug): ${repaintInconsistent.length}`);
+    for (const r of repaintInconsistent) console.log(`    ${r.path}`);
+
     const buckets = new Map(); // signature -> { count, examplePath, exampleBytes, message, outcome, stage }
     for (const r of records) {
         if (r.outcome === 'ok') continue;
@@ -277,6 +291,30 @@ function main() {
         }
     }
 
+    /* --- Issue #384 — `--regen-check`: clean paragraphs that do not
+    regenerate byte-identically, by class. --- */
+    const regenChecked = records.filter((r) => r.regen_check);
+    const regenClasses = new Map();
+    let regenParagraphs = 0;
+    let regenMismatched = 0;
+    for (const r of regenChecked) {
+        regenParagraphs += r.regen_check.checked;
+        regenMismatched += r.regen_check.mismatched;
+        for (const [cls, n] of Object.entries(r.regen_check.classes ?? {})) {
+            regenClasses.set(cls, (regenClasses.get(cls) || 0) + n);
+        }
+    }
+    const sortedRegenClasses = [...regenClasses.entries()].sort((a, b) => b[1] - a[1]);
+    if (regenChecked.length > 0) {
+        console.log(
+            `\n=== Paragraph regeneration (#384): ${regenMismatched}/${regenParagraphs} clean paragraphs differ, ` +
+                `${regenChecked.filter((r) => r.regen_check.mismatched > 0).length}/${regenChecked.length} documents ===`,
+        );
+        for (const [cls, count] of sortedRegenClasses) {
+            console.log(`  ${String(count).padStart(4)}  ${cls}`);
+        }
+    }
+
     /* --- Layout-time outliers. --- */
     const withLayoutTime = records.filter((r) => typeof r.layout_ms === 'number').sort((a, b) => b.layout_ms - a.layout_ms);
     console.log(`\n=== Layout-time outliers (top ${Math.min(10, withLayoutTime.length)}) ===`);
@@ -342,6 +380,14 @@ function main() {
             edit_bound_exceeded_informational: editOutOfBoundInformational.map((r) => r.path),
         },
         edit_rewrite_root_causes: Object.fromEntries(sortedCauses),
+        warm_repaint_inconsistent: repaintInconsistent.map((r) => r.path),
+        /* Issue #384 — `--regen-check` mismatch classes (paragraphs). */
+        regen_check: {
+            documents: regenChecked.length,
+            paragraphs: regenParagraphs,
+            mismatched: regenMismatched,
+            classes: Object.fromEntries(sortedRegenClasses),
+        },
         layout: {
             budget_ms: LAYOUT_BUDGET_MS,
             laid_out: L.laidOut.length,

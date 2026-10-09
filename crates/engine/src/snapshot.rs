@@ -871,8 +871,11 @@ mod tests {
                     open: b"\n  ".to_vec(),
                     after_rpr: b"\n  ".to_vec(),
                     close: b"\n".to_vec(),
+                    inner: b"\n  ".to_vec(),
                 })),
                 bare_edge_ws: true,
+                /* Issue #335 — literal hyphen characters in the `<w:t>`. */
+                literal_hyphens: true,
             }],
             markers: vec![
                 SourceMarker {
@@ -886,6 +889,7 @@ mod tests {
                     xml: br#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#.to_vec(),
                     role: crate::MarkerRole::Content,
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     /* Issue #245 — a content control's two ends. */
@@ -896,12 +900,14 @@ mod tests {
                         close_xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     },
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     at: 5,
                     xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     role: crate::MarkerRole::Close { id: 7 },
                     comment: None,
+                    ..SourceMarker::default()
                 },
                 SourceMarker {
                     /* Issue #243 — a comment anchor keeps its identity. */
@@ -911,6 +917,16 @@ mod tests {
                         kind: crate::CommentAnchorKind::RangeEnd,
                         id: 3,
                     }),
+                    ..SourceMarker::default()
+                },
+                SourceMarker {
+                    /* Issue #384 — a marker's slot among the wrapper
+                    boundaries, and a `_Toc*` bookmark's name. */
+                    at: 11,
+                    xml: br#"<w:bookmarkEnd w:id="4"/>"#.to_vec(),
+                    closes_after: 2,
+                    opens_before: 1,
+                    toc_bookmark: Some("_Toc4".into()),
                     ..SourceMarker::default()
                 },
             ],

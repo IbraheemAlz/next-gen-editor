@@ -697,7 +697,10 @@ fn forged_story(u: &mut Unstructured) -> Mp {
         0 => (
             "Note",
             vec![
-                ("kind", Mp::string(*pick(u, &["Footnote", "Endnote"]))),
+                (
+                    "kind",
+                    Mp::string(pick::<&str>(u, &["Footnote", "Endnote"])),
+                ),
                 ("id", n(u)),
                 ("page", n(u)),
                 ("section_block", n(u)),
@@ -780,10 +783,10 @@ pub fn base_engine(u: &mut Unstructured) -> engine_wasm::Engine {
 
 /// `(snapshot bytes, package key, detached package)` as the engine's own
 /// `Command::Snapshot` reports them.
-pub fn capture(
-    engine: &mut engine_wasm::Engine,
-    detach: bool,
-) -> Option<(Vec<u8>, Option<String>, Option<Vec<u8>>)> {
+pub type Captured = (Vec<u8>, Option<String>, Option<Vec<u8>>);
+
+/// Run `Command::Snapshot` and return what the engine reports.
+pub fn capture(engine: &mut engine_wasm::Engine, detach: bool) -> Option<Captured> {
     match engine.apply_sync(bridge::Command::Snapshot {
         seq: Some(1),
         detach_package: Some(detach),

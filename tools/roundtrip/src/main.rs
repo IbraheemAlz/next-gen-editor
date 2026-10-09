@@ -36,11 +36,15 @@ mod malformed;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
+mod ppr_splice;
 mod protection;
 mod reader_cascade;
 mod reader_hardening;
+mod regen;
 mod revision_ids;
 mod revisions;
+mod run_content;
+mod styles_patch;
 mod table_markup;
 mod theme;
 mod tracked_coverage;
@@ -366,6 +370,16 @@ fn run_default() -> Result<()> {
     tracked_coverage::run_tracked_table_rows_roundtrip()?;
     tracked_coverage::run_section_break_revision_roundtrip()?;
     protection::run_document_protection_roundtrip()?;
+    regen::run_regen_classes_roundtrip()?;
+    ppr_splice::run_ppr_splice_roundtrip()?;
+    styles_patch::run_styles_patch_roundtrip()?;
+    /* Step 59 — issues #335 / #357 / #326: run-content elements and
+    automatic hyphenation. */
+    run_content::run_soft_hyphen_roundtrip()?;
+    run_content::run_run_content_roundtrip()?;
+    run_content::run_hyphenation_roundtrip()?;
+    /* Step 60 — issues #439 / #434 / #435: malformed parts are repaired up
+    front (regenerate-only) and every save of them is well-formed. */
     malformed::run_malformed_parts_roundtrip()?;
 
     println!("\nPASS");
@@ -5041,7 +5055,78 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 },
             },
         },
+        /* Issue #335 — `<w:softHyphen/>` / `<w:noBreakHyphen/>` (the
+        visual-diff `soft-hyphen` golden loads it). Zero-edit drift 0;
+        the default harness's step 59a–d edits it. */
+        PrebuiltFixture {
+            name: "soft_hyphen.docx",
+            bytes: format_docx::test_fixtures::soft_hyphen_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec![
+                        format_docx::test_fixtures::SOFT_HYPHEN_TEXT.into(),
+                        format_docx::test_fixtures::NB_HYPHEN_TEXT.into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #357 — `<w:sym>`, `<w:cr/>`, `<w:ptab>`, `<w:bdo>` /
+        `<w:dir>` (the visual-diff `run-content` golden loads it).
+        Zero-edit drift 0; the default harness's step 59e–h edits it. */
+        PrebuiltFixture {
+            name: "run_content.docx",
+            bytes: format_docx::test_fixtures::run_content_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 4,
+                    paragraph_texts: format_docx::test_fixtures::RUN_CONTENT_TEXTS
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect(),
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #326 — automatic hyphenation on / off (the visual-diff
+        `hyphenation` / `hyphenation-off` goldens load them). Zero-edit
+        drift 0; the default harness's step 59i–k edits both. */
+        PrebuiltFixture {
+            name: "hyphenation_on.docx",
+            bytes: format_docx::test_fixtures::hyphenation_docx(true),
+            entry: hyphenation_fixture_entry(),
+        },
+        PrebuiltFixture {
+            name: "hyphenation_off.docx",
+            bytes: format_docx::test_fixtures::hyphenation_docx(false),
+            entry: hyphenation_fixture_entry(),
+        },
     ]
+}
+
+/// Issue #326 — the manifest entry both hyphenation fixtures share.
+fn hyphenation_fixture_entry() -> FixtureEntry {
+    let texts = format_docx::test_fixtures::HYPHENATION_TEXTS;
+    FixtureEntry {
+        generator: "handcrafted".into(),
+        phase_introduced: 12,
+        asserts: FixtureAsserts {
+            paragraph_count: texts.len() as u32,
+            paragraph_texts: texts.iter().map(|t| t.to_string()).collect(),
+        },
+        roundtrip: RoundtripBounds {
+            document_xml_drift_bytes: 0,
+        },
+    }
 }
 
 /// Issue #355 — the manifest entry both theme fixtures share.

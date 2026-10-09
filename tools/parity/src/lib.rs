@@ -31,6 +31,8 @@ pub const FACADE_MAP: &str = "packages/core/src/facadeMap.ts";
 pub const UI_ROOTS: &[&str] = &["packages/ui/src", "packages/core/src", "ts/src"];
 /// The Playwright suite.
 pub const E2E_ROOT: &str = "ts/e2e";
+/// The `@nge/ui` toast (`ERROR_TOAST_COPY` and friends, issue #427).
+pub const ERROR_TOAST: &str = "packages/ui/src/ErrorToast.tsx";
 /// The fuzz generator holding the `classify_variants!` list.
 pub const FUZZ_GEN: &str = "fuzz/src/command_gen.rs";
 /// Ratchet: `Implemented` commands the e2e suite dispatches by wire name.
@@ -95,6 +97,46 @@ pub struct Sources {
     pub fuzz_curated: BTreeSet<String>,
     /// Every variant name `classify_variants!` lists.
     pub fuzz_listed: BTreeSet<String>,
+    /// Issue #427 - `ErrorKind` names with an `ERROR_TOAST_COPY` entry.
+    pub toast_copy: BTreeSet<String>,
+    /// Issue #427 - `ErrorKind` names in `ERROR_KINDS_WITH_OWN_PRESENTATION`.
+    pub own_presentation: BTreeSet<String>,
+    /// Issue #427 - the `ErrorKind` keys of `ERROR_KIND_PRESENTATION`.
+    pub presentation_keys: BTreeSet<String>,
+}
+
+/// Issue #427 - parse the error-kind tables out of `ErrorToast.tsx`:
+/// `(toast_copy, own_presentation, presentation_keys)`.
+pub fn parse_error_toast(src: &str) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    let keys = |name: &str| -> BTreeSet<String> {
+        object_lines(src, name)
+            .into_iter()
+            .filter(|l| {
+                /* A key sits at the object's own indent (4 spaces); the
+                wrapped string continuation lines are deeper. */
+                l.starts_with("    ") && !l.starts_with("     ")
+            })
+            .filter_map(|l| l.trim().split_once(':').map(|(k, _)| k.trim().to_string()))
+            .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric()))
+            .collect()
+    };
+    let mut own = BTreeSet::new();
+    if let Some(start) = src.find("export const ERROR_KINDS_WITH_OWN_PRESENTATION") {
+        let rest = &src[start..];
+        if let Some(end) = rest.find("] as const") {
+            let body = &rest[rest.find("= [").map_or(0, |i| i + 3)..end];
+            for part in body.split(',') {
+                if let Some(n) = unquote(part) {
+                    own.insert(n.to_string());
+                }
+            }
+        }
+    }
+    (
+        keys("ERROR_TOAST_COPY"),
+        own,
+        keys("ERROR_KIND_PRESENTATION"),
+    )
 }
 
 fn read(root: &Path, rel: &str) -> std::io::Result<String> {
@@ -148,7 +190,12 @@ pub fn load(root: &Path) -> std::io::Result<Sources> {
         .filter(|w| e2e_text.contains(&format!("'{w}'")) || e2e_text.contains(&format!("\"{w}\"")))
         .collect();
     let (fuzz_listed, fuzz_curated) = parse_fuzz_classification(&read(root, FUZZ_GEN)?);
+    let (toast_copy, own_presentation, presentation_keys) =
+        parse_error_toast(&read(root, ERROR_TOAST)?);
     Ok(Sources {
+        toast_copy,
+        own_presentation,
+        presentation_keys,
         facade,
         members,
         ui,
@@ -542,6 +589,47 @@ impl Matrix {
             .collect()
     }
 
+    /// Issue #427 - every `bridge::ErrorKind` has toast copy OR a declared
+    /// own presentation (floor: 0 uncovered), never both, and the shell's
+    /// tables name only real kinds.
+    pub fn error_kind_violations(&self) -> Vec<String> {
+        let s = &self.sources;
+        let mut v = Vec::new();
+        let kinds: BTreeSet<&str> = bridge::ErrorKind::ALL.iter().map(|k| k.name()).collect();
+        for k in &kinds {
+            let copy = s.toast_copy.contains(*k);
+            let own = s.own_presentation.contains(*k);
+            if !copy && !own {
+                v.push(format!(
+                    "ErrorKind::{k} has no ERROR_TOAST_COPY entry and is not in \
+                     ERROR_KINDS_WITH_OWN_PRESENTATION ({ERROR_TOAST})"
+                ));
+            }
+            if copy && own {
+                v.push(format!(
+                    "ErrorKind::{k} has toast copy AND an own presentation"
+                ));
+            }
+            if !s.presentation_keys.contains(*k) {
+                v.push(format!(
+                    "ErrorKind::{k} is missing from ERROR_KIND_PRESENTATION"
+                ));
+            }
+        }
+        for (what, set) in [
+            ("ERROR_TOAST_COPY", &s.toast_copy),
+            ("ERROR_KINDS_WITH_OWN_PRESENTATION", &s.own_presentation),
+            ("ERROR_KIND_PRESENTATION", &s.presentation_keys),
+        ] {
+            for k in set {
+                if !kinds.contains(k.as_str()) {
+                    v.push(format!("{what} names unknown ErrorKind {k}"));
+                }
+            }
+        }
+        v
+    }
+
     /// The floor. Empty means every check passes.
     pub fn violations(&self) -> Vec<String> {
         let mut v = Vec::new();
@@ -567,6 +655,9 @@ impl Matrix {
                 names.difference(&s.fuzz_listed).collect::<Vec<_>>()
             ));
         }
+
+        /* -- error kinds (issue #427) ---------------------------------- */
+        v.extend(self.error_kind_violations());
 
         /* -- facade ---------------------------------------------------- */
         for r in &self.rows {
@@ -716,6 +807,15 @@ impl Matrix {
             c.unfiled,
             MAX_UNFILED,
         );
+        let kinds = bridge::ErrorKind::ALL.len();
+        let uncovered = self.error_kind_violations().len();
+        let _ = writeln!(
+            out,
+            "- Error kinds (issue #427): {kinds}, toast copy for {}, own presentation for {}, \
+             uncovered: {uncovered} (floor 0)\n",
+            self.sources.toast_copy.len(),
+            self.sources.own_presentation.len(),
+        );
         let _ = writeln!(out, "### Gaps\n");
         let _ = writeln!(
             out,
@@ -824,6 +924,33 @@ mod tests {
         let m = repo_matrix();
         let v = m.violations();
         assert!(v.is_empty(), "parity floor violations:\n{}", v.join("\n"));
+    }
+
+    /// Issue #427 - the error-kind floor reads the real tables and trips on
+    /// a kind with neither copy nor a declared own presentation.
+    #[test]
+    fn error_kinds_need_copy_or_an_own_presentation() {
+        let m = repo_matrix();
+        assert!(
+            m.sources.toast_copy.contains("InTableCell"),
+            "{:?}",
+            m.sources.toast_copy
+        );
+        assert!(m.sources.own_presentation.contains("Protected"));
+        assert_eq!(
+            m.sources.presentation_keys.len(),
+            bridge::ErrorKind::ALL.len(),
+            "ERROR_KIND_PRESENTATION lists every kind"
+        );
+        assert!(m.error_kind_violations().is_empty());
+        let mut broken = m.clone();
+        broken.sources.toast_copy.remove("InTableCell");
+        let v = broken.error_kind_violations();
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("InTableCell"), "{v:?}");
+        let mut unknown = m;
+        unknown.sources.toast_copy.insert("Bogus".into());
+        assert!(unknown.error_kind_violations()[0].contains("unknown ErrorKind Bogus"));
     }
 
     /// The scanner really sees the shell: the facade map is fully parsed,

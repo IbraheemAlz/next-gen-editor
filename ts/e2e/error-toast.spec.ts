@@ -167,3 +167,42 @@ test('an untracked delete across the same range is allowed - no toast (#364)', a
     await page.waitForTimeout(300);
     await expect(page.locator('.nge-toast')).toHaveText('');
 });
+
+/* Issue #427 - the remaining refusals are typed too: a field insert inside
+ * a table cell answers `ErrorKind::InTableCell` and the toast says so, via
+ * the real engine reply (not a delivered event). */
+test('InsertField inside a table cell shows a typed toast (#427)', async ({ page }) => {
+    test.setTimeout(60_000);
+    await boot(page);
+    const reply = await page.evaluate(async () => {
+        const dispatch = (cmd: unknown): Promise<any> => (window as any).__dispatch(cmd);
+        await dispatch({ type: 'SELECT_ALL' });
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'x' });
+        const t = await dispatch({
+            type: 'INSERT_TABLE',
+            at: { steps: [{ kind: 'BLOCK', idx: 1 }] },
+            rows: 1,
+            cols: 1,
+        });
+        if (t.type === 'ERROR') throw new Error(`INSERT_TABLE: ${t.message}`);
+        return dispatch({
+            type: 'INSERT_FIELD',
+            at: {
+                path: {
+                    steps: [
+                        { kind: 'BLOCK', idx: 1 },
+                        { kind: 'CELL', row: 0, col: 0 },
+                        { kind: 'BLOCK', idx: 0 },
+                    ],
+                },
+                offset: 0,
+            },
+            kind: 'Page',
+        });
+    });
+    expect(reply.type).toBe('ERROR');
+    expect(reply.kind).toBe('InTableCell');
+    const toast = page.locator('.nge-toast');
+    await expect(toast).toContainText('not supported inside a table cell');
+    await expect(toast).toHaveText('', { timeout: 8_000 });
+});

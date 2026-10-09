@@ -6,6 +6,7 @@
 
 pub mod boxes;
 pub mod floats;
+pub mod hyphen;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
@@ -21,7 +22,7 @@ mod wrap_fixtures;
 pub use boxes::{
     CellAnchorRef, ComplexScriptAttrs, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx,
     FloatSpec, FloatWrap, FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField,
-    LineBox, LineSegment, MarkerBox, NoteBand, PageBox, ParaFlow, ParagraphBox, Point,
+    LineBox, LineHyphen, LineSegment, MarkerBox, NoteBand, PageBox, ParaFlow, ParagraphBox, Point,
     PositionedGlyph, Size, SpanFace, StyleSpan, TabLeaderKind, TableBox, TableCellBox, TableRowBox,
     TextAttrs, TextBoxFrame, TextBoxGlyph, VisualRun, WrapSide,
 };

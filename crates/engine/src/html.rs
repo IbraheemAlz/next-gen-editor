@@ -359,6 +359,23 @@ fn emit_inline_object(obj: &InlineObject, out: &mut String) {
             }
             out.push_str("</span>");
         }
+        InlineKind::Symbol { font, char } => {
+            /* Issue #357 — a symbol copies as its Unicode equivalent (a
+            paste reads the character); the source font and code ride
+            along as data attributes. */
+            out.push_str("<span data-nge-sym-font=\"");
+            escape_into(font, out);
+            out.push_str("\" data-nge-sym-char=\"");
+            escape_into(char, out);
+            out.push_str("\">");
+            escape_into(
+                &crate::run_content::symbol_char(font, char).to_string(),
+                out,
+            );
+            out.push_str("</span>");
+        }
+        /* Issue #357 — a positional tab copies as a tab. */
+        InlineKind::PositionalTab { .. } => out.push('\t'),
     }
 }
 
@@ -792,6 +809,7 @@ fn parse_border_shorthand(v: &str) -> Option<BorderStroke> {
         style,
         size_eighth_pt: size_eighth_pt.unwrap_or(4),
         color,
+        ..Default::default()
     })
 }
 
@@ -1572,6 +1590,7 @@ mod tests {
                 style: BorderStyle::Single,
                 size_eighth_pt: 8, // 1pt
                 color: Some(red),
+                ..Default::default()
             }),
             ..Default::default()
         });

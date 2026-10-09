@@ -218,7 +218,10 @@ impl Engine {
                 };
                 self.commit_edit(new_doc, caret)
             }
-            None => Event::error("form field edit: the field no longer exists"),
+            None => Event::error_kind(
+                bridge::ErrorKind::NoSuchTarget,
+                "form field edit: the field no longer exists",
+            ),
         }
     }
 
