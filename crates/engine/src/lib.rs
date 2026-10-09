@@ -65,6 +65,9 @@ pub mod fields;
 mod revision_tests;
 mod revisions;
 mod text_remap;
+mod tracked;
+#[cfg(test)]
+mod tracked_tests;
 pub use text_remap::TextEdit;
 pub mod html;
 pub mod numbering;
@@ -9163,7 +9166,13 @@ impl DocumentTree {
         let Some(p) = self.paragraph_at_path(&at.path) else {
             return self.clone();
         };
-        let (left, mut right) = p.split_at(at.offset);
+        let (mut left, mut right) = p.split_at(at.offset);
+        /* Issue #301 — the text's tracked changes travel with it
+        (`split_at` drops them: a clipboard slice must not carry them).
+        Enter inside a reviewer's pending insertion used to turn the
+        typed text into plain, unreviewable text. */
+        (left.revisions, right.revisions) =
+            tracked::split_revisions(&p.revisions, p.snap_offset(at.offset));
         /* Issue #277 — Word's "next style" rule: Enter at the very END
         of a paragraph gives the NEW paragraph its style's `<w:next>`
         (Heading 1 → Normal); a split anywhere else keeps the style on

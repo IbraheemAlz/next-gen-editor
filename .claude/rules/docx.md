@@ -247,6 +247,12 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   any one that removes the mark merges; a single Accept/Reject decides
   the first — through `splice_text` + `remap_text_edit_record` /
   `remap_paragraph_merge` / `remap_block_splice`, never around them.
+- **Recording structural tracked changes (issue #301).** Enter with
+  review mode on (`DocumentTree::tracked_split_paragraph`, engine
+  `crates/engine/src/tracked.rs`) records the NEW mark — the one ending
+  the left half, Word's `<w:ins/>` on the first paragraph — as inserted;
+  `split_paragraph` now carries the text revisions onto both halves
+  (a straddling change is cut; the right piece drops its source id).
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

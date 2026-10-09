@@ -14381,11 +14381,25 @@ impl Engine {
         if self.story_active() {
             return self.story_split_paragraph(at);
         }
+        let tracking = self.tracking_changes;
+        let author = self.review_author.clone();
+        let date = self.current_review_date();
         let (base, split_at) = match self.selection.clone() {
             Some(s) => {
                 let (start, end) = ordered(s.anchor, s.caret);
                 let doc = if start == end {
                     self.undo.current().clone()
+                } else if tracking {
+                    /* Issue #301 — replacing a selection with a break
+                    while tracking = mark the selection deleted, then
+                    the tracked break at its start (the typed-replacement
+                    path's order). */
+                    self.undo.current().tracked_delete_range(
+                        to_engine_pos(start.clone()),
+                        to_engine_pos(end),
+                        author.clone(),
+                        date.clone(),
+                    )
                 } else {
                     self.undo
                         .current()
@@ -14395,7 +14409,13 @@ impl Engine {
             }
             None => (self.undo.current().clone(), at),
         };
-        let new_doc = base.split_paragraph(to_engine_pos(split_at.clone()));
+        /* Issue #301 — with review mode on, the new paragraph mark is a
+        tracked insertion (reject merges the halves back). */
+        let new_doc = if tracking {
+            base.tracked_split_paragraph(to_engine_pos(split_at.clone()), &author, &date)
+        } else {
+            base.split_paragraph(to_engine_pos(split_at.clone()))
+        };
         let next_path = engine::bump_last_block_index(&bridge_to_engine_path(split_at.path));
         let caret = BridgeLogicalPos {
             path: engine_to_bridge_path(next_path),
@@ -15050,6 +15070,7 @@ impl Engine {
     fn do_accept_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
         let new_doc = self.undo.current().accept_revision_at(block, start, end);
         self.undo.push(new_doc);
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15059,10 +15080,25 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// A review decision merged or shortened paragraphs (issue #262 / #301 —
+    /// a resolved paragraph mark merges two): keep the caret on real text.
+    fn clamp_selection_to_document(&mut self) {
+        if let Some(sel) = self.selection.clone() {
+            let doc = self.undo.current();
+            self.selection = Some(SelectionState {
+                anchor: clamp_pos(doc, sel.anchor),
+                caret: clamp_pos(doc, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+        }
+    }
+
     /// `Command::RejectRevision` (Sprint 7 UI Edition).
     fn do_reject_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
         let new_doc = self.undo.current().reject_revision_at(block, start, end);
         self.undo.push(new_doc);
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15085,16 +15121,7 @@ impl Engine {
         }
         let new_doc = doc.resolve_all_revisions(accept);
         self.undo.push(new_doc);
-        /* Merged / shortened paragraphs: keep the caret on real text. */
-        if let Some(sel) = self.selection.clone() {
-            let doc = self.undo.current();
-            self.selection = Some(SelectionState {
-                anchor: clamp_pos(doc, sel.anchor),
-                caret: clamp_pos(doc, sel.caret),
-                ideal_x: None,
-                kind: sel.kind,
-            });
-        }
+        self.clamp_selection_to_document();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -27016,6 +27043,9 @@ mod text_remap_tests;
 
 #[cfg(test)]
 mod revision_command_tests;
+
+#[cfg(test)]
+mod tracked_command_tests;
 
 #[cfg(test)]
 mod story_tab_tests;

@@ -336,6 +336,7 @@ fn run_default() -> Result<()> {
     run_comment_anchor_roundtrip()?;
     note_containers::run_note_containers_roundtrip()?;
     revisions::run_double_mark_revisions_roundtrip()?;
+    revisions::run_tracked_split_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

@@ -420,3 +420,91 @@ pub(crate) fn run_double_mark_revisions_roundtrip() -> Result<()> {
     println!("[roundtrip] step 36d OK — accept-all / reject-all resolve both mark changes");
     Ok(())
 }
+
+/// Issues #301 / #298 — a plain source paragraph pair the tracked
+/// structural edits run on.
+const TRACKED_EDIT_BODY: &str = concat!(
+    r#"<w:p w:rsidR="00C0FFEE"><w:r><w:t>alpha beta</w:t></w:r></w:p>"#,
+    r#"<w:p><w:r><w:t>gamma delta</w:t></w:r></w:p>"#,
+);
+
+const REVIEWER: &str = "Reviewer";
+const REVIEW_DATE: &str = "2026-10-09T00:00:00Z";
+
+/// Save `doc` on both paths; each output well-formed, re-read.
+fn save_and_reread(
+    step: &str,
+    archive: &format_docx::DocxArchive,
+    doc: &DocumentTree,
+) -> Result<Vec<(String, DocumentTree)>> {
+    let mut out = Vec::new();
+    for (path, bytes) in [
+        ("write_docx", write_docx(archive, doc).context("write")?),
+        ("save_docx", format_docx::save_docx(doc).context("ui save")?),
+    ] {
+        assert_document_xml_well_formed(&bytes).with_context(|| format!("{step} {path}"))?;
+        let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+        let reread = read_docx(&bytes).with_context(|| format!("{step} {path} re-read"))?;
+        out.push((xml, reread.document));
+    }
+    Ok(out)
+}
+
+/// Issue #301 — step 37: a paragraph break typed with track changes on.
+///
+/// a. `tracked_split_paragraph` records the new mark (ending the left
+///    half) as inserted by the reviewer; both save paths write it as
+///    `<w:pPr><w:rPr><w:ins …/>` and it re-reads as such.
+/// b. Reject-all on the re-read document merges the halves back; the
+///    save carries no `<w:ins>`.
+/// c. Accept-all keeps the break, clean.
+pub(crate) fn run_tracked_split_roundtrip() -> Result<()> {
+    let xml = document(TRACKED_EDIT_BODY);
+    let bytes = build_styled_docx(STYLES_XML, &xml);
+    let archive = read_docx(&bytes).context("read tracked-edit fixture")?;
+    let split = archive
+        .document
+        .tracked_split_paragraph(at(0, 5), REVIEWER, REVIEW_DATE);
+    let mark = format!(
+        r#"<w:pPr><w:rPr><w:ins w:id="0" w:author="{REVIEWER}" w:date="{REVIEW_DATE}"/></w:rPr></w:pPr>"#
+    );
+    let want_marks = vec![vec![(RevisionKind::Insert, None)], vec![], vec![]];
+    let mut reread_split = None;
+    for (got, reread) in save_and_reread("step 37a", &archive, &split)? {
+        if !got.contains(&mark) {
+            bail!("step 37a: the inserted mark was not written ({mark})\n{got}");
+        }
+        let marks: Vec<Vec<(RevisionKind, Option<u32>)>> = reread
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| p.mark_revisions.iter().map(|r| (r.kind, None)).collect())
+            .collect();
+        if texts(&reread) != vec!["alpha", " beta", "gamma delta"] || marks != want_marks {
+            bail!("step 37a: re-read {:?} / {marks:?}", texts(&reread));
+        }
+        reread_split = Some(reread);
+    }
+    println!("[roundtrip] step 37a OK — a tracked Enter writes and re-reads an inserted mark");
+
+    let reread_split = reread_split.context("no re-read")?;
+    for (accept, want) in [
+        (false, vec!["alpha beta", "gamma delta"]),
+        (true, vec!["alpha", " beta", "gamma delta"]),
+    ] {
+        let step = if accept { "step 37c" } else { "step 37b" };
+        let resolved = reread_split.resolve_all_revisions(accept);
+        if texts(&resolved) != want || resolved.has_revisions() {
+            bail!("{step}: resolved to {:?}", texts(&resolved));
+        }
+        for (got, reread) in save_and_reread(step, &archive, &resolved)? {
+            if got.contains("<w:ins ") || reread.has_revisions() || texts(&reread) != want {
+                bail!("{step}: saved {:?}\n{got}", texts(&reread));
+            }
+        }
+    }
+    println!(
+        "[roundtrip] step 37b/c OK — reject-all merges the tracked break back, accept-all keeps it"
+    );
+    Ok(())
+}
