@@ -6397,6 +6397,59 @@ fn doc_paragraph_neighbor(
     Some((candidate, para))
 }
 
+/// Issues #423 / #420 — the formatting at a caret position before it is
+/// flattened (`Engine::caret_style`).
+struct CaretStyle {
+    /// docDefaults → paragraph style chain → direct span → armed pending
+    /// style: what the caret's text is laid out with.
+    full: SpanStyle,
+    /// The run's own direct formatting (+ pending style): what the run
+    /// itself names — the `Explicit` font source.
+    direct: SpanStyle,
+    /// The caret's text reads the complex-script twins (Arabic / Hebrew /
+    /// … text, or a `<w:rtl/>` / `<w:cs/>` run).
+    complex: bool,
+    /// The theme's supplemental script entry the complex-script slot
+    /// resolves through (`Arab`, `Hebr`, …).
+    script_hint: &'static str,
+}
+
+/// Issues #423 / #420 — `Engine::font_slots_of`'s result: the per-slot
+/// fields of `Event::SelectionChanged`.
+struct CaretFontSlots {
+    resolved_latin: String,
+    resolved_cs: String,
+    sources: bridge::BridgeFontSources,
+    formats: bridge::BridgeSlotFormats,
+    caret_slot: bridge::FontSlot,
+}
+
+/// Issue #423 — the theme script tag for the complex-script slot at
+/// `offset`: the nearest complex-script character (back, then forward),
+/// as layout's `run_font_ids` takes the run's first; `Arab` when the
+/// paragraph has none (the theme's Arabic row is the bidi default).
+fn caret_script_tag(para: &engine::Paragraph, offset: u32) -> &'static str {
+    let text = para.text.as_str();
+    let mut at = (offset as usize).min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let (before, after) = text.split_at(at);
+    /* Bounded: this runs on every `SelectionChanged`, and a long Latin
+    paragraph would otherwise be walked end to end each keystroke. */
+    before
+        .chars()
+        .rev()
+        .take(SCRIPT_TAG_SCAN)
+        .chain(after.chars().take(SCRIPT_TAG_SCAN))
+        .find_map(text_pipeline::complex_script_tag)
+        .unwrap_or("Arab")
+}
+
+/// How far (in chars, each way) [`caret_script_tag`] looks for the
+/// caret's complex script.
+const SCRIPT_TAG_SCAN: usize = 256;
+
 /// Issues #359 / #104 / #249 — `true` when the character the toolbar
 /// read-back at `offset` stands for is complex script, so it reports the
 /// complex-script twins. The character is the one the attributes come
@@ -12823,6 +12876,10 @@ impl Engine {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
         };
+        /* Issues #423 / #420 — one cascade walk feeds the flat read-back
+        and the per-slot one. */
+        let caret_style = self.caret_style(&start, start == end);
+        let fonts = self.font_slots_of(&caret_style);
         Event::SelectionChanged {
             range: BridgeLogicalRange {
                 start: start.clone(),
@@ -12839,7 +12896,7 @@ impl Engine {
             rects,
             /* A collapsed caret reflects any armed pending style; a real
             selection reports the document's own attributes (Backlog #11). */
-            attrs_at_caret: self.attrs_at(start.clone(), start == end),
+            attrs_at_caret: self.text_attrs_of(&caret_style),
             paragraph_alignment: self.paragraph_alignment_at(&sel.caret.path),
             paragraph_style_id: self.with_selection_doc(|d| {
                 d.paragraph_at_path(&bridge_to_engine_path(sel.caret.path.clone()))
@@ -12865,6 +12922,11 @@ impl Engine {
             /* Issue #260 — `apply` re-stamps this after the command's own
             mutation bump; outside `apply` (replay) it is already final. */
             document_revision: self.mutation_seq,
+            resolved_font_latin: fonts.resolved_latin,
+            resolved_font_cs: fonts.resolved_cs,
+            font_source: fonts.sources,
+            slot_formats: fonts.formats,
+            caret_font_slot: fonts.caret_slot,
         }
     }
 
@@ -13332,15 +13394,22 @@ impl Engine {
     /// style overlaid (Backlog #11). A range reports its first character
     /// — which is also what typing over it produces.
     fn attrs_at(&self, pos: BridgeLogicalPos, collapsed: bool) -> TextAttrs {
-        let apply_pending = collapsed;
+        self.text_attrs_of(&self.caret_style(&pos, collapsed))
+    }
+
+    /// Issues #423 / #420 — the formatting at `pos` before it is flattened
+    /// into one [`TextAttrs`] (the collapsed / range rules of
+    /// [`Self::attrs_at`]). Computed once per `SelectionChanged` and read
+    /// by both the flat read-back and the per-slot one.
+    fn caret_style(&self, pos: &BridgeLogicalPos, collapsed: bool) -> CaretStyle {
         let engine_path = bridge_to_engine_path(pos.path.clone());
         /* Issue #29 — fold the paragraph's style-chain run base UNDER
         the direct span style so the toolbar reads the same cascaded
         values the renderer paints (Heading 1 reports bold even with
         zero direct formatting). Phase 3 (#39) — story-aware doc. */
-        let (mut style, complex) = self.with_selection_doc(|doc| {
+        let (mut full, mut direct, complex, script_hint) = self.with_selection_doc(|doc| {
             doc.paragraph_at_path(&engine_path).map_or_else(
-                || (SpanStyle::default(), false),
+                || (SpanStyle::default(), SpanStyle::default(), false, "Arab"),
                 |p| {
                     let direct = if collapsed {
                         p.typing_style_at(pos.offset)
@@ -13349,21 +13418,38 @@ impl Engine {
                     };
                     (
                         doc.resolve_style_run_cascade(p.style_id.as_deref())
-                            .merged_with(direct),
+                            .merged_with(direct.clone()),
+                        direct,
                         reads_complex_script(p, pos.offset, collapsed),
+                        caret_script_tag(p, pos.offset),
                     )
                 },
             )
         });
-        if apply_pending && let Some(pending) = self.pending_format.as_ref() {
-            style = style.merged_with(pending.clone());
+        if collapsed && let Some(pending) = self.pending_format.as_ref() {
+            full = full.merged_with(pending.clone());
+            direct = direct.merged_with(pending.clone());
         }
         /* Issues #359 / #104 / #249 — complex-script text reports (and
         toggles against) the twins it is laid out with, as Word's ribbon
         does: a caret in `w:sz="22" w:szCs="28"` Arabic shows 14 pt. */
-        if complex || style.forces_complex_script() {
-            style = style.complex_script_view();
+        let complex = complex || full.forces_complex_script();
+        CaretStyle {
+            full,
+            direct,
+            complex,
+            script_hint,
         }
+    }
+
+    /// The flat [`TextAttrs`] read-back of `caret`: the script slot the
+    /// caret's own text reads (see [`Self::caret_style`]).
+    fn text_attrs_of(&self, caret: &CaretStyle) -> TextAttrs {
+        let style = if caret.complex {
+            caret.full.complex_script_view()
+        } else {
+            caret.full.clone()
+        };
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let [r, g, b, a] = style.color.unwrap_or([0, 0, 0, 255]);
         let underline =
@@ -13398,6 +13484,120 @@ impl Engine {
             caps: style.caps.unwrap_or(false),
             small_caps: style.small_caps.unwrap_or(false),
         }
+    }
+
+    /// Issues #423 / #420 — `caret`'s formatting per script slot, fully
+    /// resolved the way layout resolves it (`StyleContext::run_font_ids`):
+    /// the slot's theme binding through the document theme (the
+    /// complex-script slot with the caret script's supplemental entry),
+    /// else the slot's own name, else — nothing in the document names it
+    /// — the face the font stack falls back to for the script. The
+    /// source says which cascade level answered: the run's own direct
+    /// formatting (+ pending style) → `Explicit`, a theme binding →
+    /// `Theme`, the style chain / docDefaults → `Style`, nothing →
+    /// `Default`.
+    fn font_slots_of(&self, caret: &CaretStyle) -> CaretFontSlots {
+        let theme = self.undo.current().theme.as_deref();
+        let direct = &caret.direct;
+        let latin_named = direct.font_family.is_some()
+            || direct
+                .raw_font_family
+                .as_deref()
+                .is_some_and(|n| !n.trim().is_empty());
+        let cs_named = direct.font_family_cs.is_some();
+        let resolve = |class, hint, named: bool| match caret.full.resolve_font(theme, class, hint) {
+            Some(r) if r.from_theme => (Some(r.family), bridge::FontSource::Theme),
+            Some(r) if named => (Some(r.family), bridge::FontSource::Explicit),
+            Some(r) => (Some(r.family), bridge::FontSource::Style),
+            None => (None, bridge::FontSource::Default),
+        };
+        let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
+        let full = &caret.full;
+        /* Built at most once, and only when a slot falls to `Default`. */
+        let stack = std::cell::OnceCell::new();
+        let slot = |(family, source): (Option<EngineFontFamily>, bridge::FontSource),
+                    script: text_pipeline::Script,
+                    size: Option<f32>,
+                    bold: Option<bool>,
+                    italic: Option<bool>| {
+            let (bold, italic) = (bold.unwrap_or(false), italic.unwrap_or(false));
+            let (id, name) = match family {
+                Some(f) => (font_family_id(&f).to_string(), f.display_name().to_string()),
+                None => {
+                    let id = self.default_face_for(&stack, script, bold, italic);
+                    let name = EngineFontFamily::from_id(&id)
+                        .map(|f| f.display_name().to_string())
+                        .unwrap_or_default();
+                    (id, name)
+                }
+            };
+            let format = bridge::BridgeSlotFormat {
+                font_family: id,
+                font_size: size.unwrap_or(default_size),
+                bold,
+                italic,
+            };
+            (name, source, format)
+        };
+        let (latin_name, latin_source, latin) = slot(
+            resolve(engine::FontClass::Latin, None, latin_named),
+            text_pipeline::Script::Latin,
+            full.font_size,
+            full.bold,
+            full.italic,
+        );
+        let (cs_name, cs_source, complex_script) = slot(
+            resolve(
+                engine::FontClass::ComplexScript,
+                Some(caret.script_hint),
+                cs_named,
+            ),
+            text_pipeline::Script::Arabic,
+            full.font_size_cs,
+            full.bold_cs,
+            full.italic_cs,
+        );
+        CaretFontSlots {
+            resolved_latin: latin_name,
+            resolved_cs: cs_name,
+            sources: bridge::BridgeFontSources {
+                latin: latin_source,
+                complex_script: cs_source,
+            },
+            formats: bridge::BridgeSlotFormats {
+                latin,
+                complex_script,
+            },
+            caret_slot: if caret.complex {
+                bridge::FontSlot::ComplexScript
+            } else {
+                bridge::FontSlot::Latin
+            },
+        }
+    }
+
+    /// Issue #423 — the face layout shapes `script` text with when the run
+    /// names no family for it (`FontStack::resolve` with no family): the
+    /// `Default` source's family id. The layout config's root face when
+    /// the stack cannot answer; empty before the first `RenderPage`.
+    /// `stack` caches the font stack across the two slots of one read-back.
+    fn default_face_for(
+        &self,
+        stack: &std::cell::OnceCell<FontStack>,
+        script: text_pipeline::Script,
+        bold: bool,
+        italic: bool,
+    ) -> String {
+        let Some(cfg) = self.layout_cfg.as_ref() else {
+            return String::new();
+        };
+        if self.fonts.is_empty() {
+            return cfg.font_id.clone();
+        }
+        stack
+            .get_or_init(|| FontStack::from_faces(self.fonts.clone(), &cfg.font_id))
+            .resolve(script, None, bold, italic)
+            .map_or_else(|| cfg.font_id.clone(), |(id, _, _)| id.clone())
     }
 
     /// Commit a document edit: push undo, collapse the caret at `caret`,
@@ -15287,7 +15487,13 @@ impl Engine {
                 &self.review_author,
                 &self.current_review_date(),
             )
-            .map_err(|e| Box::new(Event::error(format!("{cmd}: {e}"))))
+            .map_err(|e| {
+                /* Issue #364 - typed, so the shell shows a visible refusal. */
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                    kind: Some(bridge::ErrorKind::TrackedDeletionRefused),
+                })
+            })
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching
@@ -28235,6 +28441,10 @@ mod story_tab_tests;
 /// Issue #355 — theme fonts / colours through read → layout.
 #[cfg(test)]
 mod theme_layout_tests;
+
+/// Issues #423 / #420 — the per-slot font read-back on `SelectionChanged`.
+#[cfg(test)]
+mod font_readback_tests;
 
 #[cfg(test)]
 mod document_lifecycle_tests;

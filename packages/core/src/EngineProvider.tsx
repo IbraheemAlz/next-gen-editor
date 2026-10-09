@@ -33,12 +33,22 @@ const DocumentDefaultsContext = createContext<DocumentDefaults | undefined>(unde
  */
 const TelemetryEndpointContext = createContext<string | undefined>(undefined);
 
+/**
+ * Issue #389 - whether the host opted into debug-only surfaces (URL-driven
+ * toggles such as the Settings menu's renderer switch). Off by default:
+ * a production embed gets none of them, and the SDK itself never reads
+ * the page URL to decide. The reference shell passes its dev-hooks flag.
+ */
+const DebugSurfacesContext = createContext<boolean>(false);
+
 export interface EngineProviderProps {
     client: EngineHandle;
     /** Issue #340 - see [`TelemetryEndpointContext`]. */
     telemetryEndpoint?: string | undefined;
     /** Issue #221 — see [`DocumentDefaultsContext`]'s doc comment above. */
     documentDefaults?: DocumentDefaults;
+    /** Issue #389 - see [`DebugSurfacesContext`]. Default `false`. */
+    debugSurfaces?: boolean;
 }
 
 export const EngineProvider: ParentComponent<EngineProviderProps> = (props) => {
@@ -46,7 +56,9 @@ export const EngineProvider: ParentComponent<EngineProviderProps> = (props) => {
         <EngineContext.Provider value={props.client}>
             <DocumentDefaultsContext.Provider value={props.documentDefaults}>
                 <TelemetryEndpointContext.Provider value={props.telemetryEndpoint}>
-                    {props.children}
+                    <DebugSurfacesContext.Provider value={props.debugSurfaces === true}>
+                        {props.children}
+                    </DebugSurfacesContext.Provider>
                 </TelemetryEndpointContext.Provider>
             </DocumentDefaultsContext.Provider>
         </EngineContext.Provider>
@@ -83,4 +95,10 @@ export function useDocumentDefaults(): DocumentDefaults | undefined {
  *  `<EngineProvider telemetryEndpoint={...}>`; `undefined` when none. */
 export function useTelemetryEndpoint(): string | undefined {
     return useContext(TelemetryEndpointContext);
+}
+
+/** Issue #389 - whether the host enabled debug-only surfaces
+ *  (`<EngineProvider debugSurfaces>`); `false` outside any provider. */
+export function useDebugSurfaces(): boolean {
+    return useContext(DebugSurfacesContext);
 }

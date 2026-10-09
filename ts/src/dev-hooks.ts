@@ -1,8 +1,8 @@
 /* Issue #340 - build-time gate for the `window.__*` dev hooks.
  *
  * `window.__dispatch`, `__engineClient`, `__fontRegistry`,
- * `__setTelemetryEnabled`, `__telemetryFlush` and `__clipboardPrefetch`
- * give any same-origin script (an XSS payload included) a typed handle on
+ * `__setTelemetryEnabled`, `__telemetryFlush`, `__clipboardPrefetch` and
+ * `__lastStats` (issue #389) give any same-origin script (an XSS payload included) a typed handle on
  * the engine, and `?telemetryEndpoint=` lets a crafted link choose where
  * telemetry batches go. They exist for Playwright and the live-validation
  * workflow, so they are installed ONLY when:
@@ -11,9 +11,13 @@
  *   - the build was made with `VITE_NGE_DEV_HOOKS=1` (the Playwright
  *     config sets it; a release build never does).
  * The passive status flags (`__paintIdle`, `__engineReady`, `__renderer`,
- * `__recovered`, `__bootMs`, `__lastStats`) are not capabilities and stay
- * unconditional - they are how a production-build smoke test knows the
- * app booted.
+ * `__recovered`, `__bootMs`) are the ONLY unconditional `window.__*`
+ * values: they are not capabilities and are how a production-build smoke
+ * test knows the app booted. Issue #389 - the debug URL parameters
+ * (`?telemetryEndpoint=`, `?clipboardPrefetch=0`) and the Settings menu's
+ * renderer-switch URL toggle are honoured under the same flag only; a
+ * production host configures them through `EngineProvider` props / build
+ * constants.
  *
  * The SDK packages (`@nge/core`, `@nge/ui`) install no globals at all. */
 
