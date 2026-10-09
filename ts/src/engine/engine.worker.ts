@@ -1567,12 +1567,25 @@ function noteCleanState(cmd: Command, evt: Event): void {
     pendingLogWrites = pendingLogWrites.then(() => write);
 }
 
+/** Issue #345 — `cmd` as it may be persisted: secrets stripped. */
+function journalSafe(cmd: Command): Command {
+    if (cmd.type === 'OPEN_DOCUMENT' && cmd.password !== undefined) {
+        const { password: _password, ...rest } = cmd;
+        return rest;
+    }
+    return cmd;
+}
+
 /**
  * Append a command to the durable log without blocking the RPC response.
  * `logSequence` increments synchronously so sequence order is preserved even
  * though the IndexedDB writes settle asynchronously. Returns the row's seq.
  */
-function logCommand(cmd: Command): number {
+function logCommand(command: Command): number {
+    /* Issue #345 — an encrypted document's password never reaches the
+       durable log (a replay without it answers EncryptedDocument; the
+       snapshot pinned after the open restores the document instead). */
+    const cmd = journalSafe(command);
     const seq = ++logSequence;
     const write = appendCommand(seq, cmd).then(
         () => noteJournalWriteOk(),

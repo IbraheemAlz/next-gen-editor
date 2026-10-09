@@ -7952,6 +7952,7 @@ impl Engine {
                 name,
                 defaults,
                 limits,
+                password,
             } => match format {
                 DocFormat::Docx => {
                     /* Issue #77 — FILENAME resolves to the opened file's
@@ -7960,7 +7961,13 @@ impl Engine {
                         .as_deref()
                         .map(file_base_name)
                         .filter(|n| !n.is_empty());
-                    self.load_docx_bytes_with_limits(&bytes, "OpenDocument", defaults, limits)
+                    self.load_docx_bytes_with_limits(
+                        &bytes,
+                        "OpenDocument",
+                        defaults,
+                        limits,
+                        password.as_deref(),
+                    )
                 }
                 /* Issue #339 — `.txt` / `.html` open through the engine's
                 own plain-text model and the rich-paste HTML parser; no
@@ -16791,19 +16798,24 @@ impl Engine {
         origin: &'static str,
         defaults: Option<DocumentDefaults>,
     ) -> Event {
-        self.load_docx_bytes_with_limits(bytes, origin, defaults, None)
+        self.load_docx_bytes_with_limits(bytes, origin, defaults, None, None)
     }
 
     /// [`Self::load_docx_bytes`] under the host's `OpenDocument.limits`
     /// overrides (issue #348). A package past a limit is refused with
     /// `Event::Error { kind: PackageTooLarge }`; the open document, the
     /// undo stack and every per-document cache stay untouched.
+    ///
+    /// Issue #345 — `password` opens an encrypted (MS-OFFCRYPTO) package;
+    /// without it one answers `kind: EncryptedDocument` (also for a scheme
+    /// the reader does not decrypt), a wrong one `kind: WrongPassword`.
     fn load_docx_bytes_with_limits(
         &mut self,
         bytes: &[u8],
         origin: &'static str,
         defaults: Option<DocumentDefaults>,
         limits: Option<bridge::PackageLimitsOverride>,
+        password: Option<&str>,
     ) -> Event {
         let default_page_size = match defaults.as_ref().and_then(|d| d.page_size) {
             Some(BridgeDefaultPageSize::A4) => engine::DefaultPageSize::A4,
@@ -16812,8 +16824,9 @@ impl Engine {
         };
         let widow_control_default = defaults.and_then(|d| d.widow_control).unwrap_or(true);
         let limits = package_limits(limits);
-        match format_docx::read_docx_with_limits(
+        match format_docx::read_docx_with_password(
             bytes,
+            password,
             default_page_size,
             widow_control_default,
             &limits,
@@ -16838,7 +16851,11 @@ impl Engine {
                     }
                     /* Issue #345 — an encrypted (password-protected)
                     package: the shell says so instead of "not a zip". */
-                    format_docx::DocxError::Encrypted => Some(bridge::ErrorKind::EncryptedDocument),
+                    format_docx::DocxError::Encrypted
+                    | format_docx::DocxError::UnsupportedEncryption(_) => {
+                        Some(bridge::ErrorKind::EncryptedDocument)
+                    }
+                    format_docx::DocxError::WrongPassword => Some(bridge::ErrorKind::WrongPassword),
                     _ => None,
                 };
                 Event::Error {
@@ -26607,6 +26624,7 @@ mod tests {
                 page_size: Some(BridgeDefaultPageSize::Letter),
                 widow_control: None,
             }),
+            password: None,
         });
         assert!(
             matches!(evt, Event::DocumentLoaded { .. }),
@@ -26639,6 +26657,7 @@ mod tests {
                 name: None,
                 defaults: None,
                 limits,
+                password: None,
             })
         };
         let evt = open(
@@ -26711,6 +26730,7 @@ mod tests {
                 page_size: None,
                 widow_control: Some(false),
             }),
+            password: None,
         });
         assert!(
             matches!(evt, Event::DocumentLoaded { .. }),
@@ -28218,6 +28238,7 @@ mod snapshot_tests {
                 name: None,
                 limits: None,
                 defaults: None,
+                password: None,
             }],
         );
         assert!(!lost(&evt), "a replayed open supersedes the base");

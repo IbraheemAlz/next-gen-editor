@@ -604,6 +604,9 @@ pub enum ErrorKind {
     /// the command (a read-only document, comments-only, tracked-changes
     /// only, or an edit outside form-field content). Nothing changed.
     Protected,
+    /// Issue #345 — `OpenDocument.password` does not open the encrypted
+    /// package. The previous document stays open.
+    WrongPassword,
 }
 
 /// Issue #345 — an enforced editing restriction (`w:documentProtection`

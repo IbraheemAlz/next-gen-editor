@@ -73,6 +73,58 @@ test('an encrypted package is refused with the typed EncryptedDocument error', a
     await expect(page.locator('.nge-trap')).toHaveCount(0);
 });
 
+test('File → Open asks for the password of an encrypted document and opens it', async ({
+    page,
+}) => {
+    test.setTimeout(45_000);
+    await boot(page);
+    /* `encrypted_agile.docx`: AES-256 / SHA-512 x 100 000, password `pass`. */
+    await page
+        .locator('input[type="file"][accept*=".docx"]')
+        .setInputFiles(fileURLToPath(new URL('./fixtures/encrypted_agile.docx', import.meta.url)));
+    const dialog = page.getByRole('dialog', { name: 'Password required' });
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText('encrypted_agile.docx');
+    await expect(dialog).toContainText('Saving writes this document without a password');
+    /* The banner stays quiet: the dialog owns the encryption errors. */
+    await expect(page.locator('.nge-fm__error')).toHaveCount(0);
+
+    await dialog.getByLabel('Document password').fill('wrong');
+    await dialog.getByRole('button', { name: 'Open' }).click();
+    await expect(dialog.locator('.nge-fm__pw-error')).toContainText('incorrect');
+    await expect(page.locator('.nge-fm__error')).toHaveCount(0);
+
+    await dialog.getByLabel('Document password').fill('pass');
+    await dialog.getByRole('button', { name: 'Open' }).click();
+    await expect(dialog).toBeHidden({ timeout: 15_000 });
+    expect(await documentText(page)).toContain('Top secret: the password is pass.');
+
+    /* The password never reaches the durable event log. */
+    await settle(page);
+    const leaked = await page.evaluate(
+        () =>
+            new Promise<number>((resolve, reject) => {
+                const open = indexedDB.open('engine-log');
+                open.onerror = () => reject(open.error);
+                open.onsuccess = () => {
+                    const db = open.result;
+                    const all = db.transaction('commands').objectStore('commands').getAll();
+                    all.onerror = () => reject(all.error);
+                    all.onsuccess = () => {
+                        const rows = all.result as { cmd: { type: string; password?: string } }[];
+                        resolve(
+                            rows.filter(
+                                (r) => r.cmd.type === 'OPEN_DOCUMENT' && 'password' in r.cmd,
+                            ).length,
+                        );
+                    };
+                };
+            }),
+    );
+    expect(leaked).toBe(0);
+    await expect(page.locator('.nge-trap')).toHaveCount(0);
+});
+
 test('forms protection: typing outside a field is refused, inside it lands', async ({
     page,
 }) => {

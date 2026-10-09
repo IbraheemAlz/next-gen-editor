@@ -545,10 +545,20 @@ export interface EditorCommands {
      *  (`useDocumentDefaults()`), and omitted there too, the wire field is
      *  left out entirely — `format_docx::read_docx`'s unchanged A4 /
      *  widow-control-ON behaviour. */
+    /** Issue #345 — `opts.password` opens an encrypted (MS-OFFCRYPTO)
+     *  `.docx`: without it such a file answers `ERROR { kind:
+     *  'EncryptedDocument' }`, with a wrong one `kind: 'WrongPassword'`.
+     *  `bytes` is TRANSFERRED to the worker — keep the source (`File`) to
+     *  retry with a password. */
     openDocument(
         bytes: Uint8Array,
         name?: string,
-        opts?: { initialZoom?: number; defaults?: DocumentDefaults; format?: DocFormat },
+        opts?: {
+            initialZoom?: number;
+            defaults?: DocumentDefaults;
+            format?: DocFormat;
+            password?: string;
+        },
     ): Promise<Event>;
     saveDocument(format: DocFormat): Promise<Event>;
     saveDocx(): Promise<Event>;
@@ -1036,18 +1046,16 @@ function build(
                the same pattern with `include_docx`). */
             const defaults = opts?.defaults ?? documentDefaults;
             const format = opts?.format ?? docFormatForFileName(name);
-            return dispatch(
-                defaults === undefined
-                    ? { type: 'OPEN_DOCUMENT', bytes, format, name: name ?? undefined }
-                    : {
-                          type: 'OPEN_DOCUMENT',
-                          bytes,
-                          format,
-                          name: name ?? undefined,
-                          defaults,
-                      },
-                [bytes.buffer as ArrayBuffer],
-            );
+            const open: Command = {
+                type: 'OPEN_DOCUMENT',
+                bytes,
+                format,
+                name: name ?? undefined,
+                ...(defaults !== undefined ? { defaults } : {}),
+                /* Issue #345 — omitted, never `undefined`, when absent. */
+                ...(opts?.password !== undefined ? { password: opts.password } : {}),
+            };
+            return dispatch(open, [bytes.buffer as ArrayBuffer]);
         },
         saveDocument: (format) => dispatch({ type: 'SAVE_DOCUMENT', format }),
         saveDocx: () => dispatch({ type: 'SAVE_DOCX' }),

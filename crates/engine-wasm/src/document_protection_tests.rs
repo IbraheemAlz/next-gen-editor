@@ -55,8 +55,69 @@ fn open_docx(e: &mut Engine, bytes: Vec<u8>) -> Event {
             name: Some("x.docx".into()),
             defaults: None,
             limits: None,
+            password: None,
         },
     )
+}
+
+fn open_docx_with_password(e: &mut Engine, bytes: Vec<u8>, password: &str) -> Event {
+    apply(
+        e,
+        Command::OpenDocument {
+            bytes,
+            format: DocFormat::Docx,
+            name: Some("locked.docx".into()),
+            defaults: None,
+            limits: None,
+            password: Some(password.into()),
+        },
+    )
+}
+
+/// Issue #345 — `OpenDocument.password` opens a real agile-encrypted
+/// package (and the Office-written POI fixture when the corpus is
+/// present); a wrong password is the typed `WrongPassword`, no password
+/// `EncryptedDocument`, and neither touches the open document.
+#[test]
+fn open_document_with_a_password_decrypts() {
+    let mut packages = vec![(
+        format_docx::test_fixtures::encrypted_agile_docx(),
+        Some(format_docx::test_fixtures::ENCRYPTED_FIXTURE_TEXT),
+    )];
+    packages.extend(corpus_password_fixture().map(|b| (b, None)));
+    for (bytes, text) in packages {
+        let mut e = engine_with(DocumentTree::from_text("keep me"));
+        let evt = open_docx(&mut e, bytes.clone());
+        assert!(
+            matches!(
+                evt,
+                Event::Error {
+                    kind: Some(bridge::ErrorKind::EncryptedDocument),
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
+        let evt = open_docx_with_password(&mut e, bytes.clone(), "wrong");
+        assert!(
+            matches!(
+                evt,
+                Event::Error {
+                    kind: Some(bridge::ErrorKind::WrongPassword),
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
+        assert_eq!(e.undo.current().to_plain_text(), "keep me");
+        let evt = open_docx_with_password(&mut e, bytes, "pass");
+        assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+        if let Some(text) = text {
+            assert_eq!(e.undo.current().to_plain_text(), text);
+        } else {
+            assert!(!e.undo.current().to_plain_text().trim().is_empty());
+        }
+    }
 }
 
 /// The Apache POI corpus fixture (`bug53475-password-is-pass.docx`, agile
