@@ -47,6 +47,20 @@ export type {
     EditorError,
 } from './createEditorState';
 
+/* Issue #387 — keep the caret visible after keyboard navigation / typing. */
+export { createCaretReveal } from './createCaretReveal';
+export type { CaretRevealOptions } from './createCaretReveal';
+export {
+    CARET_REVEAL_MARGIN_PX,
+    MAX_PAINT_SCALE,
+    SCREEN_DPI_SCALE,
+    deviceRatioFor,
+    keepBoxVisible,
+    offsetInViewport,
+    revealScroll,
+} from './caretReveal';
+export type { ScrollView, ViewBox } from './caretReveal';
+
 export { createFontRegistry } from './createFontRegistry';
 export type {
     FontRegistry,
@@ -191,4 +205,5 @@ export type {
     BridgeParaPropertiesPatch,
     RendererDowngrade,
     RendererDowngradeReason,
+    CommentHighlight,
 } from './types';

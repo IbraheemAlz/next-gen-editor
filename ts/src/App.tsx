@@ -14,6 +14,8 @@ import { PageSelectionOverlay } from './components/PageSelectionOverlay';
 import { ImageHandlesOverlay } from './components/ImageHandlesOverlay';
 import { StoryModeOverlay } from './components/StoryModeOverlay';
 import { HiddenInput } from './components/HiddenInput';
+import { CaretReveal } from './components/CaretReveal';
+import { CommentHighlights } from '@nge/ui';
 import { SdkShelf } from './sdk-bridge';
 import { AccessibilityTree } from './components/AccessibilityTree';
 import { Announcements } from './components/Announcements';
@@ -347,6 +349,9 @@ export function App() {
                 onRevealCaret={revealCaret}
             >
                 <div class="editor-viewport" ref={viewportEl}>
+                    {/* Issue #387 — keyboard-driven caret moves scroll the
+                        caret into view (pointer clicks never do). */}
+                    <CaretReveal store={store} viewport={() => viewportEl} />
                     {/* Phase 6c multi-canvas DOM — one `.editor-page` per
                         paginated page. Page 0 hosts the boot canvas (the
                         engine's INIT surface + selection / caret overlays
@@ -400,6 +405,8 @@ export function App() {
                                     />
                                 )}
                             </For>
+                            {/* Issue #387 — commented text, tinted. */}
+                            <CommentHighlights pageIdx={0} />
                             <PageSelectionOverlay store={store} pageIdx={0} />
                             <CaretOverlay store={store} pageIdx={0} />
                             <ImageHandlesOverlay

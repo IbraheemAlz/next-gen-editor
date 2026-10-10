@@ -297,6 +297,12 @@ let broadcastMutationSeq = 0;
    this. */
 let broadcastGeometrySeq = 0;
 
+/* Issue #387 — whether the last `CommentHighlights` broadcast carried any
+   comment, so the one empty broadcast that clears the overlay goes out
+   exactly once after the last comment is deleted. A fresh worker (INIT,
+   crash recovery) starts with nothing on screen. */
+let broadcastHadHighlights = false;
+
 /* Highest `version` seen on a real `Painted` event — synthetic paint-dims
    broadcasts reuse it so `paintVersion` consumers never see a reset to 0. */
 let lastPaintVersion = 0;
@@ -1373,6 +1379,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                    repainting the replay itself triggered is already
                    reflected in the state the shell just rebuilt from. */
                 broadcastGeometrySeq = engine.paint_geometry_seq();
+                /* Issue #387 — the restored document's comment ranges. */
+                broadcastCommentHighlights();
             }
         }
         /* Issue #268 — a pinned base restored WITHOUT its (pruned) tail:
@@ -1485,6 +1493,8 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
                emits more pages. */
             broadcastPaintDims();
             broadcastGeometrySeq = engine.paint_geometry_seq();
+            /* Issue #387 — the commented ranges moved with the edit. */
+            broadcastCommentHighlights();
         } else {
             /* Issue #231 — `SET_ZOOM` / `SET_DEVICE_SCALE` (and, via
                `ExpandLayout`'s own `RequestPaint`, `EXPAND_LAYOUT`) repaint
@@ -1508,6 +1518,8 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
                 if (evt.type !== 'PAINTED') {
                     broadcastPaintDims();
                 }
+                /* Issue #387 — a zoom / expand repaint moves every rect. */
+                broadcastCommentHighlights();
             }
         }
         /* Sprint 10 — drain queued aria-live announcements (queued by
@@ -1588,6 +1600,30 @@ function broadcastPaintDims(): void {
         });
     } catch (e: unknown) {
         console.warn('[worker] paint_dims broadcast failed', e);
+    }
+}
+
+/**
+ * Issue #387 — broadcast the engine's `Event::CommentHighlights` (per-line
+ * rects of every commented range) on the subscribe path. The engine
+ * answers `undefined` for a document without comments: nothing is posted
+ * then, except one empty list right after the last comment went, so the
+ * overlay clears.
+ */
+function broadcastCommentHighlights(): void {
+    if (!engine) return;
+    try {
+        const evt = engine.comment_highlights() as Event | undefined;
+        if (evt) {
+            self.postMessage({ evt });
+            broadcastHadHighlights = true;
+        } else if (broadcastHadHighlights) {
+            const cleared: Event = { type: 'COMMENT_HIGHLIGHTS', highlights: [] };
+            self.postMessage({ evt: cleared });
+            broadcastHadHighlights = false;
+        }
+    } catch (e: unknown) {
+        console.warn('[worker] comment_highlights broadcast failed', e);
     }
 }
 

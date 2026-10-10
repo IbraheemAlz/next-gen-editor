@@ -198,7 +198,9 @@ fn resolve_line_height(
 /// Issue #329 — `(ascent + gap, descent)` of one line in the paragraph
 /// MARK's face (the run cascade under the mark's own formatting; its
 /// complex-script set in an RTL paragraph), resolved through the stack
-/// like a text run.
+/// like a text run. Under Word's font pitch this is what sizes an empty
+/// paragraph (issue #370's rule; the configured-pitch
+/// `layout::empty_mark_pitch` scaling does not apply here).
 fn mark_line_extents(
     p: &Paragraph,
     doc: &DocumentTree,
@@ -325,7 +327,17 @@ fn build_style_spans(p: &Paragraph, doc: &DocumentTree) -> Vec<StyleSpan> {
         cursor = end;
     }
     if cursor < text_len || out.is_empty() {
-        out.push(span_from_style(&base, cursor, text_len, &p.text, theme));
+        /* Issue #370 — an empty paragraph's one zero-width span is its
+        paragraph MARK (`<w:pPr><w:rPr>` over the style), which sizes its
+        line (`layout::empty_line_extents`), as in engine-wasm. */
+        let style = match p.mark_style.as_deref() {
+            Some(mark) if text_len == 0 => base.clone().merged_with(SpanStyle {
+                grab_bag: None,
+                ..mark.clone()
+            }),
+            _ => base.clone(),
+        };
+        out.push(span_from_style(&style, cursor, text_len, &p.text, theme));
     }
     out
 }

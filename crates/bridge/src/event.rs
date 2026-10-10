@@ -482,6 +482,16 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[tsify(optional)]
         protection: Option<ProtectionMode>,
+        /// Issue #387 — the command this event answers moved the caret
+        /// by keyboard or programmatically (navigation, typing, an edit,
+        /// undo / redo — `bridge::CommandMeta::reveals_caret`), so the
+        /// shell scrolls `caret` into view. `false` for a pointer gesture
+        /// (the user clicked where they are looking), Ctrl+A, a view
+        /// change (zoom, device scale) or a property edit, and for every
+        /// event produced outside `Engine::apply`. Additive — `false`
+        /// from producers that predate it.
+        #[serde(default)]
+        reveal_caret: bool,
     },
     /// Issue #239 — reply to `SetZoom` / `SetDeviceScale` when no
     /// `RenderPage` has run yet: there is no layout config to fold the
@@ -580,6 +590,22 @@ pub enum Event {
         message: String,
     },
 
+    /// Issue #387 — the on-canvas highlight of every commented range, as
+    /// per-line rectangles in absolute document device px (the
+    /// `SelectionChanged.rects` space: pages stacked top to bottom with
+    /// the paint's inter-page gap), computed from the BODY's laid-out
+    /// lines exactly like selection rectangles (per visual run, so a
+    /// BiDi line yields its discontinuous segments). Broadcast
+    /// unsolicited on `subscribe()` (never a reply) after every command
+    /// that changed the document or its painted geometry, only while
+    /// the document has comments — plus one empty list when the last
+    /// one goes, so the overlay clears. Additive: no `Command` carries
+    /// it. A comment anchored past the laid-out band has no rects until
+    /// layout reaches it.
+    CommentHighlights {
+        highlights: Vec<CommentHighlight>,
+    },
+
     /// Issue #390 - health of the worker's durable event log, broadcast
     /// unsolicited on `subscribe()` (like the accessibility deltas; never
     /// a reply, never produced by `Engine::apply`) whenever it changes.
@@ -606,6 +632,25 @@ pub enum Event {
         #[serde(default)]
         journal_failing: bool,
     },
+}
+
+/// Issue #387 — one top-level comment's on-canvas highlight
+/// ([`Event::CommentHighlights`]). Replies ride their thread root's range
+/// and are not listed separately.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+pub struct CommentHighlight {
+    /// The comment's `w:id` (the comments rail's `CommentSnapshot.id`).
+    pub id: u32,
+    /// Display author for the hover label (empty when the comment has
+    /// none).
+    pub author: String,
+    /// `<w15:commentEx w15:done="1">` — the overlay tints a resolved
+    /// thread more faintly.
+    pub resolved: bool,
+    /// Per-line rectangles, document order. A collapsed (point) comment
+    /// yields one narrow marker at its anchor; an anchor the laid-out
+    /// lines do not reach yields none.
+    pub rects: Vec<Rect>,
 }
 
 /// Issue #348 — the class of an [`Event::Error`] the shell can present
@@ -1621,6 +1666,40 @@ mod a11y_note_wire_tests {
                 "kind": "TrackedDeletionRefused"
             })
         );
+    }
+
+    /// Issue #387 — `CommentHighlights` is an unsolicited, additive event
+    /// with per-comment rect lists (device px).
+    #[test]
+    fn comment_highlights_wire_shape() {
+        let evt = serde_json::to_value(Event::CommentHighlights {
+            highlights: vec![CommentHighlight {
+                id: 3,
+                author: "Ada".into(),
+                resolved: false,
+                rects: vec![Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    w: 30.0,
+                    h: 12.0,
+                }],
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            evt,
+            serde_json::json!({
+                "type": "COMMENT_HIGHLIGHTS",
+                "highlights": [{
+                    "id": 3,
+                    "author": "Ada",
+                    "resolved": false,
+                    "rects": [{ "x": 10.0, "y": 20.0, "w": 30.0, "h": 12.0 }]
+                }]
+            })
+        );
+        let back: Event = serde_json::from_value(evt).unwrap();
+        assert!(matches!(back, Event::CommentHighlights { highlights } if highlights.len() == 1));
     }
 
     /// Issue #390 - `CheckpointState` is an unsolicited, additive event:

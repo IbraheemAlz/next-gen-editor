@@ -19,6 +19,7 @@ import { PageSelectionOverlay } from './PageSelectionOverlay';
 import { CaretOverlay } from './CaretOverlay';
 import { ImageHandlesOverlay } from './ImageHandlesOverlay';
 import { StoryModeOverlay } from './StoryModeOverlay';
+import { CommentHighlights } from '@nge/ui';
 
 export interface ExtraPageCanvasProps {
     client: EngineClient;
@@ -67,6 +68,8 @@ export function ExtraPageCanvas(props: ExtraPageCanvasProps) {
             }}
         >
             <canvas ref={canvasRef} class="editor-canvas" />
+            {/* Issue #387 — commented text, tinted. */}
+            <CommentHighlights pageIdx={props.pageIdx} />
             <PageSelectionOverlay store={props.store} pageIdx={props.pageIdx} />
             <CaretOverlay store={props.store} pageIdx={props.pageIdx} />
             <ImageHandlesOverlay

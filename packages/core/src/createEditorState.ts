@@ -32,6 +32,7 @@ import type {
     BridgeSlotFormats,
     BridgeTabStop,
     CheckpointStatus,
+    CommentHighlight,
     Direction,
     EngineStats,
     ErrorKind,
@@ -53,8 +54,19 @@ import type {
 export interface EditorState {
     /** Current selection (anchor + caret), `undefined` before first SELECTION_CHANGED. */
     selection: Accessor<LogicalRange | undefined>;
-    /** Caret rectangle (single Rect — the active caret tip). */
+    /** Caret rectangle (single Rect — the active caret tip), in absolute
+     *  document device px (pages stacked with the paint's gap; x is
+     *  page-local). */
     caret: Accessor<Rect | undefined>;
+    /**
+     * Issue #387 — bumps once per `SELECTION_CHANGED` whose command moved
+     * the caret by keyboard or programmatically (navigation, typing, an
+     * edit, undo — `reveal_caret`), never for a pointer gesture, Ctrl+A or
+     * a zoom. A host scrolls {@link EditorState.caret} into view when it
+     * moves (`createCaretReveal`, which `EditorSurface` uses). `0` until
+     * the first such event.
+     */
+    caretRevealSeq: Accessor<number>;
     /** Per-line selection rectangles in device px. */
     rects: Accessor<Rect[]>;
     /** Resolved text attributes at the caret. */
@@ -127,7 +139,9 @@ export interface EditorState {
      * from uniform page-size constants. Issue #280 — `widths` are the
      * per-page widths (device px, index-aligned; empty from a pre-#280
      * engine); a host sizes its page cards from `widths` / `heights`
-     * so a zoom visibly resizes the page.
+     * so a zoom visibly resizes the page. Issue #387 — shared like
+     * `zoom` (one signal per engine), so a page overlay mounted after the
+     * last paint still positions against the live geometry.
      */
     pageGeometry: Accessor<{ tops: number[]; heights: number[]; widths: number[] }>;
     /** Active renderer reported by the worker at INIT, re-reported by the
@@ -299,6 +313,13 @@ export interface EditorState {
      * Shared like `zoom`.
      */
     fontSubstitutions: Accessor<FontSubstitution[]>;
+     * Issue #387 — the on-canvas highlight of every top-level comment
+     * (`Event::CommentHighlights`): per-line rects in absolute document
+     * device px, the `caret` / `rects` space. Empty for a document without
+     * comments. Shared like `zoom`, so an overlay mounted late starts from
+     * the live highlights.
+     */
+    commentHighlights: Accessor<CommentHighlight[]>;
 }
 
 /**
@@ -333,8 +354,16 @@ export interface CheckpointHealth {
     lastError: string | undefined;
 }
 
+interface PageGeometryState {
+    tops: number[];
+    heights: number[];
+    widths: number[];
+}
+
 interface ViewState {
     zoom: Accessor<number>;
+    pageGeometry: Accessor<PageGeometryState>;
+    commentHighlights: Accessor<CommentHighlight[]>;
     deviceScale: Accessor<number | undefined>;
     rendererDowngrade: Accessor<RendererDowngrade | undefined>;
     lastRecovery: Accessor<RecoveryReport | undefined>;
@@ -422,7 +451,28 @@ function viewStateFor(engine: EngineHandle): ViewState {
         /* Issue #364 - every `Event::Error` reply, with its command. */
         const [lastError, setLastError] = createSignal<EditorError | undefined>(undefined);
         let errorCount = 0;
+        /* Issue #26 / #387 — the paginator's page geometry, shared. */
+        const [pageGeometry, setPageGeometry] = createSignal<PageGeometryState>({
+            tops: [],
+            heights: [],
+            widths: [],
+        });
+        /* Issue #387 — every commented range's highlight rects. */
+        const [commentHighlights, setCommentHighlights] = createSignal<CommentHighlight[]>([]);
         engine.subscribe((evt: Event) => {
+            if (evt.type === 'PAINTED' && evt.page_tops.length > 0) {
+                setPageGeometry({
+                    tops: evt.page_tops,
+                    heights: evt.page_heights,
+                    widths: evt.page_widths ?? [],
+                });
+            } else if (evt.type === 'COMMENT_HIGHLIGHTS') {
+                setCommentHighlights(evt.highlights);
+            } else if (evt.type === 'DOCUMENT_LOADED' || evt.type === 'DOCUMENT_CLOSED') {
+                /* The next broadcast (if the new document has comments)
+                   repopulates; until then nothing stale is drawn. */
+                setCommentHighlights([]);
+            }
             if (evt.type === 'ERROR') {
                 errorCount += 1;
                 const prefix = /^([A-Za-z][A-Za-z0-9]*): /.exec(evt.message);
@@ -475,6 +525,8 @@ function viewStateFor(engine: EngineHandle): ViewState {
         });
         return {
             zoom,
+            pageGeometry,
+            commentHighlights,
             deviceScale,
             rendererDowngrade,
             lastRecovery,
@@ -498,6 +550,7 @@ export function createEditorState(): EditorState {
 
     const [selection, setSelection] = createSignal<LogicalRange | undefined>(undefined);
     const [caret, setCaret] = createSignal<Rect | undefined>(undefined);
+    const [caretRevealSeq, setCaretRevealSeq] = createSignal(0);
     const [rects, setRects] = createSignal<Rect[]>([]);
     const [attrsAtCaret, setAttrsAtCaret] = createSignal<TextAttrs | undefined>(undefined);
     const [attrsMixed, setAttrsMixed] = createSignal<AttrsMixed | undefined>(undefined);
@@ -517,11 +570,6 @@ export function createEditorState(): EditorState {
     const [paintVersion, setPaintVersion] = createSignal(0);
     const [estimatedDocumentHeight, setEstimatedDocumentHeight] = createSignal(0);
     const [layoutDegraded, setLayoutDegraded] = createSignal<LayoutDegraded[]>([]);
-    const [pageGeometry, setPageGeometry] = createSignal<{
-        tops: number[];
-        heights: number[];
-        widths: number[];
-    }>({ tops: [], heights: [], widths: [] });
     const [renderer, setRenderer] = createSignal(engine.renderer);
     const [sectionGeometry, setSectionGeometry] =
         createSignal<BridgeSectionGeometry | undefined>(undefined);
@@ -572,6 +620,8 @@ export function createEditorState(): EditorState {
                 setEditingStory(evt.editing_story);
                 setFieldCodeView(evt.field_code_view);
                 setFieldAtCaret(evt.field_at_caret);
+                /* Issue #387 — last, so a reveal effect reads the new caret. */
+                if (evt.reveal_caret === true) setCaretRevealSeq((n) => n + 1);
                 break;
             }
             case 'UNDO_STATE_CHANGED': {
@@ -602,13 +652,6 @@ export function createEditorState(): EditorState {
                 setPaintVersion(evt.version);
                 setEstimatedDocumentHeight(evt.estimated_document_height);
                 setLayoutDegraded(evt.layout_degraded ?? []);
-                if (evt.page_tops.length > 0) {
-                    setPageGeometry({
-                        tops: evt.page_tops,
-                        heights: evt.page_heights,
-                        widths: evt.page_widths ?? [],
-                    });
-                }
                 break;
             }
             default:
@@ -621,6 +664,7 @@ export function createEditorState(): EditorState {
     return {
         selection,
         caret,
+        caretRevealSeq,
         rects,
         attrsAtCaret,
         attrsMixed,
@@ -640,7 +684,7 @@ export function createEditorState(): EditorState {
         paintVersion,
         estimatedDocumentHeight,
         layoutDegraded,
-        pageGeometry,
+        pageGeometry: view.pageGeometry,
         renderer,
         sectionGeometry,
         cellProperties,
@@ -663,5 +707,6 @@ export function createEditorState(): EditorState {
         openWarnings: view.openWarnings,
         previousSessions: view.previousSessions,
         fontSubstitutions: view.fontSubstitutions,
+        commentHighlights: view.commentHighlights,
     };
 }
