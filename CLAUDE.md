@@ -362,7 +362,7 @@ Engine backlog" references a real issue.
   (issue #425). A wall-clock assertion in Playwright fails under machine load
   with the code unchanged (`boot.spec.ts` once read 717 ms at load 43-58).
   `ts/e2e/boot.spec.ts` is a smoke (`__bootMs` / `__engineReady` reported);
-  the D2.1 worker-boot < 500 ms gate is `workerBootMs` in
+  the D2.1 worker-boot < 500 ms gate is `workerBootMs` and the D2.4 50 MB SAB-transfer < 50 ms gate is `sabTransferMs` (issue #452; `sab-transfer.spec.ts` is a functional smoke) in
   `node tools/perf/run.mjs --strict`, alongside cold start and insert p95.
 - `pnpm -r test` (issue #332) — the TypeScript **unit** tests: `vitest`
   (pinned, workspace root dev dep; shared node-environment config in

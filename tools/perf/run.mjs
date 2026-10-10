@@ -53,8 +53,12 @@ const BUDGETS = {
        here, on a quiet runner, and NOT in the blocking e2e suite
        (`ts/e2e/boot.spec.ts` is only a smoke) - a wall-clock budget there
        fails under machine load with the code unchanged. */
-    'tier-1': { coldStartMs: 3000, workerBootMs: 500, insertP95Ms: 8, openDocMs: 1000 },
-    'tier-2': { coldStartMs: 8000, workerBootMs: 500, insertP95Ms: 16, openDocMs: 2500 },
+    /* `sabTransferMs` = D2.4 exit gate (issue #452): a 50 MB ArrayBuffer
+       round-trips through a worker via Transferable in < 50 ms. Moved out of
+       `ts/e2e/sab-transfer.spec.ts` (now a functional smoke) for the same
+       reason as `workerBootMs`. */
+    'tier-1': { coldStartMs: 3000, workerBootMs: 500, sabTransferMs: 50, insertP95Ms: 8, openDocMs: 1000 },
+    'tier-2': { coldStartMs: 8000, workerBootMs: 500, sabTransferMs: 50, insertP95Ms: 16, openDocMs: 2500 },
 };
 const budget = BUDGETS[hardware];
 if (!budget) {
@@ -77,6 +81,7 @@ console.log(`[perf] origin=${ORIGIN} hardware=${hardware} mode=${strict ? 'stric
 const browser = await chromium.launch({ headless: true, channel: 'chrome' });
 let coldStartMs = 0;
 let workerBootMs = null;
+let sab = null;
 let samples = [];
 let openDocMs = null;
 let tables = null;
@@ -91,6 +96,27 @@ try {
     workerBootMs = await page.evaluate(() =>
         typeof window.__bootMs === 'number' ? window.__bootMs : null,
     );
+
+    /* --- D2.4: 50 MB zero-copy worker round-trip (issue #452) --- */
+    sab = await page.evaluate(async () => {
+        const SIZE = 50 * 1024 * 1024;
+        const src = 'self.onmessage = (e) => { const b = e.data; self.postMessage(b, [b]); };';
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        try {
+            const buf = new ArrayBuffer(SIZE);
+            const t0 = performance.now();
+            const echoed = await new Promise((resolve) => {
+                worker.onmessage = (e) => resolve(e.data);
+                worker.postMessage(buf, [buf]);
+            });
+            return {
+                ms: performance.now() - t0,
+                ok: buf.byteLength === 0 && echoed.byteLength === SIZE,
+            };
+        } finally {
+            worker.terminate();
+        }
+    });
 
     /* --- Insert char @ caret, p95 (one-page seeded document) --- */
     samples = await page.evaluate(async (n) => {
@@ -173,6 +199,11 @@ console.log(
         `(budget ${budget.workerBootMs} ms)`,
 );
 console.log(
+    `[perf] SAB 50 MB transfer        : ` +
+        `${sab === null ? 'NOT REPORTED' : `${sab.ms.toFixed(1)} ms${sab.ok ? '' : ' (NOT ZERO-COPY)'}`} ` +
+        `(budget ${budget.sabTransferMs} ms)`,
+);
+console.log(
     `[perf] insert @ caret x${INSERT_KEYSTROKES}     : ` +
         `p50 ${p50.toFixed(2)} ms · p95 ${p95.toFixed(2)} ms · max ${maxInsert.toFixed(2)} ms ` +
         `(p95 budget ${budget.insertP95Ms} ms)`,
@@ -202,6 +233,8 @@ const breaches = [];
 if (coldStartMs >= budget.coldStartMs) breaches.push(`cold start ${coldStartMs}ms`);
 if (workerBootMs === null) breaches.push('worker boot never reported (__bootMs)');
 else if (workerBootMs >= budget.workerBootMs) breaches.push(`worker boot ${workerBootMs.toFixed(1)}ms`);
+if (sab === null || !sab.ok) breaches.push('SAB transfer not zero-copy / not reported');
+else if (sab.ms >= budget.sabTransferMs) breaches.push(`SAB transfer ${sab.ms.toFixed(1)}ms`);
 if (p95 >= budget.insertP95Ms) breaches.push(`insert p95 ${p95.toFixed(2)}ms`);
 
 /* Open-doc on a multi-page document is dominated by the engine's
