@@ -1068,10 +1068,7 @@ pub fn run_one(
     can be diffed by hand. */
     let dump = |suffix: &str, xml: &[u8]| {
         if let Some(dir) = dump_drift {
-            let stem = std::path::Path::new(path_label)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "document".into());
+            let stem = drift_dump_stem(path_label);
             let _ = std::fs::create_dir_all(dir);
             let _ = std::fs::write(dir.join(format!("{stem}.{suffix}.xml")), xml);
         }
@@ -1534,9 +1531,47 @@ mod cputime {
     }
 }
 
+/// Issue #452 - the file stem a `--dump-drift` pair is written under:
+/// the document's basename (readable) plus a short stable FNV-1a hash of
+/// its FULL path label, so `a/x.docx` and `b/x.docx` never overwrite
+/// each other. Filesystem-hostile characters in the basename are
+/// replaced; the result is deterministic across runs.
+pub(crate) fn drift_dump_stem(path_label: &str) -> String {
+    let base = std::path::Path::new(path_label)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".into());
+    let base: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path_label.replace('\\', "/").bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{base}-{:08x}", h >> 32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drift_dump_stem_separates_same_named_documents() {
+        let a = drift_dump_stem("corpus/a/x.docx");
+        let b = drift_dump_stem("corpus/b/x.docx");
+        assert_ne!(a, b);
+        assert!(a.starts_with("x.docx-") && b.starts_with("x.docx-"));
+        assert_eq!(a, drift_dump_stem("corpus/a/x.docx"));
+        assert!(!drift_dump_stem("d/we ird:name.docx").contains([' ', ':']));
+    }
 
     #[test]
     fn rewritten_region_reports_prefix_and_spans() {
