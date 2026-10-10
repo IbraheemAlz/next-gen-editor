@@ -37,6 +37,7 @@ export type {
     EngineStats,
     Event,
     FontMetrics,
+    ErrorKind,
     ImageBlob,
     ImageFit,
     ImageWrapMode,

@@ -33,6 +33,8 @@ pub const UI_ROOTS: &[&str] = &["packages/ui/src", "packages/core/src", "ts/src"
 pub const E2E_ROOT: &str = "ts/e2e";
 /// The `@nge/ui` toast (`ERROR_TOAST_COPY` and friends, issue #427).
 pub const ERROR_TOAST: &str = "packages/ui/src/ErrorToast.tsx";
+/// The telemetry collector (`ERROR_KIND_SAMPLING`, issue #461).
+pub const TELEMETRY_TS: &str = "ts/src/state/telemetry.ts";
 /// The fuzz generator holding the `classify_variants!` list.
 pub const FUZZ_GEN: &str = "fuzz/src/command_gen.rs";
 /// Ratchet: `Implemented` commands the e2e suite dispatches by wire name.
@@ -103,6 +105,17 @@ pub struct Sources {
     pub own_presentation: BTreeSet<String>,
     /// Issue #427 - the `ErrorKind` keys of `ERROR_KIND_PRESENTATION`.
     pub presentation_keys: BTreeSet<String>,
+    /// Issue #461 - the `ErrorKind` keys of telemetry's `ERROR_KIND_SAMPLING`.
+    pub sampling_keys: BTreeSet<String>,
+}
+
+/// Issue #461 - the `ErrorKind` keys of `ERROR_KIND_SAMPLING` in `telemetry.ts`.
+pub fn parse_error_sampling(src: &str) -> BTreeSet<String> {
+    object_lines(src, "ERROR_KIND_SAMPLING")
+        .into_iter()
+        .filter_map(|l| l.trim().split_once(':').map(|(k, _)| k.trim().to_string()))
+        .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric()))
+        .collect()
 }
 
 /// Issue #427 - parse the error-kind tables out of `ErrorToast.tsx`:
@@ -196,6 +209,7 @@ pub fn load(root: &Path) -> std::io::Result<Sources> {
         toast_copy,
         own_presentation,
         presentation_keys,
+        sampling_keys: parse_error_sampling(&read(root, TELEMETRY_TS)?),
         facade,
         members,
         ui,
@@ -610,6 +624,12 @@ impl Matrix {
                     "ErrorKind::{k} has toast copy AND an own presentation"
                 ));
             }
+            if !s.sampling_keys.contains(*k) {
+                v.push(format!(
+                    "ErrorKind::{k} is missing from ERROR_KIND_SAMPLING ({TELEMETRY_TS}): \
+                     map it to a telemetry sample or mark it 'not-sampled'"
+                ));
+            }
             if !s.presentation_keys.contains(*k) {
                 v.push(format!(
                     "ErrorKind::{k} is missing from ERROR_KIND_PRESENTATION"
@@ -620,6 +640,7 @@ impl Matrix {
             ("ERROR_TOAST_COPY", &s.toast_copy),
             ("ERROR_KINDS_WITH_OWN_PRESENTATION", &s.own_presentation),
             ("ERROR_KIND_PRESENTATION", &s.presentation_keys),
+            ("ERROR_KIND_SAMPLING", &s.sampling_keys),
         ] {
             for k in set {
                 if !kinds.contains(k.as_str()) {
@@ -943,6 +964,14 @@ mod tests {
             "ERROR_KIND_PRESENTATION lists every kind"
         );
         assert!(m.error_kind_violations().is_empty());
+        assert_eq!(
+            m.sources.sampling_keys.len(),
+            bridge::ErrorKind::ALL.len(),
+            "ERROR_KIND_SAMPLING lists every kind (#461)"
+        );
+        let mut unsampled = m.clone();
+        unsampled.sources.sampling_keys.remove("InvalidArgument");
+        assert!(unsampled.error_kind_violations()[0].contains("ERROR_KIND_SAMPLING"));
         let mut broken = m.clone();
         broken.sources.toast_copy.remove("InTableCell");
         let v = broken.error_kind_violations();

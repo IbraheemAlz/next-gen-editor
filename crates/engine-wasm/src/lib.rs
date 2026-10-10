@@ -18352,7 +18352,7 @@ impl Engine {
         self.with_selection_doc(|d| d.resolve_table_target(&epath, row, col).and_then(extra))
             .map_err(|e| {
                 Box::new(Event::error_kind(
-                    bridge::ErrorKind::NoSuchTarget,
+                    table_error_kind(&e),
                     format!("{cmd}: {e}"),
                 ))
             })
@@ -19274,6 +19274,27 @@ struct RenderStats {
     page_content_bottoms: Vec<f32>,
     /// Issue #87 — degradation notes for this paint.
     layout_degraded: Vec<LayoutDegraded>,
+}
+
+/// Issue #454 - the typed refusal for a [`engine::TableError`]. Exhaustive
+/// (no wildcard): a new variant cannot compile without choosing a kind.
+/// - the path addresses no table -> `NoSuchTarget`;
+/// - a nested table (editing it is unsupported) -> `UnsupportedHere`;
+/// - a row / column index past the end (this includes a merge rectangle
+///   whose corner does not exist) and every growth-cap / count failure
+///   -> `OutOfRange`.
+fn table_error_kind(e: &engine::TableError) -> bridge::ErrorKind {
+    use engine::TableError as T;
+    match e {
+        T::NotATable { .. } => bridge::ErrorKind::NoSuchTarget,
+        T::NestedUnsupported { .. } => bridge::ErrorKind::UnsupportedHere,
+        T::RowOutOfRange { .. }
+        | T::ColOutOfRange { .. }
+        | T::ZeroDimension
+        | T::TooManyRows { .. }
+        | T::TooManyCols { .. }
+        | T::TooManyCells { .. } => bridge::ErrorKind::OutOfRange,
+    }
 }
 
 #[cfg(test)]
@@ -30289,6 +30310,185 @@ mod wire_validation_tests {
         assert_eq!(table(&e).rows.len(), before.rows.len());
         assert_eq!(e.undo.current().blocks.len(), 2);
         assert!(selection_valid(&e));
+    }
+
+    /// Issue #454 - the kind each `TableError` variant surfaces as.
+    fn table_err_kind(evt: &Event) -> Option<bridge::ErrorKind> {
+        match evt {
+            Event::Error { kind, .. } => *kind,
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_error_not_a_table_is_no_such_target() {
+        let mut e = table_engine();
+        for path in [WirePath::top(1), WirePath::top(9)] {
+            let evt = apply(
+                &mut e,
+                Command::DeleteRow {
+                    table_path: path,
+                    row: 0,
+                },
+            );
+            assert_eq!(table_err_kind(&evt), Some(bridge::ErrorKind::NoSuchTarget));
+        }
+    }
+
+    #[test]
+    fn table_error_nested_is_unsupported_here() {
+        let e = table_engine();
+        let mut doc = e.undo.current().clone();
+        let mut blocks = doc.blocks.clone();
+        let mut b = blocks[0].clone();
+        if let engine::Block::Table(t) = &mut b {
+            t.rows[0].cells[0]
+                .blocks
+                .push(engine::Block::Table(engine::Table::default()));
+        }
+        blocks.set(0, b);
+        doc.blocks = blocks;
+        let mut e2 = engine_with(doc, bpos_top(1, 0));
+        let nested = WirePath {
+            steps: vec![
+                BridgePathStep::Block { idx: 0 },
+                BridgePathStep::Cell { row: 0, col: 0 },
+                BridgePathStep::Block { idx: 1 },
+            ],
+        };
+        let evt = apply(
+            &mut e2,
+            Command::DeleteRow {
+                table_path: nested,
+                row: 0,
+            },
+        );
+        assert_eq!(
+            table_err_kind(&evt),
+            Some(bridge::ErrorKind::UnsupportedHere)
+        );
+    }
+
+    #[test]
+    fn table_error_row_and_col_past_end_are_out_of_range() {
+        let mut e = table_engine();
+        let t = WirePath::top(0);
+        let cmds = [
+            Command::DeleteRow {
+                table_path: t.clone(),
+                row: 5,
+            },
+            Command::DeleteColumn {
+                table_path: t.clone(),
+                col: 9,
+            },
+            Command::SplitCell {
+                table_path: t.clone(),
+                row: 3,
+                col: 0,
+            },
+            Command::SetCellShading {
+                table_path: t.clone(),
+                row: 0,
+                col: 7,
+                color: None,
+            },
+            /* A merge rectangle whose corner does not exist. */
+            Command::MergeCells {
+                table_path: t.clone(),
+                from_row: 0,
+                from_col: 0,
+                to_row: 5,
+                to_col: 5,
+            },
+            Command::MergeCells {
+                table_path: t.clone(),
+                from_row: 0,
+                from_col: 0,
+                to_row: 1,
+                to_col: 9,
+            },
+        ];
+        for cmd in cmds {
+            let label = format!("{cmd:?}");
+            let evt = apply(&mut e, cmd);
+            assert_eq!(
+                table_err_kind(&evt),
+                Some(bridge::ErrorKind::OutOfRange),
+                "{label}"
+            );
+        }
+    }
+
+    fn grown_table_engine(rows: u32, cols: u32) -> Engine {
+        let doc = DocumentTree::from_text("tail").insert_table(EngineBlockPath::top(0), rows, cols);
+        engine_with(doc, bpos_top(1, 0))
+    }
+
+    #[test]
+    fn table_error_too_many_rows_is_out_of_range() {
+        let mut e = grown_table_engine(engine::MAX_TABLE_ROWS, 1);
+        let evt = apply(
+            &mut e,
+            Command::InsertRow {
+                table_path: WirePath::top(0),
+                row: 0,
+                side: InsertSide::After,
+            },
+        );
+        assert_eq!(table_err_kind(&evt), Some(bridge::ErrorKind::OutOfRange));
+        assert!(format!("{evt:?}").contains("row limit"), "{evt:?}");
+    }
+
+    #[test]
+    fn table_error_too_many_cols_is_out_of_range() {
+        let mut e = grown_table_engine(1, engine::MAX_TABLE_COLS);
+        let evt = apply(
+            &mut e,
+            Command::InsertColumn {
+                table_path: WirePath::top(0),
+                col: 0,
+                side: InsertSide::After,
+            },
+        );
+        assert_eq!(table_err_kind(&evt), Some(bridge::ErrorKind::OutOfRange));
+        assert!(format!("{evt:?}").contains("column limit"), "{evt:?}");
+    }
+
+    #[test]
+    fn table_error_too_many_cells_is_out_of_range() {
+        /* 1 040 x 63 = 65 520 cells; one more row is 65 583 > the cap. */
+        let mut e = grown_table_engine(1_040, 63);
+        let evt = apply(
+            &mut e,
+            Command::InsertRow {
+                table_path: WirePath::top(0),
+                row: 0,
+                side: InsertSide::After,
+            },
+        );
+        assert_eq!(table_err_kind(&evt), Some(bridge::ErrorKind::OutOfRange));
+        assert!(format!("{evt:?}").contains("cell limit"), "{evt:?}");
+    }
+
+    #[test]
+    fn table_error_zero_dimension_is_out_of_range() {
+        /* Not reachable through a table command (InsertTable has its own
+        check); pin the mapping itself. */
+        assert_eq!(
+            table_error_kind(&engine::TableError::ZeroDimension),
+            bridge::ErrorKind::OutOfRange
+        );
+        let mut e = text_engine("x");
+        let evt = apply(
+            &mut e,
+            Command::InsertTable {
+                at: WirePath::top(0),
+                rows: 0,
+                cols: 3,
+            },
+        );
+        assert_eq!(table_err_kind(&evt), Some(bridge::ErrorKind::OutOfRange));
     }
 
     #[test]

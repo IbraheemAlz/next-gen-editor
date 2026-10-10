@@ -194,6 +194,17 @@ describe('batching and folding', () => {
         expect(kinds().map((k) => k.type)).toEqual(['ERROR']);
     });
 
+    it('carries the typed ErrorKind on an ERROR sample; an untyped one is UNKNOWN (#461)', async () => {
+        start();
+        client.emit({ type: 'ERROR', message: 'x', kind: 'InvalidArgument' });
+        client.emit({ type: 'ERROR', message: 'y' });
+        await tick();
+        expect(ofType('ERROR')).toEqual([
+            { type: 'ERROR', code: 'UNKNOWN', recoverable: true, kind: 'InvalidArgument' },
+            { type: 'ERROR', code: 'UNKNOWN', recoverable: true },
+        ]);
+    });
+
     it('counts every failed checkpoint write as an ERROR / CHECKPOINT_FAILED sample (#333)', async () => {
         start();
         for (const l of client.checkpointListeners) l(1);

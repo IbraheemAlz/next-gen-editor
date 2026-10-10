@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{RendererDowngrade, Script};
-use crate::event::{EngineStats, LayoutDegradeReason, ReadWarningKind};
+use crate::event::{EngineStats, ErrorKind, LayoutDegradeReason, ReadWarningKind};
 
 /// One telemetry sample. `doc_id` is anonymized — never a document title or
 /// path, only an opaque per-session identifier.
@@ -32,7 +32,19 @@ pub enum TelemetryKind {
     /// A memory / performance counter snapshot.
     EngineStats(EngineStats),
     /// A recoverable or fatal engine error, classified coarsely.
-    Error { code: ErrorCode, recoverable: bool },
+    Error {
+        code: ErrorCode,
+        recoverable: bool,
+        /// Issue #461 - the typed [`ErrorKind`] of an engine `Event::Error`
+        /// refusal (#427 / #407), so refusal rates are visible per kind.
+        /// `None` (omitted from the wire) for every sample that did not
+        /// come from a typed engine reply - an untyped `Event::Error`
+        /// stays `code: UNKNOWN` with no kind, the shell-synthesized
+        /// codes (`CHECKPOINT_FAILED`, ...) keep their exact prior shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        kind: Option<ErrorKind>,
+    },
     /// A font fallback — signals a missing font package for `script`.
     FontFallback {
         script: Script,
@@ -504,10 +516,25 @@ mod tests {
         let kind = TelemetryKind::Error {
             code: ErrorCode::EngineTrap,
             recoverable: true,
+            kind: None,
         };
         assert_eq!(
             roundtrip(&kind),
             serde_json::json!({ "type": "ERROR", "code": "ENGINE_TRAP", "recoverable": true })
+        );
+    }
+
+    #[test]
+    fn typed_error_sample_carries_its_kind() {
+        // Issue #461 - the kind rides the ERROR sample under its wire name.
+        let kind = TelemetryKind::Error {
+            code: ErrorCode::Unknown,
+            recoverable: true,
+            kind: Some(ErrorKind::InvalidArgument),
+        };
+        assert_eq!(
+            roundtrip(&kind),
+            serde_json::json!({ "type": "ERROR", "code": "UNKNOWN", "recoverable": true, "kind": "InvalidArgument" })
         );
     }
 
@@ -517,6 +544,7 @@ mod tests {
         let kind = TelemetryKind::Error {
             code: ErrorCode::CheckpointFailed,
             recoverable: true,
+            kind: None,
         };
         assert_eq!(
             roundtrip(&kind),
@@ -530,6 +558,7 @@ mod tests {
         let kind = TelemetryKind::Error {
             code: ErrorCode::JournalFailed,
             recoverable: true,
+            kind: None,
         };
         assert_eq!(
             roundtrip(&kind),

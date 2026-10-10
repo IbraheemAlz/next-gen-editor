@@ -86,7 +86,7 @@ struct Args {
     with_edit: bool,
     timeout_secs: u64,
     worker: Option<PathBuf>,
-    /// Issue #112 — `--dump-drift DIR`: write `<name>.orig.xml` /
+    /// Issue #112 — `--dump-drift DIR`: write `<name>-<hash>.orig.xml` /
     /// `<name>.resaved.xml` for every document whose zero-edit resave is
     /// not byte-identical, so the drift can be diffed.
     dump_drift: Option<PathBuf>,

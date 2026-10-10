@@ -17,7 +17,7 @@
  * an opaque per-session id; the crash sample's `recent_commands` carries only
  * dispatched `Command.type` tags (e.g. `"INSERT_TEXT"`), never a command's
  * payload (which, for `InsertText`, IS document content). */
-import type { Command, Event } from '../engine/types';
+import type { Command, ErrorKind, Event } from '../engine/types';
 import { readWarningCounts, type ReadWarningCount } from './read-warning-counts';
 import { installDevHook } from '../dev-hooks';
 
@@ -29,6 +29,34 @@ type ErrorCode =
     | 'CHECKPOINT_FAILED'
     | 'JOURNAL_FAILED'
     | 'UNKNOWN';
+/** Issue #461 - every `bridge::ErrorKind` is either folded into the `ERROR`
+ *  sample's `kind` ('sampled') or deliberately left out ('not-sampled').
+ *  `Record<ErrorKind, ...>` makes `tsc` fail on a new kind; `tools/parity`
+ *  is the Rust-side floor (same pattern as `ERROR_KIND_PRESENTATION`).
+ *  Every kind is sampled today: a refusal rate per kind is the point. */
+export const ERROR_KIND_SAMPLING: Record<ErrorKind, 'sampled' | 'not-sampled'> = {
+    PackageTooLarge: 'sampled',
+    TrackedDeletionRefused: 'sampled',
+    EncryptedDocument: 'sampled',
+    Protected: 'sampled',
+    WrongPassword: 'sampled',
+    NoSelection: 'sampled',
+    NotInParagraph: 'sampled',
+    InStory: 'sampled',
+    InTableCell: 'sampled',
+    NoFieldAtCaret: 'sampled',
+    NoSuchTarget: 'sampled',
+    NotInHeaderFooter: 'sampled',
+    UnsupportedHere: 'sampled',
+    OutOfRange: 'sampled',
+    EmptyInput: 'sampled',
+    NestingTooDeep: 'sampled',
+    NotReady: 'sampled',
+    Unimplemented: 'sampled',
+    Internal: 'sampled',
+    InvalidDocument: 'sampled',
+    InvalidArgument: 'sampled',
+};
 type RecoveryOutcome = 'RECOVERED' | 'FAILED' | 'PENDING';
 /** Mirror of `bridge::RendererDowngrade` (issue #99). */
 interface RendererDowngrade {
@@ -92,7 +120,7 @@ type TelemetryKind =
           last_paint_ms: number;
           last_command_ms: number;
       }
-    | { type: 'ERROR'; code: ErrorCode; recoverable: boolean }
+    | { type: 'ERROR'; code: ErrorCode; recoverable: boolean; kind?: ErrorKind }
     | { type: 'FONT_FALLBACK'; script: string; requested: string; fallback: string }
     /* Issue #87 — one sample per `Painted.layout_degraded` note. */
     | { type: 'LAYOUT_DEGRADED'; reason: string; page: number | undefined }
@@ -405,7 +433,19 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
         } else if (e.type === 'TRAP') {
             armCrashSample(e.stack);
         } else if (e.type === 'ERROR') {
-            pending.push(sample({ type: 'ERROR', code: 'UNKNOWN', recoverable: true }));
+            /* Issue #461 - a typed refusal carries its kind (the code stays
+               UNKNOWN: the kind IS the classification); an untyped error is
+               UNKNOWN with no kind. */
+            const kind = e.kind;
+            if (kind !== undefined && ERROR_KIND_SAMPLING[kind] === 'not-sampled') return;
+            pending.push(
+                sample({
+                    type: 'ERROR',
+                    code: 'UNKNOWN',
+                    recoverable: true,
+                    ...(kind !== undefined ? { kind } : {}),
+                }),
+            );
         }
     });
 
