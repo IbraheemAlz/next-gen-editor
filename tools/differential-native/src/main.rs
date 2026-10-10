@@ -23,67 +23,17 @@ mod pipeline;
 use anyhow::{Context, Result};
 use format_docx::read_docx;
 use format_pdf::{PdfProfile, export_pdf_with_media};
-use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
-use text_pipeline::{FontStack, LoadedFont};
+use text_pipeline::FontStack;
 
-/// Issue #329 — the faces the editor's shell boots with (`ts/public/
-/// fonts.json` `defaults` + `substitutes`) under their manifest ids:
-/// Liberation Sans, Amiri, Noto Naskh Arabic, and the substitutes the
-/// font-substitution table maps document families to (Carlito for
-/// Calibri, Caladea for Cambria, Liberation Serif / Mono for Times New
-/// Roman / Courier New, Gelasio for Georgia, Selawik for Segoe UI).
-/// `FontStack::from_faces` classifies each by script and indexes its
-/// `name`-table family, so a document's families resolve exactly as in the
-/// editor (`pipeline` passes them through).
+/// The harness font stack (issue #464: Latin -> Liberation Sans, Arabic ->
+/// Amiri, shared with `corpus-native` through `harness-fonts`) plus the
+/// editor's substitute faces (issue #329), so a document's families resolve
+/// as in the editor: Calibri -> Carlito, Simplified Arabic -> Noto Naskh
+/// Arabic, ... (`pipeline` passes them through).
 fn build_font_stack() -> Result<FontStack> {
-    let mut faces: HashMap<String, Arc<LoadedFont>> = HashMap::new();
-    let seeds: &[(&str, &[u8])] = &[
-        (
-            "liberation",
-            include_bytes!("../../../ts/public/fonts/LiberationSans-Regular.ttf"),
-        ),
-        (
-            "amiri",
-            include_bytes!("../../../ts/public/fonts/Amiri-Regular.ttf"),
-        ),
-        (
-            "noto-naskh",
-            include_bytes!("../../../ts/public/fonts/NotoNaskhArabic-Regular.ttf"),
-        ),
-        (
-            "carlito",
-            include_bytes!("../../../ts/public/fonts/Carlito-Regular.ttf"),
-        ),
-        (
-            "caladea",
-            include_bytes!("../../../ts/public/fonts/Caladea-Regular.ttf"),
-        ),
-        (
-            "liberation-serif",
-            include_bytes!("../../../ts/public/fonts/LiberationSerif-Regular.ttf"),
-        ),
-        (
-            "liberation-mono",
-            include_bytes!("../../../ts/public/fonts/LiberationMono-Regular.ttf"),
-        ),
-        (
-            "gelasio",
-            include_bytes!("../../../ts/public/fonts/Gelasio-Regular.ttf"),
-        ),
-        (
-            "selawik",
-            include_bytes!("../../../ts/public/fonts/Selawik-Regular.ttf"),
-        ),
-    ];
-    for (id, bytes) in seeds {
-        let face = LoadedFont::parse((*id).to_string(), bytes.to_vec())
-            .map_err(|e| anyhow::anyhow!("parse font `{id}`: {e:?}"))?;
-        faces.insert((*id).to_string(), Arc::new(face));
-    }
-    Ok(FontStack::from_faces(faces, "liberation"))
+    Ok(harness_fonts::harness_stack_with_substitutes())
 }
 
 /// Issue #109 — best-effort substring check: does the raw `word/document.xml`

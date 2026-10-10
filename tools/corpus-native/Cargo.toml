@@ -15,6 +15,7 @@ engine = { path = "../../crates/engine" }
 format-docx = { path = "../../crates/format-docx" }
 layout = { path = "../../crates/layout" }
 text-pipeline = { path = "../../crates/text-pipeline" }
+harness-fonts = { path = "../harness-fonts" }
 format-pdf = { path = "../../crates/format-pdf" }
 # Issue #318 — the production layout (`Engine::build_pages`, real table
 # grid + autofit, headers/footers, notes) driven natively through the

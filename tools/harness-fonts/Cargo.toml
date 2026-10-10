@@ -1,0 +1,10 @@
+[package]
+name = "harness-fonts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared native font stack for the QA harnesses (corpus-native, differential-native): Latin runs resolve to Liberation Sans, Arabic runs to Amiri, as in the browser shell (issue #464)."
+
+[dependencies]
+text-pipeline = { path = "../../crates/text-pipeline" }
