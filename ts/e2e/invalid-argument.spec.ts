@@ -40,6 +40,12 @@ test('NaN / infinite numeric arguments are refused as InvalidArgument and change
         ['ERROR', 'InvalidArgument'],
         ['ERROR', 'InvalidArgument'],
     ]);
+    expect(replies.map((r: any) => r.command)).toEqual([
+        'APPLY_FORMATTING',
+        'SET_ZOOM',
+        'REQUEST_PAINT',
+        'EXPAND_LAYOUT',
+    ]);
     expect(replies[0].message).toMatch(/^ApplyFormatting: attrs\.font_size is NaN /);
     expect(replies[1].message).toMatch(/^SetZoom: scale is inf /);
     expect(replies[2].message).toMatch(/^RequestPaint: viewport\.h is NaN /);
@@ -53,7 +59,7 @@ test('NaN / infinite numeric arguments are refused as InvalidArgument and change
     await page.keyboard.press('Control+Shift+D');
     const row = page.locator('.nge-hud__lasterror');
     await expect(row).toBeVisible();
-    await expect(row).toContainText('ExpandLayout · InvalidArgument · #4');
+    await expect(row).toContainText('EXPAND_LAYOUT · InvalidArgument · #4');
 
     /* Nothing changed, and the same commands with finite numbers work. */
     expect(await documentText(page)).toBe(before);

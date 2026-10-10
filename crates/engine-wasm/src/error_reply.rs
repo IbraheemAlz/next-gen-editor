@@ -30,9 +30,7 @@ mod tests {
             kind: None,
             command: Some("OTHER".into()),
         };
-        assert!(
-            matches!(stamp(keep, kind), Event::Error { command: Some(c), .. } if c == "OTHER")
-        );
+        assert!(matches!(stamp(keep, kind), Event::Error { command: Some(c), .. } if c == "OTHER"));
         assert!(matches!(stamp(Event::Pong, kind), Event::Pong));
     }
 }

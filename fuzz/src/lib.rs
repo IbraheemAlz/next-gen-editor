@@ -233,7 +233,10 @@ pub fn run_rpc_command(data: &[u8]) {
         }
         /* Issue #469 — every error reply to a dispatched command names
         that command by its wire name (stamped by `Engine::apply`). */
-        if let bridge::Event::Error { command, message, .. } = &evt {
+        if let bridge::Event::Error {
+            command, message, ..
+        } = &evt
+        {
             assert_eq!(
                 command.as_deref(),
                 Some(keep.kind().wire_name().as_str()),
