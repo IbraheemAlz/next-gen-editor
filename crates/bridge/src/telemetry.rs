@@ -44,6 +44,13 @@ pub enum TelemetryKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[tsify(optional)]
         kind: Option<ErrorKind>,
+        /// Issue #469 - the wire name (`"APPLY_FORMATTING"`) of the command
+        /// the refusal answered (`Event::Error.command`), so refusals can
+        /// be counted per command x kind. A command name, never content.
+        /// Omitted when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        command: Option<String>,
     },
     /// A font fallback — signals a missing font package for `script`.
     FontFallback {
@@ -497,6 +504,7 @@ mod tests {
             code: ErrorCode::EngineTrap,
             recoverable: true,
             kind: None,
+            command: None,
         };
         assert_eq!(
             roundtrip(&kind),
@@ -511,10 +519,26 @@ mod tests {
             code: ErrorCode::Unknown,
             recoverable: true,
             kind: Some(ErrorKind::InvalidArgument),
+            command: None,
         };
         assert_eq!(
             roundtrip(&kind),
             serde_json::json!({ "type": "ERROR", "code": "UNKNOWN", "recoverable": true, "kind": "InvalidArgument" })
+        );
+    }
+
+    #[test]
+    fn error_sample_carries_the_refused_command() {
+        // Issue #469 - additive `command` (wire name), omitted when absent.
+        let kind = TelemetryKind::Error {
+            code: ErrorCode::Unknown,
+            recoverable: true,
+            kind: Some(ErrorKind::InvalidArgument),
+            command: Some("APPLY_FORMATTING".to_string()),
+        };
+        assert_eq!(
+            roundtrip(&kind),
+            serde_json::json!({ "type": "ERROR", "code": "UNKNOWN", "recoverable": true, "kind": "InvalidArgument", "command": "APPLY_FORMATTING" })
         );
     }
 
@@ -525,6 +549,7 @@ mod tests {
             code: ErrorCode::CheckpointFailed,
             recoverable: true,
             kind: None,
+            command: None,
         };
         assert_eq!(
             roundtrip(&kind),
@@ -539,6 +564,7 @@ mod tests {
             code: ErrorCode::JournalFailed,
             recoverable: true,
             kind: None,
+            command: None,
         };
         assert_eq!(
             roundtrip(&kind),
