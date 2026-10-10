@@ -199,14 +199,15 @@ jobs:
     name: Playwright e2e suite
     needs: wasm
     runs-on: ubuntu-24.04
-    # Issue #230 — the suite itself runs in under a minute locally
-    # (`workers: 1` — several specs are timing-sensitive, see
-    # playwright.config.ts).
+    # Issue #230 — `workers: 1` (several specs are timing-sensitive, see
+    # playwright.config.ts); the suite runs in ~4 min locally and took
+    # 4.7 min on the runner at 129 specs (2026-10-10), so the old 5-minute
+    # cap cancelled a fully green run at the "129 passed" line.
     # No Rust toolchain / wasm-pack build in this job (the `wasm` job's
-    # artifact is reused below), so the whole job should land well inside
-    # this cap; the cap exists to catch a Vite dev-server boot stall, not
-    # the suite itself.
-    timeout-minutes: 5
+    # artifact is reused below). The cap exists to catch a Vite dev-server
+    # boot stall or a hung spec, not to bound the suite — keep it at least
+    # 3× the suite's runner time.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
