@@ -114,6 +114,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[tsify(optional)]
         kind: Option<ErrorKind>,
+        /// Issue #469 — the wire name (`"APPLY_FORMATTING"`) of the
+        /// command this error answers, stamped by the engine's
+        /// dispatcher from `CommandMeta` so no consumer has to parse the
+        /// `<CommandName>: ` message prefix. Additive: skipped when
+        /// `None` (an error not tied to a dispatched command, or a
+        /// pre-#469 payload).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        command: Option<String>,
     },
 
     // ===================================================================
@@ -899,6 +908,7 @@ impl Event {
         Event::Error {
             message: message.into(),
             kind: Some(kind),
+            command: None,
         }
     }
 
@@ -907,7 +917,20 @@ impl Event {
         Event::Error {
             message: message.into(),
             kind: None,
+            command: None,
         }
+    }
+
+    /// Issue #469 — stamp the answered command's wire name on an
+    /// [`Event::Error`] that does not carry one yet; every other event
+    /// (and an already-attributed error) passes through unchanged.
+    pub fn with_command(mut self, wire_name: impl FnOnce() -> String) -> Self {
+        if let Event::Error { command, .. } = &mut self
+            && command.is_none()
+        {
+            *command = Some(wire_name());
+        }
+        self
     }
 }
 
@@ -1498,12 +1521,23 @@ mod a11y_note_wire_tests {
         let typed = serde_json::to_value(Event::Error {
             message: "too big".into(),
             kind: Some(ErrorKind::PackageTooLarge),
+            command: None,
         })
         .unwrap();
         assert_eq!(
             typed,
             serde_json::json!({ "type": "ERROR", "message": "too big", "kind": "PackageTooLarge" })
         );
+        /* Issue #469 - the command name rides as an additive field. */
+        let attributed = serde_json::to_value(
+            Event::error("ApplyFormatting: no").with_command(|| "APPLY_FORMATTING".to_string()),
+        )
+        .unwrap();
+        assert_eq!(attributed["command"], "APPLY_FORMATTING");
+        assert!(typed.get("command").is_none(), "absent when None");
+        let legacy: Event =
+            serde_json::from_value(serde_json::json!({ "type": "ERROR", "message": "m" })).unwrap();
+        assert!(matches!(legacy, Event::Error { command: None, .. }));
         /* Issue #427 - `ErrorKind::ALL` / `name()` agree with the wire. */
         let mut seen = std::collections::BTreeSet::new();
         for k in ErrorKind::ALL {
@@ -1517,6 +1551,7 @@ mod a11y_note_wire_tests {
         let encrypted = serde_json::to_value(Event::Error {
             message: "locked".into(),
             kind: Some(ErrorKind::EncryptedDocument),
+            command: None,
         })
         .unwrap();
         assert_eq!(encrypted["kind"], "EncryptedDocument");
@@ -1524,6 +1559,7 @@ mod a11y_note_wire_tests {
         let invalid = serde_json::to_value(Event::Error {
             message: "SetZoom: scale is NaN".into(),
             kind: Some(ErrorKind::InvalidArgument),
+            command: None,
         })
         .unwrap();
         assert_eq!(invalid["kind"], "InvalidArgument");
@@ -1545,6 +1581,7 @@ mod a11y_note_wire_tests {
         let refused = serde_json::to_value(Event::Error {
             message: "protected".into(),
             kind: Some(ErrorKind::Protected),
+            command: None,
         })
         .unwrap();
         assert_eq!(refused["kind"], "Protected");
@@ -1613,6 +1650,7 @@ mod a11y_note_wire_tests {
         let typed = serde_json::to_value(Event::Error {
             message: "DeleteRange: table".into(),
             kind: Some(ErrorKind::TrackedDeletionRefused),
+            command: None,
         })
         .unwrap();
         assert_eq!(

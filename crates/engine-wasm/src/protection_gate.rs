@@ -87,6 +87,7 @@ impl Engine {
         Event::Error {
             message: format!("{}: {message}", cmd.kind().name()),
             kind: Some(bridge::ErrorKind::Protected),
+            command: None,
         }
     }
 

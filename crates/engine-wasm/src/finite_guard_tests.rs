@@ -81,6 +81,7 @@ fn invalid_argument(evt: &Event) -> Option<&str> {
         Event::Error {
             message,
             kind: Some(bridge::ErrorKind::InvalidArgument),
+            ..
         } => Some(message),
         _ => None,
     }
@@ -352,4 +353,32 @@ fn recovery_replays_around_a_logged_non_finite_command() {
     assert_eq!(b.undo.current().to_plain_text(), "!alpha");
     let cfg = b.layout_cfg.as_ref().unwrap();
     assert!(cfg.zoom.is_finite() && cfg.scale.is_finite());
+}
+
+/// Issue #469 - a refused command's `Event::Error` carries the command's
+/// wire name as a field (early refusals included); the message prefix is no longer the only carrier.
+#[test]
+fn refusal_carries_the_command_wire_name() {
+    let mut e = engine_with(DocumentTree::from_text("hello"));
+    let evt = apply(
+        &mut e,
+        Command::ApplyFormatting {
+            range: Some(range(0, 5)),
+            attrs: font_size_patch(f32::NAN),
+        },
+    );
+    assert!(
+        matches!(&evt, Event::Error { command: Some(c), kind: Some(bridge::ErrorKind::InvalidArgument), .. } if c == "APPLY_FORMATTING"),
+        "{evt:?}"
+    );
+    /* A story-gated / protection-gated / handler refusal goes through the
+    same choke point: every Error reply names its command. */
+    for (bad, _) in poisoned(f32::INFINITY) {
+        let wire_name = bad.kind().wire_name();
+        let evt = apply(&mut e, bad);
+        assert!(
+            matches!(&evt, Event::Error { command: Some(c), .. } if *c == wire_name),
+            "{wire_name}: {evt:?}"
+        );
+    }
 }

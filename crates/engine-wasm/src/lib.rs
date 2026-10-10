@@ -44,6 +44,7 @@ use text_pipeline::{
 use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
+mod error_reply;
 mod pdf_semantics;
 mod read_report;
 /// Issue #379 — the content-keyed table layout cache that survives
@@ -7481,6 +7482,7 @@ fn text_file_over_limits(
     (len as u64 > cap).then(|| Event::Error {
         message: format!("OpenDocument: the file is {len} bytes, over the {cap}-byte limit"),
         kind: Some(bridge::ErrorKind::PackageTooLarge),
+        command: None,
     })
 }
 
@@ -8264,7 +8266,11 @@ impl Engine {
         let revision_before = self.undo.revision();
         /* Issue #387 — classified once, in `bridge::meta`. */
         let reveals_caret = cmd.meta().reveals_caret;
-        let mut evt = self.apply_command(cmd).await;
+        let cmd_kind = cmd.kind();
+        /* Issue #469 - the ONE place an error reply is attributed to the
+        command it answers (finite guard, story / protection gates and
+        every handler refusal all return through here). */
+        let mut evt = error_reply::stamp(self.apply_command(cmd).await, cmd_kind);
         if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
             self.mutation_seq += 1;
         }
@@ -8301,6 +8307,7 @@ impl Engine {
             return Event::Error {
                 message: format!("{}: {bad}", cmd.kind().name()),
                 kind: Some(bridge::ErrorKind::InvalidArgument),
+                command: None,
             };
         }
         if let Some(rejected) = self.story_gate(&cmd) {
@@ -16076,6 +16083,7 @@ impl Engine {
                 Box::new(Event::Error {
                     message: format!("{cmd}: {e}"),
                     kind: Some(bridge::ErrorKind::TrackedDeletionRefused),
+                    command: None,
                 })
             })
     }
@@ -17552,6 +17560,7 @@ impl Engine {
                 Event::Error {
                     message: format!("{origin}: {e}"),
                     kind,
+                    command: None,
                 }
             }
         }
@@ -27419,6 +27428,36 @@ mod tests {
         }
     }
 
+    /// Issue #469 - the fuzz-native invariant: every `Event::Error` reply to
+    /// a dispatched command names that command's wire name.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn fuzz_native_error_replies_carry_the_command_wire_name() {
+        let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+        let cmds = vec![
+            Command::SetZoom { scale: f32::NAN },
+            Command::DeleteRange {
+                range: BridgeLogicalRange {
+                    start: bpos_top(9, 0),
+                    end: bpos_top(9, 3),
+                },
+            },
+            Command::Ping,
+        ];
+        let mut errors = 0;
+        for cmd in cmds {
+            let wire = cmd.kind().wire_name();
+            if let Event::Error {
+                command, message, ..
+            } = engine.apply_sync(cmd)
+            {
+                errors += 1;
+                assert_eq!(command.as_deref(), Some(wire.as_str()), "{message}");
+            }
+        }
+        assert!(errors >= 1, "at least the NaN guard must refuse");
+    }
+
     /// Issue #221 — `OpenDocument.defaults.page_size` reaches
     /// `format_docx::read_docx_with_settings` through the REAL bridge
     /// dispatcher (`Engine::apply`, not a direct `load_docx_bytes` call):
@@ -27487,6 +27526,7 @@ mod tests {
                 Event::Error {
                     kind: Some(bridge::ErrorKind::PackageTooLarge),
                     message,
+                    ..
                 } if message.contains("XML nesting depth")
             ),
             "{evt:?}"
