@@ -1,0 +1,27 @@
+/* Issue #465 - dotted leader from a comment's anchor to its rail card.
+ * One full-window SVG, click-through, above the canvas but below popovers. */
+.nge-comment-connectors {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: visible;
+    z-index: var(--nge-z-overlay, 10);
+}
+
+.nge-comment-connector {
+    fill: none;
+    stroke: var(--nge-color-comment-highlight-edge);
+    stroke-width: 1;
+    stroke-dasharray: 2 3;
+}
+
+.nge-comment-connector--active {
+    stroke: var(--nge-color-primary);
+    stroke-width: 1.5;
+}
+
+.nge-comment-connector--resolved {
+    stroke: var(--nge-color-comment-highlight-resolved);
+}

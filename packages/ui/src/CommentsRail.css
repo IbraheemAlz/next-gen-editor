@@ -133,8 +133,11 @@
 }
 
 .nge-cm__card--active {
+    /* Issue #465 - Word's selected balloon: stronger border + tinted
+       surface while the caret is inside the comment's range. */
     border-color: var(--nge-color-primary);
-    box-shadow: var(--nge-shadow-md);
+    background: var(--nge-color-comment-card-active);
+    box-shadow: 0 0 0 1px var(--nge-color-primary), var(--nge-shadow-md);
 }
 
 .nge-cm__card--resolved {
