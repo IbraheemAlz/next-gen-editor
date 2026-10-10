@@ -23,39 +23,14 @@ mod pipeline;
 use anyhow::{Context, Result};
 use format_docx::read_docx;
 use format_pdf::{PdfProfile, export_pdf_with_media};
-use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
-use text_pipeline::{FontStack, LoadedFont};
+use text_pipeline::FontStack;
 
-/// The three fonts committed under `ts/fonts/` — Latin (Liberation Sans) and
-/// two Arabic faces (Amiri for justified/kashida body text, Noto Naskh as a
-/// second covering face). `FontStack::from_faces` classifies each by script
-/// automatically (`fonts.rs::from_faces`), so no per-script wiring is needed
-/// here.
+/// The harness font stack - Latin -> Liberation Sans, Arabic -> Amiri, shared
+/// with `corpus-native` through `harness-fonts` (issue #464).
 fn build_font_stack() -> Result<FontStack> {
-    let mut faces: HashMap<String, Arc<LoadedFont>> = HashMap::new();
-    let seeds: &[(&str, &[u8])] = &[
-        (
-            "liberation",
-            include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf"),
-        ),
-        (
-            "amiri",
-            include_bytes!("../../../ts/fonts/Amiri-Regular.ttf"),
-        ),
-        (
-            "noto-naskh",
-            include_bytes!("../../../ts/fonts/NotoNaskhArabic-Regular.ttf"),
-        ),
-    ];
-    for (id, bytes) in seeds {
-        let face = LoadedFont::parse((*id).to_string(), bytes.to_vec())
-            .map_err(|e| anyhow::anyhow!("parse font `{id}`: {e:?}"))?;
-        faces.insert((*id).to_string(), Arc::new(face));
-    }
-    Ok(FontStack::from_faces(faces, "liberation"))
+    Ok(harness_fonts::harness_stack())
 }
 
 /// Issue #109 — best-effort substring check: does the raw `word/document.xml`

@@ -16,5 +16,6 @@ format-docx = { path = "../../crates/format-docx" }
 format-pdf = { path = "../../crates/format-pdf" }
 layout = { path = "../../crates/layout" }
 text-pipeline = { path = "../../crates/text-pipeline" }
+harness-fonts = { path = "../harness-fonts" }
 anyhow = { workspace = true }
 zip = { workspace = true }
