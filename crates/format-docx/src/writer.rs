@@ -4268,6 +4268,21 @@ pub fn write_docx_with_notes(
 /// [`write_docx`] without choosing whether recorded source markup is
 /// trusted — the caller has set [`WRITE_AGAINST_SOURCE`].
 fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    let bytes = write_docx_raw(archive, doc)?;
+
+    /* Issue #468 — never hand back a package whose regenerated parts the
+    reader's own strict scan would have to repair (a corrupt file is worse
+    than a typed refusal). Parts copied byte-identical from the source are
+    not re-scanned. */
+    crate::opc::well_formed::verify_saved(
+        &bytes,
+        &archive.other_entries,
+        archive.part_names.main.as_str(),
+    )?;
+    Ok(bytes)
+}
+
+fn write_docx_raw(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
     let names = &archive.part_names;
     let main_dir_prefix = match names.main.rsplit_once('/') {
         Some((dir, _)) => format!("{dir}/"),
@@ -5217,7 +5232,9 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
         }
 
         /* Write the regenerated document.xml (built and finalized above,
-        issue #295). */
+        issue #295). Issue #468 — scanned in memory, before it is deflated:
+        the biggest part is the one the gate must not inflate again. */
+        crate::opc::well_formed::verify_part(names.main.as_str(), &doc_xml)?;
         zip.start_file(names.main.as_str(), opts)?;
         zip.write_all(&doc_xml)?;
 
