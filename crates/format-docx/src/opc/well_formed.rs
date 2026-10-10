@@ -118,6 +118,9 @@ struct Tally {
     stray: u64,
     /// Comments holding `--` or ending in `-`.
     comments: u64,
+    /// Issue #468 — a `<!DOCTYPE …>` (OPC forbids DTDs): dropped, and the
+    /// offset of the first one.
+    doctype: Option<usize>,
     /// Elements still open at the end of the part.
     unclosed: u64,
     /// Issue #435 — namespace prefixes used where no `xmlns:` binds them,
@@ -137,6 +140,9 @@ impl Tally {
                 self.unbound.len(),
                 self.unbound.join(", ")
             ));
+        }
+        if let Some(at) = self.doctype {
+            parts.push(format!("DOCTYPE declaration at offset {at} (OPC forbids DTDs)"));
         }
         for (n, what) in [
             (self.escapes, "unescaped `&` / `<` / `]]>`"),
@@ -713,7 +719,17 @@ fn scan(body: &[u8]) -> Scan {
                     }
                 }
             }
-            Event::DocType(_) => {}
+            Event::DocType(_) => {
+                /* Issue #468 — OPC forbids DTDs: the declaration goes, the
+                XML declaration stays. (Entities it declared were never
+                expanded anyway.) */
+                tally.doctype.get_or_insert(prev);
+                patches.push(Patch {
+                    start: prev,
+                    end: pos,
+                    with: Vec::new(),
+                });
+            }
             Event::Eof => break,
         }
         prev = pos;
@@ -920,6 +936,17 @@ mod tests {
         };
         assert_eq!(defects(&out), None, "the repair is well-formed");
         (String::from_utf8(out).expect("utf-8"), detail.clone())
+    }
+
+    /// Issue #468 — a DOCTYPE is dropped from the prolog (the XML
+    /// declaration stays) and is itself a save-side defect.
+    #[test]
+    fn a_doctype_is_dropped_and_is_a_defect() {
+        let xml = b"<?xml version=\"1.0\"?>\n<!DOCTYPE r [<!ENTITY e \"X\">]><r><t>a</t></r>";
+        assert!(defects(xml).is_some_and(|d| d.contains("DOCTYPE")));
+        let (out, detail) = repaired(xml);
+        assert_eq!(out, "<?xml version=\"1.0\"?>\n<r><t>a</t></r>");
+        assert!(detail.contains("DOCTYPE"), "{detail}");
     }
 
     #[test]
