@@ -47,6 +47,7 @@ describe('describeReadWarning (#406)', () => {
         for (const label of Object.values(READ_WARNING_LABELS)) {
             expect(label.length).toBeGreaterThan(10);
         }
-        expect(Object.keys(READ_WARNING_LABELS)).toHaveLength(10);
+        /* Issues #439 / #434 / #435 added `MalformedPart`. */
+        expect(Object.keys(READ_WARNING_LABELS)).toHaveLength(11);
     });
 });

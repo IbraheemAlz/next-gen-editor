@@ -160,6 +160,19 @@ pub fn to_family(text: &str, family: NsFamily) -> Cow<'_, str> {
     out
 }
 
+/// Issue #435 — the URI of the table entry conventionally bound to
+/// `prefix`, in `family`'s spelling (`r` → the relationships URI); `None`
+/// for a prefix the table does not own.
+pub fn uri_for_prefix(prefix: &str, family: NsFamily) -> Option<&'static str> {
+    FAMILY_URIS
+        .iter()
+        .find(|f| f.prefix == prefix)
+        .map(|f| match family {
+            NsFamily::Strict => f.strict,
+            NsFamily::Transitional => f.transitional,
+        })
+}
+
 /// The exact schema URI `uri` (either spelling) in `family`'s spelling;
 /// unchanged when it is not a table entry. `'static` in, `'static` out.
 pub fn uri_in(uri: &'static str, family: NsFamily) -> &'static str {

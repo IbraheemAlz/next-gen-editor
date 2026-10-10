@@ -130,6 +130,20 @@ pub enum DocxWarning {
     /// Issue #353 — a relationship target of a sibling part escapes the
     /// package; it was ignored (the fixed sibling name applies).
     UnsafeRelationshipTarget { target: String },
+    /// Issues #439 / #434 — the WordprocessingML part `part` (the main part
+    /// or a sibling the reader walks) is not well-formed XML; `detail`
+    /// names the defects. `repaired` = the defects were fixed up front
+    /// (`opc::well_formed`) and the repaired bytes were read: the part is
+    /// then **regenerate-only** like a #325 normalised part — its source
+    /// bytes are never reused, a zero-edit save re-emits the repaired,
+    /// well-formed part. `false` = no faithful repair exists; the part was
+    /// read as it is (the main part's typed parse refuses what it cannot
+    /// walk).
+    MalformedPart {
+        part: String,
+        detail: String,
+        repaired: bool,
+    },
 }
 
 impl DocxWarning {
@@ -138,7 +152,8 @@ impl DocxWarning {
     /// walk — measures, fields, table nesting).
     pub fn part(&self) -> Option<&str> {
         match self {
-            DocxWarning::NonCanonicalNamespaces { part, .. } => Some(part),
+            DocxWarning::NonCanonicalNamespaces { part, .. }
+            | DocxWarning::MalformedPart { part, .. } => Some(part),
             DocxWarning::MainPartFallback { .. } => Some("_rels/.rels"),
             DocxWarning::TableNestingTooDeep { .. }
             | DocxWarning::InvalidMeasure { .. }
@@ -188,6 +203,15 @@ impl DocxWarning {
             }
             DocxWarning::MainPartFallback { target }
             | DocxWarning::UnsafeRelationshipTarget { target } => target.clone(),
+            DocxWarning::MalformedPart {
+                detail, repaired, ..
+            } => {
+                if *repaired {
+                    format!("{detail} (repaired; rewritten on save)")
+                } else {
+                    format!("{detail} (beyond repair; read as-is)")
+                }
+            }
         }
     }
 }

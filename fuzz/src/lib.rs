@@ -94,28 +94,37 @@ pub fn run_docx_roundtrip(data: &[u8]) {
             );
         }
     };
+    /* Issue #434 — the writer's output is well-formed: the reader repairs
+    a malformed source up front (`MalformedPart { repaired: true }`), so
+    the re-read must need no repair. Only a part the FIRST read already
+    found beyond repair (and kept as it was) may be reported again. */
+    if let Some(part) = needless_repair(&archive_a.warnings, &archive_b.warnings) {
+        if trace_enabled() {
+            eprintln!(
+                "[docx_roundtrip] the save needed a repair ({part}):\n  warnings: {:?}\n  saved document.xml: {}",
+                archive_b.warnings,
+                String::from_utf8_lossy(&document_xml_of(&written_a)),
+            );
+        }
+        panic!("docx_roundtrip: write_docx produced a part that is not well-formed");
+    }
     /* Issue #358 — read => write => read preserves the text (every
-    generated and spliced package that parsed at all), with ONE documented
-    exception: a namespace-ill-formed source (an element prefix no
-    `xmlns:` declares — the generator's root omits the drawing / mc
-    bindings one time in eight). The reader skips such elements, while the
-    writer's namespace normalization binds the conventional URI on save, so
-    the second read may see a drawing or `AlternateContent` the first one
-    skipped. Tracked as a gap; everything namespace-well-formed must hold. */
-    let source_xml = document_xml_of(&bytes);
-    let comparable = !has_undeclared_element_prefix(&source_xml);
-    if comparable && trace_enabled() && doc_a.to_plain_text() != archive_b.document.to_plain_text()
-    {
+    generated and spliced package that parsed at all). No exception any
+    more (issue #435): a prefix no `xmlns:` declares (the generator's root
+    omits the drawing / mc bindings one time in eight) is bound on the
+    root by the reader's up-front repair, so the first read already sees
+    what the writer's save makes every later read see. */
+    if trace_enabled() && doc_a.to_plain_text() != archive_b.document.to_plain_text() {
         eprintln!(
             "[docx_roundtrip] text drift:\n  before: {:?}\n  after:  {:?}\n  source document.xml: {}\n  saved document.xml: {}",
             doc_a.to_plain_text(),
             archive_b.document.to_plain_text(),
-            String::from_utf8_lossy(&source_xml),
+            String::from_utf8_lossy(&document_xml_of(&bytes)),
             String::from_utf8_lossy(&document_xml_of(&written_a)),
         );
     }
     assert!(
-        !comparable || doc_a.to_plain_text() == archive_b.document.to_plain_text(),
+        doc_a.to_plain_text() == archive_b.document.to_plain_text(),
         "docx_roundtrip: a zero-edit save changed the document text"
     );
     let doc_b = archive_b.document.clone();
@@ -123,6 +132,26 @@ pub fn run_docx_roundtrip(data: &[u8]) {
         panic!("docx_roundtrip: second write_docx failed after a successful first round-trip");
     };
     let _ = format_docx::read_docx(&written_b);
+}
+
+/// Issue #434 — the first part the re-read of a save reports as malformed
+/// (`DocxWarning::MalformedPart`) that the first read did not already find
+/// beyond repair: a part the writer produced not well-formed.
+fn needless_repair(
+    first: &[format_docx::DocxWarning],
+    second: &[format_docx::DocxWarning],
+) -> Option<String> {
+    use format_docx::DocxWarning::MalformedPart;
+    second.iter().find_map(|w| match w {
+        MalformedPart { part, .. }
+            if !first.iter().any(
+                |f| matches!(f, MalformedPart { part: p, repaired: false, .. } if p == part),
+            ) =>
+        {
+            Some(part.clone())
+        }
+        _ => None,
+    })
 }
 
 /// `word/document.xml` of a package (empty when unreadable) — trace output.
@@ -137,44 +166,6 @@ fn document_xml_of(docx: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
     let _ = f.read_to_end(&mut v);
     v
-}
-
-/// Issue #358 — `true` when some element in `xml` uses a prefix that no
-/// `xmlns:<prefix>=` anywhere in the part declares (namespace-ill-formed
-/// XML; see `run_docx_roundtrip`'s exception). A byte scan, not a parse:
-/// `<p:` / `</p:` element names against every declared prefix.
-fn has_undeclared_element_prefix(xml: &[u8]) -> bool {
-    let mut declared: Vec<&[u8]> = Vec::new();
-    let needle = b"xmlns:";
-    let mut i = 0;
-    while let Some(off) = xml[i..].windows(needle.len()).position(|w| w == needle) {
-        let start = i + off + needle.len();
-        let end = xml[start..]
-            .iter()
-            .position(|b| *b == b'=' || b.is_ascii_whitespace())
-            .map_or(xml.len(), |e| start + e);
-        declared.push(&xml[start..end]);
-        i = end;
-    }
-    let mut j = 0;
-    while let Some(off) = xml[j..].iter().position(|b| *b == b'<') {
-        let mut k = j + off + 1;
-        if xml.get(k) == Some(&b'/') {
-            k += 1;
-        }
-        let name_end = xml[k..]
-            .iter()
-            .position(|b| matches!(b, b' ' | b'/' | b'>' | b'\t' | b'\n' | b'\r'))
-            .map_or(xml.len(), |e| k + e);
-        let name = &xml[k..name_end];
-        if let Some(colon) = name.iter().position(|b| *b == b':')
-            && !declared.contains(&&name[..colon])
-        {
-            return true;
-        }
-        j = name_end.max(k);
-    }
-    false
 }
 
 /// Cap on how many commands one fuzz input drives — bounds wall-clock per
@@ -632,18 +623,6 @@ mod tests {
         run_format_pdf_image_decode(&[]);
     }
 
-    #[test]
-    fn undeclared_element_prefixes_are_detected() {
-        let ok =
-            br#"<w:document xmlns:w="u" xmlns:wp="v"><w:body><wp:inline/></w:body></w:document>"#;
-        assert!(!has_undeclared_element_prefix(ok));
-        let bad = br#"<w:document xmlns:w="u"><w:body><wp:inline/></w:body></w:document>"#;
-        assert!(has_undeclared_element_prefix(bad));
-        assert!(!has_undeclared_element_prefix(
-            b"<?xml version=\"1.0\"?><a/>"
-        ));
-    }
-
     /// Issue #358 — `dictionaries/docx.dict` parses as a libFuzzer
     /// dictionary (`[name=]"value"` per line, `\\` / `\"` / `\xNN`
     /// escapes, `#` comments) and every word fits libFuzzer's 64-byte
@@ -712,6 +691,29 @@ mod tests {
         }
         assert!(words.len() > 150, "only {} words", words.len());
         assert!(words.contains(b"<w:fldChar w:fldCharType=\"begin\"/>".as_slice()));
+    }
+
+    /// Issues #439 / #434 — every committed `docx_roundtrip` reproducer
+    /// (`corpus/docx_roundtrip/repro_*`, raw fuzz inputs the generator
+    /// turns into malformed packages) holds the read => write => read
+    /// invariant. The generator-independent spellings of the same shapes
+    /// are `format_docx`'s `reader_well_formed_tests`.
+    #[test]
+    fn committed_docx_roundtrip_reproducers_hold() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_roundtrip");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).expect("corpus/docx_roundtrip") {
+            let path = entry.expect("entry").path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("repro_"))
+            {
+                run_docx_roundtrip(&std::fs::read(&path).expect("seed"));
+                seen += 1;
+            }
+        }
+        assert!(seen >= 1, "the #439 reproducer is committed");
     }
 
     /// Issue #422 — the committed reproducer scenario runs to completion

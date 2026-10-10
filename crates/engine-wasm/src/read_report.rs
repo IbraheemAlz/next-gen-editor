@@ -32,6 +32,9 @@ fn kind_of(w: &DocxWarning) -> ReadWarningKind {
         DocxWarning::NotWordprocessingMl => ReadWarningKind::NotWordprocessingMl,
         DocxWarning::MainPartFallback { .. } => ReadWarningKind::MainPartFallback,
         DocxWarning::UnsafeRelationshipTarget { .. } => ReadWarningKind::UnsafeRelationshipTarget,
+        /* Issues #439 / #434 / #435 — repaired (regenerate-only) or beyond
+        repair; the detail says which. */
+        DocxWarning::MalformedPart { .. } => ReadWarningKind::MalformedPart,
     }
 }
 
@@ -92,6 +95,29 @@ mod tests {
         assert_eq!(out[1].part.as_deref(), Some("word/styles.xml"));
         assert_eq!(out[2].kind, ReadWarningKind::InvalidMeasure);
         assert_eq!(out[2].detail, "w:tab/@w:pos = \"NaN\"");
+    }
+
+    /// Issues #439 / #434 / #435 — a malformed part is its own class, names
+    /// its part, and says whether it was repaired.
+    #[test]
+    fn malformed_parts_are_classified_with_their_part() {
+        let out = bridge_read_warnings(&[
+            DocxWarning::MalformedPart {
+                part: "word/document.xml".into(),
+                detail: "1 unescaped `&` / `<` / `]]>`".into(),
+                repaired: true,
+            },
+            DocxWarning::MalformedPart {
+                part: "word/styles.xml".into(),
+                detail: "no root element".into(),
+                repaired: false,
+            },
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|w| w.kind == ReadWarningKind::MalformedPart));
+        assert_eq!(out[0].part.as_deref(), Some("word/document.xml"));
+        assert!(out[0].detail.ends_with("(repaired; rewritten on save)"));
+        assert!(out[1].detail.ends_with("(beyond repair; read as-is)"));
     }
 
     #[test]

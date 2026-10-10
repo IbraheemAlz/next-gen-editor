@@ -32,6 +32,7 @@
 mod comments;
 mod complex_script;
 mod inline_spans;
+mod malformed;
 mod note_containers;
 mod package_families;
 mod paragraph_format;
@@ -377,6 +378,9 @@ fn run_default() -> Result<()> {
     run_content::run_soft_hyphen_roundtrip()?;
     run_content::run_run_content_roundtrip()?;
     run_content::run_hyphenation_roundtrip()?;
+    /* Step 60 — issues #439 / #434 / #435: malformed parts are repaired up
+    front (regenerate-only) and every save of them is well-formed. */
+    malformed::run_malformed_parts_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

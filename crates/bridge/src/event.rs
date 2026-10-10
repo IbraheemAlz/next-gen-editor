@@ -884,6 +884,13 @@ pub enum ReadWarningKind {
     /// Issue #353 — a relationship target escapes the package and was
     /// ignored.
     UnsafeRelationshipTarget,
+    /// Issues #439 / #434 / #435 — a WordprocessingML part is not
+    /// well-formed XML (bytes that are not UTF-8, a raw `&`, an excluded
+    /// character, an undeclared namespace prefix, a truncated part, …).
+    /// Repaired up front where a faithful repair exists — the part is then
+    /// regenerate-only on save — else read as it is (the detail says
+    /// which).
+    MalformedPart,
 }
 
 impl Event {
