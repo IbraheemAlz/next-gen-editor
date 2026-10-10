@@ -118,6 +118,12 @@ struct Tally {
     stray: u64,
     /// Comments holding `--` or ending in `-`.
     comments: u64,
+    /// Issue #468 — a `<!DOCTYPE …>` (OPC forbids DTDs): dropped, and the
+    /// offset of the first one.
+    doctype: Option<usize>,
+    /// Issue #468 — offset (in the UTF-8-repaired body) of the start of the
+    /// first markup item that carried a counted defect.
+    first_at: Option<usize>,
     /// Elements still open at the end of the part.
     unclosed: u64,
     /// Issue #435 — namespace prefixes used where no `xmlns:` binds them,
@@ -126,6 +132,17 @@ struct Tally {
 }
 
 impl Tally {
+    /// Sum of the counted defects — to tell whether one item added any.
+    fn weight(&self) -> u64 {
+        self.escapes
+            + self.characters
+            + self.attributes
+            + self.stray
+            + self.comments
+            + self.unbound.len() as u64
+            + u64::from(self.doctype.is_some())
+    }
+
     fn detail(&self) -> String {
         let mut parts = Vec::new();
         if let Some(at) = self.not_utf8 {
@@ -136,6 +153,11 @@ impl Tally {
                 "{} undeclared namespace prefixes ({})",
                 self.unbound.len(),
                 self.unbound.join(", ")
+            ));
+        }
+        if let Some(at) = self.doctype {
+            parts.push(format!(
+                "DOCTYPE declaration at offset {at} (OPC forbids DTDs)"
             ));
         }
         for (n, what) in [
@@ -149,6 +171,9 @@ impl Tally {
             if n > 0 {
                 parts.push(format!("{n} {what}"));
             }
+        }
+        if let Some(at) = self.first_at {
+            parts.push(format!("first defect near offset {at}"));
         }
         parts.join("; ")
     }
@@ -183,6 +208,22 @@ enum Context {
     Attribute,
     Markup,
 }
+
+/// Bytes `repair_chars` must look at: `&`, `<`, `]`, the C0 controls other
+/// than tab / LF / CR, and `0xEF` (the lead byte of U+FFFE / U+FFFF).
+const NEEDS_LOOK: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < 0x20 {
+        t[i] = !matches!(i as u8, b'\t' | b'\n' | b'\r');
+        i += 1;
+    }
+    t[b'&' as usize] = true;
+    t[b'<' as usize] = true;
+    t[b']' as usize] = true;
+    t[0xEF] = true;
+    t
+};
 
 /// Lazily-built repaired copy of a byte run: nothing is allocated until
 /// the first defect.
@@ -246,6 +287,12 @@ fn char_ref_value(name: &[u8]) -> Option<Result<u32, ()>> {
 /// The repaired spelling of a run of characters (valid UTF-8 — the scan
 /// runs after the UTF-8 repair), `None` when it is already well-formed.
 fn repair_chars(s: &[u8], ctx: Context, tally: &mut Tally) -> Option<Vec<u8>> {
+    /* Issue #468 — the save-side gate runs this over every byte of a 12 MB
+    part: a byte-table prefilter for "nothing here can need repair" keeps
+    the common run off the per-byte state machine below. */
+    if s.iter().all(|&b| !NEEDS_LOOK[b as usize]) {
+        return None;
+    }
     let mut rw = Rewrite::new(s);
     let mut i = 0;
     while i < s.len() {
@@ -333,6 +380,28 @@ fn repair_comment(inner: &[u8], tally: &mut Tally) -> Option<Vec<u8>> {
 /// when the tag is well-formed. A rebuilt tag is spelled
 /// `<name a="v" …>`: one space before each attribute, double quotes.
 fn repair_tag(e: &BytesStart<'_>, empty: bool, tally: &mut Tally) -> Option<Vec<u8>> {
+    /* Issue #468 — a first pass that only asks "does anything here need
+    repair?" (no allocation); the collecting pass runs for the rare tag
+    that does. The tally is counted by the second pass only. */
+    let mut clean = true;
+    let mut probe = Tally::default();
+    for attr in e.attributes() {
+        match attr {
+            Ok(Attribute { value, .. }) => {
+                if repair_chars(&value, Context::Attribute, &mut probe).is_some() {
+                    clean = false;
+                    break;
+                }
+            }
+            Err(_) => {
+                clean = false;
+                break;
+            }
+        }
+    }
+    if clean {
+        return None;
+    }
     let mut kept: Vec<(&[u8], Cow<'_, [u8]>)> = Vec::new();
     let mut changed = false;
     for attr in e.attributes() {
@@ -419,9 +488,18 @@ fn check_prefixes(
     decls: &mut Vec<(usize, Vec<u8>)>,
     unbound: &mut Vec<String>,
 ) {
-    for a in e.attributes().with_checks(false).flatten() {
-        if let Some(p) = a.key.as_ref().strip_prefix(b"xmlns:") {
-            decls.push((level, p.to_vec()));
+    /* Issue #468 — the attribute text after the element name: no `:` in it
+    means no `xmlns:` declaration and no prefixed attribute to look at. */
+    let name_len = e.name().as_ref().len();
+    let has_colon = e
+        .as_ref()
+        .get(name_len..)
+        .is_some_and(|r| r.contains(&b':'));
+    if has_colon {
+        for a in e.attributes().with_checks(false).flatten() {
+            if let Some(p) = a.key.as_ref().strip_prefix(b"xmlns:") {
+                decls.push((level, p.to_vec()));
+            }
         }
     }
     let mut note = |p: &[u8], decls: &[(usize, Vec<u8>)]| {
@@ -435,7 +513,12 @@ fn check_prefixes(
     if let Some(p) = bindable_prefix(e.name().as_ref()) {
         note(p, decls);
     }
-    for a in e.attributes().with_checks(false).flatten() {
+    for a in e
+        .attributes()
+        .with_checks(false)
+        .flatten()
+        .take(if has_colon { usize::MAX } else { 0 })
+    {
         let key = a.key.as_ref();
         if key == b"xmlns" || key.starts_with(b"xmlns:") {
             continue;
@@ -568,6 +651,7 @@ fn scan(body: &[u8]) -> Scan {
         };
         let pos = reader.buffer_position() as usize;
         let raw = &body[prev..pos];
+        let weight_before = tally.weight();
         match &event {
             Event::Start(e) | Event::Empty(e) => {
                 if root_closed {
@@ -713,8 +797,21 @@ fn scan(body: &[u8]) -> Scan {
                     }
                 }
             }
-            Event::DocType(_) => {}
+            Event::DocType(_) => {
+                /* Issue #468 — OPC forbids DTDs: the declaration goes, the
+                XML declaration stays. (Entities it declared were never
+                expanded anyway.) */
+                tally.doctype.get_or_insert(prev);
+                patches.push(Patch {
+                    start: prev,
+                    end: pos,
+                    with: Vec::new(),
+                });
+            }
             Event::Eof => break,
+        }
+        if tally.first_at.is_none() && tally.weight() > weight_before {
+            tally.first_at = Some(prev);
         }
         prev = pos;
     }
@@ -794,6 +891,46 @@ pub(crate) fn defects(xml: &[u8]) -> Option<String> {
         Health::WellFormed => None,
         Health::Repairable { tally, .. } => Some(tally.detail()),
         Health::Unrepairable(detail) => Some(detail),
+    }
+}
+
+/// Issue #468 — the production save-side gate. Scan, with the reader's own
+/// strict scan ([`defects`]), every XML part of a freshly written package
+/// that is NOT a byte-identical copy of a `source` entry (the parts the
+/// writer regenerated or spliced: `word/document.xml`, a rewritten header /
+/// footer / comments / settings / numbering / styles part, the rels and
+/// content types). A defect is `DocxError::MalformedXml` naming the part
+/// and the first offending offset; the caller returns no bytes.
+pub(crate) fn verify_saved(
+    zip_bytes: &[u8],
+    source: &[(String, Vec<u8>)],
+    already_checked: &str,
+) -> Result<(), DocxError> {
+    use crate::opc::limits::{PackageLimits, read_entry_bounded};
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))?;
+    let mut budget = 0u64;
+    for i in 0..archive.len() {
+        let file = archive.by_index(i)?;
+        let name = file.name().to_string();
+        if name == already_checked || !(name.ends_with(".xml") || name.ends_with(".rels")) {
+            continue;
+        }
+        let data = read_entry_bounded(file, &name, &PackageLimits::DEFAULT, &mut budget)?;
+        if source.iter().any(|(n, d)| *n == name && *d == data) {
+            continue;
+        }
+        verify_part(&name, &data)?;
+    }
+    Ok(())
+}
+
+/// [`verify_saved`] for one part's bytes, before they are packed.
+pub(crate) fn verify_part(name: &str, data: &[u8]) -> Result<(), DocxError> {
+    match defects(data) {
+        None => Ok(()),
+        Some(detail) => Err(DocxError::MalformedXml(format!(
+            "the saved `{name}` is not well-formed XML ({detail}); the save was refused"
+        ))),
     }
 }
 
@@ -920,6 +1057,17 @@ mod tests {
         };
         assert_eq!(defects(&out), None, "the repair is well-formed");
         (String::from_utf8(out).expect("utf-8"), detail.clone())
+    }
+
+    /// Issue #468 — a DOCTYPE is dropped from the prolog (the XML
+    /// declaration stays) and is itself a save-side defect.
+    #[test]
+    fn a_doctype_is_dropped_and_is_a_defect() {
+        let xml = b"<?xml version=\"1.0\"?>\n<!DOCTYPE r [<!ENTITY e \"X\">]><r><t>a</t></r>";
+        assert!(defects(xml).is_some_and(|d| d.contains("DOCTYPE")));
+        let (out, detail) = repaired(xml);
+        assert_eq!(out, "<?xml version=\"1.0\"?>\n<r><t>a</t></r>");
+        assert!(detail.contains("DOCTYPE"), "{detail}");
     }
 
     #[test]

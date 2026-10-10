@@ -86,7 +86,16 @@ paths:
   save-side gate) runs the same scan (`well_formed::defects`), and the
   `docx_roundtrip` fuzz target asserts a save's re-read needs no repair.
   Harness: `tools/roundtrip` step 60 (`malformed.rs`); seeds
-  `fuzz/corpus/docx_roundtrip/repro_*`.
+  `fuzz/corpus/docx_roundtrip/repro_*`. Issue #468 — a `<!DOCTYPE>` is a
+  lexical defect too (dropped from the prolog, XML declaration kept), and
+  the same scan is the PRODUCTION save gate: `write_docx_inner` scans the
+  main part in memory before it is deflated and every other XML part whose
+  bytes differ from the source package's (`well_formed::verify_saved`);
+  a defect is `DocxError::MalformedXml` naming the part and the first
+  offending offset, which the engine answers as `Event::Error { kind:
+  Internal }` with no bytes and the document untouched. Cost on the 12.6 MB
+  corpus part: ~ the scan itself (≈ 17 % of save time, half of it quick-xml
+  tokenization) — item 6 of #468 (fold it into `check_xml_part`) is the fix.
 - **Measures (issue #349).** Page geometry, `<w:ind>`, `<w:spacing>` and
   table widths go through `schema::measure` (`attr_measure*`): integer or
   decimal twips, ECMA universal-measure units (`in` / `cm` / `mm` / `pt` /

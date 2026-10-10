@@ -16105,8 +16105,14 @@ impl Engine {
         even for a copy issued from inside a header/footer/note story. */
         let docx_fragment = if include_docx {
             let paragraph_slice = doc.slice(estart, eend);
-            let fragment_doc = DocumentTree::from_rich_paragraphs(paragraph_slice);
+            let mut fragment_doc = DocumentTree::from_rich_paragraphs(paragraph_slice);
             let source_package = self.undo.current().source_package.clone();
+            /* Issue #468 — the copied paragraphs keep their source markup
+            (`w14:paraId`, …): the fragment's synthesized root must
+            re-declare the source root's bindings (the #100 rule, as on
+            the save path), or the save-side gate refuses the fragment —
+            it used to ship namespace-ill-formed. */
+            fragment_doc.document_root_attrs = self.undo.current().document_root_attrs.clone();
             format_docx::build_clipboard_fragment_docx(&fragment_doc, source_package.as_deref())
                 .unwrap_or_default()
         } else {
@@ -27026,6 +27032,42 @@ mod tests {
         assert_eq!(replayed, layout_degraded);
     }
 
+    /// Issue #468 — after a hostile `InsertText`, `SaveDocx` either answers
+    /// a typed error or returns a package whose parts all pass the strict
+    /// well-formedness check; it never returns malformed bytes.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn save_docx_after_hostile_insert_text_is_never_malformed() {
+        let hostile = [
+            "\u{1}",
+            "a\u{0}b",
+            "\u{b}\u{c}\u{1f}",
+            "\u{fffe}\u{ffff}",
+            "<![CDATA[ ]]> & &amp; &#0; <!-- -- -->",
+            "\u{202e}\u{200f}\u{feff}x\r\n\t",
+            "\"'><\u{7f}\u{85}",
+        ];
+        for text in hostile {
+            let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+            let _ = engine.apply_sync(Command::InsertText {
+                at: None,
+                text: text.to_string(),
+            });
+            match engine.apply_sync(Command::SaveDocx) {
+                Event::DocumentSaved { bytes, .. } => {
+                    for part in ["word/document.xml", "[Content_Types].xml"] {
+                        format_docx::check_part_xml_well_formed(&bytes, part)
+                            .unwrap_or_else(|e| panic!("{text:?}: {part}: {e}"));
+                    }
+                }
+                Event::Error { kind, .. } => {
+                    assert_eq!(kind, Some(bridge::ErrorKind::Internal), "{text:?}");
+                }
+                other => panic!("{text:?}: unexpected {other:?}"),
+            }
+        }
+    }
+
     /// D5.5 (issue #90) — the `fuzz-native` surface actually works end to
     /// end: a headless engine drives real `Command`s through the real
     /// `apply` dispatcher, runs the real layout pipeline, and the
@@ -28331,6 +28373,40 @@ mod snapshot_tests {
 
     const PACKAGE_FIXTURE: &[u8] =
         include_bytes!("../../format-docx/tests/fixtures/word_package_parts.docx");
+
+    /// Issue #468 — the production save-side well-formedness gate. A raw
+    /// control character the writer leaves in a regenerated part (the #467
+    /// shape) is refused with a typed `Event::Error`, yields no bytes, and
+    /// leaves the document state alone (#341 invariant); the same save
+    /// succeeds once the character is gone.
+    #[test]
+    fn save_refuses_a_part_the_writer_left_malformed() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(4, 4),
+            caret: bpos_top(4, 4),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let evt = apply(&mut e, insert("a\u{1}b"));
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        #[cfg(feature = "fuzz-native")]
+        let before = e.state_fingerprint_for_fuzzing();
+        match apply(&mut e, Command::SaveDocx) {
+            Event::Error {
+                kind: Some(bridge::ErrorKind::Internal),
+                message,
+                ..
+            } => {
+                assert!(message.contains("word/document.xml"), "{message}");
+                assert!(message.contains("not well-formed"), "{message}");
+                assert!(message.contains("offset"), "{message}");
+            }
+            other => panic!("expected a typed save refusal, got {other:?}"),
+        }
+        #[cfg(feature = "fuzz-native")]
+        assert_eq!(e.state_fingerprint_for_fuzzing(), before);
+    }
 
     /// Issue #134 (P0) — the live editor's save path used to synthesize a
     /// minimal package from the tree alone, dropping every unedited part:
