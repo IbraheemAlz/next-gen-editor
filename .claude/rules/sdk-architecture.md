@@ -45,8 +45,18 @@ discipline.
     (issue #315), `checkpointState` (`Event::CheckpointState`, #390),
     `lastError` (every `Event::Error`, #364); and the font read-back
     `resolvedFonts` / `fontSource` / `slotFormats` / `caretFontSlot`
-    (#423, #420). A new engine event field lands here as one more
-    signal, never as a second `subscribe`.
+    (#423, #420); `caretRevealSeq` (bumps on a keyboard / programmatic
+    caret move — `SELECTION_CHANGED.reveal_caret`, classified by
+    `bridge::CommandMeta::reveals_caret`, never a pointer gesture) and
+    the shared `commentHighlights` (`Event::CommentHighlights`, #387).
+    A new engine event field lands here as one more signal, never as a
+    second `subscribe`.
+  - `src/createCaretReveal.ts` + `src/caretReveal.ts` — issue #387:
+    scroll the host viewport minimally (with a margin, one frame after
+    the event) so the caret stays visible after keyboard navigation and
+    typing; the host maps the device-px caret to its scroll content
+    (`EditorSurface` does it for its one canvas, the reference shell's
+    `CaretReveal` per page card).
   - `src/types.ts` — re-exports every bridge type from the wasm-pack
     output plus the `EngineClientLike` + `EngineClientSnapshots`
     interface contracts. **Single point of coupling** to

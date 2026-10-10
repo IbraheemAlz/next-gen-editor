@@ -7,6 +7,7 @@
 pub mod boxes;
 pub mod floats;
 pub mod hyphen;
+pub mod mark;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
@@ -27,6 +28,7 @@ pub use boxes::{
     TextAttrs, TextBoxFrame, TextBoxGlyph, VisualRun, WrapSide,
 };
 pub use floats::{ColumnLayout, resolve_page_floats, story_frame_page};
+pub use mark::{empty_line_extents, empty_mark_pitch, mark_line_ratio};
 pub use page::{A4Page, Margins};
 pub use paginate::{
     FOOTNOTE_SEPARATOR_HEIGHT_PT, HeaderBands, HeaderRole, NoteBody,
