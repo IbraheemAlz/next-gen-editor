@@ -629,6 +629,33 @@ pub enum Event {
     },
 }
 
+/// Defines [`ErrorKind`], `ErrorKind::ALL` and `ErrorKind::name()` from ONE
+/// variant list (issue #454, in the style of `command_meta!`): a variant
+/// cannot exist without being listed in `ALL` and named, so the hand-kept
+/// list the parity cross-check used to guard is gone. Attributes (docs) ride
+/// on each variant; the declaration order is the wire order of `ALL`.
+macro_rules! error_kinds {
+    ( $( #[$enum_meta:meta] )* ; $( $( #[$meta:meta] )* $variant:ident ),+ $(,)? ) => {
+        $( #[$enum_meta] )*
+        pub enum ErrorKind {
+            $( $( #[$meta] )* $variant ),+
+        }
+
+        impl ErrorKind {
+            /// Every kind, in declaration order (issue #427). `tools/parity`
+            /// joins it with the shell's `ERROR_TOAST_COPY`.
+            pub const ALL: &'static [ErrorKind] = &[ $( ErrorKind::$variant ),+ ];
+
+            /// The wire name (the variant name, as `Event::Error.kind` carries it).
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $( ErrorKind::$variant => stringify!($variant) ),+
+                }
+            }
+        }
+    };
+}
+
 /// Issue #387 — one top-level comment's on-canvas highlight
 /// ([`Event::CommentHighlights`]). Replies ride their thread root's range
 /// and are not listed separately.
@@ -648,10 +675,11 @@ pub struct CommentHighlight {
     pub rects: Vec<Rect>,
 }
 
+error_kinds! {
 /// Issue #348 — the class of an [`Event::Error`] the shell can present
 /// specifically.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorKind {
+;
     /// The document package exceeded the reader's resource limits (a part
     /// or the whole package inflating past its byte budget, too many ZIP
     /// entries, XML nested too deep or holding too many elements): the
@@ -760,63 +788,6 @@ impl ProtectionMode {
             ProtectionMode::Comments => "comments",
             ProtectionMode::TrackedChanges => "trackedChanges",
             ProtectionMode::Forms => "forms",
-        }
-    }
-}
-
-impl ErrorKind {
-    /// Every kind, in declaration order (issue #427). `tools/parity`
-    /// joins it with the shell's `ERROR_TOAST_COPY`; [`ErrorKind::name`]
-    /// is an exhaustive `match`, so a new variant cannot compile without
-    /// being named, and parity flags a name missing from this list.
-    pub const ALL: &'static [ErrorKind] = &[
-        ErrorKind::PackageTooLarge,
-        ErrorKind::TrackedDeletionRefused,
-        ErrorKind::EncryptedDocument,
-        ErrorKind::Protected,
-        ErrorKind::WrongPassword,
-        ErrorKind::NoSelection,
-        ErrorKind::NotInParagraph,
-        ErrorKind::InStory,
-        ErrorKind::InTableCell,
-        ErrorKind::NoFieldAtCaret,
-        ErrorKind::NoSuchTarget,
-        ErrorKind::NotInHeaderFooter,
-        ErrorKind::UnsupportedHere,
-        ErrorKind::OutOfRange,
-        ErrorKind::EmptyInput,
-        ErrorKind::NestingTooDeep,
-        ErrorKind::NotReady,
-        ErrorKind::Unimplemented,
-        ErrorKind::Internal,
-        ErrorKind::InvalidDocument,
-        ErrorKind::InvalidArgument,
-    ];
-
-    /// The wire name (the variant name, as `Event::Error.kind` carries it).
-    pub fn name(self) -> &'static str {
-        match self {
-            ErrorKind::PackageTooLarge => "PackageTooLarge",
-            ErrorKind::TrackedDeletionRefused => "TrackedDeletionRefused",
-            ErrorKind::EncryptedDocument => "EncryptedDocument",
-            ErrorKind::Protected => "Protected",
-            ErrorKind::WrongPassword => "WrongPassword",
-            ErrorKind::NoSelection => "NoSelection",
-            ErrorKind::NotInParagraph => "NotInParagraph",
-            ErrorKind::InStory => "InStory",
-            ErrorKind::InTableCell => "InTableCell",
-            ErrorKind::NoFieldAtCaret => "NoFieldAtCaret",
-            ErrorKind::NoSuchTarget => "NoSuchTarget",
-            ErrorKind::NotInHeaderFooter => "NotInHeaderFooter",
-            ErrorKind::UnsupportedHere => "UnsupportedHere",
-            ErrorKind::OutOfRange => "OutOfRange",
-            ErrorKind::EmptyInput => "EmptyInput",
-            ErrorKind::NestingTooDeep => "NestingTooDeep",
-            ErrorKind::NotReady => "NotReady",
-            ErrorKind::Unimplemented => "Unimplemented",
-            ErrorKind::Internal => "Internal",
-            ErrorKind::InvalidDocument => "InvalidDocument",
-            ErrorKind::InvalidArgument => "InvalidArgument",
         }
     }
 }
