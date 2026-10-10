@@ -392,17 +392,26 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     the line the caret cannot find its host paragraph after pressing
     Enter — `caret_rect_geom` falls back to `geom.first()` and the
     caret visibly jumps to (0, 0). Without the height the cell
-    containing the placeholder collapses to zero. */
+    containing the placeholder collapses to zero. Issue #370 — the line
+    is the paragraph MARK's: sized from the zero-width mark span the
+    caller passes (`crate::mark`), not from the document default. */
     if lines.is_empty() {
         let inner_origin =
             alignment_origin_x(0.0, content_width, cfg.alignment, cfg.base_direction);
+        let (baseline, height) = crate::mark::empty_line_extents(
+            cfg.fonts,
+            cfg.spans.first(),
+            rtl,
+            cfg.line_height,
+            cfg.line_height_exact,
+        );
         lines.push(LineBox {
             origin: Point {
                 x: leading_off + inner_origin,
                 y: 0.0,
             },
-            baseline: cfg.line_height,
-            height: cfg.line_height,
+            baseline,
+            height,
             width: 0.0,
             runs: Vec::new(),
             alignment: cfg.alignment,
@@ -412,7 +421,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             segment: 0,
             hyphen: crate::boxes::LineHyphen::None,
         });
-        y = cfg.line_height;
+        y = height;
     }
     let height = y;
     /* Phase 4 — list marker (`"1."`, `"a)"`, `"•"`). Shape against the

@@ -172,6 +172,16 @@ pub struct CommandMeta {
     pub status: CommandStatus,
     /// Issue #345 — what an enforced document protection lets through.
     pub protection: ProtectionClass,
+    /// Issue #387 — the caret this command leaves should be scrolled
+    /// into view: keyboard navigation, typing and every other edit or
+    /// programmatic move, but never a pointer gesture (the user clicked
+    /// where they are looking), a whole-document selection (Word / Docs
+    /// keep the view on Ctrl+A) or a pure view / property change. The
+    /// engine stamps it onto the reply's `Event::SelectionChanged::
+    /// reveal_caret`, which the shell's caret scroller follows. Engine
+    /// side only — not mirrored into `commandMeta.generated.ts`
+    /// (consumers read the event field).
+    pub reveals_caret: bool,
 }
 
 impl CommandMeta {
@@ -190,6 +200,7 @@ impl CommandMeta {
         story: StoryPolicy::Allowed,
         status: CommandStatus::Implemented,
         protection: ProtectionClass::Exempt,
+        reveals_caret: false,
     };
 
     /// View / session state (fonts, zoom, viewport, render clock):
@@ -203,6 +214,7 @@ impl CommandMeta {
     /// Selection / caret / composition / active-story moves.
     const SELECT: CommandMeta = CommandMeta {
         moves_selection: true,
+        reveals_caret: true,
         ..Self::VIEW
     };
 
@@ -220,6 +232,7 @@ impl CommandMeta {
         mutates_doc: true,
         moves_selection: true,
         protection: ProtectionClass::Other,
+        reveals_caret: true,
         ..Self::VIEW
     };
 
@@ -256,6 +269,15 @@ impl CommandMeta {
 
     const fn protection(self, protection: ProtectionClass) -> Self {
         CommandMeta { protection, ..self }
+    }
+
+    /// Issue #387 — the caret it leaves is NOT scrolled into view (a
+    /// pointer gesture, a whole-document selection, a view toggle).
+    const fn no_reveal(self) -> Self {
+        CommandMeta {
+            reveals_caret: false,
+            ..self
+        }
     }
 
     const fn logged(self) -> Self {
@@ -378,7 +400,8 @@ command_meta! {
     SetImageWrap { .. } => M::FORMAT.text_box_only().partial(137),
     SetSelection { .. } => M::SELECT,
     ExtendSelection { .. } => M::SELECT,
-    SelectAll => M::SELECT,
+    // Issue #387 — Word / Docs keep the view on Ctrl+A.
+    SelectAll => M::SELECT.no_reveal(),
     MoveCaret { .. } => M::SELECT,
     BeginComposition { .. } => M::SELECT,
     UpdateComposition { .. } => M::SELECT,
@@ -395,13 +418,15 @@ command_meta! {
     // ---- Phase 4 §7 ------------------------------------------------------------
     HitTest { .. } => M::QUERY,
     HitTestInPage { .. } => M::QUERY,
-    PlaceCaretAtPoint { .. } => M::SELECT,
-    ExtendSelectionToPoint { .. } => M::SELECT,
+    // Issue #387 — pointer gestures land where the user is looking: the
+    // caret they leave is never scrolled into view.
+    PlaceCaretAtPoint { .. } => M::SELECT.no_reveal(),
+    ExtendSelectionToPoint { .. } => M::SELECT.no_reveal(),
     // Issue #342 — was read-only in EngineClient but logged by the worker.
     GetImageRects => M::QUERY,
-    SelectWordAt { .. } => M::SELECT,
-    SelectParagraphAt { .. } => M::SELECT,
-    SelectCellAt { .. } => M::SELECT,
+    SelectWordAt { .. } => M::SELECT.no_reveal(),
+    SelectParagraphAt { .. } => M::SELECT.no_reveal(),
+    SelectCellAt { .. } => M::SELECT.no_reveal(),
     DeleteAtCaret { .. } => M::EDIT.protection(P::Text),
     RequestAccessibilityDelta => M::QUERY,
     GetSelectionAsClipboard { .. } => M::QUERY,
@@ -426,7 +451,8 @@ command_meta! {
     SetColumns { .. } => M::FORMAT.body_only(),
     InsertPageBreak { .. } => M::EDIT.body_only(),
     InsertSectionBreak { .. } => M::EDIT.body_only(),
-    EnterHeaderFooter { .. } => M::SELECT,
+    // Issue #387 — entered by a double-click on the band.
+    EnterHeaderFooter { .. } => M::SELECT.no_reveal(),
     ExitHeaderFooter => M::SELECT,
     SetHeaderFooterLink { .. } => M::FORMAT,
     SetTitlePage { .. } => M::FORMAT,
@@ -437,7 +463,7 @@ command_meta! {
     InsertTextBox { .. } => M::EDIT.body_only(),
     SetRenderDate { .. } => M::VIEW,
     UpdateFields => M::FORMAT,
-    SetFieldCodeView { .. } => M::SELECT,
+    SetFieldCodeView { .. } => M::SELECT.no_reveal(),
     SetFieldInstruction { .. } => M::EDIT,
     InsertToc { .. } => M::EDIT.body_only(),
     SetParagraphBorders { .. } => M::FORMAT,
@@ -720,6 +746,51 @@ mod tests {
                 "duplicate wire name {kind:?}"
             );
             assert_eq!(CommandKind::from_wire_name(&kind.wire_name()), Some(*kind));
+        }
+    }
+
+    /// Issue #387 — the caret scroller follows keyboard navigation, typing
+    /// and edits, never a pointer gesture, Ctrl+A or a view change; and
+    /// only a command that can move the caret can ask for a reveal.
+    #[test]
+    fn caret_reveal_follows_keyboard_and_edits_not_pointer_or_view() {
+        use CommandKind as K;
+        for k in [
+            K::MoveCaret,
+            K::InsertText,
+            K::DeleteAtCaret,
+            K::SplitParagraph,
+            K::PastePlain,
+            K::PasteHtml,
+            K::Undo,
+            K::Redo,
+            K::EndComposition,
+            K::SetSelection,
+        ] {
+            assert!(k.meta().reveals_caret, "{k:?} reveals the caret");
+        }
+        for k in [
+            K::PlaceCaretAtPoint,
+            K::ExtendSelectionToPoint,
+            K::SelectWordAt,
+            K::SelectParagraphAt,
+            K::SelectCellAt,
+            K::EnterHeaderFooter,
+            K::SelectAll,
+            K::SetZoom,
+            K::SetDeviceScale,
+            K::ExpandLayout,
+            K::RequestPaint,
+            K::ToggleFormatting,
+            K::HitTest,
+        ] {
+            assert!(!k.meta().reveals_caret, "{k:?} leaves the view alone");
+        }
+        for k in CommandKind::ALL {
+            assert!(
+                !k.meta().reveals_caret || k.meta().moves_selection,
+                "{k:?} reveals a caret it cannot move"
+            );
         }
     }
 
