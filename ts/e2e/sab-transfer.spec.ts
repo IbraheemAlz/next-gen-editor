@@ -1,10 +1,13 @@
 import { test, expect } from '@playwright/test';
 
 /* D2.4 exit gate: zero-copy bulk transfer. A 50 MB ArrayBuffer round-trips
-   through a worker via Transferable in well under 50 ms — and the source
+   through a worker via Transferable and the source
    buffer is detached afterward, proving it was MOVED, not structure-cloned
-   (a structured clone would leave byteLength === 50 MB and cost ~tens of ms). */
-test('50 MB blob transfers zero-copy round-trip under 50 ms', async ({ page }) => {
+   (a structured clone would leave byteLength === 50 MB and cost ~tens of ms).
+   The < 50 ms budget is NOT asserted here (issue #452, same class as #425: a
+   wall-clock assertion fails under machine load with the code unchanged); it
+   is `sabTransferMs` in `node tools/perf/run.mjs --strict`. */
+test('50 MB blob transfers zero-copy round-trip and is detached (smoke)', async ({ page }) => {
     await page.goto('/');
 
     const result = await page.evaluate(async () => {
@@ -36,5 +39,4 @@ test('50 MB blob transfers zero-copy round-trip under 50 ms', async ({ page }) =
     expect(result.sabAvailable, 'SharedArrayBuffer available (cross-origin isolated)').toBe(true);
     expect(result.echoedBytes, 'full 50 MB echoed back').toBe(50 * 1024 * 1024);
     expect(result.sourceDetached, 'source buffer detached — transferred, not copied').toBe(true);
-    expect(result.elapsedMs).toBeLessThan(50);
 });
