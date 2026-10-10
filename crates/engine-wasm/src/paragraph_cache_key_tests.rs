@@ -15,6 +15,7 @@ fn sctx() -> StyleContext<'static> {
         theme: None,
         theme_key: 0,
         settings: None,
+        word_line_metrics: false,
     }
 }
 
@@ -386,6 +387,29 @@ fn empty_paragraph_mark_style_is_hashed() {
     let mut bold = marked.clone();
     bold.mark_style.as_mut().expect("mark").bold = Some(true);
     assert_ne!(key(&marked), key(&bold));
+}
+
+/// Issue #329 — the line-pitch model is an input, and under Word's
+/// font-derived pitch so is the mark of a paragraph WITH text (it sizes a
+/// runless line such as a doubled soft break); under the configured pitch
+/// a text paragraph's mark is not.
+#[test]
+fn the_line_pitch_model_and_its_mark_are_hashed() {
+    let p = base();
+    let word = StyleContext {
+        word_line_metrics: true,
+        ..sctx()
+    };
+    let key_in =
+        |p: &engine::Paragraph, s: StyleContext| paragraph_layout_key(p, &cfg(), 1.0, 400.0, s);
+    assert_ne!(key_in(&p, sctx()), key_in(&p, word));
+    let mut marked = p.clone();
+    marked.mark_style = Some(Box::new(engine::SpanStyle {
+        font_size: Some(40.0),
+        ..Default::default()
+    }));
+    assert_ne!(key_in(&p, word), key_in(&marked, word));
+    assert_eq!(key_in(&p, sctx()), key_in(&marked, sctx()));
 }
 
 /// The config / width / scale half of the key.

@@ -49,11 +49,16 @@ async function setupEngine(
     restored = false,
 ): Promise<void> {
     /* Forget any resident-font flags (recovery wiped the engine's map),
-       then push only the manifest's minimal boot set — one Latin + one
-       dual-script Arabic. Every other declared font lazy-loads (JIT) the
-       first time it is picked in the toolbar. */
+       then push the manifest's minimal boot set — one Latin + one
+       dual-script Arabic — and its substitute faces. Every other declared
+       font lazy-loads (JIT) the first time it is picked in the toolbar. */
     fonts.reset();
-    await fonts.loadDefaults();
+    /* Issue #329 — the substitute faces (Carlito for Calibri, Noto Naskh
+       Arabic for Simplified Arabic, …) load in parallel with the boot set:
+       a document opened (or recovered) next lays out in metric-compatible
+       faces from its first paint, and `FONT_LOADED` / `DOCUMENT_LOADED`
+       report what they stand in for. */
+    await Promise.all([fonts.loadDefaults(), fonts.loadSubstitutes()]);
     if (restored) {
         const repaint = await client.dispatch({
             type: 'SET_DEVICE_SCALE',

@@ -361,6 +361,7 @@ fn empty_sctx() -> StyleContext<'static> {
         note_self_mark: None,
         theme: None,
         theme_key: 0,
+        word_line_metrics: false,
         settings: None,
     }
 }

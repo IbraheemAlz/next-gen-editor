@@ -103,6 +103,14 @@ pub enum TelemetryKind {
         page_count: u32,
         open_ms: f32,
         backend: String,
+        /// Issue #329 — how many (family, script slot) font substitutions
+        /// the opened document's layout makes (`Event::DocumentLoaded.
+        /// substituted`): a count only, never the family names. Omitted
+        /// from the wire when `None`, so a sender that predates it keeps
+        /// the exact #86 shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        font_substitutions: Option<u32>,
         /// Issue #406 — the reader's warnings for this open, as per-kind
         /// counts (`Event::DocumentLoaded::warnings` folded by kind, kinds
         /// in ascending order): how often field documents open degraded,
@@ -417,6 +425,7 @@ mod tests {
             page_count: 12,
             open_ms: 87.5,
             backend: "vello".to_string(),
+            font_substitutions: None,
             read_warnings: vec![],
         };
         let json = roundtrip(&kind);
@@ -430,6 +439,16 @@ mod tests {
                 "backend": "vello",
             })
         );
+        /* Issue #329 — the substitution count rides along when known. */
+        let kind = TelemetryKind::DocOpen {
+            size_bytes: 1,
+            page_count: 1,
+            open_ms: 1.0,
+            backend: "canvas2d".to_string(),
+            font_substitutions: Some(3),
+            read_warnings: vec![],
+        };
+        assert_eq!(roundtrip(&kind)["font_substitutions"], 3);
     }
 
     /// Issue #406 — a degraded open carries per-kind warning counts (codes
@@ -471,6 +490,7 @@ mod tests {
             page_count: 1,
             open_ms: 1.0,
             backend: "canvas2d".to_string(),
+            font_substitutions: None,
             read_warnings: counts,
         };
         let json = roundtrip(&kind);

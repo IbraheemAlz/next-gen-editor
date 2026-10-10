@@ -63,18 +63,21 @@ fn style_borders_paint_per_edge_by_the_paragraph_direction() {
 /// 1 pt accent rule): Title — bottom only; boxed — top, left, bottom
 /// (`basedOn` per edge); no top — left, bottom (direct nil); LTR start —
 /// blue left; RTL start (direct bidi) — blue right; RTL style start —
-/// blue right; LTR override (direct `bidi="0"`) — blue left.
+/// blue right; LTR override (direct `bidi="0"`) — blue left. Issue #329 —
+/// line heights are Word's font-derived pitch (18 px for the 16 px test
+/// face; the configured 26 px before), which also moves the Title rule.
 const GOLDEN: [(char, char, i32, i32, i32); 10] = [
-    ('A', 'H', 72, 100, 451),
-    ('R', 'H', 72, 114, 451),
-    ('R', 'V', 70, 116, 26),
-    ('R', 'H', 72, 140, 451),
-    ('R', 'V', 70, 142, 26),
-    ('R', 'H', 72, 166, 451),
-    ('B', 'V', 70, 168, 26),
-    ('B', 'V', 521, 194, 26),
-    ('B', 'V', 521, 220, 26),
-    ('B', 'V', 70, 246, 26),
+    ('A', 'H', 72, 101, 451),
+    ('R', 'H', 72, 115, 451),
+    ('R', 'V', 70, 117, 18),
+    ('R', 'H', 72, 133, 451),
+    ('R', 'V', 70, 135, 18),
+    ('R', 'H', 72, 152, 451),
+    ('B', 'V', 70, 154, 18),
+    ('B', 'V', 521, 172, 18),
+    ('B', 'V', 521, 190, 18),
+    ('B', 'V', 70, 209, 18),
 ];
 
-const GOLDEN_FINGERPRINT: &str = "0x1b3b06bbca34b0ac";
+/// Issue #329 — was `0x1b3b06bbca34b0ac` under the configured pitch.
+const GOLDEN_FINGERPRINT: &str = "0x4da969f4646ef429";

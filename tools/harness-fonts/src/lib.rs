@@ -37,10 +37,86 @@ pub fn harness_stack() -> FontStack {
     FontStack::from_faces(faces, LATIN_ID)
 }
 
+/// Issue #329 — the editor's substitute faces (`ts/public/fonts.json`
+/// `substitutes`): what the font stack's substitution table maps a
+/// document's families to. Their ids sort AFTER the base faces in every
+/// script they cover ([`LATIN_ID`] < `sub-*`, [`ARABIC_ID`] < `sub-*`), so
+/// the per-script fallback for a run that names no family is unchanged
+/// (#464); a named family reaches them through `FontStack::resolve_family`
+/// by their `name`-table families (Carlito, Noto Naskh Arabic, ...).
+const SUBSTITUTES: &[(&str, &[u8])] = &[
+    (
+        "sub-noto-naskh",
+        include_bytes!("../../../ts/public/fonts/NotoNaskhArabic-Regular.ttf"),
+    ),
+    (
+        "sub-carlito",
+        include_bytes!("../../../ts/public/fonts/Carlito-Regular.ttf"),
+    ),
+    (
+        "sub-caladea",
+        include_bytes!("../../../ts/public/fonts/Caladea-Regular.ttf"),
+    ),
+    (
+        "sub-liberation-serif",
+        include_bytes!("../../../ts/public/fonts/LiberationSerif-Regular.ttf"),
+    ),
+    (
+        "sub-liberation-mono",
+        include_bytes!("../../../ts/public/fonts/LiberationMono-Regular.ttf"),
+    ),
+    (
+        "sub-gelasio",
+        include_bytes!("../../../ts/public/fonts/Gelasio-Regular.ttf"),
+    ),
+    (
+        "sub-selawik",
+        include_bytes!("../../../ts/public/fonts/Selawik-Regular.ttf"),
+    ),
+];
+
+/// [`harness_stack`] plus the editor's substitute faces (issue #329): a run
+/// naming no family resolves exactly as in [`harness_stack`]; a run naming
+/// Calibri, Times New Roman, Simplified Arabic, ... lays out in the face the
+/// editor substitutes.
+pub fn harness_stack_with_substitutes() -> FontStack {
+    let mut faces: HashMap<String, Arc<LoadedFont>> = HashMap::new();
+    for (id, bytes) in [(LATIN_ID, LIBERATION_SANS), (ARABIC_ID, AMIRI)]
+        .into_iter()
+        .chain(SUBSTITUTES.iter().copied())
+    {
+        let face = LoadedFont::parse(id.to_string(), bytes.to_vec())
+            .unwrap_or_else(|e| panic!("bundled face `{id}` must parse: {e:?}"));
+        faces.insert(id.to_string(), Arc::new(face));
+    }
+    FontStack::from_faces(faces, LATIN_ID)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use text_pipeline::Script;
+
+    /// Issue #329 — the substitutes never change the unnamed fallback, and a
+    /// named family reaches its substitute.
+    #[test]
+    fn substitutes_keep_the_fallback_and_serve_named_families() {
+        let stack = harness_stack_with_substitutes();
+        let id = |script, family: Option<&str>| {
+            stack
+                .resolve(script, family, false, false)
+                .map(|(id, _, _)| id.clone())
+                .expect("a face")
+        };
+        assert_eq!(id(Script::Latin, None), LATIN_ID);
+        assert_eq!(id(Script::Arabic, None), ARABIC_ID);
+        assert_eq!(id(Script::Latin, Some("calibri")), "sub-carlito");
+        assert_eq!(
+            id(Script::Arabic, Some("simplified-arabic")),
+            "sub-noto-naskh"
+        );
+        assert_eq!(id(Script::Latin, Some("arial")), LATIN_ID);
+    }
 
     #[test]
     fn latin_run_resolves_to_the_latin_face() {

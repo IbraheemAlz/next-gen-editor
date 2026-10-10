@@ -99,8 +99,10 @@ fn soft_hyphens_break_with_a_drawn_hyphen_and_non_breaking_ones_never_break() {
     );
 }
 
-/// Recorded on this change via `--nocapture` (issue #335).
-const PINNED_SOFT_HYPHEN: u64 = 0x56ec09b23de0751b;
+/// Recorded on this change via `--nocapture` (issue #335). Issue #329 —
+/// Word's font-derived line pitch for a document read from a Word package
+/// moved it from `0x56ec09b23de0751b` (line breaks unchanged).
+const PINNED_SOFT_HYPHEN: u64 = 0xd9df663d94b73706;
 
 /// The end-of-line caret of a hyphenated line stops at the last character,
 /// BEFORE the drawn hyphen (it is ink, not text); the hyphen itself is no
@@ -271,8 +273,9 @@ fn run_content_elements_render() {
     );
 }
 
-/// Recorded on this change via `--nocapture` (issue #357).
-const PINNED_RUN_CONTENT: u64 = 0xfe0dec40a0164d8c;
+/// Recorded on this change via `--nocapture` (issue #357). Issue #329 —
+/// Word's font-derived line pitch moved it from `0xfe0dec40a0164d8c`.
+const PINNED_RUN_CONTENT: u64 = 0x0a9c13b6475a08dc;
 
 /// The mirror reads a symbol as its Unicode equivalent and a positional
 /// tab as a tab — never the U+FFFC placeholder; the override's controls
@@ -420,6 +423,9 @@ fn without_auto_hyphenation_nothing_moves() {
     );
 }
 
-/// Recorded on this change via `--nocapture` (issue #326).
-const PINNED_HYPHENATION_ON: u64 = 0xf0e2a651dd4f7436;
-const PINNED_HYPHENATION_OFF: u64 = 0xf73ce07da5151bbf;
+/// Recorded on this change via `--nocapture` (issue #326). Issue #329 —
+/// Word's font-derived line pitch moved both (from `0xf0e2a651dd4f7436` /
+/// `0xf73ce07da5151bbf`); the hyphenation and every line break are
+/// unchanged.
+const PINNED_HYPHENATION_ON: u64 = 0x5f0d16b8482d3d05;
+const PINNED_HYPHENATION_OFF: u64 = 0x0aa783da639ea241;

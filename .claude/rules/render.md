@@ -22,6 +22,33 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   `StyleSpan::face_for(complex)` — keep the two in step, and never read
   `span.px_size` / `span.bold` / `span.font_family` directly for a piece.
 
+## Font substitution and line pitch (issue #329)
+
+- `FontStack::resolve_family` matches a document's family before the
+  per-script fallback: exact id → name (id key or the face's `name`-table
+  family, `family_key`-folded) → `text_pipeline::SUBSTITUTIONS`, keyed by
+  (family, `ScriptClass`) — Arial Latin is Liberation Sans, Arial Arabic
+  is Noto Naskh Arabic. A substitute must cover the class. Add rows to
+  the table (and the face to `fonts.json` `substitutes`), never a special
+  case in layout; `every_shipped_substitute_resolves_through_its_name_table`
+  pins the shipped faces against it.
+- **Line pitch has two models.** A document read from a Word package
+  (`DocumentEnvelope::is_captured`, `StyleContext::word_line_metrics`)
+  lays out with Word's font-derived pitch (`layout::FontLinePitch`): a
+  line is the largest `ascent + line gap` plus the largest `descent` of
+  its runs' faces under `LoadedFont::line_metrics` (Windows Word's rule:
+  win extent + GDI external leading, typo metrics when
+  `USE_TYPO_METRICS`), × the `auto` multiple / floored by `atLeast`, the
+  extra space ABOVE the text; a runless line takes the paragraph mark's
+  face. A substituted run whose row names `metrics_from` measures that
+  face (`VisualRun::metrics_font`). Everything else (the seeded page,
+  `.txt` / `.html`, the `RenderPage` harness) keeps the configured
+  `line_height` — its goldens stay put. `exact` is the same in both.
+- The rule is the Windows one on purpose (Arabic documents are authored
+  there); Mac Word uses `hhea`. Whether Windows Word honours
+  `USE_TYPO_METRICS` is unverified (Amiri: 1.758 em typo vs 2.760 em win)
+  — `word_line_metrics` is the one place to flip it.
+
 ## Canvas2D backend
 
 - **`put_image_data` ignores the canvas clip path** (and the transform), per

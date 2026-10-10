@@ -24,12 +24,12 @@ use engine::{
     Paragraph, SpanStyle, Table, TextDirection,
 };
 use layout::{
-    ComplexScriptAttrs, LayoutBlock, Margins, PageBox, PaginatePageGeometry as LayoutPageGeometry,
-    Paginator, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan, TableBox, TableCellBox,
-    TableRowBox, layout_paragraph,
+    ComplexScriptAttrs, FontLinePitch, LayoutBlock, Margins, PageBox,
+    PaginatePageGeometry as LayoutPageGeometry, Paginator, ParagraphBox, ParagraphConfig, Point,
+    Size, StyleSpan, TableBox, TableCellBox, TableRowBox, layout_paragraph,
 };
 use text_pipeline::{
-    Alignment as TpAlignment, FontStack, ShapingDirection, first_strong_direction,
+    Alignment as TpAlignment, FontStack, Script, ShapingDirection, first_strong_direction,
 };
 
 /// Fallback body font size (pt) when no style / span sets one. Matches the
@@ -156,22 +156,120 @@ fn resolve_direction(text: &str, props: &ParaProperties) -> ShapingDirection {
     }
 }
 
-/// Issue #25's `(px, exact)` line-height resolver, re-derived here against a
-/// fixed document-wide default (this pipeline has no per-document
-/// `RenderConfig`). See the module docs for why re-deriving instead of
-/// depending on `engine-wasm` is the right call.
-fn resolve_line_height(line_height: Option<engine::LineHeight>) -> (f32, bool) {
-    match line_height {
-        None => (DEFAULT_LINE_HEIGHT_PT, false),
+/// Issue #329 — the line pitch, as engine-wasm's `paragraph_line_rule`
+/// builds it for a document read from a Word package (every input here
+/// is): `exact` is a fixed `(pt, true)`; `auto` (or no `w:spacing`, single)
+/// and `atLeast` are Word's font-derived pitch — each line as tall as its
+/// faces say under `text_pipeline::LineMetrics`, times the multiple /
+/// floored by `atLeast` — with `empty` (the paragraph mark's face) for a
+/// line without text. The returned `line_height` is the nominal pitch of a
+/// mark-face line (what the band heuristics size against).
+fn resolve_line_height(
+    line_height: Option<engine::LineHeight>,
+    empty: (f32, f32),
+) -> (f32, bool, Option<FontLinePitch>) {
+    let (multiple, at_least) = match line_height {
+        Some(engine::LineHeight::Exact { twips }) => return (twips_to_pt(twips), true, None),
         Some(engine::LineHeight::Auto { twips }) => {
-            (DEFAULT_LINE_HEIGHT_PT * (twips as f32 / 240.0), false)
+            let m = twips as f32 / 240.0;
+            (
+                if m.is_finite() {
+                    m.clamp(0.06, 132.0)
+                } else {
+                    1.0
+                },
+                0.0,
+            )
         }
-        Some(engine::LineHeight::Exact { twips }) => (twips_to_pt(twips), true),
-        Some(engine::LineHeight::AtLeast { twips }) => (twips_to_pt(twips), false),
+        Some(engine::LineHeight::AtLeast { twips }) => (1.0, twips_to_pt(twips).max(0.0)),
+        None => (1.0, 0.0),
+    };
+    (
+        ((empty.0 + empty.1) * multiple).max(at_least),
+        false,
+        Some(FontLinePitch {
+            multiple,
+            at_least,
+            empty,
+        }),
+    )
+}
+
+/// Issue #329 — `(ascent + gap, descent)` of one line in the paragraph
+/// MARK's face (the run cascade under the mark's own formatting; its
+/// complex-script set in an RTL paragraph), resolved through the stack
+/// like a text run. Under Word's font pitch this is what sizes an empty
+/// paragraph (issue #370's rule; the configured-pitch
+/// `layout::empty_mark_pitch` scaling does not apply here).
+fn mark_line_extents(
+    p: &Paragraph,
+    doc: &DocumentTree,
+    fonts: &FontStack,
+    rtl: bool,
+) -> (f32, f32) {
+    let mut style = doc.resolve_style_run_cascade(p.style_id.as_deref());
+    if let Some(mark) = p.mark_style.as_deref() {
+        style = style.merged_with(mark.clone());
+    }
+    let theme = doc.theme.as_deref();
+    let complex = rtl || style.forces_complex_script();
+    let (script, class, hint, size, bold, italic) = if complex {
+        (
+            Script::Arabic,
+            engine::FontClass::ComplexScript,
+            Some("Arab"),
+            style.font_size_cs,
+            style.bold_cs,
+            style.italic_cs,
+        )
+    } else {
+        (
+            Script::Latin,
+            engine::FontClass::Latin,
+            None,
+            style.font_size,
+            style.bold,
+            style.italic,
+        )
+    };
+    let family = style
+        .resolve_font(theme, class, hint)
+        .map(|r| r.family.id().to_string());
+    let px = size.unwrap_or(DEFAULT_FONT_SIZE_PT);
+    match fonts.resolve_detailed(
+        script,
+        family.as_deref(),
+        bold.unwrap_or(false),
+        italic.unwrap_or(false),
+    ) {
+        Some(r) => {
+            let face = r.metrics_id.and_then(|id| fonts.face(id)).unwrap_or(r.face);
+            face.line_metrics().scaled(px)
+        }
+        None => (DEFAULT_LINE_HEIGHT_PT * 0.82, DEFAULT_LINE_HEIGHT_PT * 0.18),
     }
 }
 
-fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
+/// `style` as a layout span over `[start, end)` of `text`. Issue #329 —
+/// the families are resolved as engine-wasm resolves them
+/// (`SpanStyle::resolve_font`: the slot's theme binding through the
+/// document theme, else its explicit name), so a document naming Calibri
+/// — directly or through the theme — reaches the font stack's
+/// substitution table instead of the per-script fallback.
+fn span_from_style(
+    style: &SpanStyle,
+    start: u32,
+    end: u32,
+    text: &str,
+    theme: Option<&engine::DocumentTheme>,
+) -> StyleSpan {
+    let run_text = text.get(start as usize..end as usize).unwrap_or("");
+    let latin_family = style
+        .resolve_font(theme, engine::FontClass::latin_for(run_text), None)
+        .map(|r| r.family.id().to_string());
+    let cs_family = style
+        .resolve_font(theme, engine::FontClass::ComplexScript, Some("Arab"))
+        .map(|r| r.family.id().to_string());
     let span = StyleSpan {
         start,
         end,
@@ -182,7 +280,7 @@ fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
         underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
         strike: style.strike.unwrap_or(false),
         bg_color: style.bg_color,
-        font_family: style.font_family.as_ref().map(|f| f.id().to_string()),
+        font_family: latin_family,
         caps_transform: style.caps.unwrap_or(false),
         baseline_shift_px: 0.0,
         cs: None,
@@ -195,7 +293,7 @@ fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
         baseline_shift_px: 0.0,
         bold: style.bold_cs.unwrap_or(false),
         italic: style.italic_cs.unwrap_or(false),
-        font_family: style.font_family_cs.as_ref().map(|f| f.id().to_string()),
+        font_family: cs_family,
         whole_span: style.forces_complex_script(),
     };
     span.with_cs(cs)
@@ -208,6 +306,7 @@ fn span_from_style(style: &SpanStyle, start: u32, end: u32) -> StyleSpan {
 /// per-span read would silently drop any inherited style.
 fn build_style_spans(p: &Paragraph, doc: &DocumentTree) -> Vec<StyleSpan> {
     let base = doc.resolve_style_run_cascade(p.style_id.as_deref());
+    let theme = doc.theme.as_deref();
     let text_len = p.text.len() as u32;
     let mut spans = p.spans.clone();
     spans.sort_by_key(|s| s.start);
@@ -221,10 +320,10 @@ fn build_style_spans(p: &Paragraph, doc: &DocumentTree) -> Vec<StyleSpan> {
             continue;
         }
         if start > cursor {
-            out.push(span_from_style(&base, cursor, start));
+            out.push(span_from_style(&base, cursor, start, &p.text, theme));
         }
         let merged = base.clone().merged_with(run.style.clone());
-        out.push(span_from_style(&merged, start, end));
+        out.push(span_from_style(&merged, start, end, &p.text, theme));
         cursor = end;
     }
     if cursor < text_len || out.is_empty() {
@@ -238,35 +337,9 @@ fn build_style_spans(p: &Paragraph, doc: &DocumentTree) -> Vec<StyleSpan> {
             }),
             _ => base.clone(),
         };
-        out.push(span_from_style(&style, cursor, text_len));
+        out.push(span_from_style(&style, cursor, text_len, &p.text, theme));
     }
     out
-}
-
-/// Issue #370 — an empty paragraph's line pitch: a font-relative rule
-/// (no `w:line`, or an `auto` multiple) follows `layout::empty_mark_pitch`
-/// against the document default run, exactly as engine-wasm's
-/// `empty_paragraph_mark`; `exact` / `atLeast` stay absolute.
-fn empty_paragraph_pitch(
-    p: &Paragraph,
-    doc: &DocumentTree,
-    fonts: &FontStack,
-    props: &ParaProperties,
-    spans: &[StyleSpan],
-    direction: ShapingDirection,
-    line_height: f32,
-) -> f32 {
-    let (true, Some(mark)) = (p.text.is_empty(), spans.first()) else {
-        return line_height;
-    };
-    match props.line_height {
-        None | Some(engine::LineHeight::Auto { .. }) => {
-            let base = span_from_style(&doc.resolve_style_run_cascade(None), 0, 0);
-            let rtl = matches!(direction, ShapingDirection::Rtl);
-            layout::empty_mark_pitch(fonts, line_height, &base, mark, rtl)
-        }
-        Some(_) => line_height,
-    }
 }
 
 fn build_paragraph_box(
@@ -284,8 +357,8 @@ fn build_paragraph_box(
         .map(map_alignment)
         .unwrap_or(TpAlignment::Start);
     let direction = resolve_direction(&p.text, &props);
-    let (line_height, line_height_exact) = resolve_line_height(props.line_height);
-    let line_height = empty_paragraph_pitch(p, doc, fonts, &props, &spans, direction, line_height);
+    let empty = mark_line_extents(p, doc, fonts, direction == ShapingDirection::Rtl);
+    let (line_height, line_height_exact, font_line) = resolve_line_height(props.line_height, empty);
 
     // Issue #50 — a list paragraph with no direct `<w:ind>` falls back to
     // the numbering level's indent (the resolver stamped it alongside the
@@ -318,6 +391,7 @@ fn build_paragraph_box(
         marker_text: p.resolved_marker.clone(),
         px_size_for_marker: marker_px,
         tab_stops_px: &[],
+        font_line,
         hyphenation: None,
     };
 

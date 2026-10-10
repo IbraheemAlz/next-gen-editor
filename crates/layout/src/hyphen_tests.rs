@@ -70,6 +70,7 @@ fn lay(fonts: &FontStack, text: &str, max_width: f32, dir: ShapingDirection) -> 
         px_size_for_marker: PX,
         tab_stops_px: &[],
         hyphenation: None,
+        font_line: None,
     })
 }
 
@@ -248,6 +249,7 @@ fn lay_auto(
         px_size_for_marker: PX,
         tab_stops_px: &[],
         hyphenation: hy,
+        font_line: None,
     })
 }
 
@@ -410,6 +412,7 @@ fn last_words_capitals_and_arabic_stay_whole() {
         px_size_for_marker: PX,
         tab_stops_px: &[],
         hyphenation: Some(&hy),
+        font_line: None,
     });
     assert!(para.lines.iter().all(|l| l.hyphen.is_none()), "Arabic");
 }

@@ -151,6 +151,11 @@ type TelemetryKind =
           page_count: number;
           open_ms: number;
           backend: string;
+          /** Issue #329 — how many (family, slot) font substitutions the
+           *  opened document's layout makes (`DOCUMENT_LOADED.substituted`);
+           *  a count, never the family names. Omitted when none, like the
+           *  Rust `skip_serializing_if`. */
+          font_substitutions?: number;
           /** Issue #406 — per-kind reader-warning counts of a degraded open
            *  (kinds ascending, like the Rust `read_warning_counts`); omitted
            *  on a clean open, like the Rust `skip_serializing_if`. Codes and
@@ -300,6 +305,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
         sizeBytes: number;
         openMs: number;
         deadlineMs: number;
+        substitutions: number;
         readWarnings: ReadWarningCount[];
     } | null = null;
 
@@ -399,6 +405,9 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                             page_count: e.page_count,
                             open_ms: pendingDocOpen.openMs,
                             backend: client.renderer,
+                            ...(pendingDocOpen.substitutions > 0
+                                ? { font_substitutions: pendingDocOpen.substitutions }
+                                : {}),
                             ...(pendingDocOpen.readWarnings.length > 0
                                 ? { read_warnings: pendingDocOpen.readWarnings }
                                 : {}),
@@ -476,6 +485,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                 sizeBytes: openSizeBytes,
                 openMs: performance.now() - openStart,
                 deadlineMs: performance.now() + DOC_OPEN_CORRELATION_MS,
+                substitutions: result.substituted?.length ?? 0,
                 readWarnings: readWarningCounts(result.warnings ?? []),
             };
         }

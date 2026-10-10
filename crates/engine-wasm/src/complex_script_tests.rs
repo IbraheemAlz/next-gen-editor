@@ -140,8 +140,10 @@ fn mixed_run_lays_latin_and_arabic_out_at_their_own_sizes() {
     );
 }
 
-/// Recorded on this change via `--nocapture` (issue #359).
-const PINNED_CS_SIZE: u64 = 0x77225ebeb9c6b3ba;
+/// Recorded on this change via `--nocapture` (issue #359). Issue #329 —
+/// moved by Word's font-derived line pitch for a document read from a
+/// Word package; was `0x77225ebeb9c6b3ba`.
+const PINNED_CS_SIZE: u64 = 0x64507e83ea6684d6;
 
 /// The old single slot let `w:szCs` win: the same paragraph with BOTH
 /// sizes at 14 pt needs more room — the twin split is what moves the
@@ -544,9 +546,12 @@ fn saved_slots(e: &Engine) -> (Option<String>, Option<String>) {
 /// Acceptance (#424): `ApplyFormatting { font_family: "Sakkal Majalla",
 /// font_slot: ComplexScript }` on mixed Latin + Arabic text — a face no
 /// registry ships — writes `w:cs="Sakkal Majalla"` and leaves the Latin
-/// slot's `w:ascii` / `w:hAnsi` alone; layout shapes the Arabic with the
-/// stack's Arabic fallback (no `.notdef`), the Latin with its own face.
-/// The Latin-slot pick is the mirror image.
+/// slot's `w:ascii` / `w:hAnsi` alone; layout shapes the Arabic with
+/// Sakkal Majalla's substitute (issue #329: Noto Naskh Arabic — before
+/// the substitution table, the stack's Arabic fallback, Amiri; never
+/// `.notdef`), the Latin with its own face. The Latin-slot pick is the
+/// mirror image: the table has no Latin row for an Arabic face, so the
+/// Latin text takes the stack's fallback.
 #[test]
 fn an_unregistered_family_claims_only_the_targeted_slot() {
     let rpr = r#"<w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:cs="Noto Naskh Arabic"/>"#;
@@ -573,7 +578,7 @@ fn an_unregistered_family_claims_only_the_targeted_slot() {
         Some("Sakkal Majalla")
     );
     for (arabic, font, notdef) in run_fonts(&e) {
-        assert_eq!(font, if arabic { "amiri" } else { "liberation" });
+        assert_eq!(font, if arabic { "noto-naskh" } else { "liberation" });
         assert!(!notdef, "every glyph has a face");
     }
     assert_eq!(

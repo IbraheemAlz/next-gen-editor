@@ -36,7 +36,7 @@ pub use paginate::{
     split_paragraph_at_line,
 };
 pub use paragraph::{
-    InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
+    FontLinePitch, InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
 };
 pub use pattern::{MAX_PATTERN_TILES, pattern_tile_bound};
 pub use table_bidi::mirror_bidi_visual;

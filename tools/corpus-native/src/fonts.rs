@@ -17,3 +17,17 @@ use text_pipeline::FontStack;
 pub fn bundled_stack() -> FontStack {
     harness_fonts::harness_stack()
 }
+
+/// Issue #329 — the harness stack plus the editor's substitute faces
+/// (`ts/public/fonts.json` `substitutes`, shared through `harness-fonts`):
+/// the stack the font-substitution counter resolves each document's
+/// families against, so the census says what the editor would substitute.
+pub fn editor_stack() -> FontStack {
+    harness_fonts::harness_stack_with_substitutes()
+}
+
+/// [`editor_stack`], parsed once per process.
+pub fn editor_stack_cached() -> &'static FontStack {
+    static STACK: std::sync::OnceLock<FontStack> = std::sync::OnceLock::new();
+    STACK.get_or_init(editor_stack)
+}

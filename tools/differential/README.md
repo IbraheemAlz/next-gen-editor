@@ -152,9 +152,20 @@ not a `run.mjs` change.
   paragraph) — confirmed during development, which is why paragraph
   grouping is re-derived from `<line>` geometry instead of trusted from
   `<block>`.
+- **Fonts and line pitch follow the editor (issue #329).** `differential-native`
+  loads the shell's boot faces (`ts/public/fonts.json` `defaults` +
+  `substitutes`), resolves every run's families like engine-wasm (theme
+  bindings, then the font stack's substitution table: Calibri → Carlito,
+  Simplified Arabic → Noto Naskh Arabic, …) and lays every paragraph out
+  with Word's font-derived line pitch. LibreOffice substitutes on its own:
+  give it the same metric clones by pointing `soffice` at a fontconfig that
+  adds `ts/public/fonts/` (`FONTCONFIG_FILE=<conf including
+  /etc/fonts/fonts.conf plus <dir>…/ts/public/fonts</dir>> node run.mjs`) —
+  it then uses Carlito for Calibri, but still has no row for Simplified
+  Arabic (it falls back to FreeSerif).
 - **No pixel-exact parity, by design** (the issue's own Out-of-scope): font
-  substitution and hinting differences between our embedded Amiri/Liberation/
-  Noto-Naskh faces and whatever LibreOffice substitutes are expected. The
+  substitution and hinting differences between our embedded faces and
+  whatever LibreOffice substitutes are expected. The
   raster bands (`close` ≤5%, `moderate` ≤15%, `divergent` >15%) are for
   triage, not a pass/fail gate — unlike the same-renderer
   `tools/visual-diff` tiers in `.claude/rules/visual-diff.md`.

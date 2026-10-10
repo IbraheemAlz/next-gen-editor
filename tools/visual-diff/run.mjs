@@ -66,6 +66,7 @@ const VIEWPORTS = {
     'rich-text-caps': { width: 595, height: 842 },
     'rich-text-cs-size': { width: 595, height: 842 },
     'theme-fonts': { width: 1190, height: 360 },
+    'font-substitution': { width: 1190, height: 640 },
     'soft-hyphen': { width: 1190, height: 400 },
     'run-content': { width: 1190, height: 440 },
     hyphenation: { width: 1190, height: 1000 },

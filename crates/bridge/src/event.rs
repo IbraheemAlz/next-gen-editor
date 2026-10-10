@@ -47,6 +47,13 @@ pub enum Event {
     FontLoaded {
         id: String,
         metrics: FontMetrics,
+        /// Issue #329 — the font substitutions the OPEN document's layout
+        /// makes now that this face is loaded (a newly loaded substitute
+        /// can start serving a family the document names). Additive:
+        /// skipped on the wire when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[tsify(optional)]
+        substituted: Vec<FontSubstitution>,
     },
     GlyphPainted {
         font_id: String,
@@ -84,6 +91,13 @@ pub enum Event {
     },
     DocumentLoaded {
         paragraph_count: u32,
+        /// Issue #329 — the font substitutions the opened document's
+        /// layout makes: every (family, script slot) it names that the
+        /// engine does not have and a substitution row serves with a
+        /// loaded face. Additive: skipped on the wire when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[tsify(optional)]
+        substituted: Vec<FontSubstitution>,
         /// Issue #406 — the reader's non-fatal diagnostics for the package
         /// just opened (`format_docx::DocxWarning`, coalesced: identical
         /// warnings ride one entry with a `count`). Non-empty means the
@@ -1080,6 +1094,33 @@ pub enum FontSource {
     /// default face for the script (the font stack's fallback).
     #[default]
     Default,
+    /// Issue #329 — the document names a family the engine does not have
+    /// (at any cascade level, theme included), and the substitution table
+    /// supplied the face the slot's text is shaped with (Carlito for
+    /// Calibri, Noto Naskh Arabic for Simplified Arabic). The resolved
+    /// name stays the document's ("Calibri").
+    Substituted,
+}
+
+/// Issue #329 — one font substitution layout makes for the open document
+/// (`text_pipeline::SUBSTITUTIONS`): a family the document names in one
+/// script slot, and the loaded face that stands in for it.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct FontSubstitution {
+    /// The family the document names, as the substitution table spells
+    /// it (`"Calibri"`, `"Simplified Arabic"`).
+    pub family: String,
+    /// The script slot whose text the substitute shapes: `Latin` or
+    /// `ComplexScript` (never `Both`).
+    pub slot: FontSlot,
+    /// The substitute's family name (`"Carlito"`).
+    pub substitute: String,
+    /// The substitute's loaded font id (`"carlito"`).
+    pub substitute_id: String,
+    /// `true` when the substitute is metric-compatible with `family`
+    /// (same advance widths, so line breaks follow the original); `false`
+    /// for a closest-style pick (every Arabic row).
+    pub metric_compatible: bool,
 }
 
 /// Issue #423 — [`FontSource`] per script slot.
@@ -1567,6 +1608,7 @@ mod a11y_note_wire_tests {
         let clean = serde_json::to_value(Event::DocumentLoaded {
             paragraph_count: 3,
             warnings: vec![],
+            substituted: vec![],
         })
         .unwrap();
         assert_eq!(
@@ -1575,10 +1617,11 @@ mod a11y_note_wire_tests {
         );
         let back: Event = serde_json::from_value(clean).unwrap();
         assert!(
-            matches!(back, Event::DocumentLoaded { paragraph_count: 3, warnings } if warnings.is_empty())
+            matches!(back, Event::DocumentLoaded { paragraph_count: 3, warnings, .. } if warnings.is_empty())
         );
         let degraded = serde_json::to_value(Event::DocumentLoaded {
             paragraph_count: 1,
+            substituted: vec![],
             warnings: vec![
                 ReadWarning {
                     kind: ReadWarningKind::MeasureClamped,
@@ -1804,5 +1847,50 @@ mod a11y_note_wire_tests {
             "{json}"
         );
         assert_eq!(serde_json::from_str::<A11yRun>(&json).unwrap(), r);
+    }
+
+    /// Issue #329 — `substituted` is additive on `FontLoaded` /
+    /// `DocumentLoaded`: an empty list keeps the pre-#329 wire shape, an
+    /// old payload decodes, and a substitution spells its slot by name;
+    /// `FontSource::Substituted` is a new variant name.
+    #[test]
+    fn font_substitution_wire_shapes() {
+        let loaded = Event::DocumentLoaded {
+            paragraph_count: 3,
+            warnings: vec![],
+            substituted: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::json!({ "type": "DOCUMENT_LOADED", "paragraph_count": 3 })
+        );
+        let old: Event = serde_json::from_value(
+            serde_json::json!({ "type": "FONT_LOADED", "id": "amiri", "metrics": {
+                "units_per_em": 1000, "ascent": 1.0, "descent": 0.5, "leading": 0.0,
+                "cap_height": 0.6, "x_height": 0.4 } }),
+        )
+        .unwrap();
+        assert!(matches!(old, Event::FontLoaded { ref substituted, .. } if substituted.is_empty()));
+        let with = serde_json::to_value(Event::DocumentLoaded {
+            paragraph_count: 1,
+            warnings: vec![],
+            substituted: vec![FontSubstitution {
+                family: "Calibri".into(),
+                slot: FontSlot::Latin,
+                substitute: "Carlito".into(),
+                substitute_id: "carlito".into(),
+                metric_compatible: true,
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            with["substituted"],
+            serde_json::json!([{ "family": "Calibri", "slot": "Latin", "substitute": "Carlito",
+                "substitute_id": "carlito", "metric_compatible": true }])
+        );
+        assert_eq!(
+            serde_json::to_value(FontSource::Substituted).unwrap(),
+            "Substituted"
+        );
     }
 }

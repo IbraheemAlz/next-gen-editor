@@ -34,13 +34,15 @@ class FakeClient implements TelemetryClient {
     checkpointListeners = new Set<(n: number) => void>();
     dispatched: Command[] = [];
     statsAvailable = true;
+    /** The `OPEN_DOCUMENT` reply (issue #329 tests add `substituted`). */
+    openReply: Record<string, unknown> = { type: 'DOCUMENT_LOADED' };
     async dispatch(cmd: Command): Promise<Event> {
         this.dispatched.push(cmd);
         if (cmd.type === 'REQUEST_STATS') {
             if (!this.statsAvailable) throw new Error('engine down');
             return stats;
         }
-        if (cmd.type === 'OPEN_DOCUMENT') return { type: 'DOCUMENT_LOADED' } as unknown as Event;
+        if (cmd.type === 'OPEN_DOCUMENT') return this.openReply as unknown as Event;
         return { type: 'PAINTED' } as unknown as Event;
     }
     subscribe(fn: (e: Event) => void): () => void {
@@ -281,6 +283,23 @@ describe('DOC_OPEN correlation', () => {
         expect(ofType('DOC_OPEN')).toEqual([
             { type: 'DOC_OPEN', size_bytes: 1234, page_count: 7, open_ms: expect.any(Number), backend: 'canvas2d' },
         ]);
+    });
+
+    it('carries the font-substitution count, never the families (#329)', async () => {
+        start();
+        client.openReply = {
+            type: 'DOCUMENT_LOADED',
+            substituted: [
+                { family: 'Calibri', slot: 'Latin', substitute: 'Carlito', substitute_id: 'carlito', metric_compatible: true },
+                { family: 'Arial', slot: 'ComplexScript', substitute: 'Noto Naskh Arabic', substitute_id: 'noto-naskh', metric_compatible: false },
+            ],
+        };
+        await client.dispatch(open);
+        client.emit({ type: 'PAINTED', paint_ms: 1, page_count: 2 });
+        await tick();
+        const [sample] = ofType('DOC_OPEN');
+        expect(sample).toMatchObject({ type: 'DOC_OPEN', page_count: 2, font_substitutions: 2 });
+        expect(JSON.stringify(sample)).not.toContain('Calibri');
     });
 
     it('gives up when no confirming paint arrives within 5 s', async () => {

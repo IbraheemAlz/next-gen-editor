@@ -37,6 +37,9 @@ import DUAL_URL from '../../fonts/Amiri-Regular.ttf?url';
 /* Issue #355 — the `theme-fonts` golden opens a committed fixture generated
    by `tools/roundtrip --gen-seed` (our own builder, no foreign bytes). */
 import THEME_DOCX_URL from '../../../crates/format-docx/tests/fixtures/theme_loaded_faces.docx?url';
+/* Issue #329 — the `font-substitution` golden opens a committed fixture
+   (`tools/roundtrip --gen-seed`) naming Calibri + Simplified Arabic. */
+import SUBSTITUTION_DOCX_URL from '../../../crates/format-docx/tests/fixtures/substitution_fonts.docx?url';
 /* Issue #335 — the `soft-hyphen` golden (soft + non-breaking hyphens). */
 import SOFT_HYPHEN_DOCX_URL from '../../../crates/format-docx/tests/fixtures/soft_hyphen.docx?url';
 /* Issue #357 — the `run-content` golden (sym, cr, ptab, bdo / dir). */
@@ -438,6 +441,23 @@ async function handleInit(msg: InitMsg): Promise<void> {
             ['liberation', LATIN_URL],
             ['amiri', DUAL_URL],
             ['noto-naskh', ARABIC_URL],
+        ] as const) {
+            const e = await dispatch({
+                type: 'LOAD_FONT',
+                id,
+                bytes: await fetchBytes(url),
+            } as Command);
+            self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
+        }
+    } else if (testCase === 'font-substitution') {
+        /* Issue #329 — the faces the fixture's families substitute to
+           (Carlito for Calibri, Noto Naskh Arabic for Simplified Arabic),
+           under their `fonts.json` ids; Carlito is a `public/` asset, so
+           it is fetched by its base-relative URL, not imported. */
+        for (const [id, url] of [
+            ['liberation', LATIN_URL],
+            ['noto-naskh', ARABIC_URL],
+            ['carlito', `${import.meta.env.BASE_URL}fonts/Carlito-Regular.ttf`],
         ] as const) {
             const e = await dispatch({
                 type: 'LOAD_FONT',
@@ -1044,6 +1064,30 @@ async function handleInit(msg: InitMsg): Promise<void> {
                 bytes: await fetchBytes(
                     testCase === 'hyphenation' ? HYPHENATION_ON_DOCX_URL : HYPHENATION_OFF_DOCX_URL,
                 ),
+            } as Command);
+            break;
+        }
+
+        case 'font-substitution': {
+            /* Issue #329 — a document naming Calibri (Latin) and
+               Simplified Arabic (complex script), neither shipped: the
+               Latin text paints in Carlito, the Arabic in Noto Naskh
+               Arabic, both at Word's font-derived line pitch (Word 2013's
+               Normal `w:line="259"`). Zoom 2 so the 11 pt body stays
+               legible; `run.mjs` screenshots the top band. */
+            await dispatch({ type: 'SET_ZOOM', scale: 2 } as Command);
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: 'liberation',
+                base_direction: 'LTR',
+                px_size: 15,
+                line_height: 22,
+                align: 'START',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'LOAD_DOCX',
+                bytes: await fetchBytes(SUBSTITUTION_DOCX_URL),
             } as Command);
             break;
         }

@@ -25,6 +25,11 @@
  * disabled placeholder option, instead of silently showing the first
  * registry font. Picks stay "Both" slots (Word's ribbon); per-slot picks
  * live in the Font dialog (issue #420), opened by the "Font…" button.
+ *
+ * Issue #329 — a family the editor does not ship but lays out with a
+ * substitute (`fontSource() === 'Substituted'`: Calibri shown with
+ * Carlito) keeps its own name and carries the substitute's name as the
+ * marker, "(Carlito)".
  */
 import { createSignal, createMemo, createEffect, For, Show, type Component } from 'solid-js';
 import {
@@ -58,6 +63,17 @@ export const FontPickers: Component = () => {
         (slotKey() === 'complex_script' ? state.resolvedFontCs() : state.resolvedFontLatin()) ??
         currentFamily();
     const fromTheme = () => state.fontSource()?.[slotKey()] === 'Theme';
+    /* Issue #329 — the face standing in for the resolved family, when the
+       engine substitutes it (`undefined` otherwise). */
+    const substitute = createMemo(() => {
+        if (state.fontSource()?.[slotKey()] !== 'Substituted') return undefined;
+        const slot = slotKey() === 'complex_script' ? 'ComplexScript' : 'Latin';
+        const key = (n: string) => n.trim().toLowerCase().replace(/[\s_-]+/g, ' ');
+        const found = state
+            .fontSubstitutions()
+            .find((s) => s.slot === slot && key(s.family) === key(resolvedName()));
+        return found?.substitute ?? 'substituted';
+    });
     const inRegistry = () => registry.fonts().some((f) => f.id === currentFamily());
     const currentSize = () => state.attrsAtCaret()?.font_size ?? 12;
 
@@ -105,9 +121,11 @@ export const FontPickers: Component = () => {
                     aria-busy={pending()}
                     disabled={!ready() || pending()}
                     title={
-                        fromTheme()
-                            ? `${resolvedName()} — from the document theme`
-                            : 'Font family'
+                        substitute()
+                            ? `${resolvedName()} — not installed; laid out with ${substitute()}`
+                            : fromTheme()
+                              ? `${resolvedName()} — from the document theme`
+                              : 'Font family'
                     }
                     data-nge-command="APPLY_FORMATTING"
                     onChange={(e) => void applyFamily(e.currentTarget.value)}
@@ -141,6 +159,17 @@ export const FontPickers: Component = () => {
                 >
                     (theme)
                 </span>
+            </Show>
+            <Show when={substitute()}>
+                {(sub) => (
+                    <span
+                        class="nge-font__source"
+                        data-nge-font-source="substituted"
+                        title={`${resolvedName()} is not installed; the document is laid out with ${sub()}`}
+                    >
+                        ({sub()})
+                    </span>
+                )}
             </Show>
             <input
                 class="nge-font__size"

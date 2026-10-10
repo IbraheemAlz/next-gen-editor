@@ -79,6 +79,7 @@ pub(crate) fn para(
         px_size_for_marker: 14.0,
         inline_objects: &[],
         tab_stops_px: &[],
+        font_line: None,
         hyphenation: None,
     });
     p.source_paragraph_id = id;
@@ -905,6 +906,7 @@ fn highlights_and_decorations_are_artifacts() {
         px_size_for_marker: 14.0,
         inline_objects: &[],
         tab_stops_px: &[],
+        font_line: None,
         hyphenation: None,
     });
     p.source_paragraph_id = 0;

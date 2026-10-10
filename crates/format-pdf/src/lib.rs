@@ -3157,6 +3157,7 @@ mod tests {
             px_size_for_marker: 18.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
             hyphenation: None,
         });
         /* Phase 6 — `source_paragraph_id` is engine-wasm's job in
@@ -3284,6 +3285,7 @@ mod tests {
             px_size_for_marker: 22.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
             hyphenation: None,
         });
         let cell_borders = engine::default_word_borders();
@@ -3396,6 +3398,7 @@ mod tests {
                 px_size_for_marker: 22.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                font_line: None,
                 hyphenation: None,
             });
             let cell = layout::TableCellBox {
@@ -3494,6 +3497,7 @@ mod tests {
                 px_size_for_marker: 22.0,
                 inline_objects: &[],
                 tab_stops_px: &[],
+                font_line: None,
                 hyphenation: None,
             });
             assert_eq!(para.lines.len(), 3, "one word per line");
@@ -3611,6 +3615,7 @@ mod tests {
                     px_size_for_marker: 22.0,
                     inline_objects: &[],
                     tab_stops_px: &[],
+                    font_line: None,
                     hyphenation: None,
                 });
                 layout::TableCellBox {
@@ -4465,6 +4470,7 @@ mod tests {
             px_size_for_marker: 18.0,
             inline_objects: &[],
             tab_stops_px: &[(250.0, layout::paragraph::TabKind::Right, leader)],
+            font_line: None,
             hyphenation: None,
         });
         para.source_paragraph_id = 0;
@@ -4702,6 +4708,7 @@ mod tests {
                 bg_color: None,
                 baseline_shift_px: 0.0,
             },
+            metrics_font: None,
         };
         let para = ParagraphBox {
             origin: Point { x: 36.0, y: 0.0 },
@@ -5031,6 +5038,7 @@ mod tests {
             px_size_for_marker: 22.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
             hyphenation: None,
         });
         let glyphs_per_row: usize = para
@@ -5147,6 +5155,7 @@ mod tests {
             px_size_for_marker: 22.0,
             inline_objects: &[],
             tab_stops_px: &[],
+            font_line: None,
             hyphenation: None,
         });
         let glyphs: usize = para

@@ -27,10 +27,13 @@ use std::path::Path;
 use std::process::ExitCode;
 use text_pipeline::FontStack;
 
-/// The harness font stack - Latin -> Liberation Sans, Arabic -> Amiri, shared
-/// with `corpus-native` through `harness-fonts` (issue #464).
+/// The harness font stack (issue #464: Latin -> Liberation Sans, Arabic ->
+/// Amiri, shared with `corpus-native` through `harness-fonts`) plus the
+/// editor's substitute faces (issue #329), so a document's families resolve
+/// as in the editor: Calibri -> Carlito, Simplified Arabic -> Noto Naskh
+/// Arabic, ... (`pipeline` passes them through).
 fn build_font_stack() -> Result<FontStack> {
-    Ok(harness_fonts::harness_stack())
+    Ok(harness_fonts::harness_stack_with_substitutes())
 }
 
 /// Issue #109 — best-effort substring check: does the raw `word/document.xml`
