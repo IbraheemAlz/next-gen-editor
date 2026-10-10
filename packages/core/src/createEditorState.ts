@@ -313,6 +313,7 @@ export interface EditorState {
      * Shared like `zoom`.
      */
     fontSubstitutions: Accessor<FontSubstitution[]>;
+    /**
      * Issue #387 — the on-canvas highlight of every top-level comment
      * (`Event::CommentHighlights`): per-line rects in absolute document
      * device px, the `caret` / `rects` space. Empty for a document without
