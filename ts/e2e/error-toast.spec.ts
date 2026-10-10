@@ -144,7 +144,7 @@ test('the Dev HUD records the last error with its command, kind and count (#364)
     await page.keyboard.press('Control+Shift+D');
     const row = page.locator('.nge-hud__lasterror');
     await expect(row).toBeVisible();
-    await expect(row).toContainText('DeleteAtCaret');
+    await expect(row).toContainText('DELETE_AT_CARET');
     await expect(row).toContainText('TrackedDeletionRefused');
     await expect(row).toContainText('#1');
 

@@ -41,6 +41,8 @@ export {
 export type { EditorCommands, ParagraphStyleId, SlotFormatPatch } from './createEditorCommands';
 
 export { createEditorState } from './createEditorState';
+export { errorCommand } from './errorCommand';
+export type { ErrorEventLike } from './errorCommand';
 export type {
     EditorState,
     CheckpointHealth,

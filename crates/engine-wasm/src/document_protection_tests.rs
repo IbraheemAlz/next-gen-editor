@@ -146,7 +146,7 @@ fn an_encrypted_package_answers_the_typed_error() {
     for bytes in packages {
         let mut e = engine_with(DocumentTree::from_text("keep me"));
         let evt = open_docx(&mut e, bytes.clone());
-        let Event::Error { message, kind } = evt else {
+        let Event::Error { message, kind, .. } = evt else {
             panic!("an encrypted package answers Error, got {evt:?}");
         };
         assert_eq!(
@@ -181,7 +181,7 @@ fn a_legacy_compound_file_is_not_reported_as_encrypted() {
     let doc = format_docx::opc::cfb::test_writer::build(&[("WordDocument", &[1u8; 600])]);
     let mut e = engine_with(DocumentTree::from_text("keep me"));
     let evt = open_docx(&mut e, doc);
-    let Event::Error { message, kind } = evt else {
+    let Event::Error { message, kind, .. } = evt else {
         panic!("a legacy compound file answers Error, got {evt:?}");
     };
     assert_eq!(kind, Some(bridge::ErrorKind::InvalidDocument), "{message}");

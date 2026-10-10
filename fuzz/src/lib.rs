@@ -231,6 +231,19 @@ pub fn run_rpc_command(data: &[u8]) {
                 format!("{evt:?}").chars().take(160).collect::<String>()
             );
         }
+        /* Issue #469 — every error reply to a dispatched command names
+        that command by its wire name (stamped by `Engine::apply`). */
+        if let bridge::Event::Error {
+            command, message, ..
+        } = &evt
+        {
+            assert_eq!(
+                command.as_deref(),
+                Some(keep.kind().wire_name().as_str()),
+                "{} answered Event::Error without its wire name: {message}",
+                variant_name(&keep)
+            );
+        }
         if let bridge::Event::Error { message, .. } = &evt
             && !is_post_commit_report_error(message)
         {

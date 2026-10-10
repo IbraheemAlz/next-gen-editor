@@ -362,7 +362,7 @@ fn open_text_honours_the_host_package_limits() {
                 password: None,
             },
         );
-        let Event::Error { message, kind } = evt else {
+        let Event::Error { message, kind, .. } = evt else {
             panic!("an oversized file answers Error, got {evt:?}");
         };
         assert_eq!(kind, Some(bridge::ErrorKind::PackageTooLarge), "{message}");

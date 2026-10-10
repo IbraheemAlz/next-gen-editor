@@ -19,6 +19,7 @@
  */
 import { createRoot, createSignal, onCleanup, type Accessor } from 'solid-js';
 import { useEngine, type EngineHandle } from './EngineProvider';
+import { errorCommand } from './errorCommand';
 import type {
     Alignment,
     AttrsMixed,
@@ -323,8 +324,9 @@ export interface EditorState {
 export interface EditorError {
     /** The typed class (`Event::Error.kind`), when the engine set one. */
     kind: ErrorKind | undefined;
-    /** The command that was refused, parsed from the engine's
-     *  `<Command>: <reason>` message prefix; `undefined` when absent. */
+    /** The wire name of the command that was refused (`Event::Error.command`,
+     *  issue #469; the legacy `<Command>: ` message prefix is the fallback
+     *  for a reply without it); `undefined` when neither is present. */
     command: string | undefined;
     /** The engine's message, verbatim. */
     message: string;
@@ -460,10 +462,9 @@ function viewStateFor(engine: EngineHandle): ViewState {
             }
             if (evt.type === 'ERROR') {
                 errorCount += 1;
-                const prefix = /^([A-Za-z][A-Za-z0-9]*): /.exec(evt.message);
                 setLastError({
                     kind: evt.kind,
-                    command: prefix?.[1],
+                    command: errorCommand(evt),
                     message: evt.message,
                     count: errorCount,
                     at: Date.now(),

@@ -17,6 +17,7 @@
  * an opaque per-session id; the crash sample's `recent_commands` carries only
  * dispatched `Command.type` tags (e.g. `"INSERT_TEXT"`), never a command's
  * payload (which, for `InsertText`, IS document content). */
+import { errorCommand } from '@nge/core';
 import type { Command, ErrorKind, Event } from '../engine/types';
 import { readWarningCounts, type ReadWarningCount } from './read-warning-counts';
 import { installDevHook } from '../dev-hooks';
@@ -120,7 +121,13 @@ type TelemetryKind =
           last_paint_ms: number;
           last_command_ms: number;
       }
-    | { type: 'ERROR'; code: ErrorCode; recoverable: boolean; kind?: ErrorKind }
+    | {
+          type: 'ERROR';
+          code: ErrorCode;
+          recoverable: boolean;
+          kind?: ErrorKind;
+          command?: string;
+      }
     | { type: 'FONT_FALLBACK'; script: string; requested: string; fallback: string }
     /* Issue #87 — one sample per `Painted.layout_degraded` note. */
     | { type: 'LAYOUT_DEGRADED'; reason: string; page: number | undefined }
@@ -428,6 +435,9 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                UNKNOWN: the kind IS the classification); an untyped error is
                UNKNOWN with no kind. */
             const kind = e.kind;
+            /* Issue #469 - the refused command's wire name (the field, else
+               the legacy message prefix): refusals per command x kind. */
+            const command = errorCommand(e);
             if (kind !== undefined && ERROR_KIND_SAMPLING[kind] === 'not-sampled') return;
             pending.push(
                 sample({
@@ -435,6 +445,7 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                     code: 'UNKNOWN',
                     recoverable: true,
                     ...(kind !== undefined ? { kind } : {}),
+                    ...(command !== undefined ? { command } : {}),
                 }),
             );
         }

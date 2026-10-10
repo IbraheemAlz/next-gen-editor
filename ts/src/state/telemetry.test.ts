@@ -203,6 +203,38 @@ describe('batching and folding', () => {
         ]);
     });
 
+    it('carries the refused command: the field, else the legacy message prefix (#469)', async () => {
+        start();
+        client.emit({
+            type: 'ERROR',
+            message: 'no prefix',
+            kind: 'InvalidArgument',
+            command: 'APPLY_FORMATTING',
+        });
+        client.emit({ type: 'ERROR', message: 'SetZoom: scale is NaN', kind: 'InvalidArgument' });
+        client.emit({ type: 'ERROR', message: 'untyped, no command' });
+        await tick();
+        expect(ofType('ERROR')).toEqual([
+            {
+                type: 'ERROR',
+                code: 'UNKNOWN',
+                recoverable: true,
+                kind: 'InvalidArgument',
+                command: 'APPLY_FORMATTING',
+            },
+            {
+                type: 'ERROR',
+                code: 'UNKNOWN',
+                recoverable: true,
+                kind: 'InvalidArgument',
+                command: 'SET_ZOOM',
+            },
+            { type: 'ERROR', code: 'UNKNOWN', recoverable: true },
+        ]);
+        /* A command name only - never the message text. */
+        expect(JSON.stringify(batches)).not.toContain('scale is NaN');
+    });
+
     it('counts every failed checkpoint write as an ERROR / CHECKPOINT_FAILED sample (#333)', async () => {
         start();
         for (const l of client.checkpointListeners) l(1);
