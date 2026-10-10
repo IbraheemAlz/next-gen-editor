@@ -36,6 +36,7 @@ export type { CommentsRailProps } from './CommentsRail';
 
 export { CommentHighlights } from './CommentHighlights';
 export type { CommentHighlightsProps } from './CommentHighlights';
+export { CommentConnectors } from './CommentConnectors';
 export { commentFocusFor } from './commentFocus';
 export type { CommentFocus } from './commentFocus';
 

@@ -37,6 +37,7 @@
     --nge-color-accent-del:   #dc2626;
     --nge-color-accent-move:  #6a1b9a;
     --nge-color-comment-bg:   #fef9c3;
+    --nge-color-comment-card-active: #fde68a;
     /* Issue #387 — on-canvas comment highlights (multiplied over the page). */
     --nge-color-comment-highlight:          rgba(250, 204, 21, 0.30);
     --nge-color-comment-highlight-edge:     rgba(202, 138, 4, 0.55);

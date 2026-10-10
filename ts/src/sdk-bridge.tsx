@@ -31,6 +31,7 @@ import {
     InsertImageButton,
     TrackChangesSidebar,
     CommentsRail,
+    CommentConnectors,
     TableContextMenu,
     LayoutControls,
     FileMenu,
@@ -142,6 +143,10 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                         <CommentsRail onNavigate={() => props.onRevealCaret?.()} />
                     </Show>
                 </aside>
+                {/* Issue #465 - dotted leaders from each anchor to its card. */}
+                <Show when={ready()}>
+                    <CommentConnectors />
+                </Show>
                 <footer class="nge-shell__statusbar">
                     <StatusBar />
                     <ZoomControls />

@@ -32,6 +32,7 @@
  */
 import {
     createEffect,
+    createMemo,
     createSignal,
     For,
     Show,
@@ -40,14 +41,15 @@ import {
 } from 'solid-js';
 import {
     createEditorCommands,
+    createEditorState,
     useEngine,
     type BlockPath,
     type CommentSnapshot,
     type LogicalPos,
     type LogicalRange,
-    type PathStep,
 } from '@nge/core';
 import { commentFocusFor } from './commentFocus';
+import { activeCommentId, comparePos } from './commentConnector';
 import './CommentsRail.css';
 
 export interface CommentsRailProps {
@@ -99,23 +101,6 @@ function anchorOf(c: CommentSnapshot): LogicalRange {
     };
 }
 
-function stepOrder(s: PathStep): [number, number] {
-    return s.kind === 'CELL' ? [s.row, s.col] : [s.idx, 0];
-}
-
-/** Document order of two positions: the paths depth-first (a block
- *  index, then a cell's row and column), then the byte offset. */
-function comparePos(a: LogicalPos, b: LogicalPos): number {
-    const n = Math.min(a.path.steps.length, b.path.steps.length);
-    for (let i = 0; i < n; i++) {
-        const [x0, x1] = stepOrder(a.path.steps[i]!);
-        const [y0, y1] = stepOrder(b.path.steps[i]!);
-        if (x0 !== y0) return x0 - y0;
-        if (x1 !== y1) return x1 - y1;
-    }
-    return a.path.steps.length - b.path.steps.length || a.offset - b.offset;
-}
-
 /** Human-readable anchor position: `block 2 › cell 1,0 › block 0:6`. */
 function describePos(p: LogicalPos): string {
     const steps = p.path.steps.map((s) =>
@@ -165,6 +150,7 @@ function groupThreads(rows: CommentSnapshot[]): CommentThread[] {
 export const CommentsRail: Component<CommentsRailProps> = (props) => {
     const engine = useEngine();
     const cmd = createEditorCommands();
+    const editorState = createEditorState();
     const [comments, setComments] = createSignal<CommentSnapshot[]>([]);
     const [error, setError] = createSignal<string | null>(null);
     /* Issue #27 — one reply draft open at a time, keyed by the
@@ -177,6 +163,19 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
     const activeId = focus.activeId;
     const setActiveId = focus.setActiveId;
     let listEl: HTMLUListElement | undefined;
+    /* Issue #465 - the caret drives the active card: the thread whose
+       range holds the selection start (innermost wins). The shared focus
+       follows it, so the card, the on-canvas highlight and the connector
+       agree, and leaving the range clears all three. */
+    const caretThreadId = createMemo(() =>
+        activeCommentId(
+            editorState.selection(),
+            groupThreads(comments()).map((t) => ({ id: t.root.id, range: anchorOf(t.root) })),
+        ),
+    );
+    createEffect(() => {
+        setActiveId(caretThreadId());
+    });
     /* Issue #387 — a highlight click (or "Go to comment") made a thread
        active: bring its card into the rail's view. */
     createEffect(() => {
@@ -289,6 +288,19 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                                 class={`nge-cm__card ${t.root.resolved ? 'nge-cm__card--resolved' : ''} ${activeId() === t.root.id ? 'nge-cm__card--active' : ''}`}
                                 data-comment-id={t.root.id}
                                 data-anchor={describePos(anchorOf(t.root).start)}
+                                onClick={(e) => {
+                                    /* Issue #465 - a click on the card itself
+                                       selects its text and reveals it, like
+                                       "Go to comment"; its controls keep
+                                       their own behaviour. */
+                                    const el = e.target;
+                                    if (
+                                        el instanceof HTMLElement &&
+                                        el.closest('button, textarea, input, a')
+                                    )
+                                        return;
+                                    void goTo(t.root);
+                                }}
                             >
                                 <div class="nge-cm__card-head">
                                     <div
