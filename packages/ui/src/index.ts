@@ -34,6 +34,11 @@ export type { TrackChangesSidebarProps } from './TrackChangesSidebar';
 export { CommentsRail } from './CommentsRail';
 export type { CommentsRailProps } from './CommentsRail';
 
+export { CommentHighlights } from './CommentHighlights';
+export type { CommentHighlightsProps } from './CommentHighlights';
+export { commentFocusFor } from './commentFocus';
+export type { CommentFocus } from './commentFocus';
+
 export { TableContextMenu } from './TableContextMenu';
 export type { TableContextMenuProps } from './TableContextMenu';
 
