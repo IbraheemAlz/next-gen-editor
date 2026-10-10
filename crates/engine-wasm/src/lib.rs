@@ -1304,6 +1304,19 @@ impl Engine {
         serde_wasm_bindgen::to_value(&comment_rows(self.undo.current()))
             .map_err(|e| JsValue::from_str(&format!("encode comments: {e}")))
     }
+
+    /// Issue #387 — the `Event::CommentHighlights` broadcast for the
+    /// current document and geometry (per-line rects of every commented
+    /// range), or `undefined` when the document has no comments. The
+    /// worker calls this whenever the document or its painted geometry
+    /// moved and posts the event on the subscribe path.
+    pub fn comment_highlights(&self) -> Result<JsValue, JsValue> {
+        match self.comment_highlights_event() {
+            Some(evt) => serde_wasm_bindgen::to_value(&evt)
+                .map_err(|e| JsValue::from_str(&format!("encode comment highlights: {e}"))),
+            None => Ok(JsValue::UNDEFINED),
+        }
+    }
 }
 
 /// The [`Engine::comments_snapshot`] rows of `doc`, one per comment range
@@ -2910,6 +2923,66 @@ impl<'a> StyleContext<'a> {
     }
 }
 
+/// One layout span for `style` over `[start, end)` of `para_text`: the
+/// size (with the `<w:vertAlign>` shrink), colour, flags, resolved font
+/// ids and complex-script twins — before any caps split
+/// ([`push_caps_spans`]). Returns the span and its Latin base px (the
+/// caps split's reference size).
+#[allow(clippy::too_many_arguments)]
+fn materialize_span(
+    para_text: &str,
+    style: &engine::SpanStyle,
+    start: u32,
+    end: u32,
+    sctx: StyleContext,
+    default_size: f32,
+    default_color: [u8; 4],
+    scale: f32,
+) -> (StyleSpan, f32) {
+    let text = para_text.get(start as usize..end as usize).unwrap_or("");
+    let (font_family, font_family_cs) = sctx.run_font_ids(style, text);
+    let raw_base_px = style.font_size.unwrap_or(default_size) * scale;
+    let vert = style.vert_align.unwrap_or(engine::VertAlign::Baseline);
+    let (px_factor, shift_factor) = match vert {
+        engine::VertAlign::Baseline => (1.0_f32, 0.0_f32),
+        engine::VertAlign::Superscript => (0.65, 0.33),
+        engine::VertAlign::Subscript => (0.65, -0.15),
+    };
+    let base_px = (raw_base_px * px_factor).max(1.0);
+    let baseline_shift_px = raw_base_px * shift_factor;
+    let template = StyleSpan {
+        start,
+        end,
+        px_size: base_px,
+        /* Issue #355 — a theme colour supersedes the cached `w:val`. */
+        color: style.resolve_color(sctx.theme).unwrap_or(default_color),
+        bold: style.bold.unwrap_or(false),
+        italic: style.italic.unwrap_or(false),
+        underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
+        strike: style.strike.unwrap_or(false),
+        bg_color: style.bg_color,
+        font_family,
+        caps_transform: false,
+        baseline_shift_px,
+        cs: None,
+    };
+    /* Issues #359 / #104 / #249 — the complex-script twins, resolved
+    through the same cascade (an unset twin takes the document
+    default, never the Latin value — Word's rule); the family is the
+    `cs` slot as `run_font_ids` resolved it (theme binding incl. the
+    script's supplemental face, else `w:cs`). */
+    let raw_cs_px = style.font_size_cs.unwrap_or(default_size) * scale;
+    let cs = ComplexScriptAttrs {
+        px_size: (raw_cs_px * px_factor).max(1.0),
+        baseline_shift_px: raw_cs_px * shift_factor,
+        bold: style.bold_cs.unwrap_or(false),
+        italic: style.italic_cs.unwrap_or(false),
+        font_family: font_family_cs,
+        whole_span: style.forces_complex_script(),
+    };
+    (template.with_cs(cs), base_px)
+}
+
 fn build_style_spans(
     para: &engine::Paragraph,
     sctx: StyleContext,
@@ -2927,48 +3000,16 @@ fn build_style_spans(
     empty in fresh documents — byte-identical to the old flat gap. */
     let run_base = sctx.run_base(para.style_id.as_deref());
     let emit = |style: &engine::SpanStyle, start: u32, end: u32, out: &mut Vec<StyleSpan>| {
-        let text = para.text.get(start as usize..end as usize).unwrap_or("");
-        let (font_family, font_family_cs) = sctx.run_font_ids(style, text);
-        let raw_base_px = style.font_size.unwrap_or(default_size) * scale;
-        let vert = style.vert_align.unwrap_or(engine::VertAlign::Baseline);
-        let (px_factor, shift_factor) = match vert {
-            engine::VertAlign::Baseline => (1.0_f32, 0.0_f32),
-            engine::VertAlign::Superscript => (0.65, 0.33),
-            engine::VertAlign::Subscript => (0.65, -0.15),
-        };
-        let base_px = (raw_base_px * px_factor).max(1.0);
-        let baseline_shift_px = raw_base_px * shift_factor;
-        let template = StyleSpan {
+        let (template, base_px) = materialize_span(
+            &para.text,
+            style,
             start,
             end,
-            px_size: base_px,
-            /* Issue #355 — a theme colour supersedes the cached `w:val`. */
-            color: style.resolve_color(sctx.theme).unwrap_or(default_color),
-            bold: style.bold.unwrap_or(false),
-            italic: style.italic.unwrap_or(false),
-            underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
-            strike: style.strike.unwrap_or(false),
-            bg_color: style.bg_color,
-            font_family,
-            caps_transform: false,
-            baseline_shift_px,
-            cs: None,
-        };
-        /* Issues #359 / #104 / #249 — the complex-script twins, resolved
-        through the same cascade (an unset twin takes the document
-        default, never the Latin value — Word's rule); the family is the
-        `cs` slot as `run_font_ids` resolved it (theme binding incl. the
-        script's supplemental face, else `w:cs`). */
-        let raw_cs_px = style.font_size_cs.unwrap_or(default_size) * scale;
-        let cs = ComplexScriptAttrs {
-            px_size: (raw_cs_px * px_factor).max(1.0),
-            baseline_shift_px: raw_cs_px * shift_factor,
-            bold: style.bold_cs.unwrap_or(false),
-            italic: style.italic_cs.unwrap_or(false),
-            font_family: font_family_cs,
-            whole_span: style.forces_complex_script(),
-        };
-        let template = template.with_cs(cs);
+            sctx,
+            default_size,
+            default_color,
+            scale,
+        );
         push_caps_spans(&para.text, style, &template, base_px, out);
     };
     for run in &para.spans {
@@ -3241,6 +3282,27 @@ fn paragraph_layout_key(
     run_base.caps.hash(&mut h);
     run_base.small_caps.hash(&mut h);
     hash_complex_script_slots(&run_base, &mut h);
+    /* Issue #370 — an EMPTY paragraph's line is sized by its mark (the
+    pilcrow's size / face). Mixed in only for empty paragraphs, so every
+    paragraph with text keeps its key. */
+    if para.text.is_empty()
+        && let Some(mark) = para.mark_style.as_deref()
+    {
+        0x70_u8.hash(&mut h);
+        mark.font_size.map(f32::to_bits).hash(&mut h);
+        mark.bold.hash(&mut h);
+        mark.italic.hash(&mut h);
+        mark.font_family.hash(&mut h);
+        mark.raw_font_family.hash(&mut h);
+        mark.font_bindings.hash(&mut h);
+        hash_complex_script_slots(mark, &mut h);
+        match mark.vert_align {
+            None => 0u8.hash(&mut h),
+            Some(engine::VertAlign::Baseline) => 1u8.hash(&mut h),
+            Some(engine::VertAlign::Superscript) => 2u8.hash(&mut h),
+            Some(engine::VertAlign::Subscript) => 3u8.hash(&mut h),
+        }
+    }
     /* Audit gap A.H2 — the cache key now folds the laid-out max width
     in. Same paragraph laid out at page-wide vs column-narrow widths
     produces different line breaks; without the mix-in a doc that
@@ -4128,7 +4190,7 @@ fn build_header_footer_box(
                 let base_direction = resolve_base_direction(para, cfg);
                 let (ind_s, ind_e, ind_fl, ind_h) =
                     effective_layout_indents(para, base_direction, scale);
-                let (lh_px, lh_exact) =
+                let (mut lh_px, lh_exact) =
                     resolve_line_height(para.props.line_height, cfg.line_height, scale);
                 let (text, spans) = if let Some(c) = comp {
                     let off = c.at.offset as usize;
@@ -4156,15 +4218,18 @@ fn build_header_footer_box(
                     );
                     (text, spans)
                 } else {
-                    let spans = apply_revision_overlay(
-                        apply_hyperlink_overlay(
-                            build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
-                            &para.hyperlinks,
-                            [0, 0, 0, 255],
-                        ),
-                        &para.revisions,
-                        [0, 0, 0, 255],
+                    /* Issue #370 — an empty band paragraph is sized by
+                    its mark, like the body's. */
+                    let (spans, mark_lh) = paragraph_layout_spans(
+                        para,
+                        sctx,
+                        fonts,
+                        cfg,
+                        scale,
+                        base_direction,
+                        lh_px,
                     );
+                    lh_px = mark_lh;
                     (para.text.clone(), spans)
                 };
                 /* Issue #78 / #188 — band pictures (and every other inline
@@ -5565,6 +5630,99 @@ fn layout_paragraph_cached(
     laid
 }
 
+/// The layout spans of a paragraph laid out as it stands (no IME
+/// preview) and its line pitch: the style spans with the hyperlink /
+/// revision overlays for text, or — issue #370 — for an EMPTY paragraph
+/// its paragraph MARK ([`empty_paragraph_mark`]), which sizes its line.
+#[allow(clippy::too_many_arguments)]
+fn paragraph_layout_spans(
+    para: &engine::Paragraph,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    base_direction: ShapingDirection,
+    line_height_px: f32,
+) -> (Vec<StyleSpan>, f32) {
+    if let Some((mark, lh)) = empty_paragraph_mark(
+        para,
+        sctx,
+        fonts,
+        cfg.px_size,
+        scale,
+        base_direction,
+        line_height_px,
+    ) {
+        return (vec![mark], lh);
+    }
+    let spans = apply_revision_overlay(
+        apply_hyperlink_overlay(
+            build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
+            &para.hyperlinks,
+            [0, 0, 0, 255],
+        ),
+        &para.revisions,
+        [0, 0, 0, 255],
+    );
+    (spans, line_height_px)
+}
+
+/// Issue #370 — an EMPTY paragraph's line is its paragraph MARK's: Word
+/// sizes it from the mark's run properties (`Paragraph::mark_style`,
+/// `<w:pPr><w:rPr>`) folded over the paragraph style, not from the
+/// document default. Returns the zero-width mark span `[0, 0)` the
+/// layout sizes the placeholder line from (`layout::empty_line_extents`)
+/// and the line pitch for it: `line_height_px` (the paragraph's resolved
+/// pitch — derived from the config's document-wide line height, the
+/// floor every line of text gets whatever its style) through
+/// `layout::empty_mark_pitch` against the DOCUMENT default run
+/// (`docDefaults <w:rPr>`, what unstyled text is set in) when the line
+/// rule is font-relative (no `w:line` override, or an `auto` multiple):
+/// a mark smaller than the default scales the floor down, a larger one
+/// grows the line only by its glyph extents, like a line of text.
+/// `exact` / `atLeast` are absolute and stay as resolved. The
+/// complex-script twins measure an RTL paragraph's mark. `None` for a
+/// paragraph with text.
+///
+/// A mark formatted like the document default (an unstyled paragraph
+/// with no mark properties — the common case) keeps the resolved pitch:
+/// the pre-#370 line, bit for bit, while the mark glyph fits it.
+fn empty_paragraph_mark(
+    para: &engine::Paragraph,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    default_size: f32,
+    scale: f32,
+    base_direction: ShapingDirection,
+    line_height_px: f32,
+) -> Option<(StyleSpan, f32)> {
+    if !para.text.is_empty() {
+        return None;
+    }
+    let run_base = sctx.run_base(para.style_id.as_deref());
+    let mark = match para.mark_style.as_deref() {
+        Some(m) => run_base.merged_with(SpanStyle {
+            grab_bag: None,
+            ..m.clone()
+        }),
+        None => run_base,
+    };
+    let black = [0, 0, 0, 255];
+    let doc_default = sctx.run_base(None);
+    let (base_span, _) = materialize_span("", &doc_default, 0, 0, sctx, default_size, black, scale);
+    let (mark_span, _) = materialize_span("", &mark, 0, 0, sctx, default_size, black, scale);
+    let rtl = matches!(base_direction, ShapingDirection::Rtl);
+    let pitch = match para.props.line_height {
+        None | Some(engine::LineHeight::Auto { .. }) => {
+            layout::empty_mark_pitch(fonts, line_height_px, &base_span, &mark_span, rtl)
+        }
+        Some(engine::LineHeight::Exact { .. } | engine::LineHeight::AtLeast { .. }) => {
+            line_height_px
+        }
+    };
+    Some((mark_span, pitch))
+}
+
 /// Lay out one engine paragraph from scratch (no cache), cut by the
 /// issue #82 wrap `cuts` (paragraph-box space; empty ⇒ the plain
 /// composer, byte-identical to the pre-#82 path). The body build calls
@@ -5580,19 +5738,12 @@ fn layout_paragraph_wrapped_uncached(
     sctx: StyleContext,
     cuts: &[layout::WrapCutout],
 ) -> ParagraphBox {
-    let spans = apply_revision_overlay(
-        apply_hyperlink_overlay(
-            build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
-            &para.hyperlinks,
-            [0, 0, 0, 255],
-        ),
-        &para.revisions,
-        [0, 0, 0, 255],
-    );
     let base_direction = resolve_base_direction(para, cfg);
     let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
     let inline_infos = build_inline_object_infos(para, cfg, scale, sctx);
     let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    let (spans, lh_px) =
+        paragraph_layout_spans(para, sctx, fonts, cfg, scale, base_direction, lh_px);
     /* Issue #326 — automatic hyphenation (document setting, paragraph
     not suppressing it, text in a language with patterns). */
     let hy_ranges = auto_hyphenation_ranges(para, sctx);
@@ -7066,6 +7217,62 @@ fn selection_rects_geom(
     rects
 }
 
+/// Issue #77 — while the field-code view is on, the layout (hence every
+/// `LineGeom` the display walk produces) is expressed in the derived code
+/// text of `doc`'s paragraphs: map it back to SOURCE offsets (see
+/// `Engine::geometry_to_source_offsets`, which passes the selection's
+/// tree; issue #387's comment highlights pass the body's).
+fn geometry_to_source_offsets_in(mut geom: Vec<LineGeom>, doc: &DocumentTree) -> Vec<LineGeom> {
+    for line in geom.iter_mut() {
+        let epath = bridge_to_engine_path(line.path.clone());
+        let Some(sp) = doc.paragraph_at_path(&epath) else {
+            continue;
+        };
+        if sp.fields.is_empty() {
+            continue;
+        }
+        let dp = sp.with_field_codes();
+        let inside = |o: u32| dp.code_span_strictly_containing(o).is_some();
+        let map = |o: u32| sp.code_view_offset_to_source(o);
+        line.start_byte = map(line.start_byte);
+        line.end_byte = map(line.end_byte);
+        line.slots.retain(|s| !inside(s.byte));
+        for slot in line.slots.iter_mut() {
+            slot.byte = map(slot.byte);
+        }
+        for run in line.runs.iter_mut() {
+            run.src_start = map(run.src_start);
+            run.src_end = map(run.src_end);
+            run.slots.retain(|s| !inside(s.byte));
+            for slot in run.slots.iter_mut() {
+                slot.byte = map(slot.byte);
+            }
+        }
+    }
+    geom
+}
+
+/// Issue #387 — width (layout pt, × the paint scale) of the marker a
+/// collapsed (point) comment gets: wide enough to hover.
+const COMMENT_POINT_MARK_W: f32 = 3.0;
+
+/// Issue #387 — the marker rect of a collapsed comment anchored at `pos`:
+/// `w` wide, centred on the caret slot, on the line holding `pos`; `None`
+/// when no laid-out line holds it (never the first line's fallback
+/// [`caret_rect_geom`] uses for the caret).
+fn point_comment_rect(geom: &[LineGeom], pos: &BridgeLogicalPos, w: f32) -> Option<BridgeRect> {
+    let line = geom
+        .iter()
+        .find(|l| l.path == pos.path && pos.offset >= l.start_byte && pos.offset <= l.end_byte)?;
+    let x = slot_x_for_byte_with_affinity(line, pos.offset, CaretAffinity::LeadingX);
+    Some(BridgeRect {
+        x: x - w / 2.0,
+        y: line.y_top,
+        w,
+        h: line.height,
+    })
+}
+
 /// Issue #276 — typing over (or replacing) a non-empty selection gives the
 /// new text the formatting of the FIRST replaced character, as Word does —
 /// and as the toolbar already reports for a range (`attrs_at` reads the
@@ -8055,18 +8262,24 @@ impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         let seq_before = self.mutation_seq;
         let revision_before = self.undo.revision();
+        /* Issue #387 — classified once, in `bridge::meta`. */
+        let reveals_caret = cmd.meta().reveals_caret;
         let mut evt = self.apply_command(cmd).await;
         if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
             self.mutation_seq += 1;
         }
         /* Issue #260 — a handler builds its `SelectionChanged` reply
         before the bump above lands, so stamp the revision the command
-        actually left the document at. */
+        actually left the document at. Issue #387 — and whether the
+        shell should scroll the caret it reports into view. */
         if let Event::SelectionChanged {
-            document_revision, ..
+            document_revision,
+            reveal_caret,
+            ..
         } = &mut evt
         {
             *document_revision = self.mutation_seq;
+            *reveal_caret = reveals_caret;
         }
         evt
     }
@@ -12074,39 +12287,67 @@ impl Engine {
     /// field's result boundaries, and line / run byte ranges map through
     /// the same function. Field-free paragraphs — and the whole result
     /// view — pass through untouched.
-    fn geometry_to_source_offsets(&self, mut geom: Vec<LineGeom>) -> Vec<LineGeom> {
+    fn geometry_to_source_offsets(&self, geom: Vec<LineGeom>) -> Vec<LineGeom> {
         if !self.field_code_view {
             return geom;
         }
-        self.with_selection_doc(|doc| {
-            for line in geom.iter_mut() {
-                let epath = bridge_to_engine_path(line.path.clone());
-                let Some(sp) = doc.paragraph_at_path(&epath) else {
-                    continue;
+        self.with_selection_doc(|doc| geometry_to_source_offsets_in(geom, doc))
+    }
+
+    /// Issue #387 — per-line highlight rectangles for every top-level
+    /// comment, built from the BODY's laid-out lines exactly like
+    /// selection rectangles ([`selection_rects_geom`]); `None` when the
+    /// document has no comment ranges (the worker then broadcasts nothing
+    /// — or one empty list when the last comment went). Replies ride
+    /// their root's range and are skipped. A collapsed (point) comment
+    /// gets one narrow marker at its anchor; an anchor past the laid-out
+    /// band gets no rects until layout reaches it.
+    fn comment_highlights_event(&self) -> Option<Event> {
+        let doc = self.undo.current();
+        if doc.comment_ranges.is_empty() {
+            return None;
+        }
+        let display = self.body_geometry_display().ok()?;
+        let geom = if self.field_code_view {
+            geometry_to_source_offsets_in(display, doc)
+        } else {
+            display
+        };
+        let scale = self.scale();
+        let highlights = doc
+            .comment_ranges
+            .iter()
+            .filter_map(|r| {
+                let def = doc.comment_defs.get(&r.id);
+                if def.and_then(|d| d.parent_id).is_some() {
+                    return None;
+                }
+                let (start, end) = ordered(
+                    BridgeLogicalPos {
+                        path: engine_to_bridge_path(r.start.path.clone()),
+                        offset: r.start.offset,
+                    },
+                    BridgeLogicalPos {
+                        path: engine_to_bridge_path(r.end.path.clone()),
+                        offset: r.end.offset,
+                    },
+                );
+                let rects = if start == end {
+                    point_comment_rect(&geom, &start, COMMENT_POINT_MARK_W * scale)
+                        .into_iter()
+                        .collect()
+                } else {
+                    selection_rects_geom(&geom, &start, &end)
                 };
-                if sp.fields.is_empty() {
-                    continue;
-                }
-                let dp = sp.with_field_codes();
-                let inside = |o: u32| dp.code_span_strictly_containing(o).is_some();
-                let map = |o: u32| sp.code_view_offset_to_source(o);
-                line.start_byte = map(line.start_byte);
-                line.end_byte = map(line.end_byte);
-                line.slots.retain(|s| !inside(s.byte));
-                for slot in line.slots.iter_mut() {
-                    slot.byte = map(slot.byte);
-                }
-                for run in line.runs.iter_mut() {
-                    run.src_start = map(run.src_start);
-                    run.src_end = map(run.src_end);
-                    run.slots.retain(|s| !inside(s.byte));
-                    for slot in run.slots.iter_mut() {
-                        slot.byte = map(slot.byte);
-                    }
-                }
-            }
-        });
-        geom
+                Some(bridge::CommentHighlight {
+                    id: r.id,
+                    author: def.map(|d| d.author.clone()).unwrap_or_default(),
+                    resolved: def.is_some_and(|d| d.resolved),
+                    rects,
+                })
+            })
+            .collect();
+        Some(Event::CommentHighlights { highlights })
     }
 
     /// The display-offset geometry walk (see [`Self::document_geometry`]
@@ -12128,6 +12369,13 @@ impl Engine {
             }
             StoryTarget::Body => {}
         }
+        self.body_geometry_display()
+    }
+
+    /// The BODY's display-offset line geometry, whatever story is active
+    /// (the body arm of [`Self::document_geometry_display`]; issue #387's
+    /// comment highlights always live in the body).
+    fn body_geometry_display(&self) -> Result<Vec<LineGeom>, Box<Event>> {
         /* `false` — hit-test + caret geometry run on committed document
         offsets, which `self.selection` is also expressed in. Audit gap
         C.H1 — geometry queries that need to resolve a deep caret /
@@ -13213,6 +13461,8 @@ impl Engine {
             caret_font_slot: fonts.caret_slot,
             /* Issue #345 — the body document's enforced restriction. */
             protection: self.protection_mode().map(bridge_protection_mode),
+            /* Issue #387 — `apply` stamps the command's classification. */
+            reveal_caret: false,
         }
     }
 
@@ -29242,6 +29492,14 @@ mod pbdr_start_end_tests;
 /// Issue #395 — paragraph borders defined on styles, on canvas.
 #[cfg(test)]
 mod pbdr_style_cascade_tests;
+
+/// Issue #370 — an empty paragraph's line is sized by its mark.
+#[cfg(test)]
+mod empty_mark_tests;
+
+/// Issue #387 — comment highlights + the caret-reveal stamp.
+#[cfg(test)]
+mod comment_highlight_tests;
 
 #[cfg(test)]
 mod block_remap_tests;

@@ -24,6 +24,11 @@
  * (`onNavigate`). The rail refetches on every document mutation
  * (`PAINTED.mutation_seq`), so typing before an anchor keeps the listed
  * position on the same text.
+ *
+ * Issue #387 — the active thread is the shared comment focus
+ * (`commentFocusFor`): clicking a comment's on-canvas highlight
+ * (`CommentHighlights`) selects its card here and scrolls it into view;
+ * "Go to comment" sets the same focus, which emphasizes the highlight.
  */
 import {
     createEffect,
@@ -42,6 +47,7 @@ import {
     type LogicalRange,
     type PathStep,
 } from '@nge/core';
+import { commentFocusFor } from './commentFocus';
 import './CommentsRail.css';
 
 export interface CommentsRailProps {
@@ -165,8 +171,20 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
      * top-level comment id it replies to. */
     const [replyFor, setReplyFor] = createSignal<number | null>(null);
     const [replyText, setReplyText] = createSignal('');
-    /* Issue #254 — the thread whose anchor the selection was moved to. */
-    const [activeId, setActiveId] = createSignal<number | null>(null);
+    /* Issue #254 — the thread whose anchor the selection was moved to;
+       issue #387 — shared with the on-canvas highlights. */
+    const focus = commentFocusFor(engine);
+    const activeId = focus.activeId;
+    const setActiveId = focus.setActiveId;
+    let listEl: HTMLUListElement | undefined;
+    /* Issue #387 — a highlight click (or "Go to comment") made a thread
+       active: bring its card into the rail's view. */
+    createEffect(() => {
+        const id = activeId();
+        if (id === null || !listEl) return;
+        const card = listEl.querySelector<HTMLElement>(`[data-comment-id="${id}"]`);
+        card?.scrollIntoView?.({ block: 'nearest' });
+    });
 
     const threads = () => groupThreads(comments());
 
@@ -264,7 +282,7 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                     <div class="nge-cm__empty">No comments in this document.</div>
                 }
             >
-                <ul class="nge-cm__list">
+                <ul class="nge-cm__list" ref={(el) => (listEl = el)}>
                     <For each={threads()}>
                         {(t) => (
                             <li
