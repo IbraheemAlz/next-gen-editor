@@ -16454,8 +16454,14 @@ impl Engine {
         even for a copy issued from inside a header/footer/note story. */
         let docx_fragment = if include_docx {
             let paragraph_slice = doc.slice(estart, eend);
-            let fragment_doc = DocumentTree::from_rich_paragraphs(paragraph_slice);
+            let mut fragment_doc = DocumentTree::from_rich_paragraphs(paragraph_slice);
             let source_package = self.undo.current().source_package.clone();
+            /* Issue #468 — the copied paragraphs keep their source markup
+            (`w14:paraId`, …): the fragment's synthesized root must
+            re-declare the source root's bindings (the #100 rule, as on
+            the save path), or the save-side gate refuses the fragment —
+            it used to ship namespace-ill-formed. */
+            fragment_doc.document_root_attrs = self.undo.current().document_root_attrs.clone();
             format_docx::build_clipboard_fragment_docx(&fragment_doc, source_package.as_deref())
                 .unwrap_or_default()
         } else {
