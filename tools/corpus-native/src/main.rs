@@ -482,6 +482,8 @@ fn main() -> ExitCode {
     construct the first differing byte falls in (see `drift.rs`). */
     let mut noedit_checked = 0usize;
     let mut noedit_identical = 0usize;
+    /* Issue #434 — documents whose main part is regenerate-only. */
+    let mut noedit_regenerate_only = 0usize;
     let mut drift_histogram: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     /* Issue #134 — the UI save path (`format_docx::save_docx`). */
@@ -626,7 +628,9 @@ fn main() -> ExitCode {
                 rec.elapsed_ms
             );
         }
-        if let Some(identical) = rec.document_xml_byte_identical {
+        if rec.main_part_regenerate_only {
+            noedit_regenerate_only += 1;
+        } else if let Some(identical) = rec.document_xml_byte_identical {
             noedit_checked += 1;
             if identical {
                 noedit_identical += 1;
@@ -787,7 +791,15 @@ fn main() -> ExitCode {
     );
     /* Issue #112 — the drift histogram, largest bucket first. */
     println!(
-        "[corpus-native] zero-edit document.xml byte-identical: {noedit_identical}/{noedit_checked}"
+        "[corpus-native] zero-edit document.xml byte-identical: {noedit_identical}/{noedit_checked}{}",
+        if noedit_regenerate_only > 0 {
+            format!(
+                " ({noedit_regenerate_only} regenerate-only main part(s) not compared — \
+                 normalised #325 or repaired #434)"
+            )
+        } else {
+            String::new()
+        }
     );
     if !drift_histogram.is_empty() {
         let mut buckets: Vec<(&String, &usize)> = drift_histogram.iter().collect();
@@ -856,9 +868,9 @@ fn main() -> ExitCode {
         files.len()
     );
     println!(
-        "[corpus-native] non-canonical namespace prefixes (#325/#394): {normalized_docs} documents, \
-         {normalized_parts} parts normalised (regenerate-only: their zero-edit save is not \
-         byte-identical to the source)"
+        "[corpus-native] non-canonical namespace prefixes (#325/#394) or malformed XML repaired \
+         (#434): {normalized_docs} documents, {normalized_parts} parts normalised (regenerate-only: \
+         their zero-edit save is not byte-identical to the source)"
     );
     println!(
         "[corpus-native] font substitution (#329): {substituting_docs}/{} documents substitute \

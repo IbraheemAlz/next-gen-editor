@@ -116,6 +116,15 @@ const UNDERSTOOD: &[(&str, &str)] = &[
     ),
 ];
 
+/// Issue #435 — the namespace URI `prefix` conventionally names among the
+/// namespaces the reader understands (`wps` → the WordprocessingShape
+/// URI), `None` for any other prefix.
+pub(crate) fn conventional_uri(prefix: &str) -> Option<&'static str> {
+    UNDERSTOOD
+        .iter()
+        .find_map(|(p, u)| (*p == prefix).then_some(*u))
+}
+
 /// `true` when the reader understands namespace `uri`.
 pub(crate) fn understands_uri(uri: &str) -> bool {
     UNDERSTOOD.iter().any(|(_, u)| *u == uri)

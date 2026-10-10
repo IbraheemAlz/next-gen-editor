@@ -29,6 +29,8 @@ export const READ_WARNING_LABELS: Record<ReadWarningKind, string> = {
     MainPartFallback:
         "The file's main-part relationship points at a missing part; the standard location was used.",
     UnsafeRelationshipTarget: 'A relationship pointing outside the file was ignored.',
+    MalformedPart:
+        'A part of the file is not well-formed XML; what could be repaired was repaired, and a repaired part will be rewritten on save.',
 };
 
 /** Total number of issues (coalesced entries count once per occurrence). */

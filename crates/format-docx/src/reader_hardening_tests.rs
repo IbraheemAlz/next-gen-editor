@@ -963,15 +963,23 @@ fn deep_inline_content_controls_read_or_refuse_typed() {
     assert!(err.to_string().contains("nesting depth"), "{err}");
 }
 
-/// Issue #358 — the splice snippets: a NUL character reference is a typed
-/// XML error (XML 1.0 forbids it), and a literal U+FFFC — the engine's own
-/// inline-object placeholder — stays TEXT through read → save → read,
+/// Issue #358 — the splice snippets: a NUL character reference (XML 1.0
+/// forbids it) is repaired up front into U+FFFD and reported (issue #434 —
+/// it used to refuse the whole part), and a literal U+FFFC — the engine's
+/// own inline-object placeholder — stays TEXT through read → save → read,
 /// never becoming an object.
 #[test]
-fn nul_references_refuse_and_object_replacement_characters_stay_text() {
+fn nul_references_are_repaired_and_object_replacement_characters_stay_text() {
     let nul = document(r#"<w:p><w:r><w:t>a&#0;b</w:t></w:r></w:p>"#, SECT);
-    let err = read_docx(&package_with_document_xml(&nul, &[])).expect_err("NUL");
-    assert!(matches!(err, crate::DocxError::Xml(_)), "{err:?}");
+    let a = assert_text_round_trips(&nul);
+    assert_eq!(a.document.to_plain_text(), "a\u{FFFD}b");
+    assert!(
+        a.warnings
+            .iter()
+            .any(|w| matches!(w, DocxWarning::MalformedPart { repaired: true, .. })),
+        "{:?}",
+        a.warnings
+    );
     for t in ["a\u{FFFC}b", "a&#xFFFC;b"] {
         let xml = document(&format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>"), SECT);
         let a = assert_text_round_trips(&xml);

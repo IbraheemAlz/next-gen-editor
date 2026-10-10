@@ -22,6 +22,7 @@ const KIND_RANK: Record<ReadWarningKind, number> = {
     NotWordprocessingMl: 7,
     MainPartFallback: 8,
     UnsafeRelationshipTarget: 9,
+    MalformedPart: 10,
 };
 
 /** Issue #406 — `bridge::read_warning_counts`: fold an open's coalesced
