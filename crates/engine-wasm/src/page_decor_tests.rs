@@ -434,3 +434,39 @@ fn drop_cap_wraps_the_first_lines_of_its_paragraph() {
 
 /// Pinned geometry of `drop_cap_docx`.
 const DROP_CAP_FINGERPRINT: &str = "0xff4a28c0d2fa2602";
+
+/// veraPDF probe: the three decoration fixtures exported as PDF/A-1b
+/// (untagged) and PDF/UA-1 (tagged — the borders and numbers must be
+/// artifacts), into `$PDF_DECOR_OUT/<profile>/<name>.pdf`. Run with
+/// `--ignored`, then `verapdf --flavour 1b|ua1` over the files.
+#[test]
+#[ignore]
+fn write_page_decor_exports() {
+    let Ok(out) = std::env::var("PDF_DECOR_OUT") else {
+        eprintln!("PDF_DECOR_OUT unset — nothing written");
+        return;
+    };
+    let fixtures = [
+        (
+            "page_borders",
+            format_docx::test_fixtures::page_borders_docx(),
+        ),
+        (
+            "line_numbers",
+            format_docx::test_fixtures::line_numbers_docx(),
+        ),
+        ("drop_cap", format_docx::test_fixtures::drop_cap_docx()),
+    ];
+    for (label, profile) in [
+        ("1b", format_pdf::PdfProfile::A1b),
+        ("ua1", format_pdf::PdfProfile::Ua1),
+    ] {
+        let dir = std::path::Path::new(&out).join(label);
+        std::fs::create_dir_all(&dir).expect("out dir");
+        for (name, docx) in &fixtures {
+            let engine = decor_engine(docx);
+            std::fs::write(dir.join(format!("{name}.pdf")), pdf(&engine, profile))
+                .expect("write pdf");
+        }
+    }
+}
