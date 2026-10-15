@@ -53,11 +53,15 @@ export async function settle(page: Page): Promise<void> {
  *    Shift) on page `page`'s canvas at page-local DEVICE px `(x, y)`,
  *    through the shell's real `pointer.ts` listener
  *  - `{ pointerup }`: releases it
+ *  - `{ key }`: a keydown of `key` (a `KeyboardEvent.key`, e.g.
+ *    `'ArrowDown'`, `'End'`, `'PageDown'`) on the hidden textarea, with
+ *    optional Shift / Ctrl(Cmd on macOS) — the shell's real key handler
  *  - any other string: an `insertText` beforeinput carrying that text */
 export type BurstStep =
     | string
     | { pointerdown: { x: number; y: number; page?: number; shift?: boolean } }
-    | { pointerup: true; page?: number };
+    | { pointerup: true; page?: number }
+    | { key: string; shift?: boolean; ctrl?: boolean };
 
 /** Fire `steps` as ONE synchronous burst on the main thread (see the file
  *  header). Resolves once the burst has been POSTED; read results through
@@ -102,7 +106,19 @@ export async function burst(page: Page, steps: BurstStep[]): Promise<void> {
         };
         for (const s of steps) {
             if (typeof s !== 'string') {
-                if ('pointerdown' in s) {
+                if ('key' in s) {
+                    const ctrl = s.ctrl === true;
+                    ta.dispatchEvent(
+                        new KeyboardEvent('keydown', {
+                            key: s.key,
+                            shiftKey: s.shift === true,
+                            ctrlKey: ctrl && !mac,
+                            metaKey: ctrl && mac,
+                            bubbles: true,
+                            cancelable: true,
+                        }),
+                    );
+                } else if ('pointerdown' in s) {
                     const p = s.pointerdown;
                     pointer('pointerdown', p.page ?? 0, p.x, p.y, p.shift === true);
                 } else {

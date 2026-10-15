@@ -899,6 +899,8 @@ fn gen_selection_command(u: &mut Unstructured) -> Option<Command> {
                     MoveDirection::LineEnd,
                     MoveDirection::DocHome,
                     MoveDirection::DocEnd,
+                    MoveDirection::PageDown,
+                    MoveDirection::PageUp,
                 ])
                 .ok()?,
             extend: u.ratio(1, 2).unwrap_or(false),

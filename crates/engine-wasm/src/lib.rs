@@ -8328,7 +8328,10 @@ impl Engine {
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => self.do_select_all(),
-            Command::MoveCaret { direction, extend } => self.do_move_caret(direction, extend),
+            /* Issue #462 — a move past the lazy band grows it first. */
+            Command::MoveCaret { direction, extend } => {
+                self.do_move_caret_reaching(direction, extend)
+            }
             Command::BeginComposition { at } => self.do_begin_composition(at),
             Command::UpdateComposition { text, target_range } => {
                 self.do_update_composition(text, target_range)
@@ -12908,6 +12911,13 @@ impl Engine {
                     }
                 }
             }
+            /* Issue #462 — one viewport height, through the lazy band. */
+            MoveDirection::PageDown | MoveDirection::PageUp => {
+                match self.page_step(&sel, direction == MoveDirection::PageDown) {
+                    Ok(target) => target,
+                    Err(e) => return *e,
+                }
+            }
             MoveDirection::Up | MoveDirection::Down => {
                 let geom = match self.document_geometry() {
                     Ok(g) => g,
@@ -13105,6 +13115,8 @@ impl Engine {
             }
             MoveDirection::Up
             | MoveDirection::Down
+            | MoveDirection::PageDown
+            | MoveDirection::PageUp
             | MoveDirection::LineHome
             | MoveDirection::LineEnd => self.snap_nearest_field_boundary(new_caret),
             _ => new_caret,
@@ -29461,6 +29473,10 @@ mod document_protection_tests;
 
 /// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
 mod protection_gate;
+
+/// Issue #462 — keyboard moves past the lazy band expand it
+/// synchronously (`Engine::do_move_caret_reaching`).
+mod lazy_nav;
 
 /// Issue #329 — the font substitutions the open document's layout makes.
 mod font_substitution;

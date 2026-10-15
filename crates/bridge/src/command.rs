@@ -1509,6 +1509,15 @@ pub enum MoveDirection {
     DocHome,
     /// `Ctrl/Cmd + End` — caret to the last paragraph at `text.len`.
     DocEnd,
+    /// Issue #462 — `PageDown`: caret one viewport height down (the
+    /// height of the last `SetViewport`), on the line at that depth,
+    /// keeping the ideal-x column like `Down`; the last line when the
+    /// document ends sooner. A target past the lazily laid-out band makes
+    /// the engine expand the layout before resolving the move.
+    PageDown,
+    /// `PageUp`: one viewport height up; the first line when the document
+    /// starts sooner.
+    PageUp,
 }
 
 #[cfg(test)]
