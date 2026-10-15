@@ -92,6 +92,9 @@ pub mod package;
 pub mod protection;
 pub mod run_content;
 pub mod snapshot;
+/// Issue #467 — the input boundary's text normalisation (one table for
+/// every door text enters the model by).
+pub mod text_input;
 pub mod theme;
 
 pub mod toc;

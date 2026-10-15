@@ -52,6 +52,9 @@ mod pdf_semantics;
 mod read_report;
 pub(crate) use paragraph_cache_key::paragraph_layout_key;
 mod table_cache;
+/// Issue #467 — the command-boundary text guard (control characters,
+/// noncharacters) every text-bearing command passes through.
+mod text_input_guard;
 
 #[wasm_bindgen(start)]
 pub fn boot() {
@@ -8072,7 +8075,7 @@ impl Engine {
         self.mutation_seq += 1;
     }
 
-    async fn apply_command(&mut self, cmd: Command) -> Event {
+    async fn apply_command(&mut self, mut cmd: Command) -> Event {
         /* Issue #407 — argument validation first: a NaN / infinite number
         anywhere in the command (a JS `NaN` crosses `serde-wasm-bindgen`
         into an `f32` unchanged, and `f32::clamp` passes it through) is
@@ -8083,6 +8086,13 @@ impl Engine {
                 kind: Some(bridge::ErrorKind::InvalidArgument),
                 command: None,
             };
+        }
+        /* Issue #467 — and the same for text: control characters the XML
+        part cannot carry are dropped / mapped (a vertical tab is a line
+        break, a form feed a page break) and a `U+FFFE` / `U+FFFF` is
+        refused, so every handler below sees clean text. */
+        if let Err(refused) = text_input_guard::sanitize_command(&mut cmd) {
+            return *refused;
         }
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
@@ -8257,7 +8267,11 @@ impl Engine {
                         .as_deref()
                         .map(file_base_name)
                         .filter(|n| !n.is_empty());
+                    /* Issue #467 — a file's control characters are
+                    repaired, never refused (the user cannot retype a
+                    byte): the same table as typed text. */
                     let text = decode_text_file(&bytes);
+                    let text = engine::text_input::sanitize_input_text_lossy(&text);
                     let doc = if matches!(format, DocFormat::Html) {
                         let parsed = engine::html::from_html_document(&text);
                         if parsed.blocks.is_empty() {
@@ -29471,6 +29485,9 @@ mod finite_guard_tests;
 /// Issue #329 — substitution reporting + the `Substituted` font source.
 #[cfg(test)]
 mod font_substitution_tests;
+/// Issue #467 — control characters / noncharacters at the input boundary.
+#[cfg(test)]
+mod text_input_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {
