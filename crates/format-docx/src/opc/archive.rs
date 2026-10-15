@@ -123,6 +123,40 @@ pub fn main_part_name(docx: &[u8]) -> Option<String> {
         .map(|p| p.main)
 }
 
+/// Issue #467 — the first character XML 1.0 cannot carry (a C0 control other
+/// than TAB / LF / CR, `U+FFFE`, `U+FFFF`) in any XML part (`*.xml`,
+/// `*.rels`) of a packaged `.docx`, as `(part, char offset, character)`;
+/// `None` for a clean package (or one that is not a zip). The fuzz and
+/// unit invariant behind "no saved package ever holds a forbidden
+/// character": the strict scan of a part also fails on one, but this names
+/// the character and reads every part, whatever the writer regenerated.
+pub fn first_forbidden_character(docx: &[u8]) -> Option<(String, usize, char)> {
+    let mut archive = ZipArchive::new(Cursor::new(docx)).ok()?;
+    let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+    let mut total = 0u64;
+    for name in names {
+        if !(name.ends_with(".xml") || name.ends_with(".rels")) {
+            continue;
+        }
+        let Ok(entry) = archive.by_name(&name) else {
+            continue;
+        };
+        let Ok(bytes) = read_entry_bounded(entry, &name, &PackageLimits::DEFAULT, &mut total)
+        else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some((offset, c)) = text
+            .chars()
+            .enumerate()
+            .find(|(_, c)| !engine::text_input::is_xml_char(*c))
+        {
+            return Some((name, offset, c));
+        }
+    }
+    None
+}
+
 /// [`check_document_xml_well_formed`] for any XML part of the package
 /// (`word/header1.xml`, `word/footer2.xml`, …) — issue #100: regenerated
 /// header/footer roots must re-declare the source root's bindings exactly

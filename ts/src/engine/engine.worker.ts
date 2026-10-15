@@ -18,6 +18,7 @@ import {
     clearJournalGap,
 } from './event-log';
 import { nextCleanState } from './clean-state';
+import { refuseIllFormedText } from './text-guard';
 import {
     buildCheckpointState,
     createJournalRetry,
@@ -1427,7 +1428,13 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
     }
     try {
         const t0 = performance.now();
-        const evt = await dispatch(msg.cmd);
+        /* Issue #467 - a lone UTF-16 surrogate would reach the engine as
+           U+FFFD (the wasm string glue substitutes it): refuse it here,
+           typed, and leave it out of the log (a replay would insert the
+           U+FFFD the live session refused). The engine owns the rest of
+           the text table (control characters, U+FFFE / U+FFFF). */
+        const refusedText = refuseIllFormedText(msg.cmd);
+        const evt = refusedText ?? (await dispatch(msg.cmd));
         const elapsed = performance.now() - t0;
         notePaintVersion(evt);
         self.postMessage({ id: msg.id, ok: true, evt, elapsed });
@@ -1437,7 +1444,7 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         /* D2.8 backpressure (PHASE_2_BRIDGE_MEMORY.md §12 risk 5): persist to
            the event log OFF the critical path. The RPC response is already
            sent, so event-log latency never throttles command throughput. */
-        if (shouldLogCommand(msg.cmd)) {
+        if (refusedText === undefined && shouldLogCommand(msg.cmd)) {
             const seq = logCommand(msg.cmd);
             /* Issue #268 — a new document: its first snapshot is pinned. */
             if (startsNewDocument(msg.cmd) && evt.type !== 'ERROR') {

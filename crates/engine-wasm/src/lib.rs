@@ -27265,6 +27265,11 @@ mod tests {
     /// Issue #468 — after a hostile `InsertText`, `SaveDocx` either answers
     /// a typed error or returns a package whose parts all pass the strict
     /// well-formedness check; it never returns malformed bytes.
+    ///
+    /// Issue #467 — and since the input boundary cleans the text, it ANSWERS
+    /// with a package (a control character no longer blocks saving) whose
+    /// XML parts hold no character XML 1.0 forbids, whichever text-bearing
+    /// command brought the string in.
     #[cfg(feature = "fuzz-native")]
     #[test]
     fn save_docx_after_hostile_insert_text_is_never_malformed() {
@@ -27278,22 +27283,53 @@ mod tests {
             "\"'><\u{7f}\u{85}",
         ];
         for text in hostile {
-            let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
-            let _ = engine.apply_sync(Command::InsertText {
-                at: None,
-                text: text.to_string(),
-            });
-            match engine.apply_sync(Command::SaveDocx) {
-                Event::DocumentSaved { bytes, .. } => {
-                    for part in ["word/document.xml", "[Content_Types].xml"] {
-                        format_docx::check_part_xml_well_formed(&bytes, part)
-                            .unwrap_or_else(|e| panic!("{text:?}: {part}: {e}"));
+            let range = BridgeLogicalRange {
+                start: bpos_top(0, 0),
+                end: bpos_top(0, 4),
+            };
+            let carriers = [
+                Command::InsertText {
+                    at: None,
+                    text: text.to_string(),
+                },
+                Command::PastePlain {
+                    text: text.to_string(),
+                },
+                Command::ReplaceRange {
+                    range: range.clone(),
+                    text: text.to_string(),
+                },
+                Command::PasteHtml {
+                    html: format!("<p>{text}</p>"),
+                },
+                Command::InsertComment {
+                    range,
+                    text: text.to_string(),
+                    author: text.to_string(),
+                },
+                Command::SetReviewIdentity {
+                    author: text.to_string(),
+                    date: text.to_string(),
+                },
+            ];
+            for carrier in carriers {
+                let name = carrier.kind().name();
+                let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+                let _ = engine.apply_sync(carrier);
+                match engine.apply_sync(Command::SaveDocx) {
+                    Event::DocumentSaved { bytes, .. } => {
+                        for part in ["word/document.xml", "[Content_Types].xml"] {
+                            format_docx::check_part_xml_well_formed(&bytes, part)
+                                .unwrap_or_else(|e| panic!("{name} {text:?}: {part}: {e}"));
+                        }
+                        assert_eq!(
+                            format_docx::first_forbidden_character(&bytes),
+                            None,
+                            "{name} {text:?}: a saved package holds a forbidden character"
+                        );
                     }
+                    other => panic!("{name} {text:?}: a save must succeed, got {other:?}"),
                 }
-                Event::Error { kind, .. } => {
-                    assert_eq!(kind, Some(bridge::ErrorKind::Internal), "{text:?}");
-                }
-                other => panic!("{text:?}: unexpected {other:?}"),
             }
         }
     }

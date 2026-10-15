@@ -262,6 +262,11 @@ pub fn run_rpc_command(data: &[u8]) {
                 format!("{evt:?}").chars().take(160).collect::<String>()
             );
         }
+        /* Issue #467 — a saved package never holds a character XML 1.0
+        forbids, whatever string a command brought in. */
+        if let bridge::Event::DocumentSaved { bytes, .. } = &evt {
+            assert_no_forbidden_character(bytes, &variant_name(&keep));
+        }
         assert!(
             engine.undo_depth() <= 100,
             "undo depth exceeded its 100-snapshot bound after {}",
@@ -278,10 +283,28 @@ pub fn run_rpc_command(data: &[u8]) {
             variant_name(&keep)
         );
     }
+    /* Issue #467 — and whatever the sequence left, saving it yields no
+    forbidden character (a typed refusal is a different invariant's). */
+    if let bridge::Event::DocumentSaved { bytes, .. } = engine.apply_sync(bridge::Command::SaveDocx)
+    {
+        assert_no_forbidden_character(&bytes, "SaveDocx after the sequence");
+    }
     // Layout + the native (browser-free) rasterizer, exercised end to end
     // over whatever the command sequence left the document as.
     if engine.ensure_layout_for_fuzzing().is_ok() {
         let _ = engine.rasterize_last_layout_for_fuzzing();
+    }
+}
+
+/// Issue #467 — a `.docx` the engine handed back (`Event::DocumentSaved`)
+/// must hold no character XML 1.0 cannot carry in any XML part. Bytes that
+/// are not a zip (an HTML / plain-text save) are not packages and pass.
+fn assert_no_forbidden_character(bytes: &[u8], after: &str) {
+    if let Some((part, offset, ch)) = format_docx::first_forbidden_character(bytes) {
+        panic!(
+            "{after}: the saved package holds U+{:04X} at char {offset} of {part}",
+            ch as u32
+        );
     }
 }
 
