@@ -15,6 +15,7 @@ paths:
 ## XML serialization
 - `<w:t xml:space="preserve">` on **every** engine-authored text element. Without `preserve`, leading/trailing whitespace gets collapsed; matters for Arabic diacritics + RTL trailing space. Exception (issue #199): a run regenerated inside a *source* run keeps the source `<w:t>`'s attributes, and a source bare `<w:t>` gains `preserve` only when its text now has edge whitespace — the invariant's purpose, without re-spelling every Word run.
 - XML escapes: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`. Quotes don't matter inside character data.
+- **Forbidden characters (issue #467).** Every text writer goes through `writer::push_escaped` / `push_escaped_attr` (the comments and numbering writers share them — no private copies): a character XML 1.0 cannot carry (`engine::text_input::is_xml_char` is false: C0 other than TAB / LF / CR, `U+FFFE`, `U+FFFF`) is written as `U+FFFD`, never raw, and counted into `WriteNote::ForbiddenCharactersReplaced` on the save report (`save_docx_with_notes` / `write_docx_with_notes`). The input boundary (`engine::text_input`) keeps them out of the model; this only catches a text door that bypassed it, so a note on a real save is a bug to chase. `format_docx::first_forbidden_character` scans every XML part of a package (the fuzz / unit invariant "no saved package holds one").
 - Header: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">`.
 - Footer: `<w:sectPr/></w:body></w:document>`.
 

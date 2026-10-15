@@ -2,6 +2,7 @@
  * OPC part) around a hand-written `word/document.xml`, so a spec can open a
  * document with exactly the malformed attribute it needs without
  * committing a binary fixture. */
+import { inflateRawSync } from 'node:zlib';
 import { appendStoredEntry } from '../zip-append';
 
 const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
@@ -53,4 +54,37 @@ export function storedDocx(document: string): Uint8Array {
         zip = appendStoredEntry(zip, name, enc.encode(xml));
     }
     return zip;
+}
+
+/** Issue #467 - read one entry of a (deflate / stored) zip as UTF-8, e.g.
+ *  the `word/document.xml` of a package the engine just saved. */
+export function readZipEntry(zip: Uint8Array, name: string): string {
+    const buf = Buffer.from(zip);
+    let eocd = -1;
+    for (let i = buf.length - 22; i >= 0; i--) {
+        if (buf.readUInt32LE(i) === 0x06054b50) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd < 0) throw new Error('readZipEntry: no end-of-central-directory record');
+    const count = buf.readUInt16LE(eocd + 10);
+    let at = buf.readUInt32LE(eocd + 16);
+    for (let n = 0; n < count; n++) {
+        const method = buf.readUInt16LE(at + 10);
+        const size = buf.readUInt32LE(at + 20);
+        const nameLen = buf.readUInt16LE(at + 28);
+        const extraLen = buf.readUInt16LE(at + 30);
+        const commentLen = buf.readUInt16LE(at + 32);
+        const local = buf.readUInt32LE(at + 42);
+        const entryName = buf.toString('utf8', at + 46, at + 46 + nameLen);
+        if (entryName === name) {
+            const dataAt =
+                local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+            const raw = buf.subarray(dataAt, dataAt + size);
+            return (method === 8 ? inflateRawSync(raw) : raw).toString('utf8');
+        }
+        at += 46 + nameLen + extraLen + commentLen;
+    }
+    throw new Error(`readZipEntry: ${name} not found`);
 }

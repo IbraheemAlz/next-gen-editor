@@ -182,15 +182,30 @@ fn family_docx_name(f: &FontFamily) -> &str {
 
 /// XML-escape character data (`&`, `<`, `>`) into `out`. Quotes don't matter
 /// inside character data.
-fn push_escaped(text: &str, out: &mut String) {
+///
+/// Issue #467 — the last line of defence: a character XML 1.0 cannot carry
+/// (a C0 control other than TAB / LF / CR, `U+FFFE`, `U+FFFF`) is written
+/// as U+FFFD, never raw, and counted for the save report
+/// ([`WriteNote::ForbiddenCharactersReplaced`]). The input boundary
+/// (`engine::text_input`) keeps these out of the model; this only catches
+/// what reached it another way (an old snapshot, a command nobody
+/// classified).
+pub(crate) fn push_escaped(text: &str, out: &mut String) {
     for c in text.chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            c if !engine::text_input::is_xml_char(c) => push_replacement(out),
             _ => out.push(c),
         }
     }
+}
+
+/// Issue #467 — write U+FFFD for a forbidden character and count it.
+fn push_replacement(out: &mut String) {
+    out.push(engine::text_input::REPLACEMENT);
+    FORBIDDEN_REPLACED.with(|n| n.set(n.get().saturating_add(1)));
 }
 
 /// Issue #84 — ordered child sink for one property container (`<w:rPr>`,
@@ -584,13 +599,16 @@ fn push_text_element(text: &str, delete_kind: bool, src: Option<&SourceRun>, out
 
 /// Escape `&` `<` `>` `"` for an XML attribute value. Quotes matter here
 /// (unlike character data) because attribute values are quote-delimited.
-fn push_escaped_attr(text: &str, out: &mut String) {
+///
+/// Issue #467 — forbidden characters become U+FFFD like in [`push_escaped`].
+pub(crate) fn push_escaped_attr(text: &str, out: &mut String) {
     for c in text.chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            c if !engine::text_input::is_xml_char(c) => push_replacement(out),
             _ => out.push(c),
         }
     }
@@ -2476,6 +2494,35 @@ fn note(n: WriteNote) {
     });
 }
 
+thread_local! {
+    /// Issue #467 — characters XML cannot carry that the escape helpers
+    /// ([`push_escaped`], [`push_escaped_attr`]) wrote as U+FFFD during the
+    /// running save; drained into one
+    /// [`WriteNote::ForbiddenCharactersReplaced`] by
+    /// [`run_collecting_notes`].
+    static FORBIDDEN_REPLACED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run one save with the writer's notes collected (restoring an enclosing
+/// collector afterwards) and the #467 replacement count folded in as the
+/// last note.
+fn run_collecting_notes<T>(
+    f: impl FnOnce() -> Result<T, DocxError>,
+) -> Result<(T, Vec<WriteNote>), DocxError> {
+    let outer = WRITE_NOTES.with(|c| c.borrow_mut().replace(Vec::new()));
+    let outer_count = FORBIDDEN_REPLACED.with(|n| n.replace(0));
+    let res = f();
+    let replaced = FORBIDDEN_REPLACED.with(|n| n.replace(outer_count));
+    let notes = WRITE_NOTES.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
+    res.map(|v| {
+        let mut notes = notes.unwrap_or_default();
+        if replaced > 0 {
+            notes.push(WriteNote::ForbiddenCharactersReplaced { count: replaced });
+        }
+        (v, notes)
+    })
+}
+
 /// Issue #246 — open a local field in its source form when the source
 /// bytes still spell its instruction ([`engine::FieldSource`]): a
 /// `<w:fldSimple>` start tag (only when the element nests with every
@@ -4210,15 +4257,7 @@ fn emit_hf_references(elem: &str, refs: &engine::HeaderFooterRefs, out: &mut Str
     ] {
         if let Some(rid) = rid {
             out.push_str(&format!("<{elem} w:type=\"{role}\" r:id=\""));
-            for ch in rid.chars() {
-                match ch {
-                    '&' => out.push_str("&amp;"),
-                    '<' => out.push_str("&lt;"),
-                    '>' => out.push_str("&gt;"),
-                    '"' => out.push_str("&quot;"),
-                    other => out.push(other),
-                }
-            }
+            push_escaped_attr(rid, out);
             out.push_str("\"/>");
         }
     }
@@ -4328,10 +4367,7 @@ pub fn write_docx_with_notes(
     let _source_scope = AgainstSourceScope::enter(true);
     /* Issue #325 — every URI / rel type minted below follows the source's family. */
     let _family = FamilyScope::enter(doc_family(doc));
-    let outer = WRITE_NOTES.with(|c| c.borrow_mut().replace(Vec::new()));
-    let res = write_docx_inner(archive, doc);
-    let notes = WRITE_NOTES.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
-    res.map(|bytes| (bytes, notes.unwrap_or_default()))
+    run_collecting_notes(|| write_docx_inner(archive, doc))
 }
 
 /// [`write_docx`] without choosing whether recorded source markup is
@@ -5322,8 +5358,16 @@ fn write_docx_raw(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
 /// `[Content_Types].xml` / rels. An engine-authored document (no package)
 /// saves through [`build_minimal_docx`], unchanged.
 pub fn save_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    save_docx_with_notes(doc).map(|(bytes, _)| bytes)
+}
+
+/// [`save_docx`], also returning the writer's best-effort decisions
+/// ([`WriteNote`]) — the save report. Issue #467 — among them, how many
+/// characters XML cannot carry were written as U+FFFD
+/// ([`WriteNote::ForbiddenCharactersReplaced`]).
+pub fn save_docx_with_notes(doc: &DocumentTree) -> Result<(Vec<u8>, Vec<WriteNote>), DocxError> {
     let Some(package) = doc.source_package.as_deref() else {
-        return build_minimal_docx(doc);
+        return run_collecting_notes(|| build_minimal_docx(doc));
     };
     let other_entries: Vec<(String, Vec<u8>)> = package
         .entries
@@ -5344,7 +5388,7 @@ pub fn save_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
         warnings: Vec::new(),
         part_names,
     };
-    write_docx(&archive, doc)
+    write_docx_with_notes(&archive, doc)
 }
 
 /// Build a minimal valid `.docx` from a freshly created document — no
@@ -11857,3 +11901,8 @@ mod styles_patch_tests;
 #[cfg(test)]
 #[path = "writer_run_content_tests.rs"]
 mod run_content_tests;
+
+/// Issue #467 — forbidden characters are written as U+FFFD, with a note.
+#[cfg(test)]
+#[path = "writer_forbidden_chars_tests.rs"]
+mod forbidden_chars_tests;

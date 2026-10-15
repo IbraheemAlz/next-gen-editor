@@ -52,6 +52,9 @@ mod pdf_semantics;
 mod read_report;
 pub(crate) use paragraph_cache_key::paragraph_layout_key;
 mod table_cache;
+/// Issue #467 — the command-boundary text guard (control characters,
+/// noncharacters) every text-bearing command passes through.
+mod text_input_guard;
 
 #[wasm_bindgen(start)]
 pub fn boot() {
@@ -8264,7 +8267,7 @@ impl Engine {
         self.mutation_seq += 1;
     }
 
-    async fn apply_command(&mut self, cmd: Command) -> Event {
+    async fn apply_command(&mut self, mut cmd: Command) -> Event {
         /* Issue #407 — argument validation first: a NaN / infinite number
         anywhere in the command (a JS `NaN` crosses `serde-wasm-bindgen`
         into an `f32` unchanged, and `f32::clamp` passes it through) is
@@ -8275,6 +8278,13 @@ impl Engine {
                 kind: Some(bridge::ErrorKind::InvalidArgument),
                 command: None,
             };
+        }
+        /* Issue #467 — and the same for text: control characters the XML
+        part cannot carry are dropped / mapped (a vertical tab is a line
+        break, a form feed a page break) and a `U+FFFE` / `U+FFFF` is
+        refused, so every handler below sees clean text. */
+        if let Err(refused) = text_input_guard::sanitize_command(&mut cmd) {
+            return *refused;
         }
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
@@ -8449,7 +8459,11 @@ impl Engine {
                         .as_deref()
                         .map(file_base_name)
                         .filter(|n| !n.is_empty());
+                    /* Issue #467 — a file's control characters are
+                    repaired, never refused (the user cannot retype a
+                    byte): the same table as typed text. */
                     let text = decode_text_file(&bytes);
+                    let text = engine::text_input::sanitize_input_text_lossy(&text);
                     let doc = if matches!(format, DocFormat::Html) {
                         let parsed = engine::html::from_html_document(&text);
                         if parsed.blocks.is_empty() {
@@ -27527,6 +27541,11 @@ mod tests {
     /// Issue #468 — after a hostile `InsertText`, `SaveDocx` either answers
     /// a typed error or returns a package whose parts all pass the strict
     /// well-formedness check; it never returns malformed bytes.
+    ///
+    /// Issue #467 — and since the input boundary cleans the text, it ANSWERS
+    /// with a package (a control character no longer blocks saving) whose
+    /// XML parts hold no character XML 1.0 forbids, whichever text-bearing
+    /// command brought the string in.
     #[cfg(feature = "fuzz-native")]
     #[test]
     fn save_docx_after_hostile_insert_text_is_never_malformed() {
@@ -27540,22 +27559,53 @@ mod tests {
             "\"'><\u{7f}\u{85}",
         ];
         for text in hostile {
-            let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
-            let _ = engine.apply_sync(Command::InsertText {
-                at: None,
-                text: text.to_string(),
-            });
-            match engine.apply_sync(Command::SaveDocx) {
-                Event::DocumentSaved { bytes, .. } => {
-                    for part in ["word/document.xml", "[Content_Types].xml"] {
-                        format_docx::check_part_xml_well_formed(&bytes, part)
-                            .unwrap_or_else(|e| panic!("{text:?}: {part}: {e}"));
+            let range = BridgeLogicalRange {
+                start: bpos_top(0, 0),
+                end: bpos_top(0, 4),
+            };
+            let carriers = [
+                Command::InsertText {
+                    at: None,
+                    text: text.to_string(),
+                },
+                Command::PastePlain {
+                    text: text.to_string(),
+                },
+                Command::ReplaceRange {
+                    range: range.clone(),
+                    text: text.to_string(),
+                },
+                Command::PasteHtml {
+                    html: format!("<p>{text}</p>"),
+                },
+                Command::InsertComment {
+                    range,
+                    text: text.to_string(),
+                    author: text.to_string(),
+                },
+                Command::SetReviewIdentity {
+                    author: text.to_string(),
+                    date: text.to_string(),
+                },
+            ];
+            for carrier in carriers {
+                let name = carrier.kind().name();
+                let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+                let _ = engine.apply_sync(carrier);
+                match engine.apply_sync(Command::SaveDocx) {
+                    Event::DocumentSaved { bytes, .. } => {
+                        for part in ["word/document.xml", "[Content_Types].xml"] {
+                            format_docx::check_part_xml_well_formed(&bytes, part)
+                                .unwrap_or_else(|e| panic!("{name} {text:?}: {part}: {e}"));
+                        }
+                        assert_eq!(
+                            format_docx::first_forbidden_character(&bytes),
+                            None,
+                            "{name} {text:?}: a saved package holds a forbidden character"
+                        );
                     }
+                    other => panic!("{name} {text:?}: a save must succeed, got {other:?}"),
                 }
-                Event::Error { kind, .. } => {
-                    assert_eq!(kind, Some(bridge::ErrorKind::Internal), "{text:?}");
-                }
-                other => panic!("{text:?}: unexpected {other:?}"),
             }
         }
     }
@@ -28898,10 +28948,14 @@ mod snapshot_tests {
         include_bytes!("../../format-docx/tests/fixtures/word_package_parts.docx");
 
     /// Issue #468 — the production save-side well-formedness gate. A raw
-    /// control character the writer leaves in a regenerated part (the #467
-    /// shape) is refused with a typed `Event::Error`, yields no bytes, and
-    /// leaves the document state alone (#341 invariant); the same save
-    /// succeeds once the character is gone.
+    /// control character the writer leaves in a regenerated part is refused
+    /// with a typed `Event::Error`, yields no bytes, and leaves the document
+    /// state alone (#341 invariant).
+    ///
+    /// Issue #467 — typed / pasted text can no longer carry such a character
+    /// (the input boundary cleans it and the writer's escape helpers repair
+    /// what slips past), so the malformed part is injected through a block's
+    /// VERBATIM passthrough markup, which the writer replays byte for byte.
     #[test]
     fn save_refuses_a_part_the_writer_left_malformed() {
         let mut e = opened_engine(PACKAGE_FIXTURE);
@@ -28911,7 +28965,19 @@ mod snapshot_tests {
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
-        let evt = apply(&mut e, insert("a\u{1}b"));
+        let mut doc = e.undo.current().clone();
+        match doc.blocks.get_mut(4) {
+            Some(engine::Block::Paragraph(p)) => {
+                p.body_xml = Some(Box::new(engine::BodyPassthrough {
+                    before: vec![engine::BodyFragment::Verbatim {
+                        xml: b"<w:bookmarkStart w:id=\"90\" w:name=\"a\x01b\"/>".to_vec(),
+                    }],
+                    after: Vec::new(),
+                }));
+            }
+            other => panic!("block 4 is not a paragraph: {other:?}"),
+        }
+        let evt = e.commit_edit(doc, bpos_top(4, 4));
         assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
         #[cfg(feature = "fuzz-native")]
         let before = e.state_fingerprint_for_fuzzing();
@@ -29754,6 +29820,9 @@ mod finite_guard_tests;
 /// Issue #329 — substitution reporting + the `Substituted` font source.
 #[cfg(test)]
 mod font_substitution_tests;
+/// Issue #467 — control characters / noncharacters at the input boundary.
+#[cfg(test)]
+mod text_input_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

@@ -58,7 +58,7 @@ export const ERROR_TOAST_COPY: Partial<Record<ErrorKind, string>> = {
     Internal:
         'Something went wrong inside the editor and nothing was changed — try again, and save your work if it persists.',
     InvalidArgument:
-        'A value was not a valid number, so nothing was changed — try again, and save your work if it keeps happening.',
+        'A value was not valid (a number, or text holding a character a document cannot contain), so nothing was changed — try again, and save your work if it keeps happening.',
 };
 
 /** Kinds the toast deliberately does not cover: a surface of their own

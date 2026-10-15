@@ -282,4 +282,11 @@ pub enum WriteNote {
     /// (hyperlink, revision, field) or another control after an edit; its
     /// range was widened to enclose it so the part stays well-formed.
     InlineWrapperWidened { id: u32 },
+    /// Issue #467 — `count` characters XML 1.0 cannot carry (a C0 control
+    /// other than TAB / LF / CR, `U+FFFE`, `U+FFFF`) reached the writer
+    /// and were written as U+FFFD instead of raw, which would have made the
+    /// part malformed. The input boundary (`engine::text_input`) keeps
+    /// them out of the model, so a note here means a text entry point
+    /// bypassed it (an old snapshot, an unclassified command).
+    ForbiddenCharactersReplaced { count: u32 },
 }
