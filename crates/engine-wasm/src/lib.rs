@@ -18639,8 +18639,10 @@ impl Engine {
     /// Issue #341 — the engine's cheap structural invariants, checked after
     /// a restore + one `apply` round: the undo stack respects its cap, the
     /// live and the stashed selection resolve inside the document they
-    /// address, and an active note / text-box story still exists. `Err`
-    /// names the first violation.
+    /// address, an active note / text-box story still exists and — issue
+    /// #283 — every tracked-change range lies inside its paragraph on char
+    /// boundaries (`engine::check_revision_ranges`). `Err` names the first
+    /// violation.
     pub fn check_invariants_for_fuzzing(&self) -> Result<(), String> {
         if self.undo.depth() as usize > self.undo.cap() {
             return Err(format!(
