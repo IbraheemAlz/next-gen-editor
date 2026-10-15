@@ -17941,10 +17941,20 @@ impl Engine {
             SectionBreakKind::EvenPage => engine::SectionType::EvenPage,
             SectionBreakKind::OddPage => engine::SectionType::OddPage,
         };
-        let new_doc = self
-            .undo
-            .current()
-            .insert_section_break_at(to_engine_pos(at.clone()), engine_kind);
+        /* Issue #442 — with review mode on the new mark (the one carrying
+        the break) is recorded as inserted. */
+        let new_doc = if self.tracking_changes {
+            self.undo.current().tracked_insert_section_break_at(
+                to_engine_pos(at.clone()),
+                engine_kind,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            self.undo
+                .current()
+                .insert_section_break_at(to_engine_pos(at.clone()), engine_kind)
+        };
         let next_path = engine::bump_last_block_index(&bridge_to_engine_path(at.path));
         let caret = BridgeLogicalPos {
             path: engine_to_bridge_path(next_path),
@@ -18065,16 +18075,32 @@ impl Engine {
                 offset: 0,
             }
         };
+        /* Issue #442 — review mode on: every row (and the escape
+        paragraph's mark) recorded as inserted. */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let caret = first_cell(self.story_doc().map_or(0, |d| d.blocks.len()));
             let epath = bridge_to_engine_path(at);
-            return self.story_mutate(move |d| d.insert_table(epath, rows, cols), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_insert_table(epath, rows, cols, author, date),
+                    None => d.insert_table(epath, rows, cols),
+                },
+                caret,
+                false,
+            );
         }
         let caret = first_cell(self.undo.current().blocks.len());
-        let new_doc = self
-            .undo
-            .current()
-            .insert_table(bridge_to_engine_path(at), rows, cols);
+        let epath = bridge_to_engine_path(at);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_insert_table(epath, rows, cols, author, date),
+            None => self.undo.current().insert_table(epath, rows, cols),
+        };
         self.announce(
             AnnouncementPriority::Polite,
             format!("Table inserted, {rows} rows by {cols} columns"),
@@ -18127,6 +18153,10 @@ impl Engine {
         }) {
             return *e;
         }
+        /* Issue #442 — review mode on: the new row is an inserted row. */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -18134,12 +18164,23 @@ impl Engine {
                 .as_ref()
                 .map(|s| s.caret.clone())
                 .unwrap_or_else(|| bpos_top(0, 0));
-            return self.story_mutate(move |d| d.insert_row(epath, at), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_insert_row(epath, at, author, date),
+                    None => d.insert_row(epath, at),
+                },
+                caret,
+                false,
+            );
         }
-        let new_doc = self
-            .undo
-            .current()
-            .insert_row(bridge_to_engine_path(path), at);
+        let epath = bridge_to_engine_path(path);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_insert_row(epath, at, author, date),
+            None => self.undo.current().insert_row(epath, at),
+        };
         self.announce(AnnouncementPriority::Polite, "Row inserted");
         self.push_table_edit(new_doc, None)
     }
@@ -18147,6 +18188,11 @@ impl Engine {
         if let Err(e) = self.validate_table_cmd("DeleteRow", &path, Some(row), None, |_| Ok(())) {
             return *e;
         }
+        /* Issue #442 — review mode on: the row is marked deleted with its
+        contents (the reviewer's own inserted row goes outright). */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -18154,12 +18200,23 @@ impl Engine {
                 .as_ref()
                 .map(|s| s.caret.clone())
                 .unwrap_or_else(|| bpos_top(0, 0));
-            return self.story_mutate(move |d| d.delete_row(epath, row), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_delete_row(epath, row, author, date),
+                    None => d.delete_row(epath, row),
+                },
+                caret,
+                false,
+            );
         }
-        let new_doc = self
-            .undo
-            .current()
-            .delete_row(bridge_to_engine_path(path), row);
+        let epath = bridge_to_engine_path(path);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_delete_row(epath, row, author, date),
+            None => self.undo.current().delete_row(epath, row),
+        };
         self.announce(AnnouncementPriority::Polite, "Row deleted");
         self.push_table_edit(new_doc, None)
     }
@@ -29472,6 +29529,10 @@ mod revision_range_tests;
 /// Issue #440 — revisions inside nested tables (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod nested_revision_tests;
+
+/// Issue #442 — structural edits tracked in review mode (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod tracked_structure_tests;
 
 #[cfg(test)]
 mod revision_address_tests;

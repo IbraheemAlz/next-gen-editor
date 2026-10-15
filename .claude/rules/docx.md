@@ -530,6 +530,20 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   top-level tables as `RevisionSlot::Row { row, index }` (path = the
   table), `revisions_snapshot` rows carry `row`. `<w:tblPrChange>` /
   `<w:trPrChange>` stay verbatim grab-bag bytes (not resolved).
+- **Structural edits by command (issue #442).** With review mode on,
+  `InsertRow` / `DeleteRow` / `InsertTable` / `InsertSectionBreak` go
+  through `engine::tracked` recorders (`tracked_insert_row` /
+  `tracked_delete_row` / `tracked_insert_table` /
+  `tracked_insert_section_break_at`; body and story paths): a new row is
+  an inserted row, a deleted row is `mark_rows_deleted` (marked whole +
+  its text, the reviewer's own inserted row removed), a new table is
+  `stamp_inserted` (every row inserted) and — when it needs an escape
+  paragraph — a tracked split of the paragraph in front (so reject
+  restores the document exactly), a section break marks the mark that
+  carries it inserted (reject = the #367 merge). No new `Command`. The
+  writer emits them through the existing `<w:trPr>` / mark-revision
+  paths; untouched source rows re-emit byte for byte. Harness:
+  `tools/roundtrip` step 62.
 - **Nested tables (issue #440).** Every revision walker reaches every
   nesting depth down to `engine::MAX_REVISION_TABLE_DEPTH` (64, the
   reader's `MAX_TABLE_NESTING_DEPTH`; the #378 bound): the resolver's
