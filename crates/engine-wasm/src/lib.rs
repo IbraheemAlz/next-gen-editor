@@ -18201,27 +18201,14 @@ impl Engine {
         to_row: u32,
         to_col: u32,
     ) -> Event {
-        /* Issue #116 — every corner of the rectangle must exist: both
-        rows, and both columns as physical cells of the TOP row (the row
-        `merge_cells` collapses into; continuation rows are clipped by
-        the engine). */
-        let (r0, r1) = (from_row.min(to_row), from_row.max(to_row));
-        let c1 = from_col.max(to_col);
+        /* Issue #116 / #471 - the rectangle is in LOGICAL GRID columns:
+        every corner must exist, and every merged region the rectangle
+        touches must lie entirely inside it (those are absorbed); a region
+        it only partly covers is refused as `CrossesMerge` before any
+        undo step or announcement. */
+        let r1 = from_row.max(to_row);
         if let Err(e) = self.validate_table_cmd("MergeCells", &path, Some(r1), None, |t| {
-            let top = t
-                .rows
-                .get(r0 as usize)
-                .ok_or(engine::TableError::RowOutOfRange {
-                    row: r0,
-                    rows: t.rows.len(),
-                })?;
-            if c1 as usize >= top.cells.len() {
-                return Err(engine::TableError::ColOutOfRange {
-                    col: c1,
-                    cols: top.cells.len(),
-                });
-            }
-            Ok(())
+            t.check_merge_rect(from_row, from_col, to_row, to_col)
         }) {
             return *e;
         }
@@ -18602,6 +18589,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Issue #471 - how many table rows (body, headers, footers, notes,
+    /// nested tables) hold a cell list whose spans do not sum to the
+    /// table's grid width. Every table the engine builds starts at 0 and a
+    /// structural table command must keep it there; `rpc_command` asserts a
+    /// table command never raises it (an opened `.docx` may carry ragged
+    /// rows of its own, hence a count and not a flag).
+    pub fn ragged_table_rows_for_fuzzing(&self) -> usize {
+        self.undo.current().ragged_table_rows()
+    }
+
     /// Issue #341 — a per-component fingerprint of the session state a
     /// FAILED command must leave alone: the current document (its
     /// deterministic snapshot encoding), the selection, the active story,
@@ -18932,6 +18929,8 @@ struct RenderStats {
 /// (no wildcard): a new variant cannot compile without choosing a kind.
 /// - the path addresses no table -> `NoSuchTarget`;
 /// - a nested table (editing it is unsupported) -> `UnsupportedHere`;
+/// - a merge rectangle that only partly covers an existing merged region
+///   (issue #471; Word refuses it too) -> `UnsupportedHere`;
 /// - a row / column index past the end (this includes a merge rectangle
 ///   whose corner does not exist) and every growth-cap / count failure
 ///   -> `OutOfRange`.
@@ -18939,7 +18938,7 @@ fn table_error_kind(e: &engine::TableError) -> bridge::ErrorKind {
     use engine::TableError as T;
     match e {
         T::NotATable { .. } => bridge::ErrorKind::NoSuchTarget,
-        T::NestedUnsupported { .. } => bridge::ErrorKind::UnsupportedHere,
+        T::NestedUnsupported { .. } | T::CrossesMerge { .. } => bridge::ErrorKind::UnsupportedHere,
         T::RowOutOfRange { .. }
         | T::ColOutOfRange { .. }
         | T::ZeroDimension
@@ -29341,6 +29340,10 @@ mod snapshot_tests {
 /// allocation, and the selection invariant holds after every command.
 #[cfg(test)]
 mod mutation_signal_tests;
+
+/// Issue #471 - `MergeCells` vs the merged regions that already exist.
+#[cfg(all(test, feature = "fuzz-native"))]
+mod table_merge_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;

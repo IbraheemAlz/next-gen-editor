@@ -594,6 +594,14 @@ pub enum Command {
         table_path: BlockPath,
         col: u32,
     },
+    /// Merge the rectangle `from_row..=to_row` by `from_col..=to_col`
+    /// (either corner order). Issue #471 - the columns are LOGICAL GRID
+    /// columns (the `<w:tblGrid>` index a cell starts at), which is the
+    /// cell index only while no row holds a `gridSpan` cell. The rectangle
+    /// must contain every merged region (`gridSpan` / `vMerge`) it touches
+    /// in full - those are absorbed; one it only partly covers is refused
+    /// with `ErrorKind::UnsupportedHere` (Word refuses it too) and the
+    /// document is untouched. A corner past the table is `OutOfRange`.
     MergeCells {
         table_path: BlockPath,
         from_row: u32,
