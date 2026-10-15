@@ -37,7 +37,7 @@ fn texts(doc: &DocumentTree) -> Vec<(usize, String)> {
     out
 }
 
-/// Issue #440 — step 61: `intro` / table ▸ cell ▸ table (its row a tracked
+/// Issue #440 — step 62: `intro` / table ▸ cell ▸ table (its row a tracked
 /// row insertion, its paragraph `inner <w:ins>NEW</w:ins>`) / `outro`.
 ///
 /// a. Both changes are listed (`revision_entries`) with depth-2 paths;
@@ -61,7 +61,7 @@ pub(crate) fn run_nested_table_revisions_roundtrip() -> Result<()> {
     );
     let bytes = build_styled_docx(STYLES_XML, &document(&body));
     let source = extract_doc_xml(&bytes)?;
-    let archive = read_docx(&bytes).context("step 61: read")?;
+    let archive = read_docx(&bytes).context("step 62: read")?;
     let doc = &archive.document;
     let entries = doc.revision_entries();
     let depths: Vec<usize> = entries
@@ -77,7 +77,7 @@ pub(crate) fn run_nested_table_revisions_roundtrip() -> Result<()> {
         .collect();
     if depths != vec![2, 2] {
         bail!(
-            "step 61a: listed {:?}",
+            "step 62a: listed {:?}",
             entries.iter().map(|e| &e.at).collect::<Vec<_>>()
         );
     }
@@ -89,11 +89,11 @@ pub(crate) fn run_nested_table_revisions_roundtrip() -> Result<()> {
         ("save_docx", format_docx::save_docx(doc).context("ui save")?),
     ] {
         if extract_doc_xml(&out)? != source {
-            bail!("step 61a: the untouched {path} save drifted");
+            bail!("step 62a: the untouched {path} save drifted");
         }
     }
     println!(
-        "[roundtrip] step 61a OK — a nested table's text + row revisions are listed at depth 2; zero-edit save byte-identical"
+        "[roundtrip] step 62a OK — a nested table's text + row revisions are listed at depth 2; zero-edit save byte-identical"
     );
 
     for (accept, want_new, want_inner) in [(true, true, true), (false, false, false)] {
@@ -131,10 +131,10 @@ pub(crate) fn run_nested_table_revisions_roundtrip() -> Result<()> {
         }
     }
     println!(
-        "[roundtrip] step 61b OK — accept-all resolves the nested table's revisions; saves carry no w:ins and re-read clean"
+        "[roundtrip] step 62b OK — accept-all resolves the nested table's revisions; saves carry no w:ins and re-read clean"
     );
     println!(
-        "[roundtrip] step 61c OK — reject-all removes the nested inserted row (and its table) and the inserted text; saves clean"
+        "[roundtrip] step 62c OK — reject-all removes the nested inserted row (and its table) and the inserted text; saves clean"
     );
     Ok(())
 }

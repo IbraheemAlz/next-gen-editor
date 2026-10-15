@@ -543,7 +543,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   carries it inserted (reject = the #367 merge). No new `Command`. The
   writer emits them through the existing `<w:trPr>` / mark-revision
   paths; untouched source rows re-emit byte for byte. Harness:
-  `tools/roundtrip` step 62.
+  `tools/roundtrip` step 63.
 - **Nested tables (issue #440).** Every revision walker reaches every
   nesting depth down to `engine::MAX_REVISION_TABLE_DEPTH` (64, the
   reader's `MAX_TABLE_NESTING_DEPTH`; the #378 bound): the resolver's
@@ -556,7 +556,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   text of nested tables too (`mark_rows_deleted`). `revisions_snapshot`
   lists every entry — cell paragraphs included — with its full `path`
   and table `depth` (the review pane's depth marker); `block` is the
-  top-level block. Harness: `tools/roundtrip` step 61.
+  top-level block. Harness: `tools/roundtrip` step 62.
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

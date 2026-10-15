@@ -117,7 +117,7 @@ fn has_minted(xml: &str, tag: &str) -> bool {
     })
 }
 
-/// Issue #442 — step 62 (`before` / a two-row source table / `after`).
+/// Issue #442 — step 63 (`before` / a two-row source table / `after`).
 ///
 /// a. A tracked row insertion saves the new row with
 ///    `<w:trPr><w:ins …/></w:trPr>` (minted id) while both source rows
@@ -133,7 +133,7 @@ fn has_minted(xml: &str, tag: &str) -> bool {
 ///    into one section, accept-all keeps two.
 pub(crate) fn run_tracked_structure_roundtrip() -> Result<()> {
     let (bytes, source_rows) = fixture();
-    let archive = read_docx(&bytes).context("step 62: read")?;
+    let archive = read_docx(&bytes).context("step 63: read")?;
     let doc = &archive.document;
     let table = BlockPath::top(1);
     use RevisionKind::{Delete, Insert};
@@ -146,15 +146,15 @@ pub(crate) fn run_tracked_structure_roundtrip() -> Result<()> {
         row(&[], ["a2", "b2"]),
     ];
     if rows(&inserted) != want {
-        bail!("step 62a: recorded {:?}", rows(&inserted));
+        bail!("step 63a: recorded {:?}", rows(&inserted));
     }
-    for (xml, reread) in save_and_reread("step 62a", &archive, &inserted)? {
+    for (xml, reread) in save_and_reread("step 63a", &archive, &inserted)? {
         if !source_rows.iter().all(|r| xml.contains(r.as_str()))
             || !xml.contains("<w:trPr><w:ins ")
             || !has_minted(&xml, "ins")
             || rows(&reread) != want
         {
-            bail!("step 62a: saved {:?}\n{xml}", rows(&reread));
+            bail!("step 63a: saved {:?}\n{xml}", rows(&reread));
         }
         let rejected = reread.resolve_all_revisions(false);
         let accepted = reread.resolve_all_revisions(true);
@@ -164,30 +164,30 @@ pub(crate) fn run_tracked_structure_roundtrip() -> Result<()> {
             || accepted.has_revisions()
         {
             bail!(
-                "step 62a: resolved to {:?} / {:?}",
+                "step 63a: resolved to {:?} / {:?}",
                 rows(&rejected),
                 rows(&accepted)
             );
         }
     }
     println!(
-        "[roundtrip] step 62a OK — a tracked row insertion saves trPr/w:ins (minted id), source rows byte-identical; reject removes it"
+        "[roundtrip] step 63a OK — a tracked row insertion saves trPr/w:ins (minted id), source rows byte-identical; reject removes it"
     );
 
     /* b. Row deletion. */
     let deleted = doc.tracked_delete_row(table.clone(), 0, REVIEWER, REVIEW_DATE);
     let want = vec![row(&[Delete], ["a1", "b1"]), row(&[], ["a2", "b2"])];
     if rows(&deleted) != want {
-        bail!("step 62b: recorded {:?}", rows(&deleted));
+        bail!("step 63b: recorded {:?}", rows(&deleted));
     }
-    for (xml, reread) in save_and_reread("step 62b", &archive, &deleted)? {
+    for (xml, reread) in save_and_reread("step 63b", &archive, &deleted)? {
         if !xml.contains(source_rows[1].as_str())
             || !xml.contains("<w:trPr><w:del ")
             || !has_minted(&xml, "del")
             || !xml.contains(">a1</w:delText>")
             || rows(&reread) != want
         {
-            bail!("step 62b: saved {:?}\n{xml}", rows(&reread));
+            bail!("step 63b: saved {:?}\n{xml}", rows(&reread));
         }
         let accepted = reread.resolve_all_revisions(true);
         let rejected = reread.resolve_all_revisions(false);
@@ -197,20 +197,20 @@ pub(crate) fn run_tracked_structure_roundtrip() -> Result<()> {
             || rejected.has_revisions()
         {
             bail!(
-                "step 62b: resolved to {:?} / {:?}",
+                "step 63b: resolved to {:?} / {:?}",
                 rows(&accepted),
                 rows(&rejected)
             );
         }
     }
     println!(
-        "[roundtrip] step 62b OK — a tracked row deletion saves trPr/w:del + delText, the other source row byte-identical; accept removes it"
+        "[roundtrip] step 63b OK — a tracked row deletion saves trPr/w:del + delText, the other source row byte-identical; accept removes it"
     );
 
     /* c. Table insertion (at the end: the escape paragraph comes from a
     tracked split of `after`). */
     let with_table = doc.tracked_insert_table(BlockPath::top(3), 2, 2, REVIEWER, REVIEW_DATE);
-    for (xml, reread) in save_and_reread("step 62c", &archive, &with_table)? {
+    for (xml, reread) in save_and_reread("step 63c", &archive, &with_table)? {
         let tables: Vec<_> = reread.blocks.iter().filter_map(Block::as_table).collect();
         let new_rows_inserted = tables.get(1).is_some_and(|t| {
             t.rows
@@ -218,18 +218,18 @@ pub(crate) fn run_tracked_structure_roundtrip() -> Result<()> {
                 .all(|r| r.props.revisions.iter().any(|x| x.kind == Insert))
         });
         if xml.matches("<w:trPr><w:ins ").count() != 2 || !new_rows_inserted {
-            bail!("step 62c: saved\n{xml}");
+            bail!("step 63c: saved\n{xml}");
         }
         let rejected = reread.resolve_all_revisions(false);
         if paragraphs(&rejected) != paragraphs(doc)
             || rejected.blocks.iter().filter_map(Block::as_table).count() != 1
             || rejected.has_revisions()
         {
-            bail!("step 62c: reject-all left {:?}", paragraphs(&rejected));
+            bail!("step 63c: reject-all left {:?}", paragraphs(&rejected));
         }
     }
     println!(
-        "[roundtrip] step 62c OK — a tracked table insertion saves every row as inserted; reject-all restores the document"
+        "[roundtrip] step 63c OK — a tracked table insertion saves every row as inserted; reject-all restores the document"
     );
 
     /* d. Section break. */
@@ -239,13 +239,13 @@ pub(crate) fn run_tracked_structure_roundtrip() -> Result<()> {
         REVIEWER,
         REVIEW_DATE,
     );
-    for (xml, reread) in save_and_reread("step 62d", &archive, &broken)? {
+    for (xml, reread) in save_and_reread("step 63d", &archive, &broken)? {
         let p0 = reread.blocks.front().and_then(Block::as_paragraph);
         let marked = p0.is_some_and(|p| {
             p.section_end.is_some() && p.mark_revisions.iter().any(|r| r.kind == Insert)
         });
         if !marked || !xml.contains("<w:rPr><w:ins ") || !has_minted(&xml, "ins") {
-            bail!("step 62d: saved\n{xml}");
+            bail!("step 63d: saved\n{xml}");
         }
         let rejected = reread.resolve_all_revisions(false);
         let accepted = reread.resolve_all_revisions(true);
@@ -256,14 +256,14 @@ pub(crate) fn run_tracked_structure_roundtrip() -> Result<()> {
             || accepted.has_revisions()
         {
             bail!(
-                "step 62d: resolved to {:?} / {} sections",
+                "step 63d: resolved to {:?} / {} sections",
                 paragraphs(&rejected),
                 accepted.effective_sections().len()
             );
         }
     }
     println!(
-        "[roundtrip] step 62d OK — a tracked section break saves its inserted mark beside the sectPr; reject-all merges back to one section"
+        "[roundtrip] step 63d OK — a tracked section break saves its inserted mark beside the sectPr; reject-all merges back to one section"
     );
     Ok(())
 }

@@ -46,6 +46,7 @@ mod revisions;
 mod run_content;
 mod styles_patch;
 mod table_markup;
+mod table_merge;
 mod theme;
 mod tracked_coverage;
 mod tracked_nesting;
@@ -383,9 +384,12 @@ fn run_default() -> Result<()> {
     /* Step 60 — issues #439 / #434 / #435: malformed parts are repaired up
     front (regenerate-only) and every save of them is well-formed. */
     malformed::run_malformed_parts_roundtrip()?;
-    /* Step 61 — issue #440: revisions inside a table nested in a cell. */
+    /* Step 61 — issue #471: a merge enclosing earlier merges saves and
+    re-reads with the same grid; one cutting a merge is refused. */
+    table_merge::run_table_merge_roundtrip()?;
+    /* Step 62 — issue #440: revisions inside a table nested in a cell. */
     tracked_nesting::run_nested_table_revisions_roundtrip()?;
-    /* Step 62 — issue #442: structural edits recorded in review mode. */
+    /* Step 63 — issue #442: structural edits recorded in review mode. */
     tracked_structure::run_tracked_structure_roundtrip()?;
 
     println!("\nPASS");
@@ -4930,6 +4934,25 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 },
                 roundtrip: RoundtripBounds {
                     document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #471 — a 3x3 table holding a `gridSpan` cell and a `vMerge`
+        run: the shape a merge that encloses an earlier merge has to keep
+        square. Zero-edit drift is the pinned A4 pgSz compaction; the
+        default harness's step 61 merges across it and re-reads. */
+        PrebuiltFixture {
+            name: "table_merge_absorb.docx",
+            bytes: table_merge::build_table_merge_absorb_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["intro".into()],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
                 },
             },
         },
