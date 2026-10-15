@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{
-    Alignment, BlockPath, Color, Direction, DocFormat, ImageWrapMode, LogicalPos, LogicalRange,
-    Point, Rect, RendererDowngrade, TextBoxHop, UnderlineStyle, VerticalScript,
+    Alignment, BlockPath, Color, Direction, DocFormat, FontPriority, ImageWrapMode, LogicalPos,
+    LogicalRange, Point, Rect, RendererDowngrade, TextBoxHop, UnderlineStyle, VerticalScript,
 };
 
 /// A command issued to the engine. Serialized internally-tagged
@@ -987,6 +987,21 @@ pub enum Command {
         style_id: String,
         properties: BridgeStyleProperties,
     },
+
+    /// Issue #472 — declare the default face(s) per script: the shell's
+    /// answer to "which loaded face shapes Latin text that names no font",
+    /// instead of whichever face sorts first by id (a dual-script Amiri
+    /// won Latin). **Replaces** the whole table, so one call after the
+    /// boot fonts load is complete and idempotent; a recovered engine
+    /// starts with an empty table and the shell re-sends it. Ids that are
+    /// not loaded yet are skipped when a stack is built, so the call may
+    /// precede or follow the `LoadFont`s. Replies
+    /// `Event::FontPriorityApplied` with the EFFECTIVE lists. Changes
+    /// which face lays out text, so the layout caches are dropped; like
+    /// `LoadFont` it does not repaint - the shell does once fonts are in.
+    SetFontPriority {
+        priorities: Vec<FontPriority>,
+    },
 }
 
 /// Issue #79 — additive patch for [`Command::SetTableProperties`]. Each
@@ -1538,6 +1553,32 @@ mod tests {
                 include_docx: Some(false)
             }
         ));
+    }
+
+    /// Issue #472 — `SetFontPriority` wire shape: the `FontPriority`
+    /// entries ride as `{ script, ids }` with the bridge `Script` spelling.
+    #[test]
+    fn set_font_priority_wire_shape() {
+        let cmd: Command = serde_json::from_value(serde_json::json!({
+            "type": "SET_FONT_PRIORITY",
+            "priorities": [
+                { "script": "Latin", "ids": ["liberation"] },
+                { "script": "Arabic", "ids": ["amiri", "noto-naskh"] },
+            ],
+        }))
+        .expect("decodes");
+        let Command::SetFontPriority { priorities } = cmd else {
+            panic!("expected SetFontPriority");
+        };
+        assert_eq!(priorities.len(), 2);
+        assert!(matches!(priorities[0].script, crate::Script::Latin));
+        assert_eq!(priorities[1].ids, ["amiri", "noto-naskh"]);
+        let evt = serde_json::to_value(crate::Event::FontPriorityApplied {
+            priorities: priorities.clone(),
+        })
+        .expect("encodes");
+        assert_eq!(evt["type"], "FONT_PRIORITY_APPLIED");
+        assert_eq!(evt["priorities"][1]["script"], "Arabic");
     }
 
     /// Issue #221 — `OpenDocument` grew `defaults`; the pre-#221 wire

@@ -859,6 +859,11 @@ pub struct Engine {
     /// Internal mirror only; never set independently.
     ctx: Option<OffscreenCanvasRenderingContext2d>,
     fonts: HashMap<String, Arc<LoadedFont>>,
+    /// Issue #472 - the shell-declared default faces per script
+    /// (`Command::SetFontPriority`), applied to every `FontStack` the engine
+    /// builds (`Engine::font_stack`). Font setup, not document state: wiped
+    /// with the font map on recovery, never snapshotted.
+    font_priority: HashMap<text_pipeline::Script, Vec<String>>,
     undo: UndoStack,
     layout_cfg: Option<RenderConfig>,
     atlas: GlyphAtlas,
@@ -1064,6 +1069,7 @@ fn assemble_engine(
         page_ctxs,
         ctx,
         fonts: HashMap::new(),
+        font_priority: HashMap::new(),
         undo: UndoStack::new(DocumentTree::new(), 100),
         layout_cfg: None,
         atlas: GlyphAtlas::new(),
@@ -8122,6 +8128,8 @@ impl Engine {
                 Err(e) => Event::error_kind(bridge::ErrorKind::Internal, format!("LoadFont: {e}")),
             },
 
+            Command::SetFontPriority { priorities } => self.do_set_font_priority(priorities),
+
             Command::RasterizeGlyph {
                 font_id,
                 ch,
@@ -9036,6 +9044,7 @@ impl Engine {
     /// context, which cannot be re-transferred.
     fn reset_session_state(&mut self) {
         self.fonts.clear();
+        self.font_priority.clear();
         self.install_undo_stack(UndoStack::new(DocumentTree::new(), UNDO_CAP));
         self.layout_cfg = None;
         /* Issue #239 — a pending pre-`RenderPage` zoom belongs to the
@@ -10019,7 +10028,7 @@ impl Engine {
         }
 
         /* Per-script font stack; the cached `font_id` is the fallback root. */
-        let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
+        let font_stack = self.font_stack(&cfg.font_id);
         /* Issue #80 — document-order note markers are a layout input
         (shaped into every reference and self-mark); issue #129 — the
         per-page relabelling pass hands its own table in. */
@@ -13943,7 +13952,7 @@ impl Engine {
             return false;
         }
         stack
-            .get_or_init(|| FontStack::from_faces(self.fonts.clone(), &cfg.font_id))
+            .get_or_init(|| self.font_stack(&cfg.font_id))
             .resolve_family(family, script, bold, italic)
             .is_some_and(|r| matches!(r.matched, text_pipeline::FamilyMatch::Substituted(_)))
     }
@@ -13967,7 +13976,7 @@ impl Engine {
             return cfg.font_id.clone();
         }
         stack
-            .get_or_init(|| FontStack::from_faces(self.fonts.clone(), &cfg.font_id))
+            .get_or_init(|| self.font_stack(&cfg.font_id))
             .resolve(script, None, bold, italic)
             .map_or_else(|| cfg.font_id.clone(), |(id, _, _)| id.clone())
     }
@@ -18966,6 +18975,7 @@ mod tests {
             page_ctxs: Vec::new(),
             ctx: None,
             fonts: HashMap::new(),
+            font_priority: HashMap::new(),
             undo: UndoStack::new(DocumentTree::new(), 8),
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
@@ -19820,6 +19830,7 @@ mod tests {
             page_ctxs: Vec::new(),
             ctx: None,
             fonts: HashMap::new(),
+            font_priority: HashMap::new(),
             undo: UndoStack::new(DocumentTree::from_text("hello world"), 8),
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
@@ -19879,6 +19890,7 @@ mod tests {
             page_ctxs: Vec::new(),
             ctx: None,
             fonts: HashMap::new(),
+            font_priority: HashMap::new(),
             undo: UndoStack::new(DocumentTree::from_text("مرحبا"), 8),
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
@@ -19933,6 +19945,7 @@ mod tests {
             page_ctxs: Vec::new(),
             ctx: None,
             fonts: HashMap::new(),
+            font_priority: HashMap::new(),
             undo: UndoStack::new(DocumentTree::from_text("مرحبا"), 8),
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
@@ -20062,6 +20075,7 @@ mod tests {
             page_ctxs: Vec::new(),
             ctx: None,
             fonts: HashMap::new(),
+            font_priority: HashMap::new(),
             undo: UndoStack::new(DocumentTree::from_text("isn't done"), 8),
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
@@ -20727,6 +20741,7 @@ mod tests {
                 page_ctxs: Vec::new(),
                 ctx: None,
                 fonts: HashMap::new(),
+                font_priority: HashMap::new(),
                 undo: UndoStack::new(doc, 8),
                 layout_cfg: None,
                 atlas: GlyphAtlas::new(),
@@ -24454,6 +24469,7 @@ mod tests {
             page_ctxs: Vec::new(),
             ctx: None,
             fonts,
+            font_priority: HashMap::new(),
             undo: UndoStack::new(doc, 100),
             layout_cfg: Some(RenderConfig {
                 font_id: "test-latin".to_string(),
@@ -29465,9 +29481,16 @@ mod protection_gate;
 /// Issue #329 — the font substitutions the open document's layout makes.
 mod font_substitution;
 
+/// Issue #472 — the shell-declared per-script default faces
+/// (`Command::SetFontPriority`) and `Engine::font_stack`.
+mod font_priority;
+
 /// Issue #407 — the command-boundary finiteness guard (`InvalidArgument`).
 #[cfg(test)]
 mod finite_guard_tests;
+/// Issue #472 — `SetFontPriority` reaches layout and the read-backs.
+#[cfg(test)]
+mod font_priority_tests;
 /// Issue #329 — substitution reporting + the `Substituted` font source.
 #[cfg(test)]
 mod font_substitution_tests;

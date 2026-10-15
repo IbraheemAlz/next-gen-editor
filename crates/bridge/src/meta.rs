@@ -487,6 +487,9 @@ command_meta! {
     ResolveComment { .. } => M::FORMAT.body_only().protection(P::Comment),
     ReplyToComment { .. } => M::FORMAT.body_only().protection(P::Comment),
     ModifyStyle { .. } => M::FORMAT,
+    // Issue #472 - font setup, classified like LoadFont (replay needs it;
+    // the shell also re-sends it after every boot / recovery).
+    SetFontPriority { .. } => M::VIEW,
 }
 
 impl CommandKind {
@@ -728,7 +731,7 @@ mod tests {
     /// match has no wildcard, so `CommandKind::ALL` is the full variant
     /// list; update this when `Command` gains or loses a variant (and
     /// classify the new variant above).
-    const EXPECTED_VARIANT_COUNT: usize = 107;
+    const EXPECTED_VARIANT_COUNT: usize = 108;
 
     #[test]
     fn command_meta_is_exhaustive() {

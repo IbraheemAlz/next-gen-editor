@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Shared native font stack for the QA harnesses (corpus-native, differential-native): Latin runs resolve to Liberation Sans, Arabic runs to Amiri, as in the browser shell (issue #464)."
+description = "Shared native font stack for the QA harnesses (corpus-native, differential-native): Latin runs resolve to Liberation Sans, Arabic runs to Amiri, declared through the same per-script priority as the browser shell (issues #464, #472)."
 
 [dependencies]
 text-pipeline = { path = "../../crates/text-pipeline" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

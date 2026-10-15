@@ -32,6 +32,29 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   the table (and the face to `fonts.json` `substitutes`), never a special
   case in layout; `every_shipped_substitute_resolves_through_its_name_table`
   pins the shipped faces against it.
+- **The per-script default is declared, never inferred from face ids
+  (issue #472).** A run that names no family (or one nothing resolves)
+  takes `FontStack::resolve`'s per-script default: the stack's explicit
+  **priority** for the script (`FontStack::with_priority(script, &[ids])`,
+  loaded faces that cover the script, in declared order), then the
+  id-sorted covering faces, then the fallback chain (the primary face,
+  then every face by id). Without a priority a dual-script face wins by
+  name: Amiri (`amiri` < `liberation`) used to shape the interactive
+  editor's Latin text with Amiri's glyphs. Every consumer declares the same
+  table: the shell sends `ts/public/fonts.json` `defaults_by_script`
+  (`latin: [liberation]`, `arabic: [amiri, noto-naskh]`) as
+  `Command::SetFontPriority` after the boot fonts load (and again after a
+  recovery, which wipes the engine's font setup with its font map);
+  `tools/harness-fonts` declares it as `DEFAULTS_BY_SCRIPT` (a unit test
+  pins the two together) and registers its faces under the manifest ids,
+  so no id has to sort a particular way. Build every engine-side stack
+  through `Engine::font_stack` (it applies the declared priority) — never
+  a bare `FontStack::from_faces(self.fonts.clone(), …)`. The script's
+  priority also orders faces that answer to ONE family name in
+  `resolve_family`; a substitution row's own family order stays the
+  document's mapping and wins over it. The shell's Latin default is also
+  its seed face (`cfg.font_id`, the fallback root), so script-neutral text
+  and scripts the stack does not specialise take it.
 - **Line pitch has two models.** A document read from a Word package
   (`DocumentEnvelope::is_captured`, `StyleContext::word_line_metrics`)
   lays out with Word's font-derived pitch (`layout::FontLinePitch`): a

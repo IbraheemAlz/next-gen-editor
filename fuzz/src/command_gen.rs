@@ -1335,6 +1335,7 @@ classify_variants! {
     ResolveComment { .. } => false,
     ReplyToComment { .. } => false,
     ModifyStyle { .. } => false,
+    SetFontPriority { .. } => false,
 }
 
 thread_local! {
