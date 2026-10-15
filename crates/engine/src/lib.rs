@@ -16211,6 +16211,96 @@ mod tests {
         assert_eq!(t.rows[2].cells.len(), 3, "row below the merge untouched");
     }
 
+    /// Issue #471 - a merge keeps every row's span sum: the survivor's
+    /// span is the SUM of what it absorbs, so a rectangle holding an
+    /// existing `gridSpan` cell widens the owner by that cell's whole span
+    /// (the old `c1 - c0 + 1` arithmetic counted it as one column).
+    #[test]
+    fn merge_cells_absorbing_a_gridspan_cell_sums_the_spans() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 2, 4);
+        let d = d.merge_cells(BlockPath::top(1), 0, 1, 0, 2);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells.len(), 3, "[a, B(2), d]");
+        assert_eq!(t.ragged_row_count(), 0);
+        /* Grid columns 0-2 of row 0 now hold a, B(2): span 1 + 2. */
+        let d = d.merge_cells(BlockPath::top(1), 0, 0, 0, 2);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells.len(), 2, "[ABC(3), d]");
+        assert_eq!(t.rows[0].cells[0].props.grid_span, 3);
+        assert_eq!(t.rows[0].cells[1].props.grid_span.max(1), 1);
+        assert_eq!(t.ragged_row_count(), 0);
+        assert_eq!(d.ragged_table_rows(), 0);
+    }
+
+    /// Issue #471 - `check_merge_rect` accepts exactly the rectangles that
+    /// hold every merged region they touch, and names the region that a
+    /// refused one cuts. Coordinates are grid columns.
+    #[test]
+    fn check_merge_rect_requires_whole_regions() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 3, 4);
+        /* A = row 0, columns 1-2. B = rows 1-2, column 3. */
+        let d = d.merge_cells(BlockPath::top(1), 0, 1, 0, 2);
+        let d = d.merge_cells(BlockPath::top(1), 1, 3, 2, 3);
+        let t = d.blocks[1].as_table().unwrap();
+        /* Disjoint, enclosing and touching-but-not-overlapping are fine. */
+        for (r0, c0, r1, c1) in [
+            (0, 0, 0, 0),
+            (1, 0, 2, 2),
+            (0, 1, 0, 2),
+            (0, 0, 0, 3),
+            (0, 1, 2, 3),
+            (0, 0, 2, 3),
+            (1, 3, 2, 3),
+        ] {
+            assert_eq!(
+                t.check_merge_rect(r0, c0, r1, c1),
+                Ok(()),
+                "({r0},{c0})-({r1},{c1})"
+            );
+        }
+        /* Cut A from either side, and B from above and below. */
+        let cut_a = Err(TableError::CrossesMerge {
+            top: 0,
+            left: 1,
+            bottom: 0,
+            right: 2,
+        });
+        assert_eq!(t.check_merge_rect(0, 0, 0, 1), cut_a);
+        assert_eq!(t.check_merge_rect(0, 2, 1, 2), cut_a);
+        assert_eq!(t.check_merge_rect(1, 3, 0, 2), cut_a, "corners swapped");
+        let cut_b = Err(TableError::CrossesMerge {
+            top: 1,
+            left: 3,
+            bottom: 2,
+            right: 3,
+        });
+        assert_eq!(t.check_merge_rect(0, 3, 1, 3), cut_b);
+        assert_eq!(t.check_merge_rect(2, 2, 2, 3), cut_b);
+        /* Corners past the table. */
+        assert_eq!(
+            t.check_merge_rect(0, 0, 3, 0),
+            Err(TableError::RowOutOfRange { row: 3, rows: 3 })
+        );
+        assert_eq!(
+            t.check_merge_rect(0, 0, 0, 4),
+            Err(TableError::ColOutOfRange { col: 4, cols: 4 })
+        );
+    }
+
+    /// Issue #471 - a refused rectangle is a `TableError` the wire maps to
+    /// a message naming the region, not a panic or a silent success.
+    #[test]
+    fn crosses_merge_message_names_the_region() {
+        let msg = TableError::CrossesMerge {
+            top: 1,
+            left: 2,
+            bottom: 3,
+            right: 4,
+        }
+        .to_string();
+        assert!(msg.contains("rows 1-3, columns 2-4"), "{msg}");
+    }
+
     /// `split_cell` is the true inverse of `merge_cells`: it restores
     /// the horizontally-removed partners in the owner row AND in every
     /// vertical continuation row, matched by starting grid column.
