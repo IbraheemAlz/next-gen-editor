@@ -530,6 +530,19 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   top-level tables as `RevisionSlot::Row { row, index }` (path = the
   table), `revisions_snapshot` rows carry `row`. `<w:tblPrChange>` /
   `<w:trPrChange>` stay verbatim grab-bag bytes (not resolved).
+- **Nested tables (issue #440).** Every revision walker reaches every
+  nesting depth down to `engine::MAX_REVISION_TABLE_DEPTH` (64, the
+  reader's `MAX_TABLE_NESTING_DEPTH`; the #378 bound): the resolver's
+  text pass / `has_revisions` / the move-marker sweep walk
+  `engine::for_each_paragraph_nested` (NOT `fields::for_each_paragraph_deep`,
+  which stops after one level), the mark / row walk (`resolve_marks_in`)
+  recurses with the same bound, `revision_entries` lists rows and cell
+  paragraphs of nested tables (so `AcceptRevision` / `RejectRevision`
+  by `revision_id` reach them), and a tracked row deletion records the
+  text of nested tables too (`mark_rows_deleted`). `revisions_snapshot`
+  lists every entry — cell paragraphs included — with its full `path`
+  and table `depth` (the review pane's depth marker); `block` is the
+  top-level block. Harness: `tools/roundtrip` step 61.
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

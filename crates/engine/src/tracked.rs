@@ -567,11 +567,10 @@ impl DocumentTree {
     /// (`<w:trPr><w:del/>`, unless already deleted) and its contents
     /// recorded as deleted — every paragraph of its cells like text (the
     /// reviewer's own insertions removed), every mark but each cell's
-    /// last swallowed, a nested table's rows deleted the same way (its
-    /// text is left alone: the resolver's text walk does not reach that
-    /// deep, and the row goes with its parent on accept anyway). A row
-    /// `author` inserted is removed outright. `true` when the table
-    /// itself left its container (every row was such a row).
+    /// last swallowed, a nested table's rows (and, issue #440, its text)
+    /// deleted the same way, down to [`crate::MAX_REVISION_TABLE_DEPTH`]
+    /// levels. A row `author` inserted is removed outright. `true` when
+    /// the table itself left its container (every row was such a row).
     pub(crate) fn mark_rows_deleted(
         &mut self,
         table: &BlockPath,
@@ -609,8 +608,9 @@ impl DocumentTree {
         let mut top = self.blocks.clone();
         let _ = crate::replace_block_in_top(&mut top, table, Block::Table(t));
         self.blocks = top;
-        /* The contents of every marked row, cell by cell. */
-        let reaches_text = table.steps.len() == 1;
+        /* The contents of every marked row, cell by cell (issue #440 —
+        at every depth the revision walkers reach). */
+        let inner_depth = crate::revisions::table_depth(&table.steps) + 1;
         for (r, cells) in marked {
             for c in 0..cells {
                 let cell = child_cell(table, r, c);
@@ -622,20 +622,20 @@ impl DocumentTree {
                 for k in (0..n).rev() {
                     let path = child(&cell.steps, k);
                     match &blocks[k as usize] {
-                        Block::Paragraph(p) if reaches_text => {
+                        Block::Paragraph(p) => {
                             let len = p.text.len() as u32;
                             self.tracked_delete_text(&path, 0, len, author, date);
                             if k + 1 < n {
                                 self.delete_mark(&cell.steps, k, author, date);
                             }
                         }
-                        Block::Paragraph(_) => {}
-                        Block::Table(inner) => {
+                        Block::Table(inner) if inner_depth < crate::MAX_REVISION_TABLE_DEPTH => {
                             let rows = inner.rows.len() as u32;
                             if rows > 0 {
                                 self.mark_rows_deleted(&path, 0, rows - 1, author, date);
                             }
                         }
+                        Block::Table(_) => {}
                     }
                 }
             }

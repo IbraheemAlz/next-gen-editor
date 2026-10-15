@@ -48,6 +48,7 @@ mod styles_patch;
 mod table_markup;
 mod theme;
 mod tracked_coverage;
+mod tracked_nesting;
 
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
@@ -381,6 +382,8 @@ fn run_default() -> Result<()> {
     /* Step 60 — issues #439 / #434 / #435: malformed parts are repaired up
     front (regenerate-only) and every save of them is well-formed. */
     malformed::run_malformed_parts_roundtrip()?;
+    /* Step 61 — issue #440: revisions inside a table nested in a cell. */
+    tracked_nesting::run_nested_table_revisions_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

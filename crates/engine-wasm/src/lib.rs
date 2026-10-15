@@ -1415,23 +1415,47 @@ struct RevisionOut {
     /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
     /// by edits elsewhere — two wrappers over one range are two ids.
     revision_id: u32,
+    /// Issue #440 — where the revision lives: the paragraph (a row
+    /// revision: the table) as a full path, so a change inside a table
+    /// cell — at any nesting depth — is listed and can be revealed. For a
+    /// top-level paragraph it is `[Block { idx: block }]`.
+    path: BridgeBlockPath,
+    /// Issue #440 — how many tables deep `path` is (0 = the body, 1 = a
+    /// top-level table's cell or row, 2 = a table nested in a cell, …):
+    /// the review pane's depth marker.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    depth: u32,
 }
 
-/// The `revisions_snapshot()` rows: every tracked change of the
-/// top-level paragraphs, in document order — per paragraph its text
-/// revisions, then its mark's changes (issue #262: the empty range at
-/// the paragraph end; issue #303: one row per change, in order) — and,
-/// issue #365, every row change of a top-level table — each with its
-/// issue #304 `revision_id` (the range alone addresses only a mark's
-/// FIRST change, and no row change; the id addresses each).
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// The `revisions_snapshot()` rows: every tracked change the resolver
+/// reaches, in document order — per paragraph its text revisions, then
+/// its mark's changes (issue #262: the empty range at the paragraph end;
+/// issue #303: one row per change, in order) — and, issue #365, every
+/// row change of a table — each with its issue #304 `revision_id` (the
+/// range alone addresses only a mark's FIRST change, and no row change;
+/// the id addresses each). Issue #440 — table cells at every nesting
+/// depth included (they used to be dropped: only top-level paragraphs
+/// and rows were listed), each with its full `path` and `depth`; `block`
+/// is the top-level block the change sits in.
 fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
     doc.revision_entries()
         .into_iter()
         .filter_map(|e| {
-            let block = match e.at.path.steps.as_slice() {
-                [EnginePathStep::Block(b)] => *b,
+            let block = match e.at.path.steps.first() {
+                Some(EnginePathStep::Block(b)) => *b,
                 _ => return None,
             };
+            let depth =
+                e.at.path
+                    .steps
+                    .iter()
+                    .filter(|s| matches!(s, EnginePathStep::Cell { .. }))
+                    .count() as u32
+                    + u32::from(matches!(e.at.slot, engine::RevisionSlot::Row { .. }));
             let r = e.revision;
             let mark = matches!(e.at.slot, engine::RevisionSlot::Mark(_));
             let row = match e.at.slot {
@@ -1457,6 +1481,8 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
                 mark,
                 row,
                 revision_id: e.id,
+                path: engine_to_bridge_path(e.at.path.clone()),
+                depth,
             })
         })
         .collect()
@@ -29442,6 +29468,10 @@ mod tracked_command_tests;
 /// Issue #283 — revision ranges through real commands (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod revision_range_tests;
+
+/// Issue #440 — revisions inside nested tables (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod nested_revision_tests;
 
 #[cfg(test)]
 mod revision_address_tests;
