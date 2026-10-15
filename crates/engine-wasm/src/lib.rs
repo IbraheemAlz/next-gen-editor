@@ -28672,10 +28672,14 @@ mod snapshot_tests {
         include_bytes!("../../format-docx/tests/fixtures/word_package_parts.docx");
 
     /// Issue #468 — the production save-side well-formedness gate. A raw
-    /// control character the writer leaves in a regenerated part (the #467
-    /// shape) is refused with a typed `Event::Error`, yields no bytes, and
-    /// leaves the document state alone (#341 invariant); the same save
-    /// succeeds once the character is gone.
+    /// control character the writer leaves in a regenerated part is refused
+    /// with a typed `Event::Error`, yields no bytes, and leaves the document
+    /// state alone (#341 invariant).
+    ///
+    /// Issue #467 — typed / pasted text can no longer carry such a character
+    /// (the input boundary cleans it and the writer's escape helpers repair
+    /// what slips past), so the malformed part is injected through a block's
+    /// VERBATIM passthrough markup, which the writer replays byte for byte.
     #[test]
     fn save_refuses_a_part_the_writer_left_malformed() {
         let mut e = opened_engine(PACKAGE_FIXTURE);
@@ -28685,7 +28689,19 @@ mod snapshot_tests {
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
-        let evt = apply(&mut e, insert("a\u{1}b"));
+        let mut doc = e.undo.current().clone();
+        match doc.blocks.get_mut(4) {
+            Some(engine::Block::Paragraph(p)) => {
+                p.body_xml = Some(Box::new(engine::BodyPassthrough {
+                    before: vec![engine::BodyFragment::Verbatim {
+                        xml: b"<w:bookmarkStart w:id=\"90\" w:name=\"a\x01b\"/>".to_vec(),
+                    }],
+                    after: Vec::new(),
+                }));
+            }
+            other => panic!("block 4 is not a paragraph: {other:?}"),
+        }
+        let evt = e.commit_edit(doc, bpos_top(4, 4));
         assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
         #[cfg(feature = "fuzz-native")]
         let before = e.state_fingerprint_for_fuzzing();

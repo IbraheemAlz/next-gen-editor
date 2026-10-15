@@ -233,6 +233,27 @@ fn rich_paste_repairs_entities_and_control_characters() {
     saved_document_xml(&mut e);
 }
 
+/// Markup attributes (a link target, a title) reach the package too; a
+/// control character spelled in one must not corrupt any part.
+#[test]
+fn a_rich_paste_with_control_characters_in_attributes_still_saves() {
+    let mut e = engine_with(DocumentTree::from_text(""));
+    let evt = apply(
+        &mut e,
+        Command::PasteHtml {
+            html: "<p><a href=\"http://example.com/a&#1;b\" title=\"t&#2;\">link</a> \
+                   <span style=\"font-family:Ar&#3;ial\">x</span></p>"
+                .into(),
+        },
+    );
+    assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+    let Event::DocumentSaved { bytes, .. } = apply(&mut e, Command::SaveDocx) else {
+        panic!("SaveDocx must succeed");
+    };
+    assert_eq!(format_docx::first_forbidden_character(&bytes), None);
+    saved_document_xml(&mut e);
+}
+
 #[test]
 fn a_header_story_gets_the_same_cleaning() {
     let mut e = engine_with(DocumentTree::from_text("body"));
