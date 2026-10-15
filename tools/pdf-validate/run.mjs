@@ -18,9 +18,14 @@
  *   node run.mjs --native --profile 2u        — natively exported fixtures
  *                                               (no browser / dev server)
  *
- * Requires the Vite dev server (`pnpm dev`, http://localhost:5173). Override
- * with the URL env var. Uses Playwright with the system Chrome
- * (channel:'chrome') — no 150 MB chromium download.
+ * Issue #470 — the browser path needs the Vite dev server and finds it the
+ * way `ts/playwright.config.ts` does (`tools/lib/port.mjs`): the `URL` env
+ * var, else `PW_PORT`, else a port hashed from this checkout's path. When
+ * nothing answers there the harness boots `vite` itself and stops it on
+ * exit; the URL it exported against is printed in the report header.
+ * `--native`, `--regen` and `--check-fixtures` never touch a server. Uses
+ * Playwright with the system Chrome (channel:'chrome') — no 150 MB chromium
+ * download.
  *
  * veraPDF is optional locally: when it is not on PATH the harness still exports
  * every PDF and runs an in-process structural check for the profile's markers,
@@ -99,6 +104,7 @@ import { dirname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { inflateSync } from 'node:zlib';
+import { ensureDevServer } from '../lib/dev-server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..', '..');
@@ -167,7 +173,6 @@ const corpus = argValue('--corpus', 'tier-a');
 const profile = argValue('--profile', '1b');
 const strict = hasFlag('--strict');
 const native = hasFlag('--native');
-const serverUrl = process.env.URL ?? 'http://localhost:5173';
 
 /* Engine `PdfConformance` value per harness profile (issue #28 added the
    PDF/A-2u + PDF/X-3 targets). `veraFlavour` is the veraPDF `--flavour`
@@ -259,9 +264,17 @@ async function exportViaBrowser() {
         console.warn("[pdf-validate] falling back to the editor's seeded document");
     }
 
+    let devServer;
+    try {
+        devServer = await ensureDevServer({ label: 'pdf-validate' });
+    } catch (e) {
+        console.error(`[pdf-validate] no editor dev server: ${e.message}`);
+        process.exit(2);
+    }
+    const serverUrl = devServer.origin;
     console.log(
         `[pdf-validate] profile=${profile} conformance=${conformance} ` +
-            `url=${serverUrl} cases=${cases.length}`,
+            `url=${devServer.describe()} cases=${cases.length}`,
     );
 
     const exported = [];
@@ -270,12 +283,20 @@ async function exportViaBrowser() {
         const page = await (await browser.newContext()).newPage();
 
         try {
-            await page.goto(serverUrl, { waitUntil: 'load', timeout: 20000 });
-            await page.waitForFunction(() => window.__paintIdle === true, { timeout: 30000 });
+            /* A freshly booted Vite transforms on first request; 20 s was
+               sized for a warm one. */
+            await page.goto(serverUrl, {
+                waitUntil: 'load',
+                timeout: devServer.booted ? 60000 : 20000,
+            });
+            await page.waitForFunction(() => window.__paintIdle === true, {
+                timeout: devServer.booted ? 60000 : 30000,
+            });
         } catch (e) {
             console.error(`[pdf-validate] cannot reach a ready editor at ${serverUrl}`);
-            console.error(`[pdf-validate] is \`pnpm dev\` running? (${e.message})`);
+            console.error(`[pdf-validate] (${e.message})`);
             await browser.close();
+            await devServer.stop();
             process.exit(2);
         }
 
@@ -328,6 +349,7 @@ async function exportViaBrowser() {
         }
     } finally {
         await browser.close();
+        await devServer.stop();
     }
     return exported;
 }

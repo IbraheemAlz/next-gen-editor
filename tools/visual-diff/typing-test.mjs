@@ -6,12 +6,14 @@
  * via real keyboard events, then undoes into the visible region and asserts
  * the canvas actually changed. Also exercises redo.
  *
- * Usage: node typing-test.mjs   (vite must be running on :5173)
+ * Usage: node typing-test.mjs   (issue #470: finds - or boots - the dev server
+ * the way `ts/playwright.config.ts` does, see `tools/lib/dev-server.mjs`)
  */
 import { chromium } from 'playwright';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
+import { ensureDevServerOrExit } from '../lib/dev-server.mjs';
 
 const OUT = '/tmp/visual-diff';
 mkdirSync(OUT, { recursive: true });
@@ -23,6 +25,7 @@ function pixelDelta(aPath, bPath) {
     return pixelmatch(a.data, b.data, diff.data, a.width, a.height, { threshold: 0.1 });
 }
 
+const devServer = await ensureDevServerOrExit({ label: 'typing-test' });
 const browser = await chromium.launch({ headless: true, channel: 'chrome' });
 let failed = false;
 try {
@@ -36,7 +39,7 @@ try {
         }
     });
 
-    await page.goto('http://localhost:5173/', { waitUntil: 'load' });
+    await page.goto(`${devServer.origin}/`, { waitUntil: 'load' });
     await page.waitForFunction(() => window.__paintIdle === true, { timeout: 15000 });
     console.log('[typing-test] editor booted, blank A4 ready');
     await page.screenshot({ path: `${OUT}/typing-0-blank.png` });
@@ -94,5 +97,6 @@ try {
     console.log(failed ? '[typing-test] FAIL' : '[typing-test] PASS');
 } finally {
     await browser.close();
+    await devServer.stop();
 }
 process.exit(failed ? 1 : 0);

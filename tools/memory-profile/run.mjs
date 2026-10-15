@@ -20,9 +20,12 @@
  * measures the true cold-open footprint; the output labels which mode
  * produced each number.
  *
- * Requires the Vite dev server (`pnpm dev`, http://localhost:5173).
- * Override the origin with the URL env var. Uses Playwright with the
- * system Chrome (channel:'chrome'), launched with
+ * Issue #470 — needs the Vite dev server (the `window.__dispatch` hooks) and
+ * finds it the way `ts/playwright.config.ts` does (`tools/lib/port.mjs`): the
+ * `URL` env var, else `PW_PORT`, else a port hashed from this checkout's
+ * path. When nothing answers there the harness boots `vite` itself and
+ * stops it on exit; the measured URL is in the report header. Uses
+ * Playwright with the system Chrome (channel:'chrome'), launched with
  * --enable-precise-memory-info and --js-flags=--expose-gc.
  *
  * Ctrl+C / SIGTERM closes the active browser before exiting — an
@@ -33,10 +36,12 @@ import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { ensureDevServerOrExit } from '../lib/dev-server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PERF_DIR = join(HERE, '..', '..', 'tests', 'perf');
-const ORIGIN = process.env.URL ?? 'http://localhost:5173';
+/* Resolved (and, if need be, booted) once the arguments check out. */
+let ORIGIN = '';
 
 const MIB = 1024 * 1024;
 
@@ -71,6 +76,7 @@ const fmtMiB = (b) => `${(b / MIB).toFixed(1)} MiB`;
 
 /* Issue #33 — SIGINT/SIGTERM must tear the browser down. */
 let activeBrowser = null;
+let devServer = null;
 let shuttingDown = false;
 async function shutdown(signal, code) {
     if (shuttingDown) return;
@@ -81,6 +87,7 @@ async function shutdown(signal, code) {
     } catch {
         /* already gone */
     }
+    await devServer?.stop();
     process.exit(code);
 }
 process.on('SIGINT', () => void shutdown('SIGINT', 130));
@@ -232,8 +239,10 @@ async function profile(browser, label) {
     }
 }
 
+devServer = await ensureDevServerOrExit({ label: 'memory-profile' });
+ORIGIN = devServer.origin;
 console.log(
-    `[memory-profile] origin=${ORIGIN} docs=${labels.join(', ')} ` +
+    `[memory-profile] origin=${devServer.describe()} docs=${labels.join(', ')} ` +
         `mode=${enforce ? 'enforce' : 'report'} layout=${lazyMode ? 'lazy cold-open' : 'forced full'}`,
 );
 
@@ -257,6 +266,8 @@ for (const label of labels) {
         await browser.close();
     }
 }
+
+await devServer.stop();
 
 const profiled = results.filter((r) => r !== null);
 if (!profiled.length) {
