@@ -73,6 +73,35 @@ fn assert_square(e: &Engine, label: &str) {
         );
     }
     assert_eq!(e.ragged_table_rows_for_fuzzing(), 0, "{label}");
+    /* Every `vMerge` continue cell hangs under a run member that starts at
+    the same grid column with the same span - a cut run (a restart merged
+    sideways, a continue left behind) breaks exactly this. */
+    let start_and_span = |row: &engine::TableRow, i: usize| {
+        let start: usize = row.cells[..i]
+            .iter()
+            .map(|c| c.props.grid_span.max(1) as usize)
+            .sum();
+        (start, row.cells[i].props.grid_span.max(1) as usize)
+    };
+    for (r, row) in t.rows.iter().enumerate() {
+        for (i, cell) in row.cells.iter().enumerate() {
+            if cell.props.v_merge != VMergeRole::Continue {
+                continue;
+            }
+            let (start, span) = start_and_span(row, i);
+            let above = r.checked_sub(1).and_then(|p| {
+                let prow = &t.rows[p];
+                (0..prow.cells.len())
+                    .find(|&k| start_and_span(prow, k) == (start, span))
+                    .map(|k| prow.cells[k].props.v_merge)
+            });
+            assert!(
+                matches!(above, Some(VMergeRole::Restart | VMergeRole::Continue)),
+                "{label}: the continue cell at row {r}, grid column {start} (span {span}) has no \
+                 run member above it"
+            );
+        }
+    }
 }
 
 fn refusal(evt: &Event) -> (&Option<ErrorKind>, &str) {
