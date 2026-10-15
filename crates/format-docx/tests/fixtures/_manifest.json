@@ -61,6 +61,22 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "drop_cap.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 4,
+        "paragraph_texts": [
+          "D",
+          "rop caps open a chapter or an article: the first letter is set in a frame three lines tall, and the first three lines of the paragraph wrap around it while the following lines return to the full width of the column, exactly as the frame properties of the cap paragraph ask. The cap paragraph itself takes no room in the flow: this paragraph starts at its top, and the cap's baseline meets the third line's.",
+          "M",
+          "argin caps hang in the left margin instead: the letter sits outside the text column, two lines tall, and every line of this paragraph keeps the full column width."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "floating_image_anchor.docx": {
       "generator": "handcrafted",
       "phase_introduced": 11,

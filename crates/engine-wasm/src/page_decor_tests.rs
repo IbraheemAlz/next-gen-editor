@@ -349,3 +349,88 @@ fn regenerated_sect_pr_keeps_page_borders_and_line_numbering() {
         );
     }
 }
+
+fn line_text_width(l: &layout::LineBox) -> f32 {
+    l.runs
+        .iter()
+        .flat_map(|r| r.glyphs.iter())
+        .map(|g| g.x_advance)
+        .sum()
+}
+
+#[test]
+fn drop_cap_frame_reads_from_the_ppr_grab_bag() {
+    let doc = format_docx::read_docx(&format_docx::test_fixtures::drop_cap_docx())
+        .expect("read")
+        .document;
+    let caps: Vec<Option<engine::DropCap>> = doc
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .map(|p| engine::page_decor::drop_cap_from_bag(&p.props.grab_bag))
+        .collect();
+    assert_eq!(caps.len(), 4);
+    assert_eq!(
+        caps[0].map(|c| (c.kind, c.lines, c.h_space_pt)),
+        Some((engine::DropCapKind::Drop, 3, 3.6))
+    );
+    assert!(caps[1].is_none());
+    assert_eq!(
+        caps[2].map(|c| (c.kind, c.lines)),
+        Some((engine::DropCapKind::Margin, 2))
+    );
+    assert!(caps[3].is_none());
+}
+
+#[test]
+fn drop_cap_wraps_the_first_lines_of_its_paragraph() {
+    let engine = decor_engine(&format_docx::test_fixtures::drop_cap_docx());
+    let pages = pages_of(&engine);
+    assert_eq!(pages.len(), 1);
+    let blocks: Vec<&layout::ParagraphBox> = pages[0]
+        .blocks
+        .iter()
+        .filter_map(LayoutBlock::as_paragraph)
+        .collect();
+    assert_eq!(blocks.len(), 4, "frame + anchor, twice");
+    let (cap, anchor) = (blocks[0], blocks[1]);
+    /* The frame takes no flow height: the anchor starts at its top. */
+    assert_eq!(cap.size.height, 0.0);
+    assert!((anchor.origin.y - cap.origin.y).abs() < 0.01);
+    assert!(anchor.lines.len() > 4, "the anchor wraps past the cap");
+    let cap_line = &cap.lines[0];
+    let cap_right = cap_line.origin.x + line_text_width(cap_line);
+    /* Lines 1-3 start right of the cap (plus w:hSpace), line 4 is back
+    at the column edge. */
+    for l in &anchor.lines[..3] {
+        assert!(
+            l.origin.x >= cap_right + 3.6 - 0.01,
+            "{} < {cap_right}",
+            l.origin.x
+        );
+    }
+    assert!(anchor.lines[3].origin.x < 1.0);
+    /* The cap's baseline sits on line 3's. */
+    let cap_base = cap.origin.y + cap_line.origin.y + cap_line.baseline;
+    let l3 = &anchor.lines[2];
+    assert!((cap_base - (anchor.origin.y + l3.origin.y + l3.baseline)).abs() < 0.01);
+
+    /* The margin cap hangs left of the column; its paragraph keeps the
+    full width; baseline on line 2. */
+    let (mcap, manchor) = (blocks[2], blocks[3]);
+    assert_eq!(mcap.size.height, 0.0);
+    let ml = &mcap.lines[0];
+    assert!(ml.origin.x + line_text_width(ml) <= -3.6 + 0.01);
+    assert!(manchor.lines.iter().all(|l| l.origin.x < 1.0));
+    let mbase = mcap.origin.y + ml.origin.y + ml.baseline;
+    let m2 = &manchor.lines[1];
+    assert!((mbase - (manchor.origin.y + m2.origin.y + m2.baseline)).abs() < 0.01);
+
+    assert_eq!(
+        format!("{:#018x}", layout::geometry_fingerprint(&pages)),
+        DROP_CAP_FINGERPRINT
+    );
+}
+
+/// Pinned geometry of `drop_cap_docx`.
+const DROP_CAP_FINGERPRINT: &str = "0xff4a28c0d2fa2602";

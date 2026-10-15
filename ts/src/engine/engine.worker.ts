@@ -50,6 +50,7 @@ import HYPHENATION_OFF_DOCX_URL from '../../../crates/format-docx/tests/fixtures
 /* Issue #328 — the `page-borders` / `line-numbers` goldens. */
 import PAGE_BORDERS_DOCX_URL from '../../../crates/format-docx/tests/fixtures/page_borders.docx?url';
 import LINE_NUMBERS_DOCX_URL from '../../../crates/format-docx/tests/fixtures/line_numbers.docx?url';
+import DROP_CAP_DOCX_URL from '../../../crates/format-docx/tests/fixtures/drop_cap.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -1072,9 +1073,11 @@ async function handleInit(msg: InitMsg): Promise<void> {
         }
 
         case 'page-borders':
-        case 'line-numbers': {
-            /* Issue #328 — `<w:pgBorders>` / `<w:lnNumType>` fixtures
-               (`tools/roundtrip --gen-seed`), A4 at 1:1. */
+        case 'line-numbers':
+        case 'drop-cap': {
+            /* Issue #328 — `<w:pgBorders>` / `<w:lnNumType>` /
+               `<w:framePr w:dropCap>` fixtures (`tools/roundtrip
+               --gen-seed`), A4 at 1:1. */
             await dispatch({
                 type: 'RENDER_PAGE',
                 text: '',
@@ -1087,7 +1090,11 @@ async function handleInit(msg: InitMsg): Promise<void> {
             paintEvt = await dispatch({
                 type: 'LOAD_DOCX',
                 bytes: await fetchBytes(
-                    testCase === 'page-borders' ? PAGE_BORDERS_DOCX_URL : LINE_NUMBERS_DOCX_URL,
+                    testCase === 'page-borders'
+                        ? PAGE_BORDERS_DOCX_URL
+                        : testCase === 'line-numbers'
+                          ? LINE_NUMBERS_DOCX_URL
+                          : DROP_CAP_DOCX_URL,
                 ),
             } as Command);
             break;

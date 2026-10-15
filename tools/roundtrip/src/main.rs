@@ -5147,6 +5147,16 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     .collect()
             }),
         },
+        /* Issue #328 — drop caps (`<w:framePr w:dropCap>` rides the
+        pPr grab bag; the visual-diff `drop-cap` golden loads it). */
+        PrebuiltFixture {
+            name: "drop_cap.docx",
+            bytes: format_docx::test_fixtures::drop_cap_docx(),
+            entry: page_decor_fixture_entry({
+                let [a, b] = format_docx::test_fixtures::DROP_CAP_TEXTS;
+                ["D", a, "M", b].iter().map(|t| t.to_string()).collect()
+            }),
+        },
         /* Issue #326 — automatic hyphenation on / off (the visual-diff
         `hyphenation` / `hyphenation-off` goldens load them). Zero-edit
         drift 0; the default harness's step 59i–k edits both. */

@@ -101,3 +101,45 @@ pub fn line_numbers_docx() -> Vec<u8> {
     );
     package_with_sect_extra(&body, "<w:lnNumType w:countBy=\"1\" w:distance=\"360\"/>")
 }
+
+/// The anchor paragraphs of `drop_cap.docx` (each follows its cap).
+pub const DROP_CAP_TEXTS: [&str; 2] = [
+    "rop caps open a chapter or an article: the first letter is set in a \
+     frame three lines tall, and the first three lines of the paragraph \
+     wrap around it while the following lines return to the full width of \
+     the column, exactly as the frame properties of the cap paragraph ask. \
+     The cap paragraph itself takes no room in the flow: this paragraph \
+     starts at its top, and the cap's baseline meets the third line's.",
+    "argin caps hang in the left margin instead: the letter sits outside \
+     the text column, two lines tall, and every line of this paragraph \
+     keeps the full column width.",
+];
+
+/// One Word-shaped drop-cap pair: the frame paragraph holding `letter`
+/// (`<w:framePr w:dropCap w:lines>`, an exact line rule `lines` × 13.8
+/// pt tall, the letter at `lines` × 13.8 pt) and its anchor paragraph.
+fn drop_cap_pair(kind: &str, lines: u32, letter: &str, text: &str) -> String {
+    let line_twips = lines * 276;
+    let half_points = lines * 25;
+    format!(
+        "<w:p><w:pPr><w:keepNext/><w:framePr w:dropCap=\"{kind}\" w:lines=\"{lines}\" \
+         w:wrap=\"around\" w:vAnchor=\"text\" w:hAnchor=\"text\" w:hSpace=\"72\"/>\
+         <w:spacing w:after=\"0\" w:line=\"{line_twips}\" w:lineRule=\"exact\"/>\
+         <w:textAlignment w:val=\"baseline\"/></w:pPr><w:r><w:rPr>\
+         <w:sz w:val=\"{half_points}\"/><w:szCs w:val=\"{half_points}\"/></w:rPr>\
+         <w:t>{letter}</w:t></w:r></w:p>{}",
+        text_para(text)
+    )
+}
+
+/// Issue #328 — a `drop` cap three lines tall ("D" + its paragraph),
+/// then a `margin` cap two lines tall ("M" + its paragraph).
+pub fn drop_cap_docx() -> Vec<u8> {
+    let [a, b] = DROP_CAP_TEXTS;
+    let body = format!(
+        "{}{}",
+        drop_cap_pair("drop", 3, "D", a),
+        drop_cap_pair("margin", 2, "M", b)
+    );
+    package_with_sect_extra(&body, "")
+}
