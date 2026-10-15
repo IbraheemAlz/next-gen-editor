@@ -1,12 +1,13 @@
-//! Issue #462 — navigation that reaches past the lazily laid-out band
-//! expands the band SYNCHRONOUSLY, inside the command that needs it,
-//! before the move resolves.
+//! Issues #462 / #65 — navigation that reaches past the lazily laid-out
+//! band expands the band SYNCHRONOUSLY, inside the command that needs
+//! it, before the move or the hit resolves.
 //!
 //! Lazy pagination (`LazyLayoutState` + `Command::ExpandLayout`) lays out
 //! only the viewport band plus a runway; the shell's scroll asks for more.
 //! A burst of ArrowDown presses outruns that scroll, so the caret used to
-//! park on the band's last line. Every caret move now goes through
-//! [`Engine::lazy_nav_expand_until`]:
+//! park on the band's last line (#462), and a click on a page past the
+//! band guessed the missing page tops from A4 and could clamp onto the
+//! wrong page (#65). Both now go through [`Engine::lazy_nav_expand_until`]:
 //! raise `min_target_y`, rebuild the band through
 //! `ensure_layout_snapshot` — so every growth is the verified fast path of
 //! `.claude/rules/render.md` (`verify_prefix_open`, the keep-with-next cull
@@ -192,6 +193,53 @@ impl Engine {
             return Ok(false);
         }
         self.lazy_nav_expand_until(FULL_LAYOUT_TARGET_PT, |_| false)
+    }
+
+    /// Issue #65 — make the band reach body page `page_idx` (0-based). The
+    /// first round estimates the missing pages from the TALLEST section's
+    /// real page height (never an A4 constant), and the loop keeps growing
+    /// until the page is laid and complete or the layout is full, so a
+    /// taller-than-estimated page can no longer leave the click on the
+    /// previous page.
+    /// On return the layout snapshot is populated (the caller borrows it).
+    pub(crate) fn lazy_nav_reach_page(&mut self, page_idx: u32) -> Result<bool, Box<Event>> {
+        let want_pages = page_idx as usize + 1;
+        let scale = self.scale().max(f32::MIN_POSITIVE);
+        let gap = render::scene::PAGE_GAP_PT * scale;
+        self.ensure_layout_snapshot(scale, false, Some(self.lazy_layout.min_target_y * scale))?;
+        let page_pt = self.tallest_section_page_pt() + render::scene::PAGE_GAP_PT;
+        let first = {
+            let snap = self.layout_snapshot.borrow();
+            let s = snap
+                .as_ref()
+                .expect("ensure_layout_snapshot populated the memo");
+            if complete_pages(s) >= want_pages {
+                return Ok(false);
+            }
+            /* At least one page: a clicked page that is the partial last
+            one needs the band to run past it. */
+            let missing = want_pages.saturating_sub(s.pages.len()).max(1);
+            band_height_px(s, gap) / scale + missing as f32 * page_pt
+        };
+        /* The clicked page must be COMPLETE (not the page the cull
+        stopped in), or a click low on it would resolve onto the last
+        laid line above. */
+        self.lazy_nav_expand_until(first, |s| complete_pages(s) >= want_pages)
+    }
+
+    /// The tallest page (layout pt) any section of the document uses.
+    fn tallest_section_page_pt(&self) -> f32 {
+        let tallest = self.with_cached_sections(|sections| {
+            sections
+                .iter()
+                .map(|s| s.geometry.height.max(s.geometry.width))
+                .fold(0.0f32, f32::max)
+        });
+        if tallest.is_finite() && tallest > 0.0 {
+            tallest
+        } else {
+            engine::PageGeometry::a4().height
+        }
     }
 
     /// Issue #462 — `Command::MoveCaret` over a band that reaches the
@@ -588,6 +636,90 @@ mod tests {
             caret_block(&engine),
             0,
             "PageUp past the start lands on the first line"
+        );
+    }
+
+    /// ISO A3 portrait with Word's stock 1-inch margins.
+    fn a3() -> engine::PageGeometry {
+        engine::PageGeometry::from_twips(16838, 23811, 1440, 1440, 1440, 1440, 720, 720)
+    }
+
+    /// US Legal portrait.
+    fn legal() -> engine::PageGeometry {
+        engine::PageGeometry::from_twips(12240, 20160, 1440, 1440, 1440, 1440, 720, 720)
+    }
+
+    fn tall_page_engine(geometry: engine::PageGeometry, paragraphs: usize) -> Engine {
+        let mut doc = prose(paragraphs);
+        doc.body_section.geometry = geometry;
+        let mut engine = test_engine_with_doc(doc);
+        small_band(&mut engine);
+        engine
+    }
+
+    /// The top-level blocks the full layout puts on page `idx`.
+    fn blocks_on_page(engine: &Engine, idx: usize) -> Vec<u32> {
+        let (_, _, paths, _) = engine
+            .build_pages(engine.scale(), false, None)
+            .expect("reference layout");
+        paths[idx].iter().filter_map(top_block_of).collect()
+    }
+
+    /// Acceptance (#65): a click on a page past the stale band of a
+    /// taller-than-A4 document resolves on THAT page, never the last laid
+    /// one — A3 and US Legal.
+    #[test]
+    fn hit_test_beyond_band_lands_on_the_clicked_tall_page() {
+        for (name, geometry, paragraphs, page_idx) in
+            [("A3", a3(), 900usize, 7u32), ("Legal", legal(), 900, 11)]
+        {
+            let mut engine = tall_page_engine(geometry, paragraphs);
+            let scale = engine.scale();
+            engine
+                .ensure_layout_snapshot(scale, false, Some(engine.lazy_layout.min_target_y * scale))
+                .expect("cold band");
+            let (cold_pages, cold_full) = snapshot_pages(&engine);
+            assert!(
+                !cold_full && cold_pages <= page_idx as usize,
+                "{name}: page {page_idx} is beyond the band ({cold_pages} laid)"
+            );
+            let expected = blocks_on_page(&engine, page_idx as usize);
+            assert!(
+                !expected.is_empty(),
+                "{name}: page {page_idx} exists in the full layout"
+            );
+            /* A point a little below the top margin of the page. */
+            let at = BridgePoint {
+                x: geometry.margin_left * scale + 20.0,
+                y: (geometry.margin_top + 30.0) * scale,
+            };
+            let evt = engine.do_hit_test_in_page(page_idx, at);
+            let Event::HitResult { pos } = evt else {
+                panic!("{name}: {evt:?}");
+            };
+            let Some(BridgePathStep::Block { idx }) = pos.path.steps.first().cloned() else {
+                panic!("{name}: hit outside the body: {pos:?}");
+            };
+            assert!(
+                expected.contains(&idx),
+                "{name}: the hit lands on block {idx}, not on page {page_idx}'s blocks {expected:?}"
+            );
+            let (pages, _) = snapshot_pages(&engine);
+            assert!(
+                pages > page_idx as usize,
+                "{name}: the band grew to the clicked page"
+            );
+        }
+    }
+
+    /// The first-round estimate uses the section's real page height.
+    #[test]
+    fn tallest_section_page_reads_the_real_geometry() {
+        let engine = tall_page_engine(a3(), 4);
+        assert!((engine.tallest_section_page_pt() - a3().height).abs() < 0.01);
+        let engine = test_engine_with_doc(lines_doc(4));
+        assert!(
+            (engine.tallest_section_page_pt() - engine::PageGeometry::a4().height).abs() < 0.01
         );
     }
 

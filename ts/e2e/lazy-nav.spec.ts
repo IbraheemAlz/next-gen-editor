@@ -2,9 +2,10 @@ import { test, expect, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { boot, burst, settle } from './helpers/editor';
+import { documentXml, storedDocx } from './helpers/docx';
 
-/* Issue #462 — navigation past the lazily laid-out band, through the REAL
- * worker + WASM engine and the shell's key handler.
+/* Issues #462 / #65 — navigation past the lazily laid-out band, through the
+ * REAL worker + WASM engine and the shell's key / pointer handlers.
  *
  * Lazy pagination lays out only the viewport band plus a runway; before
  * #462 a burst of ArrowDown presses parked the caret on the band's last
@@ -14,6 +15,10 @@ import { boot, burst, settle } from './helpers/editor';
  * with `burst` (ONE synchronous evaluate: no reply, no scroll, no
  * `EXPAND_LAYOUT` can interleave — the deterministic form of a fast key
  * repeat), plus one slow real-keyboard smoke.
+ *
+ * #65 — a hit-test on a page past the band used to guess the missing page
+ * tops from A4 and clamp onto the last laid page under taller pages; it now
+ * grows the band to the clicked page from the section's real page size.
  *
  * Assertions ride engine replies (caret paths and rects, page tops) —
  * valid under headless Chrome, which never composites the interactive
@@ -187,4 +192,65 @@ test('slow real-keyboard smoke: ArrowDown / PageDown through the hidden input (#
     await page.keyboard.press('Control+End');
     await settle(page);
     expect((await caretNow(page)).block).toBe(199);
+});
+
+/** A 5-page A3 document: 250 numbered paragraphs under an A3 `<w:pgSz>`. */
+function a3Docx(): Uint8Array {
+    const paras = Array.from(
+        { length: 250 },
+        (_, i) =>
+            `<w:p><w:r><w:t xml:space="preserve">Paragraph ${i + 1}: sphinx of black quartz, judge my vow; pack my box with five dozen liquor jugs.</w:t></w:r></w:p>`,
+    ).join('');
+    const sectPr =
+        '<w:sectPr><w:pgSz w:w="16838" w:h="23811"/>' +
+        '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>' +
+        '</w:sectPr>';
+    return storedDocx(documentXml(paras + sectPr));
+}
+
+test('a click on page 3 of a 5-page A3 document lands on page 3 (#65)', async ({ page }) => {
+    test.setTimeout(60_000);
+    await boot(page);
+    const bytes = Array.from(a3Docx());
+    /* OPEN + a hit-test on the LAST page, queued back to back (no shell
+       scroll or EXPAND_LAYOUT can run in between): the beyond-band path. */
+    const early = await page.evaluate(async (arr) => {
+        const d = (window as any).__dispatch;
+        const open = d({
+            type: 'OPEN_DOCUMENT',
+            bytes: new Uint8Array(arr),
+            format: 'docx',
+            name: 'a3.docx',
+        });
+        const hit = d({ type: 'HIT_TEST_IN_PAGE', page: 4, at: { x: 400, y: 600 } });
+        return { open: (await open).type, hit: await hit };
+    }, bytes);
+    expect(early.open).toBe('DOCUMENT_LOADED');
+    expect(early.hit.type).toBe('HIT_RESULT');
+    let geom = await pageGeometry(page);
+    expect(geom.tops.length).toBeGreaterThanOrEqual(5);
+    const hitY = await page.evaluate(async (pos) => {
+        const s = await (window as any).__dispatch({
+            type: 'SET_SELECTION',
+            range: { start: pos, end: pos },
+            caret: pos,
+        });
+        return s.caret.y as number;
+    }, early.hit.pos);
+    expect(pageOf(hitY, geom.tops, geom.heights)).toBe(4);
+
+    /* The real pointer path: pointerdown / up on page 3's canvas. */
+    const card = page.locator('.editor-page[data-page-index="2"]');
+    await card.scrollIntoViewIfNeeded();
+    await expect(card.locator('canvas')).toHaveCount(1);
+    await settle(page);
+    const scale = geom.heights[0]! / 1190.55;
+    await burst(page, [
+        { pointerdown: { page: 2, x: 120 * scale, y: 400 * scale } },
+        { pointerup: true, page: 2 },
+    ]);
+    await settle(page);
+    geom = await pageGeometry(page);
+    const caret = await caretNow(page);
+    expect(pageOf(caret.y, geom.tops, geom.heights)).toBe(2);
 });
