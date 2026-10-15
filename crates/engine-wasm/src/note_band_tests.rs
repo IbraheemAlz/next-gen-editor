@@ -239,7 +239,7 @@ fn a_band_culled_mid_footnote_continuation_expands_without_demotion() {
     assert_eq!(fp, PINNED_LONG_FOOTNOTE, "long-footnote fixture moved");
 }
 
-const PINNED_LONG_FOOTNOTE: u64 = 0xde9dc2ca1a2f4f0c;
+const PINNED_LONG_FOOTNOTE: u64 = 0x07887c22cda1645a;
 
 /// Issue #181 (a) — document-end endnotes alone never make a band
 /// provisional: the band simply ends before them, verifies as a prefix
@@ -385,4 +385,4 @@ fn a_float_at_the_page_bottom_clears_the_footnote_band() {
     assert_eq!(fp, PINNED_FLOAT_OVER_BAND, "float-over-band fixture moved");
 }
 
-const PINNED_FLOAT_OVER_BAND: u64 = 0xaf1490d945e3c9a9;
+const PINNED_FLOAT_OVER_BAND: u64 = 0x8b179608009b85b1;

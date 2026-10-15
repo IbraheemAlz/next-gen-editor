@@ -361,7 +361,6 @@ pub(crate) fn paragraph_layout_key(
         theme_key,
         note_self_mark,
         settings: _,
-        word_line_metrics,
     } = sctx;
     theme_key.hash(&mut h);
     /* Issue #370 — an EMPTY paragraph's line is sized by its mark (the
@@ -373,12 +372,10 @@ pub(crate) fn paragraph_layout_key(
         0x70_u8.hash(&mut h);
         hash_span_style(mark, &mut h);
     }
-    /* Issue #329 — the line-pitch model (Word's font-derived pitch for a
-    document read from a Word package), and under it the paragraph mark's
-    face, which sizes any line with no text run (a doubled soft break, not
-    only an empty paragraph). */
-    word_line_metrics.hash(&mut h);
-    if word_line_metrics && let Some(mark) = mark_style.as_deref() {
+    /* Issues #329 / #475 — under Word's font-derived pitch (every
+    document's model) the paragraph mark's face sizes any line with no
+    text run (a doubled soft break, not only an empty paragraph). */
+    if let Some(mark) = mark_style.as_deref() {
         0x329_u16.hash(&mut h);
         hash_span_style(mark, &mut h);
     }

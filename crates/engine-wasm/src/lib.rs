@@ -2836,14 +2836,6 @@ struct StyleContext<'a> {
     /// into every paragraph layout key: the same text and bindings under
     /// another theme must never hit a cached box.
     theme_key: u64,
-    /// Issue #329 — lay the document out with Word's font-derived line
-    /// pitch ([`layout::FontLinePitch`], `text_pipeline::LineMetrics`)
-    /// instead of the configured one: `true` for a document read from a
-    /// Word package (its `document.xml` envelope was captured), whose
-    /// `<w:spacing>` values mean what they mean in Word. Engine-authored
-    /// documents (the seeded editor page, `.txt` / `.html` opens, the
-    /// `RenderPage` harness) keep the configured `line_height`.
-    word_line_metrics: bool,
     /// Issue #326 — the document's hyphenation settings (`None`: a
     /// layout outside a document — automatic hyphenation off).
     settings: Option<&'a engine::DocumentSettings>,
@@ -2865,7 +2857,6 @@ impl<'a> StyleContext<'a> {
                 t.hash(&mut h);
                 h.finish()
             }),
-            word_line_metrics: doc.document_envelope.is_captured(),
         }
     }
 
@@ -3291,15 +3282,19 @@ fn resolve_line_height(
 /// 132 lines); a hostile `w:line` cannot collapse or explode the pitch.
 const WORD_LINE_MULTIPLE_RANGE: (f32, f32) = (0.06, 132.0);
 
-/// Issue #329 — a paragraph's line pitch as `layout_paragraph` takes it:
-/// `(line_height_px, exact, font_line)`. Under the configured model
-/// (`!sctx.word_line_metrics`) and for `lineRule="exact"` this is
-/// [`resolve_line_height`] with no font pitch. Under Word's model the
-/// pitch is font-derived — `auto` is a multiple of each line's single
+/// Issues #329 / #475 — a paragraph's line pitch as `layout_paragraph`
+/// takes it: `(line_height_px, exact, font_line)`. ONE model for every
+/// document — read from a Word package or built in the editor (the seeded
+/// page, `.txt` / `.html` opens, the `RenderPage` harness), so a document
+/// typed here and re-opened from its own `.docx` lays out identically:
+/// Word's font-derived pitch — `auto` is a multiple of each line's single
 /// height (`w:line / 240`; no `w:spacing` = single), `atLeast` that single
 /// height floored at the value — and `line_height_px` is the nominal pitch
 /// of a line in the paragraph mark's face (what the float-cutout band
-/// heuristics size against).
+/// heuristics size against). Only `lineRule="exact"` is absolute
+/// ([`resolve_line_height`], no font pitch). The configured
+/// `RenderConfig::line_height` no longer sets any line's pitch; it is the
+/// fallback when the stack holds no face to measure.
 fn paragraph_line_rule(
     para: &engine::Paragraph,
     cfg: &RenderConfig,
@@ -3309,7 +3304,7 @@ fn paragraph_line_rule(
     base_direction: ShapingDirection,
 ) -> (f32, bool, Option<layout::FontLinePitch>) {
     let (lh_px, exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
-    if !sctx.word_line_metrics || exact {
+    if exact {
         return (lh_px, exact, None);
     }
     let empty = mark_line_extents(para, cfg, scale, sctx, fonts, base_direction)
@@ -5514,9 +5509,10 @@ fn layout_paragraph_wrapped_uncached(
         paragraph_line_rule(para, cfg, scale, sctx, fonts, base_direction);
     let (spans, mark_lh) =
         paragraph_layout_spans(para, sctx, fonts, cfg, scale, base_direction, lh_px);
-    /* Issues #370 / #329 — the mark-scaled nominal pitch under the
-    configured model; Word's font pitch already sizes the mark's line
-    from its face (`FontLinePitch::empty`). */
+    /* Issues #370 / #329 / #475 — the mark-resolved nominal pitch for an
+    `exact` paragraph (the only rule without a font pitch); Word's font
+    pitch already sizes the mark's line from its face
+    (`FontLinePitch::empty`). */
     let lh_px = if font_line.is_some() { lh_px } else { mark_lh };
     /* Issue #326 — automatic hyphenation (document setting, paragraph
     not suppressing it, text in a language with patterns). */
@@ -20126,7 +20122,6 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
-            word_line_metrics: false,
             settings: None,
         }
     }
@@ -20160,7 +20155,6 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
-            word_line_metrics: false,
             settings: None,
         };
         let mut para = engine::Paragraph {
@@ -20227,7 +20221,6 @@ mod tests {
             note_self_mark: None,
             theme,
             theme_key: key,
-            word_line_metrics: false,
             settings: None,
         };
         let theme: &'static engine::DocumentTheme = Box::leak(Box::new(theme));
@@ -21872,7 +21865,7 @@ mod tests {
     }
 
     /// Recorded on this change via `--nocapture` (issue #130).
-    const PINNED_NOTE_SECTION_WIDTHS: u64 = 0xd6cfac1cc9cef805;
+    const PINNED_NOTE_SECTION_WIDTHS: u64 = 0xfb3118be9b2a6c44;
 
     /* ================================================================
     Issue #129 — `<w:numRestart w:val="eachPage"/>` footnote numbering.
@@ -21970,7 +21963,7 @@ mod tests {
     }
 
     /// Recorded on this change via `--nocapture` (issue #129).
-    const PINNED_NOTE_EACH_PAGE: u64 = 0x34081f7fb7e9e11c;
+    const PINNED_NOTE_EACH_PAGE: u64 = 0xa21954d2c06ba3bc;
 
     /// Continuous stays the default: the same document numbers 1–4, and
     /// no relabelling pass runs (the rule table is empty).
@@ -22742,7 +22735,7 @@ mod tests {
         assert_eq!(fp, PINNED_SQUARE_WRAP_X2);
     }
 
-    const PINNED_SQUARE_WRAP_X2: u64 = 0xe26a96b1e1df3649;
+    const PINNED_SQUARE_WRAP_X2: u64 = 0x517ada704ca16aef;
 
     /* ------------------------ Issue #83 — text boxes ------------------------ */
 
@@ -22872,7 +22865,7 @@ mod tests {
         assert_eq!(fp, PINNED_TEXT_BOXES_X1);
     }
 
-    const PINNED_TEXT_BOXES_X1: u64 = 0x36dc281bfc45e4a1;
+    const PINNED_TEXT_BOXES_X1: u64 = 0x1f94faae327b3643;
 
     /// An overflowing story is clipped at the shape's bottom edge (lines
     /// past it are culled from the scene) and a centred story shifts down
@@ -23098,7 +23091,7 @@ mod tests {
         assert_eq!(fp, PINNED_NESTED_TEXT_BOXES);
     }
 
-    const PINNED_NESTED_TEXT_BOXES: u64 = 0x0effc1fd111fcc44;
+    const PINNED_NESTED_TEXT_BOXES: u64 = 0xd1bba4abc5dee080;
 
     /// Issue #197 — a 0.75" × 0.5" square-wrapped floating picture
     /// anchored at the head of a story paragraph.
@@ -23225,7 +23218,7 @@ mod tests {
         assert_eq!(fp, PINNED_BOXED_FLOAT_IMAGE);
     }
 
-    const PINNED_BOXED_FLOAT_IMAGE: u64 = 0xce020097437da437;
+    const PINNED_BOXED_FLOAT_IMAGE: u64 = 0xd70e2d81e7d7dbf7;
 
     /// Issue #196 — the committed `text_boxes_nested.docx` (outer box at
     /// 1", 3" on the page, 3" × 2"; nested box 1" / 0.5" into its
@@ -26576,30 +26569,33 @@ mod tests {
     /// Recorded on the pre-#87 adapter via `--nocapture`. Issue #329 — the
     /// two 50-page entries (the only fixture read from a Word package) moved
     /// with Word's font-derived line pitch: `0xf565e610ffdbc22d` (116 pages)
-    /// and `0x3b2d3d53655395a1` before; 82 pages now.
+    /// and `0x3b2d3d53655395a1` before; 82 pages now. Issue #475 — every
+    /// engine-built entry (all but the two 50-page ones) moved when
+    /// engine-built documents took the same font-derived pitch; the old
+    /// values are listed in the #475 commit body.
     const PINNED_ENGINE_FINGERPRINTS: &[(&str, u64)] = &[
         ("50p_full_x2", 0x341267f577563dc0),
         ("50p_band_2000_x2", 0xd014bb2dc81283ce),
-        ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("two_page_form_feed", 0xcbf3d391561b7991),
         /* Issue #75 — `<w:pageBreakBefore/>` alone (new fixture, recorded
         on the #75 adapter; every other value is unchanged by it). */
-        ("two_page_break_before", 0xc9a32cc093e20dbd),
-        ("autofit_table", 0x92435b9636de4c72),
+        ("two_page_break_before", 0x245084a28a724bc3),
+        ("autofit_table", 0x3de31dd133d4d97e),
         /* Issue #169 — an overflowing exact-height row, recorded on the
         #169 adapter (new fixture; every other value is unchanged). */
-        ("exact_row_overflow_table", 0x33d0f55718ea079f),
-        ("prose_300_full", 0xd3d662539c126b7d),
-        ("prose_300_band_1200", 0x5e704685f3cc770c),
+        ("exact_row_overflow_table", 0xc6547a8e88ba6840),
+        ("prose_300_full", 0xfdaf02cf90471c56),
+        ("prose_300_band_1200", 0x3f0ed621ac0153a8),
         /* Issue #79 — recorded with the `<w:bidiVisual>` mirror in place
         (column 1 rightmost); every value above is unchanged by it. */
-        ("rtl_bidi_visual_table", 0xa105472832896e3f),
+        ("rtl_bidi_visual_table", 0x5df34fc4e1e582a8),
         /* Issue #173 — recorded with `<w:jc>` / `<w:tblInd>` placement in
         place (new fixtures; every value above is unchanged by it —
         autofit tables fill the column, so they have no slack to move). */
-        ("ltr_center_fixed_table", 0x392d9b82e26033b8),
-        ("ltr_right_fixed_table", 0x93457cced5c21beb),
-        ("ltr_indented_fixed_table", 0x327125e1450360f6),
-        ("rtl_narrow_bidi_visual_table", 0x840944f9156e942e),
+        ("ltr_center_fixed_table", 0x37d3aeb3f1d7e7d8),
+        ("ltr_right_fixed_table", 0x9cf0480ead6b3eb8),
+        ("ltr_indented_fixed_table", 0x76902c7d1ccfaeb6),
+        ("rtl_narrow_bidi_visual_table", 0x38b1758f1a852aac),
     ];
 
     /// Issue #95 — the same fixtures with widow / orphan control at its
@@ -26608,15 +26604,18 @@ mod tests {
     /// lines at page edges); the other four equal the OFF anchor.
     /// Issue #329 — the 50-page entries moved with Word's font-derived line
     /// pitch: `0xa7f584534ce2ac6f` / `0x25ddf363691ee633` before; 84 pages.
+    /// Issue #475 — the engine-built entries moved with the same switch
+    /// (old values in the #475 commit body); `prose_300_*` now differ from
+    /// the OFF anchor (the denser pitch leaves single lines at page edges).
     const PINNED_WIDOW_DEFAULT_FINGERPRINTS: &[(&str, u64)] = &[
         ("50p_full_x2", 0x2859dac37f27b6af),
         ("50p_band_2000_x2", 0xbd7ba49646a045a3),
-        ("two_page_form_feed", 0xd804a22dcd3af5fd),
-        ("two_page_break_before", 0xc9a32cc093e20dbd),
-        ("autofit_table", 0x92435b9636de4c72),
-        ("exact_row_overflow_table", 0x33d0f55718ea079f),
-        ("prose_300_full", 0xd3d662539c126b7d),
-        ("prose_300_band_1200", 0x5e704685f3cc770c),
+        ("two_page_form_feed", 0xcbf3d391561b7991),
+        ("two_page_break_before", 0x245084a28a724bc3),
+        ("autofit_table", 0x3de31dd133d4d97e),
+        ("exact_row_overflow_table", 0xc6547a8e88ba6840),
+        ("prose_300_full", 0x208933ac898379a9),
+        ("prose_300_band_1200", 0x86fd4ad84f42fc34),
     ];
 
     #[test]
@@ -27720,7 +27719,7 @@ mod tests {
     }
 
     /// Recorded on this change via `--nocapture` (issue #81).
-    const PINNED_TOC_FINGERPRINT: u64 = 0xe2f7683e6b40ee7f;
+    const PINNED_TOC_FINGERPRINT: u64 = 0xf80dba0148668bac;
 
     #[test]
     fn f9_regenerates_after_a_heading_edit_and_a_page_shift() {
@@ -29421,6 +29420,10 @@ mod pbdr_style_cascade_tests;
 /// Issue #370 — an empty paragraph's line is sized by its mark.
 #[cfg(test)]
 mod empty_mark_tests;
+
+/// Issues #475 / #463 — one line-pitch model for every document.
+#[cfg(test)]
+mod line_pitch_tests;
 
 /// Issue #387 — comment highlights + the caret-reveal stamp.
 #[cfg(test)]

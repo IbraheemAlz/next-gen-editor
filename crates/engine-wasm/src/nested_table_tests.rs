@@ -178,9 +178,9 @@ fn rows_of_towers(rows: usize) -> engine::Table {
     }
 }
 
-const PINNED_MIXED_TOWER_7: u64 = 0xcb9f7de1f168b482;
-const PINNED_PLAIN_TOWER_9: u64 = 0xa687449ecac5ac96;
-const PINNED_ROWS_OF_TOWERS_40: u64 = 0x33b3ba96d6fdce87;
+const PINNED_MIXED_TOWER_7: u64 = 0xd8b8dec9a6241fde;
+const PINNED_PLAIN_TOWER_9: u64 = 0xa85fb93315b4310d;
+const PINNED_ROWS_OF_TOWERS_40: u64 = 0x8e0ae9d5fc50508e;
 
 /// Grid layouts (memo misses) the body build of `doc` runs.
 fn grid_layouts_for(doc: DocumentTree) -> (u64, Vec<PageBox>, LazyLayoutInfo) {
@@ -361,7 +361,6 @@ fn empty_sctx() -> StyleContext<'static> {
         note_self_mark: None,
         theme: None,
         theme_key: 0,
-        word_line_metrics: false,
         settings: None,
     }
 }

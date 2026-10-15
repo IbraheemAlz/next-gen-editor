@@ -218,8 +218,11 @@ pub struct ParagraphConfig<'a> {
     /// Word's rule) times [`FontLinePitch::multiple`] instead of
     /// [`Self::line_height`]; `line_height` then only feeds the heuristics
     /// that need a nominal line (float-cutout band minimums). Ignored when
-    /// [`Self::line_height_exact`] is set. `None` is the configured-pitch
-    /// model every engine-authored document uses.
+    /// [`Self::line_height_exact`] is set. Issue #475 — engine-wasm passes
+    /// `Some` for every document (one model); `None` is the configured-
+    /// pitch model, left for layout callers outside a document (unit
+    /// fixtures, `format-pdf` tests, `tools/corpus-native`'s reduced
+    /// layout).
     pub font_line: Option<FontLinePitch>,
     /// Issue #326 — automatic hyphenation for this paragraph (`None`: off —
     /// `<w:autoHyphenation/>` unset, `<w:suppressAutoHyphens/>`, or no text
