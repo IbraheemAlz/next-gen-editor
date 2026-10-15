@@ -226,6 +226,7 @@ pub fn story_frame_page(blocks: Vec<LayoutBlock>, size: Size, page_number: u32) 
         hf_role: crate::boxes::HeaderRole::Default,
         page_number,
         floats: Vec::new(),
+        decor: Default::default(),
     }
 }
 
@@ -577,6 +578,7 @@ mod tests {
             hf_role: crate::boxes::HeaderRole::Default,
             page_number,
             floats: Vec::new(),
+            decor: Default::default(),
         }
     }
 

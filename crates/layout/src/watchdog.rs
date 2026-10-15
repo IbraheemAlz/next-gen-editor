@@ -691,6 +691,29 @@ pub fn geometry_fingerprint(pages: &[PageBox]) -> u64 {
                 }
             }
         }
+        /* Issue #328 — page borders and line numbers join ONLY when
+        present, so every earlier pinned value is unchanged. */
+        if !page.decor.is_empty() {
+            0x328_u64.hash(&mut h);
+            if let Some(b) = &page.decor.borders {
+                hash_f32(&mut h, b.origin.x);
+                hash_f32(&mut h, b.origin.y);
+                hash_f32(&mut h, b.size.width);
+                hash_f32(&mut h, b.size.height);
+                b.behind.hash(&mut h);
+                for e in [&b.edges.top, &b.edges.left, &b.edges.bottom, &b.edges.right] {
+                    e.as_ref().map(|s| s.size_eighth_pt).hash(&mut h);
+                }
+            }
+            (page.decor.line_numbers.len() as u64).hash(&mut h);
+            for n in &page.decor.line_numbers {
+                n.text.hash(&mut h);
+                hash_f32(&mut h, n.origin.x);
+                hash_f32(&mut h, n.origin.y);
+                hash_f32(&mut h, n.baseline);
+                hash_f32(&mut h, n.width);
+            }
+        }
     }
     h.finish()
 }
@@ -1013,6 +1036,7 @@ mod tests {
             hf_role: crate::boxes::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         }
     }
 

@@ -72,6 +72,12 @@ struct SectPrAccum {
     /// open, so its leaf children (`<w:pos>`, `<w:numFmt>`, …) route to
     /// the right props. Cleared on the container's end tag.
     note_pr_scope: Option<engine::NoteKind>,
+    /// Issue #328 — `<w:pgBorders>` (its edge children fold in while
+    /// [`Self::in_pg_borders`] is set).
+    page_borders: Option<engine::PageBorders>,
+    in_pg_borders: bool,
+    /// Issue #328 — `<w:lnNumType>`.
+    line_numbering: Option<engine::LineNumbering>,
     /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes, for the
     /// writer's verified passthrough (`SectionProps::source_xml`).
     source_xml: Option<Vec<u8>>,
@@ -870,6 +876,40 @@ fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
     }
 }
 
+/// Issue #328 — the `ST_Border` values that are line styles; every
+/// other value of a page-border edge is an artwork preset (`apples`,
+/// `celticKnotwork`, …), painted as a plain line.
+fn is_line_border_style(v: &str) -> bool {
+    matches!(
+        v,
+        "single"
+            | "thick"
+            | "double"
+            | "dotted"
+            | "dashed"
+            | "dotdash"
+            | "dotdotdash"
+            | "triple"
+            | "thinthicksmallgap"
+            | "thickthinsmallgap"
+            | "thinthickthinsmallgap"
+            | "thinthickmediumgap"
+            | "thickthinmediumgap"
+            | "thinthickthinmediumgap"
+            | "thinthicklargegap"
+            | "thickthinlargegap"
+            | "thinthickthinlargegap"
+            | "wave"
+            | "doublewave"
+            | "dashsmallgap"
+            | "dashdotstroked"
+            | "threedemboss"
+            | "threedengrave"
+            | "outset"
+            | "inset"
+    )
+}
+
 /// Audit gap A.M3 — parse one `<w:tab w:val w:pos/>` child.
 /// `w:val` defaults to `left`; `w:pos` is `ST_SignedTwipsMeasure`.
 /// Returns `None` for malformed entries (missing or unusable pos) so they
@@ -913,6 +953,44 @@ impl SectPrAccum {
                 return;
             }
             _ => {}
+        }
+        /* Issue #328 — `<w:pgBorders>` opens a scope for its edges. */
+        if name == b"w:pgBorders" {
+            let borders = self.page_borders.get_or_insert_with(Default::default);
+            borders.offset_from = match attr_val(e, b"w:offsetFrom").as_deref().map(str::trim) {
+                Some("page") => engine::PageBorderOffset::Page,
+                _ => engine::PageBorderOffset::Text,
+            };
+            borders.display = match attr_val(e, b"w:display").as_deref().map(str::trim) {
+                Some("firstPage") => engine::PageBorderDisplay::FirstPage,
+                Some("notFirstPage") => engine::PageBorderDisplay::NotFirstPage,
+                _ => engine::PageBorderDisplay::AllPages,
+            };
+            borders.z_back = attr_val(e, b"w:zOrder").as_deref().map(str::trim) == Some("back");
+            self.in_pg_borders = true;
+            return;
+        }
+        if self.in_pg_borders
+            && let Some(borders) = self.page_borders.as_mut()
+        {
+            let slot = match name {
+                b"w:top" => Some(&mut borders.top),
+                b"w:left" | b"w:start" => Some(&mut borders.left),
+                b"w:bottom" => Some(&mut borders.bottom),
+                b"w:right" | b"w:end" => Some(&mut borders.right),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                let stroke = crate::schema::ct_pbdr::parse_pbdr_stroke(e);
+                if let Some(st) = &stroke
+                    && let engine::BorderStyle::Other(v) = &st.style
+                    && !is_line_border_style(v)
+                {
+                    borders.has_art = true;
+                }
+                *slot = stroke;
+                return;
+            }
         }
         if let Some(kind) = self.note_pr_scope {
             let props = match kind {
@@ -1006,6 +1084,27 @@ impl SectPrAccum {
                 };
                 self.page_num = Some(engine::PageNumType { start, format });
             }
+            /* Issue #328 — `<w:lnNumType w:countBy w:start w:distance
+            w:restart/>`. Word numbers nothing while `w:countBy` is
+            absent or zero. */
+            b"w:lnNumType" => {
+                let count_by = attr_val(e, b"w:countBy")
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                self.line_numbering = (count_by > 0).then(|| engine::LineNumbering {
+                    count_by: count_by.min(100),
+                    start: attr_val(e, b"w:start")
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                        .unwrap_or(0)
+                        .min(32_767),
+                    distance_pt: attr_measure_pt(e, b"w:distance", TWIPS),
+                    restart: match attr_val(e, b"w:restart").as_deref().map(str::trim) {
+                        Some("newSection") => engine::LineNumberRestart::NewSection,
+                        Some("continuous") => engine::LineNumberRestart::Continuous,
+                        _ => engine::LineNumberRestart::NewPage,
+                    },
+                });
+            }
             /* Audit gap A.M12 — `<w:sectPr><w:type w:val>`. */
             b"w:type" => {
                 self.section_type = match attr_val(e, b"w:val").as_deref().map(str::trim) {
@@ -1057,6 +1156,8 @@ impl SectPrAccum {
             section_type: self.section_type,
             footnote_props: self.footnote_props,
             endnote_props: self.endnote_props,
+            page_borders: self.page_borders.clone(),
+            line_numbering: self.line_numbering,
             source_xml: self.source_xml.clone(),
             start_block,
             end_block,
@@ -1094,6 +1195,9 @@ pub(crate) fn parse_sect_pr_fragment(
             Ok(Event::End(e)) => {
                 if matches!(e.name().as_ref(), b"w:footnotePr" | b"w:endnotePr") {
                     accum.note_pr_scope = None;
+                }
+                if e.name().as_ref() == b"w:pgBorders" {
+                    accum.in_pg_borders = false;
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -3134,6 +3238,10 @@ pub(crate) fn parse_document_xml_with_events(
                     b"w:footnotePr" | b"w:endnotePr" if in_sect_pr => {
                         /* Issue #80 — close the note-props scope. */
                         cur_sect.note_pr_scope = None;
+                    }
+                    b"w:pgBorders" if in_sect_pr => {
+                        /* Issue #328 — close the page-border scope. */
+                        cur_sect.in_pg_borders = false;
                     }
                     b"w:sectPr" => {
                         /* Inline (inside a paragraph's `<w:pPr>`) → stash for

@@ -88,6 +88,11 @@ pub use tracked::{TrackedDeletion, TrackedEditError};
 pub mod html;
 pub mod numbering;
 pub mod package;
+pub mod page_decor;
+pub use page_decor::{
+    DropCap, DropCapKind, LineNumberRestart, LineNumbering, PageBorderDisplay, PageBorderOffset,
+    PageBorders,
+};
 /// Issue #345 — `w:documentProtection` model + form-region predicates.
 pub mod protection;
 pub mod run_content;
@@ -751,6 +756,12 @@ pub struct Section {
     pub footnote_props: NoteProps,
     /// Issue #80 — `<w:sectPr><w:endnotePr>` overrides.
     pub endnote_props: NoteProps,
+    /// Issue #328 — `<w:pgBorders>`; `None` = no page border.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_borders: Option<PageBorders>,
+    /// Issue #328 — `<w:lnNumType>`; `None` = no line numbering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_numbering: Option<LineNumbering>,
     /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes this section
     /// was read from (see [`SectionProps::source_xml`]).
     #[serde(default, with = "serde_bytes")]
@@ -920,6 +931,12 @@ pub struct SectionProps {
     pub footnote_props: NoteProps,
     /// Issue #80 — `<w:endnotePr>` overrides.
     pub endnote_props: NoteProps,
+    /// Issue #328 — `<w:pgBorders>`; `None` = no page border.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_borders: Option<PageBorders>,
+    /// Issue #328 — `<w:lnNumType>`; `None` = no line numbering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_numbering: Option<LineNumbering>,
     /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes these
     /// properties were read from. The `.docx` writer re-emits them
     /// verbatim as long as a re-parse of the bytes still yields these
@@ -948,6 +965,8 @@ impl SectionProps {
             section_type: self.section_type,
             footnote_props: self.footnote_props,
             endnote_props: self.endnote_props,
+            page_borders: self.page_borders,
+            line_numbering: self.line_numbering,
             source_xml: self.source_xml,
         }
     }
@@ -974,6 +993,8 @@ impl From<&Section> for SectionProps {
             section_type: s.section_type,
             footnote_props: s.footnote_props,
             endnote_props: s.endnote_props,
+            page_borders: s.page_borders.clone(),
+            line_numbering: s.line_numbering,
             source_xml: s.source_xml.clone(),
         }
     }

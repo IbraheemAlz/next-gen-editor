@@ -3741,6 +3741,198 @@ fn endnote_entries_for(
     out
 }
 
+/// Issue #328 — a laid-out drop-cap frame paragraph (`<w:framePr
+/// w:dropCap>`) waiting for the paragraph it anchors to. Word lays the
+/// frame out as a float `w:lines` lines tall at that paragraph's top:
+/// `drop` inside the text column, the anchor's first lines indented
+/// around it; `margin` hanging in the margin left of the column.
+struct DropCapCarry {
+    cap: engine::DropCap,
+    /// `w:hSpace` in layout units.
+    h_space: f32,
+    frame: ParagraphBox,
+    path: EngineBlockPath,
+}
+
+impl DropCapCarry {
+    /// Widest line of the frame (the cap glyphs' advance).
+    fn cap_width(&self) -> f32 {
+        self.frame
+            .lines
+            .iter()
+            .map(|l| {
+                l.runs
+                    .iter()
+                    .flat_map(|r| r.glyphs.iter())
+                    .map(|g| g.x_advance)
+                    .sum::<f32>()
+            })
+            .fold(0.0, f32::max)
+    }
+
+    /// The anchor line the cap's baseline sits on: line `w:lines` (or
+    /// the anchor's last line when it is shorter).
+    fn anchor_line<'a>(&self, anchor: &'a ParagraphBox) -> Option<&'a layout::LineBox> {
+        let n = usize::from(self.cap.lines.max(1));
+        anchor.lines.get(n - 1).or(anchor.lines.last())
+    }
+
+    /// The left cutout of the anchor paragraph (`drop` only): from the
+    /// column edge to the cap's right edge plus `w:hSpace`, down to the
+    /// bottom of the anchor line (`anchor` = the anchor's uncut layout).
+    fn cutout(&self, anchor: &ParagraphBox) -> Option<layout::WrapCutout> {
+        if self.cap.kind != engine::DropCapKind::Drop {
+            return None;
+        }
+        let line = self.anchor_line(anchor)?;
+        let x0 = self.frame.lines.first().map_or(0.0, |l| l.origin.x);
+        Some(layout::WrapCutout {
+            x0: 0.0,
+            x1: x0 + self.cap_width() + self.h_space,
+            y0: 0.0,
+            /* Just above the next band, so exactly `w:lines` bands cut. */
+            y1: (line.origin.y + line.height - 0.5).max(0.5),
+        })
+    }
+
+    /// The frame as it is pushed: zero flow height, its line moved so
+    /// its baseline meets the anchor line's (and, for `margin`, left of
+    /// the column), kept with the anchor.
+    fn into_frame(mut self, anchor: &ParagraphBox) -> ParagraphBox {
+        let target = self.anchor_line(anchor).map(|l| l.origin.y + l.baseline);
+        let cap_w = self.cap_width();
+        let margin = self.cap.kind == engine::DropCapKind::Margin;
+        if let (Some(target), Some(first)) = (target, self.frame.lines.first()) {
+            let dy = target - (first.origin.y + first.baseline);
+            for line in &mut self.frame.lines {
+                line.origin.y += dy;
+                if margin {
+                    line.origin.x = -(cap_w + self.h_space);
+                }
+            }
+        }
+        self.frame.size.height = 0.0;
+        self.frame.keep_next = true;
+        self.frame.flow.widow_control = false;
+        self.frame
+    }
+}
+
+/// Issue #328 — fill every page's [`layout::PageDecor`]: the section's
+/// `<w:pgBorders>` box (per `w:display`) and its `<w:lnNumType>` line
+/// numbers. A page belongs to the section of its first block (a blank
+/// page to the previous page's); a block's lines are numbered under its
+/// own section, so a continuous section break mid-page switches
+/// numbering there. Tables, paragraphs with `w:suppressLineNumbers` and
+/// drop-cap frames are neither counted nor numbered (Word's rule);
+/// headers, footers and notes never are.
+fn apply_page_decor(
+    pages: &mut [PageBox],
+    page_paths: &[Vec<EngineBlockPath>],
+    sections: &[engine::Section],
+    doc: &DocumentTree,
+    fonts: &FontStack,
+    base_px: f32,
+    scale: f32,
+) {
+    if !sections
+        .iter()
+        .any(|s| s.page_borders.is_some() || s.line_numbering.is_some())
+    {
+        return;
+    }
+    let section_of = |block: u32| {
+        sections
+            .iter()
+            .position(|s| s.start_block <= block && block < s.end_block)
+    };
+    let top_block = |path: &EngineBlockPath| match path.steps.first() {
+        Some(engine::PathStep::Block(i)) if path.steps.len() == 1 => Some(*i),
+        _ => None,
+    };
+    let defaults = &doc.style_run_defaults;
+    let style = layout::decor::LineNumberStyle {
+        family: defaults.font_family.as_ref().map(engine::FontFamily::id),
+        px_size: defaults.font_size.unwrap_or(base_px) * scale,
+        color: [0, 0, 0, 255],
+    };
+    let mut prev_sect: Option<usize> = None;
+    let mut page_in_section = 0_usize;
+    /* The line-number count: the next number, and the section whose
+    lines it last numbered. */
+    let mut counter: Option<u32> = None;
+    let mut counted_sect: Option<usize> = None;
+    for (pi, page) in pages.iter_mut().enumerate() {
+        let paths = page_paths.get(pi).map(Vec::as_slice).unwrap_or(&[]);
+        let block_sects: Vec<Option<usize>> = (0..page.blocks.len())
+            .map(|j| paths.get(j).and_then(top_block).and_then(section_of))
+            .collect();
+        let page_sect = block_sects.iter().flatten().next().copied().or(prev_sect);
+        if page_sect != prev_sect {
+            page_in_section = 0;
+        } else {
+            page_in_section += 1;
+        }
+        prev_sect = page_sect;
+        if let Some(b) = page_sect
+            .and_then(|s| sections[s].page_borders.as_ref())
+            .filter(|b| b.shows_on(page_in_section))
+        {
+            page.decor.borders = layout::decor::page_border_box(b, page.size, page.margins, scale);
+        }
+        /* Line numbers, one run of same-section blocks at a time. */
+        let mut page_started = false;
+        let mut j = 0;
+        while j < block_sects.len() {
+            let Some(s) = block_sects[j] else {
+                j += 1;
+                continue;
+            };
+            let end = (j..block_sects.len())
+                .find(|&k| block_sects[k] != Some(s))
+                .unwrap_or(block_sects.len());
+            if let Some(numbering) = sections[s].line_numbering {
+                let restart = counter.is_none()
+                    || (counted_sect != Some(s)
+                        && numbering.restart != engine::LineNumberRestart::Continuous)
+                    || (!page_started && numbering.restart == engine::LineNumberRestart::NewPage);
+                if restart {
+                    counter = Some(numbering.first_number());
+                }
+                counted_sect = Some(s);
+                page_started = true;
+                let counted: Vec<bool> = (0..page.blocks.len())
+                    .map(|k| {
+                        (j..end).contains(&k)
+                            && paths
+                                .get(k)
+                                .and_then(top_block)
+                                .and_then(|i| doc.blocks.get(i as usize))
+                                .and_then(engine::Block::as_paragraph)
+                                .is_some_and(|p| {
+                                    !engine::page_decor::suppresses_line_numbers(&p.props.grab_bag)
+                                        && engine::page_decor::drop_cap_from_bag(&p.props.grab_bag)
+                                            .is_none()
+                                })
+                    })
+                    .collect();
+                let mut n = counter.unwrap_or(1);
+                layout::decor::number_page_lines(
+                    page,
+                    &counted,
+                    &numbering,
+                    &mut n,
+                    numbering.distance() * scale,
+                    fonts,
+                    style,
+                );
+                counter = Some(n);
+            }
+            j = end;
+        }
+    }
+}
+
 /// Phase 2 audit (gap D.1 follow-up) — lay out one section's header
 /// (or footer) paragraphs into a [`layout::HeaderFooterBox`]. The
 /// input is the full `engine::Paragraph` model now, not plain text:
@@ -10139,6 +10331,9 @@ impl Engine {
         /* Issue #95 — the last body block pushed was a keep-with-next
         paragraph (see the cull stop below). */
         let mut after_keep_next = false;
+        /* Issue #328 — a laid-out drop-cap frame paragraph waiting for
+        the paragraph it is anchored to (pushed right before it). */
+        let mut drop_carry: Option<DropCapCarry> = None;
         /* Issue #87 — degradation notes for this build: paginator
         watchdog notes join here as each paginator finishes; the
         sub-paginator sink is drained at the end. Clear leftovers from
@@ -10235,6 +10430,7 @@ impl Engine {
                         hf_role: layout::HeaderRole::Default,
                         page_number: incoming,
                         floats: Vec::new(),
+                        decor: Default::default(),
                     });
                     emitted_paths.push(Vec::new());
                 }
@@ -10507,8 +10703,31 @@ impl Engine {
                         });
                         /* Issue #82 — this paragraph's wrap cutouts
                         (the id `next_para_id` is about to be stamped). */
-                        let cuts: &[layout::WrapCutout] =
-                            plan.get(&next_para_id).map_or(&[], Vec::as_slice);
+                        let mut owned_cuts: Vec<layout::WrapCutout> =
+                            plan.get(&next_para_id).cloned().unwrap_or_default();
+                        /* Issue #328 — the paragraph a drop cap anchors
+                        to: its first `w:lines` lines wrap around the cap
+                        (a left cutout down to the bottom of line N of
+                        the uncut layout — the cap never changes line
+                        heights, only widths). */
+                        let carry = drop_carry.take();
+                        let drop_probe = carry.as_ref().map(|_| {
+                            layout_paragraph_cached(
+                                para,
+                                &font_stack,
+                                &cfg,
+                                scale,
+                                pag.column_width(),
+                                sctx,
+                                &mut cache,
+                            )
+                        });
+                        if let (Some(c), Some(probe)) = (carry.as_ref(), drop_probe.as_ref())
+                            && let Some(cut) = c.cutout(probe)
+                        {
+                            owned_cuts.push(cut);
+                        }
+                        let cuts: &[layout::WrapCutout] = &owned_cuts;
                         let para_box = if let Some((c, off)) = comp {
                             let mut text = String::with_capacity(para.text.len() + c.text.len());
                             text.push_str(&para.text[..off]);
@@ -10593,9 +10812,30 @@ impl Engine {
                                 &mut cache,
                             )
                         };
-                        let before_px = twips_to_layout_px(para.props.spacing.before_twips, scale);
+                        let mut before_px =
+                            twips_to_layout_px(para.props.spacing.before_twips, scale);
                         let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
                         let mut para_box = para_box;
+                        /* Issue #328 — push the waiting drop cap first,
+                        zero-height, at this paragraph's top (it takes
+                        the spacing above), baseline-aligned with line N. */
+                        if let (Some(c), Some(probe)) = (carry, drop_probe.as_ref()) {
+                            let prev_pages_in_pag = pag.page_count_emitted();
+                            let cap_path = c.path.clone();
+                            pag.push_block(
+                                LayoutBlock::Paragraph(c.into_frame(probe)),
+                                before_px,
+                                0.0,
+                            );
+                            attach_block_paths(
+                                pag,
+                                prev_pages_in_pag,
+                                &mut page_paths,
+                                &cap_path,
+                                &para_paths,
+                            );
+                            before_px = 0.0;
+                        }
                         para_box.source_paragraph_id = next_para_id;
                         para_paths.insert(next_para_id, para_path.clone());
                         next_para_id += 1;
@@ -10655,6 +10895,29 @@ impl Engine {
                         footer, note and text-box paragraphs are laid
                         out elsewhere and ignore it, as Word does. */
                         para_box.flow.page_break_before = para.props.page_break_before;
+                        /* Issue #328 — a drop-cap frame (`<w:framePr
+                        w:dropCap>`) followed by a paragraph of the same
+                        section waits for it instead of taking flow. */
+                        if let Some(dc) =
+                            engine::page_decor::drop_cap_from_bag(&para.props.grab_bag)
+                            && block_idx + 1 < section.end_block
+                            && matches!(
+                                doc.blocks.get(block_idx as usize + 1),
+                                Some(engine::Block::Paragraph(_))
+                            )
+                        {
+                            drop_carry = Some(DropCapCarry {
+                                cap: dc,
+                                h_space: dc.h_space_pt * scale,
+                                frame: para_box,
+                                path: para_path.clone(),
+                            });
+                            /* The cull never stops between the frame and
+                            its anchor (it would drop the cap). */
+                            after_keep_next = true;
+                            processed_blocks += 1;
+                            continue;
+                        }
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(
@@ -10764,6 +11027,17 @@ impl Engine {
             );
         }
         drop(cache);
+        /* Issue #328 — page borders + line numbers: a pure function of
+        the placed pages, never fed back into the flow. */
+        apply_page_decor(
+            &mut emitted_pages,
+            &emitted_paths,
+            &sections,
+            &doc,
+            &font_stack,
+            cfg.px_size,
+            scale,
+        );
         /* Always at least one page so downstream consumers can index `[0]`. */
         if emitted_pages.is_empty() {
             let default_geom = scaled_paginator_geometry(engine::PageGeometry::a4(), scale);
@@ -10783,6 +11057,7 @@ impl Engine {
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
                 floats: Vec::new(),
+                decor: Default::default(),
             });
             emitted_paths.push(Vec::new());
         }
@@ -10825,6 +11100,7 @@ impl Engine {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         });
         let p0 = paths.drain(..).next().unwrap_or_default();
         Ok((page, fonts, p0))
@@ -27137,6 +27413,7 @@ mod tests {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         }
     }
 
@@ -29374,6 +29651,9 @@ mod toc_pdf_export_tests;
 #[cfg(test)]
 mod pdf_validate_fixtures_tests;
 
+/// Issue #328 — page borders, line numbers and drop caps, end to end.
+#[cfg(test)]
+mod page_decor_tests;
 /// Issue #360 — PDF outline / links / XMP / tagging, end to end.
 #[cfg(test)]
 mod pdf_semantics_tests;

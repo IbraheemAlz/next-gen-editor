@@ -442,6 +442,7 @@ fn empty_cutouts_are_the_unwrapped_composer_byte_for_byte() {
             hf_role: crate::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         };
         assert_eq!(
             geometry_fingerprint(&[page(a)]),

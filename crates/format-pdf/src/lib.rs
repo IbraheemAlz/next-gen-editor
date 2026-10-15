@@ -659,6 +659,12 @@ pub fn export_pdf_document(
                 tb.for_each_story_blocks(&mut |blocks| for_each_paragraph(blocks, &mut collect));
             }
         }
+        /* Issue #328 — line numbers embed their face too. */
+        for n in &page.decor.line_numbers {
+            if !used.iter().any(|u| u == &n.run.font) {
+                used.push(n.run.font.clone());
+            }
+        }
     }
 
     let mut pdf = Pdf::new();
@@ -1219,6 +1225,10 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
     /* Issue #83 / #121 — the behind-text float group (pictures + text
     boxes, z-ordered) paints first (scene.rs order). */
     emit_floats(&mut content, page, true, res);
+    /* Issue #328 — a `w:zOrder="back"` page border under everything. */
+    if let Some(b) = page.decor.borders.as_ref().filter(|b| b.behind) {
+        decoration_pass(&mut content, res, |c| emit_page_borders(c, page_h, b));
+    }
 
     /* Issue #71 — header band BEFORE body (mirrors
     `render/scene.rs::build_document_scene` ordering: header, body,
@@ -1265,6 +1275,25 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
             emit_block_borders(c, page_h, content_x, content_y, block);
         }
     });
+
+    /* Issue #328 — line numbers: real glyphs (copyable, /ToUnicode
+    mapped) but never document content — one layout artifact. */
+    if !page.decor.line_numbers.is_empty() {
+        artifact_begin(&mut content, res, ArtifactKind::Layout);
+        content.begin_text();
+        for n in &page.decor.line_numbers {
+            show_run(
+                &mut content,
+                page_h,
+                &n.run,
+                n.origin.x,
+                n.origin.y + n.baseline,
+                res,
+            );
+        }
+        content.end_text();
+        artifact_end(&mut content, res);
+    }
 
     /* Issue #80 — note bands at the paginator's `NoteBand::y` (the
     SAME placement scene.rs paints): separator rule (30 % of the content
@@ -1336,8 +1365,23 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
 
     /* Issue #83 / #121 — the in-front float group closes the page. */
     emit_floats(&mut content, page, false, res);
+    /* Issue #328 — the default (`front`) page border, over the text. */
+    if let Some(b) = page.decor.borders.as_ref().filter(|b| !b.behind) {
+        decoration_pass(&mut content, res, |c| emit_page_borders(c, page_h, b));
+    }
 
     content.finish().to_vec()
+}
+
+/// Issue #328 — the `<w:pgBorders>` box through the table / paragraph
+/// border stroker (the scene's `paint_page_borders` twin).
+fn emit_page_borders(content: &mut Content, page_h: f32, b: &layout::PageBorderBox) {
+    let (x0, y0) = (b.origin.x, b.origin.y);
+    let (x1, y1) = (x0 + b.size.width, y0 + b.size.height);
+    stroke_border_edge(content, page_h, &b.edges.top, x0, y0, x1, y0);
+    stroke_border_edge(content, page_h, &b.edges.left, x0, y0, x0, y1);
+    stroke_border_edge(content, page_h, &b.edges.right, x1, y0, x1, y1);
+    stroke_border_edge(content, page_h, &b.edges.bottom, x0, y1, x1, y1);
 }
 
 /// Issue #83 / #121 / #165 — one z-order group of the page's floating
@@ -2811,6 +2855,10 @@ fn collect_to_unicode_pages(
                 tb.for_each_story_blocks(&mut |blocks| for_each_paragraph(blocks, &mut collect));
             }
         }
+        /* Issue #328 — a line number maps through its own text. */
+        for n in &page.decor.line_numbers {
+            add_marker_mappings(n, out.entry(n.run.font.clone()).or_default());
+        }
     }
     out
 }
@@ -3180,6 +3228,7 @@ mod tests {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         }
     }
 
@@ -3345,6 +3394,7 @@ mod tests {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         };
         let mut out = Vec::new();
         export_pdf(
@@ -3457,6 +3507,7 @@ mod tests {
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
                 floats: Vec::new(),
+                decor: Default::default(),
             }
         }
         let stack = liberation_stack();
@@ -3558,6 +3609,7 @@ mod tests {
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
                 floats: Vec::new(),
+                decor: Default::default(),
             }
         }
         fn ops(content: &[u8], op: &str) -> usize {
@@ -3678,6 +3730,7 @@ mod tests {
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
                 floats: Vec::new(),
+                decor: Default::default(),
             }
         }
         let stack = liberation_stack();
@@ -3713,6 +3766,7 @@ mod tests {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         };
         let mut out = Vec::new();
         export_pdf(
@@ -4490,6 +4544,7 @@ mod tests {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         }
     }
 
@@ -4750,6 +4805,7 @@ mod tests {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         };
         let mut out = Vec::new();
         export_pdf(

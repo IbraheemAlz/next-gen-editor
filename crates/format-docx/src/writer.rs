@@ -3916,6 +3916,8 @@ fn same_section_props(a: &engine::SectionProps, b: &engine::SectionProps) -> boo
         section_type,
         footnote_props,
         endnote_props,
+        page_borders,
+        line_numbering,
         source_xml: _,
     } = a;
     let same = |x: f32, y: f32| x.to_bits() == y.to_bits();
@@ -3953,6 +3955,65 @@ fn same_section_props(a: &engine::SectionProps, b: &engine::SectionProps) -> boo
         && *section_type == b.section_type
         && *footnote_props == b.footnote_props
         && *endnote_props == b.endnote_props
+        && *page_borders == b.page_borders
+        && same_line_numbering(line_numbering, &b.line_numbering)
+}
+
+/// Issue #328 — `<w:lnNumType>` equality with the distance compared by
+/// bits (the #349 rule: verified reuse never uses float `==`).
+fn same_line_numbering(
+    a: &Option<engine::LineNumbering>,
+    b: &Option<engine::LineNumbering>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.count_by == y.count_by
+                && x.start == y.start
+                && x.restart == y.restart
+                && x.distance_pt.map(f32::to_bits) == y.distance_pt.map(f32::to_bits)
+        }
+        _ => false,
+    }
+}
+
+/// Issue #328 — `<w:pgBorders>` (CT_PageBorders) from the typed model.
+fn emit_pg_borders(b: &engine::PageBorders, out: &mut String) {
+    out.push_str("<w:pgBorders");
+    if b.z_back {
+        out.push_str(" w:zOrder=\"back\"");
+    }
+    match b.display {
+        engine::PageBorderDisplay::AllPages => {}
+        engine::PageBorderDisplay::FirstPage => out.push_str(" w:display=\"firstPage\""),
+        engine::PageBorderDisplay::NotFirstPage => out.push_str(" w:display=\"notFirstPage\""),
+    }
+    if b.offset_from == engine::PageBorderOffset::Page {
+        out.push_str(" w:offsetFrom=\"page\"");
+    }
+    out.push('>');
+    emit_border_edge("w:top", &b.top, out);
+    emit_border_edge("w:left", &b.left, out);
+    emit_border_edge("w:bottom", &b.bottom, out);
+    emit_border_edge("w:right", &b.right, out);
+    out.push_str("</w:pgBorders>");
+}
+
+/// Issue #328 — `<w:lnNumType>` from the typed model.
+fn emit_ln_num_type(n: &engine::LineNumbering, out: &mut String) {
+    out.push_str(&format!("<w:lnNumType w:countBy=\"{}\"", n.count_by));
+    if n.start != 0 {
+        out.push_str(&format!(" w:start=\"{}\"", n.start));
+    }
+    if let Some(d) = n.distance_pt {
+        out.push_str(&format!(" w:distance=\"{}\"", (d * 20.0).round() as i64));
+    }
+    match n.restart {
+        engine::LineNumberRestart::NewPage => {}
+        engine::LineNumberRestart::NewSection => out.push_str(" w:restart=\"newSection\""),
+        engine::LineNumberRestart::Continuous => out.push_str(" w:restart=\"continuous\""),
+    }
+    out.push_str("/>");
 }
 
 thread_local! {
@@ -4212,6 +4273,14 @@ fn emit_sect_pr(props: &engine::SectionProps, out: &mut String) {
         tw(g.header_offset),
         tw(g.footer_offset)
     ));
+    /* Issue #328 — CT_SectPr order: pgMar, paperSrc, pgBorders,
+    lnNumType, pgNumType. */
+    if let Some(b) = &props.page_borders {
+        emit_pg_borders(b, out);
+    }
+    if let Some(n) = &props.line_numbering {
+        emit_ln_num_type(n, out);
+    }
     emit_pg_num_type(props.page_num, out);
     if props.columns.is_multi() {
         emit_cols(props.columns, out);
