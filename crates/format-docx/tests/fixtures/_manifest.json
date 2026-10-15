@@ -436,6 +436,19 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "table_merge_absorb.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "intro"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 141
+      }
+    },
     "table_nested_200_deep.docx": {
       "generator": "handcrafted",
       "phase_introduced": 10,
