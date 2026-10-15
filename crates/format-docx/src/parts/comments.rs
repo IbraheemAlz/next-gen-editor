@@ -375,16 +375,10 @@ pub fn build_comments_xml(
     (out.into_bytes(), minted)
 }
 
+/// Issue #467 — the writer's escape (forbidden characters become U+FFFD and
+/// are counted), not a private copy.
 fn escape_attr(out: &mut String, src: &str) {
-    for ch in src.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            other => out.push(other),
-        }
-    }
+    crate::writer::push_escaped_attr(src, out);
 }
 
 /// Issue #282 — what [`patch_comments_xml`] did to a source
@@ -706,15 +700,9 @@ pub fn remove_comment_rows(
     Some((out, collected))
 }
 
+/// Issue #467 — see [`escape_attr`].
 fn escape_text(out: &mut String, src: &str) {
-    for ch in src.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            other => out.push(other),
-        }
-    }
+    crate::writer::push_escaped(src, out);
 }
 
 #[cfg(test)]

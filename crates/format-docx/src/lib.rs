@@ -39,7 +39,9 @@ pub use opc::archive::{
 };
 pub use opc::cfb::{CompoundFileKind, sniff_compound_file};
 pub use opc::limits::{PackageLimit, PackageLimits};
-pub use writer::{build_minimal_docx, save_docx, write_docx, write_docx_with_notes};
+pub use writer::{
+    build_minimal_docx, save_docx, save_docx_with_notes, write_docx, write_docx_with_notes,
+};
 
 /// Issue #213 — build a clipboard `.docx` fragment for `doc`, and — when
 /// the source document carries a retained package (`DocumentTree::
