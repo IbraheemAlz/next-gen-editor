@@ -37,7 +37,9 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
         testCase === 'autofit-long-url-overflow' ||
         testCase === 'list-bullet-numbered' ||
         testCase === 'rich-text-caps' ||
-        testCase === 'rich-text-cs-size'
+        testCase === 'rich-text-cs-size' ||
+        testCase === 'page-borders' ||
+        testCase === 'line-numbers'
     ) {
         return { w: 595, h: 842 };
     }

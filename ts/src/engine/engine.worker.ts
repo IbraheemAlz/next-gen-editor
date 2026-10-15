@@ -47,6 +47,9 @@ import RUN_CONTENT_DOCX_URL from '../../../crates/format-docx/tests/fixtures/run
 /* Issue #326 — the `hyphenation` / `hyphenation-off` goldens. */
 import HYPHENATION_ON_DOCX_URL from '../../../crates/format-docx/tests/fixtures/hyphenation_on.docx?url';
 import HYPHENATION_OFF_DOCX_URL from '../../../crates/format-docx/tests/fixtures/hyphenation_off.docx?url';
+/* Issue #328 — the `page-borders` / `line-numbers` goldens. */
+import PAGE_BORDERS_DOCX_URL from '../../../crates/format-docx/tests/fixtures/page_borders.docx?url';
+import LINE_NUMBERS_DOCX_URL from '../../../crates/format-docx/tests/fixtures/line_numbers.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -1063,6 +1066,28 @@ async function handleInit(msg: InitMsg): Promise<void> {
                 type: 'LOAD_DOCX',
                 bytes: await fetchBytes(
                     testCase === 'hyphenation' ? HYPHENATION_ON_DOCX_URL : HYPHENATION_OFF_DOCX_URL,
+                ),
+            } as Command);
+            break;
+        }
+
+        case 'page-borders':
+        case 'line-numbers': {
+            /* Issue #328 — `<w:pgBorders>` / `<w:lnNumType>` fixtures
+               (`tools/roundtrip --gen-seed`), A4 at 1:1. */
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 15,
+                line_height: 22,
+                align: 'START',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'LOAD_DOCX',
+                bytes: await fetchBytes(
+                    testCase === 'page-borders' ? PAGE_BORDERS_DOCX_URL : LINE_NUMBERS_DOCX_URL,
                 ),
             } as Command);
             break;

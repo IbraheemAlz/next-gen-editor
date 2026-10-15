@@ -861,6 +861,7 @@ mod tests {
             hf_role: HeaderRole::Default,
             page_number: 1,
             floats,
+            decor: Default::default(),
         }
     }
 

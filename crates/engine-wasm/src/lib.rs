@@ -3741,6 +3741,121 @@ fn endnote_entries_for(
     out
 }
 
+/// Issue #328 — fill every page's [`layout::PageDecor`]: the section's
+/// `<w:pgBorders>` box (per `w:display`) and its `<w:lnNumType>` line
+/// numbers. A page belongs to the section of its first block (a blank
+/// page to the previous page's); a block's lines are numbered under its
+/// own section, so a continuous section break mid-page switches
+/// numbering there. Tables, paragraphs with `w:suppressLineNumbers` and
+/// drop-cap frames are neither counted nor numbered (Word's rule);
+/// headers, footers and notes never are.
+fn apply_page_decor(
+    pages: &mut [PageBox],
+    page_paths: &[Vec<EngineBlockPath>],
+    sections: &[engine::Section],
+    doc: &DocumentTree,
+    fonts: &FontStack,
+    base_px: f32,
+    scale: f32,
+) {
+    if !sections
+        .iter()
+        .any(|s| s.page_borders.is_some() || s.line_numbering.is_some())
+    {
+        return;
+    }
+    let section_of = |block: u32| {
+        sections
+            .iter()
+            .position(|s| s.start_block <= block && block < s.end_block)
+    };
+    let top_block = |path: &EngineBlockPath| match path.steps.first() {
+        Some(engine::PathStep::Block(i)) if path.steps.len() == 1 => Some(*i),
+        _ => None,
+    };
+    let defaults = &doc.style_run_defaults;
+    let style = layout::decor::LineNumberStyle {
+        family: defaults.font_family.as_ref().map(engine::FontFamily::id),
+        px_size: defaults.font_size.unwrap_or(base_px) * scale,
+        color: [0, 0, 0, 255],
+    };
+    let mut prev_sect: Option<usize> = None;
+    let mut page_in_section = 0_usize;
+    /* The line-number count: the next number, and the section whose
+    lines it last numbered. */
+    let mut counter: Option<u32> = None;
+    let mut counted_sect: Option<usize> = None;
+    for (pi, page) in pages.iter_mut().enumerate() {
+        let paths = page_paths.get(pi).map(Vec::as_slice).unwrap_or(&[]);
+        let block_sects: Vec<Option<usize>> = (0..page.blocks.len())
+            .map(|j| paths.get(j).and_then(top_block).and_then(section_of))
+            .collect();
+        let page_sect = block_sects.iter().flatten().next().copied().or(prev_sect);
+        if page_sect != prev_sect {
+            page_in_section = 0;
+        } else {
+            page_in_section += 1;
+        }
+        prev_sect = page_sect;
+        if let Some(b) = page_sect
+            .and_then(|s| sections[s].page_borders.as_ref())
+            .filter(|b| b.shows_on(page_in_section))
+        {
+            page.decor.borders = layout::decor::page_border_box(b, page.size, page.margins, scale);
+        }
+        /* Line numbers, one run of same-section blocks at a time. */
+        let mut page_started = false;
+        let mut j = 0;
+        while j < block_sects.len() {
+            let Some(s) = block_sects[j] else {
+                j += 1;
+                continue;
+            };
+            let end = (j..block_sects.len())
+                .find(|&k| block_sects[k] != Some(s))
+                .unwrap_or(block_sects.len());
+            if let Some(numbering) = sections[s].line_numbering {
+                let restart = counter.is_none()
+                    || (counted_sect != Some(s)
+                        && numbering.restart != engine::LineNumberRestart::Continuous)
+                    || (!page_started && numbering.restart == engine::LineNumberRestart::NewPage);
+                if restart {
+                    counter = Some(numbering.first_number());
+                }
+                counted_sect = Some(s);
+                page_started = true;
+                let counted: Vec<bool> = (0..page.blocks.len())
+                    .map(|k| {
+                        (j..end).contains(&k)
+                            && paths
+                                .get(k)
+                                .and_then(top_block)
+                                .and_then(|i| doc.blocks.get(i as usize))
+                                .and_then(engine::Block::as_paragraph)
+                                .is_some_and(|p| {
+                                    !engine::page_decor::suppresses_line_numbers(&p.props.grab_bag)
+                                        && engine::page_decor::drop_cap_from_bag(&p.props.grab_bag)
+                                            .is_none()
+                                })
+                    })
+                    .collect();
+                let mut n = counter.unwrap_or(1);
+                layout::decor::number_page_lines(
+                    page,
+                    &counted,
+                    &numbering,
+                    &mut n,
+                    numbering.distance() * scale,
+                    fonts,
+                    style,
+                );
+                counter = Some(n);
+            }
+            j = end;
+        }
+    }
+}
+
 /// Phase 2 audit (gap D.1 follow-up) — lay out one section's header
 /// (or footer) paragraphs into a [`layout::HeaderFooterBox`]. The
 /// input is the full `engine::Paragraph` model now, not plain text:
@@ -10235,6 +10350,7 @@ impl Engine {
                         hf_role: layout::HeaderRole::Default,
                         page_number: incoming,
                         floats: Vec::new(),
+                        decor: Default::default(),
                     });
                     emitted_paths.push(Vec::new());
                 }
@@ -10764,6 +10880,17 @@ impl Engine {
             );
         }
         drop(cache);
+        /* Issue #328 — page borders + line numbers: a pure function of
+        the placed pages, never fed back into the flow. */
+        apply_page_decor(
+            &mut emitted_pages,
+            &emitted_paths,
+            &sections,
+            &doc,
+            &font_stack,
+            cfg.px_size,
+            scale,
+        );
         /* Always at least one page so downstream consumers can index `[0]`. */
         if emitted_pages.is_empty() {
             let default_geom = scaled_paginator_geometry(engine::PageGeometry::a4(), scale);
@@ -10783,6 +10910,7 @@ impl Engine {
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
                 floats: Vec::new(),
+                decor: Default::default(),
             });
             emitted_paths.push(Vec::new());
         }
@@ -10825,6 +10953,7 @@ impl Engine {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         });
         let p0 = paths.drain(..).next().unwrap_or_default();
         Ok((page, fonts, p0))
@@ -27138,6 +27267,7 @@ mod tests {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         }
     }
 
@@ -29371,6 +29501,9 @@ mod toc_pdf_export_tests;
 #[cfg(test)]
 mod pdf_validate_fixtures_tests;
 
+/// Issue #328 — page borders, line numbers and drop caps, end to end.
+#[cfg(test)]
+mod page_decor_tests;
 /// Issue #360 — PDF outline / links / XMP / tagging, end to end.
 #[cfg(test)]
 mod pdf_semantics_tests;
