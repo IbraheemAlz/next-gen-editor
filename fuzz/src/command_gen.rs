@@ -228,11 +228,15 @@ pub enum Scenario {
     /// width stretches its run, and a wavy (then dotted, dashed) underline
     /// over it tiled one display-list fill per ~2 px. Now one stroke.
     PatternedUnderlineGiantImage,
+    /// Issue #471 - a `MergeCells` rectangle that only partly covers an
+    /// existing merge (refused), then one that encloses it (absorbed):
+    /// every row's span sum must stay equal to the grid width.
+    TableMergeCrossesMerge,
 }
 
 impl Scenario {
     /// Every scenario, in the fixed order [`Scenario::index`] encodes.
-    pub const ALL: [Scenario; 13] = [
+    pub const ALL: [Scenario; 14] = [
         Scenario::NanZoom,
         Scenario::NanDeviceScale,
         Scenario::BadRenderDate,
@@ -248,6 +252,8 @@ impl Scenario {
         // Issue #422 — appended: an index is a position in this array, so
         // new scenarios go last and every committed seed stays valid.
         Scenario::PatternedUnderlineGiantImage,
+        // Issue #471 - appended, same rule.
+        Scenario::TableMergeCrossesMerge,
     ];
 
     /// The committed corpus file this scenario's seed lives at, relative
@@ -267,6 +273,7 @@ impl Scenario {
             Scenario::SelectionClampOutOfRange => "repro_117_1",
             Scenario::SelectionClampAfterUndo => "repro_117_undo_repaint_error",
             Scenario::PatternedUnderlineGiantImage => "repro_422_patterned_underline_giant_image",
+            Scenario::TableMergeCrossesMerge => "repro_471_merge_crosses_merge",
         }
     }
 
@@ -592,6 +599,29 @@ impl Scenario {
                     underline(UnderlineStyle::Wavy),
                     underline(UnderlineStyle::Dotted),
                     underline(UnderlineStyle::Dashed),
+                ]
+            }
+            Scenario::TableMergeCrossesMerge => {
+                let merge = |from_row, from_col, to_row, to_col| Command::MergeCells {
+                    table_path: BlockPath::top(0),
+                    from_row,
+                    from_col,
+                    to_row,
+                    to_col,
+                };
+                vec![
+                    Command::InsertTable {
+                        at: BlockPath::top(0),
+                        rows: 3,
+                        cols: 3,
+                    },
+                    // A: grid columns 0-1 of the top row.
+                    merge(0, 0, 0, 1),
+                    // Grid columns 1-2 over rows 0-1: holds A's second grid
+                    // column but not its first - refused, nothing changes.
+                    merge(0, 1, 1, 2),
+                    // The whole table: A lies inside, so it is absorbed.
+                    merge(0, 0, 2, 2),
                 ]
             }
         }
@@ -1532,6 +1562,38 @@ mod tests {
             "MergeCells past the table's shape must return a typed Error \
              naming the command, not panic: {:?}",
             events.last()
+        );
+    }
+
+    /// Issue #471 (`repro_471_merge_crosses_merge`) - a rectangle that only
+    /// partly covers an existing merge is refused (`UnsupportedHere`,
+    /// nothing changes); one that encloses it absorbs it. The table stays
+    /// square throughout.
+    #[test]
+    fn table_merge_crossing_a_merge_is_refused_and_enclosing_one_absorbs_it() {
+        let (engine, events) = apply_scenario(Scenario::TableMergeCrossesMerge);
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(
+            matches!(
+                &events[2],
+                Event::Error {
+                    kind: Some(bridge::ErrorKind::UnsupportedHere),
+                    message,
+                    ..
+                } if message.contains("MergeCells")
+            ),
+            "the crossing merge is refused: {:?}",
+            events[2]
+        );
+        assert!(
+            matches!(events[3], Event::SelectionChanged { .. }),
+            "the enclosing merge is applied: {:?}",
+            events[3]
+        );
+        assert_eq!(
+            engine.ragged_table_rows_for_fuzzing(),
+            0,
+            "every row's span sum equals the grid width"
         );
     }
 

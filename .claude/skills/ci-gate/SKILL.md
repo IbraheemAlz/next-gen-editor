@@ -75,16 +75,13 @@ echo "=== 8. roundtrip ==="
 $CAP cargo run -p roundtrip --release 2>&1 | tail -5
 
 echo "=== 9. visual diffs ==="
-# Vite must already be running on :5173 for this step.
-# Use /start-dev first if not.
-if curl -sI http://localhost:5173/ 2>/dev/null | head -1 | grep -q "200"; then
-    # Farm mode runs EVERY committed golden (11 cases as of beta.3) at the
-    # tier-A bar (<= 0.5% per case, 100% pass) — stricter and more complete
-    # than the old hand-listed 6-case loop.
-    (cd tools/visual-diff && node run.mjs --tier A 2>&1 | tail -14)
-else
-    echo "SKIP visual diffs — vite not running on :5173 (use /start-dev)"
-fi
+# Issue #470: the harness finds this checkout's Vite the way Playwright does
+# (URL > PW_PORT > a port hashed from the checkout path) and boots one
+# itself when nothing answers, so no `/start-dev` is needed.
+# Farm mode runs EVERY committed golden (11 cases as of beta.3) at the
+# tier-A bar (<= 0.5% per case, 100% pass) — stricter and more complete
+# than the old hand-listed 6-case loop.
+(cd tools/visual-diff && node run.mjs --tier A 2>&1 | tail -14)
 
 echo "=== ALL GATES PASSED ==="
 ```
