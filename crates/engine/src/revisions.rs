@@ -26,6 +26,63 @@ use crate::{
     replace_block_in_top,
 };
 
+/// Issues #440 / #378 — how many levels of table nesting the revision
+/// walkers ([`for_each_paragraph_nested`], the mark / row resolver, the
+/// review listing) descend: the `.docx` reader's own cap
+/// (`format_docx::parts::table::MAX_TABLE_NESTING_DEPTH`), so every table
+/// a file can carry is reached, while a command-built tower deeper than
+/// that cannot run the walkers off the stack. Depth 1 = a table in the
+/// body; its cells' tables are depth 2.
+pub const MAX_REVISION_TABLE_DEPTH: u32 = 64;
+
+/// Issue #440 — every paragraph of `blocks` with its full path: top-level
+/// paragraphs, then — in document order — the paragraphs of every table
+/// cell, recursing through nested tables down to
+/// [`MAX_REVISION_TABLE_DEPTH`] levels (`fields::for_each_paragraph_deep`
+/// stops after one). The single walk behind `has_revisions`, the text
+/// pass of the resolver, the move-range-marker sweep and the #283 range
+/// invariant.
+pub fn for_each_paragraph_nested<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    f: &mut impl FnMut(BlockPath, &'a Paragraph),
+) {
+    let mut steps = Vec::new();
+    nested_paragraphs_in(blocks, &mut steps, 0, f);
+}
+
+fn nested_paragraphs_in<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    steps: &mut Vec<PathStep>,
+    depth: u32,
+    f: &mut impl FnMut(BlockPath, &'a Paragraph),
+) {
+    for (bi, block) in blocks.into_iter().enumerate() {
+        steps.push(PathStep::Block(bi as u32));
+        match block {
+            Block::Paragraph(p) => f(
+                BlockPath {
+                    steps: steps.clone(),
+                },
+                p,
+            ),
+            Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => {
+                for (ri, row) in t.rows.iter().enumerate() {
+                    for (ci, cell) in row.cells.iter().enumerate() {
+                        steps.push(PathStep::Cell {
+                            row: ri as u32,
+                            col: ci as u32,
+                        });
+                        nested_paragraphs_in(cell.blocks.iter(), steps, depth + 1, f);
+                        steps.pop();
+                    }
+                }
+            }
+            Block::Table(_) => {}
+        }
+        steps.pop();
+    }
+}
+
 impl DocumentTree {
     /// `true` when any body paragraph (table cells included) carries a
     /// tracked change — text overlay or paragraph mark — or, issue #365,
@@ -642,11 +699,12 @@ pub(crate) fn shift_overlays_after_removal(para: &mut Paragraph, from: u32, remo
         shift(&mut h.end);
     }
     para.hyperlinks.retain(|h| h.start < h.end);
-    for r in &mut para.revisions {
-        shift(&mut r.start);
-        shift(&mut r.end);
-    }
-    para.revisions.retain(|r| r.start < r.end);
+    /* Issue #283 — the one revision range rule. */
+    para.shift_revisions(TextEdit {
+        at: from,
+        removed: removed_len,
+        inserted: 0,
+    });
     for f in &mut para.fields {
         shift(&mut f.start);
         shift(&mut f.end);

@@ -3140,27 +3140,17 @@ fn composition_overlay_ranges(
     off: u32,
     comp_len: u32,
 ) -> (Vec<engine::Hyperlink>, Vec<engine::Revision>) {
-    let start = |p: u32| if p >= off { p + comp_len } else { p };
-    let end = |p: u32| if p > off { p + comp_len } else { p };
-    let hyperlinks = para
-        .hyperlinks
-        .iter()
-        .map(|h| engine::Hyperlink {
-            start: start(h.start),
-            end: end(h.end),
-            ..h.clone()
-        })
-        .collect();
-    let revisions = para
-        .revisions
-        .iter()
-        .map(|r| engine::Revision {
-            start: start(r.start),
-            end: end(r.end),
-            ..r.clone()
-        })
-        .collect();
-    (hyperlinks, revisions)
+    /* Issue #283 — the engine's one range rule, on copies (the preview
+    text is never stored). */
+    let edit = engine::TextEdit {
+        at: off,
+        removed: 0,
+        inserted: comp_len,
+    };
+    (
+        engine::hyperlinks_through_edit(&para.hyperlinks, edit),
+        engine::revisions_through_edit(&para.revisions, edit),
+    )
 }
 
 /// Style spans for a paragraph with an IME composition spliced in at `off`.
@@ -3546,13 +3536,16 @@ fn layout_note_paragraph_with_composition(
     text.push_str(&para.text[..off]);
     text.push_str(&c.text);
     text.push_str(&para.text[off..]);
+    /* Issue #283 — the overlays shift past the preview text like the
+    body / band preview paths' do. */
+    let (links, revs) = composition_overlay_ranges(para, off as u32, ins);
     let spans = apply_revision_overlay(
         apply_hyperlink_overlay(
             composition_layout_spans(para, sctx, off as u32, ins, cfg.px_size, scale),
-            &para.hyperlinks,
+            &links,
             [0, 0, 0, 255],
         ),
-        &para.revisions,
+        &revs,
         [0, 0, 0, 255],
     );
     let mut infos = build_inline_object_infos(para, cfg, scale, sctx);
@@ -9461,6 +9454,11 @@ impl Engine {
             (None, None) => None,
         };
         let package_lost = named_package && package.is_none();
+        /* Issue #283 — snapshot bytes may come from anywhere: hold every
+        revision range to the in-paragraph / char-boundary invariant. */
+        for d in &mut s.doc_history {
+            d.repair_revision_ranges();
+        }
         if let Some(pkg) = &package {
             for d in &mut s.doc_history {
                 if d.source_package.is_none() {
@@ -18599,6 +18597,9 @@ impl Engine {
         {
             return Err("the active note / text-box story no longer exists".to_string());
         }
+        /* Issue #283 — every revision range inside its paragraph, on
+        char boundaries. */
+        engine::check_revision_ranges(self.undo.current())?;
         Ok(())
     }
 
@@ -29437,6 +29438,10 @@ mod revision_command_tests;
 
 #[cfg(test)]
 mod tracked_command_tests;
+
+/// Issue #283 — revision ranges through real commands (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod revision_range_tests;
 
 #[cfg(test)]
 mod revision_address_tests;

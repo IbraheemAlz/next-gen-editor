@@ -416,6 +416,18 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   positioned verbatim markers. Untracked `insert_text` carries every
   revision with its text (shift at / after the start, grow strictly
   inside).
+- **One revision range rule (issue #283).** Every byte-moving paragraph
+  edit maps `Paragraph::revisions` through `Paragraph::shift_revisions`
+  (= `TextEdit::map_range`, the record the source markup and comment
+  anchors see): `insert_text`, the inline-object splice (an object at a
+  revision's END stays outside it), `revisions::remove_text`,
+  `delete_text` / `split_at` / `concat` (`remap_range_overlays`) and the
+  field-result splice; layout-only clones (the IME preview, body / band /
+  note) use `engine::revisions_through_edit`. Never hand-roll a revision
+  shift loop. `engine::check_revision_ranges` (in-paragraph, non-empty,
+  char boundaries; body, cells at every depth, headers / footers, notes)
+  runs in `Engine::check_invariants_for_fuzzing`; a restored snapshot is
+  held to it by `DocumentTree::repair_revision_ranges`.
 - **Paragraph-mark revisions (issues #262 / #303).** `<w:pPr><w:rPr><w:ins/>`
   (`<w:del/>`, `<w:moveFrom/>`, `<w:moveTo/>`) — ALL of them, in source
   order (a mark one reviewer inserted and another deleted carries two) —
