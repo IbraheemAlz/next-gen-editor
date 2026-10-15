@@ -63,7 +63,7 @@ export {
 } from './caretReveal';
 export type { ScrollView, ViewBox } from './caretReveal';
 
-export { createFontRegistry } from './createFontRegistry';
+export { createFontRegistry, normalizeScriptDefaults, SCRIPT_KEYS } from './createFontRegistry';
 export type {
     FontRegistry,
     FontDescriptor,

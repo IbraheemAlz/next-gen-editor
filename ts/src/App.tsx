@@ -59,6 +59,13 @@ async function setupEngine(
        faces from its first paint, and `FONT_LOADED` / `DOCUMENT_LOADED`
        report what they stand in for. */
     await Promise.all([fonts.loadDefaults(), fonts.loadSubstitutes()]);
+    /* Issue #472 - declare which loaded face shapes each script's text that
+       names no font (`fonts.json` `defaults_by_script`: Latin ->
+       Liberation Sans, Arabic -> Amiri). Without it the engine picks the
+       first covering face BY ID, and the dual-script Amiri (`amiri` <
+       `liberation`) won Latin text. Recovery wipes the engine's font setup
+       along with its font map, so this runs on every (re)boot. */
+    await fonts.applyScriptDefaults();
     if (restored) {
         const repaint = await client.dispatch({
             type: 'SET_DEVICE_SCALE',
@@ -69,9 +76,15 @@ async function setupEngine(
         }
         return;
     }
-    /* `defaults[0]` is the manifest's seed/primary face (dual-script Amiri
-       so the mixed RTL seed text shapes from one face). */
-    const seedFont = fonts.defaults()[0] ?? 'amiri';
+    /* The seed / fallback-root face (`cfg.font_id`): the manifest's Latin
+       default - script-neutral text and scripts the engine's font stack
+       does not specialise fall to it. The seed's Arabic run takes its own
+       script default (Amiri). Older manifests with no `defaults_by_script`
+       keep `defaults[0]`. */
+    const seedFont =
+        fonts.scriptDefaults().latin?.find((id) => fonts.isLoaded(id)) ??
+        fonts.defaults()[0] ??
+        'amiri';
     const seedPaint = await client.dispatch({
         type: 'RENDER_PAGE',
         /* Seed mixed Arabic/English so the pointer + selection overlays have

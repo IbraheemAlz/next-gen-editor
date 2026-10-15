@@ -57,6 +57,7 @@ export type {
     TextBoxHop,
     Color,
     Script,
+    FontPriority,
     TextAttrs,
     AttrsMixed,
     FontSource,
