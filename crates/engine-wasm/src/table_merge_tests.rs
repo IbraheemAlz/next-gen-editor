@@ -357,7 +357,9 @@ fn absorbed_content_keeps_row_major_order_without_placeholder_blanks() {
 /// grid - ~100 rectangles per starting shape.
 #[test]
 fn every_rectangle_is_refused_or_keeps_the_table_square() {
-    let shapes: [&[((u32, u32), (u32, u32))]; 4] = [
+    /* A merge rectangle as its two corners, `(row, grid column)` each. */
+    type Rect = ((u32, u32), (u32, u32));
+    let shapes: [&[Rect]; 4] = [
         &[((0, 0), (0, 1))],
         &[((0, 0), (0, 1)), ((1, 2), (3, 2))],
         &[((1, 1), (2, 2)), ((0, 3), (1, 3))],
