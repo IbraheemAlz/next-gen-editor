@@ -180,9 +180,11 @@ const MAX_COMMAND_SEQUENCE: usize = 64;
 /// the auto-repaint -> layout pipeline, then the native glyph rasterizer.
 /// Invariants asserted after every command: no panic (the fuzz harness
 /// itself), the undo stack never exceeds its 100-snapshot bound, the
-/// live selection always resolves inside the current document, and
+/// live selection always resolves inside the current document,
 /// (issue #341) a command answered with `Event::Error` changed nothing
-/// (`Engine::state_fingerprint_for_fuzzing`).
+/// (`Engine::state_fingerprint_for_fuzzing`), and (issue #471) a table
+/// command never leaves a row whose spans do not sum to the grid width
+/// (`keeps_tables_square`).
 pub fn run_rpc_command(data: &[u8]) {
     let mut u = Unstructured::new(data);
     let seed_text = command_gen::gen_seed_text(&mut u);
@@ -207,6 +209,10 @@ pub fn run_rpc_command(data: &[u8]) {
         /* Issue #341 — "error => no mutation": the document, selection,
         active story and undo depth before the command. */
         let before = engine.state_fingerprint_for_fuzzing();
+        /* Issue #471 - rows whose spans miss the grid width, before. Only
+        measured for a command that is meant to keep tables square. */
+        let ragged_before =
+            keeps_tables_square(&keep).then(|| engine.ragged_table_rows_for_fuzzing());
         let started = trace.then(std::time::Instant::now);
         let evt = engine.apply_sync(cmd);
         if let Some(t) = started {
@@ -267,6 +273,21 @@ pub fn run_rpc_command(data: &[u8]) {
         if let bridge::Event::DocumentSaved { bytes, .. } = &evt {
             assert_no_forbidden_character(bytes, &variant_name(&keep));
         }
+        /* Issue #471 - a table command (merge included: a rectangle that
+        only partly covers a merged region is refused, one that encloses
+        regions absorbs them) leaves every row's span sum equal to the
+        grid width. A count, not a flag, so a ragged row an opened `.docx`
+        carries is not blamed on the command. */
+        if let Some(ragged_before) = ragged_before {
+            let ragged_after = engine.ragged_table_rows_for_fuzzing();
+            assert!(
+                ragged_after <= ragged_before,
+                "{} left {ragged_after} table row(s) whose spans do not sum to the grid width \
+                 (was {ragged_before}): {}",
+                variant_name(&keep),
+                format!("{evt:?}").chars().take(160).collect::<String>()
+            );
+        }
         assert!(
             engine.undo_depth() <= 100,
             "undo depth exceeded its 100-snapshot bound after {}",
@@ -306,6 +327,29 @@ fn assert_no_forbidden_character(bytes: &[u8], after: &str) {
             ch as u32
         );
     }
+}
+
+/// Issue #471 - the table commands that must keep every row's span sum
+/// equal to the grid width. `DeleteColumn` is NOT among them yet: it removes
+/// the cell at a physical index in every row, so on a table that already
+/// holds a `gridSpan` cell it deletes a whole merged cell (or the wrong
+/// one) and leaves the row short of the grid. That is a separate gap in the
+/// column commands, not in `MergeCells`; add it here when it is grid-aware.
+fn keeps_tables_square(cmd: &bridge::Command) -> bool {
+    use bridge::Command as C;
+    matches!(
+        cmd,
+        C::MergeCells { .. }
+            | C::SplitCell { .. }
+            | C::InsertRow { .. }
+            | C::DeleteRow { .. }
+            | C::InsertColumn { .. }
+            | C::InsertTable { .. }
+            | C::DeleteTable { .. }
+            | C::SetCellShading { .. }
+            | C::SetCellBorders { .. }
+            | C::SetTableProperties { .. }
+    )
 }
 
 /// Issue #422 — `ENGINE_FUZZ_TRACE=1` prints every generated command

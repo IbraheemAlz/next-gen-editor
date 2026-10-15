@@ -554,6 +554,17 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
   instead of a fixed 5173, so a sibling worktree's already-running Vite
   server can no longer be silently reused as the wrong tree under test —
   override with `PW_PORT`, or opt back into reuse with `PW_REUSE_SERVER=1`.
+  The `tools/*` browser harnesses (`perf`, `memory-profile`, `pdf-validate`,
+  `visual-diff`) resolve the very same port (issue #470): the derivation
+  lives in ONE module, `tools/lib/port.mjs` (imported by
+  `playwright.config.ts`, the telemetry specs and the harnesses), and
+  `tools/lib/dev-server.mjs` `ensureDevServer` picks the origin as `URL` >
+  `PW_PORT` > the path hash, reuses a server already answering there and
+  otherwise boots `pnpm exec vite --port N --strictPort` itself (stopped on
+  exit). Each report header names the measured URL; they no longer assume
+  5173 (`URL=http://localhost:5173` still pins a harness to it, as `ci.yml`
+  does). `pnpm --filter tools-lib test` covers the derivation (pinned
+  values) and the boot/reuse paths.
 
 ## Things to never do
 

@@ -335,6 +335,13 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run visual-diff harness
+        # Issue #470 - the harnesses resolve the dev-server origin like
+        # Playwright does (URL > PW_PORT > a port hashed from the checkout
+        # path) and boot Vite themselves when nothing answers. This step
+        # starts Vite on `pnpm dev`'s fixed 5173 and says so, so the
+        # harness reuses it instead of booting a second server.
+        env:
+          URL: http://localhost:5173
         run: |
           set -uo pipefail
           pnpm --dir ts dev &
@@ -417,6 +424,11 @@ jobs:
         # the real veraPDF installed above - `--strict` makes a missing
         # veraPDF a failure instead of a silent skip. The job stays
         # non-blocking regardless (see the job header).
+        #
+        # Issue #470 - see the visual-diff step: `URL` pins the harness to
+        # the server started below.
+        env:
+          URL: http://localhost:5173
         run: |
           set -uo pipefail
           pnpm --dir ts dev &

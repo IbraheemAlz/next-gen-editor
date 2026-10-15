@@ -5560,6 +5560,17 @@ pub enum TableError {
         requested: u64,
         max: u64,
     },
+    /// Issue #471 - a `MergeCells` rectangle that only PARTLY covers an
+    /// existing merged region (a `gridSpan` cell, a `vMerge` run, or both).
+    /// Word refuses it; applying it would leave a row whose span sum no
+    /// longer matches the grid. The fields are the conflicting region in
+    /// logical-grid coordinates, all inclusive and 0-based.
+    CrossesMerge {
+        top: u32,
+        left: u32,
+        bottom: u32,
+        right: u32,
+    },
 }
 
 impl std::fmt::Display for TableError {
@@ -5589,6 +5600,16 @@ impl std::fmt::Display for TableError {
             TableError::TooManyCells { requested, max } => {
                 write!(f, "{requested} cells exceeds the {max}-cell limit")
             }
+            TableError::CrossesMerge {
+                top,
+                left,
+                bottom,
+                right,
+            } => write!(
+                f,
+                "the cells overlap a merged region (rows {top}-{bottom}, columns {left}-{right}) \
+                 that is only partly inside them; select the whole merged region to merge it"
+            ),
         }
     }
 }
@@ -5805,6 +5826,226 @@ impl Table {
             });
         }
         Ok(())
+    }
+
+    /// Issue #471 - the width of the logical grid, in columns: the
+    /// `<w:tblGrid>` length, or - for a grid-less (reader-synthesised)
+    /// table - the widest row's span sum. A row is "square" when its
+    /// cells' spans sum to exactly this.
+    pub fn grid_width(&self) -> usize {
+        if self.grid.is_empty() {
+            self.rows
+                .iter()
+                .map(|r| r.cells.iter().map(cell_span).sum::<usize>())
+                .max()
+                .unwrap_or(0)
+        } else {
+            self.grid.len()
+        }
+    }
+
+    /// Issue #471 - how many rows' span sums differ from
+    /// [`Self::grid_width`]. Every table the engine builds is square, and
+    /// a merge / split keeps it so; a `.docx` row with a `gridBefore` /
+    /// `gridAfter` or a short row can legitimately be ragged, so this is a
+    /// count (the fuzz invariant compares before and after), not a flag.
+    pub fn ragged_row_count(&self) -> usize {
+        let width = self.grid_width();
+        self.rows
+            .iter()
+            .filter(|r| r.cells.iter().map(cell_span).sum::<usize>() != width)
+            .count()
+    }
+
+    /// Issue #471 - may the rectangle of rows `from_row..=to_row` by grid
+    /// columns `from_col..=to_col` (either corner order) be merged? Every
+    /// corner must exist ([`TableError::RowOutOfRange`] /
+    /// [`TableError::ColOutOfRange`] - the grid width for a column), and
+    /// every merged region (a `gridSpan` cell, a `vMerge` run, or both) the
+    /// rectangle TOUCHES must lie ENTIRELY inside it - such a region is
+    /// absorbed by the merge. A region that only partly overlaps it is
+    /// refused with [`TableError::CrossesMerge`] naming that region: Word
+    /// refuses the same merge, and applying it would leave a row whose
+    /// span sum no longer matches the grid.
+    ///
+    /// Cost: one pass over the rectangle's cells; a `vMerge` run is walked
+    /// once, from its first cell inside the rectangle (the interior of a
+    /// run is vouched for by its predecessor), so a tall merged column is
+    /// linear, not quadratic.
+    pub fn check_merge_rect(
+        &self,
+        from_row: u32,
+        from_col: u32,
+        to_row: u32,
+        to_col: u32,
+    ) -> Result<(), TableError> {
+        let (r0, r1) = (from_row.min(to_row) as usize, from_row.max(to_row) as usize);
+        let (g0, g1) = (from_col.min(to_col) as usize, from_col.max(to_col) as usize);
+        if r1 >= self.rows.len() {
+            return Err(TableError::RowOutOfRange {
+                row: r1 as u32,
+                rows: self.rows.len(),
+            });
+        }
+        let width = self.grid_width();
+        if g1 >= width {
+            return Err(TableError::ColOutOfRange {
+                col: g1 as u32,
+                cols: width,
+            });
+        }
+        /* The vMerge role of the cell that STARTS at grid column `start`
+        in row `r`, if any cell does. */
+        let role_at = |r: usize, start: usize| -> Option<VMergeRole> {
+            let row = self.rows.get(r)?;
+            cell_starting_at(row, start).map(|i| row.cells[i].props.v_merge)
+        };
+        let in_run = |role: Option<VMergeRole>| {
+            matches!(role, Some(VMergeRole::Restart | VMergeRole::Continue))
+        };
+        for r in r0..=r1 {
+            let row = &self.rows[r];
+            for (i, start, span) in row_extents(row) {
+                if start > g1 {
+                    break;
+                }
+                let end = start + span - 1;
+                if end < g0 {
+                    continue;
+                }
+                let role = row.cells[i].props.v_merge;
+                let (mut top, mut bottom) = (r, r);
+                /* The interior of a run that began inside the rectangle was
+                already walked from its first cell. */
+                let interior =
+                    role == VMergeRole::Continue && r > r0 && in_run(role_at(r - 1, start));
+                if role != VMergeRole::None && !interior {
+                    while top > 0
+                        && role_at(top, start) == Some(VMergeRole::Continue)
+                        && in_run(role_at(top - 1, start))
+                    {
+                        top -= 1;
+                    }
+                    while role_at(bottom + 1, start) == Some(VMergeRole::Continue) {
+                        bottom += 1;
+                    }
+                }
+                if start < g0 || end > g1 || top < r0 || bottom > r1 {
+                    return Err(TableError::CrossesMerge {
+                        top: top as u32,
+                        left: start as u32,
+                        bottom: bottom as u32,
+                        right: end as u32,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Issue #471 - how many grid columns `cell` spans (`gridSpan` 0 / unset
+/// reads as 1, like every other consumer).
+fn cell_span(cell: &TableCell) -> usize {
+    cell.props.grid_span.max(1) as usize
+}
+
+/// Issue #471 - `(cell index, first grid column, span)` for each cell of
+/// `row`, in order: the cursor walk that turns a row's cell list into
+/// grid coordinates.
+fn row_extents(row: &TableRow) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+    let mut start = 0usize;
+    row.cells.iter().enumerate().map(move |(i, cell)| {
+        let first = start;
+        let span = cell_span(cell);
+        start += span;
+        (i, first, span)
+    })
+}
+
+/// Index of the cell of `row` that starts at grid column `grid_col`.
+fn cell_starting_at(row: &TableRow, grid_col: usize) -> Option<usize> {
+    row_extents(row)
+        .take_while(|&(_, start, _)| start <= grid_col)
+        .find(|&(_, start, _)| start == grid_col)
+        .map(|(i, ..)| i)
+}
+
+/// Issue #471 - the cells a merge of rows `r0..=r1` by grid columns
+/// `g0..=g1` touches, per row: `(row, first cell index, last cell index)`.
+/// The cells overlapping a grid range are contiguous, and a row the range
+/// does not reach (a short / ragged row) is simply absent - the merge
+/// leaves it alone, and rows past the end of the table are clipped.
+fn merge_plan(t: &Table, r0: u32, r1: u32, g0: u32, g1: u32) -> Vec<(u32, usize, usize)> {
+    let (g0, g1) = (g0 as usize, g1 as usize);
+    let mut plan = Vec::new();
+    for r in r0..=r1.min(t.rows.len().saturating_sub(1) as u32) {
+        let Some(row) = t.rows.get(r as usize) else {
+            break;
+        };
+        let mut touched: Option<(usize, usize)> = None;
+        for (i, start, span) in row_extents(row) {
+            if start > g1 {
+                break;
+            }
+            if start + span > g0 {
+                touched = Some(touched.map_or((i, i), |(lo, _)| (lo, i)));
+            }
+        }
+        if let Some((lo, hi)) = touched {
+            plan.push((r, lo, hi));
+        }
+    }
+    plan
+}
+
+/// Issue #471 - a `vMerge` continue cell holding nothing but one empty
+/// paragraph: pure placeholder (Word never gives it content). Merging it
+/// away must not pile an empty paragraph onto the owner.
+fn is_content_free_placeholder(cell: &TableCell) -> bool {
+    cell.props.v_merge == VMergeRole::Continue
+        && matches!(
+            cell.blocks.as_slice(),
+            [Block::Paragraph(p)] if p.text.is_empty() && p.inline_objects.is_empty()
+        )
+}
+
+impl DocumentTree {
+    /// Issue #471 - [`Table::ragged_row_count`] summed over every table
+    /// the document holds (body, headers, footers, notes; nested tables
+    /// included). The `rpc_command` fuzz target asserts a table command
+    /// never raises it.
+    pub fn ragged_table_rows(&self) -> usize {
+        fn count<'a>(blocks: impl Iterator<Item = &'a Block>) -> usize {
+            blocks
+                .filter_map(Block::as_table)
+                .map(|t| {
+                    t.ragged_row_count()
+                        + t.rows
+                            .iter()
+                            .flat_map(|r| r.cells.iter())
+                            .map(|c| count(c.blocks.iter()))
+                            .sum::<usize>()
+                })
+                .sum()
+        }
+        count(self.blocks.iter())
+            + self
+                .headers
+                .values()
+                .map(|b| count(b.iter()))
+                .sum::<usize>()
+            + self
+                .footers
+                .values()
+                .map(|b| count(b.iter()))
+                .sum::<usize>()
+            + self
+                .footnote_stories
+                .values()
+                .chain(self.endnote_stories.values())
+                .map(|s| count(s.body.iter()))
+                .sum::<usize>()
     }
 }
 
@@ -10893,17 +11134,31 @@ impl DocumentTree {
         })
     }
 
-    /// Merge the rectangle of cells `(from_row, from_col)..=(to_row,
-    /// to_col)` inside the table at `table_path`. The top-left cell
-    /// becomes the visual owner: its `grid_span` widens to cover the
-    /// column range, every cell directly below in the column range
-    /// becomes `VMergeRole::Continue`. Horizontal partners (same row,
-    /// columns to the right) are *removed*, their widths summed into the
-    /// owner's `grid_span`; a continuation row's own cell is emptied to a
-    /// single blank paragraph. Issue #263 — none of that content is
-    /// dropped: every merged-away cell's blocks are appended into the
-    /// owner, in row-major order (Word's behaviour), by
-    /// [`Self::merge_cells_unmapped`].
+    /// Merge the rectangle `(from_row, from_col)..=(to_row, to_col)` of the
+    /// table at `table_path`. Issue #471 - the columns are LOGICAL GRID
+    /// columns (the `<w:tblGrid>` index a cell starts at), not indices into
+    /// a row's cell list: once a row holds a `gridSpan` cell its cell index
+    /// and its grid column part ways, and a rectangle has to mean the same
+    /// columns in every row. On a table with no merges the two coincide.
+    ///
+    /// The first cell the rectangle reaches in its top row becomes the
+    /// visual owner: its `grid_span` widens to the SUM of the spans of the
+    /// cells it absorbs, and (for a rectangle of several rows) it becomes a
+    /// `vMerge` restart. Every other cell the rectangle reaches in the top
+    /// row is *removed*; in each row below, the cells collapse the same way
+    /// into one `vMerge` continuation cell and its blocks move to the
+    /// owner. Because every collapsed cell lends its span to the survivor
+    /// the row's span sum - and so its width on the grid - never changes.
+    ///
+    /// Issue #263 - none of the content is dropped: every merged-away
+    /// cell's blocks are appended into the owner, in row-major order
+    /// (Word's behaviour), by [`Self::merge_cells_unmapped`]; the one
+    /// exception is a placeholder (`vMerge` continue cell holding a single
+    /// empty paragraph), which carries no content.
+    ///
+    /// The rectangle is expected to have passed [`Table::check_merge_rect`]
+    /// (the engine-wasm boundary does that): a merged region that is only
+    /// partly inside it makes the result a region Word would never write.
     pub fn merge_cells(
         &self,
         table_path: BlockPath,
@@ -10912,98 +11167,71 @@ impl DocumentTree {
         to_row: u32,
         to_col: u32,
     ) -> Self {
-        let (r0, r1) = if from_row <= to_row {
-            (from_row, to_row)
-        } else {
-            (to_row, from_row)
-        };
-        let (c0, c1) = if from_col <= to_col {
-            (from_col, to_col)
-        } else {
-            (to_col, from_col)
-        };
-        /* Issue #253 / #263 — mirror the merge on the PRE-mutation shape:
-        per affected row, the cells `c0 + 1 ..= c0 + drop` are removed and
-        (issue #263) a continuation row's own `c0` cell is also emptied —
-        every one of those cells' blocks lands, whole, inside the owner
-        `(r0, c0)`. `absorbed` records exactly where: `cursor` walks the
-        SAME row-major order `merge_cells_unmapped` appends in (row r0's
-        horizontal partners, then each continuation row's own cell
-        followed by its horizontal partners), so an anchor at block `k` of
-        an absorbed cell lands on block `cursor + k` of the owner. Cells
-        past the merged range shift left by `drop`. */
+        let (r0, r1) = (from_row.min(to_row), from_row.max(to_row));
+        let (g0, g1) = (from_col.min(to_col), from_col.max(to_col));
+        /* Issue #253 / #263 - mirror the merge on the PRE-mutation shape:
+        per affected row, the cells `lo + 1 ..= hi` are removed and a
+        continuation row's own `lo` cell is also emptied - every one of
+        those cells' blocks lands, whole, inside the owner `(r0, lo)`.
+        `absorbed` records exactly where: `cursor` walks the SAME row-major
+        order `merge_cells_unmapped` appends in (the owner row's partners,
+        then each continuation row's own cell followed by its partners), so
+        an anchor at block `k` of an absorbed cell lands on block
+        `cursor + k` of the owner (a content-free placeholder collapses
+        onto the owner's end instead). Cells past the merged range shift
+        left by the number dropped from their row. */
         let remap = self.mutated_table_shape(&table_path).and_then(|(tp, t)| {
-            let rcount = t.rows.len() as u32;
-            let owner_row = t.rows.get(r0 as usize)?;
-            let last = (owner_row.cells.len() as u32).checked_sub(1)?;
-            if c0 > last {
+            let plan = merge_plan(t, r0, r1, g0, g1);
+            let &(first_row, owner_col, _) = plan.first()?;
+            if first_row != r0 {
                 return None;
             }
-            let mut cursor = owner_row
-                .cells
-                .get(c0 as usize)
-                .map_or(0, |c| c.blocks.len() as u32);
-            let mut absorbed: Vec<(u32, u32, u32)> = Vec::new();
-            /* (row, cells dropped) for the owner row and each continuation. */
-            let mut drops = Vec::new();
-            let c1_r0 = c1.min(last);
-            for c in (c0 + 1)..=c1_r0 {
-                let len = owner_row
-                    .cells
-                    .get(c as usize)
-                    .map_or(0, |cell| cell.blocks.len() as u32);
-                absorbed.push((r0, c, cursor));
-                cursor += len;
-            }
-            drops.push((r0, c1_r0 - c0));
-            for r in (r0 + 1)..=r1.min(rcount.saturating_sub(1)) {
+            let mut cursor = t.rows[r0 as usize].cells[owner_col].blocks.len() as u32;
+            /* (row, col, block offset in the owner, content kept). */
+            let mut absorbed: Vec<(u32, usize, u32, bool)> = Vec::new();
+            for &(r, lo, hi) in &plan {
                 let row = &t.rows[r as usize];
-                let len = row.cells.len() as u32;
-                if c0 >= len {
-                    continue;
+                let from = if r == r0 { lo + 1 } else { lo };
+                for c in from..=hi {
+                    let cell = &row.cells[c];
+                    let kept = !is_content_free_placeholder(cell);
+                    absorbed.push((r, c, cursor, kept));
+                    if kept {
+                        cursor += cell.blocks.len() as u32;
+                    }
                 }
-                let own_len = row.cells[c0 as usize].blocks.len() as u32;
-                absorbed.push((r, c0, cursor));
-                cursor += own_len;
-                let c1_r = c1.min(len - 1);
-                for c in (c0 + 1)..=c1_r {
-                    let clen = row.cells[c as usize].blocks.len() as u32;
-                    absorbed.push((r, c, cursor));
-                    cursor += clen;
-                }
-                drops.push((r, c1_r - c0));
             }
-            Some((tp, drops, absorbed))
+            Some((tp, plan, absorbed, owner_col as u32))
         });
-        let mut out = self.merge_cells_unmapped(table_path, r0, r1, c0, c1);
-        if let Some((tp, drops, absorbed)) = remap {
+        let mut out = self.merge_cells_unmapped(table_path, r0, r1, g0, g1);
+        if let Some((tp, plan, absorbed, owner_col)) = remap {
             out.remap_table_cells(&tp, |row, col| {
-                let Some(&(_, drop)) = drops.iter().find(|(r, _)| *r == row) else {
+                let Some(&(_, lo, hi)) = plan.iter().find(|(r, _, _)| *r == row) else {
                     return CellMove::Keep;
                 };
-                let owner = row == r0 && col == c0;
-                if col < c0 || owner {
+                let col = col as usize;
+                let is_owner = row == r0 && col == lo;
+                if col < lo || is_owner {
                     CellMove::Keep
-                } else if col <= c0 + drop {
-                    match absorbed.iter().find(|(r, c, _)| *r == row && *c == col) {
-                        Some(&(_, _, block_offset)) => CellMove::Absorbed {
+                } else if col <= hi {
+                    match absorbed.iter().find(|(r, c, _, _)| *r == row && *c == col) {
+                        Some(&(_, _, block_offset, true)) => CellMove::Absorbed {
                             row: r0,
-                            col: c0,
+                            col: owner_col,
                             block_offset,
                         },
-                        /* Defensive fallback; every merged-away cell the
-                        classification reaches this branch for is also in
-                        `absorbed` by construction. */
-                        None => CellMove::Collapse {
+                        /* A placeholder carried nothing (or, defensively,
+                        a cell the plan does not list): collapse. */
+                        _ => CellMove::Collapse {
                             row: r0,
-                            col: c0,
+                            col: owner_col,
                             at_end: true,
                         },
                     }
                 } else {
                     CellMove::To {
                         row,
-                        col: col - drop,
+                        col: (col - (hi - lo)) as u32,
                     }
                 }
             });
@@ -11011,88 +11239,64 @@ impl DocumentTree {
         out
     }
 
-    /// Issue #263 — physically restructure the table AND carry every
-    /// merged-away cell's blocks into the owner `(r0, c0)`, row-major
-    /// (owner row's horizontal partners, left to right, then each
-    /// continuation row's own cell followed by ITS horizontal partners) —
-    /// [`Self::merge_cells`]'s `absorbed` list mirrors this exact order so
-    /// a comment anchor lands on the same paragraph its text moved to.
+    /// Issue #263 - physically restructure the table AND carry every
+    /// merged-away cell's blocks into the owner, row-major (owner row's
+    /// horizontal partners, left to right, then each continuation row's
+    /// own cell followed by ITS horizontal partners) - [`Self::merge_cells`]'s
+    /// `absorbed` list mirrors this exact order so a comment anchor lands
+    /// on the same paragraph its text moved to. Issue #471 - rows are
+    /// addressed through [`merge_plan`] (grid columns), and a survivor's
+    /// span is the sum of the spans it absorbed.
     fn merge_cells_unmapped(
         &self,
         table_path: BlockPath,
         r0: u32,
         r1: u32,
-        c0: u32,
-        c1: u32,
+        g0: u32,
+        g1: u32,
     ) -> Self {
         self.mutate_table(table_path, |t| {
-            let rcount = t.rows.len() as u32;
-            if r0 >= rcount {
+            let plan = merge_plan(t, r0, r1, g0, g1);
+            let Some(&(first_row, owner_col, _)) = plan.first() else {
+                return;
+            };
+            if first_row != r0 {
                 return;
             }
-            let span = (c1 - c0 + 1).min(u8::MAX as u32) as u8;
-            /* Horizontal collapse: top-row cells in the rectangle's
-            column range merge into one cell with `grid_span = span`. */
-            let Some(top_row) = t.rows.get_mut(r0 as usize) else {
-                return;
-            };
-            /* Issue #116 — a cell-less row (or `c0` past the row's last
-            cell) used to underflow `len - 1 - c0`; nothing to merge. */
-            let Some(last) = (top_row.cells.len() as u32).checked_sub(1) else {
-                return;
-            };
-            if c0 > last {
-                return;
-            }
-            let drop_count = (c1.min(last) - c0) as usize;
-            top_row.cells[c0 as usize].props.grid_span = span;
-            top_row.cells[c0 as usize].props.v_merge = if r0 == r1 {
-                VMergeRole::None
-            } else {
-                VMergeRole::Restart
-            };
-            /* Issue #263 — Word appends every merged-away cell's blocks
-            into the owner instead of discarding them. `remove` always
-            takes whatever now sits right after the owner, so this loop
-            already visits the horizontal partners left to right. */
             let mut appended: Vec<Block> = Vec::new();
-            for _ in 0..drop_count {
-                if (c0 as usize + 1) < top_row.cells.len() {
-                    appended.extend(top_row.cells.remove(c0 as usize + 1).blocks);
-                }
-            }
-            top_row.cells[c0 as usize].blocks.extend(appended);
-            /* Vertical: rows r0+1..=r1 collapse to Word's on-disk shape —
-            ONE cell per continuation row spanning the merged columns
-            (`gridSpan = span`, `vMerge` continue), horizontal partners
-            physically removed exactly like the top row. Anything else
-            double-counts grid columns in the layout cursor walk and
-            diverges from what the .docx reader produces for the same
-            merge authored in Word. Issue #263 — the continuation cell's
-            OWN blocks move into the owner too (Word never leaves content
-            behind a `vMerge="continue"` cell); it is left with a single
-            blank paragraph, same as a fresh cell elsewhere in the tree. */
-            for r in (r0 + 1)..=r1.min(rcount - 1) {
-                if (c0 as usize) >= t.rows[r as usize].cells.len() {
-                    continue;
-                }
+            for &(r, lo, hi) in &plan {
                 let row = &mut t.rows[r as usize];
-                let mut appended = std::mem::replace(
-                    &mut row.cells[c0 as usize].blocks,
-                    vec![Block::Paragraph(Paragraph::default())],
-                );
-                row.cells[c0 as usize].props.v_merge = VMergeRole::Continue;
-                row.cells[c0 as usize].props.grid_span = span.max(1);
-                let drop_count = (c1.min(row.cells.len() as u32 - 1) - c0) as usize;
-                for _ in 0..drop_count {
-                    if (c0 as usize + 1) < row.cells.len() {
-                        appended.extend(row.cells.remove(c0 as usize + 1).blocks);
+                let span: usize = row.cells[lo..=hi].iter().map(cell_span).sum();
+                let span = u8::try_from(span).unwrap_or(u8::MAX);
+                if r != r0 {
+                    /* The continuation row's own cell stays as the
+                    `vMerge` placeholder; its content moves to the owner. */
+                    let free = is_content_free_placeholder(&row.cells[lo]);
+                    let own = std::mem::replace(
+                        &mut row.cells[lo].blocks,
+                        vec![Block::Paragraph(Paragraph::default())],
+                    );
+                    if !free {
+                        appended.extend(own);
                     }
                 }
-                t.rows[r0 as usize].cells[c0 as usize]
-                    .blocks
-                    .extend(appended);
+                for _ in lo..hi {
+                    let gone = row.cells.remove(lo + 1);
+                    if !is_content_free_placeholder(&gone) {
+                        appended.extend(gone.blocks);
+                    }
+                }
+                let survivor = &mut row.cells[lo];
+                survivor.props.grid_span = span;
+                survivor.props.v_merge = if r != r0 {
+                    VMergeRole::Continue
+                } else if r0 == r1 {
+                    VMergeRole::None
+                } else {
+                    VMergeRole::Restart
+                };
             }
+            t.rows[r0 as usize].cells[owner_col].blocks.extend(appended);
         })
     }
 
@@ -16008,6 +16212,96 @@ mod tests {
             "cell right of the merge is untouched"
         );
         assert_eq!(t.rows[2].cells.len(), 3, "row below the merge untouched");
+    }
+
+    /// Issue #471 - a merge keeps every row's span sum: the survivor's
+    /// span is the SUM of what it absorbs, so a rectangle holding an
+    /// existing `gridSpan` cell widens the owner by that cell's whole span
+    /// (the old `c1 - c0 + 1` arithmetic counted it as one column).
+    #[test]
+    fn merge_cells_absorbing_a_gridspan_cell_sums_the_spans() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 2, 4);
+        let d = d.merge_cells(BlockPath::top(1), 0, 1, 0, 2);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells.len(), 3, "[a, B(2), d]");
+        assert_eq!(t.ragged_row_count(), 0);
+        /* Grid columns 0-2 of row 0 now hold a, B(2): span 1 + 2. */
+        let d = d.merge_cells(BlockPath::top(1), 0, 0, 0, 2);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells.len(), 2, "[ABC(3), d]");
+        assert_eq!(t.rows[0].cells[0].props.grid_span, 3);
+        assert_eq!(t.rows[0].cells[1].props.grid_span.max(1), 1);
+        assert_eq!(t.ragged_row_count(), 0);
+        assert_eq!(d.ragged_table_rows(), 0);
+    }
+
+    /// Issue #471 - `check_merge_rect` accepts exactly the rectangles that
+    /// hold every merged region they touch, and names the region that a
+    /// refused one cuts. Coordinates are grid columns.
+    #[test]
+    fn check_merge_rect_requires_whole_regions() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 3, 4);
+        /* A = row 0, columns 1-2. B = rows 1-2, column 3. */
+        let d = d.merge_cells(BlockPath::top(1), 0, 1, 0, 2);
+        let d = d.merge_cells(BlockPath::top(1), 1, 3, 2, 3);
+        let t = d.blocks[1].as_table().unwrap();
+        /* Disjoint, enclosing and touching-but-not-overlapping are fine. */
+        for (r0, c0, r1, c1) in [
+            (0, 0, 0, 0),
+            (1, 0, 2, 2),
+            (0, 1, 0, 2),
+            (0, 0, 0, 3),
+            (0, 1, 2, 3),
+            (0, 0, 2, 3),
+            (1, 3, 2, 3),
+        ] {
+            assert_eq!(
+                t.check_merge_rect(r0, c0, r1, c1),
+                Ok(()),
+                "({r0},{c0})-({r1},{c1})"
+            );
+        }
+        /* Cut A from either side, and B from above and below. */
+        let cut_a = Err(TableError::CrossesMerge {
+            top: 0,
+            left: 1,
+            bottom: 0,
+            right: 2,
+        });
+        assert_eq!(t.check_merge_rect(0, 0, 0, 1), cut_a);
+        assert_eq!(t.check_merge_rect(0, 2, 1, 2), cut_a);
+        assert_eq!(t.check_merge_rect(1, 3, 0, 2), cut_a, "corners swapped");
+        let cut_b = Err(TableError::CrossesMerge {
+            top: 1,
+            left: 3,
+            bottom: 2,
+            right: 3,
+        });
+        assert_eq!(t.check_merge_rect(0, 3, 1, 3), cut_b);
+        assert_eq!(t.check_merge_rect(2, 2, 2, 3), cut_b);
+        /* Corners past the table. */
+        assert_eq!(
+            t.check_merge_rect(0, 0, 3, 0),
+            Err(TableError::RowOutOfRange { row: 3, rows: 3 })
+        );
+        assert_eq!(
+            t.check_merge_rect(0, 0, 0, 4),
+            Err(TableError::ColOutOfRange { col: 4, cols: 4 })
+        );
+    }
+
+    /// Issue #471 - a refused rectangle is a `TableError` the wire maps to
+    /// a message naming the region, not a panic or a silent success.
+    #[test]
+    fn crosses_merge_message_names_the_region() {
+        let msg = TableError::CrossesMerge {
+            top: 1,
+            left: 2,
+            bottom: 3,
+            right: 4,
+        }
+        .to_string();
+        assert!(msg.contains("rows 1-3, columns 2-4"), "{msg}");
     }
 
     /// `split_cell` is the true inverse of `merge_cells`: it restores
