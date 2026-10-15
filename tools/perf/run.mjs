@@ -18,9 +18,14 @@
  *   node run.mjs --hardware tier-1  — Tier-1 (stricter) budgets
  *   node run.mjs --strict           — a budget breach exits non-zero
  *
- * Requires the Vite dev server (`pnpm dev`, http://localhost:5173). Override
- * the origin with the URL env var. Uses Playwright with the system Chrome
- * (channel:'chrome') — no extra browser download.
+ * Issue #470 — needs the Vite dev server (the `window.__dispatch` hooks), and
+ * finds it the way `ts/playwright.config.ts` does (`tools/lib/port.mjs`): the
+ * `URL` env var, else `PW_PORT`, else a port hashed from this checkout's
+ * path (so a worktree never measures a sibling's server). When nothing
+ * answers there the harness boots `vite` itself, warms it with one
+ * throw-away load, and stops it on exit. The measured URL is the first line
+ * of the report. Uses Playwright with the system Chrome (channel:'chrome') —
+ * no extra browser download.
  *
  * Insert latency is measured on the one-page seeded document — the case the
  * §6 <8/16 ms budget targets. Per-keystroke cost on a multi-page document is
@@ -31,12 +36,12 @@ import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { ensureDevServerOrExit } from '../lib/dev-server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PERF_DOC = join(HERE, '..', '..', 'tests', 'perf', '50p.docx');
 /* Issue #379 — the table-heavy repaint fixture. */
 const TABLES_DOC = join(HERE, '..', '..', 'tests', 'perf', 'tables-30p.docx');
-const ORIGIN = process.env.URL ?? 'http://localhost:5173';
 
 const argv = process.argv.slice(2);
 const argValue = (flag, fallback) => {
@@ -76,7 +81,11 @@ function percentile(samples, p) {
     return sorted[Math.min(sorted.length - 1, Math.max(0, rank))];
 }
 
-console.log(`[perf] origin=${ORIGIN} hardware=${hardware} mode=${strict ? 'strict' : 'report'}`);
+const devServer = await ensureDevServerOrExit({ label: 'perf' });
+const ORIGIN = devServer.origin;
+console.log(
+    `[perf] origin=${devServer.describe()} hardware=${hardware} mode=${strict ? 'strict' : 'report'}`,
+);
 
 const browser = await chromium.launch({ headless: true, channel: 'chrome' });
 let coldStartMs = 0;
@@ -86,6 +95,20 @@ let samples = [];
 let openDocMs = null;
 let tables = null;
 try {
+    /* A server this run just booted has transformed nothing yet: its first
+       page load pays Vite's one-off module transforms (and the dependency
+       optimizer's reload), which is the dev server's warm-up, not the
+       editor's cold start. One throw-away load pays it, so the measured
+       cold start is the same quantity as against a server that was already
+       running. */
+    if (devServer.booted) {
+        const t = Date.now();
+        const warm = await (await browser.newContext()).newPage();
+        await warm.goto(ORIGIN, { waitUntil: 'load', timeout: 60000 });
+        await warm.waitForFunction(() => window.__paintIdle === true, { timeout: 60000 });
+        await warm.context().close();
+        console.log(`[perf] warm-up load of the freshly booted dev server: ${Date.now() - t} ms (not measured)`);
+    }
     const page = await (await browser.newContext()).newPage();
 
     /* --- Cold start to first paint --- */
@@ -186,6 +209,7 @@ try {
     }
 } finally {
     await browser.close();
+    await devServer.stop();
 }
 
 const p50 = percentile(samples, 50);

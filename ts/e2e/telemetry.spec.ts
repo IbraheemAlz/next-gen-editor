@@ -1,7 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
-import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { telemetrySinkPort } from '../../tools/lib/port.mjs';
 
 /* Issue #86 — D5.7 real telemetry transport.
  *
@@ -21,15 +21,10 @@ import { fileURLToPath } from 'node:url';
  * running this suite concurrently don't share one stateful sink process
  * (this file calls `POST /reset` mid-test, which would wipe another
  * worktree's in-flight samples). This spec and `playwright.config.ts` run
- * in separate processes with no shared state, so both independently
- * compute the identical port from the same algorithm + salt + range —
- * change one, change the other. */
+ * in separate processes with no shared state, so both compute the port
+ * from the one shared definition (issue #470: `tools/lib/port.mjs`). */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-function stablePortFor(seed: string, rangeStart: number, rangeSize: number): number {
-    const digest = createHash('sha256').update(seed).digest();
-    return rangeStart + (digest.readUInt32BE(0) % rangeSize);
-}
-const SINK_PORT = stablePortFor(`${REPO_ROOT}::telemetry-sink`, 4200, 800);
+const SINK_PORT = telemetrySinkPort(REPO_ROOT);
 const SINK_ORIGIN = `http://localhost:${SINK_PORT}`;
 
 async function resetSink(page: Page): Promise<void> {

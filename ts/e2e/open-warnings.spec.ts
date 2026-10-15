@@ -1,7 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
-import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { telemetrySinkPort } from '../../tools/lib/port.mjs';
 import { documentXml, storedDocx } from './helpers/docx';
 
 /* Issue #406 — the reader's warning report reaches the user and telemetry
@@ -115,14 +115,10 @@ test('a degraded open shows "Opened with N issues" listing MeasureClamped; a cle
 });
 
 /* Issue #205 — the sink's port is derived per checkout, exactly like
- * `telemetry.spec.ts` / `playwright.config.ts` (same algorithm + salt +
- * range — change one, change all). */
+ * `telemetry.spec.ts` / `playwright.config.ts` (one shared definition,
+ * issue #470: `tools/lib/port.mjs`). */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-function stablePortFor(seed: string, rangeStart: number, rangeSize: number): number {
-    const digest = createHash('sha256').update(seed).digest();
-    return rangeStart + (digest.readUInt32BE(0) % rangeSize);
-}
-const SINK_ORIGIN = `http://localhost:${stablePortFor(`${REPO_ROOT}::telemetry-sink`, 4200, 800)}`;
+const SINK_ORIGIN = `http://localhost:${telemetrySinkPort(REPO_ROOT)}`;
 
 test('the telemetry DOC_OPEN sample carries per-kind read-warning counts, codes only', async ({
     page,

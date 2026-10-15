@@ -1,0 +1,10 @@
+{
+  "name": "tools-lib",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared helpers for the tools/* harnesses and ts/playwright.config.ts: per-checkout port derivation (issue #205) and dev-server origin resolution + auto-boot (issue #470).",
+  "scripts": {
+    "test": "vitest run"
+  }
+}
