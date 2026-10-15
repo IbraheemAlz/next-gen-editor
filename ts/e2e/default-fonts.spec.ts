@@ -18,8 +18,8 @@ import { boot } from './helpers/editor';
 /** The boot seed `setupEngine` paints. */
 const SEED = 'Hello world مرحبا بالعالم';
 /** UTF-8 byte offsets into the seed paragraph. */
-const IN_LATIN = Buffer.byteLength('Hel', 'utf8');
-const IN_ARABIC = Buffer.byteLength('Hello world مر', 'utf8');
+const IN_LATIN = Buffer.byteLength(SEED.slice(0, 3), 'utf8');
+const IN_ARABIC = Buffer.byteLength(SEED.slice(0, SEED.indexOf('م') + 2), 'utf8');
 
 /** Collapse the engine caret at `(block 0, offset)`; the reply. */
 async function caretAt(page: Page, offset: number): Promise<any> {
@@ -83,7 +83,6 @@ test('#472: the declared defaults are what moves Latin - an empty table falls ba
 test('#472: crash recovery re-declares the defaults on the respawned engine', async ({ page }) => {
     test.setTimeout(60_000);
     await boot(page);
-    expect(SEED).toContain('Hello');
 
     await page.evaluate(() => (window as any).__engineClient.forceTrap());
     await page.waitForFunction(() => (window as any).__recovered === true, undefined, {
