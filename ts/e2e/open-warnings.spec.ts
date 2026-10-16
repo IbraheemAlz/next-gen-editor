@@ -73,12 +73,15 @@ test('a degraded open shows "Opened with N issues" listing MeasureClamped; a cle
     const reply = await open(page, DEGRADED, 'margins.docx');
     expect(reply.type).toBe('DOCUMENT_LOADED');
     const kinds = (reply.warnings as { kind: string }[]).map((w) => w.kind).sort();
-    expect(kinds).toEqual(['InvalidMeasure', 'MeasureClamped']);
+    /* #503: w:top="99999" is clamped to 31680 twips (one MeasureClamped), and the clamped
+     * 22-in top plus the bottom margin leave no text area on A4, so the reader's proportional
+     * margin repair moves top and bottom (two more). */
+    expect(kinds).toEqual(['InvalidMeasure', 'MeasureClamped', 'MeasureClamped', 'MeasureClamped']);
 
     const banner = page.locator('.nge-open-warnings');
     await expect(banner).toBeVisible();
     await expect(banner).toHaveAttribute('role', 'status');
-    await expect(banner).toContainText('Opened with 2 issues');
+    await expect(banner).toContainText('Opened with 4 issues');
     await expect(banner).toHaveAttribute('data-kinds', /MeasureClamped/);
 
     /* "Details" expands the list: the clamped margin with its raw value. */
@@ -94,8 +97,8 @@ test('a degraded open shows "Opened with N issues" listing MeasureClamped; a cle
     await page.keyboard.press('Control+Shift+D');
     const row = page.locator('.nge-hud__open-warnings');
     await expect(row).toBeVisible();
-    await expect(row).toContainText('2 (');
-    await expect(row).toContainText('MeasureClamped ×1');
+    await expect(row).toContainText('4 (');
+    await expect(row).toContainText('MeasureClamped ×3');
     await expect(row).toHaveClass(/nge-hud__warn/);
 
     /* Dismiss hides it for this open... */
@@ -144,7 +147,7 @@ test('the telemetry DOC_OPEN sample carries per-kind read-warning counts, codes 
     const sample = (await docOpens())[0]!;
     expect(sample.read_warnings).toEqual([
         { kind: 'InvalidMeasure', count: 1 },
-        { kind: 'MeasureClamped', count: 1 },
+        { kind: 'MeasureClamped', count: 3 },
     ]);
     /* Codes and counts only: no detail string (it echoes document bytes).
        Not a bare `99999` substring check: a float like `open_ms:
