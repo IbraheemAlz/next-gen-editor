@@ -29,7 +29,7 @@
 
 use crate::{
     Block, DocumentTree, InlineKind, LineHeight, PageGeometry, ParaProperties, Paragraph,
-    SectionProps, SpanStyle, TabStop, font_size_bounds, point_bounds,
+    SectionProps, SpanStyle, TabStop, border_bounds, font_size_bounds, point_bounds,
 };
 
 /// Pull `v` into `lo..=hi`; `1` when it moved.
@@ -64,12 +64,17 @@ pub fn repair_span_style_sizes(style: &mut SpanStyle) -> u32 {
     repair_size(&mut style.font_size) + repair_size(&mut style.font_size_cs)
 }
 
-fn repair_tab_stops(stops: &mut [TabStop]) -> u32 {
+fn repair_tab_stops(stops: &mut Vec<TabStop>) -> u32 {
     let max = point_bounds::MAX_POINT_FIELD_PT;
-    stops
+    /* Word's 64-stop list: keep the first 64 (the reader's rule), count
+    each stop dropped. */
+    let dropped = stops.len().saturating_sub(point_bounds::MAX_TAB_STOPS);
+    stops.truncate(point_bounds::MAX_TAB_STOPS);
+    let moved: u32 = stops
         .iter_mut()
         .map(|s| clamp_f32(&mut s.position_pt, -max, max, 0.0))
-        .sum()
+        .sum();
+    moved.saturating_add(u32::try_from(dropped).unwrap_or(u32::MAX))
 }
 
 fn repair_para_props(p: &mut ParaProperties) -> u32 {
@@ -87,6 +92,7 @@ fn repair_para_props(p: &mut ParaProperties) -> u32 {
     {
         n += clamp_i32(twips, -max, max);
     }
+    n += border_bounds::repair_cell_borders(&mut p.borders);
     n + repair_tab_stops(&mut p.tab_stops)
 }
 
@@ -117,7 +123,8 @@ fn repair_geometry(g: &mut PageGeometry) -> u32 {
 }
 
 fn repair_section(s: &mut SectionProps) -> u32 {
-    repair_geometry(&mut s.geometry)
+    border_bounds::repair_page_borders(&mut s.page_borders)
+        + repair_geometry(&mut s.geometry)
         + clamp_f32(
             &mut s.columns.gutter_pt,
             0.0,
@@ -160,8 +167,10 @@ fn repair_blocks<'a>(roots: impl Iterator<Item = &'a mut Block>) -> u32 {
         match block {
             Block::Paragraph(p) => n += repair_paragraph(p, &mut stack),
             Block::Table(t) => {
+                n += border_bounds::repair_cell_borders(&mut t.props.borders);
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
+                        n += border_bounds::repair_cell_borders(&mut cell.props.borders);
                         stack.extend(cell.blocks.iter_mut());
                     }
                 }
@@ -268,6 +277,31 @@ mod tests {
         assert_eq!(p.spans[0].style.font_size, Some(1638.0));
         assert_eq!(p.mark_style.as_ref().and_then(|m| m.font_size), Some(1.0));
         assert_eq!(p.props.tab_stops[1].position_pt, 0.0, "NaN resets to 0");
+        assert_eq!(doc.repair_bounds(), 0, "idempotent");
+    }
+
+    /// Word keeps 64 tab stops per paragraph: a restored list longer than
+    /// that keeps its first 64 (the reader's rule) and counts each stop it
+    /// dropped.
+    #[test]
+    fn a_tab_stop_list_is_cut_to_64() {
+        let mut doc = DocumentTree::from_text("hello");
+        {
+            let p = doc.blocks[0].as_paragraph_mut().expect("paragraph");
+            for i in 0..70 {
+                p.props.tab_stops.push(TabStop {
+                    position_pt: i as f32,
+                    kind: TabKind::Left,
+                    leader: TabLeader::None,
+                });
+            }
+        }
+        assert!(crate::first_point_field_beyond_bound(&doc).is_some());
+        assert_eq!(doc.repair_bounds(), 6);
+        assert_eq!(crate::first_point_field_beyond_bound(&doc), None);
+        let p = doc.blocks[0].as_paragraph().expect("paragraph");
+        assert_eq!(p.props.tab_stops.len(), 64);
+        assert_eq!(p.props.tab_stops[63].position_pt, 63.0, "the first 64");
         assert_eq!(doc.repair_bounds(), 0, "idempotent");
     }
 

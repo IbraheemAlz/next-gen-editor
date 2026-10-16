@@ -33,7 +33,24 @@ pub fn run_docx_reader(data: &[u8]) {
     let Some(bytes) = docx_gen::build_docx(&mut u) else {
         return;
     };
-    let _ = format_docx::read_docx(&bytes);
+    if let Ok(archive) = format_docx::read_docx(&bytes) {
+        assert_reads_inside_bounds(&archive, "docx_reader");
+    }
+    /* Issue #503 (residue) - and a second package of nothing but measures at
+    Word's edges (border widths, tab-stop lists, margins). */
+    if let Some(bytes) = docx_gen::build_measure_docx(&mut Unstructured::new(data))
+        && let Ok(archive) = format_docx::read_docx(&bytes)
+    {
+        assert_reads_inside_bounds(&archive, "docx_reader (measures)");
+    }
+}
+
+/// Issue #503 - whatever a file spelled, the model the reader built holds
+/// Word's bounds (point fields, border widths, tab-stop lists).
+fn assert_reads_inside_bounds(archive: &format_docx::DocxArchive, target: &str) {
+    if let Some(why) = engine::first_point_field_beyond_bound(&archive.document) {
+        panic!("{target}: the read model holds an out-of-bound field: {why}");
+    }
 }
 
 /// Issue #348 — the resource bounds the fuzz targets read raw packages
@@ -370,7 +387,8 @@ pub fn run_rpc_command(data: &[u8]) {
 }
 
 /// Issue #503 - the commands that can put a page size, margin, column
-/// gutter, indent, spacing, line height or tab stop into the model (the
+/// gutter, indent, spacing, line height, tab stop (or, residue, a border
+/// stroke width / a tab-stop list longer than 64) into the model (the
 /// ones `check_point_fields_for_fuzzing` is run after): the direct setters,
 /// a style edit, the doors that bring a whole document in (the `.docx`
 /// reader clamps per attribute and repairs margins that swallow the page;
@@ -386,6 +404,8 @@ fn touches_point_fields(cmd: &bridge::Command) -> bool {
             | C::SetParagraphIndent { .. }
             | C::SetLineSpacing { .. }
             | C::SetTabStops { .. }
+            | C::SetCellBorders { .. }
+            | C::SetParagraphBorders { .. }
             | C::ModifyStyle { .. }
             | C::InsertSectionBreak { .. }
             | C::PasteHtml { .. }

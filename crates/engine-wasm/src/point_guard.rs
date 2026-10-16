@@ -17,6 +17,7 @@
 //! | `SetParagraphIndent` | `start_pt` / `end_pt` / `first_line_pt` | `-1584 ..= 1584` |
 //! | `SetLineSpacing` | `multiplier` | `<= 0` (clear) or `0.06 ..= 132` |
 //! | `SetTabStops` | `stops[i].position_pt` | `-1584 ..= 1584` |
+//! | `SetTabStops` | `stops` (the list length) | at most 64 (issue #503 residue) |
 //! | `ModifyStyle` | `properties.para_props.{indent_start_pt, indent_end_pt, first_line_pt, line_spacing_multiplier}` | as the direct commands |
 //!
 //! (1584 pt = 22 in, Word's largest margin / indent / spacing / tab
@@ -34,7 +35,7 @@
 
 use bridge::{BridgeParaPropertiesPatch, Command, ErrorKind, Event};
 use engine::{
-    MAX_LINE_SPACING_MULTIPLE, MAX_POINT_FIELD_PT, MIN_LINE_SPACING_MULTIPLE,
+    MAX_LINE_SPACING_MULTIPLE, MAX_POINT_FIELD_PT, MAX_TAB_STOPS, MIN_LINE_SPACING_MULTIPLE,
     column_gutter_in_bound, indent_in_bound, line_spacing_multiple_in_bound, margin_in_bound,
     tab_position_in_bound,
 };
@@ -79,6 +80,15 @@ fn tab(field: &str, value: f32) -> Option<Refused> {
         range: format!(
             "-{MAX_POINT_FIELD_PT}..={MAX_POINT_FIELD_PT}, Word's tab position limits (22 in)"
         ),
+    })
+}
+
+/// Issue #503 (residue): Word holds at most 64 tab stops per paragraph.
+fn tab_count(field: &str, len: usize) -> Option<Refused> {
+    (len > MAX_TAB_STOPS).then(|| Refused {
+        field: field.to_string(),
+        value: len as f32,
+        range: format!("at most {MAX_TAB_STOPS} tab stops per paragraph, Word's limit"),
     })
 }
 
@@ -137,10 +147,13 @@ fn first_refused(cmd: &Command) -> Option<Refused> {
             .or_else(|| indent("end_pt", *end_pt))
             .or_else(|| indent("first_line_pt", *first_line_pt)),
         Command::SetLineSpacing { multiplier, .. } => multiple("multiplier", *multiplier),
-        Command::SetTabStops { stops, .. } => stops
-            .iter()
-            .enumerate()
-            .find_map(|(i, s)| tab(&format!("stops[{i}].position_pt"), s.position_pt)),
+        Command::SetTabStops { stops, .. } => tab_count("stops (tab stop count)", stops.len())
+            .or_else(|| {
+                stops
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, s)| tab(&format!("stops[{i}].position_pt"), s.position_pt))
+            }),
         Command::ModifyStyle { properties, .. } => {
             properties.para_props.as_ref().and_then(para_patch)
         }

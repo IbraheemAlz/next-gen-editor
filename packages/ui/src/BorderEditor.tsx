@@ -27,6 +27,12 @@ const BORDER_STYLES: BridgeBorderStyle[] = [
     'Dashed',
 ];
 
+/* Issue #503 — Word draws a line from 1/4 pt to 6 pt (`w:sz` 2..=48
+   eighths of a point); the engine refuses a drawn stroke outside it
+   (`OutOfRange`, `engine::border_bounds`). */
+const MIN_BORDER_EIGHTH_PT = 2;
+const MAX_BORDER_EIGHTH_PT = 48;
+
 type Edge = 'top' | 'right' | 'bottom' | 'left';
 const EDGES: Edge[] = ['top', 'right', 'bottom', 'left'];
 
@@ -138,13 +144,19 @@ export const BorderEditor: Component<BorderEditorProps> = (props) => {
                             id={`${props.idPrefix}-border-width`}
                             class="nge-form__input"
                             type="number"
-                            min={1}
-                            max={96}
+                            min={MIN_BORDER_EIGHTH_PT}
+                            max={MAX_BORDER_EIGHTH_PT}
                             step={1}
                             value={penWidthEighth()}
                             onInput={(e) =>
                                 setPenWidthEighth(
-                                    Math.max(1, parseInt(e.currentTarget.value, 10) || 4),
+                                    Math.min(
+                                        MAX_BORDER_EIGHTH_PT,
+                                        Math.max(
+                                            MIN_BORDER_EIGHTH_PT,
+                                            parseInt(e.currentTarget.value, 10) || 4,
+                                        ),
+                                    ),
                                 )
                             }
                             style={{ width: '72px' }}

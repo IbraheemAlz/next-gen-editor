@@ -171,6 +171,29 @@ paths:
   A NEW command field carrying such a measure must be added to
   `point_guard::first_refused`; `rpc_command` checks
   `check_point_fields_for_fuzzing` after every command that can set one.
+- **Border stroke widths and the tab-stop list (issue #503, residue).** Word
+  draws a line 1/4 pt ..= 6 pt (`w:sz` 2..=48 eighths of a point; a
+  `none` / `nil` edge paints nothing, so it may also be 0) and keeps 64 tab
+  stops per paragraph: `engine::border_bounds` (`MAX_BORDER_EIGHTH_PT` /
+  `MIN_BORDER_EIGHTH_PT`, `border_size_in_bound`, `clamp_border_eighth_pt`,
+  `first_border_beyond_bound`) and `point_bounds::MAX_TAB_STOPS` are the ONE
+  pair. The reader's `w:sz` on every paragraph / page / table / cell edge
+  (`ct_pbdr::border_size_eighth_pt` — `parse_pbdr_stroke` for `pBdr` +
+  `pgBorders`, `parts::table::parse_border_stroke` for `tblBorders` /
+  `tcBorders`; a digit string past `u16` clamps, it no longer reads as the
+  default 4) CLAMPS with `DocxWarning::MeasureClamped` (`w:top/@w:sz`, the
+  value in twips = eighths x 2.5; source bytes kept), the `<w:tabs>` reader
+  keeps the first 64 stops and reports one `MeasureClamped { attr: "w:tabs" }`
+  per list (`twips` = the kept count; `detail()` words it), HTML paste
+  clamps `border: Npx` (a non-finite number is no width), `engine-wasm`
+  `border_guard` REFUSES (`OutOfRange`, field named) a stroke width outside
+  the range on `SetCellBorders` / `SetParagraphBorders`
+  (`borders.<edge>.size_eighth_pt`) and `point_guard` a `SetTabStops` list
+  over 64 (`stops (tab stop count)`), and `repair_bounds` clamps / truncates on
+  restore. `first_point_field_beyond_bound` now covers both, so every
+  `rpc_command` / `snapshot_decode` / `docx_reader` invariant holds them. A NEW
+  command field carrying a `BridgeBorderStroke` must be added to
+  `border_guard::first_refused`; `w:bar` is not modelled (nothing to clamp).
 - **Restore and replay are doors too (issue #503, item 1).** A crash-recovery
   snapshot's bytes are neither guarded nor read by the reader, so
   `Engine::restore_snapshot` runs `DocumentTree::repair_bounds`

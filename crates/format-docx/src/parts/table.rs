@@ -1347,9 +1347,7 @@ fn parse_border_stroke(e: &BytesStart) -> BorderStroke {
         "none" | "nil" => BorderStyle::None,
         other => BorderStyle::Other(other.to_owned()),
     };
-    let size_eighth_pt = attr_val(e, b"w:sz")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
+    let size_eighth_pt = crate::schema::ct_pbdr::border_size_eighth_pt(e, &style, 4);
     let color = attr_val(e, b"w:color").and_then(|v| parse_hex_color(&v));
     BorderStroke {
         style,

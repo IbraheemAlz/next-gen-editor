@@ -26,9 +26,13 @@ fn eighth_pt_to_css_px(eighth_pt: u16) -> f32 {
     (eighth_pt as f32) / 6.0
 }
 
+/// Issue #503 (residue): a pasted CSS width is clamped into Word's
+/// 1/4 pt ..= 6 pt (`engine::border_bounds`) - `0` would round-trip as
+/// "no border", and `border: 1e30px solid` is not a line Word can draw.
+/// `px` is finite (the caller drops a `NaN` / `inf` token).
 fn css_px_to_eighth_pt(px: f32) -> u16 {
-    /* `0` would round-trip as "no border"; clamp upward. */
-    (px * 6.0).round().max(1.0) as u16
+    let eighths = (px * 6.0).round().clamp(0.0, f32::from(u16::MAX)) as u16;
+    crate::clamp_border_eighth_pt(&BorderStyle::Single, eighths)
 }
 
 /// CSS `border-style` token for an OOXML border style.
@@ -804,7 +808,11 @@ fn parse_border_shorthand(v: &str) -> Option<BorderStroke> {
     let mut style: Option<BorderStyle> = None;
     let mut color: Option<[u8; 4]> = None;
     for tok in parts {
-        if let Some(num) = tok.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
+        if let Some(num) = tok
+            .strip_suffix("px")
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|n| n.is_finite())
+        {
             size_eighth_pt = Some(css_px_to_eighth_pt(num));
         } else if let Some(c) = parse_css_color(tok) {
             color = Some(c);
@@ -1646,6 +1654,42 @@ mod tests {
     }
 
     /// Round-trip the cell shading + top-border through HTML and back.
+    /// Issue #503 (residue): a pasted border width lands inside Word's
+    /// 1/4 pt ..= 6 pt (2..=48 eighths of a point) whatever the CSS says -
+    /// hostile numbers clamp, a non-finite one is no width (the default).
+    #[test]
+    fn pasted_border_widths_clamp_into_words_range() {
+        let width = |css: &str| -> u16 {
+            let html = format!(
+                r#"<table><tr><td style="border-top:{css} solid #000">c</td></tr></table>"#
+            );
+            let blocks = from_html_blocks(&html);
+            let Some(Block::Table(t)) = blocks.iter().find(|b| matches!(b, Block::Table(_))) else {
+                panic!("table for {css}")
+            };
+            t.rows[0].cells[0]
+                .props
+                .borders
+                .as_ref()
+                .and_then(|b| b.top.as_ref())
+                .map(|s| s.size_eighth_pt)
+                .unwrap_or_else(|| panic!("a top stroke for {css}"))
+        };
+        assert_eq!(width("1px"), 6);
+        assert_eq!(width("8px"), 48, "6 pt itself");
+        assert_eq!(width("8.2px"), 48, "49 eighths -> 48");
+        assert_eq!(width("1e30px"), 48);
+        assert_eq!(width("99999px"), 48);
+        assert_eq!(width("0px"), 2, "a drawn line is at least 1/4 pt");
+        assert_eq!(width("0.01px"), 2);
+        assert_eq!(width("-5px"), 2);
+        /* A non-finite number is no width: the 4-eighth default. */
+        assert_eq!(width("NaNpx"), 4);
+        assert_eq!(width("infpx"), 4);
+        assert_eq!(css_px_to_eighth_pt(f32::MAX), 48);
+        assert_eq!(css_px_to_eighth_pt(f32::MIN), 2);
+    }
+
     /// Shading and the OOXML border eighth-point stroke survive within
     /// ±1 eighth-pt of rounding (CSS px → eighth-pt has 6:1 ratio).
     #[test]

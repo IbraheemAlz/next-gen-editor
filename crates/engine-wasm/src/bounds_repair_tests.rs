@@ -177,6 +177,105 @@ fn an_engine_authored_snapshot_repairs_nothing() {
     assert_eq!(counts(&evt), (1, 0, 0));
 }
 
+/// Issue #503 (residue): border stroke widths (paragraph, table, cell, page)
+/// and the tab-stop list length are repaired on restore like every other
+/// bounded field, and a border-width refusal in the tail counts as refused.
+#[test]
+fn restore_clamps_border_widths_and_cuts_the_tab_list() {
+    use engine::{
+        Block, BorderStroke, BorderStyle, CellBorders, CellProperties, PageBorders, Table,
+        TableCell, TableProperties, TableRow,
+    };
+    let stroke = |style, size| {
+        Some(BorderStroke {
+            style,
+            size_eighth_pt: size,
+            ..Default::default()
+        })
+    };
+    let mut doc = DocumentTree::from_text("hello world");
+    {
+        let p = doc.blocks[0].as_paragraph_mut().expect("paragraph");
+        p.props.borders = Some(CellBorders {
+            top: stroke(BorderStyle::Single, 8191),
+            bottom: stroke(BorderStyle::Double, 0),
+            ..Default::default()
+        });
+        for i in 0..80 {
+            p.props.tab_stops.push(TabStop {
+                position_pt: i as f32,
+                kind: TabKind::Left,
+                leader: TabLeader::None,
+            });
+        }
+    }
+    let cell = TableCell {
+        props: CellProperties {
+            borders: Some(CellBorders {
+                left: stroke(BorderStyle::Dashed, 49),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    doc.blocks.push_back(Block::Table(Table {
+        props: TableProperties {
+            borders: Some(CellBorders {
+                inside_v: stroke(BorderStyle::Single, u16::MAX),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        rows: vec![TableRow {
+            cells: vec![cell],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    doc.body_section.page_borders = Some(PageBorders {
+        left: stroke(BorderStyle::Single, 96),
+        ..Default::default()
+    });
+    assert!(engine::first_point_field_beyond_bound(&doc).is_some());
+    let bytes = Engine::new_headless(doc)
+        .snapshot_bytes()
+        .expect("snapshot");
+
+    let mut e = engine_over(DocumentTree::from_text("fresh"));
+    let evt = recover(
+        &mut e,
+        bytes,
+        vec![Command::SetParagraphBorders {
+            range: BridgeLogicalRange {
+                start: bpos_top(0, 0),
+                end: bpos_top(0, 5),
+            },
+            borders: bridge::BridgeCellBorders {
+                top: Some(bridge::BridgeBorderStroke {
+                    style: bridge::BridgeBorderStyle::Single,
+                    size_eighth_pt: 4000,
+                    color: None,
+                }),
+                ..Default::default()
+            },
+        }],
+    );
+    let (applied, repaired, refused) = counts(&evt);
+    /* paragraph top + bottom (drawn 0), 16 stops cut, cell left, table
+    inside-V, page left. */
+    assert_eq!(repaired, 5 + 16, "{repaired}");
+    assert_eq!((applied, refused), (1, 1), "the 4000-eighth tail command");
+    assert_eq!(e.check_point_fields_for_fuzzing(), Ok(()));
+    let doc = e.undo.current();
+    let p = doc.blocks[0].as_paragraph().expect("paragraph");
+    let b = p.props.borders.as_ref().expect("borders");
+    assert_eq!(b.top.as_ref().map(|s| s.size_eighth_pt), Some(48));
+    assert_eq!(b.bottom.as_ref().map(|s| s.size_eighth_pt), Some(2));
+    assert_eq!(p.props.tab_stops.len(), 64);
+    assert_eq!(p.props.tab_stops[63].position_pt, 63.0);
+}
+
 #[test]
 fn an_undo_step_does_not_bring_a_hostile_value_back() {
     /* A hostile value in an UNDO entry is repaired too (and not counted:

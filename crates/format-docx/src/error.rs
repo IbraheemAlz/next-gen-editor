@@ -176,6 +176,11 @@ impl DocxWarning {
                 format!("tables nested {limit} or more levels deep kept as-is")
             }
             DocxWarning::InvalidMeasure { attr, value } => format!("{attr} = \"{value}\""),
+            /* Issue #503 (residue): a tab-stop LIST longer than Word's 64
+            keeps its first 64 - `twips` carries the kept count. */
+            DocxWarning::MeasureClamped { attr, value, twips } if attr == "w:tabs" => {
+                format!("{attr} holds {value}; the first {twips} are kept")
+            }
             DocxWarning::MeasureClamped { attr, value, twips } => {
                 format!("{attr} = \"{value}\" → {twips} twips")
             }

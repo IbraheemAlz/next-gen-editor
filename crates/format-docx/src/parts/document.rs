@@ -1532,6 +1532,9 @@ pub(crate) fn parse_document_xml_with_events(
     fold into `direct_ppr`. */
     let mut in_pbdr = false;
     let mut in_tabs = false;
+    /* Issue #503 (residue) - stops past Word's 64 per paragraph, dropped
+    (the first 64 are kept) and reported when `<w:tabs>` closes. */
+    let mut tab_stops_dropped: u32 = 0;
     /* Issue #352 — `<w:pBdr>` `<w:start>` / `<w:end>` edges, held until
     the paragraph's direction is final (after the style cascade). */
     let mut pbdr_logical = PbdrLogical::default();
@@ -2933,7 +2936,11 @@ pub(crate) fn parse_document_xml_with_events(
                     /* Audit gap A.M3 — `<w:tabs>` per-stop children. */
                     n if in_ppr && in_tabs && n == b"w:tab" => {
                         if let Some(stop) = parse_tab_stop(&e) {
-                            direct_ppr.tab_stops.push(stop);
+                            if direct_ppr.tab_stops.len() < engine::MAX_TAB_STOPS {
+                                direct_ppr.tab_stops.push(stop);
+                            } else {
+                                tab_stops_dropped = tab_stops_dropped.saturating_add(1);
+                            }
                         }
                     }
                     n if in_ppr
@@ -3192,7 +3199,20 @@ pub(crate) fn parse_document_xml_with_events(
                     }
                     b"w:numPr" => in_num_pr = false,
                     b"w:pBdr" => in_pbdr = false,
-                    b"w:tabs" => in_tabs = false,
+                    b"w:tabs" => {
+                        in_tabs = false;
+                        if tab_stops_dropped > 0 {
+                            warn(DocxWarning::MeasureClamped {
+                                attr: "w:tabs".to_string(),
+                                value: format!(
+                                    "{} tab stops",
+                                    engine::MAX_TAB_STOPS as u64 + u64::from(tab_stops_dropped)
+                                ),
+                                twips: engine::MAX_TAB_STOPS as i64,
+                            });
+                            tab_stops_dropped = 0;
+                        }
+                    }
                     /* Issue #120 — a block-level container closes: its
                     envelope lands on its first / last inner block (or, with
                     no inner block, rides whole as one verbatim fragment). A

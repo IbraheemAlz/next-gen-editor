@@ -532,6 +532,11 @@ fn main() -> ExitCode {
     let mut margin_repair_docs = 0usize;
     let mut point_clamp_docs = 0usize;
     let mut point_clamp_values = 0usize;
+    /* Issue #503 (residue) - border widths clamped to 2..=48 eighths of a
+    point, tab-stop lists cut to 64. */
+    let mut border_clamp_docs = 0usize;
+    let mut border_clamp_values = 0usize;
+    let mut tab_clamp_docs = 0usize;
     /* Issue #318 — production-layout timings `(ms, label)`, the
     documents that blew the budget, and a degradation-reason histogram. */
     let mut engine_times: Vec<(u128, String)> = Vec::new();
@@ -701,6 +706,13 @@ fn main() -> ExitCode {
         if rec.point_field_clamps > 0 {
             point_clamp_docs += 1;
             point_clamp_values += rec.point_field_clamps;
+        }
+        if rec.border_width_clamps > 0 {
+            border_clamp_docs += 1;
+            border_clamp_values += rec.border_width_clamps;
+        }
+        if rec.tab_list_clamps > 0 {
+            tab_clamp_docs += 1;
         }
 
         if let Some(t) = &rec.theme_fonts {
@@ -897,6 +909,11 @@ fn main() -> ExitCode {
         "[corpus-native] page/paragraph point fields clamped to Word's 22 in (#503): \
          {point_clamp_docs} documents, {point_clamp_values} attribute values; margins repaired \
          because they swallowed the page: {margin_repair_docs} documents"
+    );
+    println!(
+        "[corpus-native] border widths clamped to Word's 2..=48 eighths of a point (#503): \
+         {border_clamp_docs} documents, {border_clamp_values} w:sz values; tab-stop lists cut \
+         to 64: {tab_clamp_docs} documents"
     );
     println!(
         "[corpus-native] font substitution (#329): {substituting_docs}/{} documents substitute \
