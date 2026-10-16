@@ -1250,3 +1250,192 @@ fn a_hostile_numbering_start_keeps_markers_bounded() {
         assert!(m.len() <= 16, "marker of {} bytes", m.len());
     }
 }
+
+/* ------------------------------------------------------------------ */
+/* Issue #459 — wrap polygon vertices                                  */
+/* ------------------------------------------------------------------ */
+
+/// A body paragraph holding a floating picture whose `wp:wrapTight`
+/// polygon is `vertices` (the `<wp:start>` + `<wp:lineTo>` children).
+fn polygon_document(vertices: &str) -> String {
+    let body = format!(
+        concat!(
+            r#"<w:p><w:r><w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" "#,
+            r#"simplePos="0" relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">"#,
+            r#"<wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+            r#"<wp:extent cx="914400" cy="457200"/>"#,
+            r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="1">{vertices}</wp:wrapPolygon></wp:wrapTight>"#,
+            r#"<wp:docPr id="1" name="P"/>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+            r#"<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+            r#"<pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic>"#,
+            r#"</a:graphicData></a:graphic></wp:anchor></w:drawing></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>tail</w:t></w:r></w:p>"#,
+        ),
+        vertices = vertices
+    );
+    document(&body, SECT)
+}
+
+const SQUARE_POLYGON: &str = concat!(
+    r#"<wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/>"#,
+    r#"<wp:lineTo x="21600" y="0"/><wp:lineTo x="0" y="0"/>"#,
+);
+
+fn floating_anchor(a: &crate::DocxArchive) -> &engine::FloatAnchor {
+    a.document.blocks[0]
+        .as_paragraph()
+        .expect("the drawing paragraph")
+        .inline_objects[0]
+        .anchor
+        .as_deref()
+        .expect("a floating picture")
+}
+
+/// The reader's warnings about a polygon coordinate, as report lines.
+fn measure_details(a: &crate::DocxArchive) -> Vec<String> {
+    a.warnings
+        .iter()
+        .filter(|w| {
+            matches!(
+                w,
+                DocxWarning::InvalidMeasure { .. } | DocxWarning::EmuClamped { .. }
+            )
+        })
+        .map(DocxWarning::detail)
+        .collect()
+}
+
+/// Issue #459 — a valid polygon reads whole (in the 21600-unit shape
+/// space), reports nothing and round-trips byte-identical.
+#[test]
+fn a_valid_wrap_polygon_reads_whole_and_round_trips_byte_identical() {
+    let archive = assert_zero_edit_identity(&polygon_document(SQUARE_POLYGON));
+    let a = floating_anchor(&archive);
+    assert_eq!(a.wrap, engine::WrapKind::Tight);
+    assert_eq!(
+        a.wrap_polygon.as_deref(),
+        Some(&[(0, 0), (0, 21600), (21600, 21600), (21600, 0), (0, 0)][..])
+    );
+    assert_eq!(measure_details(&archive), Vec::<String>::new());
+    /* A vertex slightly outside the shape space (Word writes these) is a
+    valid coordinate too. */
+    let archive = assert_zero_edit_identity(&polygon_document(concat!(
+        r#"<wp:start x="-120" y="0"/><wp:lineTo x="21720" y="0"/>"#,
+        r#"<wp:lineTo x="10800" y="21600"/>"#,
+    )));
+    assert_eq!(
+        floating_anchor(&archive).wrap_polygon.as_deref(),
+        Some(&[(-120, 0), (21720, 0), (10800, 21600)][..])
+    );
+    assert_eq!(measure_details(&archive), Vec::<String>::new());
+}
+
+/// Issue #459 — a malformed vertex (`NaN`, `inf`, text, empty, or an
+/// absent `x` / `y`) is `InvalidMeasure` and the polygon falls back to the
+/// extent rectangle (`None`): never a partial polygon. The source element
+/// still rides verbatim, so the zero-edit save is byte-identical.
+#[test]
+fn a_malformed_wrap_polygon_vertex_drops_the_polygon_and_is_reported() {
+    for bad in ["NaN", "inf", "-inf", "abc", "", "1e400", "12px"] {
+        for (attr, vertices) in [
+            (
+                "wp:lineTo/@x",
+                format!(
+                    r#"<wp:start x="0" y="0"/><wp:lineTo x="{bad}" y="21600"/><wp:lineTo x="21600" y="0"/>"#
+                ),
+            ),
+            (
+                "wp:start/@y",
+                format!(
+                    r#"<wp:start x="0" y="{bad}"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="0"/>"#
+                ),
+            ),
+        ] {
+            let archive = assert_zero_edit_identity(&polygon_document(&vertices));
+            let a = floating_anchor(&archive);
+            assert_eq!(a.wrap, engine::WrapKind::Tight, "{bad}");
+            assert_eq!(a.wrap_polygon, None, "{bad}: never a partial polygon");
+            assert!(
+                a.wrap_xml.as_deref().is_some_and(|x| x.contains(&vertices)),
+                "{bad}: the source element is kept verbatim"
+            );
+            assert_eq!(
+                measure_details(&archive),
+                vec![format!("{attr} = \"{bad}\"")],
+                "{bad}"
+            );
+        }
+    }
+    /* Absent coordinates and a vertex with two bad values: each reported. */
+    let archive = assert_zero_edit_identity(&polygon_document(
+        r#"<wp:start x="0" y="0"/><wp:lineTo y="21600"/><wp:lineTo x="NaN" y="inf"/>"#,
+    ));
+    assert_eq!(floating_anchor(&archive).wrap_polygon, None);
+    assert_eq!(
+        measure_details(&archive),
+        vec![
+            r#"wp:lineTo/@x = """#.to_string(),
+            r#"wp:lineTo/@x = "NaN""#.to_string(),
+            r#"wp:lineTo/@y = "inf""#.to_string(),
+        ]
+    );
+}
+
+/// Issue #459 — a finite vertex past ±22 in is clamped and reported
+/// (`EmuClamped`, like every other DrawingML coordinate): the polygon keeps
+/// every vertex, the source bytes stay.
+#[test]
+fn an_out_of_range_wrap_polygon_vertex_is_clamped_and_reported() {
+    let vertices = concat!(
+        r#"<wp:start x="0" y="0"/><wp:lineTo x="99999999999" y="21600"/>"#,
+        r#"<wp:lineTo x="21600" y="-99999999999"/>"#,
+    );
+    let archive = assert_zero_edit_identity(&polygon_document(vertices));
+    assert_eq!(
+        floating_anchor(&archive).wrap_polygon.as_deref(),
+        Some(&[(0, 0), (20_116_800, 21600), (21600, -20_116_800)][..]),
+        "every vertex kept, the two offenders clamped"
+    );
+    assert_eq!(
+        measure_details(&archive),
+        vec![
+            r#"wp:lineTo/@x = "99999999999" → 20116800 EMU"#.to_string(),
+            r#"wp:lineTo/@y = "-99999999999" → -20116800 EMU"#.to_string(),
+        ]
+    );
+}
+
+/// Issue #459 — after the polygon fell back to the extent rectangle, an
+/// edit that regenerates the wrap element writes Word's full-rectangle
+/// polygon (`edited="0"`), never a half of the broken one.
+#[test]
+fn a_dropped_polygon_regenerates_as_the_extent_rectangle() {
+    let archive = read_docx(&package_with_document_xml(
+        &polygon_document(
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="NaN" y="21600"/><wp:lineTo x="21600" y="0"/>"#,
+        ),
+        &[],
+    ))
+    .expect("read");
+    let edited = archive.document.set_floating_image_wrap_at(
+        &engine::BlockPath::top(0),
+        0,
+        engine::WrapKind::Through,
+        false,
+    );
+    let saved = write_docx(&archive, &edited).expect("write");
+    let xml = document_xml_of(&saved);
+    assert!(
+        xml.contains(concat!(
+            r#"<wp:wrapThrough wrapText="bothSides"><wp:wrapPolygon edited="0">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/>"#,
+            r#"<wp:lineTo x="21600" y="21600"/><wp:lineTo x="21600" y="0"/>"#,
+            r#"<wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapThrough>"#,
+        )),
+        "{xml}"
+    );
+    assert!(!xml.contains("NaN"), "{xml}");
+}

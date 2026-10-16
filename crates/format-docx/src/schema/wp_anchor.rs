@@ -24,7 +24,7 @@ use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
 use super::ct_rpr::attr_val;
-use super::measure::{EMU_COORD, EMU_EXTENT, attr_emu, text_emu};
+use super::measure::{EMU_COORD, EMU_EXTENT, attr_emu, attr_emu_required, text_emu};
 
 /// Which positioning axis is open while the reader walks an anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,14 +227,24 @@ pub type WrapFragment = (WrapKind, WrapText, Option<Vec<(i64, i64)>>);
 /// Issue #82 — the typed content of one captured wrap element: its kind
 /// (by root element name), `wrapText`, and the `<wp:wrapPolygon>` vertices
 /// (`<wp:start>` then every `<wp:lineTo>`, in document order). `None` for
-/// a fragment whose root is not a wrap element. Tolerant: an unparsable
-/// coordinate drops that vertex, never the whole element.
+/// a fragment whose root is not a wrap element.
+///
+/// Issue #459 — vertex coordinates (`ST_Coordinate`, Word's 21600-unit
+/// shape space) go through the validating EMU reader like every other
+/// DrawingML coordinate: a finite value past ±22 in is clamped and
+/// reported (`DocxWarning::EmuClamped`); a malformed one (`NaN`, `inf`,
+/// text, or an absent `x` / `y`) is `DocxWarning::InvalidMeasure` and the
+/// WHOLE polygon is dropped (`None` — layout falls back to the object's
+/// extent rectangle, the writer keeps the source element verbatim). A
+/// polygon is never partial: silently losing a vertex used to reshape the
+/// wrap with no warning at all.
 pub fn parse_wrap_fragment(xml: &str) -> Option<WrapFragment> {
     let mut reader = Reader::from_str(xml);
     let mut kind: Option<WrapKind> = None;
     let mut text = WrapText::BothSides;
     let mut poly: Vec<(i64, i64)> = Vec::new();
     let mut saw_poly = false;
+    let mut malformed = false;
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
@@ -248,9 +258,13 @@ pub fn parse_wrap_fragment(xml: &str) -> Option<WrapFragment> {
                 match q {
                     b"wp:wrapPolygon" => saw_poly = true,
                     b"wp:start" | b"wp:lineTo" => {
-                        let c = |k: &[u8]| attr_val(&e, k).and_then(|v| v.trim().parse().ok());
-                        if let (Some(x), Some(y)) = (c(b"x"), c(b"y")) {
-                            poly.push((x, y));
+                        /* Both read (and reported) even when the first is
+                        bad: one vertex can carry two malformed values. */
+                        let x = attr_emu_required(&e, b"x", EMU_COORD);
+                        let y = attr_emu_required(&e, b"y", EMU_COORD);
+                        match (x, y) {
+                            (Some(x), Some(y)) => poly.push((x, y)),
+                            _ => malformed = true,
                         }
                     }
                     _ => {}
@@ -260,7 +274,7 @@ pub fn parse_wrap_fragment(xml: &str) -> Option<WrapFragment> {
             Ok(_) => {}
         }
     }
-    let polygon = (saw_poly && !poly.is_empty()).then_some(poly);
+    let polygon = (saw_poly && !malformed && !poly.is_empty()).then_some(poly);
     kind.map(|k| (k, text, polygon))
 }
 

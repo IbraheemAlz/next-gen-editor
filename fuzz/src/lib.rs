@@ -303,6 +303,18 @@ pub fn run_rpc_command(data: &[u8]) {
             "live selection escaped the document bounds after {}",
             variant_name(&keep)
         );
+        /* Issue #459 - a command that authors or moves a picture never
+        leaves one past Word's 22 in (model extent / offset and laid-out
+        image rect). */
+        if touches_images(&keep)
+            && let Err(why) = engine.check_image_bounds_for_fuzzing()
+        {
+            panic!(
+                "{} left a picture past the 22 in bound: {why} [{}]",
+                variant_name(&keep),
+                format!("{evt:?}").chars().take(160).collect::<String>()
+            );
+        }
     }
     /* Issue #467 — and whatever the sequence left, saving it yields no
     forbidden character (a typed refusal is a different invariant's). */
@@ -314,7 +326,26 @@ pub fn run_rpc_command(data: &[u8]) {
     // over whatever the command sequence left the document as.
     if engine.ensure_layout_for_fuzzing().is_ok() {
         let _ = engine.rasterize_last_layout_for_fuzzing();
+        /* Issue #459 - and the laid-out document of the whole sequence
+        holds no picture past the bound. */
+        if let Err(why) = engine.check_image_bounds_for_fuzzing() {
+            panic!("the sequence left a picture past the 22 in bound: {why}");
+        }
     }
+}
+
+/// Issue #459 - the commands that author, resize, move or re-wrap a
+/// picture (the ones `check_image_bounds_for_fuzzing` is run after).
+fn touches_images(cmd: &bridge::Command) -> bool {
+    use bridge::Command as C;
+    matches!(
+        cmd,
+        C::InsertImage { .. }
+            | C::ResizeImage { .. }
+            | C::MoveImage { .. }
+            | C::SetImageWrap { .. }
+            | C::PasteHtml { .. }
+    )
 }
 
 /// Issue #467 — a `.docx` the engine handed back (`Event::DocumentSaved`)

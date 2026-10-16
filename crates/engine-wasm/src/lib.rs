@@ -52,6 +52,9 @@ mod paragraph_cache_key;
 mod pdf_semantics;
 mod read_report;
 pub(crate) use paragraph_cache_key::paragraph_layout_key;
+/// Issue #459 — the command-boundary EMU range guard (picture extents and
+/// offsets stay inside Word's 22 in).
+mod emu_guard;
 mod table_cache;
 /// Issue #467 — the command-boundary text guard (control characters,
 /// noncharacters) every text-bearing command passes through.
@@ -8310,6 +8313,12 @@ impl Engine {
         if let Err(refused) = text_input_guard::sanitize_command(&mut cmd) {
             return *refused;
         }
+        /* Issue #459 - and the same for drawing sizes: an integer EMU
+        extent / offset past Word's 22 in (`i64::MAX` reached layout as a
+        box ~10^14 px wide) is refused `OutOfRange` before any handler. */
+        if let Err(refused) = emu_guard::check_command(&cmd) {
+            return *refused;
+        }
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
         }
@@ -15164,9 +15173,10 @@ impl Engine {
         height_emu: i64,
     ) -> Event {
         /* A sane extent: positive and at most 22 inches on either axis
-        (Word's own shape limit), so a malformed request never reaches
-        layout. */
-        const MAX_EMU: i64 = 22 * 914_400;
+        (Word's own shape limit, `engine::MAX_DRAWING_EMU` - issue #459
+        shares it with the image commands), so a malformed request never
+        reaches layout. */
+        const MAX_EMU: i64 = engine::MAX_DRAWING_EMU;
         if self.story_active() {
             return Event::error_kind(
                 bridge::ErrorKind::InStory,
@@ -17961,6 +17971,12 @@ impl Engine {
             }
         };
 
+        /* Issue #459 - a natural size (`Original`, a decoder-reported
+        `u32` px count) or an extreme aspect under `FitWidth` can still
+        pass Word's 22 in: scale it down, keeping the aspect ratio, so no
+        picture the engine authors is wider or taller than the reader
+        would accept. */
+        let (w_emu, h_emu) = engine::fit_extent_within_bound(w_emu, h_emu);
         let engine_blob = engine::ImageBlob {
             content_type: image.mime,
             data: image.bytes,
@@ -19006,6 +19022,47 @@ impl Engine {
         /* Issue #283 — every revision range inside its paragraph, on
         char boundaries. */
         engine::check_revision_ranges(self.undo.current())?;
+        Ok(())
+    }
+
+    /// Issue #459 - no picture the session holds may pass Word's 22 in:
+    /// the document model (body, cells, text-box stories) carries no
+    /// extent outside `0..=MAX_DRAWING_EMU` and no fixed offset outside
+    /// +-`MAX_DRAWING_EMU` ([`engine::first_image_beyond_bound`]), and no
+    /// image rect in the laid-out document (inline, floating, in a box) is
+    /// wider or taller than that bound at the current scale. Kept apart
+    /// from [`Self::check_invariants_for_fuzzing`]: a hostile snapshot may
+    /// legitimately restore to anything (`snapshot_decode`), the COMMAND
+    /// path must not produce it (`rpc_command`). `Err` names the first
+    /// violation; a document that has no layout yet checks the model only.
+    pub fn check_image_bounds_for_fuzzing(&self) -> Result<(), String> {
+        if let Some(why) = engine::first_image_beyond_bound(self.undo.current()) {
+            return Err(format!(
+                "the document model holds an out-of-bound picture: {why}"
+            ));
+        }
+        let Ok(rects) = self.image_geometry() else {
+            return Ok(());
+        };
+        /* Layout px = pt x scale; a hair of slack for the f32 division. */
+        let limit = engine::emu_to_pt(engine::MAX_DRAWING_EMU) * self.scale() * 1.001 + 1.0;
+        for r in &rects {
+            /* `!(x <= limit)` also refuses a NaN. */
+            if !(r.rect.w <= limit && r.rect.h <= limit) {
+                return Err(format!(
+                    "an image rect ({} x {} px at {:?}) passes the 22 in bound ({limit} px)",
+                    r.rect.w, r.rect.h, r.path
+                ));
+            }
+            if !(0..=engine::MAX_DRAWING_EMU).contains(&r.width_emu)
+                || !(0..=engine::MAX_DRAWING_EMU).contains(&r.height_emu)
+            {
+                return Err(format!(
+                    "an image rect reports an extent {} x {} EMU past the 22 in bound",
+                    r.width_emu, r.height_emu
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -29842,6 +29899,11 @@ mod mutation_signal_tests;
 /// Issue #471 - `MergeCells` vs the merged regions that already exist.
 #[cfg(all(test, feature = "fuzz-native"))]
 mod table_merge_tests;
+
+/// Issue #459 - `ResizeImage` / `MoveImage` EMU fields vs Word's 22 in
+/// (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod emu_guard_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;
