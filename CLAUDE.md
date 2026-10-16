@@ -151,12 +151,27 @@ D5.10 are external/human sign-offs, not code.
   goldens under `tools/visual-diff/golden/`.
 - **Memory snapshot (D5.2).** `tools/memory-profile/run.mjs` loads each
   `tests/perf/{50,100,250,500}p.docx` and checks the engine WASM heap + JS
-  heap against the §5 budgets. `tools/perf-fixtures` (a workspace crate)
-  generates those `.docx` files with `build_minimal_docx`.
+  heap against the §5 budgets and, since issue #476, against measured
+  **regression pins** (§5 budgets sit 5-10x above the real footprint; pin =
+  three quiet release runs x 1.5, rule in the `PINS` comment). `Np.docx` must
+  LAY OUT to N pages in the shell: the run prints each fixture's page count
+  and `--budgets` fails when one is > 10 % off nominal.
+  `tools/perf-fixtures` (a workspace crate) generates those `.docx` files with
+  `build_minimal_docx`; `PARAS_PER_PAGE` (6) is a calibration against the line
+  pitch + font stack, not a property of the text — re-calibrate it (module
+  docs) when a pitch change moves the page counts (it had drifted to 3.3x
+  after #329 / #475). It also emits
+  `crates/engine-wasm/tests/fixtures/long_single_section.docx`, the frozen
+  1000-paragraph anchor the engine-wasm layout fingerprint pins read, so a
+  perf re-calibration never re-pins them.
 - **Performance harness (D5.3).** `tools/perf/run.mjs` measures cold start,
   insert-char p95 (one-page seeded doc) and open-50p-doc against §6 tier
-  budgets. `--strict` gates cold start + insert p95; open-doc is reported but
-  **ungated** — it was bounded by incremental relayout, which shipped in Phase 5 (see "Where the deferred work landed" below).
+  budgets. `--strict` gates cold start, worker boot, SAB transfer, insert p95
+  and (issue #476) open-50p — it opens in tens of ms since incremental
+  relayout shipped, so the old "ungated" excuse expired — and fails when
+  `50p.docx` no longer lays out to ~50 pages. The timing budgets stay at the
+  §6 contract values: insert p95 on a shared box spreads 5-13 ms between
+  identical runs, too wide to pin tighter.
 - **PDF/A-1b (D5.4).** `format-pdf` emits true PDF/A-1b for `PdfProfile::A1b`;
   `crates/format-pdf/build.rs` synthesizes the sRGB ICC profile — no binary
   blob in the tree. `tools/pdf-validate` is the veraPDF harness.
@@ -352,7 +367,7 @@ Engine backlog" references a real issue.
 - `wasm-pack build --release` then assert artifact `< 15728640` bytes.
 - `cargo run -p shape-regression --release` — 0 failed on the corpus.
   **CI-enforced since issue #287** (`rust-native`, ~4 s warm).
-- `cargo run -p roundtrip --release` — PASS, and `-- --fixtures` (33
+- `cargo run -p roundtrip --release` — PASS, and `-- --fixtures` (47
   fixtures). **CI-enforced since issue #287** (`rust-native`, ~40 s warm +
   <1 s); the step tees its output to `roundtrip-dump/*.log`, uploaded as the
   `roundtrip-dump` artifact on failure (the harness has no separate
@@ -547,8 +562,9 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
   --no-run` — because `wasm-pack test` builds the whole test module for
   wasm32 and a native-only `cfg` on a helper that tests use breaks CI while
   every native gate stays green (2026-09-25 incident).
-  Disk is the binding constraint on this 8-core / 15 GB box: the shared
-  `target/` alone is ~20 GB.
+  Disk is the binding constraint on this 32-core / 128 GB box (the data
+  volume, not RAM): a private `target-private/` per worktree is ~8 GB and
+  the gate's `target-main/` ~17 GB — delete stale `target*/` dirs first.
   Playwright ports are per-checkout too (issue #205): `ts/playwright.config.ts`
   derives its port from a stable hash of the absolute repo path (5200–5999)
   instead of a fixed 5173, so a sibling worktree's already-running Vite

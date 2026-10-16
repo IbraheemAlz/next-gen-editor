@@ -133,19 +133,17 @@ hard failure so CI catches a new loop instead of a silent recovery.
   `docx.md`), but a restored snapshot or an old logged command can still
   hold any size: the clamp is the structural defence, the progress-bounded
   expansion below the backstop.
-- **One expansion routine, progress-bounded (issues #499 / #501).** Every
-  growth of the lazy band that must reach a depth - a caret move, a click on
-  a page past the band (`lazy_nav.rs`), and the scroll-driven paint
-  (`RequestPaint`, `ExpandLayout`, the paint after `SetViewport`:
-  `do_request_paint` -> `Engine::lazy_expand_to_viewport`) - goes through
-  `Engine::lazy_nav_expand_until`. A round that raised the target yet left
-  the band no taller and no block fewer unlaid is a stall: the routine stops
-  negotiating, falls back to ONE full layout and records
-  `LayoutDegradeReason::NavExpansionStalled` (document-level, rides the next
-  `Painted`). Never add a second grow-until loop beside it. The test hook
-  `CULL_CLAMP_OFF` (`cfg(test)`) switches the #501 clamp off so
-  `oversize_line_tests` can still prove the fallback now that the clamp
-  makes the stall unreachable from a line.
+- **One expansion routine (issues #499 / #501).** Every growth of the lazy
+  band that must reach a depth - a caret move, a click on a page past the
+  band (`lazy_nav.rs`), and the scroll-driven paint (`RequestPaint`,
+  `ExpandLayout`, the paint after `SetViewport`: `do_request_paint` ->
+  `Engine::lazy_expand_to_viewport`, a cache hit while the band reaches
+  `min_target_y`) - goes through `Engine::lazy_nav_expand_until` (the #499
+  progress bound and `NavExpansionStalled` fallback, below). Never add a
+  second grow-until loop beside it. The test hook `CULL_CLAMP_OFF`
+  (`cfg(test)`) switches the #501 clamp off so `oversize_line_tests` can
+  still prove the fallback now that the clamp makes the stall unreachable
+  from a line.
 - A band's geometry must be self-consistent where it stops: never cull
   right behind a keep-with-next paragraph (issue #95), and mark pages
   that a pending pass will still rewrite — a continuous section's column
@@ -155,6 +153,14 @@ hard failure so CI catches a new loop instead of a silent recovery.
 - The nominal path stays output-identical: `geometry_fingerprint` pins
   the pre-watchdog geometry for every paginator and engine fixture. A
   self-defense change that moves a pinned fingerprint moves the goldens.
+- **A deeper cull target is not a full layout (issue #499).** The
+  viewport cull compares the paginator's RUNNING height (an oversize
+  line's cursor can run far past its page), not the band's page sizes,
+  so a band can stay put under any finite target. A loop that grows the
+  band (`lazy_nav_expand_until`) is bounded by band PROGRESS — more pages
+  or fewer unlaid blocks per round, else ONE target-less
+  `build_pages(None)` noted `NavExpansionStalled` — never by "the target
+  will get big enough".
 - **Bound slow progress, not only churn (issue #318).** The watchdog
   catches non-progress; a recursion that re-does a subtree per ancestor
   pass makes progress and still never finishes (nested-table autofit

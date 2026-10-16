@@ -1185,7 +1185,8 @@ pub struct EngineCapabilities {
 /// Memory + performance counters, re-emitted on `Command::RequestStats`.
 /// Issue #87 — why a paint was laid out degraded. Mirrors
 /// `layout::DegradeReason` one-to-one (the engine maps at the bridge
-/// boundary; the layout crate has no serde).
+/// boundary; the layout crate has no serde), plus the engine-level notes
+/// the paginator cannot raise (`NavExpansionStalled`, issue #499).
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum LayoutDegradeReason {
@@ -1256,11 +1257,12 @@ pub enum LayoutDegradeReason {
     /// its post-conditions and the table was re-laid from scratch.
     /// Distinct from `CacheMismatch` (the paragraph cache).
     TableCacheMismatch,
-    /// Issues #499 / #501 — a synchronous band expansion (a caret move,
-    /// a click, a scroll-driven `ExpandLayout` / paint) stopped making
-    /// progress: the band grew no taller and no block was laid for a
-    /// round, because the running height passed every finite cull target.
-    /// The engine fell back to one full layout (document-level, no page).
+    /// Issue #499 — a navigation-driven band expansion (`MoveCaret`,
+    /// `PageDown`, a hit-test past the band) raised the cull target and
+    /// the band did not grow: the cull's running height (an oversize line
+    /// can push the paginator's cursor far past its page) stays above any
+    /// deeper target. The engine fell back to one full layout instead of
+    /// raising the target forever.
     NavExpansionStalled,
 }
 

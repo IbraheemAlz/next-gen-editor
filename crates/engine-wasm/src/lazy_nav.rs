@@ -13,11 +13,16 @@
 //! `.claude/rules/render.md` (`verify_prefix_open`, the keep-with-next cull
 //! deferral and provisional pages all apply unchanged) — and repeat with a
 //! geometrically growing target until the predicate holds or the layout is
-//! full. Bounded: the target at least doubles past the band each round, a
-//! full layout satisfies every predicate, and the round cap falls back to
-//! one full layout. The reply of the command is then built over the grown
-//! band, so it already carries the final caret and geometry — one
-//! round-trip, no shell retry.
+//! full. Bounded twice (`.claude/rules/render.md`, issue #87 / #499): by
+//! construction — every round must grow the band (more pages or fewer
+//! unlaid blocks); a round that does not means no deeper target can (the
+//! cull's running height sits above the band, e.g. an oversize line), and
+//! the loop falls back to ONE target-less full layout, noted as
+//! `NavExpansionStalled` — and by the round cap, which takes the same
+//! fallback. A target-less build never culls, so the fallback always
+//! ends the loop; a hard iteration cap backstops even that. The reply of
+//! the command is then built over the grown band, so it already carries
+//! the final caret and geometry — one round-trip, no shell retry.
 
 use super::*;
 
@@ -32,9 +37,28 @@ const NAV_PAGES_AHEAD: usize = 1;
 /// (the cold-open band × 2^24); a full layout always ends the loop sooner.
 const MAX_EXPAND_ROUNDS: u32 = 24;
 
-/// A cull target (layout pt at scale 1) no document reaches: the band
-/// becomes a full layout. Finite so `× scale` stays finite.
-const FULL_LAYOUT_TARGET_PT: f32 = 1.0e30;
+/// Issue #499 — the hard cap on builds inside one expansion: every band
+/// round plus the one target-less fallback. Unreachable while the
+/// fallback is target-less (it never culls); hitting it keeps the band
+/// as it is (navigation then resolves on the nearest laid line) and
+/// notes `NavExpansionStalled` — never a hang.
+const MAX_EXPAND_BUILDS: u32 = MAX_EXPAND_ROUNDS + 2;
+
+/// Ceiling of a band's cull target (layout pt at scale 1), so the
+/// doubling and `× scale` stay finite. Reaching it does NOT make the band
+/// a full layout (issue #499: the cull compares the paginator's running
+/// height, which an oversize line can push past any target) — the
+/// target-less fallback of [`Engine::lazy_nav_expand_until`] does.
+const MAX_BAND_TARGET_PT: f32 = 1.0e30;
+
+/// What one expansion round lays out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NavBuild {
+    /// A viewport-culled band at `min_target_y`.
+    Band,
+    /// A full layout: no cull target at all.
+    Full,
+}
 
 /// Height of a laid band in device px (inter-page gaps included).
 fn band_height_px(s: &LayoutSnapshot, gap: f32) -> f32 {
@@ -109,9 +133,21 @@ impl Engine {
     /// pt at scale 1; it is floored at one `LAYOUT_BUFFER_PT` past both the
     /// band's end and the current target, so a round is never a no-op bump
     /// (the #65 retry was one whenever its A4 guess fell short of the
-    /// existing target). Later rounds double the target. Returns whether
+    /// existing target). Later rounds double the target. `None` asks for
+    /// the whole document straight away (`Ctrl+End`). Returns whether
     /// `min_target_y` moved — the caller then repaints so the new pages
     /// reach the shell.
+    ///
+    /// Issue #499 — bounded BY CONSTRUCTION, not by the target: the floor
+    /// puts the cull budget past the band's end, so a band whose content
+    /// stays inside its pages always grows. A round that leaves the band
+    /// exactly as it was (same pages, same unlaid blocks) proves the cull's
+    /// running height sits above any target (an oversize line's cursor
+    /// runs far past its page — the #499 input set a 1e33 pt font), so
+    /// raising the target again could never help: the loop falls back to
+    /// one target-less full layout (`NavBuild::Full`, which never culls)
+    /// and notes `NavExpansionStalled` on it. The round cap takes the same
+    /// fallback, and [`MAX_EXPAND_BUILDS`] backstops the whole loop.
     ///
     /// After a round that ends in a FULL layout, `min_target_y` is lowered
     /// back to the real document height (never below where it started):
@@ -121,20 +157,31 @@ impl Engine {
     /// on `is_full_layout`), so lowering it costs no rebuild.
     fn lazy_nav_expand_until(
         &mut self,
-        first_target_pt: f32,
+        first_target_pt: Option<f32>,
         covered: impl Fn(&LayoutSnapshot) -> bool,
     ) -> Result<bool, Box<Event>> {
         let scale = self.scale().max(f32::MIN_POSITIVE);
         let gap = render::scene::PAGE_GAP_PT * scale;
         let start = self.lazy_layout.min_target_y;
-        let mut want = first_target_pt;
+        let mut build = if first_target_pt.is_some() {
+            NavBuild::Band
+        } else {
+            NavBuild::Full
+        };
+        let mut want = first_target_pt.unwrap_or(MAX_BAND_TARGET_PT);
         let mut rounds = 0u32;
-        /* Band height and unlaid block count after the previous round. */
-        let mut last: Option<(f32, u32)> = None;
+        let mut builds = 0u32;
+        let mut stalled = false;
+        /* The band's progress mark after the previous round. */
+        let mut last_mark: Option<(usize, u32)> = None;
         loop {
-            let target = Some(self.lazy_layout.min_target_y * scale);
+            builds += 1;
+            let target = match build {
+                NavBuild::Band => Some(self.lazy_layout.min_target_y * scale),
+                NavBuild::Full => None,
+            };
             self.ensure_layout_snapshot(scale, false, target)?;
-            let (done, full, band_pt, remaining) = {
+            let (done, full, band_pt, mark) = {
                 let snap = self.layout_snapshot.borrow();
                 let s = snap
                     .as_ref()
@@ -144,67 +191,51 @@ impl Engine {
                     full || covered(s),
                     full,
                     band_height_px(s, gap) / scale,
-                    s.info.remaining_blocks,
+                    (s.pages.len(), s.info.remaining_blocks),
                 )
             };
-            if done {
-                if full && self.lazy_layout.min_target_y > band_pt.max(start) {
-                    self.lazy_layout.min_target_y = band_pt.max(start);
+            let capped = !done && builds >= MAX_EXPAND_BUILDS;
+            if stalled || capped {
+                self.note_nav_expansion_stalled();
+            }
+            if done || capped {
+                if full {
+                    let floor = band_pt.max(start);
+                    if build == NavBuild::Full || self.lazy_layout.min_target_y > floor {
+                        self.lazy_layout.min_target_y = floor;
+                    }
                 }
                 return Ok(self.lazy_layout.min_target_y != start);
             }
-            /* The progress bound: a round that raised the target but laid
-            no more (the band no taller, no block fewer unlaid) means the
-            running height already passes every target - no finite one
-            will clear it. Stop negotiating: one full layout, noted. */
-            if let Some((prev_band, prev_remaining)) = last
-                && band_pt <= prev_band
-                && remaining >= prev_remaining
-            {
-                self.lazy_nav_fall_back_to_full_layout(scale)?;
-                let full_pt = {
-                    let snap = self.layout_snapshot.borrow();
-                    let s = snap
-                        .as_ref()
-                        .expect("ensure_layout_snapshot populated the memo");
-                    band_height_px(s, gap) / scale
-                };
-                if self.lazy_layout.min_target_y > full_pt.max(start) {
-                    self.lazy_layout.min_target_y = full_pt.max(start);
-                }
-                return Ok(self.lazy_layout.min_target_y != start);
-            }
-            last = Some((band_pt, remaining));
             rounds += 1;
-            if rounds > MAX_EXPAND_ROUNDS {
-                /* Backstop: one full layout ends the loop. */
-                want = FULL_LAYOUT_TARGET_PT;
+            /* By construction: the floor below put this round's budget
+            past the previous band's end, so an unchanged band is a proof
+            that no target grows it. */
+            stalled = last_mark == Some(mark);
+            last_mark = Some(mark);
+            if stalled || rounds > MAX_EXPAND_ROUNDS {
+                build = NavBuild::Full;
+                continue;
             }
             let floor = band_pt.max(self.lazy_layout.min_target_y) + LAYOUT_BUFFER_PT;
-            self.lazy_layout.min_target_y = want.max(floor);
-            want = (2.0 * self.lazy_layout.min_target_y).min(FULL_LAYOUT_TARGET_PT);
+            self.lazy_layout.min_target_y = want.max(floor).min(MAX_BAND_TARGET_PT);
+            want = (2.0 * self.lazy_layout.min_target_y).min(MAX_BAND_TARGET_PT);
         }
     }
 
-    /// Issues #499 / #501 — the stalled expansion's way out: one full
-    /// layout (no cull), carrying a `NavExpansionStalled` note that rides
-    /// the snapshot to the next `Painted`. The full snapshot then serves
-    /// every later target (`ensure_layout_snapshot` short-circuits on it).
-    fn lazy_nav_fall_back_to_full_layout(&mut self, scale: f32) -> Result<(), Box<Event>> {
-        self.ensure_layout_snapshot(scale, false, None)?;
-        if let Some(s) = self.layout_snapshot.borrow_mut().as_mut()
-            && !s
-                .info
-                .degradations
-                .iter()
-                .any(|d| d.reason == LayoutDegradeReason::NavExpansionStalled)
-        {
-            s.info.degradations.push(LayoutDegraded {
+    /// Issue #499 — record a stalled navigation expansion on the laid
+    /// snapshot, so the next `Painted` carries it (`layout_degraded`) like
+    /// every other layout self-defense note.
+    fn note_nav_expansion_stalled(&self) {
+        if let Some(s) = self.layout_snapshot.borrow_mut().as_mut() {
+            let note = LayoutDegraded {
                 reason: LayoutDegradeReason::NavExpansionStalled,
                 page: None,
-            });
+            };
+            if !s.info.degradations.contains(&note) {
+                s.info.degradations.push(note);
+            }
         }
-        Ok(())
     }
 
     /// Issue #462 — make the band cover a caret at `pos`: its block's last
@@ -233,7 +264,7 @@ impl Engine {
             last_page_of_block(s, block).map_or(0.0, |k| page_bottom_px(s, k, gap) / scale)
                 + LAYOUT_BUFFER_PT
         };
-        self.lazy_nav_expand_until(first, |s| band_covers_block(s, block))
+        self.lazy_nav_expand_until(Some(first), |s| band_covers_block(s, block))
     }
 
     /// Issue #462 — `Ctrl+End`: lay out the whole document (one full
@@ -242,7 +273,7 @@ impl Engine {
         if !self.lazy_nav_active() {
             return Ok(false);
         }
-        self.lazy_nav_expand_until(FULL_LAYOUT_TARGET_PT, |_| false)
+        self.lazy_nav_expand_until(None, |_| false)
     }
 
     /// Issue #501 — scroll-driven growth through the same routine. A paint
@@ -250,11 +281,10 @@ impl Engine {
     /// to reach `min_target_y` — the high-water mark `SetViewport` /
     /// `ExpandLayout` raise. The paginator's cull normally satisfies that
     /// in the one build the paint makes anyway; when it cannot (a running
-    /// height that passes every target: a page or a line no finite target
-    /// clears — a restored tree can hold one) the band did not grow and
-    /// nothing said so. Here the band is checked first and, only when it
-    /// falls short, grown by [`Self::lazy_nav_expand_until`] — its
-    /// progress bound, full-layout fallback and degradation note apply
+    /// height that passes every target) the band did not grow and nothing
+    /// said so. Here the band is checked first and, only when it falls
+    /// short, grown by [`Self::lazy_nav_expand_until`] — its progress
+    /// bound, full-layout fallback and `NavExpansionStalled` note apply
     /// unchanged. Returns whether `min_target_y` moved.
     pub(crate) fn lazy_expand_to_viewport(&mut self) -> Result<bool, Box<Event>> {
         if !self.lazy_nav_active() {
@@ -276,7 +306,7 @@ impl Engine {
                 return Ok(false);
             }
         }
-        self.lazy_nav_expand_until(want_pt, reaches)
+        self.lazy_nav_expand_until(Some(want_pt), reaches)
     }
 
     /// Issue #65 — make the band reach body page `page_idx` (0-based). The
@@ -308,7 +338,7 @@ impl Engine {
         /* The clicked page must be COMPLETE (not the page the cull
         stopped in), or a click low on it would resolve onto the last
         laid line above. */
-        self.lazy_nav_expand_until(first, |s| complete_pages(s) >= want_pages)
+        self.lazy_nav_expand_until(Some(first), |s| complete_pages(s) >= want_pages)
     }
 
     /// The tallest page (layout pt) any section of the document uses.
@@ -407,7 +437,7 @@ impl Engine {
         if down && self.lazy_nav_active() {
             /* Settled pages down to one line past the target depth. */
             let need = target_y + cur_h;
-            self.lazy_nav_expand_until(need / scale + LAYOUT_BUFFER_PT, |s| {
+            self.lazy_nav_expand_until(Some(need / scale + LAYOUT_BUFFER_PT), |s| {
                 let complete = complete_pages(s);
                 complete > 0 && page_bottom_px(s, complete - 1, gap) >= need
             })?;
@@ -829,6 +859,224 @@ mod tests {
         let engine = test_engine_with_doc(lines_doc(4));
         assert!(
             (engine.tallest_section_page_pt() - engine::PageGeometry::a4().height).abs() < 0.01
+        );
+    }
+
+    /// Issue #499 — a document the cull can never grow past: block 1 is
+    /// laid at a 1e33 pt font (the fuzz input's `ApplyFormatting`), so the
+    /// paginator's running height behind it sits above ANY finite cull
+    /// target while the band itself stays two pages tall. Blocks after it
+    /// are never laid by a band.
+    fn stalled_band_doc() -> DocumentTree {
+        let mut d = DocumentTree::from_text("Opening paragraph.");
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "Huge".to_string(),
+                spans: vec![engine::StyleRun {
+                    start: 0,
+                    end: 4,
+                    style: engine::SpanStyle {
+                        font_size: Some(1.0e33),
+                        ..Default::default()
+                    },
+                }],
+                ..Default::default()
+            }));
+        for i in 0..6 {
+            d.blocks
+                .push_back(engine::Block::Paragraph(engine::Paragraph {
+                    text: format!("Tail paragraph {i}."),
+                    ..Default::default()
+                }));
+        }
+        d
+    }
+
+    /// The #499 engine over [`stalled_band_doc`], caret collapsed inside
+    /// the LAST block (which no band reaches).
+    fn stalled_band_engine() -> Engine {
+        let mut engine = test_engine_with_doc(stalled_band_doc());
+        small_band(&mut engine);
+        let last = engine.undo.current().blocks.len() as u32 - 1;
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(last, 3),
+            caret: bpos_top(last, 3),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let scale = engine.scale();
+        engine
+            .ensure_layout_snapshot(scale, false, Some(engine.lazy_layout.min_target_y * scale))
+            .expect("cold band");
+        engine
+    }
+
+    fn noted_stall(engine: &Engine) -> bool {
+        let snap = engine.layout_snapshot.borrow();
+        snap.as_ref()
+            .expect("snapshot")
+            .info
+            .degradations
+            .iter()
+            .any(|d| d.reason == LayoutDegradeReason::NavExpansionStalled)
+    }
+
+    /// Acceptance (#499): the band really is stuck — a cull target far
+    /// past the document's laid height still culls behind the oversize
+    /// paragraph — so only a target-less build can lay the tail.
+    #[test]
+    fn the_stalled_band_culls_at_any_finite_target() {
+        let engine = stalled_band_engine();
+        let scale = engine.scale();
+        let (pages, full) = snapshot_pages(&engine);
+        assert!(!full, "the cold band is culled");
+        engine
+            .ensure_layout_snapshot(scale, false, Some(MAX_BAND_TARGET_PT * scale))
+            .expect("deep band");
+        assert_eq!(
+            snapshot_pages(&engine),
+            (pages, false),
+            "a 1e30 pt target lays nothing more: the cull compares the running height"
+        );
+    }
+
+    /// Acceptance (#499): `MoveCaret { Left, extend: true }` with the caret
+    /// past a band that cannot grow returns (it used to raise the cull
+    /// target forever), falls back to ONE full layout, notes
+    /// `NavExpansionStalled` on it and extends the selection by one
+    /// character.
+    #[test]
+    fn shift_left_past_a_stalled_band_falls_back_to_a_full_layout() {
+        let mut engine = stalled_band_engine();
+        let last = engine.undo.current().blocks.len() as u32 - 1;
+        let evt = move_via_dispatch(&mut engine, MoveDirection::Left, true);
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let (_, full) = snapshot_pages(&engine);
+        assert!(full, "the fallback is a full layout");
+        assert!(noted_stall(&engine), "the stall is reported, never silent");
+        let sel = engine.selection.as_ref().expect("selection");
+        assert_eq!(sel.anchor, bpos_top(last, 3), "extend keeps the anchor");
+        assert_eq!(sel.caret.path, bpos_top(last, 0).path);
+        assert!(
+            sel.caret.offset < 3,
+            "the caret stepped left: {:?}",
+            sel.caret
+        );
+        assert!(
+            engine.lazy_layout.min_target_y.is_finite()
+                && engine.lazy_layout.min_target_y < MAX_BAND_TARGET_PT,
+            "the high-water mark is the real height, not the backstop target"
+        );
+    }
+
+    /// Issue #499 — every other expansion over the same document ends too:
+    /// `Ctrl+End` (a direct target-less build), `PageDown` and a hit-test
+    /// past the band (`lazy_nav_reach_page`).
+    #[test]
+    fn every_expansion_over_a_stalled_band_terminates() {
+        let mut engine = stalled_band_engine();
+        let evt = move_via_dispatch(&mut engine, MoveDirection::DocEnd, false);
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(snapshot_pages(&engine).1, "Ctrl+End lays out every block");
+        assert_eq!(
+            caret_block(&engine) as usize,
+            engine.undo.current().blocks.len() - 1
+        );
+
+        let mut engine = stalled_band_engine();
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        for _ in 0..4 {
+            let evt = move_via_dispatch(&mut engine, MoveDirection::PageDown, false);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        }
+
+        let mut engine = stalled_band_engine();
+        let (pages, _) = snapshot_pages(&engine);
+        engine
+            .lazy_nav_reach_page(pages as u32 + 3)
+            .expect("reach a page past the band");
+    }
+
+    /// Issue #499 — the smoke sweep's input #3196 in its command shape
+    /// (the `repro_499_nav_expansion_stalled` corpus seed), driven through
+    /// the real dispatcher: a 1e33 pt font, a table after it, a
+    /// word-delete, then `MoveCaret { Left, extend: true }`. Before the
+    /// move the band is provably stuck (a 1e30 pt target lays nothing
+    /// more — the pre-#499 loop's backstop round repeated forever); the
+    /// move returns, over one full layout noted `NavExpansionStalled`,
+    /// and the move's repaint carries the note.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn repro_499_shift_left_after_an_oversize_font_and_a_table_returns() {
+        let mut engine = Engine::new_headless(DocumentTree::from_text(""));
+        let size = TextAttrsPatch {
+            bold: None,
+            italic: None,
+            underline: None,
+            strike: None,
+            font_family: None,
+            font_size: Some(1.095_157_5e33),
+            color: None,
+            bg_color: None,
+            script: None,
+            language: None,
+            caps: None,
+            small_caps: None,
+            font_slot: None,
+        };
+        for cmd in [
+            Command::InsertText {
+                at: None,
+                text: "Huge".to_string(),
+            },
+            Command::SelectAll,
+            Command::ApplyFormatting {
+                range: None,
+                attrs: size,
+            },
+            Command::InsertTable {
+                at: bridge::BlockPath::top(1),
+                rows: 5,
+                cols: 4,
+            },
+            Command::DeleteAtCaret {
+                forward: false,
+                by_word: true,
+            },
+        ] {
+            let evt = engine.apply_sync(cmd);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        }
+        let scale = engine.scale();
+        engine
+            .ensure_layout_snapshot(scale, false, Some(MAX_BAND_TARGET_PT * scale))
+            .expect("deep band");
+        assert!(
+            !snapshot_pages(&engine).1,
+            "the band is stuck: a 1e30 pt target still culls behind the oversize line"
+        );
+        let evt = engine.apply_sync(Command::MoveCaret {
+            direction: MoveDirection::Left,
+            extend: true,
+        });
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(snapshot_pages(&engine).1, "fell back to one full layout");
+        assert!(noted_stall(&engine), "the stall is reported, never silent");
+        assert!(engine.selection_is_valid());
+        /* The move repainted over the grown band: its paint carries it. */
+        assert!(
+            engine
+                .last_paint_dims
+                .layout_degraded
+                .iter()
+                .any(|d| d.reason == LayoutDegradeReason::NavExpansionStalled),
+            "{:?}",
+            engine.last_paint_dims.layout_degraded
         );
     }
 

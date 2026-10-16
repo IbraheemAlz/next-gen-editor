@@ -304,11 +304,17 @@ pub enum Scenario {
     /// existing merge (refused), then one that encloses it (absorbed):
     /// every row's span sum must stay equal to the grid width.
     TableMergeCrossesMerge,
+    /// Issue #499 - the smoke-sweep input (#3196) that never returned: a
+    /// paragraph set at a 1e33 pt font keeps the paginator's running
+    /// height above any cull target, so `MoveCaret { Left, extend }` from
+    /// a table past the band raised the target forever. Now one full
+    /// layout noted `NavExpansionStalled`.
+    NavExpansionStalled,
 }
 
 impl Scenario {
     /// Every scenario, in the fixed order [`Scenario::index`] encodes.
-    pub const ALL: [Scenario; 14] = [
+    pub const ALL: [Scenario; 15] = [
         Scenario::NanZoom,
         Scenario::NanDeviceScale,
         Scenario::BadRenderDate,
@@ -326,6 +332,8 @@ impl Scenario {
         Scenario::PatternedUnderlineGiantImage,
         // Issue #471 - appended, same rule.
         Scenario::TableMergeCrossesMerge,
+        // Issue #499 - appended, same rule.
+        Scenario::NavExpansionStalled,
     ];
 
     /// The committed corpus file this scenario's seed lives at, relative
@@ -346,6 +354,7 @@ impl Scenario {
             Scenario::SelectionClampAfterUndo => "repro_117_undo_repaint_error",
             Scenario::PatternedUnderlineGiantImage => "repro_422_patterned_underline_giant_image",
             Scenario::TableMergeCrossesMerge => "repro_471_merge_crosses_merge",
+            Scenario::NavExpansionStalled => "repro_499_nav_expansion_stalled",
         }
     }
 
@@ -696,6 +705,46 @@ impl Scenario {
                     merge(0, 0, 2, 2),
                 ]
             }
+            Scenario::NavExpansionStalled => vec![
+                Command::InsertText {
+                    at: None,
+                    text: "Huge".to_string(),
+                },
+                Command::SelectAll,
+                // The reproducer's exact size.
+                Command::ApplyFormatting {
+                    range: None,
+                    attrs: TextAttrsPatch {
+                        bold: None,
+                        italic: None,
+                        underline: None,
+                        strike: None,
+                        font_family: None,
+                        font_size: Some(1.095_157_5e33),
+                        color: None,
+                        bg_color: None,
+                        script: None,
+                        language: None,
+                        caps: None,
+                        small_caps: None,
+                        font_slot: None,
+                    },
+                },
+                // After the oversize paragraph: no band reaches the table.
+                Command::InsertTable {
+                    at: BlockPath::top(1),
+                    rows: 5,
+                    cols: 4,
+                },
+                Command::DeleteAtCaret {
+                    forward: false,
+                    by_word: true,
+                },
+                Command::MoveCaret {
+                    direction: MoveDirection::Left,
+                    extend: true,
+                },
+            ],
         }
     }
 
@@ -1685,6 +1734,26 @@ mod tests {
             0,
             "every row's span sum equals the grid width"
         );
+    }
+
+    /// Issue #499 (`repro_499_nav_expansion_stalled`) - every command
+    /// returns (the final `MoveCaret` used to never return), and the
+    /// move extends the selection: the anchor stays, the caret moves.
+    #[test]
+    fn nav_expansion_over_a_stalled_band_returns() {
+        let (engine, events) = apply_scenario(Scenario::NavExpansionStalled);
+        assert_eq!(events.len(), 6, "{events:?}");
+        assert!(
+            matches!(events[3], Event::SelectionChanged { .. }),
+            "the table is inserted: {:?}",
+            events[3]
+        );
+        assert!(
+            matches!(events[5], Event::SelectionChanged { .. }),
+            "Shift+Left answers: {:?}",
+            events[5]
+        );
+        assert!(engine.selection_is_valid());
     }
 
     /// Issue #117/#261 (`repro_117_1`) — `SetSelection` with a wildly
