@@ -40,6 +40,7 @@
 //! documents, recovery — [`LayoutCache::clear`]).
 
 use super::*;
+use crate::paragraph_cache::{ParagraphCache, paragraph_box_bytes};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
@@ -60,14 +61,14 @@ const TABLE_CACHE_MAX_INTRINSIC: usize = 16384;
 /// keep addressing it directly; [`LayoutCache::clear`] — the call every
 /// "layout inputs changed wholesale" site makes — clears both.
 pub(crate) struct LayoutCache {
-    pub(crate) paragraphs: LruCache<u64, ParagraphBox>,
+    pub(crate) paragraphs: ParagraphCache,
     pub(crate) tables: TableCache,
 }
 
 impl LayoutCache {
-    pub(crate) fn new(paragraph_cap: NonZeroUsize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            paragraphs: LruCache::new(paragraph_cap),
+            paragraphs: ParagraphCache::new(),
             tables: TableCache::new(),
         }
     }
@@ -80,7 +81,7 @@ impl LayoutCache {
 }
 
 impl std::ops::Deref for LayoutCache {
-    type Target = LruCache<u64, ParagraphBox>;
+    type Target = ParagraphCache;
     fn deref(&self) -> &Self::Target {
         &self.paragraphs
     }
@@ -645,19 +646,6 @@ pub(crate) fn table_box_bytes(table: &TableBox) -> usize {
                     LayoutBlock::Table(t) => table_box_bytes(t),
                 };
             }
-        }
-    }
-    bytes
-}
-
-fn paragraph_box_bytes(p: &ParagraphBox) -> usize {
-    use std::mem::size_of;
-    let mut bytes = size_of::<ParagraphBox>();
-    for line in &p.lines {
-        bytes += size_of::<LineBox>();
-        for run in &line.runs {
-            bytes += size_of::<layout::VisualRun>()
-                + run.glyphs.len() * size_of::<layout::PositionedGlyph>();
         }
     }
     bytes
