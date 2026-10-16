@@ -10682,7 +10682,9 @@ impl Engine {
                     let pag_h = paginator.as_ref().map_or(0.0, |p| {
                         p.emitted_pages_height()
                             + p.page_count_emitted() as f32 * gap
-                            + p.cursor_y()
+                            /* Issue #501 - a line taller than its page
+                            adds at most that page to the height. */
+                            + p.cursor_y_within_page()
                     });
                     if height_so_far(&emitted_pages, pag_h) >= budget {
                         culled = true;
@@ -11753,6 +11755,12 @@ impl Engine {
         let bottom_pt = (viewport.y + viewport.h) / self.scale();
         if bottom_pt > self.lazy_layout.min_target_y {
             self.lazy_layout.min_target_y = bottom_pt;
+        }
+        /* Issue #501 - growth the cull could not deliver (a running height
+        past every target) goes through the progress-bounded expansion
+        shared with the caret / click paths, not a silent no-op. */
+        if let Err(e) = self.lazy_expand_to_viewport() {
+            return *e;
         }
         let stats = match self.render_document(Some(region)) {
             Ok(s) => s,
@@ -30092,12 +30100,17 @@ mod font_priority;
 /// Issue #407 — the command-boundary finiteness guard (`InvalidArgument`).
 #[cfg(test)]
 mod finite_guard_tests;
+
 /// Issue #472 — `SetFontPriority` reaches layout and the read-backs.
 #[cfg(test)]
 mod font_priority_tests;
 /// Issue #329 — substitution reporting + the `Substituted` font source.
 #[cfg(test)]
 mod font_substitution_tests;
+/// Issue #501 item 3 - the viewport cull counts at most one page for a line
+/// taller than its page.
+#[cfg(test)]
+mod oversize_line_tests;
 /// Issue #467 — control characters / noncharacters at the input boundary.
 #[cfg(test)]
 mod text_input_tests;

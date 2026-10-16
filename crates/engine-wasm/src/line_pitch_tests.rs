@@ -19,7 +19,10 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// A `TextAttrsPatch` that sets only the font size (pt).
+/// A `TextAttrsPatch` that sets only the font size (pt). Only the
+/// `fuzz-native` test below drives it (issue #501 item 4: dead code, hence a
+/// warning, without the feature).
+#[cfg(feature = "fuzz-native")]
 fn size_patch(pt: f32) -> TextAttrsPatch {
     TextAttrsPatch {
         bold: None,

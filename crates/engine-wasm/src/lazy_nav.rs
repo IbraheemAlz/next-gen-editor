@@ -195,6 +195,40 @@ impl Engine {
         self.lazy_nav_expand_until(FULL_LAYOUT_TARGET_PT, |_| false)
     }
 
+    /// Issue #501 — scroll-driven growth through the same routine. A paint
+    /// (`RequestPaint`, and `ExpandLayout`, which paints) asks for the band
+    /// to reach `min_target_y` — the high-water mark `SetViewport` /
+    /// `ExpandLayout` raise. The paginator's cull normally satisfies that
+    /// in the one build the paint makes anyway; when it cannot (a running
+    /// height that passes every target: a page or a line no finite target
+    /// clears — a restored tree can hold one) the band did not grow and
+    /// nothing said so. Here the band is checked first and, only when it
+    /// falls short, grown by [`Self::lazy_nav_expand_until`] — its
+    /// progress bound, full-layout fallback and degradation note apply
+    /// unchanged. Returns whether `min_target_y` moved.
+    pub(crate) fn lazy_expand_to_viewport(&mut self) -> Result<bool, Box<Event>> {
+        if !self.lazy_nav_active() {
+            return Ok(false);
+        }
+        let scale = self.scale().max(f32::MIN_POSITIVE);
+        let gap = render::scene::PAGE_GAP_PT * scale;
+        let want_pt = self.lazy_layout.min_target_y;
+        /* The same build `render_document` makes next (composition
+        included), so the common path costs a cache hit. */
+        self.ensure_layout_snapshot(scale, true, Some(want_pt * scale))?;
+        let reaches = |s: &LayoutSnapshot| band_height_px(s, gap) / scale >= want_pt;
+        {
+            let snap = self.layout_snapshot.borrow();
+            let s = snap
+                .as_ref()
+                .expect("ensure_layout_snapshot populated the memo");
+            if s.info.is_full_layout || reaches(s) {
+                return Ok(false);
+            }
+        }
+        self.lazy_nav_expand_until(want_pt, reaches)
+    }
+
     /// Issue #65 — make the band reach body page `page_idx` (0-based). The
     /// first round estimates the missing pages from the TALLEST section's
     /// real page height (never an A4 constant), and the loop keeps growing
