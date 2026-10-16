@@ -7,11 +7,13 @@
  *   - insert char @ caret, p95 over 100 keystrokes (one-page seeded document)
  *   - open a 50-page .docx
  *
- * plus, issue #379, the table-heavy repaint (report only, ungated): open
+ * plus, issue #379, the table-heavy repaint: open
  * `tests/perf/tables-30p.docx` (30 three-deep nested autofit tables,
- * `tools/perf-fixtures`) and time one-character body edits — each one a
- * repaint that re-lays (or, with the cross-paint table cache, reuses)
- * every table in the viewport band.
+ * `tools/perf-fixtures`), lay it out in full, and time one-character body
+ * edits above every table — each one a repaint that re-lays (or, with the
+ * cross-paint table cache, reuses) every table and repaints the page
+ * canvases whose display list changed (issue #497). Its p95 is gated by a
+ * measured regression pin (`PINS`) under --strict.
  *
  * Usage:
  *   node run.mjs                    — report only, Tier-2 budgets
@@ -90,6 +92,20 @@ const NOMINAL_PAGE_TOLERANCE = 0.1;
 const NOMINAL_TABLE_PAGES = 30;
 /* Issue #379 — body edits timed on the table-heavy fixture. */
 const TABLE_REPAINT_KEYSTROKES = 40;
+
+/* Issue #497 - regression pins, measured (the #476 convention of
+   tools/memory-profile): what the editor measured on a quiet machine,
+   RELEASE wasm, three runs of `node run.mjs` (2026-10-16) x 1.5, rounded up
+   to the next 5 ms. There is no §6 budget for this metric; the pin is the
+   gate. The table-heavy repaint was report-only, and it read p50 ~40 ms /
+   p95 ~50-90 ms once #476 laid the fixture out in full before timing it:
+   every edit re-rasterized all 30 page canvases. Since #497 an edit repaints
+   only the pages whose display list changed.
+   measured table-repaint p95 ms : 22.2 / 19.4 / 21.1 (p50 8.8 / 9.5 / 8.6; load avg 6.7-7.4)
+   Re-pin after an INTENDED cost change: run `node run.mjs` three times on a
+   quiet machine (load average < 8) and apply the rule above; never to
+   silence a breach. */
+const PINS = { tableRepaintP95Ms: 35 };
 
 function percentile(samples, p) {
     const sorted = [...samples].sort((a, b) => a - b);
@@ -277,7 +293,7 @@ if (tables !== null) {
         console.log(
             `[perf] table-heavy doc (#379)    : open ${tables.openMs.toFixed(0)} ms · ` +
                 `repaint after body edit x${tables.samples.length} p50 ${tp50.toFixed(2)} ms · ` +
-                `p95 ${tp95.toFixed(2)} ms (report only) · ` +
+                `p95 ${tp95.toFixed(2)} ms (pin ${PINS.tableRepaintP95Ms} ms) · ` +
                 `${tables.pages === null ? 'UNKNOWN' : tables.pages} pages ` +
                 `(nominal ${NOMINAL_TABLE_PAGES})`,
         );
@@ -314,7 +330,14 @@ if (openDocMs !== null) {
     }
 }
 
+/* Issue #497 - the table-heavy repaint's p95 against its measured pin. A
+   failed load fails the run too: the metric would silently go missing. */
+if (tables !== null && tables.openMs < 0) breaches.push('table-heavy LOAD_DOCX failed');
 if (tables !== null && tables.openMs >= 0) {
+    const tp95 = percentile(tables.samples, 95);
+    if (tp95 >= PINS.tableRepaintP95Ms) {
+        breaches.push(`table-heavy repaint p95 ${tp95.toFixed(2)}ms (pin ${PINS.tableRepaintP95Ms}ms)`);
+    }
     if (
         tables.pages === null ||
         Math.abs(tables.pages - NOMINAL_TABLE_PAGES) > NOMINAL_TABLE_PAGES * NOMINAL_PAGE_TOLERANCE
@@ -330,5 +353,8 @@ if (breaches.length) {
     console.error(`[perf] OVER ${hardware} BUDGET — ${breaches.join('; ')}`);
     process.exit(strict ? 1 : 0);
 }
-console.log(`[perf] PASS — cold start, worker boot, SAB, insert p95 and open-doc within ${hardware} budgets`);
+console.log(
+    `[perf] PASS — cold start, worker boot, SAB, insert p95 and open-doc within ${hardware} budgets; ` +
+        'table-heavy repaint p95 within its pin',
+);
 process.exit(0);
