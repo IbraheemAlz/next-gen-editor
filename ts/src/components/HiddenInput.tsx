@@ -207,7 +207,10 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         }
 
         /* Home / End. Ctrl/Cmd promotes line-bounded motion to document
-           bounds (`DocHome` / `DocEnd`). Shift extends as with arrows. */
+           bounds (`DocHome` / `DocEnd`). Shift extends as with arrows.
+           Issue #462 — PageDown / PageUp move one viewport height; the
+           engine lays out past the lazy band itself before resolving any
+           of these, so a burst never stops at the band's edge. */
         const docJump = (e.ctrlKey || e.metaKey) && !e.altKey;
         const lineMotion: MoveDirection | undefined =
             e.key === 'Home'
@@ -218,7 +221,11 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
                   ? docJump
                       ? 'DocEnd'
                       : 'LineEnd'
-                  : undefined;
+                  : e.key === 'PageDown' && !docJump
+                    ? 'PageDown'
+                    : e.key === 'PageUp' && !docJump
+                      ? 'PageUp'
+                      : undefined;
         if (lineMotion) {
             e.preventDefault();
             void props.client.dispatch({
