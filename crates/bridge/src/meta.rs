@@ -26,7 +26,10 @@
 //!   `data-nge-command` / `data-nge-pending-issue` attributes, the e2e
 //!   suite and the fuzz generator into the parity matrix (issue #342).
 
+use std::ops::ControlFlow;
+
 use crate::Command;
+use crate::text_fields::{TextClass, TextField, TextSlots, TextVisitor};
 
 /// The sentinel issue number of a [`CommandStatus::Stub`] / `Partial` gap
 /// that has no GitHub issue yet. `tools/parity` reports every such row as
@@ -182,6 +185,14 @@ pub struct CommandMeta {
     /// side only — not mirrored into `commandMeta.generated.ts`
     /// (consumers read the event field).
     pub reveals_caret: bool,
+    /// Issue #485 - the command's text-bearing fields and how the input
+    /// boundary treats each one (`engine-wasm` `text_input_guard` walks
+    /// exactly these, through the macro-generated `Command::
+    /// visit_text_mut`). Declared per entry in `command_meta!`
+    /// (`; (field: class, ...)`, `()` for no text), so a new variant does
+    /// not compile unclassified. Engine side only - not mirrored into
+    /// `commandMeta.generated.ts`.
+    pub text: &'static [TextField],
 }
 
 impl CommandMeta {
@@ -201,6 +212,7 @@ impl CommandMeta {
         status: CommandStatus::Implemented,
         protection: ProtectionClass::Exempt,
         reveals_caret: false,
+        text: &[],
     };
 
     /// View / session state (fonts, zoom, viewport, render clock):
@@ -294,6 +306,12 @@ impl CommandMeta {
         }
     }
 
+    /// Issue #485 - attach the entry's text-field declaration (what
+    /// `command_meta!` expands `; (field: class, ...)` into).
+    const fn with_text(self, text: &'static [TextField]) -> Self {
+        CommandMeta { text, ..self }
+    }
+
     const fn partial(self, issue: u32) -> Self {
         CommandMeta {
             status: CommandStatus::Partial { issue },
@@ -314,7 +332,7 @@ impl CommandMeta {
 /// same `{ .. }` pattern shape the `Command` match needs, and a `const`
 /// [`CommandMeta`] expression built from the presets above.
 macro_rules! command_meta {
-    ( $( $variant:ident $( { $($field:tt)* } )? => $meta:expr ),+ $(,)? ) => {
+    ( $( $variant:ident $( { $($field:tt)* } )? => $meta:expr ; ( $( $tf:ident : $tc:expr ),* ) ),+ $(,)? ) => {
         /// A fieldless mirror of [`Command`] — one value per variant, in
         /// declaration order (`CommandKind::X as usize` indexes
         /// [`COMMAND_META`]).
@@ -346,150 +364,172 @@ macro_rules! command_meta {
             }
         }
 
+        impl Command {
+            /// Issue #485 - hand every DECLARED text field of this command
+            /// to `f` (a `command_meta!` `; (field: class, ...)` entry).
+            /// **No wildcard arm**: a new variant does not compile until
+            /// its text fields are classified, and a declared field must
+            /// exist on the variant. Returns `Break` as soon as `f` does.
+            pub fn visit_text_mut(
+                &mut self,
+                f: &mut TextVisitor<'_>,
+            ) -> ControlFlow<()> {
+                match self {
+                    $( Command::$variant { $( $tf, )* .. } => {
+                        $( TextSlots::visit_text($tf, stringify!($tf), $tc, f)?; )*
+                        ControlFlow::Continue(())
+                    } ),+
+                }
+            }
+        }
+
         /// Every variant's metadata, indexed by `CommandKind as usize`.
-        pub const COMMAND_META: &[CommandMeta] = &[ $( $meta ),+ ];
+        pub const COMMAND_META: &[CommandMeta] = &[
+            $( $meta.with_text(&[ $( TextField { name: stringify!($tf), class: $tc } ),* ]) ),+
+        ];
     };
 }
 
 use CommandMeta as M;
 use ProtectionClass as P;
+use TextClass as T;
 
 command_meta! {
     // ---- Phase 1 PoC -------------------------------------------------------
-    Ping => M::QUERY.logged(), // D2.6: the event-log exit gate replays PING
-    LoadFont { .. } => M::VIEW,
-    RasterizeGlyph { .. } => M::VIEW.body_only(),
-    ShapeAndRasterize { .. } => M::VIEW.body_only(),
-    RenderPage { .. } => M::EDIT.new_document().body_only(),
-    InsertText { .. } => M::EDIT.protection(P::Text),
+    Ping => M::QUERY.logged() ; (), // D2.6: the event-log exit gate replays PING
+    LoadFont { .. } => M::VIEW ; (id: T::Exempt("font registry key, never stored")),
+    RasterizeGlyph { .. } => M::VIEW.body_only() ; (font_id: T::Exempt("font registry key, never stored"), ch: T::Exempt("one glyph rasterised for the harness, never stored")),
+    ShapeAndRasterize { .. } => M::VIEW.body_only() ; (text: T::Exempt("harness input: shaped and rasterised, never stored"), font_id: T::Exempt("font registry key, never stored"), direction: T::Exempt("enum spelling, parsed and never stored")),
+    RenderPage { .. } => M::EDIT.new_document().body_only() ; (text: T::Body, font_id: T::Exempt("font registry key, never stored"), base_direction: T::Exempt("enum spelling, parsed and never stored"), align: T::Exempt("enum spelling, parsed and never stored")),
+    InsertText { .. } => M::EDIT.protection(P::Text) ; (text: T::Body),
     // Issue #345 — history replays states the protection admitted.
-    Undo => M::EDIT.protection(P::Exempt),
-    Redo => M::EDIT.protection(P::Exempt),
-    LoadDocx { .. } => M::EDIT.new_document().exits_story(),
-    SaveDocx => M::QUERY,
+    Undo => M::EDIT.protection(P::Exempt) ; (),
+    Redo => M::EDIT.protection(P::Exempt) ; (),
+    LoadDocx { .. } => M::EDIT.new_document().exits_story() ; (),
+    SaveDocx => M::QUERY ; (),
     // ---- Phase 2 §4 ----------------------------------------------------------
     // Issue #397 — lifecycle slots the worker protocol owns (INIT message,
     // worker termination); no client dispatches them.
-    Init { .. } => M::VIEW.body_only().stub(397),
+    Init { .. } => M::VIEW.body_only().stub(397) ; (locale: T::Exempt("lifecycle slot the worker owns (#397), never dispatched")),
     // Issue #85 — recovery primitives are never part of the history they
     // persist / restore.
-    Recover { .. } => M::EDIT.unlogged().protection(P::Exempt),
-    Snapshot { .. } => M::QUERY,
-    Dispose => M::VIEW.body_only().stub(397),
-    Tick { .. } => M::VIEW.body_only().stub(397),
+    Recover { .. } => M::EDIT.unlogged().protection(P::Exempt) ; (log_tail: T::Exempt("replayed through apply: each tail command meets the guard itself"), renderer_downgrade: T::Exempt("backend names echoed on Event::Recovered, never stored")),
+    Snapshot { .. } => M::QUERY ; (known_package_hash: T::Exempt("content key looked up in the shell, never stored")),
+    Dispose => M::VIEW.body_only().stub(397) ; (),
+    Tick { .. } => M::VIEW.body_only().stub(397) ; (),
     // Issue #339 — Docx, PlainText and Html; Pdf is an export-only format
     // (an honest, specific error).
-    OpenDocument { .. } => M::EDIT.new_document().exits_story(),
-    SaveDocument { .. } => M::QUERY,
-    ExportPdf { .. } => M::QUERY,
+    OpenDocument { .. } => M::EDIT.new_document().exits_story() ; (name: T::Line, password: T::Exempt("key-derivation input, never stored")),
+    SaveDocument { .. } => M::QUERY ; (),
+    ExportPdf { .. } => M::QUERY ; (),
     // Issue #338 — back to the seeded empty document.
-    CloseDocument => M::EDIT.new_document().exits_story(),
-    DeleteRange { .. } => M::EDIT.body_only().protection(P::Text),
-    ReplaceRange { .. } => M::EDIT.body_only().protection(P::Text),
-    ApplyFormatting { .. } => M::FORMAT.protection(P::Formatting),
-    ToggleFormatting { .. } => M::FORMAT.protection(P::Formatting),
-    SplitParagraph { .. } => M::EDIT.protection(P::Text),
+    CloseDocument => M::EDIT.new_document().exits_story() ; (),
+    DeleteRange { .. } => M::EDIT.body_only().protection(P::Text) ; (),
+    ReplaceRange { .. } => M::EDIT.body_only().protection(P::Text) ; (text: T::Body),
+    ApplyFormatting { .. } => M::FORMAT.protection(P::Formatting) ; (attrs: T::Nested),
+    ToggleFormatting { .. } => M::FORMAT.protection(P::Formatting) ; (),
+    SplitParagraph { .. } => M::EDIT.protection(P::Text) ; (),
     // Issue #396 — stable paragraph ids do not exist yet; Backspace/Delete
     // across a boundary (`DeleteAtCaret`) is the interactive merge.
-    MergeParagraph { .. } => M::EDIT.body_only().stub(396),
-    InsertImage { .. } => M::EDIT.body_only(),
-    ResizeImage { .. } => M::FORMAT.text_box_only(),
-    MoveImage { .. } => M::FORMAT.text_box_only(),
+    MergeParagraph { .. } => M::EDIT.body_only().stub(396) ; (),
+    InsertImage { .. } => M::EDIT.body_only() ; (image: T::Nested),
+    ResizeImage { .. } => M::FORMAT.text_box_only() ; (),
+    MoveImage { .. } => M::FORMAT.text_box_only() ; (),
     // Issue #137 — an inline picture has no wrap mode until inline →
     // floating conversion ships (ImageWrapPicker's "Engine pending" badge).
-    SetImageWrap { .. } => M::FORMAT.text_box_only().partial(137),
-    SetSelection { .. } => M::SELECT,
-    ExtendSelection { .. } => M::SELECT,
+    SetImageWrap { .. } => M::FORMAT.text_box_only().partial(137) ; (),
+    SetSelection { .. } => M::SELECT ; (),
+    ExtendSelection { .. } => M::SELECT ; (),
     // Issue #387 — Word / Docs keep the view on Ctrl+A.
-    SelectAll => M::SELECT.no_reveal(),
-    MoveCaret { .. } => M::SELECT,
-    BeginComposition { .. } => M::SELECT,
-    UpdateComposition { .. } => M::SELECT,
-    EndComposition { .. } => M::EDIT.protection(P::Text),
-    SetViewport { .. } => M::VIEW,
-    SetZoom { .. } => M::VIEW,
-    SetDeviceScale { .. } => M::VIEW,
-    RequestPaint { .. } => M::QUERY,
-    ExpandLayout { .. } => M::VIEW,
+    SelectAll => M::SELECT.no_reveal() ; (),
+    MoveCaret { .. } => M::SELECT ; (),
+    BeginComposition { .. } => M::SELECT ; (),
+    UpdateComposition { .. } => M::SELECT ; (text: T::Body),
+    EndComposition { .. } => M::EDIT.protection(P::Text) ; (),
+    SetViewport { .. } => M::VIEW ; (),
+    SetZoom { .. } => M::VIEW ; (),
+    SetDeviceScale { .. } => M::VIEW ; (),
+    RequestPaint { .. } => M::QUERY ; (),
+    ExpandLayout { .. } => M::VIEW ; (),
     // Issue #376 — fonts' bytes are leaked for a `'static` face; unloading
     // needs owned font storage first.
-    UnloadFont { .. } => M::VIEW.body_only().stub(376),
-    RequestStats => M::QUERY,
+    UnloadFont { .. } => M::VIEW.body_only().stub(376) ; (id: T::Exempt("font registry key, never stored")),
+    RequestStats => M::QUERY ; (),
     // ---- Phase 4 §7 ------------------------------------------------------------
-    HitTest { .. } => M::QUERY,
-    HitTestInPage { .. } => M::QUERY,
+    HitTest { .. } => M::QUERY ; (),
+    HitTestInPage { .. } => M::QUERY ; (),
     // Issue #387 — pointer gestures land where the user is looking: the
     // caret they leave is never scrolled into view.
-    PlaceCaretAtPoint { .. } => M::SELECT.no_reveal(),
-    ExtendSelectionToPoint { .. } => M::SELECT.no_reveal(),
+    PlaceCaretAtPoint { .. } => M::SELECT.no_reveal() ; (),
+    ExtendSelectionToPoint { .. } => M::SELECT.no_reveal() ; (),
     // Issue #342 — was read-only in EngineClient but logged by the worker.
-    GetImageRects => M::QUERY,
-    SelectWordAt { .. } => M::SELECT.no_reveal(),
-    SelectParagraphAt { .. } => M::SELECT.no_reveal(),
-    SelectCellAt { .. } => M::SELECT.no_reveal(),
-    DeleteAtCaret { .. } => M::EDIT.protection(P::Text),
-    RequestAccessibilityDelta => M::QUERY,
-    GetSelectionAsClipboard { .. } => M::QUERY,
-    PastePlain { .. } => M::EDIT.protection(P::Text),
+    GetImageRects => M::QUERY ; (),
+    SelectWordAt { .. } => M::SELECT.no_reveal() ; (),
+    SelectParagraphAt { .. } => M::SELECT.no_reveal() ; (),
+    SelectCellAt { .. } => M::SELECT.no_reveal() ; (),
+    DeleteAtCaret { .. } => M::EDIT.protection(P::Text) ; (),
+    RequestAccessibilityDelta => M::QUERY ; (),
+    GetSelectionAsClipboard { .. } => M::QUERY ; (),
+    PastePlain { .. } => M::EDIT.protection(P::Text) ; (text: T::Body),
     // ---- Backlog sprint 1 ------------------------------------------------------
-    SetParagraphAlign { .. } => M::FORMAT,
-    SetParagraphDirection { .. } => M::FORMAT,
+    SetParagraphAlign { .. } => M::FORMAT ; (),
+    SetParagraphDirection { .. } => M::FORMAT ; (),
     // ---- Backlog sprint 7 ------------------------------------------------------
-    PasteHtml { .. } => M::EDIT.body_only().protection(P::Text),
+    PasteHtml { .. } => M::EDIT.body_only().protection(P::Text) ; (html: T::Exempt("repaired by the HTML parser (engine::html), not here")),
     // ---- Phase 5 PR 3 — tables ------------------------------------------------
-    InsertTable { .. } => M::EDIT,
-    DeleteTable { .. } => M::EDIT,
-    InsertRow { .. } => M::EDIT,
-    DeleteRow { .. } => M::EDIT,
-    InsertColumn { .. } => M::EDIT,
-    DeleteColumn { .. } => M::EDIT,
-    MergeCells { .. } => M::EDIT,
-    SplitCell { .. } => M::EDIT,
-    SetCellShading { .. } => M::FORMAT,
-    SetCellBorders { .. } => M::FORMAT,
-    SetTableProperties { .. } => M::FORMAT,
-    SetColumns { .. } => M::FORMAT.body_only(),
-    InsertPageBreak { .. } => M::EDIT.body_only(),
-    InsertSectionBreak { .. } => M::EDIT.body_only(),
+    InsertTable { .. } => M::EDIT ; (),
+    DeleteTable { .. } => M::EDIT ; (),
+    InsertRow { .. } => M::EDIT ; (),
+    DeleteRow { .. } => M::EDIT ; (),
+    InsertColumn { .. } => M::EDIT ; (),
+    DeleteColumn { .. } => M::EDIT ; (),
+    MergeCells { .. } => M::EDIT ; (),
+    SplitCell { .. } => M::EDIT ; (),
+    SetCellShading { .. } => M::FORMAT ; (),
+    SetCellBorders { .. } => M::FORMAT ; (),
+    SetTableProperties { .. } => M::FORMAT ; (),
+    SetColumns { .. } => M::FORMAT.body_only() ; (),
+    InsertPageBreak { .. } => M::EDIT.body_only() ; (),
+    InsertSectionBreak { .. } => M::EDIT.body_only() ; (),
     // Issue #387 — entered by a double-click on the band.
-    EnterHeaderFooter { .. } => M::SELECT.no_reveal(),
-    ExitHeaderFooter => M::SELECT,
-    SetHeaderFooterLink { .. } => M::FORMAT,
-    SetTitlePage { .. } => M::FORMAT,
-    SetEvenOddHeaders { .. } => M::FORMAT,
-    InsertField { .. } => M::EDIT,
-    InsertFootnote { .. } => M::EDIT.body_only(),
-    InsertEndnote { .. } => M::EDIT.body_only(),
-    InsertTextBox { .. } => M::EDIT.body_only(),
-    SetRenderDate { .. } => M::VIEW,
-    UpdateFields => M::FORMAT,
-    SetFieldCodeView { .. } => M::SELECT.no_reveal(),
-    SetFieldInstruction { .. } => M::EDIT,
-    InsertToc { .. } => M::EDIT.body_only(),
-    SetParagraphBorders { .. } => M::FORMAT,
-    SetPageMargins { .. } => M::FORMAT.body_only(),
-    SetPageOrientation { .. } => M::FORMAT.body_only(),
-    ToggleList { .. } => M::FORMAT,
-    ChangeListLevel { .. } => M::FORMAT,
-    SetParagraphIndent { .. } => M::FORMAT,
-    SetLineSpacing { .. } => M::FORMAT,
-    SetParagraphShading { .. } => M::FORMAT,
-    ToggleTrackChanges { .. } => M::FORMAT.body_only().protection(P::ReviewToggle),
-    AcceptRevision { .. } => M::EDIT.body_only(),
-    RejectRevision { .. } => M::EDIT.body_only(),
-    AcceptAllRevisions => M::EDIT.body_only(),
-    RejectAllRevisions => M::EDIT.body_only(),
-    InsertComment { .. } => M::FORMAT.body_only().protection(P::Comment),
-    DeleteComment { .. } => M::FORMAT.body_only().protection(P::Comment),
-    SetTabStops { .. } => M::FORMAT,
-    SetReviewIdentity { .. } => M::VIEW.body_only(),
-    ApplyStyle { .. } => M::FORMAT,
-    ResolveComment { .. } => M::FORMAT.body_only().protection(P::Comment),
-    ReplyToComment { .. } => M::FORMAT.body_only().protection(P::Comment),
-    ModifyStyle { .. } => M::FORMAT,
+    EnterHeaderFooter { .. } => M::SELECT.no_reveal() ; (),
+    ExitHeaderFooter => M::SELECT ; (),
+    SetHeaderFooterLink { .. } => M::FORMAT ; (),
+    SetTitlePage { .. } => M::FORMAT ; (),
+    SetEvenOddHeaders { .. } => M::FORMAT ; (),
+    InsertField { .. } => M::EDIT ; (),
+    InsertFootnote { .. } => M::EDIT.body_only() ; (),
+    InsertEndnote { .. } => M::EDIT.body_only() ; (),
+    InsertTextBox { .. } => M::EDIT.body_only() ; (),
+    SetRenderDate { .. } => M::VIEW ; (),
+    UpdateFields => M::FORMAT ; (),
+    SetFieldCodeView { .. } => M::SELECT.no_reveal() ; (),
+    SetFieldInstruction { .. } => M::EDIT ; (instruction: T::Line),
+    InsertToc { .. } => M::EDIT.body_only() ; (),
+    SetParagraphBorders { .. } => M::FORMAT ; (),
+    SetPageMargins { .. } => M::FORMAT.body_only() ; (),
+    SetPageOrientation { .. } => M::FORMAT.body_only() ; (),
+    ToggleList { .. } => M::FORMAT ; (),
+    ChangeListLevel { .. } => M::FORMAT ; (),
+    SetParagraphIndent { .. } => M::FORMAT ; (),
+    SetLineSpacing { .. } => M::FORMAT ; (),
+    SetParagraphShading { .. } => M::FORMAT ; (),
+    ToggleTrackChanges { .. } => M::FORMAT.body_only().protection(P::ReviewToggle) ; (),
+    AcceptRevision { .. } => M::EDIT.body_only() ; (),
+    RejectRevision { .. } => M::EDIT.body_only() ; (),
+    AcceptAllRevisions => M::EDIT.body_only() ; (),
+    RejectAllRevisions => M::EDIT.body_only() ; (),
+    InsertComment { .. } => M::FORMAT.body_only().protection(P::Comment) ; (text: T::Body, author: T::Line),
+    DeleteComment { .. } => M::FORMAT.body_only().protection(P::Comment) ; (),
+    SetTabStops { .. } => M::FORMAT ; (),
+    SetReviewIdentity { .. } => M::VIEW.body_only() ; (author: T::Line, date: T::Line),
+    ApplyStyle { .. } => M::FORMAT ; (style_id: T::Line),
+    ResolveComment { .. } => M::FORMAT.body_only().protection(P::Comment) ; (),
+    ReplyToComment { .. } => M::FORMAT.body_only().protection(P::Comment) ; (text: T::Body, author: T::Line),
+    ModifyStyle { .. } => M::FORMAT ; (style_id: T::Line, properties: T::Nested),
     // Issue #472 - font setup, classified like LoadFont (replay needs it;
     // the shell also re-sends it after every boot / recovery).
-    SetFontPriority { .. } => M::VIEW,
+    SetFontPriority { .. } => M::VIEW ; (priorities: T::Exempt("font registry ids, looked up and never stored")),
 }
 
 impl CommandKind {

@@ -458,3 +458,56 @@ fn a_restored_snapshot_with_a_control_character_saves_with_a_note() {
         vec![bridge::SaveNote::ForbiddenCharactersReplaced { count: 2 }]
     );
 }
+
+/// Issue #485 - the guard's field set is derived from `command_meta!`, so
+/// the fields the old hand list missed are covered: an image's MIME type is
+/// stored as the media's content type and reaches `[Content_Types].xml`.
+#[test]
+fn an_image_mime_type_is_cleaned_like_any_one_line_value() {
+    let mut e = engine_with(DocumentTree::from_text("x"));
+    let evt = apply(
+        &mut e,
+        Command::InsertImage {
+            at: bpos_top(0, 1),
+            image: bridge::ImageBlob {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                mime: "image/png\u{1}".into(),
+                width: 10,
+                height: 10,
+            },
+            fit: bridge::ImageFit::Original,
+        },
+    );
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    let types: Vec<&str> = e
+        .undo
+        .current()
+        .media
+        .values()
+        .map(|b| b.content_type.as_str())
+        .collect();
+    assert_eq!(types, vec!["image/png"]);
+    saved_document_xml(&mut e);
+}
+
+/// Issue #485 - a refusal inside a nested payload names the dotted path
+/// (the message the shell and the e2e specs match on is unchanged).
+#[test]
+fn a_noncharacter_in_a_nested_field_names_its_path() {
+    let mut e = engine_with(DocumentTree::from_text("x"));
+    let evt = apply(
+        &mut e,
+        Command::ModifyStyle {
+            style_id: "Heading1".into(),
+            properties: bridge::BridgeStyleProperties {
+                display_name: Some("a\u{FFFF}b".into()),
+                ..Default::default()
+            },
+        },
+    );
+    let msg = refusal(&evt).unwrap_or_else(|| panic!("refused: {evt:?}"));
+    assert!(
+        msg.starts_with("ModifyStyle: properties.display_name:"),
+        "{msg}"
+    );
+}
