@@ -63,11 +63,31 @@
 //! `archive::check_part_xml_well_formed`), so the reader and the writer's
 //! well-formedness gate agree on what "well-formed" means.
 //!
-//! Not checked (known gaps): the XML `Name` production (a byte flip that
-//! turns a name character into `;` or `=` stays a name to quick-xml, and a
-//! prefix that is no `NCName` cannot be bound, so it is not reported
-//! either), and entity / attribute-list declarations inside a DOCTYPE
-//! (left as they are; OPC forbids DTDs and nothing is ever expanded).
+//! Issue #468 — a **UTF-16** part (a `FF FE` / `FE FF` byte-order mark;
+//! some generators write them although Word never does) is decoded to
+//! UTF-8 BEFORE the scan (`char::decode_utf16` over the BOM-selected byte
+//! order; an unpaired surrogate or a trailing odd byte is U+FFFD, a
+//! declared `encoding` becomes `UTF-8`), scanned and repaired like any other
+//! part, and reported `MalformedPart { repaired: true }` with the encoding
+//! named. The decoded bytes REPLACE the source's from then on, so every
+//! save writes the part as UTF-8 with a correct declaration; the decoded
+//! part is held to the #348 shape caps again. A UTF-32 part has no
+//! decoder: reported, `repaired: false` (the main part refuses).
+//!
+//! Issue #468 — **names** are checked too ([`is_xml_name`], the XML 1.0
+//! `Name` production, an ASCII fast path in front of the full
+//! `NameStartChar` / `NameChar` ranges): quick-xml accepts any bytes up to
+//! a space, `/` or `>` as an element or attribute name, so a byte flip that
+//! put `;`, `=`, `"` or a leading digit into a tag or prefix name used to be
+//! neither reported nor repaired — and a prefix that is no `NCName` cannot
+//! be bound by [`bind_on_root`]. There is no faithful repair (which name did
+//! the producer mean?), so an invalid element or attribute name is a
+//! STRUCTURAL defect: the main part refuses, a sibling is left verbatim and
+//! reported `repaired: false`.
+//!
+//! Not checked (known gap): entity / attribute-list declarations inside a
+//! DOCTYPE (left as they are; OPC forbids DTDs and nothing is ever
+//! expanded).
 
 use crate::error::{DocxError, DocxWarning};
 use crate::opc::limits::{PackageLimit, PackageLimits};
@@ -90,11 +110,93 @@ fn split_bom(xml: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// `true` for a part encoded as UTF-16 (a UTF-16 byte-order mark): the
-/// reader decodes UTF-8 only, so such a part is reported, never "repaired"
-/// byte by byte into noise.
-fn is_utf16(xml: &[u8]) -> bool {
-    xml.starts_with(b"\xFF\xFE") || xml.starts_with(b"\xFE\xFF")
+/// `true` for a part encoded as UTF-32 (a UTF-32 byte-order mark; the LE
+/// one starts like UTF-16LE's, but a UTF-16 part never opens with U+0000):
+/// beyond a faithful repair — reported, never decoded as UTF-16 noise.
+fn is_utf32(xml: &[u8]) -> bool {
+    xml.starts_with(b"\xFF\xFE\x00\x00") || xml.starts_with(b"\x00\x00\xFE\xFF")
+}
+
+/// Issue #468 — a part encoded as UTF-16 (a UTF-16 byte-order mark):
+/// `(little endian, the encoding's name)`. The reader's tokenizer decodes
+/// UTF-8 only, so such a part is decoded up front ([`decode_utf16_part`])
+/// and then scanned like any other.
+fn utf16_order(xml: &[u8]) -> Option<(bool, &'static str)> {
+    if is_utf32(xml) {
+        None
+    } else if xml.starts_with(b"\xFF\xFE") {
+        Some((true, "UTF-16LE"))
+    } else if xml.starts_with(b"\xFE\xFF") {
+        Some((false, "UTF-16BE"))
+    } else {
+        None
+    }
+}
+
+/// Issue #468 — the UTF-8 spelling of a UTF-16 part (BOM included in
+/// `xml`, dropped from the result): `char::decode_utf16` over the
+/// BOM-selected byte order, an unpaired surrogate or a trailing odd byte
+/// becomes U+FFFD (the scan repairs what it decodes to like any other
+/// text), and a declared `encoding` is rewritten to `UTF-8` — the bytes are
+/// UTF-8 from here on, in the reader's walk AND in every save.
+fn decode_utf16_part(xml: &[u8], little_endian: bool) -> Vec<u8> {
+    let body = xml.get(2..).unwrap_or_default();
+    let units = body.chunks_exact(2).map(|c| {
+        if little_endian {
+            u16::from_le_bytes([c[0], c[1]])
+        } else {
+            u16::from_be_bytes([c[0], c[1]])
+        }
+    });
+    let mut text = String::with_capacity(body.len());
+    for c in char::decode_utf16(units) {
+        text.push(c.unwrap_or('\u{FFFD}'));
+    }
+    if body.len() % 2 == 1 {
+        text.push('\u{FFFD}');
+    }
+    let mut out = text.into_bytes();
+    declare_utf8(&mut out);
+    out
+}
+
+/// Rewrite the `encoding` pseudo-attribute of a leading XML declaration to
+/// `UTF-8` (a part decoded from UTF-16 says `encoding="UTF-16"`, which is
+/// no longer true of its bytes). Anything else is left alone: no
+/// declaration, no `encoding`, or one that already names UTF-8.
+fn declare_utf8(text: &mut Vec<u8>) {
+    if !text.starts_with(b"<?xml") {
+        return;
+    }
+    let Some(end) = text.windows(2).position(|w| w == b"?>") else {
+        return;
+    };
+    let decl = &text[..end];
+    let Some(key) = decl.windows(8).position(|w| w == b"encoding") else {
+        return;
+    };
+    let mut i = key + 8;
+    let skip_ws = |i: &mut usize| {
+        while decl.get(*i).is_some_and(u8::is_ascii_whitespace) {
+            *i += 1;
+        }
+    };
+    skip_ws(&mut i);
+    if decl.get(i) != Some(&b'=') {
+        return;
+    }
+    i += 1;
+    skip_ws(&mut i);
+    let Some(&quote @ (b'"' | b'\'')) = decl.get(i) else {
+        return;
+    };
+    let start = i + 1;
+    let Some(len) = decl[start..].iter().position(|&b| b == quote) else {
+        return;
+    };
+    if !decl[start..start + len].eq_ignore_ascii_case(b"utf-8") {
+        text.splice(start..start + len, b"UTF-8".iter().copied());
+    }
 }
 
 /// XML 1.0 `Char`: tab, LF, CR, and everything from U+0020 except the
@@ -103,9 +205,72 @@ fn is_xml_char(c: u32) -> bool {
     matches!(c, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
 }
 
+/// XML 1.0 `NameStartChar` (colon included: the `Name` production, not
+/// `NCName`).
+fn is_name_start(c: char) -> bool {
+    matches!(c,
+        ':' | 'A'..='Z' | '_' | 'a'..='z'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+}
+
+/// XML 1.0 `NameChar`.
+fn is_name_char(c: char) -> bool {
+    is_name_start(c)
+        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+}
+
+/// Issue #468 — `true` when `name` (an element or attribute name as the
+/// tokenizer cut it) is an XML 1.0 `Name`: a `NameStartChar` then
+/// `NameChar`s. ASCII names (every real WordprocessingML name) take a byte
+/// loop; anything else is decoded (a name that is not UTF-8 is no name — the
+/// scan runs on UTF-8-repaired bytes, so U+FFFD is the only way one shows).
+pub(crate) fn is_xml_name(name: &[u8]) -> bool {
+    let Some((&first, rest)) = name.split_first() else {
+        return false;
+    };
+    if name.is_ascii() {
+        let start = |b: u8| b.is_ascii_alphabetic() || matches!(b, b'_' | b':');
+        return start(first)
+            && rest
+                .iter()
+                .all(|&b| start(b) || b.is_ascii_digit() || matches!(b, b'-' | b'.'));
+    }
+    let Ok(text) = std::str::from_utf8(name) else {
+        return false;
+    };
+    let mut chars = text.chars();
+    chars.next().is_some_and(is_name_start) && chars.all(is_name_char)
+}
+
+/// Issue #468 — the first element or attribute name of start / empty tag
+/// `e` that is no XML `Name`, if any.
+fn first_invalid_name<'a>(e: &'a BytesStart<'_>) -> Option<Cow<'a, str>> {
+    let name = e.name().into_inner();
+    if !is_xml_name(name) {
+        return Some(lossy(name));
+    }
+    /* Nothing after the name but `/` / whitespace: no attributes to read. */
+    let after = e.as_ref().get(name.len()..).unwrap_or_default();
+    if after.iter().all(|b| b.is_ascii_whitespace() || *b == b'/') {
+        return None;
+    }
+    for a in e.attributes().with_checks(false).flatten() {
+        if !is_xml_name(a.key.into_inner()) {
+            return Some(lossy(a.key.into_inner()));
+        }
+    }
+    None
+}
+
 /// What one strict scan found, per defect class (the warning's detail).
 #[derive(Debug, Default)]
 struct Tally {
+    /// Issue #468 — the part was UTF-16 (the encoding's name): decoded to
+    /// UTF-8 before the scan.
+    utf16: Option<&'static str>,
     /// Offset of the first byte sequence that is not UTF-8.
     not_utf8: Option<usize>,
     /// `&` starting no reference, `<` in an attribute value, `]]>` in text.
@@ -145,6 +310,11 @@ impl Tally {
 
     fn detail(&self) -> String {
         let mut parts = Vec::new();
+        if let Some(name) = self.utf16 {
+            parts.push(format!(
+                "{name} encoded (decoded to UTF-8; saved as UTF-8 with the declaration rewritten)"
+            ));
+        }
         if let Some(at) = self.not_utf8 {
             parts.push(format!("not UTF-8 (first invalid byte at offset {at})"));
         }
@@ -459,9 +629,9 @@ fn is_implicit_prefix(p: &[u8]) -> bool {
 
 /// `true` for an `NCName`-shaped prefix (ASCII letters, digits, `-`, `.`,
 /// `_`, any non-ASCII character; not starting with a digit, `-` or `.`).
-/// Only such a prefix can be bound by an `xmlns:` attribute; a "name"
-/// holding `"` or `=` is an XML `Name` defect, which the scan does not
-/// judge (see the module docs).
+/// Only such a prefix can be bound by an `xmlns:` attribute. (A name that
+/// is no XML `Name` at all never reaches here: the scan refuses it first,
+/// [`first_invalid_name`].)
 fn is_ncname(p: &[u8]) -> bool {
     let ok = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_') || b >= 0x80;
     match p.first() {
@@ -658,6 +828,11 @@ fn scan(body: &[u8]) -> Scan {
                     return Scan::Structural(format!("a second root element at byte {prev}"));
                 }
                 root_seen = true;
+                if let Some(bad) = first_invalid_name(e) {
+                    return Scan::Structural(format!(
+                        "`{bad}` in the tag at byte {prev} is not a valid XML name"
+                    ));
+                }
                 let empty = matches!(event, Event::Empty(_));
                 let level = open.len() + 1;
                 check_prefixes(e, level, &mut decls, &mut tally.unbound);
@@ -852,14 +1027,22 @@ enum Health<'x> {
 }
 
 fn inspect(xml: &[u8]) -> Health<'_> {
-    if is_utf16(xml) {
-        return Health::Unrepairable("UTF-16 encoded (only UTF-8 parts are read)".to_string());
+    if is_utf32(xml) {
+        return Health::Unrepairable(
+            "UTF-32 encoded (only UTF-8 and UTF-16 parts are read)".to_string(),
+        );
     }
-    let (_, body) = split_bom(xml);
-    let not_utf8 = std::str::from_utf8(body).err().map(|e| e.valid_up_to());
+    /* Issue #468 — a UTF-16 part is decoded to UTF-8 first (the BOM goes
+    with the encoding), then judged like any other part. */
+    let utf16 = utf16_order(xml);
+    let source: Cow<'_, [u8]> = match utf16 {
+        Some((little_endian, _)) => Cow::Owned(decode_utf16_part(xml, little_endian)),
+        None => Cow::Borrowed(split_bom(xml).1),
+    };
+    let not_utf8 = std::str::from_utf8(&source).err().map(|e| e.valid_up_to());
     let body: Cow<'_, [u8]> = match not_utf8 {
-        None => Cow::Borrowed(body),
-        Some(_) => Cow::Owned(String::from_utf8_lossy(body).into_owned().into_bytes()),
+        None => source,
+        Some(_) => Cow::Owned(String::from_utf8_lossy(&source).into_owned().into_bytes()),
     };
     match scan(&body) {
         Scan::Structural(detail) => Health::Unrepairable(detail),
@@ -868,10 +1051,11 @@ fn inspect(xml: &[u8]) -> Health<'_> {
             patches,
             closers,
         } => {
-            if not_utf8.is_none() && patches.is_empty() && closers.is_empty() {
+            if not_utf8.is_none() && utf16.is_none() && patches.is_empty() && closers.is_empty() {
                 return Health::WellFormed;
             }
             tally.not_utf8 = not_utf8;
+            tally.utf16 = utf16.map(|(_, name)| name);
             Health::Repairable {
                 body,
                 patches,
@@ -934,38 +1118,268 @@ pub(crate) fn verify_part(name: &str, data: &[u8]) -> Result<(), DocxError> {
     }
 }
 
-/// Issue #435 — a main part whose root element is no `document` (markup
-/// spliced in front of the real root now wraps it — `<w:t><w:document …>`)
-/// is beyond a faithful repair: the reader walks it leniently, but the
-/// writer synthesizes a `<w:document>` root that re-declares the FIRST
-/// element's bindings only, so whatever the wrapped root declared is lost
-/// on save. Reported (`repaired: false`) — the part reads as before. A
-/// root that is no WordprocessingML at all is `NotWordprocessingMl`'s
-/// business, not this check's.
-pub(crate) fn check_main_root(name: &str, xml: &[u8], warnings: &mut Vec<DocxWarning>) {
-    use crate::schema::family::RootBinding;
-    let (_, body) = split_bom(xml);
+/// Issue #468 — the qualified name of a part's root element when it is no
+/// `document` (`None`: it is one, or the part has no readable root).
+fn non_document_root(body: &[u8]) -> Option<String> {
     let mut reader = Reader::from_reader(body);
-    let qname = loop {
+    loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if e.local_name().as_ref() == b"document" {
-                    return;
-                }
-                break lossy(e.name().as_ref()).into_owned();
+                return (e.local_name().as_ref() != b"document")
+                    .then(|| lossy(e.name().as_ref()).into_owned());
             }
-            Ok(Event::Eof) | Err(_) => return,
+            Ok(Event::Eof) | Err(_) => return None,
             Ok(_) => {}
         }
+    }
+}
+
+/// One WordprocessingML `document` element found inside a wrapper.
+struct WrappedDocument {
+    /// Byte range of the whole element, and the end of its start tag.
+    start: usize,
+    tag_end: usize,
+    end: usize,
+    /// Length of the element's qualified name.
+    name_len: usize,
+    /// `xmlns` declarations in scope from the wrapper chain that the
+    /// element does not redeclare itself, `(attribute, raw value)`.
+    inherited: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// What [`find_wrapped_documents`] saw.
+struct Wrapped {
+    /// Start of the root element (end of the prolog), end of the root
+    /// element (start of the epilog).
+    root_start: usize,
+    root_end: usize,
+    /// The outermost WordprocessingML `document` elements, at most two
+    /// (two is "more than one").
+    documents: Vec<WrappedDocument>,
+}
+
+/// The `xmlns` / `xmlns:*` attributes of a start tag, `(key, raw value)`.
+fn namespace_declarations(e: &BytesStart<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    e.attributes()
+        .with_checks(false)
+        .flatten()
+        .filter(|a| {
+            let k = a.key.as_ref();
+            k == b"xmlns" || k.starts_with(b"xmlns:")
+        })
+        .map(|a| (a.key.as_ref().to_vec(), a.value.to_vec()))
+        .collect()
+}
+
+/// Declarations in scope while [`find_wrapped_documents`] walks: attribute
+/// name → the values of every open element declaring it, innermost last
+/// (a hash lookup, so a hostile part with a million declarations stays
+/// linear).
+type Scope = std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>;
+
+/// `true` when `e` is a `document` element bound to a WordprocessingML
+/// namespace (either family) by the declarations in `scope` (the element's
+/// own already pushed); a `w` prefix nothing binds counts too (the reader's
+/// lenient Transitional fast path, see [`is_implicit_prefix`]).
+fn is_wordprocessing_document(e: &BytesStart<'_>, scope: &Scope) -> bool {
+    if e.local_name().as_ref() != b"document" {
+        return false;
+    }
+    let name = e.name().into_inner();
+    let key: Vec<u8> = match name.iter().position(|&b| b == b':') {
+        Some(i) => [b"xmlns:".as_slice(), &name[..i]].concat(),
+        None => b"xmlns".to_vec(),
     };
-    if crate::schema::ns_normalize::inspect_root(xml) != RootBinding::NotWordprocessingMl {
-        warnings.push(DocxWarning::MalformedPart {
-            part: name.to_string(),
-            detail: format!(
-                "the root element is `{qname}`, not a WordprocessingML `document` (its own namespace bindings are not re-declared on save)"
-            ),
-            repaired: false,
-        });
+    match scope.get(&key).and_then(|values| values.last()) {
+        Some(uri) => std::str::from_utf8(uri)
+            .ok()
+            .and_then(crate::schema::family::family_of_w_uri)
+            .is_some(),
+        None => key == b"xmlns:w",
+    }
+}
+
+/// Issue #468 — walk the whole of a (structurally well-formed) part and
+/// collect its outermost WordprocessingML `document` elements.
+fn find_wrapped_documents(body: &[u8]) -> Result<Wrapped, String> {
+    use std::collections::{HashMap, HashSet};
+    let mut reader = Reader::from_reader(body);
+    /* Declarations of every open element, outermost first, and the same
+    as a lookup table. */
+    let mut open: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    let mut scope = Scope::new();
+    let mut root_start = None;
+    let mut root_end = None;
+    /* The candidate being walked: the nesting depth it sits at. */
+    let mut active: Option<(usize, WrappedDocument)> = None;
+    let mut documents = Vec::new();
+    let mut prev = 0usize;
+    loop {
+        let event = reader.read_event().map_err(|e| e.to_string())?;
+        let pos = reader.buffer_position() as usize;
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                let own = namespace_declarations(e);
+                root_start.get_or_insert(prev);
+                for (k, v) in &own {
+                    scope.entry(k.clone()).or_default().push(v.clone());
+                }
+                if active.is_none() && is_wordprocessing_document(e, &scope) {
+                    /* What the wrapper chain declares and the element does
+                    not: the innermost value of each name. */
+                    let own_keys: HashSet<&[u8]> = own.iter().map(|(k, _)| k.as_slice()).collect();
+                    let mut slot_of: HashMap<&[u8], usize> = HashMap::new();
+                    let mut inherited: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    for (k, v) in open.iter().flatten() {
+                        if own_keys.contains(k.as_slice()) {
+                            continue;
+                        }
+                        match slot_of.get(k.as_slice()) {
+                            Some(&i) => inherited[i].1 = v.clone(),
+                            None => {
+                                slot_of.insert(k.as_slice(), inherited.len());
+                                inherited.push((k.clone(), v.clone()));
+                            }
+                        }
+                    }
+                    let document = WrappedDocument {
+                        start: prev,
+                        tag_end: pos,
+                        end: pos,
+                        name_len: e.name().as_ref().len(),
+                        inherited,
+                    };
+                    if matches!(event, Event::Empty(_)) {
+                        documents.push(document);
+                    } else {
+                        active = Some((open.len(), document));
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    open.push(own);
+                } else {
+                    /* An empty element's declarations scope itself only. */
+                    for (k, _) in &own {
+                        if let Some(values) = scope.get_mut(k) {
+                            values.pop();
+                        }
+                    }
+                    if open.is_empty() {
+                        root_end = Some(pos);
+                    }
+                }
+            }
+            Event::End(_) => {
+                for (k, _) in open.pop().iter().flatten() {
+                    if let Some(values) = scope.get_mut(k) {
+                        values.pop();
+                    }
+                }
+                if active
+                    .as_ref()
+                    .is_some_and(|(depth, _)| open.len() == *depth)
+                    && let Some((_, mut document)) = active.take()
+                {
+                    document.end = pos;
+                    documents.push(document);
+                }
+                if open.is_empty() {
+                    root_end = Some(pos);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        if documents.len() >= 2 {
+            break;
+        }
+        prev = pos;
+    }
+    Ok(Wrapped {
+        root_start: root_start.unwrap_or(0),
+        root_end: root_end.unwrap_or(body.len()),
+        documents,
+    })
+}
+
+/// Issues #435 / #468 — a main part whose root element is no `document`:
+/// markup spliced in front of the real root wraps it
+/// (`<w:t><w:document …>…</w:document></w:t>`). The reader walked that
+/// leniently, but the writer synthesizes a `<w:document>` root that can
+/// only re-declare the FIRST element's bindings, so whatever the wrapped
+/// root declared was lost on save (a namespace-ill-formed part Word
+/// refuses). Decided per shape, on a part already known to be structurally
+/// well-formed:
+///
+/// - **exactly one** WordprocessingML `document` element inside (the
+///   outermost one, in either family): the wrapper is junk, so the part is
+///   UNWRAPPED to that element — prolog and epilog kept, the wrapper and
+///   everything else inside it dropped, any namespace declaration the
+///   wrapper chain contributed and the element does not redeclare added to
+///   the element's start tag (the element's own bytes are otherwise
+///   verbatim) — and reported `MalformedPart { repaired: true }`;
+/// - **none, or more than one**: no faithful repair (which one was
+///   meant? where is the document?) — the open is refused with
+///   `DocxError::MalformedXml` (the typed `DocumentUnreadable`), so a part
+///   the writer cannot re-declare is never written;
+/// - a root that is no WordprocessingML at all (and wraps no `document`) is
+///   `NotWordprocessingMl`'s business and is returned untouched.
+pub(crate) fn unwrap_main_root(
+    name: &str,
+    xml: Vec<u8>,
+    warnings: &mut Vec<DocxWarning>,
+) -> Result<Vec<u8>, DocxError> {
+    use crate::schema::family::RootBinding;
+    let (bom, body) = split_bom(&xml);
+    let Some(qname) = non_document_root(body) else {
+        return Ok(xml);
+    };
+    let wrapped = find_wrapped_documents(body)
+        .map_err(|e| DocxError::MalformedXml(format!("{name}: unreadable under `{qname}`: {e}")))?;
+    match wrapped.documents.as_slice() {
+        [] if crate::schema::ns_normalize::inspect_root(&xml)
+            == RootBinding::NotWordprocessingMl =>
+        {
+            Ok(xml)
+        }
+        [] => Err(DocxError::MalformedXml(format!(
+            "{name}: the root element is `{qname}`, not a WordprocessingML `document`, and it wraps none (no faithful repair)"
+        ))),
+        [document] => {
+            let tag = &body[document.start..document.tag_end];
+            let (head, tail) = tag.split_at((1 + document.name_len).min(tag.len()));
+            let mut out = Vec::with_capacity(xml.len());
+            out.extend_from_slice(bom);
+            out.extend_from_slice(&body[..wrapped.root_start]);
+            out.extend_from_slice(head);
+            for (key, value) in &document.inherited {
+                out.push(b' ');
+                out.extend_from_slice(key);
+                out.extend_from_slice(b"=\"");
+                for &b in value {
+                    if b == b'"' {
+                        out.extend_from_slice(b"&quot;");
+                    } else {
+                        out.push(b);
+                    }
+                }
+                out.push(b'"');
+            }
+            out.extend_from_slice(tail);
+            out.extend_from_slice(&body[document.tag_end..document.end]);
+            out.extend_from_slice(&body[wrapped.root_end..]);
+            warnings.push(DocxWarning::MalformedPart {
+                part: name.to_string(),
+                detail: format!(
+                    "the root element is `{qname}`, not a WordprocessingML `document`: unwrapped the one `document` inside it (the wrapper and its other content were dropped)"
+                ),
+                repaired: true,
+            });
+            Ok(out)
+        }
+        _ => Err(DocxError::MalformedXml(format!(
+            "{name}: the root element is `{qname}`, not a WordprocessingML `document`, and it wraps more than one (no faithful repair)"
+        ))),
     }
 }
 
@@ -981,6 +1395,7 @@ pub(crate) fn repair_part(
     limits: &PackageLimits,
     warnings: &mut Vec<DocxWarning>,
 ) -> Result<Vec<u8>, DocxError> {
+    let decoded_utf16;
     let out = match inspect(&xml) {
         Health::WellFormed => return Ok(xml),
         Health::Unrepairable(detail) => {
@@ -1008,6 +1423,7 @@ pub(crate) fn repair_part(
             }
             out.extend_from_slice(&body[at..]);
             out.extend_from_slice(&closers);
+            decoded_utf16 = tally.utf16.is_some();
             warnings.push(DocxWarning::MalformedPart {
                 part: name.to_string(),
                 detail: tally.detail(),
@@ -1022,6 +1438,11 @@ pub(crate) fn repair_part(
             max: limits.max_part_bytes,
             part: Some(name.to_string()),
         });
+    }
+    /* Issue #468 — the #348 shape caps ran on the UTF-16 bytes (no
+    structure to count there); the decoded part is held to them now. */
+    if decoded_utf16 {
+        crate::opc::limits::check_xml_part(name, &out, limits)?;
     }
     Ok(out)
 }
@@ -1241,7 +1662,6 @@ mod tests {
         for xml in [
             &br#"<w:document><w:p xml:space="preserve"/></w:document>"#[..],
             br#"<r xmlns:p="u"><p:a/><s xmlns:q="v"><q:b p:c="1"/></s></r>"#,
-            b"<r><a=b:c/><d e;f:g=\"1\"/></r>",
         ] {
             let (out, w) = run(xml);
             assert_eq!(out, xml);
@@ -1249,18 +1669,183 @@ mod tests {
         }
     }
 
+    /// Issue #468 — a tag or attribute name that is no XML `Name` (a byte
+    /// flip put `;` `=` `"` or a leading digit in it) is a structural
+    /// defect: reported, left as it is.
     #[test]
-    fn utf16_parts_are_reported_not_rewritten() {
-        let xml = b"\xFF\xFE<\0w\0/\0>\0";
-        let (out, w) = run(xml);
-        assert_eq!(out, xml);
-        assert!(matches!(
-            w.as_slice(),
-            [DocxWarning::MalformedPart {
-                repaired: false,
-                ..
-            }]
-        ));
+    fn an_invalid_xml_name_is_a_structural_defect() {
+        for xml in [
+            &b"<r><a=b:c/></r>"[..],
+            b"<r><d e;f:g=\"1\"/></r>",
+            b"<r><1a/></r>",
+            b"<r><a:b\"c\"/></r>",
+            b"<r><a 1b=\"x\"/></r>",
+            b"<r><a b\"c\"=\"x\"/></r>",
+            b"<r>< a/></r>",
+            b"<r><a\x01b/></r>",
+        ] {
+            let (out, w) = run(xml);
+            assert_eq!(out, xml, "left as it is");
+            assert!(
+                matches!(
+                    w.as_slice(),
+                    [DocxWarning::MalformedPart { detail, repaired: false, .. }]
+                        if detail.contains("not a valid XML name")
+                ),
+                "{}: {w:?}",
+                lossy(xml)
+            );
+            assert!(defects(xml).is_some_and(|d| d.contains("not a valid XML name")));
+        }
+    }
+
+    #[test]
+    fn xml_names_follow_the_name_production() {
+        for ok in [
+            "w:p",
+            "_a",
+            ":x",
+            "a-b.c1",
+            "w14:paraId",
+            "\u{E9}t\u{E9}",
+            "\u{FFFD}:a",
+            "a\u{B7}b",
+            "\u{10000}x",
+        ] {
+            assert!(is_xml_name(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            "",
+            "1a",
+            "-a",
+            ".a",
+            "a;b",
+            "a=b",
+            "a\"b",
+            "a b",
+            "a\u{D7}b",
+            "\u{37E}",
+            "\u{B7}a",
+            "a\u{FFFE}",
+        ] {
+            assert!(!is_xml_name(bad.as_bytes()), "{bad:?}");
+        }
+        assert!(!is_xml_name(b"a\xFFb"));
+    }
+
+    fn utf16(text: &str, little_endian: bool) -> Vec<u8> {
+        let mut out = if little_endian {
+            b"\xFF\xFE".to_vec()
+        } else {
+            b"\xFE\xFF".to_vec()
+        };
+        for u in text.encode_utf16() {
+            out.extend_from_slice(&if little_endian {
+                u.to_le_bytes()
+            } else {
+                u.to_be_bytes()
+            });
+        }
+        out
+    }
+
+    /// Issue #468 — a UTF-16 part (either byte order, surrogate pairs
+    /// included) is decoded to UTF-8, reported repaired with the encoding
+    /// named, and its declaration says UTF-8.
+    #[test]
+    fn utf16_parts_are_decoded_to_utf8() {
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\" standalone=\"yes\"?>\n<w:document><w:t>\u{627}\u{644}\u{639} \u{1F600} &amp; é</w:t></w:document>";
+        for (little_endian, name) in [(true, "UTF-16LE"), (false, "UTF-16BE")] {
+            let (out, detail) = repaired(&utf16(text, little_endian));
+            assert_eq!(
+                out,
+                text.replace("encoding=\"UTF-16\"", "encoding=\"UTF-8\""),
+                "{name}"
+            );
+            assert!(detail.contains(name), "{detail}");
+        }
+    }
+
+    #[test]
+    fn utf16_decoding_repairs_what_it_cannot_decode() {
+        /* An unpaired surrogate and a trailing odd byte become U+FFFD; an
+        `&` the decoded text leaves bare is escaped like in any part. */
+        let mut xml = b"\xFF\xFE".to_vec();
+        for u in "<r>a"
+            .encode_utf16()
+            .chain([0xD800])
+            .chain("& b</r>".encode_utf16())
+        {
+            xml.extend_from_slice(&u.to_le_bytes());
+        }
+        xml.push(b'x');
+        let (out, detail) = repaired(&xml);
+        /* The odd byte decodes to U+FFFD after the root: stray text, dropped. */
+        assert_eq!(out, "<r>a\u{FFFD}&amp; b</r>");
+        assert!(
+            detail.contains("UTF-16LE") && detail.contains("1 stray"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_declared_encoding_is_rewritten_only_when_it_is_not_utf8() {
+        for (decl, want) in [
+            (
+                r#"<?xml version="1.0" encoding="utf-16"?>"#,
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            ),
+            (
+                r#"<?xml version='1.0' encoding = 'UTF-16LE' standalone='yes'?>"#,
+                r#"<?xml version='1.0' encoding = 'UTF-8' standalone='yes'?>"#,
+            ),
+            (
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            ),
+            (r#"<?xml version="1.0"?>"#, r#"<?xml version="1.0"?>"#),
+        ] {
+            let (out, _) = repaired(&utf16(&format!("{decl}<r/>"), true));
+            assert_eq!(out, format!("{want}<r/>"));
+        }
+    }
+
+    /// A UTF-32 part is beyond a faithful repair (and is never read as
+    /// UTF-16 noise); a UTF-16 part with a structural defect is left as
+    /// the bytes it was.
+    #[test]
+    fn utf32_and_structurally_broken_utf16_parts_are_reported_and_kept() {
+        for xml in [
+            b"\xFF\xFE\x00\x00<\0\0\0r\0\0\0/\0\0\0>\0\0\0".to_vec(),
+            b"\x00\x00\xFE\xFF\0\0\0<\0\0\0r\0\0\0/\0\0\0>".to_vec(),
+            utf16("<r><a></b></r>", true),
+        ] {
+            let (out, w) = run(&xml);
+            assert_eq!(out, xml);
+            assert!(
+                matches!(
+                    w.as_slice(),
+                    [DocxWarning::MalformedPart {
+                        repaired: false,
+                        ..
+                    }]
+                ),
+                "{w:?}"
+            );
+        }
+    }
+
+    /// The decoded part is held to the #348 shape caps again (they ran on
+    /// UTF-16 bytes with no structure).
+    #[test]
+    fn a_decoded_utf16_part_is_held_to_the_shape_caps() {
+        let limits = PackageLimits {
+            max_xml_depth: 4,
+            ..PackageLimits::DEFAULT
+        };
+        let xml = utf16("<a><b><c><d><e><f/></e></d></c></b></a>", true);
+        let err = repair_part("p.xml", xml, &limits, &mut Vec::new()).expect_err("too deep");
+        assert!(matches!(err, DocxError::PackageTooLarge { .. }), "{err:?}");
     }
 
     #[test]
