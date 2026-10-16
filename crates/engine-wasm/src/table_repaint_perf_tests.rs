@@ -62,6 +62,10 @@ const EDITOR_FACES: &[(&str, &[u8])] = &[
         "selawik",
         include_bytes!("../../../ts/public/fonts/Selawik-Regular.ttf"),
     ),
+    (
+        "scheherazade-new",
+        include_bytes!("../../../ts/public/fonts/ScheherazadeNew-Regular.ttf"),
+    ),
 ];
 
 /// An engine booted like the shell: every boot face loaded through

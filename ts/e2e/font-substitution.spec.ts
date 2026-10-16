@@ -7,7 +7,8 @@ import { boot } from './helpers/editor';
  * REAL shell + worker + WASM engine.
  *
  * The boot sequence loads the manifest's `substitutes` (Carlito, Caladea,
- * Liberation Serif / Mono, Gelasio, Selawik, Noto Naskh Arabic) next to
+ * Liberation Serif / Mono, Gelasio, Selawik, Noto Naskh Arabic, Scheherazade
+ * New - issue #474) next to
  * the defaults. `theme_word_default.docx` is Word's default template: its
  * runs name Calibri / Calibri Light (Latin) and Arial / Times New Roman
  * (Arabic) through the theme — none of which the editor ships. The open
@@ -30,11 +31,11 @@ test('#329: an opened document reports its font substitutions and the Dev HUD li
     /* The substitutes are resident once boot settles. */
     const resident = await page.evaluate(() => {
         const reg = (window as any).__fontRegistry;
-        return ['carlito', 'caladea', 'liberation-serif', 'noto-naskh'].map((id) =>
-            reg.isLoaded(id),
+        return ['carlito', 'caladea', 'liberation-serif', 'noto-naskh', 'scheherazade-new'].map(
+            (id) => reg.isLoaded(id),
         );
     });
-    expect(resident).toEqual([true, true, true, true]);
+    expect(resident).toEqual([true, true, true, true, true]);
 
     const bytes = Array.from(readFileSync(THEME_FIXTURE));
     const loaded = await page.evaluate(

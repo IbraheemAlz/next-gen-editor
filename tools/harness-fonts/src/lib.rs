@@ -95,6 +95,10 @@ const SUBSTITUTES: &[(&str, &[u8])] = &[
         "selawik",
         include_bytes!("../../../ts/public/fonts/Selawik-Regular.ttf"),
     ),
+    (
+        "scheherazade-new",
+        include_bytes!("../../../ts/public/fonts/ScheherazadeNew-Regular.ttf"),
+    ),
 ];
 
 /// [`harness_stack`] plus the editor's substitute faces (issue #329): a run
