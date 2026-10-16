@@ -698,6 +698,19 @@ impl Paginator {
         self.cur_y
     }
 
+    /// Issue #501 - [`Self::cursor_y`] bounded to the page it sits on: the
+    /// extent the in-progress page can really contribute to the document
+    /// height. A single line (or atomic block) taller than its page is
+    /// clipped by the oversize guard (`DegradeReason::OversizeLine`) but
+    /// leaves `cur_y` at the line's full height - a 1e33 pt line pushed it
+    /// past every finite viewport-cull target, so the lazy band stopped
+    /// right behind it for ever (#499). The cull compares this instead; a
+    /// cursor inside the page is returned unchanged, so no normal
+    /// document's band moves. A NaN cursor reads as the page height.
+    pub fn cursor_y_within_page(&self) -> f32 {
+        self.cur_y.min(self.geometry.height)
+    }
+
     /// Number of pages already finalised (i.e. excluding the
     /// in-progress page being filled by [`Paginator::push_block`]).
     /// Callers diff this before/after a `push_block` to detect implicit

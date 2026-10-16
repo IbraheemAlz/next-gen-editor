@@ -135,6 +135,46 @@ fn hostile_measures_read_finite_and_round_trip_byte_identical() {
     }
 }
 
+/// Issue #501 - `<w:sz>` / `<w:szCs>` land inside Word's 1..=1638 pt
+/// (`w:val` 2..=3276): a clamped value is reported as `MeasureClamped`
+/// (naming the attribute), an in-range one is not, and the zero-edit
+/// save stays byte-identical (the clamped model re-derives from the same
+/// bytes, so the verified `<w:rPr>` passthrough still holds).
+#[test]
+fn font_sizes_are_clamped_into_words_bound_and_reported() {
+    for (val, want_pt, clamped) in [
+        ("22", 11.0, false),
+        ("2", 1.0, false),
+        ("3276", 1638.0, false),
+        ("0", 1.0, true),
+        ("1", 1.0, true),
+        ("3277", 1638.0, true),
+        ("4294967295", 1638.0, true),
+        ("99999999999", 1638.0, true),
+    ] {
+        let xml = document(
+            &format!(
+                r#"<w:p><w:r><w:rPr><w:sz w:val="{val}"/><w:szCs w:val="{val}"/></w:rPr><w:t>big</w:t></w:r></w:p>"#
+            ),
+            r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#,
+        );
+        let archive = assert_zero_edit_identity(&xml);
+        let style = archive.document.blocks[0]
+            .as_paragraph()
+            .expect("paragraph")
+            .style_at(0);
+        assert_eq!(style.font_size, Some(want_pt), "{val}: w:sz");
+        assert_eq!(style.font_size_cs, Some(want_pt), "{val}: w:szCs");
+        for attr in ["w:sz/@w:val", "w:szCs/@w:val"] {
+            let reported = archive.warnings.iter().any(|w| {
+                matches!(w, DocxWarning::MeasureClamped { attr: a, value, .. }
+                    if a == attr && value == val)
+            });
+            assert_eq!(reported, clamped, "{val}: {attr} in {:?}", archive.warnings);
+        }
+    }
+}
+
 /// An edit elsewhere in the document still re-emits the hostile
 /// `<w:sectPr>` bytes verbatim (the verified passthrough holds), and the
 /// edited paragraph keeps its source `<w:pPr>` (its model is unchanged).

@@ -141,6 +141,41 @@ fn emu_or_hostile(u: &mut Unstructured, small: i64) -> i64 {
     }
 }
 
+/// Issue #501 - the sizes Word's 1..=1638 pt bound
+/// (`engine::MAX_FONT_SIZE_PT`) pivots on, for a font-size command field:
+/// zero, below / at / past each edge, the #499 trigger (`1.0951575e33`),
+/// `f32::MAX` and a negative. The command path must refuse every one that
+/// is outside with `OutOfRange` and leave the document alone, and a value
+/// inside must never leave a run past the bound.
+fn hostile_font_size(u: &mut Unstructured) -> f32 {
+    const EDGES: [f32; 13] = [
+        0.0,
+        0.5,
+        0.999,
+        1.0,
+        1.5,
+        1637.5,
+        1638.0,
+        1638.5,
+        1639.0,
+        1e33,
+        1.0951575e33,
+        f32::MAX,
+        -1.0,
+    ];
+    u.choose(&EDGES).copied().unwrap_or(0.0)
+}
+
+/// A font size: usually a small ordinary one (`1..=97`), a quarter of the
+/// time one of [`hostile_font_size`]'s edges (issue #501).
+fn font_size_or_hostile(u: &mut Unstructured) -> f32 {
+    if u.ratio(1, 4).unwrap_or(false) {
+        hostile_font_size(u)
+    } else {
+        small(u, 96) as f32 + 1.0
+    }
+}
+
 fn pos(u: &mut Unstructured) -> LogicalPos {
     LogicalPos {
         path: BlockPath::top(small(u, 3)),
@@ -273,7 +308,12 @@ pub enum Scenario {
     /// paragraph set at a 1e33 pt font keeps the paginator's running
     /// height above any cull target, so `MoveCaret { Left, extend }` from
     /// a table past the band raised the target forever. Now one full
-    /// layout noted `NavExpansionStalled`.
+    /// layout noted `NavExpansionStalled`. Issue #501 - the size itself is
+    /// refused at the door (`ApplyFormatting` past 1638 pt answers
+    /// `OutOfRange`, nothing applied), so this sequence now pins that
+    /// refusal and the rest of the flow on an unformatted document; the
+    /// stall itself is reproduced by `lazy_nav`'s fuzz-native tests, which
+    /// write the size into the model.
     NavExpansionStalled,
 }
 
@@ -790,7 +830,7 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
                 underline: Some(UnderlineStyle::Single),
                 strike: None,
                 font_family: None,
-                font_size: Some(small(u, 96) as f32 + 1.0),
+                font_size: Some(font_size_or_hostile(u)),
                 color: None,
                 bg_color: None,
                 script: None,

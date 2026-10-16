@@ -458,7 +458,9 @@ fn rpr_children(style: &SpanStyle) -> PrChildren {
     `<w:sz>` never gains a synthesized `<w:szCs>` (#249), and an
     engine-authored size change sets both slots (`SpanStyle::
     with_cs_twins`), so it still writes the pair Word writes. */
-    let half_points = |pt: f32| (pt * 2.0).round().max(2.0) as u32;
+    /* Issue #501 - never spelled outside Word's 2..=3276 half-points
+    (1..=1638 pt), whatever a model that bypassed a door holds. */
+    let half_points = |pt: f32| (engine::clamp_font_size_pt(pt) * 2.0).round() as u32;
     if let Some(pt) = style.font_size {
         let half_pts = half_points(pt);
         ch.push(rank(b"w:sz"), format!("<w:sz w:val=\"{half_pts}\"/>"));

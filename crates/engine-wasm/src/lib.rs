@@ -55,6 +55,9 @@ pub(crate) use paragraph_cache_key::paragraph_layout_key;
 /// Issue #459 — the command-boundary EMU range guard (picture extents and
 /// offsets stay inside Word's 22 in).
 mod emu_guard;
+/// Issue #501 — the command-boundary font-size range guard (a run / mark /
+/// style size stays inside Word's 1..=1638 pt).
+mod font_size_guard;
 mod table_cache;
 /// Issue #467 — the command-boundary text guard (control characters,
 /// noncharacters) every text-bearing command passes through.
@@ -406,6 +409,47 @@ const AVG_BLOCK_HEIGHT_PT: f32 = 64.0;
 /// arithmetic.
 fn lazy_runway(viewport_h_pt: f32, scale: f32) -> f32 {
     LAYOUT_BUFFER_PT.max(viewport_h_pt * scale * 2.0)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Issue #501 - test hook: counts the paginator's RAW cursor in the
+    /// cull again (the pre-#501 behaviour), so a test can stand in for a
+    /// hypothetical regression of the structural clamp and check that the
+    /// progress-bounded expansion still ends the stall with a note.
+    static CULL_CLAMP_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Issue #501 - scoped switch for [`CULL_CLAMP_OFF`]: the clamp is off
+/// while the guard lives (a test that needs the unclamped cull to build a
+/// stalled band, #499), restored on drop.
+#[cfg(test)]
+pub(crate) struct CullClampOff;
+
+#[cfg(test)]
+impl CullClampOff {
+    pub(crate) fn on() -> Self {
+        CULL_CLAMP_OFF.with(|c| c.set(true));
+        CullClampOff
+    }
+}
+
+#[cfg(test)]
+impl Drop for CullClampOff {
+    fn drop(&mut self) {
+        CULL_CLAMP_OFF.with(|c| c.set(false));
+    }
+}
+
+/// The in-progress page's contribution to the running height the cull
+/// compares with its budget (issue #501): the paginator's cursor bounded
+/// by its page, so one line taller than the page adds at most the page.
+fn cull_cursor_y(pag: &Paginator) -> f32 {
+    #[cfg(test)]
+    if CULL_CLAMP_OFF.with(std::cell::Cell::get) {
+        return pag.cursor_y();
+    }
+    pag.cursor_y_within_page()
 }
 
 /// Audit gap C.H1 — pagination-completion info that rides alongside
@@ -8341,6 +8385,12 @@ impl Engine {
         if let Err(refused) = emu_guard::check_command(&cmd) {
             return *refused;
         }
+        /* Issue #501 - and for font sizes: a finite `1.0951575e33` pt made
+        a line taller than any page and stalled the cull; a size outside
+        Word's 1..=1638 pt is refused `OutOfRange` before any handler. */
+        if let Err(refused) = font_size_guard::check_command(&cmd) {
+            return *refused;
+        }
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
         }
@@ -10700,7 +10750,9 @@ impl Engine {
                     let pag_h = paginator.as_ref().map_or(0.0, |p| {
                         p.emitted_pages_height()
                             + p.page_count_emitted() as f32 * gap
-                            + p.cursor_y()
+                            /* Issue #501 - a line taller than its page
+                            adds at most that page to the height. */
+                            + cull_cursor_y(p)
                     });
                     if height_so_far(&emitted_pages, pag_h) >= budget {
                         culled = true;
@@ -11798,6 +11850,12 @@ impl Engine {
         let bottom_pt = (viewport.y + viewport.h) / self.scale();
         if bottom_pt > self.lazy_layout.min_target_y {
             self.lazy_layout.min_target_y = bottom_pt;
+        }
+        /* Issue #501 - growth the cull could not deliver (a running height
+        past every target) goes through the progress-bounded expansion
+        shared with the caret / click paths, not a silent no-op. */
+        if let Err(e) = self.lazy_expand_to_viewport() {
+            return *e;
         }
         let stats = match self.render_document(Some(region)) {
             Ok(s) => s,
@@ -19123,6 +19181,21 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Issue #501 - no run or paragraph mark the session holds may carry a
+    /// font size outside Word's 1..=1638 pt
+    /// ([`engine::first_font_size_beyond_bound`]). Kept apart from
+    /// [`Self::check_invariants_for_fuzzing`] like the picture bound: a
+    /// hostile snapshot may restore to anything, the COMMAND path must not
+    /// produce it. `Err` names the first violation.
+    pub fn check_font_sizes_for_fuzzing(&self) -> Result<(), String> {
+        match engine::first_font_size_beyond_bound(self.undo.current()) {
+            Some(why) => Err(format!(
+                "the document model holds an out-of-bound size: {why}"
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Issue #471 - how many table rows (body, headers, footers, notes,
@@ -29964,6 +30037,11 @@ mod table_merge_tests;
 #[cfg(all(test, feature = "fuzz-native"))]
 mod emu_guard_tests;
 
+/// Issue #501 - font sizes vs Word's 1..=1638 pt, and the scroll-driven
+/// expansion of a document with a page-tall line (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod font_size_guard_tests;
+
 #[cfg(test)]
 mod a11y_direction_tests;
 
@@ -30118,12 +30196,17 @@ mod font_priority;
 /// Issue #407 — the command-boundary finiteness guard (`InvalidArgument`).
 #[cfg(test)]
 mod finite_guard_tests;
+
 /// Issue #472 — `SetFontPriority` reaches layout and the read-backs.
 #[cfg(test)]
 mod font_priority_tests;
 /// Issue #329 — substitution reporting + the `Substituted` font source.
 #[cfg(test)]
 mod font_substitution_tests;
+/// Issue #501 item 3 - the viewport cull counts at most one page for a line
+/// taller than its page.
+#[cfg(test)]
+mod oversize_line_tests;
 /// Issue #467 — control characters / noncharacters at the input boundary.
 #[cfg(test)]
 mod text_input_tests;

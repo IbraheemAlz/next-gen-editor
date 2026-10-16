@@ -119,6 +119,19 @@ paths:
   falls back to the extent rectangle, the source element stays verbatim) —
   never a partial polygon. A NEW command field carrying a drawing extent or
   offset must be added to `emu_guard::check_command`.
+- **Font sizes (issue #501).** Word holds a character at 1 pt .. 1638 pt
+  (`<w:sz w:val>` 2..=3276 half-points): `engine::MIN_FONT_SIZE_PT` /
+  `MAX_FONT_SIZE_PT` are the ONE pair. The reader's `<w:sz>` / `<w:szCs>`
+  (`ct_rpr::half_points` - also a digit string past `u32`) CLAMP into it with
+  `DocxWarning::MeasureClamped` (`attr` `w:sz/@w:val` / `w:szCs/@w:val`, the
+  value in twips; source bytes kept, so the verified `<w:rPr>` passthrough
+  still holds), the HTML paste door clamps (a non-finite `font-size` is
+  dropped), the writer never spells a size outside the bound, and
+  `engine-wasm` `font_size_guard` REFUSES (`OutOfRange`, field named) an
+  `ApplyFormatting.attrs.font_size`, a `ModifyStyle` run size and the harness
+  `px_size` fields outside it. A NEW command field that sets a font size must
+  be added to `font_size_guard::first_refused`; `rpc_command` checks
+  `first_font_size_beyond_bound` after every size-setting command.
 - **Namespace prefixes (issues #325 / #394).** The parsers match literal
   qnames (`w:p`), so every WordprocessingML part the reader walks — the
   main part, `styles.xml`, `numbering.xml`, `settings.xml`, the note

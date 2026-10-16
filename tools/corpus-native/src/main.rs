@@ -526,6 +526,9 @@ fn main() -> ExitCode {
     prefix normaliser (regenerate-only parts). */
     let mut normalized_docs = 0usize;
     let mut normalized_parts = 0usize;
+    /* Issue #501 - documents whose `<w:sz>` / `<w:szCs>` the reader clamped. */
+    let mut font_clamp_docs = 0usize;
+    let mut font_clamp_values = 0usize;
     /* Issue #318 — production-layout timings `(ms, label)`, the
     documents that blew the budget, and a degradation-reason histogram. */
     let mut engine_times: Vec<(u128, String)> = Vec::new();
@@ -684,6 +687,10 @@ fn main() -> ExitCode {
         if !rec.normalized_parts.is_empty() {
             normalized_docs += 1;
             normalized_parts += rec.normalized_parts.len();
+        }
+        if rec.font_size_clamps > 0 {
+            font_clamp_docs += 1;
+            font_clamp_values += rec.font_size_clamps;
         }
 
         if let Some(t) = &rec.theme_fonts {
@@ -871,6 +878,10 @@ fn main() -> ExitCode {
         "[corpus-native] non-canonical namespace prefixes (#325/#394) or malformed XML repaired \
          (#434): {normalized_docs} documents, {normalized_parts} parts normalised (regenerate-only: \
          their zero-edit save is not byte-identical to the source)"
+    );
+    println!(
+        "[corpus-native] font sizes clamped to Word's 1..=1638 pt (#501): {font_clamp_docs} \
+         documents, {font_clamp_values} <w:sz>/<w:szCs> values"
     );
     println!(
         "[corpus-native] font substitution (#329): {substituting_docs}/{} documents substitute \

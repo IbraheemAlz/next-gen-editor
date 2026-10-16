@@ -752,7 +752,8 @@ error_kinds! {
     /// for this input (PDF as an open format, a TOC outside the body, ...).
     UnsupportedHere,
     /// A numeric argument is outside its allowed range (table dimensions,
-    /// text-box extent, render date). A `NaN` / infinite one is
+    /// text-box extent, picture EMU (#459), font size (#501), render date).
+    /// A `NaN` / infinite one is
     /// [`ErrorKind::InvalidArgument`] (issue #407).
     OutOfRange,
     /// A required text argument is empty (a field code, a glyph string).
