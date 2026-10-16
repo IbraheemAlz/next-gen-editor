@@ -1624,6 +1624,11 @@ pub(crate) fn drift_dump_stem(path_label: &str) -> String {
     format!("{base}-{:08x}", h >> 32)
 }
 
+/// serde `skip_serializing_if` for a zero count.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,8 +1753,4 @@ mod tests {
         let _ = classify_rewrite(xml, xml.len(), 1);
         let _ = classify_rewrite(xml, xml.len() + 1000, 1);
     }
-}
-
-fn is_zero(n: &usize) -> bool {
-    *n == 0
 }

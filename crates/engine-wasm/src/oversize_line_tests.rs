@@ -103,3 +103,51 @@ fn a_cursor_inside_the_page_is_counted_unclamped() {
     assert!(!a_full && a >= 1);
     assert!(b > a || b_full, "a plain document grows with its target");
 }
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut fut = Box::pin(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!("Engine::apply suspended in a native test"),
+    }
+}
+
+/// What an `ExpandLayout` answered: (pages, full layout, the degradation
+/// reasons it carried).
+fn expand(engine: &mut Engine, target_y: f32) -> (u32, bool, Vec<bridge::LayoutDegradeReason>) {
+    match block_on(engine.apply(Command::ExpandLayout { target_y })) {
+        Event::Painted {
+            page_count,
+            is_full_layout,
+            layout_degraded,
+            ..
+        } => (
+            page_count,
+            is_full_layout,
+            layout_degraded.iter().map(|d| d.reason).collect(),
+        ),
+        other => panic!("ExpandLayout answers Painted, got {other:?}"),
+    }
+}
+
+/// Item 2, the nominal path: a scroll-driven `ExpandLayout` over a document
+/// holding a page-tall line grows the band with the target and completes
+/// without a stall note - the structural clamp already delivered it.
+#[test]
+fn expand_layout_over_a_page_tall_line_grows_the_band_without_a_note() {
+    for size in [1638.0, 1.0951575e33] {
+        let mut engine = test_engine_with_doc(doc_with_tall_paragraph(80, 0, size));
+        small_band(&mut engine);
+        let (first, _, _) = expand(&mut engine, 2_000.0);
+        let (second, second_full, notes) = expand(&mut engine, 12_000.0);
+        assert!(second > first || second_full, "{size}: {first} -> {second}");
+        assert!(
+            !notes.contains(&bridge::LayoutDegradeReason::FastPathMismatch),
+            "{size}: {notes:?}"
+        );
+        let (_, full, _) = expand(&mut engine, 1.0e6);
+        assert!(full, "{size}: an ExpandLayout past the end lays it all out");
+    }
+}

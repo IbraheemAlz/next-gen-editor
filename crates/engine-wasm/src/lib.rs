@@ -411,6 +411,26 @@ fn lazy_runway(viewport_h_pt: f32, scale: f32) -> f32 {
     LAYOUT_BUFFER_PT.max(viewport_h_pt * scale * 2.0)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Issue #501 - test hook: counts the paginator's RAW cursor in the
+    /// cull again (the pre-#501 behaviour), so a test can stand in for a
+    /// hypothetical regression of the structural clamp and check that the
+    /// progress-bounded expansion still ends the stall with a note.
+    static CULL_CLAMP_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The in-progress page's contribution to the running height the cull
+/// compares with its budget (issue #501): the paginator's cursor bounded
+/// by its page, so one line taller than the page adds at most the page.
+fn cull_cursor_y(pag: &Paginator) -> f32 {
+    #[cfg(test)]
+    if CULL_CLAMP_OFF.with(std::cell::Cell::get) {
+        return pag.cursor_y();
+    }
+    pag.cursor_y_within_page()
+}
+
 /// Audit gap C.H1 — pagination-completion info that rides alongside
 /// the laid-out pages. The caller folds this into `Painted` so the TS
 /// shell knows (a) whether more pages may materialize via
@@ -10680,7 +10700,7 @@ impl Engine {
                             + p.page_count_emitted() as f32 * gap
                             /* Issue #501 - a line taller than its page
                             adds at most that page to the height. */
-                            + p.cursor_y_within_page()
+                            + cull_cursor_y(p)
                     });
                     if height_so_far(&emitted_pages, pag_h) >= budget {
                         culled = true;
