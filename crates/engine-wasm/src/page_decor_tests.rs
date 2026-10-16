@@ -308,7 +308,7 @@ fn number_attrs(extra_styles: &str) -> layout::TextAttrs {
         extra_styles,
     );
     let pages = pages_of(&decor_engine(&docx));
-    pages[0].decor.line_numbers[0].run.attrs.clone()
+    pages[0].decor.line_numbers[0].run.attrs
 }
 
 /// Issue #487 — the numbers paint in the `LineNumber` character style

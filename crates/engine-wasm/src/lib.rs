@@ -3999,6 +3999,7 @@ impl DropCapCarry {
 /// numbering there. Tables, paragraphs with `w:suppressLineNumbers` and
 /// drop-cap frames are neither counted nor numbered (Word's rule);
 /// headers, footers and notes never are.
+#[allow(clippy::too_many_arguments)]
 fn apply_page_decor(
     pages: &mut [PageBox],
     page_paths: &[Vec<EngineBlockPath>],
