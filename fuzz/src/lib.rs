@@ -833,7 +833,39 @@ pub fn well_formed_docx_seeds() -> Vec<(&'static str, Vec<u8>, WfOutcome)> {
     use format_docx::test_fixtures::package_with_document_xml_bytes as package;
     let para = |t: &str| format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>").into_bytes();
     let styles: &[u8] = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="A"><w:na;me w:val="A"/></w:style></w:styles>"#;
+    /* A UTF-16 main part: Arabic + a surrogate pair, the declaration
+    naming UTF-16. */
+    let utf16_main = |little_endian: bool| {
+        let text = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\" standalone=\"yes\"?>\n{}{}",
+            String::from_utf8_lossy(wf_root()),
+            "<w:body><w:p><w:r><w:t>\u{627}\u{644}\u{639}\u{631}\u{628}\u{64A}\u{629} \u{1F600}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"
+        );
+        let mut out = if little_endian {
+            vec![0xFF, 0xFE]
+        } else {
+            vec![0xFE, 0xFF]
+        };
+        for u in text.encode_utf16() {
+            out.extend_from_slice(&if little_endian {
+                u.to_le_bytes()
+            } else {
+                u.to_be_bytes()
+            });
+        }
+        package(&out, &[])
+    };
     vec![
+        (
+            "wf_utf16le_document.docx",
+            utf16_main(true),
+            WfOutcome::Opens,
+        ),
+        (
+            "wf_utf16be_document.docx",
+            utf16_main(false),
+            WfOutcome::Opens,
+        ),
         (
             "wf_bad_tag_name_main.docx",
             package(&wf_document(b"<w:p;><w:r><w:t>a</w:t></w:r></w:p>"), &[]),

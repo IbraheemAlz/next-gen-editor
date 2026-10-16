@@ -63,6 +63,17 @@
 //! `archive::check_part_xml_well_formed`), so the reader and the writer's
 //! well-formedness gate agree on what "well-formed" means.
 //!
+//! Issue #468 — a **UTF-16** part (a `FF FE` / `FE FF` byte-order mark;
+//! some generators write them although Word never does) is decoded to
+//! UTF-8 BEFORE the scan (`char::decode_utf16` over the BOM-selected byte
+//! order; an unpaired surrogate or a trailing odd byte is U+FFFD, a
+//! declared `encoding` becomes `UTF-8`), scanned and repaired like any other
+//! part, and reported `MalformedPart { repaired: true }` with the encoding
+//! named. The decoded bytes REPLACE the source's from then on, so every
+//! save writes the part as UTF-8 with a correct declaration; the decoded
+//! part is held to the #348 shape caps again. A UTF-32 part has no
+//! decoder: reported, `repaired: false` (the main part refuses).
+//!
 //! Issue #468 — **names** are checked too ([`is_xml_name`], the XML 1.0
 //! `Name` production, an ASCII fast path in front of the full
 //! `NameStartChar` / `NameChar` ranges): quick-xml accepts any bytes up to
@@ -99,11 +110,93 @@ fn split_bom(xml: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// `true` for a part encoded as UTF-16 (a UTF-16 byte-order mark): the
-/// reader decodes UTF-8 only, so such a part is reported, never "repaired"
-/// byte by byte into noise.
-fn is_utf16(xml: &[u8]) -> bool {
-    xml.starts_with(b"\xFF\xFE") || xml.starts_with(b"\xFE\xFF")
+/// `true` for a part encoded as UTF-32 (a UTF-32 byte-order mark; the LE
+/// one starts like UTF-16LE's, but a UTF-16 part never opens with U+0000):
+/// beyond a faithful repair — reported, never decoded as UTF-16 noise.
+fn is_utf32(xml: &[u8]) -> bool {
+    xml.starts_with(b"\xFF\xFE\x00\x00") || xml.starts_with(b"\x00\x00\xFE\xFF")
+}
+
+/// Issue #468 — a part encoded as UTF-16 (a UTF-16 byte-order mark):
+/// `(little endian, the encoding's name)`. The reader's tokenizer decodes
+/// UTF-8 only, so such a part is decoded up front ([`decode_utf16_part`])
+/// and then scanned like any other.
+fn utf16_order(xml: &[u8]) -> Option<(bool, &'static str)> {
+    if is_utf32(xml) {
+        None
+    } else if xml.starts_with(b"\xFF\xFE") {
+        Some((true, "UTF-16LE"))
+    } else if xml.starts_with(b"\xFE\xFF") {
+        Some((false, "UTF-16BE"))
+    } else {
+        None
+    }
+}
+
+/// Issue #468 — the UTF-8 spelling of a UTF-16 part (BOM included in
+/// `xml`, dropped from the result): `char::decode_utf16` over the
+/// BOM-selected byte order, an unpaired surrogate or a trailing odd byte
+/// becomes U+FFFD (the scan repairs what it decodes to like any other
+/// text), and a declared `encoding` is rewritten to `UTF-8` — the bytes are
+/// UTF-8 from here on, in the reader's walk AND in every save.
+fn decode_utf16_part(xml: &[u8], little_endian: bool) -> Vec<u8> {
+    let body = xml.get(2..).unwrap_or_default();
+    let units = body.chunks_exact(2).map(|c| {
+        if little_endian {
+            u16::from_le_bytes([c[0], c[1]])
+        } else {
+            u16::from_be_bytes([c[0], c[1]])
+        }
+    });
+    let mut text = String::with_capacity(body.len());
+    for c in char::decode_utf16(units) {
+        text.push(c.unwrap_or('\u{FFFD}'));
+    }
+    if body.len() % 2 == 1 {
+        text.push('\u{FFFD}');
+    }
+    let mut out = text.into_bytes();
+    declare_utf8(&mut out);
+    out
+}
+
+/// Rewrite the `encoding` pseudo-attribute of a leading XML declaration to
+/// `UTF-8` (a part decoded from UTF-16 says `encoding="UTF-16"`, which is
+/// no longer true of its bytes). Anything else is left alone: no
+/// declaration, no `encoding`, or one that already names UTF-8.
+fn declare_utf8(text: &mut Vec<u8>) {
+    if !text.starts_with(b"<?xml") {
+        return;
+    }
+    let Some(end) = text.windows(2).position(|w| w == b"?>") else {
+        return;
+    };
+    let decl = &text[..end];
+    let Some(key) = decl.windows(8).position(|w| w == b"encoding") else {
+        return;
+    };
+    let mut i = key + 8;
+    let skip_ws = |i: &mut usize| {
+        while decl.get(*i).is_some_and(u8::is_ascii_whitespace) {
+            *i += 1;
+        }
+    };
+    skip_ws(&mut i);
+    if decl.get(i) != Some(&b'=') {
+        return;
+    }
+    i += 1;
+    skip_ws(&mut i);
+    let Some(&quote @ (b'"' | b'\'')) = decl.get(i) else {
+        return;
+    };
+    let start = i + 1;
+    let Some(len) = decl[start..].iter().position(|&b| b == quote) else {
+        return;
+    };
+    if !decl[start..start + len].eq_ignore_ascii_case(b"utf-8") {
+        text.splice(start..start + len, b"UTF-8".iter().copied());
+    }
 }
 
 /// XML 1.0 `Char`: tab, LF, CR, and everything from U+0020 except the
@@ -175,6 +268,9 @@ fn first_invalid_name<'a>(e: &'a BytesStart<'_>) -> Option<Cow<'a, str>> {
 /// What one strict scan found, per defect class (the warning's detail).
 #[derive(Debug, Default)]
 struct Tally {
+    /// Issue #468 — the part was UTF-16 (the encoding's name): decoded to
+    /// UTF-8 before the scan.
+    utf16: Option<&'static str>,
     /// Offset of the first byte sequence that is not UTF-8.
     not_utf8: Option<usize>,
     /// `&` starting no reference, `<` in an attribute value, `]]>` in text.
@@ -214,6 +310,11 @@ impl Tally {
 
     fn detail(&self) -> String {
         let mut parts = Vec::new();
+        if let Some(name) = self.utf16 {
+            parts.push(format!(
+                "{name} encoded (decoded to UTF-8; saved as UTF-8 with the declaration rewritten)"
+            ));
+        }
         if let Some(at) = self.not_utf8 {
             parts.push(format!("not UTF-8 (first invalid byte at offset {at})"));
         }
@@ -926,14 +1027,22 @@ enum Health<'x> {
 }
 
 fn inspect(xml: &[u8]) -> Health<'_> {
-    if is_utf16(xml) {
-        return Health::Unrepairable("UTF-16 encoded (only UTF-8 parts are read)".to_string());
+    if is_utf32(xml) {
+        return Health::Unrepairable(
+            "UTF-32 encoded (only UTF-8 and UTF-16 parts are read)".to_string(),
+        );
     }
-    let (_, body) = split_bom(xml);
-    let not_utf8 = std::str::from_utf8(body).err().map(|e| e.valid_up_to());
+    /* Issue #468 — a UTF-16 part is decoded to UTF-8 first (the BOM goes
+    with the encoding), then judged like any other part. */
+    let utf16 = utf16_order(xml);
+    let source: Cow<'_, [u8]> = match utf16 {
+        Some((little_endian, _)) => Cow::Owned(decode_utf16_part(xml, little_endian)),
+        None => Cow::Borrowed(split_bom(xml).1),
+    };
+    let not_utf8 = std::str::from_utf8(&source).err().map(|e| e.valid_up_to());
     let body: Cow<'_, [u8]> = match not_utf8 {
-        None => Cow::Borrowed(body),
-        Some(_) => Cow::Owned(String::from_utf8_lossy(body).into_owned().into_bytes()),
+        None => source,
+        Some(_) => Cow::Owned(String::from_utf8_lossy(&source).into_owned().into_bytes()),
     };
     match scan(&body) {
         Scan::Structural(detail) => Health::Unrepairable(detail),
@@ -942,10 +1051,11 @@ fn inspect(xml: &[u8]) -> Health<'_> {
             patches,
             closers,
         } => {
-            if not_utf8.is_none() && patches.is_empty() && closers.is_empty() {
+            if not_utf8.is_none() && utf16.is_none() && patches.is_empty() && closers.is_empty() {
                 return Health::WellFormed;
             }
             tally.not_utf8 = not_utf8;
+            tally.utf16 = utf16.map(|(_, name)| name);
             Health::Repairable {
                 body,
                 patches,
@@ -1055,6 +1165,7 @@ pub(crate) fn repair_part(
     limits: &PackageLimits,
     warnings: &mut Vec<DocxWarning>,
 ) -> Result<Vec<u8>, DocxError> {
+    let decoded_utf16;
     let out = match inspect(&xml) {
         Health::WellFormed => return Ok(xml),
         Health::Unrepairable(detail) => {
@@ -1082,6 +1193,7 @@ pub(crate) fn repair_part(
             }
             out.extend_from_slice(&body[at..]);
             out.extend_from_slice(&closers);
+            decoded_utf16 = tally.utf16.is_some();
             warnings.push(DocxWarning::MalformedPart {
                 part: name.to_string(),
                 detail: tally.detail(),
@@ -1096,6 +1208,11 @@ pub(crate) fn repair_part(
             max: limits.max_part_bytes,
             part: Some(name.to_string()),
         });
+    }
+    /* Issue #468 — the #348 shape caps ran on the UTF-16 bytes (no
+    structure to count there); the decoded part is held to them now. */
+    if decoded_utf16 {
+        crate::opc::limits::check_xml_part(name, &out, limits)?;
     }
     Ok(out)
 }
@@ -1386,18 +1503,119 @@ mod tests {
         assert!(!is_xml_name(b"a\xFFb"));
     }
 
+    fn utf16(text: &str, little_endian: bool) -> Vec<u8> {
+        let mut out = if little_endian {
+            b"\xFF\xFE".to_vec()
+        } else {
+            b"\xFE\xFF".to_vec()
+        };
+        for u in text.encode_utf16() {
+            out.extend_from_slice(&if little_endian {
+                u.to_le_bytes()
+            } else {
+                u.to_be_bytes()
+            });
+        }
+        out
+    }
+
+    /// Issue #468 — a UTF-16 part (either byte order, surrogate pairs
+    /// included) is decoded to UTF-8, reported repaired with the encoding
+    /// named, and its declaration says UTF-8.
     #[test]
-    fn utf16_parts_are_reported_not_rewritten() {
-        let xml = b"\xFF\xFE<\0w\0/\0>\0";
-        let (out, w) = run(xml);
-        assert_eq!(out, xml);
-        assert!(matches!(
-            w.as_slice(),
-            [DocxWarning::MalformedPart {
-                repaired: false,
-                ..
-            }]
-        ));
+    fn utf16_parts_are_decoded_to_utf8() {
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\" standalone=\"yes\"?>\n<w:document><w:t>\u{627}\u{644}\u{639} \u{1F600} &amp; é</w:t></w:document>";
+        for (little_endian, name) in [(true, "UTF-16LE"), (false, "UTF-16BE")] {
+            let (out, detail) = repaired(&utf16(text, little_endian));
+            assert_eq!(
+                out,
+                text.replace("encoding=\"UTF-16\"", "encoding=\"UTF-8\""),
+                "{name}"
+            );
+            assert!(detail.contains(name), "{detail}");
+        }
+    }
+
+    #[test]
+    fn utf16_decoding_repairs_what_it_cannot_decode() {
+        /* An unpaired surrogate and a trailing odd byte become U+FFFD; an
+        `&` the decoded text leaves bare is escaped like in any part. */
+        let mut xml = b"\xFF\xFE".to_vec();
+        for u in "<r>a"
+            .encode_utf16()
+            .chain([0xD800])
+            .chain("& b</r>".encode_utf16())
+        {
+            xml.extend_from_slice(&u.to_le_bytes());
+        }
+        xml.push(b'x');
+        let (out, detail) = repaired(&xml);
+        /* The odd byte decodes to U+FFFD after the root: stray text, dropped. */
+        assert_eq!(out, "<r>a\u{FFFD}&amp; b</r>");
+        assert!(
+            detail.contains("UTF-16LE") && detail.contains("1 stray"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_declared_encoding_is_rewritten_only_when_it_is_not_utf8() {
+        for (decl, want) in [
+            (
+                r#"<?xml version="1.0" encoding="utf-16"?>"#,
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            ),
+            (
+                r#"<?xml version='1.0' encoding = 'UTF-16LE' standalone='yes'?>"#,
+                r#"<?xml version='1.0' encoding = 'UTF-8' standalone='yes'?>"#,
+            ),
+            (
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            ),
+            (r#"<?xml version="1.0"?>"#, r#"<?xml version="1.0"?>"#),
+        ] {
+            let (out, _) = repaired(&utf16(&format!("{decl}<r/>"), true));
+            assert_eq!(out, format!("{want}<r/>"));
+        }
+    }
+
+    /// A UTF-32 part is beyond a faithful repair (and is never read as
+    /// UTF-16 noise); a UTF-16 part with a structural defect is left as
+    /// the bytes it was.
+    #[test]
+    fn utf32_and_structurally_broken_utf16_parts_are_reported_and_kept() {
+        for xml in [
+            b"\xFF\xFE\x00\x00<\0\0\0r\0\0\0/\0\0\0>\0\0\0".to_vec(),
+            b"\x00\x00\xFE\xFF\0\0\0<\0\0\0r\0\0\0/\0\0\0>".to_vec(),
+            utf16("<r><a></b></r>", true),
+        ] {
+            let (out, w) = run(&xml);
+            assert_eq!(out, xml);
+            assert!(
+                matches!(
+                    w.as_slice(),
+                    [DocxWarning::MalformedPart {
+                        repaired: false,
+                        ..
+                    }]
+                ),
+                "{w:?}"
+            );
+        }
+    }
+
+    /// The decoded part is held to the #348 shape caps again (they ran on
+    /// UTF-16 bytes with no structure).
+    #[test]
+    fn a_decoded_utf16_part_is_held_to_the_shape_caps() {
+        let limits = PackageLimits {
+            max_xml_depth: 4,
+            ..PackageLimits::DEFAULT
+        };
+        let xml = utf16("<a><b><c><d><e><f/></e></d></c></b></a>", true);
+        let err = repair_part("p.xml", xml, &limits, &mut Vec::new()).expect_err("too deep");
+        assert!(matches!(err, DocxError::PackageTooLarge { .. }), "{err:?}");
     }
 
     #[test]
