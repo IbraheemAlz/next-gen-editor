@@ -79,6 +79,10 @@ type WorkerReply = {
     baseTakenAt?: number;
     /** Issue #390 — RECOVER reply: see `RecoveryInfo.journalGap`. */
     journalGap?: number;
+    /** Issue #503 — RECOVER reply: see `RecoveryInfo.boundsRepaired`. */
+    boundsRepaired?: number;
+    /** Issue #503 — RECOVER reply: see `RecoveryInfo.refusedCommands`. */
+    refusedCommands?: number;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -204,6 +208,15 @@ export interface RecoveryInfo {
      *  never written (the journal failed): the recovery replayed the
      *  commands around them and could not replay these. `0` = none. */
     journalGap: number;
+    /** Issue #503 — values in the restored snapshot outside Word's font-size
+     *  / page / paragraph limits that the restore clamped into them
+     *  (`Event::Recovered.bounds_repaired`). `0` = none. */
+    boundsRepaired: number;
+    /** Issue #503 — replayed log-tail commands the engine's argument guards
+     *  refused (a size or point outside Word's limits, a non-finite number,
+     *  forbidden text): skipped, not applied
+     *  (`Event::Recovered.refused_commands`). `0` = none. */
+    refusedCommands: number;
     /** Issue #270 — why the recovery ran: a worker `trap`, or the Dev
      *  HUD's in-place `renderer-retry` (a planned respawn, no crash). */
     cause: RecoveryCause;
@@ -1193,6 +1206,8 @@ export class EngineClient {
             rendererDowngraded: downgradedNow && recovered?.renderer_downgrade !== undefined,
             baseSnapshotAt: r.restored === true ? r.baseTakenAt : undefined,
             journalGap: r.journalGap ?? 0,
+            boundsRepaired: r.boundsRepaired ?? 0,
+            refusedCommands: r.refusedCommands ?? 0,
             cause,
         };
         this.noteGenerationStart();

@@ -426,6 +426,44 @@ fn saturate_ints(u: &mut Unstructured, node: &mut Mp, k: usize) {
     }
 }
 
+/// Issue #503 - swap every `f32` / `f64` leaf under `node` for a hostile
+/// float with probability `1 / rate`: the finite-but-absurd values (a
+/// `1e33` pt size, a `1e9` pt margin, a tab stop at `-1e30`, a point just
+/// past Word's bound) the command guards refuse, and NaN / infinity.
+fn hostile_floats(u: &mut Unstructured, node: &mut Mp, rate: u8) {
+    const HOSTILE: &[f32] = &[
+        1e33,
+        1e9,
+        -1e30,
+        f32::MAX,
+        f32::MIN,
+        1638.5,
+        1585.0,
+        -1585.0,
+        0.5,
+        0.0,
+        -1.0,
+        f32::NAN,
+        f32::INFINITY,
+    ];
+    match node {
+        Mp::F32(_) | Mp::F64(_) if u.ratio(1, u32::from(rate)).unwrap_or(false) => {
+            *node = Mp::F32(*pick(u, HOSTILE));
+        }
+        Mp::Arr(items) => {
+            for item in items {
+                hostile_floats(u, item, rate);
+            }
+        }
+        Mp::Map(entries) => {
+            for (_, v) in entries {
+                hostile_floats(u, v, rate);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Keys a Recover caller could present for `package` (the detached
 /// source package bytes), valid and not.
 fn package_keys(package: &[u8]) -> Vec<String> {
@@ -565,7 +603,7 @@ pub fn mutate_snapshot(u: &mut Unstructured, bytes: &[u8], package: Option<&[u8]
     let mut payload_override: Option<Vec<u8>> = None;
     let mut lie = false;
     for _ in 0..ops {
-        match u.int_in_range(0u8..=10).unwrap_or(0) {
+        match u.int_in_range(0u8..=11).unwrap_or(0) {
             // Issue #422 — a declared length the bytes cannot back
             // (applied to the final encoding, below).
             10 => lie = true,
@@ -647,6 +685,19 @@ pub fn mutate_snapshot(u: &mut Unstructured, bytes: &[u8], package: Option<&[u8]
                     }
                     if let Some(c) = t.field_mut("undo_cursor") {
                         *c = Mp::Int(*pick(u, HOSTILE_INTS));
+                    }
+                }
+            }
+            // Issue #503 - every float of a field (a font size, a margin, a
+            // page side, a tab stop, a gutter) swapped for a hostile one at
+            // a random rate: `Engine::restore` must clamp what the command
+            // guards never see.
+            11 => {
+                if let Some(t) = tree.as_mut() {
+                    let name = *pick(u, &["doc_history", "pending_format", "layout_cfg"]);
+                    let rate = *pick(u, &[1u8, 2, 4, 16]);
+                    if let Some(f) = t.field_mut(name) {
+                        hostile_floats(u, f, rate);
                     }
                 }
             }
