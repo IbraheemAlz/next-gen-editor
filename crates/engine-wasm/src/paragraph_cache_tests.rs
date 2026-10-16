@@ -273,7 +273,25 @@ fn shell_font_engine(doc: DocumentTree) -> Engine {
     engine
 }
 
+/// The pre-#476 perf-fixture filler (`tools/perf-fixtures`): mixed Latin and
+/// Arabic, ~110 characters a paragraph.
+const FIXTURE_FILLER: &str = "The quick brown fox jumps over the lazy dog. \
+    مرحبا بالعالم، هذا نص حشو لقياس استهلاك الذاكرة.";
+
+/// A harness document: a committed `tests/perf/<label>.docx` fixture, or
+/// `dense-<n>` — `n` filler paragraphs, the shape the `250p` / `500p`
+/// fixtures had before issue #476 re-calibrated them to their nominal page
+/// counts (20 paragraphs a page: 5 000 and 10 000 paragraphs). Since #476
+/// the committed `500p` is 3 000 paragraphs and fits even the old 4096-entry
+/// cache; a real 500-page document (a dozen paragraphs a page and up) does
+/// not, so the dense documents keep that scenario measurable.
 fn perf_fixture(label: &str) -> DocumentTree {
+    if let Some(n) = label.strip_prefix("dense-") {
+        let n: usize = n.parse().expect("dense-<paragraph count>");
+        return DocumentTree::from_paragraphs(
+            (0..n).map(|i| format!("Paragraph {i:05}. {FIXTURE_FILLER}")),
+        );
+    }
     let path = format!(
         "{}/../../tests/perf/{label}.docx",
         env!("CARGO_MANIFEST_DIR")
@@ -291,7 +309,7 @@ fn perf_fixture(label: &str) -> DocumentTree {
 #[test]
 #[ignore = "manual sizing harness, not a correctness gate"]
 fn profile_paragraph_cache_sizing() {
-    for label in ["50p", "100p", "250p", "500p"] {
+    for label in ["50p", "100p", "250p", "500p", "dense-5000", "dense-10000"] {
         let engine = shell_font_engine(perf_fixture(label));
         let (pages, _, _, _) = engine.build_pages(2.0, false, None).expect("full layout");
         let cache = engine.layout_cache.borrow();
@@ -304,7 +322,7 @@ fn profile_paragraph_cache_sizing() {
             })
             .sum();
         eprintln!(
-            "{label:>5}: {:>5} pages, {:>6} cached paragraphs, {:>9} glyphs, {:>7.1} MiB estimated \
+            "{label:>11}: {:>5} pages, {:>6} cached paragraphs, {:>9} glyphs, {:>7.1} MiB estimated \
              ({:.0} B/paragraph, {} B/glyph, size_of PositionedGlyph = {}), budget {} MiB",
             pages.len(),
             cache.len(),
@@ -328,7 +346,7 @@ fn profile_paragraph_cache_sizing() {
 #[ignore = "manual timing harness, not a correctness gate"]
 fn profile_paragraph_cache_warm_vs_cold() {
     use std::time::Instant;
-    const ROUNDS: usize = 3;
+    const ROUNDS: usize = 2;
     let load = || {
         std::fs::read_to_string("/proc/loadavg")
             .unwrap_or_default()
@@ -336,7 +354,7 @@ fn profile_paragraph_cache_warm_vs_cold() {
             .to_string()
     };
     eprintln!("loadavg at start: {}", load());
-    for label in ["250p", "500p"] {
+    for label in ["500p", "dense-5000", "dense-10000"] {
         let engine = shell_font_engine(perf_fixture(label));
         for (name, fresh) in [
             (

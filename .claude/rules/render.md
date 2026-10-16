@@ -166,13 +166,15 @@ hard failure so CI catches a new loop instead of a silent recovery.
   it), `PARAGRAPH_CACHE_BUDGET_BYTES` = 192 MiB, an entry ceiling of
   65 536 as a sanity bound only, and a box over an eighth of the budget
   is never cached. The old 4096-ENTRY LRU was smaller than the
-  paragraphs of `tests/perf/250p.docx` / `500p.docx` (5 000 / 10 000),
+  paragraphs of a long document (the `250p` / `500p` perf fixtures had
+  5 000 / 10 000 before issue #476 re-calibrated them to 1 500 / 3 000),
   and a document-order sweep over an LRU smaller than its working set
   hits NOTHING — a warm full re-layout (PDF export, `ExpandLayout` to
-  the end, the save restamp) cost the same as a cold one. 500p is
-  10 000 paragraphs / ~113 MiB of boxes at native pointer width (~87
-  MiB on wasm32), so the budget fits a 500-page document with
-  headroom; re-measure with
+  the end, the save restamp) cost the same as a cold one. 10 000
+  paragraphs are ~113 MiB of boxes at native pointer width (~87 MiB on
+  wasm32), so the budget fits a 500-page document with headroom;
+  re-measure (the `dense-5000` / `dense-10000` harness documents keep
+  the old fixtures' shape) with
   `cargo test -p engine-wasm --release profile_paragraph_cache -- --ignored --nocapture`
   (sizing + warm/cold) before moving the budget, and re-run
   `node tools/memory-profile/run.mjs --budgets`. A scene larger than

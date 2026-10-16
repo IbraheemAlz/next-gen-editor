@@ -34,16 +34,17 @@ use std::mem::size_of;
 
 /// Estimated bytes of cached paragraph boxes kept across paints.
 ///
-/// Measured on the perf fixtures (`profile_paragraph_cache_sizing`, native
-/// pointer width — wasm32's boxes are smaller, so native is the upper
-/// bound): `50p` 1 000 paragraphs / 11.3 MiB, `250p` 5 000 / 56.3 MiB,
-/// `500p` 10 000 paragraphs / 112.6 MiB (11 808 B per paragraph of ~110
-/// glyphs, 107 B per glyph; a 64-bit `PositionedGlyph` is 96 bytes). The
-/// budget is 1.7x the 500-page fixture (more on wasm32, whose boxes are a
-/// quarter smaller), which leaves a real 500-page document — denser than
-/// the synthetic fixture — and a PDF export's second set of scale-1.0
-/// keys some headroom. The 4096-entry cap it replaces pinned only 46 MiB
-/// and fit neither the 250p nor the 500p fixture.
+/// Measured by `profile_paragraph_cache_sizing` at native pointer width
+/// (wasm32's boxes are smaller, so native is the upper bound): a
+/// paragraph of ~110 glyphs is 11 808 B (107 B per glyph; a 64-bit
+/// `PositionedGlyph` is 96 bytes), so 5 000 paragraphs are 56.3 MiB and
+/// 10 000 are 112.6 MiB (the 20-paragraphs-a-page `250p` / `500p`
+/// fixtures from before issue #476; the committed `500p` is now 3 000
+/// paragraphs, 33.8 MiB). The budget is 1.7x the 10 000-paragraph
+/// document (more on wasm32, whose boxes are a quarter smaller), which
+/// leaves a real 500-page document — twice the fixture's glyph density —
+/// and a PDF export's second set of scale-1.0 keys headroom. The
+/// 4096-entry cap it replaces pinned 46 MiB and fit neither document.
 pub(crate) const PARAGRAPH_CACHE_BUDGET_BYTES: usize = 192 << 20;
 /// Sanity ceiling on the entry count, on top of the byte budget (an empty
 /// paragraph box is ~200 bytes, so the bytes alone would admit ~1M of
