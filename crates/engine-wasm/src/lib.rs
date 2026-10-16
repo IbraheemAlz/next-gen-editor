@@ -54,6 +54,9 @@ pub(crate) use paragraph_cache_key::paragraph_layout_key;
 /// Issue #459 — the command-boundary EMU range guard (picture extents and
 /// offsets stay inside Word's 22 in).
 mod emu_guard;
+/// Issue #501 — the command-boundary font-size range guard (a run / mark /
+/// style size stays inside Word's 1..=1638 pt).
+mod font_size_guard;
 mod table_cache;
 /// Issue #467 — the command-boundary text guard (control characters,
 /// noncharacters) every text-bearing command passes through.
@@ -8321,6 +8324,12 @@ impl Engine {
         extent / offset past Word's 22 in (`i64::MAX` reached layout as a
         box ~10^14 px wide) is refused `OutOfRange` before any handler. */
         if let Err(refused) = emu_guard::check_command(&cmd) {
+            return *refused;
+        }
+        /* Issue #501 - and for font sizes: a finite `1.0951575e33` pt made
+        a line taller than any page and stalled the cull; a size outside
+        Word's 1..=1638 pt is refused `OutOfRange` before any handler. */
+        if let Err(refused) = font_size_guard::check_command(&cmd) {
             return *refused;
         }
         if let Some(rejected) = self.story_gate(&cmd) {
@@ -19068,6 +19077,21 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Issue #501 - no run or paragraph mark the session holds may carry a
+    /// font size outside Word's 1..=1638 pt
+    /// ([`engine::first_font_size_beyond_bound`]). Kept apart from
+    /// [`Self::check_invariants_for_fuzzing`] like the picture bound: a
+    /// hostile snapshot may restore to anything, the COMMAND path must not
+    /// produce it. `Err` names the first violation.
+    pub fn check_font_sizes_for_fuzzing(&self) -> Result<(), String> {
+        match engine::first_font_size_beyond_bound(self.undo.current()) {
+            Some(why) => Err(format!(
+                "the document model holds an out-of-bound size: {why}"
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Issue #471 - how many table rows (body, headers, footers, notes,
@@ -29908,6 +29932,11 @@ mod table_merge_tests;
 /// (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod emu_guard_tests;
+
+/// Issue #501 - font sizes vs Word's 1..=1638 pt, and the scroll-driven
+/// expansion of a document with a page-tall line (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod font_size_guard_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;

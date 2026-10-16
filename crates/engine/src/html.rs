@@ -602,8 +602,15 @@ fn parse_inline_style(css: &str) -> SpanStyle {
                 }
             }
             "font-size" => {
-                if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse().ok()) {
-                    s.font_size = Some(px);
+                /* Issue #501 - a pasted size is clamped into Word's
+                1..=1638 pt (`MAX_FONT_SIZE_PT`), and a non-finite one
+                (`f32::from_str` takes `NaN` / `inf`) is no size at all. */
+                if let Some(px) = v
+                    .strip_suffix("px")
+                    .and_then(|n| n.trim().parse::<f32>().ok())
+                    .filter(|px| px.is_finite())
+                {
+                    s.font_size = Some(crate::clamp_font_size_pt(px));
                 }
             }
             _ => {}
@@ -1567,6 +1574,26 @@ mod tests {
         let st = parsed[0].style_at(0);
         assert_eq!(st.bg_color, Some([0, 255, 0, 255]));
         assert_eq!(st.font_family, Some(FontFamily::LiberationSans));
+    }
+
+    /// Issue #501 - a pasted `font-size` lands inside Word's 1..=1638 pt;
+    /// a non-finite one is no size at all.
+    #[test]
+    fn from_html_font_size_is_clamped_into_words_bound() {
+        let size = |css: &str| {
+            let parsed = from_html(&format!("<p><span style=\"font-size:{css}\">x</span></p>"));
+            parsed[0].style_at(0).font_size
+        };
+        assert_eq!(size("12px"), Some(12.0));
+        assert_eq!(size("1638px"), Some(1638.0));
+        assert_eq!(size("1638.5px"), Some(1638.0));
+        assert_eq!(size("1e33px"), Some(1638.0));
+        assert_eq!(size("0px"), Some(1.0));
+        assert_eq!(size("0.5px"), Some(1.0));
+        assert_eq!(size("-4px"), Some(1.0));
+        assert_eq!(size("NaNpx"), None);
+        assert_eq!(size("infpx"), None);
+        assert_eq!(size("-infpx"), None);
     }
 
     #[test]

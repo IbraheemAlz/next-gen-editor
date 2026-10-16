@@ -66,6 +66,12 @@ pub use emu_bounds::{
     MAX_DRAWING_EMU, clamp_extent_emu, clamp_offset_emu, first_image_beyond_bound,
     fit_extent_within_bound,
 };
+/// Issue #501 - Word's 1638 pt / 1 pt font-size bound.
+mod font_size_bounds;
+pub use font_size_bounds::{
+    MAX_FONT_SIZE_PT, MIN_FONT_SIZE_PT, clamp_font_size_pt, first_font_size_beyond_bound,
+    font_size_in_bound,
+};
 pub mod fields;
 mod revision_refs;
 pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};

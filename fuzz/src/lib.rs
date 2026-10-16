@@ -315,6 +315,17 @@ pub fn run_rpc_command(data: &[u8]) {
                 format!("{evt:?}").chars().take(160).collect::<String>()
             );
         }
+        /* Issue #501 - and a command that sets a size (or brings text in
+        with its own) never leaves a run / mark outside Word's 1..=1638 pt. */
+        if touches_font_sizes(&keep)
+            && let Err(why) = engine.check_font_sizes_for_fuzzing()
+        {
+            panic!(
+                "{} left a font size past Word's 1..=1638 pt: {why} [{}]",
+                variant_name(&keep),
+                format!("{evt:?}").chars().take(160).collect::<String>()
+            );
+        }
     }
     /* Issue #467 — and whatever the sequence left, saving it yields no
     forbidden character (a typed refusal is a different invariant's). */
@@ -332,6 +343,20 @@ pub fn run_rpc_command(data: &[u8]) {
             panic!("the sequence left a picture past the 22 in bound: {why}");
         }
     }
+}
+
+/// Issue #501 - the commands that can put a font size on a run or a mark
+/// (the ones `check_font_sizes_for_fuzzing` is run after).
+fn touches_font_sizes(cmd: &bridge::Command) -> bool {
+    use bridge::Command as C;
+    matches!(
+        cmd,
+        C::ApplyFormatting { .. }
+            | C::ModifyStyle { .. }
+            | C::PasteHtml { .. }
+            | C::LoadDocx { .. }
+            | C::OpenDocument { .. }
+    )
 }
 
 /// Issue #459 - the commands that author, resize, move or re-wrap a

@@ -6,6 +6,8 @@
 //! `styles.xml`'s `<w:style>/<w:rPr>` (Phase 3); kept here so the cascade
 //! resolver can reuse them without depending on `parts::document`.
 
+use crate::error::{DocxWarning, warn};
+use crate::schema::measure::describe;
 use engine::{FontFamily, SpanStyle, UnderlineStyle, VertAlign};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -247,10 +249,31 @@ pub fn family_from_docx(name: &str) -> Option<FontFamily> {
 }
 
 /// `<w:sz>` / `<w:szCs>` `w:val` (half-points) as points.
+///
+/// Issue #501 - clamped into Word's `1..=1638` pt
+/// ([`engine::MAX_FONT_SIZE_PT`]: `w:val` 2..=3276) so a hostile
+/// `w:val="4294967295"` (2.1 billion pt) never reaches layout; a clamped
+/// value is reported as [`DocxWarning::MeasureClamped`] (in twips, like
+/// every measure; the source bytes are kept).
 fn half_points(e: &BytesStart) -> Option<f32> {
-    attr_val(e, b"w:val")
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .map(|half_pts| (half_pts as f32) / 2.0)
+    let raw = attr_val(e, b"w:val")?;
+    let half_pts = match raw.trim().parse::<u32>() {
+        Ok(n) => n,
+        /* A digit string past `u32` is a size, just an absurd one: clamp
+        it like any other rather than dropping it unreported. */
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => u32::MAX,
+        Err(_) => return None,
+    };
+    let pt = (half_pts as f32) / 2.0;
+    let clamped = engine::clamp_font_size_pt(pt);
+    if clamped != pt {
+        warn(DocxWarning::MeasureClamped {
+            attr: describe(e, b"w:val"),
+            value: raw,
+            twips: (f64::from(clamped) * 20.0).round() as i64,
+        });
+    }
+    Some(clamped)
 }
 
 /// An OOXML toggle property: bare `<w:b/>` is on; `<w:b w:val="false"/>` off.
