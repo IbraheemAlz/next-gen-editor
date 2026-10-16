@@ -53,6 +53,37 @@ const BUDGETS = {
     '500p': { engine: 640 * MIB, jsHeap: 192 * MIB },
 };
 
+/* Issue #476 - regression pins, measured. The §5 budgets above are the
+   product contract (the plan's table); they were never derived from a
+   measurement, and on the fixtures' real size they sit 5-10x above what the
+   engine uses, so a doubling of the footprint passed silently. A pin is
+   "what the engine measured on a quiet machine, RELEASE wasm, the fixtures at
+   their nominal page counts (three identical runs of --budgets, 2026-10-16)
+   x 1.5, rounded up" - engine to 8 MiB, JS heap to 4 MiB. The engine heap is
+   deterministic (all three runs read 74.0 / 80.7 / 103.1 / 138.9 MiB); the JS
+   heap moves by ~0.3 MiB between runs. A run fails past EITHER the pin or
+   the budget (the pin is always the lower one today; if a re-pin ever
+   exceeds the budget the budget still holds).
+   measured engine / jsHeap MiB : 50p 74.0 / 9.8 · 100p 80.7 / 11.2 ·
+                                  250p 103.1 / 15.1 · 500p 138.9 / 21.7
+   Re-pin after an INTENDED footprint change: run `node run.mjs` three times
+   on a quiet machine and apply the rule above; never to silence a breach. */
+const PINS = {
+    '50p': { engine: 112 * MIB, jsHeap: 16 * MIB },
+    '100p': { engine: 128 * MIB, jsHeap: 20 * MIB },
+    '250p': { engine: 160 * MIB, jsHeap: 24 * MIB },
+    '500p': { engine: 216 * MIB, jsHeap: 36 * MIB },
+};
+
+/* Issue #476 - `Np.docx` must lay out to N pages (the budgets are per
+   page). The fixtures are a calibration against the line pitch and the font
+   stack (`tools/perf-fixtures` PARAS_PER_PAGE): after #329 / #475 the "50p"
+   file laid out to 167 pages and every number here silently described a
+   document 3.3x larger. A page count further than this fraction from
+   nominal fails `--budgets`. */
+const NOMINAL_PAGE_TOLERANCE = 0.1;
+const nominalPages = (label) => parseInt(label, 10);
+
 /* Issue #33 — the old hardcoded 1_800_000 ms stats race stalled an
    interrupted run for 30 minutes with zero output. */
 const STATS_TIMEOUT_MS = 120_000;
@@ -232,13 +263,35 @@ async function profile(browser, label) {
         }
         const engine = stats.wasm_heap_bytes ?? 0;
         const budget = BUDGETS[label];
-        const ok = engine < budget.engine && jsHeap < budget.jsHeap;
+        const pin = PINS[label];
+        const withinBudget = engine < budget.engine && jsHeap < budget.jsHeap;
+        const withinPin = engine < pin.engine && jsHeap < pin.jsHeap;
+        /* Lazy mode lays out a culled band, so its page count says nothing. */
+        const pagesOk =
+            lazyMode ||
+            (pageCount !== null &&
+                Math.abs(pageCount - nominalPages(label)) <=
+                    nominalPages(label) * NOMINAL_PAGE_TOLERANCE);
+        const ok = withinBudget && withinPin && pagesOk;
         console.log(
-            `[memory-profile] ${label}: engine ${fmtMiB(engine)} / ${fmtMiB(budget.engine)} · ` +
-                `jsHeap ${fmtMiB(jsHeap)} / ${fmtMiB(budget.jsHeap)} · ` +
+            `[memory-profile] ${label}: engine ${fmtMiB(engine)} / pin ${fmtMiB(pin.engine)} ` +
+                `(budget ${fmtMiB(budget.engine)}) · ` +
+                `jsHeap ${fmtMiB(jsHeap)} / pin ${fmtMiB(pin.jsHeap)} (budget ${fmtMiB(budget.jsHeap)}) · ` +
                 `tree ${fmtMiB(stats?.document_tree_bytes ?? 0)} · ` +
+                (lazyMode ? '' : `${pageCount ?? 'UNKNOWN'} pages (nominal ${nominalPages(label)}) · `) +
                 `${ok ? 'OK' : 'OVER BUDGET'}`,
         );
+        if (!withinBudget || !withinPin) {
+            console.error(
+                `[memory-profile] ${label}: over its ${withinBudget ? 'regression pin' : '§5 budget'}`,
+            );
+        }
+        if (!pagesOk) {
+            console.error(
+                `[memory-profile] ${label}: lays out to ${pageCount ?? 'an unknown number of'} pages, ` +
+                    `not ~${nominalPages(label)} - re-calibrate tools/perf-fixtures PARAS_PER_PAGE`,
+            );
+        }
         return { label, ok, engine, jsHeap };
     } finally {
         await ctx.close();
