@@ -169,29 +169,35 @@ async function profile(browser, label) {
            keeps the product's cold-open footprint instead. One retry:
            a first expand can report a still-partial layout when the
            runway estimate undershoots the real document height. */
+        let pageCount = null;
         if (!lazyMode) {
             const expandStart = Date.now();
             let full = false;
             for (let attempt = 1; attempt <= 2 && !full; attempt++) {
-                full = await withHeartbeat(
+                const expanded = await withHeartbeat(
                     page.evaluate(async () => {
                         const evt = await window.__dispatch({
                             type: 'EXPAND_LAYOUT',
                             target_y: 1e9,
                         });
-                        return evt.type === 'PAINTED' ? evt.is_full_layout === true : false;
+                        return evt.type === 'PAINTED'
+                            ? { full: evt.is_full_layout === true, pages: evt.page_count }
+                            : { full: false, pages: null };
                     }),
                     300_000,
                     (ms) =>
                         console.log(
                             `[memory-profile] ${label}: waiting for EXPAND_LAYOUT... ${Math.round(ms / 1000)}s`,
                         ),
-                    false,
+                    { full: false, pages: null },
                 );
+                full = expanded.full;
+                if (full) pageCount = expanded.pages;
             }
             console.log(
                 `[memory-profile] ${label}: EXPAND_LAYOUT forced full layout ` +
-                    `(${full ? 'complete' : 'INCOMPLETE'}) in ${Date.now() - expandStart}ms`,
+                    `(${full ? 'complete' : 'INCOMPLETE'}) in ${Date.now() - expandStart}ms` +
+                    (pageCount === null ? '' : ` -> ${pageCount} pages`),
             );
         }
 

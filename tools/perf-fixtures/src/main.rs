@@ -8,6 +8,22 @@
 //! documents are built with the engine's own `build_minimal_docx` writer
 //! and verified to round-trip through `read_docx`, so the harness's
 //! `LOAD_DOCX` command can always parse them.
+//!
+//! ## Keeping `Np` honest (issue #476)
+//!
+//! `Np.docx` must LAY OUT to about `N` pages in the editor - the memory
+//! budgets (`tools/memory-profile`) are per-page and the open-50p timing
+//! (`tools/perf`) is "a 50-page document" - so [`PARAS_PER_PAGE`] is a
+//! calibration against the shell's boot text metrics and the shipped font
+//! set, not a property of the text. It drifts whenever the line pitch or the
+//! font stack changes (#329 Word line metrics, #463/#475 one font-derived
+//! pitch: the old 20 per page laid out 167 pages for the "50p" file). To
+//! re-calibrate, run `node tools/memory-profile/run.mjs` (it prints each
+//! fixture's laid-out page count, and `--budgets` fails when one is further
+//! than its tolerance from nominal), set `PARAS_PER_PAGE` to
+//! `old * nominal / measured`, and regenerate with
+//! `cargo run -p perf-fixtures --release`. The output is deterministic, so
+//! a no-op run leaves the working tree clean.
 
 use engine::{Block, DocumentTree, Paragraph, Table, TableCell, TableRow};
 use format_docx::read_docx;
@@ -15,8 +31,11 @@ use format_docx::writer::build_minimal_docx;
 use std::fs;
 use std::path::Path;
 
-/// Filler paragraphs per nominal page — roughly a page of body copy on A4.
-const PARAS_PER_PAGE: usize = 20;
+/// Filler paragraphs per nominal page: a page of this ~110-character filler
+/// at the editor's boot metrics (24 px text on the Word-derived pitch, A4)
+/// holds six paragraphs of three to four lines. Issue #476 - it was 20
+/// before #329 / #475 and laid out ~3.3x the nominal pages.
+const PARAS_PER_PAGE: usize = 6;
 
 /// Mixed Latin + Arabic filler so a loaded document exercises the BiDi and
 /// shaping paths a real corpus document would.
@@ -38,18 +57,7 @@ fn main() {
 
     for pages in [50usize, 100, 250, 500] {
         let count = pages * PARAS_PER_PAGE;
-        let texts = (0..count).map(|i| format!("Paragraph {i:05}. {FILLER}"));
-        let doc = DocumentTree::from_paragraphs(texts);
-
-        let bytes = build_minimal_docx(&doc).expect("build .docx");
-
-        /* Sanity: the file must parse back, or the harness LOAD_DOCX fails. */
-        let parsed = read_docx(&bytes).expect("re-read generated .docx");
-        assert_eq!(
-            parsed.document.paragraph_count() as usize,
-            count,
-            "round-trip paragraph count mismatch for {pages}p",
-        );
+        let bytes = filler_docx(count, &format!("{pages}p"));
 
         let path = out_dir.join(format!("{pages}p.docx"));
         fs::write(&path, &bytes).expect("write .docx");
@@ -60,6 +68,46 @@ fn main() {
     }
 
     write_table_fixture(&out_dir);
+    write_engine_anchor();
+}
+
+/// `count` filler paragraphs as a minimal `.docx`. Sanity: the file must
+/// parse back, or the harness's `LOAD_DOCX` fails.
+fn filler_docx(count: usize, label: &str) -> Vec<u8> {
+    let texts = (0..count).map(|i| format!("Paragraph {i:05}. {FILLER}"));
+    let doc = DocumentTree::from_paragraphs(texts);
+    let bytes = build_minimal_docx(&doc).expect("build .docx");
+    let parsed = read_docx(&bytes).expect("re-read generated .docx");
+    assert_eq!(
+        parsed.document.paragraph_count() as usize,
+        count,
+        "round-trip paragraph count mismatch for {label}",
+    );
+    bytes
+}
+
+/// Paragraphs in the engine-test anchor: what `50p.docx` held before issue
+/// #476 re-calibrated it (50 pages x the old 20 per page).
+const ENGINE_ANCHOR_PARAGRAPHS: usize = 1000;
+
+/// Issue #476 - `crates/engine-wasm/tests/fixtures/long_single_section.docx`:
+/// the long single-section document `engine-wasm`'s layout tests pin
+/// (`viewport_cull_stops_single_section_layout`, the geometry fingerprints
+/// of the widow-control and bridge tests). Those tests used to read
+/// `tests/perf/50p.docx`, which made every re-calibration of the perf
+/// fixture a re-pin of unrelated layout anchors. The anchor has its own
+/// file now, byte-identical to the pre-#476 `50p.docx` (same text, same
+/// writer), so no pin moved. Regenerating it must leave the file unchanged.
+fn write_engine_anchor() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/engine-wasm/tests/fixtures/long_single_section.docx");
+    fs::create_dir_all(path.parent().expect("fixture dir")).expect("create fixture dir");
+    let bytes = filler_docx(ENGINE_ANCHOR_PARAGRAPHS, "long_single_section");
+    fs::write(&path, &bytes).expect("write engine anchor");
+    println!(
+        "[perf-fixtures] long_single_section -> {ENGINE_ANCHOR_PARAGRAPHS} paragraphs, {} bytes",
+        bytes.len()
+    );
 }
 
 fn para(text: String) -> Block {

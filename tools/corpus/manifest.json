@@ -1541,8 +1541,8 @@
     },
     {
       "path": "repo-fixtures-perf/100p.docx",
-      "sha256": "a5227e69f1b61148da02cdb268f17aaa647cf760544ca4851f9ab4d621159e80",
-      "bytes": 7585,
+      "sha256": "836874f4fd5a19659b0486fcac03854b9dd3224d68ecdda76ef0fcb119ccb04f",
+      "bytes": 3201,
       "source_id": "repo-fixtures-perf",
       "source_url": "repo:tests/perf/100p.docx",
       "license": "MIT OR Apache-2.0",
@@ -1550,8 +1550,8 @@
     },
     {
       "path": "repo-fixtures-perf/250p.docx",
-      "sha256": "950230ff366565a2799caa28aa49f6d14affc0cd7b7f4345c3f43f7f5f08f30e",
-      "bytes": 16826,
+      "sha256": "685ca83df5f1a7cdd00137f80aaac8873ea3955877be86fef13c8e52a6689ca1",
+      "bytes": 6020,
       "source_id": "repo-fixtures-perf",
       "source_url": "repo:tests/perf/250p.docx",
       "license": "MIT OR Apache-2.0",
@@ -1559,8 +1559,8 @@
     },
     {
       "path": "repo-fixtures-perf/500p.docx",
-      "sha256": "3b8fbfcf3894051d5eb27f3ec24e8e99031f88a3e42074b7a6b6644272471343",
-      "bytes": 32179,
+      "sha256": "6b4eccc2abe05618d4faa1add27b1c5f280e408cf4d7ea4e3d510d4047f02eea",
+      "bytes": 10670,
       "source_id": "repo-fixtures-perf",
       "source_url": "repo:tests/perf/500p.docx",
       "license": "MIT OR Apache-2.0",
@@ -1568,8 +1568,8 @@
     },
     {
       "path": "repo-fixtures-perf/50p.docx",
-      "sha256": "8548dc7212e148be86ea7f8ae696ac68af8755e5604159798c5342527f21c92d",
-      "bytes": 4482,
+      "sha256": "c87e93145888dc5539afd3a73b2c7b64cf7fe603a510de150ddd4052325c9597",
+      "bytes": 2261,
       "source_id": "repo-fixtures-perf",
       "source_url": "repo:tests/perf/50p.docx",
       "license": "MIT OR Apache-2.0",
