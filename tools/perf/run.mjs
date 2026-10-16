@@ -8,7 +8,7 @@
  *   - open a 50-page .docx
  *
  * plus, issue #379, the table-heavy repaint (report only, ungated): open
- * `tests/perf/tables-30p.docx` (22 three-deep nested autofit tables,
+ * `tests/perf/tables-30p.docx` (30 three-deep nested autofit tables,
  * `tools/perf-fixtures`) and time one-character body edits — each one a
  * repaint that re-lays (or, with the cross-paint table cache, reuses)
  * every table in the viewport band.
@@ -26,6 +26,14 @@
  * throw-away load, and stops it on exit. The measured URL is the first line
  * of the report. Uses Playwright with the system Chrome (channel:'chrome') —
  * no extra browser download.
+ *
+ * Issue #476 - fixture honesty: after the timed open, each fixture is laid
+ * out in full (`EXPAND_LAYOUT`) and its page count is reported; --strict
+ * fails when `50p.docx` is more than NOMINAL_PAGE_TOLERANCE away from 50
+ * pages. The page count is a calibration against the font stack and line
+ * pitch (it drifted to 167 after #329 / #475), so a layout change that moves
+ * it must re-calibrate `tools/perf-fixtures` (see its module docs) instead of
+ * silently turning "open a 50-page document" into something else.
  *
  * Insert latency is measured on the one-page seeded document — the case the
  * §6 <8/16 ms budget targets. Per-keystroke cost on a multi-page document is
@@ -72,6 +80,14 @@ if (!budget) {
 }
 
 const INSERT_KEYSTROKES = 100;
+/* Issue #476 - the pages `tests/perf/50p.docx` must lay out to, and how far
+   it may drift before the "open a 50-page document" metric stops meaning
+   that. */
+const NOMINAL_PAGES = 50;
+const NOMINAL_PAGE_TOLERANCE = 0.1;
+/* ... and `tables-30p.docx`, whose repaint timing is only meaningful on the
+   30-page document it is named for. */
+const NOMINAL_TABLE_PAGES = 30;
 /* Issue #379 — body edits timed on the table-heavy fixture. */
 const TABLE_REPAINT_KEYSTROKES = 40;
 
@@ -93,6 +109,7 @@ let workerBootMs = null;
 let sab = null;
 let samples = [];
 let openDocMs = null;
+let openDocPages = null;
 let tables = null;
 try {
     /* A server this run just booted has transformed nothing yet: its first
@@ -162,15 +179,22 @@ try {
     /* --- Open a 50-page document --- */
     if (existsSync(PERF_DOC)) {
         const docxBytes = Array.from(readFileSync(PERF_DOC));
-        openDocMs = await page.evaluate(async (bytes) => {
+        ({ openMs: openDocMs, pages: openDocPages } = await page.evaluate(async (bytes) => {
             const start = performance.now();
             const evt = await window.__dispatch({
                 type: 'LOAD_DOCX',
                 bytes: new Uint8Array(bytes),
             });
             const elapsed = performance.now() - start;
-            return evt.type === 'DOCUMENT_LOADED' ? elapsed : -1;
-        }, docxBytes);
+            if (evt.type !== 'DOCUMENT_LOADED') return { openMs: -1, pages: null };
+            /* Issue #476 - not timed: the laid-out page count, so the fixture
+               cannot drift away from "50 pages" unnoticed. */
+            const full = await window.__dispatch({ type: 'EXPAND_LAYOUT', target_y: 1e9 });
+            return {
+                openMs: elapsed,
+                pages: full.type === 'PAINTED' && full.is_full_layout ? full.page_count : null,
+            };
+        }, docxBytes));
     } else {
         console.warn(`[perf] ${PERF_DOC} missing — skipping open-doc metric`);
     }
@@ -186,7 +210,10 @@ try {
                     bytes: new Uint8Array(bytes),
                 });
                 const openMs = performance.now() - start;
-                if (evt.type !== 'DOCUMENT_LOADED') return { openMs: -1, samples: [] };
+                if (evt.type !== 'DOCUMENT_LOADED') return { openMs: -1, samples: [], pages: null };
+                const full = await window.__dispatch({ type: 'EXPAND_LAYOUT', target_y: 1e9 });
+                const pages =
+                    full.type === 'PAINTED' && full.is_full_layout ? full.page_count : null;
                 /* One-character edits in the intro paragraph, above every
                    table: the engine's reply follows its auto-repaint, so the
                    round trip is the repaint an edit elsewhere triggers. */
@@ -200,7 +227,7 @@ try {
                     });
                     samples.push(performance.now() - t);
                 }
-                return { openMs, samples };
+                return { openMs, samples, pages };
             },
             { bytes: docxBytes, n: TABLE_REPAINT_KEYSTROKES },
         );
@@ -234,7 +261,11 @@ console.log(
 );
 if (openDocMs !== null) {
     const shown = openDocMs < 0 ? 'LOAD_DOCX failed' : `${openDocMs.toFixed(0)} ms`;
-    console.log(`[perf] open 50-page document     : ${shown} (budget ${budget.openDocMs} ms)`);
+    console.log(
+        `[perf] open 50-page document     : ${shown} (budget ${budget.openDocMs} ms) · ` +
+            `lays out to ${openDocPages === null ? 'UNKNOWN' : openDocPages} pages ` +
+            `(nominal ${NOMINAL_PAGES} +/- ${NOMINAL_PAGE_TOLERANCE * 100}%)`,
+    );
 }
 
 if (tables !== null) {
@@ -246,13 +277,15 @@ if (tables !== null) {
         console.log(
             `[perf] table-heavy doc (#379)    : open ${tables.openMs.toFixed(0)} ms · ` +
                 `repaint after body edit x${tables.samples.length} p50 ${tp50.toFixed(2)} ms · ` +
-                `p95 ${tp95.toFixed(2)} ms (report only)`,
+                `p95 ${tp95.toFixed(2)} ms (report only) · ` +
+                `${tables.pages === null ? 'UNKNOWN' : tables.pages} pages ` +
+                `(nominal ${NOMINAL_TABLE_PAGES})`,
         );
     }
 }
 
-/* Gated budgets: cold start + insert p95 — the achievable §6 numbers a
-   regression must fail on. */
+/* Gated budgets: cold start, worker boot, SAB transfer, insert p95 and (issue
+   #476) open-50p - the achievable §6 numbers a regression must fail on. */
 const breaches = [];
 if (coldStartMs >= budget.coldStartMs) breaches.push(`cold start ${coldStartMs}ms`);
 if (workerBootMs === null) breaches.push('worker boot never reported (__bootMs)');
@@ -261,21 +294,41 @@ if (sab === null || !sab.ok) breaches.push('SAB transfer not zero-copy / not rep
 else if (sab.ms >= budget.sabTransferMs) breaches.push(`SAB transfer ${sab.ms.toFixed(1)}ms`);
 if (p95 >= budget.insertP95Ms) breaches.push(`insert p95 ${p95.toFixed(2)}ms`);
 
-/* Open-doc on a multi-page document is dominated by the engine's
-   whole-document relayout — incremental relayout is deferred Phase-5 work
-   (CLAUDE.md / BACKLOG). It is measured and reported, but kept out of the
-   --strict gate so a known, tracked cost cannot mask a real regression in
-   the other budgets. */
-if (openDocMs !== null && openDocMs >= 0 && openDocMs >= budget.openDocMs) {
-    console.warn(
-        `[perf] note: open-doc ${openDocMs.toFixed(0)} ms exceeds the ` +
-            `${budget.openDocMs} ms budget — known deferred cost (incremental relayout)`,
-    );
+/* Issue #476 - open-doc is gated now. It was reported only while a
+   multi-page open was dominated by whole-document relayout; incremental,
+   viewport-culled layout shipped (CLAUDE.md: LazyLayoutState), and the
+   50-page fixture opens in tens of milliseconds, far inside the budget, so a
+   breach is a real regression. A failed load, or a fixture that no longer
+   lays out to ~50 pages (the measurement would silently describe another
+   document), fails the run as well. */
+if (openDocMs !== null) {
+    if (openDocMs < 0) breaches.push('open-doc LOAD_DOCX failed');
+    else if (openDocMs >= budget.openDocMs) breaches.push(`open-doc ${openDocMs.toFixed(0)}ms`);
+    if (openDocPages === null) {
+        breaches.push('open-doc page count not reported (EXPAND_LAYOUT did not complete)');
+    } else if (Math.abs(openDocPages - NOMINAL_PAGES) > NOMINAL_PAGES * NOMINAL_PAGE_TOLERANCE) {
+        breaches.push(
+            `50p.docx lays out to ${openDocPages} pages, not ~${NOMINAL_PAGES} ` +
+                '(re-calibrate tools/perf-fixtures PARAS_PER_PAGE)',
+        );
+    }
+}
+
+if (tables !== null && tables.openMs >= 0) {
+    if (
+        tables.pages === null ||
+        Math.abs(tables.pages - NOMINAL_TABLE_PAGES) > NOMINAL_TABLE_PAGES * NOMINAL_PAGE_TOLERANCE
+    ) {
+        breaches.push(
+            `tables-30p.docx lays out to ${tables.pages ?? 'an unknown number of'} pages, ` +
+                `not ~${NOMINAL_TABLE_PAGES} (re-calibrate tools/perf-fixtures TABLE_TOWERS)`,
+        );
+    }
 }
 
 if (breaches.length) {
     console.error(`[perf] OVER ${hardware} BUDGET — ${breaches.join('; ')}`);
     process.exit(strict ? 1 : 0);
 }
-console.log(`[perf] PASS — cold start + insert p95 within ${hardware} budgets`);
+console.log(`[perf] PASS — cold start, worker boot, SAB, insert p95 and open-doc within ${hardware} budgets`);
 process.exit(0);

@@ -1458,6 +1458,9 @@ fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Durati
             let report = panics::catch(
                 || -> Result<(engine_wasm::LayoutProbe, WarmRepaint), String> {
                     let mut engine = engine_wasm::Engine::new_headless(doc);
+                    /* Issue #476 - the editor's boot fonts, not the lone
+                    Liberation Sans `new_headless` holds. */
+                    crate::fonts::register_editor_fonts(&mut engine)?;
                     let probe = |engine: &engine_wasm::Engine| {
                         engine
                             .layout_probe_for_fuzzing()

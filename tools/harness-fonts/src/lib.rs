@@ -98,11 +98,21 @@ const SUBSTITUTES: &[(&str, &[u8])] = &[
 /// Calibri, Times New Roman, Simplified Arabic, ... lays out in the face the
 /// editor substitutes.
 pub fn harness_stack_with_substitutes() -> FontStack {
-    stack_of(
-        [(LATIN_ID, LIBERATION_SANS), (ARABIC_ID, AMIRI)]
-            .into_iter()
-            .chain(SUBSTITUTES.iter().copied()),
-    )
+    stack_of(editor_faces())
+}
+
+/// Issue #476 - every face the shell loads at boot (`fonts.json` `defaults`
+/// and `substitutes`) as `(manifest id, TTF bytes)`: the two defaults, then
+/// the substitutes. [`harness_stack_with_substitutes`] is built from exactly
+/// this list; a harness that drives a real `Engine` (`corpus-native`'s production
+/// layout) registers the same faces with `Command::LoadFont` and then sends
+/// [`DEFAULTS_BY_SCRIPT`] as `Command::SetFontPriority`, so it lays out with
+/// the stack the editor boots with instead of a lone Liberation Sans.
+pub fn editor_faces() -> Vec<(&'static str, &'static [u8])> {
+    [(LATIN_ID, LIBERATION_SANS), (ARABIC_ID, AMIRI)]
+        .into_iter()
+        .chain(SUBSTITUTES.iter().copied())
+        .collect()
 }
 
 #[cfg(test)]
@@ -129,6 +139,32 @@ mod tests {
             "noto-naskh"
         );
         assert_eq!(id_of(&stack, Script::Latin, Some("arial")), LATIN_ID);
+    }
+
+    /// Issue #476 - the face list a harness hands an engine is the one the
+    /// substitute stack is built from, and it is the shell's boot set.
+    #[test]
+    fn editor_faces_are_the_shells_boot_set() {
+        let ids: Vec<&str> = editor_faces().iter().map(|(id, _)| *id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "an id is registered twice");
+        assert_eq!(&ids[..2], &[LATIN_ID, ARABIC_ID]);
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../ts/public/fonts.json")).unwrap();
+        let mut shipped: Vec<String> = manifest["defaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(manifest["substitutes"].as_array().unwrap())
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        shipped.sort();
+        shipped.dedup();
+        let mut mine: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        mine.sort();
+        assert_eq!(mine, shipped, "harness faces drifted from fonts.json");
     }
 
     #[test]

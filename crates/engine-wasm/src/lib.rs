@@ -21582,9 +21582,12 @@ mod tests {
     /// "lazy" paint (and the shell then mounted 100+ page canvases).
     #[test]
     fn viewport_cull_stops_single_section_layout() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
-        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
-        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/long_single_section.docx"
+        );
+        let bytes = std::fs::read(path).expect("read long_single_section.docx fixture");
+        let archive = format_docx::read_docx(&bytes).expect("parse long_single_section.docx");
         let engine = test_engine_with_doc(archive.document);
 
         /* A ~2-page band must NOT lay out the whole document. The runway
@@ -24935,11 +24938,14 @@ mod tests {
     #[ignore = "manual profiling harness, not a correctness gate"]
     fn profile_50p_layout() {
         use std::time::Instant;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
-        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/long_single_section.docx"
+        );
+        let bytes = std::fs::read(path).expect("read long_single_section.docx fixture");
 
         let t0 = Instant::now();
-        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let archive = format_docx::read_docx(&bytes).expect("parse long_single_section.docx");
         eprintln!("read_docx:                {:?}", t0.elapsed());
         eprintln!(
             "blocks: {}  paragraphs: {}",
@@ -26810,9 +26816,12 @@ mod tests {
     fn engine_nominal_fixtures_with(
         widow: Option<bool>,
     ) -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
-        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
-        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/long_single_section.docx"
+        );
+        let bytes = std::fs::read(path).expect("read long_single_section.docx fixture");
+        let archive = format_docx::read_docx(&bytes).expect("parse long_single_section.docx");
         let engine = test_engine_with_doc(with_widow_control(archive.document, widow));
         let mut out = Vec::new();
         let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
@@ -26893,9 +26902,12 @@ mod tests {
     fn engine_nominal_fixtures_with_document_widow_default(
         default_on: bool,
     ) -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
-        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
-        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/long_single_section.docx"
+        );
+        let bytes = std::fs::read(path).expect("read long_single_section.docx fixture");
+        let archive = format_docx::read_docx(&bytes).expect("parse long_single_section.docx");
         let engine = test_engine_with_doc(with_widow_control_default(archive.document, default_on));
         let mut out = Vec::new();
         let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
@@ -28009,8 +28021,11 @@ mod tests {
     #[cfg(feature = "fuzz-native")]
     #[test]
     fn open_document_bridge_widow_control_false_reproduces_pinned_pre_95_fingerprints() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
-        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/long_single_section.docx"
+        );
+        let bytes = std::fs::read(path).expect("read long_single_section.docx fixture");
         let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
 
         let evt = engine.apply_sync(Command::OpenDocument {
