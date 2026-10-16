@@ -685,6 +685,21 @@
       "roundtrip": {
         "document_xml_drift_bytes": 0
       }
+    },
+    "wrap_polygon_vertices.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 11,
+      "asserts": {
+        "paragraph_count": 3,
+        "paragraph_texts": [
+          "valid ￼text",
+          "nan ￼text",
+          "huge ￼text"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
     }
   }
 }

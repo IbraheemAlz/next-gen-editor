@@ -278,6 +278,21 @@ pub(crate) fn attr_emu(e: &BytesStart, key: &[u8], spec: MeasureSpec) -> Option<
     report(emu(&raw, spec), &raw, || describe(e, key)).map(|v| v.round() as i64)
 }
 
+/// Issue #459 — [`attr_emu`] for an attribute the schema REQUIRES (a wrap
+/// polygon vertex's `x` / `y`): absent is as unusable as `NaN`, so it is
+/// reported as [`DocxWarning::InvalidMeasure`] (empty value) rather than
+/// vanishing silently. `None` when absent or unusable.
+pub(crate) fn attr_emu_required(e: &BytesStart, key: &[u8], spec: MeasureSpec) -> Option<i64> {
+    if attr_val(e, key).is_none() {
+        warn(DocxWarning::InvalidMeasure {
+            attr: describe(e, key),
+            value: String::new(),
+        });
+        return None;
+    }
+    attr_emu(e, key, spec)
+}
+
 /// Issue #407 — [`emu`] of an element's TEXT content (`<wp:posOffset>`),
 /// reported as `element`. `None` when unusable.
 pub(crate) fn text_emu(text: &str, spec: MeasureSpec, element: &str) -> Option<i64> {
