@@ -41,6 +41,14 @@ declare global {
         /** Issue #57 — the synchronous clipboard payload cache (e2e hook:
          *  `stats()`, `invalidate()`). */
         __clipboardPrefetch?: ClipboardPrefetch;
+        /** Issue #502 — simulate a 2D context loss / restore on page canvas
+         *  `pageIndex` (dev-hooks only; e2e `canvas-context.spec.ts`).
+         *  `phase` `'lost'` leaves the page lost, `'restored'` completes
+         *  it, `'both'` (default) is a full cycle. */
+        __forceContextLoss?: (
+            pageIndex: number,
+            phase?: 'lost' | 'restored' | 'both',
+        ) => Promise<string>;
     }
 }
 

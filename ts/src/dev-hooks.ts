@@ -1,7 +1,8 @@
 /* Issue #340 - build-time gate for the `window.__*` dev hooks.
  *
  * `window.__dispatch`, `__engineClient`, `__fontRegistry`,
- * `__setTelemetryEnabled`, `__telemetryFlush`, `__clipboardPrefetch` and
+ * `__setTelemetryEnabled`, `__telemetryFlush`, `__clipboardPrefetch`,
+ * `__forceContextLoss` (issue #502) and
  * `__lastStats` (issue #389) give any same-origin script (an XSS payload included) a typed handle on
  * the engine, and `?telemetryEndpoint=` lets a crafted link choose where
  * telemetry batches go. They exist for Playwright and the live-validation

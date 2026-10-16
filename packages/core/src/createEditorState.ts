@@ -272,6 +272,16 @@ export interface EditorState {
      */
     checkpointState: Accessor<CheckpointHealth>;
     /**
+     * Issue #502 - the 2D-context health of the page canvases as the
+     * bridge's `Event::CanvasContext` reports it (broadcast on
+     * `subscribe()` whenever a canvas loses or regains its context).
+     * `lostPages` is non-empty while some canvas has lost its context and
+     * `contextrestored` has not arrived - that page is blank until it
+     * does (the worker repaints it on restore). Reset by a recovered
+     * worker generation. Shared like `zoom`.
+     */
+    canvasContext: Accessor<CanvasContextHealth>;
+    /**
      * Issue #364 - the most recent `Event::Error` any command answered
      * (engine refusals such as a tracked deletion across a table cell, or
      * a typed `ErrorKind`), with the command that produced it and a
@@ -364,6 +374,16 @@ export interface EditorError {
     at: number;
 }
 
+/** Issue #502 - see `EditorState.canvasContext`. */
+export interface CanvasContextHealth {
+    /** Page indices whose 2D context is lost right now, ascending. */
+    lostPages: number[];
+    /** Context losses this worker generation has seen. */
+    losses: number;
+    /** Context restorations this worker generation has seen. */
+    restores: number;
+}
+
 /** Issue #390 - see `EditorState.checkpointState`. */
 export interface CheckpointHealth {
     ok: boolean;
@@ -387,6 +407,7 @@ interface ViewState {
     lastRecovery: Accessor<RecoveryReport | undefined>;
     checkpointFailing: Accessor<boolean>;
     checkpointState: Accessor<CheckpointHealth>;
+    canvasContext: Accessor<CanvasContextHealth>;
     lastError: Accessor<EditorError | undefined>;
     previousSession: Accessor<PreviousSessionInfo | undefined>;
     openWarnings: Accessor<ReadWarning[]>;
@@ -463,6 +484,10 @@ function viewStateFor(engine: EngineHandle): ViewState {
            a respawned worker) AND by the typed bridge event itself. */
         engine.onCheckpointStatus?.((s) => setCheckpointState(toHealth(s)));
         const checkpointFailing: Accessor<boolean> = () => !checkpointState().ok;
+        /* Issue #502 - a respawned worker generation holds fresh canvases:
+           nothing is lost and its counters start at zero. */
+        const noCanvasLoss = (): CanvasContextHealth => ({ lostPages: [], losses: 0, restores: 0 });
+        const [canvasContext, setCanvasContext] = createSignal<CanvasContextHealth>(noCanvasLoss());
         /* Issue #388 - the unsaved previous session, seeded then fed. */
         const [previousSession, setPreviousSession] = createSignal<
             PreviousSessionInfo | undefined
@@ -540,7 +565,14 @@ function viewStateFor(engine: EngineHandle): ViewState {
                     journalFailing: evt.journal_failing === true,
                     lastError: evt.last_error,
                 });
+            } else if (evt.type === 'CANVAS_CONTEXT') {
+                setCanvasContext({
+                    lostPages: [...(evt.lost_pages ?? [])],
+                    losses: evt.losses ?? 0,
+                    restores: evt.restores ?? 0,
+                });
             } else if (evt.type === 'RECOVERED') {
+                setCanvasContext(noCanvasLoss());
                 /* Issue #97 — the respawned engine folded the replayed
                    SET_ZOOM / SET_DEVICE_SCALE into its restored config (or
                    came back cold at 100 %); the controls follow IT, not
@@ -562,6 +594,7 @@ function viewStateFor(engine: EngineHandle): ViewState {
             lastRecovery,
             checkpointFailing,
             checkpointState,
+            canvasContext,
             lastError,
             previousSession,
             openWarnings,
@@ -737,6 +770,7 @@ export function createEditorState(): EditorState {
         lastRecovery: view.lastRecovery,
         checkpointFailing: view.checkpointFailing,
         checkpointState: view.checkpointState,
+        canvasContext: view.canvasContext,
         lastError: view.lastError,
         previousSession: view.previousSession,
         openWarnings: view.openWarnings,

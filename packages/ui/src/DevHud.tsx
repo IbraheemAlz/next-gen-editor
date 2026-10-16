@@ -243,6 +243,22 @@ export const DevHud: Component<DevHudProps> = (props) => {
                               : 'checkpoints failing'}
                     </dd>
 
+                    {/* Issue #502 - a page canvas whose 2D context is lost and
+                        not (yet) restored is blank until `contextrestored`
+                        arrives (the typed `CanvasContext` event). */}
+                    <dt>Canvas context</dt>
+                    <dd
+                        class="nge-hud__canvas-context"
+                        classList={{ 'nge-hud__warn': state.canvasContext().lostPages.length > 0 }}
+                        title={`${state.canvasContext().losses} lost, ${state.canvasContext().restores} restored`}
+                    >
+                        {state.canvasContext().lostPages.length > 0
+                            ? `canvas context lost (page ${state.canvasContext().lostPages.map((p) => p + 1).join(', ')})`
+                            : state.canvasContext().losses > 0
+                              ? `ok (${state.canvasContext().restores}/${state.canvasContext().losses} restored)`
+                              : 'ok'}
+                    </dd>
+
                     {/* Issue #406 - the reader's warning report for the open
                         document (the same report the open-issues banner
                         and the telemetry DOC_OPEN sample carry). */}

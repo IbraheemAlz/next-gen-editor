@@ -75,6 +75,7 @@ const HOOKS = [
     '__fontRegistry',
     '__telemetryFlush',
     '__clipboardPrefetch',
+    '__forceContextLoss',
     '__lastStats',
 ] as const;
 

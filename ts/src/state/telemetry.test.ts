@@ -268,6 +268,31 @@ describe('batching and folding', () => {
         await tick();
         expect(ofType('ERROR')).toEqual([]);
     });
+
+    it('samples each page canvas context LOSS once, never a restore (#502)', async () => {
+        start();
+        const ctx = (o: Record<string, unknown>) =>
+            client.emit({ type: 'CANVAS_CONTEXT', lost_pages: [], losses: 0, restores: 0, ...o });
+        ctx({ lost_pages: [2], losses: 1 });
+        ctx({ lost_pages: [2], losses: 1 }); // a repeat broadcast: not a new loss
+        ctx({ lost_pages: [], losses: 1, restores: 1 }); // restored: the recovery
+        ctx({ lost_pages: [0, 4], losses: 3, restores: 1 }); // two more losses
+        await tick();
+        const lost = ofType('ERROR').filter((e) => e.code === 'CANVAS_CONTEXT_LOST');
+        expect(lost).toHaveLength(3);
+        expect(lost[0]).toEqual({ type: 'ERROR', code: 'CANVAS_CONTEXT_LOST', recoverable: true });
+        /* Counts only - no page index leaves the device. */
+        expect(JSON.stringify(lost)).not.toContain('lost_pages');
+    });
+
+    it('a recovered worker generation counts its canvas losses from zero (#502)', async () => {
+        start();
+        client.emit({ type: 'CANVAS_CONTEXT', lost_pages: [1], losses: 1, restores: 0 });
+        client.emit({ type: 'RECOVERED' } as never);
+        client.emit({ type: 'CANVAS_CONTEXT', lost_pages: [1], losses: 1, restores: 0 });
+        await tick();
+        expect(ofType('ERROR').filter((e) => e.code === 'CANVAS_CONTEXT_LOST')).toHaveLength(2);
+    });
 });
 
 describe('DOC_OPEN correlation', () => {

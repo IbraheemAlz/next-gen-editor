@@ -243,6 +243,10 @@ pub enum ErrorCode {
     /// engine-side `SNAPSHOT` dispatch kept failing after its bounded
     /// retries: a recovery now would miss commands.
     JournalFailed,
+    /// Issue #502 - a page canvas lost its 2D context (one sample per
+    /// loss; the worker repaints the page when the context is restored,
+    /// and `Event::CanvasContext` says whether it ever was).
+    CanvasContextLost,
     Unknown,
 }
 
@@ -624,6 +628,21 @@ mod tests {
         assert_eq!(
             roundtrip(&kind),
             serde_json::json!({ "type": "ERROR", "code": "JOURNAL_FAILED", "recoverable": true })
+        );
+    }
+
+    #[test]
+    fn canvas_context_lost_error_code_is_screaming_snake() {
+        // Issue #502 - the TS collector mirrors this exact wire spelling.
+        let kind = TelemetryKind::Error {
+            code: ErrorCode::CanvasContextLost,
+            recoverable: true,
+            kind: None,
+            command: None,
+        };
+        assert_eq!(
+            roundtrip(&kind),
+            serde_json::json!({ "type": "ERROR", "code": "CANVAS_CONTEXT_LOST", "recoverable": true })
         );
     }
 

@@ -680,6 +680,31 @@ pub enum Event {
         #[serde(default)]
         journal_failing: bool,
     },
+
+    /// Issue #502 - the 2D-context health of the worker's page canvases,
+    /// broadcast unsolicited on `subscribe()` (like `CheckpointState`;
+    /// never a reply, never produced by `Engine::apply`) whenever a
+    /// canvas loses or regains its context. A lost-and-restored 2D
+    /// context comes back BLANK, and the engine's per-canvas display-list
+    /// memo (#497) would skip repainting a page whose list did not
+    /// change, so the worker forgets that canvas's memo and repaints it
+    /// on `contextrestored`; this event is the visible half: a
+    /// `contextrestored` that never arrives leaves `lost_pages`
+    /// non-empty (Dev HUD row, telemetry `ERROR / CANVAS_CONTEXT_LOST`).
+    /// Additive: no `Command` carries it.
+    CanvasContext {
+        /// Page indices (0 = the boot canvas) whose context is lost right
+        /// now, ascending; empty when every canvas is healthy.
+        #[serde(default)]
+        lost_pages: Vec<u32>,
+        /// Context losses this worker generation has seen.
+        #[serde(default)]
+        losses: u32,
+        /// Context restorations this worker generation has seen (a
+        /// restoration whose loss was never observed counts too).
+        #[serde(default)]
+        restores: u32,
+    },
 }
 
 /// Defines [`ErrorKind`], `ErrorKind::ALL` and `ErrorKind::name()` from ONE
@@ -1928,6 +1953,33 @@ mod a11y_note_wire_tests {
                 journal_failing: false,
                 ..
             }
+        ));
+    }
+
+    /// Issue #502 - `CanvasContext` is an unsolicited, additive event; an
+    /// older payload without the counters still decodes.
+    #[test]
+    fn canvas_context_wire_shape() {
+        let lost = serde_json::to_value(Event::CanvasContext {
+            lost_pages: vec![0, 3],
+            losses: 2,
+            restores: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            lost,
+            serde_json::json!({
+                "type": "CANVAS_CONTEXT",
+                "lost_pages": [0, 3],
+                "losses": 2,
+                "restores": 1
+            })
+        );
+        let back: Event =
+            serde_json::from_value(serde_json::json!({ "type": "CANVAS_CONTEXT" })).unwrap();
+        assert!(matches!(
+            back,
+            Event::CanvasContext { lost_pages, losses: 0, restores: 0 } if lost_pages.is_empty()
         ));
     }
 

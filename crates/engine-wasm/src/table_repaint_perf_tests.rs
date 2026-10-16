@@ -343,3 +343,91 @@ fn an_edit_repaints_only_the_pages_it_changed() {
     assert!(matches!(apply(&mut e, paint), Event::Painted { .. }));
     assert_eq!(marked(&ctxs), vec![true, true, false]);
 }
+
+/// Issue #502 — a canvas whose 2D context was lost and restored comes back
+/// blank; `forget_canvas_memo(idx)` makes the next paint of THAT page
+/// unconditional (the #497 memo would skip it, its display list being
+/// unchanged) while the other pages keep skipping. The marker drawn on
+/// each canvas stands in for the page's pixels: a repaint clears it, a
+/// skipped canvas keeps it. Browser-only, like the test above.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn forgetting_a_canvas_memo_repaints_only_that_page() {
+    use web_sys::OffscreenCanvas;
+    const MARK: [u8; 3] = [0xff, 0x00, 0xff];
+    let mut e = tests::test_engine_with_doc(DocumentTree::from_paragraphs(
+        (1..=200).map(|i| format!("Line {i}")),
+    ));
+    let evt = apply(&mut e, Command::ExpandLayout { target_y: 1e9 });
+    let Event::Painted { page_count, .. } = evt else {
+        panic!("EXPAND_LAYOUT: {evt:?}");
+    };
+    assert!(
+        page_count >= 3,
+        "fixture must span 3+ pages, got {page_count}"
+    );
+    let ctxs: Vec<OffscreenCanvasRenderingContext2d> = (0..3)
+        .map(|i| {
+            let canvas = OffscreenCanvas::new(1, 1).expect("OffscreenCanvas");
+            let ctx = canvas
+                .get_context("2d")
+                .expect("2d")
+                .expect("2d")
+                .dyn_into::<OffscreenCanvasRenderingContext2d>()
+                .expect("2d ctx");
+            e.set_page_canvas(i, canvas).expect("register");
+            ctx
+        })
+        .collect();
+    let mark_all = || {
+        for ctx in &ctxs {
+            ctx.set_fill_style_str("#ff00ff");
+            ctx.fill_rect(0.0, 0.0, 2.0, 2.0);
+        }
+    };
+    let marked = || -> Vec<bool> {
+        ctxs.iter()
+            .map(|ctx| {
+                let px = ctx.get_image_data(0.0, 0.0, 1.0, 1.0).expect("read").data();
+                px[..3] == MARK
+            })
+            .collect()
+    };
+    let paint = Command::RequestPaint {
+        viewport: BridgeRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        },
+        dirty: None,
+    };
+    assert!(matches!(
+        apply(&mut e, paint.clone()),
+        Event::Painted { .. }
+    ));
+    /* Everything is painted and up to date: a paint request keeps all. */
+    mark_all();
+    assert!(matches!(
+        apply(&mut e, paint.clone()),
+        Event::Painted { .. }
+    ));
+    assert_eq!(marked(), vec![true, true, true], "up-to-date pages skip");
+    /* Page 2 (index 1) loses its context: forget it, the others skip. */
+    assert!(e.forget_canvas_memo(1));
+    assert!(matches!(
+        apply(&mut e, paint.clone()),
+        Event::Painted { .. }
+    ));
+    assert_eq!(
+        marked(),
+        vec![true, false, true],
+        "only the forgotten page repaints"
+    );
+    /* The repaint re-recorded it: it skips again. */
+    mark_all();
+    assert!(matches!(apply(&mut e, paint), Event::Painted { .. }));
+    assert_eq!(marked(), vec![true, true, true]);
+    /* An index with no canvas registered is reported, not an error. */
+    assert!(!e.forget_canvas_memo(40));
+}

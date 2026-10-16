@@ -30,6 +30,7 @@ type ErrorCode =
     | 'RPC'
     | 'CHECKPOINT_FAILED'
     | 'JOURNAL_FAILED'
+    | 'CANVAS_CONTEXT_LOST'
     | 'UNKNOWN';
 /** Issue #461 - every `bridge::ErrorKind` is either folded into the `ERROR`
  *  sample's `kind` ('sampled') or deliberately left out ('not-sampled').
@@ -306,6 +307,8 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
     let lastDegradedKey = '[]';
     /* Issue #390 - one JOURNAL_FAILED sample per exhausted-journal run. */
     let journalFailedReported = false;
+    /* Issue #502 - `Event::CanvasContext.losses` already sampled. */
+    let canvasLossesReported = 0;
     const recentCommands: string[] = [];
     let pendingDocOpen: {
         sizeBytes: number;
@@ -434,6 +437,21 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
             } else {
                 journalFailedReported = false;
             }
+        } else if (e.type === 'CANVAS_CONTEXT') {
+            /* Issue #502 - one ERROR sample per page canvas context LOSS (a
+               restore is the recovery, not a failure); the worker repaints
+               the page when the context comes back, and the Dev HUD shows
+               a page whose restore never arrived. */
+            const losses = e.losses ?? 0;
+            for (let n = canvasLossesReported; n < losses; n++) {
+                pending.push(
+                    sample({ type: 'ERROR', code: 'CANVAS_CONTEXT_LOST', recoverable: true }),
+                );
+            }
+            canvasLossesReported = losses;
+        } else if (e.type === 'RECOVERED') {
+            /* A respawned worker generation counts its losses from zero. */
+            canvasLossesReported = 0;
         } else if (e.type === 'DOCUMENT_SAVED') {
             /* Issue #485 - only a REPAIRED save samples: kind counts and the
                byte length, never the notes' text. */
