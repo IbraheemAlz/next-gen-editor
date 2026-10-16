@@ -15,7 +15,7 @@ use peniko::{Brush, Color};
 pub type FontId = String;
 
 /// A solid paint. Wraps a `peniko::Brush`; batch 1 only ever uses `Solid`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Paint {
     pub brush: Brush,
 }
@@ -44,7 +44,7 @@ impl Paint {
 
 /// One positioned glyph in a run. `x`/`y` is the baseline pen position; the
 /// backend adds the rasterized glyph's bearing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RunGlyph {
     pub glyph_id: u16,
     pub x: f64,
@@ -52,7 +52,7 @@ pub struct RunGlyph {
 }
 
 /// A run of glyphs sharing one font, pixel size, and paint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GlyphRun {
     pub font: FontId,
     pub px_size: f32,
@@ -70,7 +70,7 @@ pub struct GlyphRun {
 
 /// One backend-agnostic drawing command. Batch 1 freezes this set; paths,
 /// images, and layers arrive with the features that need them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DisplayCmd {
     FillRect {
         rect: Rect,
@@ -111,7 +111,7 @@ pub enum DisplayCmd {
 }
 
 /// An ordered list of drawing commands — the renderer's sole input.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DisplayList {
     pub cmds: Vec<DisplayCmd>,
 }
