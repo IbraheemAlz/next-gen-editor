@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{RendererDowngrade, Script};
-use crate::event::{EngineStats, ErrorKind, LayoutDegradeReason, ReadWarningKind};
+use crate::event::{
+    EngineStats, ErrorKind, LayoutDegradeReason, ReadWarningKind, SaveNote, SaveNoteKind,
+};
 
 /// One telemetry sample. `doc_id` is anonymized — never a document title or
 /// path, only an opaque per-session identifier.
@@ -121,6 +123,39 @@ pub enum TelemetryKind {
         #[tsify(optional)]
         read_warnings: Vec<ReadWarningCount>,
     },
+    /// Issue #485 - a save that carried write notes (`Event::DocumentSaved::
+    /// notes`): the file was written REPAIRED. Only degraded saves sample
+    /// (a clean save emits nothing), so the sample rate is the repair
+    /// rate. `size_bytes` is the saved file's byte length, `save_notes` the
+    /// per-kind counts (kinds ascending): codes and counts only, no
+    /// document content.
+    DocSave {
+        size_bytes: u32,
+        save_notes: Vec<SaveNoteCount>,
+    },
+}
+
+/// Issue #485 - one note kind's count on [`TelemetryKind::DocSave::
+/// save_notes`].
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveNoteCount {
+    pub kind: SaveNoteKind,
+    pub count: u32,
+}
+
+/// Issue #485 - fold a save's notes into per-kind counts, kinds in
+/// ascending ([`SaveNoteKind`] declaration) order, each kind once.
+pub fn save_note_counts(notes: &[SaveNote]) -> Vec<SaveNoteCount> {
+    let mut counts: std::collections::BTreeMap<SaveNoteKind, u32> =
+        std::collections::BTreeMap::new();
+    for n in notes {
+        let c = counts.entry(n.kind()).or_insert(0);
+        *c = c.saturating_add(n.count().max(1));
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| SaveNoteCount { kind, count })
+        .collect()
 }
 
 /// Issue #406 — one warning kind's count on
@@ -619,5 +654,32 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Issue #485 - a degraded save samples `DOC_SAVE` with per-kind
+    /// counts; the kinds fold in declaration order, each once.
+    #[test]
+    fn doc_save_sample_carries_per_kind_counts() {
+        use crate::event::SaveNote;
+        let counts = save_note_counts(&[
+            SaveNote::StaleMarkupClamped { markers: 2 },
+            SaveNote::ForbiddenCharactersReplaced { count: 3 },
+            SaveNote::StaleMarkupClamped { markers: 1 },
+        ]);
+        let kind = TelemetryKind::DocSave {
+            size_bytes: 4096,
+            save_notes: counts,
+        };
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::json!({
+                "type": "DOC_SAVE",
+                "size_bytes": 4096,
+                "save_notes": [
+                    { "kind": "ForbiddenCharactersReplaced", "count": 3 },
+                    { "kind": "StaleMarkupClamped", "count": 3 },
+                ],
+            })
+        );
     }
 }

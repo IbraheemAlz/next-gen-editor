@@ -126,6 +126,9 @@ export type {
 } from './commandMeta.generated';
 export type { RecoveryNotice, RecoveryNoticeKind, RecoveryNoticeOptions } from './recovery';
 
+/* Issue #485 - the writer's save report (`lastSaveNotes()`), worded. */
+export { describeSaveNote, saveNoteCount, saveNoteKind, saveNotices } from './saveNotes';
+
 /* Issue #406 — the reader's warning report for the open document. */
 export { READ_WARNING_LABELS, openWarningCount, describeReadWarning } from './openWarnings';
 
@@ -138,6 +141,8 @@ export type {
     ErrorKind,
     ReadWarning,
     ReadWarningKind,
+    SaveNote,
+    SaveNoteKind,
     ProtectionMode,
     PackageLimitsOverride,
     TextAttrsPatch,

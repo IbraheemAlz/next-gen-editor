@@ -79,3 +79,9 @@
     color: var(--nge-color-text-muted);
     font-size: var(--nge-font-size-xs);
 }
+
+/* Issue #485 - one line per save note under the notice's detail. */
+.nge-recovery-banner__lines {
+    margin: var(--nge-space-1) 0 0;
+    padding-left: var(--nge-space-4);
+}

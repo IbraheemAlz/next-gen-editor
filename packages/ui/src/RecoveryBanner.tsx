@@ -15,6 +15,10 @@
  * nothing (an older-snapshot fallback that still replayed its full tail
  * included — the Dev HUD shows those). A newer recovery replaces a
  * dismissed banner's content and shows it again.
+ *
+ * Issue #485 - the same banner carries the writer's save report: a save
+ * that replaced characters (or clamped markup) says so, one line per note
+ * kind (`data-kind="save-notes"`), until dismissed or the next save.
  */
 import { createEffect, createMemo, createSignal, For, Show, type Component } from 'solid-js';
 import {
@@ -22,9 +26,11 @@ import {
     createEditorState,
     previousSessionNotice,
     recoveryNotices,
+    saveNotices,
     useEngine,
     type RecoveryNoticeOptions,
     type RecoveryReport,
+    type SaveNote,
 } from '@nge/core';
 import './RecoveryBanner.css';
 
@@ -68,6 +74,9 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
     createEffect(() => {
         if (state.checkpointState().ok) setCheckpointDismissed(false);
     });
+    /* Issue #485 - a repaired save is dismissed per save: the notes array
+       is replaced by every save, so the next repaired save shows again. */
+    const [saveDismissed, setSaveDismissed] = createSignal<SaveNote[] | undefined>(undefined);
     const notices = createMemo(() => {
         const options: RecoveryNoticeOptions = {};
         if (props.formatTime) options.formatTime = props.formatTime;
@@ -84,7 +93,9 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
         const previous = previousDismissed()
             ? []
             : previousSessionNotice(state.previousSessions(), options);
-        return [...previous, ...recovery, ...checkpoint];
+        const saved =
+            saveDismissed() === state.lastSaveNotes() ? [] : saveNotices(state.lastSaveNotes());
+        return [...previous, ...recovery, ...checkpoint, ...saved];
     });
     const visible = createMemo(() => notices().length > 0);
 
@@ -111,6 +122,13 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
                                     {notice.title}
                                 </strong>
                                 <p class="nge-recovery-banner__detail">{notice.detail}</p>
+                                <Show when={notice.lines}>
+                                    {(lines) => (
+                                        <ul class="nge-recovery-banner__lines">
+                                            <For each={lines()}>{(l) => <li>{l}</li>}</For>
+                                        </ul>
+                                    )}
+                                </Show>
                                 <p class="nge-recovery-banner__action">{notice.action}</p>
                                 <Show when={notice.kind === 'previous-session'}>
                                     <For each={state.previousSessions()}>
@@ -157,6 +175,7 @@ export const RecoveryBanner: Component<RecoveryBannerProps> = (props) => {
                     onClick={() => {
                         setDismissed(() => state.lastRecovery());
                         setCheckpointDismissed(true);
+                        setSaveDismissed(() => state.lastSaveNotes());
                         setPreviousDismissed(true);
                         void engine.dismissPreviousSessions?.();
                     }}

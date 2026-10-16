@@ -44,6 +44,7 @@ import type {
     PreviousSessionInfo,
     LogicalRange,
     ReadWarning,
+    SaveNote,
     ProtectionMode,
     RecoveryReport,
     Rect,
@@ -300,6 +301,20 @@ export interface EditorState {
      */
     openWarnings: Accessor<ReadWarning[]>;
     /**
+     * Issue #485 - the writer's report for the LAST save
+     * (`DOCUMENT_SAVED.notes`, one entry per kind): characters XML cannot
+     * carry that were written as U+FFFD, stale markup written at a clamped
+     * position, a content control widened around a wrapper. `[]` for a
+     * faithful save, before the first save, after a document open /
+     * close and after a restored previous session; non-empty means the
+     * file on disk differs from the document on screen and the UI must
+     * say so (`@nge/ui` `RecoveryBanner`; feed entries to
+     * `describeSaveNote()`). Every save replaces it with a NEW array, so
+     * a dismissed notice reappears for the next repaired save. Shared
+     * like `zoom`.
+     */
+    lastSaveNotes: Accessor<SaveNote[]>;
+    /**
      * Issue #426 - every previous session still waiting for a decision
      * (the archive ring, newest first); `previousSession` is the first.
      */
@@ -375,6 +390,7 @@ interface ViewState {
     lastError: Accessor<EditorError | undefined>;
     previousSession: Accessor<PreviousSessionInfo | undefined>;
     openWarnings: Accessor<ReadWarning[]>;
+    lastSaveNotes: Accessor<SaveNote[]>;
     clearOpenWarnings: () => void;
     previousSessions: Accessor<PreviousSessionInfo[]>;
     fontSubstitutions: Accessor<FontSubstitution[]>;
@@ -384,10 +400,11 @@ const viewStates = new WeakMap<EngineHandle, ViewState>();
 
 /**
  * Issue #406 - forget the open document's reader warnings (the document
- * they describe is gone). `createEditorCommands().closeDocument()` calls
- * this once the engine confirmed the close; the CLOSE_DOCUMENT reply is a
- * plain `SELECTION_CHANGED`, which the shared subscription cannot tell
- * apart from any other. Internal to `@nge/core`.
+ * they describe is gone; issue #485 - and its last save report).
+ * `createEditorCommands().closeDocument()` calls this once the engine
+ * confirmed the close; the CLOSE_DOCUMENT reply is a plain
+ * `SELECTION_CHANGED`, which the shared subscription cannot tell apart
+ * from any other. Internal to `@nge/core`.
  */
 export function clearOpenWarnings(engine: EngineHandle): void {
     viewStateFor(engine).clearOpenWarnings();
@@ -422,9 +439,15 @@ function viewStateFor(engine: EngineHandle): ViewState {
            what the restored model holds); restoring the previous session
            swaps the document, so its open's warnings no longer apply. */
         const [openWarnings, setOpenWarnings] = createSignal<ReadWarning[]>([]);
+        /* Issue #485 - the last save's write notes; a new document (open,
+           close, restored session) leaves nothing to report about. */
+        const [lastSaveNotes, setLastSaveNotes] = createSignal<SaveNote[]>([]);
         engine.onRecovery?.((report) => {
             setLastRecovery(() => report);
-            if (report.cause === 'session-restore') setOpenWarnings([]);
+            if (report.cause === 'session-restore') {
+                setOpenWarnings([]);
+                setLastSaveNotes([]);
+            }
         });
         /* Issue #333 - checkpoint health, seeded then fed by the client. */
         const toHealth = (s: CheckpointStatus | undefined): CheckpointHealth => ({
@@ -475,6 +498,11 @@ function viewStateFor(engine: EngineHandle): ViewState {
                 /* The next broadcast (if the new document has comments)
                    repopulates; until then nothing stale is drawn. */
                 setCommentHighlights([]);
+                setLastSaveNotes([]);
+            } else if (evt.type === 'DOCUMENT_SAVED') {
+                /* Issue #485 - every save replaces the report (a clean
+                   save, an HTML / plain-text export, sends none). */
+                setLastSaveNotes(evt.notes ?? []);
             }
             if (evt.type === 'ERROR') {
                 errorCount += 1;
@@ -537,7 +565,12 @@ function viewStateFor(engine: EngineHandle): ViewState {
             lastError,
             previousSession,
             openWarnings,
-            clearOpenWarnings: () => setOpenWarnings([]),
+            lastSaveNotes,
+            clearOpenWarnings: () => {
+                setOpenWarnings([]);
+                /* Issue #485 - and the closed document's save report. */
+                setLastSaveNotes([]);
+            },
             previousSessions,
             fontSubstitutions,
         };
@@ -707,6 +740,7 @@ export function createEditorState(): EditorState {
         lastError: view.lastError,
         previousSession: view.previousSession,
         openWarnings: view.openWarnings,
+        lastSaveNotes: view.lastSaveNotes,
         previousSessions: view.previousSessions,
         fontSubstitutions: view.fontSubstitutions,
         commentHighlights: view.commentHighlights,

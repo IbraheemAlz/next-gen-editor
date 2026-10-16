@@ -43,7 +43,10 @@ discipline.
     `estimatedDocumentHeight`, `renderer`; the recovery / honesty
     signals `lastRecovery` + `recoveryNotices()` / `recoveryDegraded()`
     (issue #315), `checkpointState` (`Event::CheckpointState`, #390),
-    `lastError` (every `Event::Error`, #364); and the font read-back
+    `lastError` (every `Event::Error`, #364), `lastSaveNotes` (the writer's
+    repairs on `Event::DocumentSaved.notes`, #485 — worded by
+    `saveNotices()` / `describeSaveNote()`, shown by `RecoveryBanner` as a
+    `save-notes` notice, mirrored in the Dev HUD "Last save" row); and the font read-back
     `resolvedFonts` / `fontSource` / `slotFormats` / `caretFontSlot`
     (#423, #420); `caretRevealSeq` (bumps on a keyboard / programmatic
     caret move — `SELECTION_CHANGED.reveal_caret`, classified by

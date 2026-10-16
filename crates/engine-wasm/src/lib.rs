@@ -51,6 +51,7 @@ mod paragraph_cache;
 mod paragraph_cache_key;
 mod pdf_semantics;
 mod read_report;
+mod save_report;
 pub(crate) use paragraph_cache_key::paragraph_layout_key;
 /// Issue #459 — the command-boundary EMU range guard (picture extents and
 /// offsets stay inside Word's 22 in).
@@ -17934,10 +17935,14 @@ impl Engine {
         retained source package (`write_docx`: every sibling part
         byte-identical); an engine-authored one through the minimal-package
         writer. */
-        match format_docx::save_docx(&doc) {
-            Ok(bytes) => {
+        match format_docx::save_docx_with_notes(&doc) {
+            Ok((bytes, notes)) => {
                 let size = bytes.len() as u32;
-                Event::DocumentSaved { bytes, size }
+                /* Issue #485 - the writer's repairs ride the reply: a
+                save that replaced characters or clamped markup is never
+                indistinguishable from a faithful one. */
+                let notes = save_report::bridge_save_notes(&notes);
+                Event::DocumentSaved { bytes, size, notes }
             }
             Err(e) => Event::error_kind(bridge::ErrorKind::Internal, format!("{origin}: {e}")),
         }
@@ -17959,7 +17964,11 @@ impl Engine {
         let html = format_html::to_html_with_note_markers(doc, &markers);
         let bytes = html.into_bytes();
         let size = bytes.len() as u32;
-        Event::DocumentSaved { bytes, size }
+        Event::DocumentSaved {
+            bytes,
+            size,
+            notes: Vec::new(),
+        }
     }
 
     /// Sprint 9 — flatten the current document to plain text via
@@ -17968,7 +17977,11 @@ impl Engine {
         let text = self.undo.current().to_plain_text();
         let bytes = text.into_bytes();
         let size = bytes.len() as u32;
-        Event::DocumentSaved { bytes, size }
+        Event::DocumentSaved {
+            bytes,
+            size,
+            notes: Vec::new(),
+        }
     }
 
     /// Sprint 3 (UI Edition) — set the user zoom fraction and force

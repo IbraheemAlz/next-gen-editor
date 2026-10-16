@@ -20,6 +20,7 @@
 import { errorCommand } from '@nge/core';
 import type { Command, ErrorKind, Event } from '../engine/types';
 import { readWarningCounts, type ReadWarningCount } from './read-warning-counts';
+import { saveNoteCounts, type SaveNoteCount } from './save-note-counts';
 import { installDevHook } from '../dev-hooks';
 
 type ErrorCode =
@@ -161,7 +162,11 @@ type TelemetryKind =
            *  on a clean open, like the Rust `skip_serializing_if`. Codes and
            *  counts only — never a warning's detail. */
           read_warnings?: ReadWarningCount[];
-      };
+      }
+    /* Issue #485 - a save that carried write notes (a REPAIRED file): per-kind
+       counts (kinds ascending, like the Rust `save_note_counts`) and the
+       saved file's byte length. Only degraded saves sample. */
+    | { type: 'DOC_SAVE'; size_bytes: number; save_notes: SaveNoteCount[] };
 
 
 
@@ -427,6 +432,19 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
                 }
             } else {
                 journalFailedReported = false;
+            }
+        } else if (e.type === 'DOCUMENT_SAVED') {
+            /* Issue #485 - only a REPAIRED save samples: kind counts and the
+               byte length, never the notes' text. */
+            const notes = e.notes ?? [];
+            if (notes.length > 0) {
+                pending.push(
+                    sample({
+                        type: 'DOC_SAVE',
+                        size_bytes: e.size,
+                        save_notes: saveNoteCounts(notes),
+                    }),
+                );
             }
         } else if (e.type === 'FONT_MISSING') {
             pending.push(

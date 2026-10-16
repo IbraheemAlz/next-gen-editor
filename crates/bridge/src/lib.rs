@@ -26,6 +26,7 @@ mod event;
 mod finite;
 mod meta;
 mod telemetry;
+mod text_fields;
 
 pub use command::*;
 pub use common::*;
@@ -33,3 +34,4 @@ pub use event::*;
 pub use finite::*;
 pub use meta::*;
 pub use telemetry::*;
+pub use text_fields::*;

@@ -92,6 +92,8 @@ export type {
     CommentHighlight,
     ReadWarning,
     ReadWarningKind,
+    SaveNote,
+    SaveNoteKind,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 import type {

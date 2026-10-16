@@ -14,21 +14,28 @@
 //! handlers see only clean text, so no handler (story, tracked, interactive,
 //! composition) carries its own copy.
 //!
-//! Covered here: body text (`InsertText`, `ReplaceRange`,
-//! `UpdateComposition`, `PastePlain`, `RenderPage`, a comment / reply body)
-//! and the one-line values that end up in the package (review author and
-//! date, comment authors, a field instruction, an opened file's name, style
-//! ids / names, font family and language names). `PasteHtml` is covered by
-//! the HTML parser (`engine::html`, entity-decoded text is repaired) and a
-//! `.txt` / `.html` open by the opener; a `.docx` by the reader's
-//! well-formedness repair. A new text-bearing command MUST be added to
-//! [`sanitize_command`]; the writer's last-line defence (`format_docx`
-//! `WriteNote::ForbiddenCharactersReplaced`) and the #468 save gate keep a
-//! missed one from corrupting a file.
+//! Issue #485 — the set of fields is NOT a list in this file. It is the
+//! per-command declaration in `bridge::command_meta!` (`; (field: class,
+//! ...)`), walked through the macro-generated `Command::visit_text_mut`:
+//! body text (`InsertText`, `ReplaceRange`, `UpdateComposition`,
+//! `PastePlain`, `RenderPage`, a comment / reply body) is
+//! `TextClass::Body`; the one-line values that end up in the package
+//! (review author and date, comment authors, a field instruction, an
+//! opened file's name, style ids / names, font family and language names,
+//! an image's MIME type) are `TextClass::Line`; a field that never reaches
+//! the document (a registry key, a password) or is cleaned elsewhere
+//! (`PasteHtml` by the HTML parser, a `.txt` / `.html` open by the opener,
+//! a `.docx` by the reader's well-formedness repair) is declared `Exempt`
+//! with its reason. A new command or field cannot be forgotten: the macro
+//! does not compile an unclassified variant and `bridge`'s
+//! `every_command_string_field_is_classified` fails an unclassified field.
+//! The writer's last-line defence (`format_docx`
+//! `WriteNote::ForbiddenCharactersReplaced`, reported on
+//! `Event::DocumentSaved.notes`) and the #468 save gate remain behind it.
 
-use bridge::{
-    BridgeSpanStylePatch, BridgeStyleProperties, Command, ErrorKind, Event, TextAttrsPatch,
-};
+use std::ops::ControlFlow;
+
+use bridge::{Command, ErrorKind, Event, TextClass};
 use engine::text_input::{InputTextRefusal, sanitize_line_in_place, sanitize_text_in_place};
 
 /// A refused argument: which field of the command, and why.
@@ -37,64 +44,27 @@ struct Refused {
     why: InputTextRefusal,
 }
 
-fn body(field: &'static str, s: &mut String) -> Result<(), Refused> {
-    sanitize_text_in_place(s).map_err(|why| Refused { field, why })
-}
-
-fn line(field: &'static str, s: &mut String) -> Result<(), Refused> {
-    sanitize_line_in_place(s).map_err(|why| Refused { field, why })
-}
-
-fn opt_line(field: &'static str, s: &mut Option<String>) -> Result<(), Refused> {
-    s.as_mut().map_or(Ok(()), |s| line(field, s))
-}
-
-fn attrs(a: &mut TextAttrsPatch) -> Result<(), Refused> {
-    opt_line("attrs.font_family", &mut a.font_family)?;
-    opt_line("attrs.language", &mut a.language)
-}
-
-fn span_patch(p: &mut BridgeSpanStylePatch) -> Result<(), Refused> {
-    opt_line("properties.run_props.font_family", &mut p.font_family)
-}
-
-fn style_properties(p: &mut BridgeStyleProperties) -> Result<(), Refused> {
-    if let Some(run) = p.run_props.as_mut() {
-        span_patch(run)?;
-    }
-    opt_line("properties.based_on", &mut p.based_on)?;
-    opt_line("properties.display_name", &mut p.display_name)
-}
-
+/// Normalise every declared text field of `cmd` in place (the walk stops at
+/// the first refusal).
 fn sanitize_fields(cmd: &mut Command) -> Result<(), Refused> {
-    match cmd {
-        Command::InsertText { text, .. }
-        | Command::ReplaceRange { text, .. }
-        | Command::UpdateComposition { text, .. }
-        | Command::PastePlain { text }
-        | Command::RenderPage { text, .. } => body("text", text),
-        Command::InsertComment { text, author, .. }
-        | Command::ReplyToComment { text, author, .. } => {
-            body("text", text)?;
-            line("author", author)
+    let mut refused: Option<Refused> = None;
+    let _ = cmd.visit_text_mut(&mut |field, class, s| {
+        let result = match class {
+            TextClass::Body => sanitize_text_in_place(s),
+            TextClass::Line => sanitize_line_in_place(s),
+            /* A nested payload reports its leaves with their own class;
+            an exempt field never reaches the document. */
+            TextClass::Nested | TextClass::Exempt(_) => return ControlFlow::Continue(()),
+        };
+        match result {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(why) => {
+                refused = Some(Refused { field, why });
+                ControlFlow::Break(())
+            }
         }
-        Command::SetReviewIdentity { author, date } => {
-            line("author", author)?;
-            line("date", date)
-        }
-        Command::SetFieldInstruction { instruction, .. } => line("instruction", instruction),
-        Command::OpenDocument { name, .. } => opt_line("name", name),
-        Command::ApplyStyle { style_id, .. } => opt_line("style_id", style_id),
-        Command::ModifyStyle {
-            style_id,
-            properties,
-        } => {
-            line("style_id", style_id)?;
-            style_properties(properties)
-        }
-        Command::ApplyFormatting { attrs: a, .. } => attrs(a),
-        _ => Ok(()),
-    }
+    });
+    refused.map_or(Ok(()), Err)
 }
 
 /// Normalise every text-bearing argument of `cmd` in place; a refusal is the

@@ -312,6 +312,44 @@ describe('DOC_OPEN correlation', () => {
     });
 });
 
+describe('DOC_SAVE (#485)', () => {
+    const saved = (notes?: unknown): Record<string, unknown> => ({
+        type: 'DOCUMENT_SAVED',
+        bytes: new Uint8Array(0),
+        size: 4096,
+        notes,
+    });
+
+    it('samples a REPAIRED save with per-kind counts and the file size', async () => {
+        start();
+        client.emit(
+            saved([
+                { type: 'STALE_MARKUP_CLAMPED', markers: 2 },
+                { type: 'FORBIDDEN_CHARACTERS_REPLACED', count: 3 },
+            ]),
+        );
+        await tick();
+        expect(ofType('DOC_SAVE')).toEqual([
+            {
+                type: 'DOC_SAVE',
+                size_bytes: 4096,
+                save_notes: [
+                    { kind: 'ForbiddenCharactersReplaced', count: 3 },
+                    { kind: 'StaleMarkupClamped', count: 2 },
+                ],
+            },
+        ]);
+    });
+
+    it('a faithful save samples nothing', async () => {
+        start();
+        client.emit(saved(undefined));
+        client.emit(saved([]));
+        await tick();
+        expect(ofType('DOC_SAVE')).toEqual([]);
+    });
+});
+
 describe('breadcrumbs never carry a payload (#86)', () => {
     it('CRASH.recent_commands lists command TYPES only, bounded to the last 20', async () => {
         start();
