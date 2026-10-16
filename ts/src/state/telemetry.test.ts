@@ -34,13 +34,15 @@ class FakeClient implements TelemetryClient {
     checkpointListeners = new Set<(n: number) => void>();
     dispatched: Command[] = [];
     statsAvailable = true;
+    /** The `REQUEST_STATS` reply (issue #500 tests add the cache counters). */
+    statsReply: Event = stats;
     /** The `OPEN_DOCUMENT` reply (issue #329 tests add `substituted`). */
     openReply: Record<string, unknown> = { type: 'DOCUMENT_LOADED' };
     async dispatch(cmd: Command): Promise<Event> {
         this.dispatched.push(cmd);
         if (cmd.type === 'REQUEST_STATS') {
             if (!this.statsAvailable) throw new Error('engine down');
-            return stats;
+            return this.statsReply;
         }
         if (cmd.type === 'OPEN_DOCUMENT') return this.openReply as unknown as Event;
         return { type: 'PAINTED' } as unknown as Event;
@@ -150,6 +152,49 @@ describe('batching and folding', () => {
         /* The window resets: the next batch has no paint sample. */
         await tick();
         expect(ofType('PAINT_TIMING')).toHaveLength(1);
+    });
+
+    it('carries the layout caches on the PAINT_TIMING sample once per batch (#500)', async () => {
+        client.statsReply = {
+            ...(stats as unknown as Record<string, unknown>),
+            paragraph_cache_bytes: 50_000,
+            paragraph_cache_entries: 12,
+            paragraph_cache_hits: 3,
+            paragraph_cache_misses: 1,
+            table_cache_bytes: 2_000,
+            table_cache_entries: 1,
+            table_cache_hits: 0,
+            table_cache_misses: 0,
+        } as unknown as Event;
+        start();
+        client.emit({ type: 'PAINTED', paint_ms: 4, page_count: 1 });
+        await tick();
+        expect(ofType('PAINT_TIMING')).toEqual([
+            {
+                type: 'PAINT_TIMING',
+                p50: 4,
+                p95: 4,
+                p99: 4,
+                /* A cache with no lookup carries no ratio. */
+                layout_caches: {
+                    paragraph_bytes: 50_000,
+                    paragraph_entries: 12,
+                    paragraph_hit_ratio: 0.75,
+                    table_bytes: 2_000,
+                    table_entries: 1,
+                },
+            },
+        ]);
+        /* One PAINT_TIMING per batch, and its stats were read once. */
+        expect(client.dispatched.filter((c) => c.type === 'REQUEST_STATS')).toHaveLength(1);
+    });
+
+    it('omits the layout caches when the engine does not answer the stats request (#500)', async () => {
+        client.statsAvailable = false;
+        start();
+        client.emit({ type: 'PAINTED', paint_ms: 4, page_count: 1 });
+        await tick();
+        expect(ofType('PAINT_TIMING')).toEqual([{ type: 'PAINT_TIMING', p50: 4, p95: 4, p99: 4 }]);
     });
 
     it('puts every queued sample of a window into ONE batch', async () => {

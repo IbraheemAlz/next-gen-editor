@@ -73,11 +73,56 @@ impl LayoutCache {
         }
     }
 
-    /// Drop every cached paragraph and table layout.
+    /// Drop every cached paragraph and table layout (the hit / miss
+    /// counters keep running).
     pub(crate) fn clear(&mut self) {
         self.paragraphs.clear();
         self.tables.clear();
     }
+
+    /// Issue #500 (item 3) — both caches' size and hit / miss counters, for
+    /// `EngineStats`. Not `stats()`: that name already reaches the
+    /// paragraph cache through `Deref`.
+    pub(crate) fn observed(&self) -> LayoutCacheObserved {
+        let paragraph = self.paragraphs.stats();
+        let table = self.tables.stats();
+        LayoutCacheObserved {
+            paragraph_bytes: self.paragraphs.bytes() as u64,
+            paragraph_entries: self.paragraphs.len() as u64,
+            paragraph_hits: paragraph.hits,
+            paragraph_misses: paragraph.misses,
+            table_bytes: self.tables.bytes as u64,
+            table_entries: self.tables.boxes.len() as u64,
+            table_hits: table.hits,
+            table_misses: table.misses,
+        }
+    }
+}
+
+/// Issue #500 (item 3) — what [`LayoutCache::observed`] reports: the
+/// estimated bytes and entry count of each cache plus its lookup counters
+/// since the engine was created (the table figures are the content-keyed
+/// BOX cache's; the intrinsic-width memo is not counted).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LayoutCacheObserved {
+    pub(crate) paragraph_bytes: u64,
+    pub(crate) paragraph_entries: u64,
+    pub(crate) paragraph_hits: u64,
+    pub(crate) paragraph_misses: u64,
+    pub(crate) table_bytes: u64,
+    pub(crate) table_entries: u64,
+    pub(crate) table_hits: u64,
+    pub(crate) table_misses: u64,
+}
+
+/// Hit / miss counts of the table BOX cache since creation: a hit is a
+/// stored box that passed the verified-hit check and was served; a miss
+/// is everything else (absent, or stale and dropped with a
+/// `TableCacheMismatch` note).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TableCacheStats {
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
 }
 
 impl std::ops::Deref for LayoutCache {
@@ -116,6 +161,7 @@ pub(crate) struct TableCache {
     intrinsic: LruCache<u64, CachedIntrinsic>,
     /// Sum of the cached boxes' estimated bytes.
     bytes: usize,
+    stats: TableCacheStats,
 }
 
 impl TableCache {
@@ -126,7 +172,14 @@ impl TableCache {
                 NonZeroUsize::new(TABLE_CACHE_MAX_INTRINSIC).expect("non-zero intrinsic cap"),
             ),
             bytes: 0,
+            stats: TableCacheStats::default(),
         }
+    }
+
+    /// Box-cache hit / miss counts since creation (they survive
+    /// [`TableCache::clear`]).
+    pub(crate) fn stats(&self) -> TableCacheStats {
+        self.stats
     }
 
     fn clear(&mut self) {
@@ -459,6 +512,7 @@ pub(crate) fn layout_table_box_persistent(
             #[cfg(test)]
             TABLE_CACHE_HITS.with(|n| n.set(n.get() + 1));
             let (laid, notes) = (hit.table.clone(), hit.notes.clone());
+            tl.cache.tables.stats.hits += 1;
             for reason in notes {
                 note_layout_degradation(reason);
             }
@@ -468,6 +522,8 @@ pub(crate) fn layout_table_box_persistent(
         tl.cache.tables.remove_box(key);
         note_layout_degradation(LayoutDegradeReason::TableCacheMismatch);
     }
+    /* Issue #500 — absent or stale (just dropped): laid out fresh. */
+    tl.cache.tables.stats.misses += 1;
     let (laid, notes) =
         with_captured_notes(|| layout_table_box_uncached(tl, table, available_width_px, depth));
     tl.cache.tables.put_box(key, laid.clone(), notes);

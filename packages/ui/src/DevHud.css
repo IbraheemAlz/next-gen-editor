@@ -95,3 +95,10 @@
 .nge-hud__substitution--approx {
     color: var(--nge-color-text-muted);
 }
+
+/* Issue #500 - the layout-cache row is a long line ("para 48.2 MiB / 1,203 ·
+   97 % hit · table ..."): wrap it instead of widening the whole HUD. */
+.nge-hud__layout-caches {
+    max-width: 28em;
+    overflow-wrap: anywhere;
+}

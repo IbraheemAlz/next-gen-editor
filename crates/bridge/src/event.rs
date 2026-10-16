@@ -1419,6 +1419,36 @@ pub struct EngineStats {
     /// Sprint 8 (UI Edition) — Unicode scalar character count
     /// (matches Word's "Characters (with spaces)").
     pub character_count: u32,
+    /// Issue #500 (item 3) — estimated bytes held by the paragraph layout
+    /// cache (`engine-wasm/src/paragraph_cache.rs`, #457; its budget is
+    /// 192 MiB). Additive: `0` from a producer that predates the field.
+    #[serde(default)]
+    pub paragraph_cache_bytes: u64,
+    /// Issue #500 — paragraph boxes currently cached.
+    #[serde(default)]
+    pub paragraph_cache_entries: u64,
+    /// Issue #500 — paragraph-cache lookups answered from the cache since
+    /// the engine was created (a recovery's fresh engine starts at 0).
+    #[serde(default)]
+    pub paragraph_cache_hits: u64,
+    /// Issue #500 — paragraph-cache lookups that laid the paragraph out.
+    #[serde(default)]
+    pub paragraph_cache_misses: u64,
+    /// Issue #500 — estimated bytes held by the content-keyed table box
+    /// cache (#379; 32 MiB budget).
+    #[serde(default)]
+    pub table_cache_bytes: u64,
+    /// Issue #500 — table boxes currently cached.
+    #[serde(default)]
+    pub table_cache_entries: u64,
+    /// Issue #500 — table-box lookups served by a verified cached box since
+    /// the engine was created.
+    #[serde(default)]
+    pub table_cache_hits: u64,
+    /// Issue #500 — table-box lookups that laid the table out (absent or
+    /// stale).
+    #[serde(default)]
+    pub table_cache_misses: u64,
 }
 
 /// A full accessibility snapshot of the document — the structure mirrored into

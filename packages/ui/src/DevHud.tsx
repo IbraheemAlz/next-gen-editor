@@ -20,6 +20,8 @@ import {
     createEditorCommands,
     createEditorState,
     type FontSubstitution,
+    formatLayoutCaches,
+    type LayoutCacheStats,
     openWarningCount,
     type ReadWarning,
     type RecoveryReport,
@@ -43,6 +45,18 @@ function fmtBytes(n: number | undefined): string {
     if (n < 1024) return `${n} B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
     return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
+/** Issue #500 - the layout-cache row's tooltip: the raw lookup counts
+ *  behind the hit ratios. */
+function layoutCacheTitle(s: LayoutCacheStats | undefined): string {
+    if (s === undefined) return '';
+    const n = (v: number) => v.toLocaleString('en-US');
+    return (
+        `paragraph cache: ${n(s.paragraph.hits)} hits, ${n(s.paragraph.misses)} misses; ` +
+        `table cache: ${n(s.table.hits)} hits, ${n(s.table.misses)} misses ` +
+        '(since the engine started)'
+    );
 }
 
 /** Issue #315 — the base the last recovery came back from. */
@@ -312,6 +326,19 @@ export const DevHud: Component<DevHudProps> = (props) => {
 
                     <dt>Glyph cache</dt>
                     <dd>{state.stats()?.glyph_cache_entries ?? '–'}</dd>
+
+                    {/* Issue #500 - the paragraph (#457) and table box (#379)
+                        layout caches: estimated bytes / entries and the hit
+                        ratio since the engine started, so a cache that
+                        stops hitting (#497) shows here, not only as a slow
+                        paint. Refreshed by the poll above. */}
+                    <dt>Layout caches</dt>
+                    <dd
+                        class="nge-hud__layout-caches"
+                        title={layoutCacheTitle(state.layoutCacheStats())}
+                    >
+                        {formatLayoutCaches(state.layoutCacheStats())}
+                    </dd>
 
                     <dt>Undo depth</dt>
                     <dd>{state.stats()?.undo_stack_depth ?? '–'}</dd>

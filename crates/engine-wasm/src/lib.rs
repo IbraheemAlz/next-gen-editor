@@ -10059,6 +10059,13 @@ impl Engine {
             .filter_map(engine::Block::as_paragraph)
             .map(|p| p.text.len())
             .sum();
+        /* Issue #500 — a paint holds the cache borrow only while it runs,
+        never across a dispatch; a (impossible) overlap reads as zeros. */
+        let caches = self
+            .layout_cache
+            .try_borrow()
+            .map(|cache| cache.observed())
+            .unwrap_or_default();
         Event::Stats(EngineStats {
             wasm_heap_bytes: wasm_heap_bytes(),
             document_tree_bytes: document_tree_bytes as u32,
@@ -10070,6 +10077,14 @@ impl Engine {
             paragraph_count: doc.paragraph_count(),
             word_count: doc.word_count(),
             character_count: doc.character_count(),
+            paragraph_cache_bytes: caches.paragraph_bytes,
+            paragraph_cache_entries: caches.paragraph_entries,
+            paragraph_cache_hits: caches.paragraph_hits,
+            paragraph_cache_misses: caches.paragraph_misses,
+            table_cache_bytes: caches.table_bytes,
+            table_cache_entries: caches.table_entries,
+            table_cache_hits: caches.table_hits,
+            table_cache_misses: caches.table_misses,
         })
     }
 
