@@ -505,10 +505,24 @@ fn restore_and_check(
         if let Err(why) = engine.check_invariants_for_fuzzing() {
             panic!("snapshot_decode: right after a successful restore: {why}");
         }
+        /* Issue #503 - a snapshot is a door like any other: whatever its
+        bytes carried, the restored model holds Word's size / point bounds
+        (`DocumentTree::repair_bounds`), so layout never sees a hostile
+        value. (Used to be exempt: "a hostile snapshot may restore to
+        anything".) */
+        if let Err(why) = engine.check_font_sizes_for_fuzzing() {
+            panic!("snapshot_decode: right after a successful restore: {why}");
+        }
+        if let Err(why) = engine.check_point_fields_for_fuzzing() {
+            panic!("snapshot_decode: right after a successful restore: {why}");
+        }
         for cmd in commands(tail) {
             let name = variant_name(&cmd);
             let _ = engine.apply_sync(cmd);
             if let Err(why) = engine.check_invariants_for_fuzzing() {
+                panic!("snapshot_decode: after restore then {name}: {why}");
+            }
+            if let Err(why) = engine.check_font_sizes_for_fuzzing() {
                 panic!("snapshot_decode: after restore then {name}: {why}");
             }
         }
@@ -529,6 +543,14 @@ fn restore_and_check(
         "Command::Recover must answer Event::Recovered for any snapshot bytes"
     );
     if let Err(why) = recovering.check_invariants_for_fuzzing() {
+        panic!("snapshot_decode: after Command::Recover: {why}");
+    }
+    /* Issue #503 - and Recover = restore + the replayed tail, which runs
+    through the same argument guards as a live command. */
+    if let Err(why) = recovering.check_font_sizes_for_fuzzing() {
+        panic!("snapshot_decode: after Command::Recover: {why}");
+    }
+    if let Err(why) = recovering.check_point_fields_for_fuzzing() {
         panic!("snapshot_decode: after Command::Recover: {why}");
     }
     outcome

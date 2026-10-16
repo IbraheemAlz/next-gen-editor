@@ -89,6 +89,29 @@ describe('recoveryNotices (#315)', () => {
         expect(many[0]?.detail).toContain('3 recent changes ');
     });
 
+    it('bounds-repaired (#503): only for a positive count, pluralised, says what was clamped', () => {
+        expect(kinds(report({ boundsRepaired: 0 }))).toEqual([]);
+        const one = recoveryNotices(report({ boundsRepaired: 1 }));
+        expect(one).toHaveLength(1);
+        expect(one[0]?.kind).toBe('bounds-repaired');
+        expect(one[0]?.detail).toContain('1 value outside Word’s limits was clamped');
+        const many = recoveryNotices(report({ boundsRepaired: 7 }));
+        expect(many[0]?.detail).toContain('7 values outside Word’s limits were clamped');
+        expect(many[0]?.detail).toContain('1638 pt');
+        expect(many[0]?.detail).toContain('22 in');
+        expect(many[0]?.action).not.toBe('');
+    });
+
+    it('commands-refused (#503): only for a positive count, pluralised', () => {
+        expect(kinds(report({ refusedCommands: 0 }))).toEqual([]);
+        const one = recoveryNotices(report({ refusedCommands: 1 }));
+        expect(one[0]?.kind).toBe('commands-refused');
+        expect(one[0]?.title).toBe('Some edits could not be replayed');
+        expect(one[0]?.detail).toContain('1 logged edit outside Word’s limits was skipped');
+        const many = recoveryNotices(report({ refusedCommands: 2 }));
+        expect(many[0]?.detail).toContain('2 logged edits outside Word’s limits were skipped');
+    });
+
     it('renderer-downgrade needs BOTH the flag and the descriptor', () => {
         const downgrade = {
             from: 'vello',
@@ -113,6 +136,8 @@ describe('recoveryNotices (#315)', () => {
                 tailDropped: true,
                 packageLost: true,
                 journalGap: 2,
+                refusedCommands: 1,
+                boundsRepaired: 4,
                 rendererDowngraded: true,
                 rendererDowngrade: {
                     from: 'vello',
@@ -128,6 +153,8 @@ describe('recoveryNotices (#315)', () => {
             'tail-dropped',
             'package-lost',
             'journal-gap',
+            'commands-refused',
+            'bounds-repaired',
             'renderer-downgrade',
         ]);
         for (const n of all) {
@@ -143,6 +170,8 @@ describe('recoveryNotices (#315)', () => {
         ['tailDropped', { tailDropped: true }],
         ['packageLost', { packageLost: true }],
         ['journalGap', { journalGap: 1 }],
+        ['boundsRepaired', { boundsRepaired: 1 }],
+        ['refusedCommands', { refusedCommands: 1 }],
     ] as const)('%s alone yields exactly one notice and counts as degraded', (_name, o) => {
         expect(recoveryNotices(report(o))).toHaveLength(1);
         expect(recoveryDegraded(report(o))).toBe(true);

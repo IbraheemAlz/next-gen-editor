@@ -205,6 +205,19 @@ impl LayoutCfgSnapshot {
     }
 }
 
+/// What installing a snapshot had to give up or change (see
+/// [`Engine::restore_snapshot`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RestoreReport {
+    /// Issue #268 - the snapshot named a source package that could not be
+    /// re-attached.
+    package_lost: bool,
+    /// Issue #503 - values outside Word's font-size / point bounds the
+    /// restore clamped (`DocumentTree::repair_bounds` on the current
+    /// document, the sticky format and the layout config).
+    bounds_repaired: u32,
+}
+
 /// Issue #85 — everything a recovered engine needs besides its rendering
 /// surface: the document (with styles, numbering, header/footer stories,
 /// media and comments — all inside `DocumentTree`), a bounded window of
@@ -9441,12 +9454,15 @@ impl Engine {
         self.reset_session_state();
         /* Issue #268 — whether the restored base lost its source package. */
         let mut base_package_lost = false;
+        /* Issue #503 - values the restore clamped into Word's bounds. */
+        let mut bounds_repaired = 0u32;
         let snapshot_restored = if snapshot.is_empty() {
             false
         } else {
-            match self.restore_from_bytes_with_package(&snapshot, package.as_deref()) {
-                Ok((_, lost)) => {
-                    base_package_lost = lost;
+            match self.restore_from_bytes_reporting(&snapshot, package.as_deref()) {
+                Ok((_, report)) => {
+                    base_package_lost = report.package_lost;
+                    bounds_repaired = report.bounds_repaired;
                     true
                 }
                 Err(e) => {
@@ -9474,6 +9490,8 @@ impl Engine {
         let mut pending_base_scale: Option<f32> = None;
         let mut pending_zoom: Option<f32> = None;
         let mut applied_commands: u32 = 0;
+        /* Issue #503 - logged commands the argument guards refuse. */
+        let mut refused_commands: u32 = 0;
         for cmd in log_tail {
             /* Issue #407 — a logged non-finite scale is refused by the
             replayed `apply` below; never let it reach the stashed config
@@ -9487,8 +9505,24 @@ impl Engine {
             }
             /* Replayed events are not observable: the shell rebuilds its
             mirrors (selection, a11y tree, paint dims) after recovery. */
-            let _ = Box::pin(self.apply(cmd)).await;
+            let reply = Box::pin(self.apply(cmd)).await;
+            /* Issue #503 - the replay goes through the same guards as a
+            live command (finiteness #407, text #467, EMU #459, font size
+            #501, point fields #503): a logged command they refuse (the
+            live session was refused too - the worker logs a command
+            whatever it answered - or the row is damaged) is SKIPPED, not
+            applied raw and not fatal to the recovery. It is counted so
+            the shell can say so. */
             applied_commands += 1;
+            if matches!(
+                reply,
+                Event::Error {
+                    kind: Some(bridge::ErrorKind::OutOfRange | bridge::ErrorKind::InvalidArgument),
+                    ..
+                }
+            ) {
+                refused_commands += 1;
+            }
             /* A replayed `RenderPage` re-seeds the config; keep it stashed
             so the next replayed edit does not paint without fonts. */
             if let Some(cfg) = self.layout_cfg.take() {
@@ -9521,6 +9555,8 @@ impl Engine {
             device_scale: self.layout_cfg.as_ref().map(|c| c.base_scale),
             renderer_downgrade,
             package_lost: base_package_lost && !tail_replaces_document,
+            bounds_repaired,
+            refused_commands,
         }
     }
 
@@ -9717,11 +9753,23 @@ impl Engine {
         bytes: &[u8],
         package: Option<&[u8]>,
     ) -> Result<(u8, bool), SnapshotError> {
+        self.restore_from_bytes_reporting(bytes, package)
+            .map(|(version, report)| (version, report.package_lost))
+    }
+
+    /// Issue #503 - [`Self::restore_from_bytes_with_package`] with the
+    /// whole [`RestoreReport`] (`Command::Recover` also reports the
+    /// values the restore clamped).
+    fn restore_from_bytes_reporting(
+        &mut self,
+        bytes: &[u8],
+        package: Option<&[u8]>,
+    ) -> Result<(u8, RestoreReport), SnapshotError> {
         let decoded = engine::snapshot::decode::<EngineSnapshotV1>(bytes)?;
         let mut state = decoded.payload;
         state.apply_version_defaults(decoded.version);
-        let package_lost = self.restore_snapshot(state, package);
-        Ok((decoded.version, package_lost))
+        let report = self.restore_snapshot(state, package);
+        Ok((decoded.version, report))
     }
 
     /// Issue #212 — the detached package a snapshot names by `key`, if
@@ -9777,11 +9825,17 @@ impl Engine {
         }
     }
 
-    /// Install a decoded snapshot. Returns `true` when it named a source
-    /// package (inline or detached) that could not be re-attached — the
-    /// session then saves through the minimal-package writer (issue #268
-    /// reports it on `Event::Recovered.package_lost`).
-    fn restore_snapshot(&mut self, mut s: EngineSnapshotV1, detached: Option<&[u8]>) -> bool {
+    /// Install a decoded snapshot. The report says whether it named a
+    /// source package (inline or detached) that could not be re-attached
+    /// — the session then saves through the minimal-package writer
+    /// (issue #268 reports it on `Event::Recovered.package_lost`) — and
+    /// how many values outside Word's bounds the restore clamped (issue
+    /// #503, `Event::Recovered.bounds_repaired`).
+    fn restore_snapshot(
+        &mut self,
+        mut s: EngineSnapshotV1,
+        detached: Option<&[u8]>,
+    ) -> RestoreReport {
         let named_package = s.source_package.is_some() || s.package_hash.is_some();
         /* Issue #134 — re-attach the once-persisted source package to every
         history entry (see `EngineSnapshotV1::source_package`). */
@@ -9804,6 +9858,35 @@ impl Engine {
         revision range to the in-paragraph / char-boundary invariant. */
         for d in &mut s.doc_history {
             d.repair_revision_ranges();
+        }
+        /* Issue #503 - the same for sizes and points: a font size, margin,
+        indent, spacing, tab stop or gutter outside Word's limits (the
+        bounds every command / reader door already enforces) is clamped
+        before layout can see it. Every history entry is repaired (an
+        undo must not bring a hostile value back); only the CURRENT
+        document's values are counted, so the user is told what their
+        document lost, not how many undo steps shared it. */
+        let current = (s.undo_cursor as usize).min(s.doc_history.len().saturating_sub(1));
+        let mut bounds_repaired = 0u32;
+        for (i, d) in s.doc_history.iter_mut().enumerate() {
+            let n = d.repair_bounds();
+            if i == current {
+                bounds_repaired = bounds_repaired.saturating_add(n);
+            }
+        }
+        /* The sticky typing format is a size door too (the next typed
+        character takes it), and so is the layout config's base size. */
+        if let Some(pending) = s.pending_format.as_mut() {
+            bounds_repaired =
+                bounds_repaired.saturating_add(engine::repair_span_style_sizes(pending));
+        }
+        if let Some(cfg) = s.layout_cfg.as_mut()
+            && cfg.px_size.is_finite()
+            && cfg.px_size > 0.0
+            && !engine::font_size_in_bound(cfg.px_size)
+        {
+            cfg.px_size = engine::clamp_font_size_pt(cfg.px_size);
+            bounds_repaired = bounds_repaired.saturating_add(1);
         }
         if let Some(pkg) = &package {
             for d in &mut s.doc_history {
@@ -9864,7 +9947,10 @@ impl Engine {
                 kind: sel.kind,
             });
         }
-        package_lost
+        RestoreReport {
+            package_lost,
+            bounds_repaired,
+        }
     }
 
     fn do_redo(&mut self) -> Event {
@@ -19223,9 +19309,11 @@ impl Engine {
     /// Issue #501 - no run or paragraph mark the session holds may carry a
     /// font size outside Word's 1..=1638 pt
     /// ([`engine::first_font_size_beyond_bound`]). Kept apart from
-    /// [`Self::check_invariants_for_fuzzing`] like the picture bound: a
-    /// hostile snapshot may restore to anything, the COMMAND path must not
-    /// produce it. `Err` names the first violation.
+    /// [`Self::check_invariants_for_fuzzing`] like the picture bound.
+    /// Issue #503: a restored snapshot is held to it too (`restore_snapshot`
+    /// clamps through `DocumentTree::repair_bounds`), so `snapshot_decode`
+    /// asserts it after a restore and after `Command::Recover`. `Err`
+    /// names the first violation.
     pub fn check_font_sizes_for_fuzzing(&self) -> Result<(), String> {
         match engine::first_font_size_beyond_bound(self.undo.current()) {
             Some(why) => Err(format!(
@@ -19239,10 +19327,10 @@ impl Engine {
     /// line height or tab stop the session holds may be outside Word's
     /// limits ([`engine::first_point_field_beyond_bound`]), and the margins
     /// of every section leave 0.1 in of text area. Kept apart like the font
-    /// size / picture bounds: a hostile snapshot may restore to anything,
-    /// the COMMAND path (and the `.docx` reader behind `LoadDocx` /
-    /// `OpenDocument`) must not produce it. `Err` names the first
-    /// violation.
+    /// size / picture bounds. The COMMAND path, the `.docx` reader behind
+    /// `LoadDocx` / `OpenDocument` and (issue #503, `repair_bounds` on
+    /// restore) a restored snapshot must all hold it. `Err` names the
+    /// first violation.
     pub fn check_point_fields_for_fuzzing(&self) -> Result<(), String> {
         match engine::first_point_field_beyond_bound(self.undo.current()) {
             Some(why) => Err(format!(
@@ -28789,10 +28877,13 @@ mod snapshot_tests {
                 device_scale,
                 renderer_downgrade,
                 package_lost,
+                bounds_repaired,
+                refused_commands,
             } => {
                 assert_eq!(applied_commands, 2);
                 assert!(snapshot_restored);
                 assert!(!package_lost, "an engine-authored document has no package");
+                assert_eq!((bounds_repaired, refused_commands), (0, 0));
                 assert_eq!(renderer, "canvas2d");
                 /* Issue #97 — the reply reports the REPLAYED zoom (the
                 snapshot said 1.25, the tail's SetZoom said 2.0) and the
@@ -30100,6 +30191,11 @@ mod font_size_guard_tests;
 /// (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod point_guard_tests;
+
+/// Issue #503 (item 1) - the restore / replay door of the same bounds
+/// (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod bounds_repair_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;

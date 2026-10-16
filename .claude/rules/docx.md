@@ -171,6 +171,33 @@ paths:
   A NEW command field carrying such a measure must be added to
   `point_guard::first_refused`; `rpc_command` checks
   `check_point_fields_for_fuzzing` after every command that can set one.
+- **Restore and replay are doors too (issue #503, item 1).** A crash-recovery
+  snapshot's bytes are neither guarded nor read by the reader, so
+  `Engine::restore_snapshot` runs `DocumentTree::repair_bounds`
+  (`engine::bounds_repair`, beside `repair_revision_ranges` #283) over EVERY
+  undo-window entry: every run / mark / tracked-format / style / document-
+  default font size into 1..=1638 pt (a NaN size becomes unset), every margin
+  / page side / header offset / gutter / indent / spacing / line height / tab
+  stop into the `point_bounds` limits (a NaN resets to the A4 value; margins
+  that swallow the page go through `fit_margins_to_text_area`), plus the
+  sticky `pending_format` and the layout config's `px_size`. It walks body,
+  cells, text boxes, headers, footers, notes and the style table with an
+  explicit worklist (no recursion), and covers exactly what
+  `first_font_size_beyond_bound` / `first_point_field_beyond_bound` check
+  (both scans now also reach styles, header / footer / note stories and
+  tracked-format `prev_attrs`) — so `snapshot_decode` asserts both rules after
+  a restore and after `Command::Recover`; there is no restore exemption.
+  `Event::Recovered.bounds_repaired` counts the CURRENT document's repairs
+  (not once per undo step); the replay runs the logged tail through the same
+  guards as a live command and `Recovered.refused_commands` counts the
+  commands they answered `OutOfRange` / `InvalidArgument` (skipped; a subset
+  of `applied_commands`, which has always counted every replayed command —
+  the worker logs a command whatever it answered, so a live-refused one is
+  refused again on replay). The shell surfaces them as
+  `RecoveryInfo.boundsRepaired` / `refusedCommands`, the `bounds-repaired` /
+  `commands-refused` `recoveryNotices()` and a Dev HUD "Losses" entry. A NEW
+  model field that holds a font size or a point measure must be repaired in
+  `bounds_repair.rs` AND scanned in the matching `first_*_beyond_bound`.
 - **Namespace prefixes (issues #325 / #394).** The parsers match literal
   qnames (`w:p`), so every WordprocessingML part the reader walks — the
   main part, `styles.xml`, `numbering.xml`, `settings.xml`, the note

@@ -933,3 +933,207 @@ test('#330 "Discard document" needs a confirmation and is the only action that d
     });
     expect(await docText(page)).toBe(SEED);
 });
+
+/* Issue #503 (item 1) - a recovery is a door for hostile VALUES too.
+ *
+ * The command guards (#501 / #503) refuse a font size or a point field
+ * outside Word's limits and the `.docx` reader clamps it, but a persisted
+ * snapshot is neither: `Engine::restore` used to install its bytes
+ * verbatim, so a `1e33` pt run or a `1e9` pt margin reached layout. Now the
+ * restore clamps them (`DocumentTree::repair_bounds`), the RECOVER reply's
+ * `bounds_repaired` counts them, and `RecoveryBanner` says so.
+ *
+ * HOW THE SPEC PRODUCES A HOSTILE SNAPSHOT. No command can put such a value
+ * into the model (that is the point of the guards), so the spec edits the
+ * PERSISTED row: two recognisable `f32`s are written through real commands
+ * (a font size of 11.5 pt, a left margin of 123.5 pt), the worker's idle
+ * snapshot lands in IndexedDB, and the spec rewrites those four-byte
+ * MessagePack floats (`0xca` + big-endian bits) in the newest snapshot row
+ * to `1e33` / `1e9` before a REAL trap sends the worker through the normal
+ * recovery path (`EngineClient.recover` -> `pickRecoveryBase` -> `RECOVER`). */
+test('a hostile snapshot is clamped on recovery and the banner says so (#503)', async ({
+    page,
+}) => {
+    test.setTimeout(90_000);
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+
+    const result = await page.evaluate(async () => {
+        const w = window as any;
+        const dispatch = w.__dispatch as (cmd: unknown) => Promise<any>;
+        const client = w.__engineClient;
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        const f32 = (v: number): number[] => {
+            const b = new DataView(new ArrayBuffer(4));
+            b.setFloat32(0, v);
+            return [0xca, b.getUint8(0), b.getUint8(1), b.getUint8(2), b.getUint8(3)];
+        };
+        const find = (hay: Uint8Array, needle: number[]): number[] => {
+            const at: number[] = [];
+            outer: for (let i = 0; i + needle.length <= hay.length; i++) {
+                for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
+                at.push(i);
+            }
+            return at;
+        };
+        const withDb = <T,>(fn: (db: IDBDatabase) => Promise<T>): Promise<T> =>
+            new Promise((resolve, reject) => {
+                const open = indexedDB.open('engine-log');
+                open.onsuccess = () => {
+                    const db = open.result;
+                    fn(db).then(
+                        (v) => {
+                            db.close();
+                            resolve(v);
+                        },
+                        (e) => {
+                            db.close();
+                            reject(e);
+                        },
+                    );
+                };
+                open.onerror = () => reject(open.error);
+            });
+        const newestSnapshot = () =>
+            withDb(
+                (db) =>
+                    new Promise<any>((resolve, reject) => {
+                        const tx = db.transaction('snapshots', 'readonly');
+                        const all = tx.objectStore('snapshots').getAll();
+                        tx.oncomplete = () => {
+                            const rows = (all.result as any[]).sort((a, b) => b.seq - a.seq);
+                            resolve(rows[0]);
+                        };
+                        tx.onerror = () => reject(tx.error);
+                    }),
+            );
+
+        const FONT = f32(11.5);
+        const MARGIN = f32(123.5);
+        await dispatch({ type: 'SELECT_ALL' });
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'QQQQ' });
+        await dispatch({ type: 'SELECT_ALL' });
+        await dispatch({ type: 'APPLY_FORMATTING', range: undefined, attrs: { font_size: 11.5 } });
+        const top = { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 };
+        const margins = await dispatch({
+            type: 'SET_PAGE_MARGINS',
+            at: top,
+            top_pt: 72,
+            right_pt: 72,
+            bottom_pt: 72,
+            left_pt: 123.5,
+        });
+        if (margins.type === 'ERROR') return { failed: `margins: ${margins.message}` };
+
+        /* Wait for the idle snapshot that holds both markers. */
+        let row: any;
+        for (let i = 0; i < 200; i++) {
+            row = await newestSnapshot();
+            if (row && find(row.bytes, FONT).length > 0 && find(row.bytes, MARGIN).length > 0) break;
+            row = undefined;
+            await sleep(50);
+        }
+        if (!row) return { failed: 'no snapshot holding the markers' };
+
+        /* Hostile-ify the persisted row: every occurrence, undo window included. */
+        const bytes = new Uint8Array(row.bytes);
+        const patch = (needle: number[], to: number[]) => {
+            for (const at of find(bytes, needle)) bytes.set(to, at);
+        };
+        patch(FONT, f32(1e33));
+        patch(MARGIN, f32(1e9));
+        const hostile = {
+            font: find(bytes, f32(1e33)).length,
+            margin: find(bytes, f32(1e9)).length,
+        };
+        await withDb(
+            (db) =>
+                new Promise<void>((resolve, reject) => {
+                    const tx = db.transaction('snapshots', 'readwrite');
+                    tx.objectStore('snapshots').put({ ...row, bytes });
+                    tx.oncomplete = () => resolve();
+                    tx.onerror = () => reject(tx.error);
+                }),
+        );
+
+        await client.armTrap(1);
+        await dispatch({ type: 'PING' }).catch(() => undefined);
+        for (let i = 0; i < 600 && w.__recovered !== true; i++) await sleep(50);
+        if (w.__recovered !== true) return { failed: 'recovery did not complete' };
+
+        /* The recovered engine's own snapshot no longer carries either value. */
+        const snap = await dispatch({ type: 'SNAPSHOT', seq: undefined });
+        const after = new Uint8Array(snap.bytes);
+        return {
+            hostile,
+            info: client.lastRecovery,
+            leftover: find(after, f32(1e33)).length + find(after, f32(1e9)).length,
+            clamped: find(after, f32(1638)).length > 0,
+        };
+    });
+
+    expect((result as any).failed, 'in-page failure').toBeUndefined();
+    const r = result as any;
+    console.log(
+        `[recovery #503] hostile=${JSON.stringify(r.hostile)} boundsRepaired=${r.info.boundsRepaired} ` +
+            `refused=${r.info.refusedCommands} leftover=${r.leftover}`,
+    );
+    expect(r.hostile.font, 'set-up: the font size marker was rewritten').toBeGreaterThan(0);
+    expect(r.hostile.margin, 'set-up: the margin marker was rewritten').toBeGreaterThan(0);
+    expect(r.info.restored).toBe(true);
+    expect(r.info.boundsRepaired, 'the run size and the margin').toBeGreaterThanOrEqual(2);
+    expect(r.info.refusedCommands).toBe(0);
+    expect(r.leftover, 'no hostile value survives the restore').toBe(0);
+    expect(r.clamped, "the run size was clamped to Word's 1638 pt").toBe(true);
+
+    const banner = page.locator('.nge-recovery-banner[data-kinds~="bounds-repaired"]');
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText(/\d+ values? outside Word.s limits (was|were) clamped/);
+});
+
+/* Issue #503 (item 1, replay) - a LOGGED command the argument guards refuse
+ * is skipped by the recovery replay and counted, not applied raw and not fatal.
+ * The worker logs a command whatever it answered, so a hostile `__dispatch` of
+ * a raw command (refused live with `OUT_OF_RANGE`) is still in the log: the
+ * trap right after it replays it from the log base. */
+test('a refused logged command is skipped by the replay, counted, and the banner says so (#503)', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+    const result = await page.evaluate(async () => {
+        const w = window as any;
+        const dispatch = w.__dispatch as (cmd: unknown) => Promise<any>;
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'KEEP' });
+        const live = await dispatch({
+            type: 'APPLY_FORMATTING',
+            range: undefined,
+            attrs: { font_size: 1e33 },
+        });
+        await w.__engineClient.armTrap(1);
+        await dispatch({ type: 'PING' }).catch(() => undefined);
+        for (let i = 0; i < 600 && w.__recovered !== true; i++) await sleep(50);
+        return {
+            live: { type: live.type, kind: live.kind },
+            recovered: w.__recovered === true,
+            info: w.__engineClient.lastRecovery,
+        };
+    });
+    expect(result.live, 'refused on the live path too').toMatchObject({
+        type: 'ERROR',
+        kind: 'OutOfRange',
+    });
+    expect(result.recovered).toBe(true);
+    expect(result.info.refusedCommands).toBe(1);
+    expect(result.info.boundsRepaired).toBe(0);
+    expect(await docText(page)).toContain('KEEP');
+    const banner = page.locator('.nge-recovery-banner[data-kinds~="commands-refused"]');
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText('1 logged edit outside Word’s limits was skipped');
+});

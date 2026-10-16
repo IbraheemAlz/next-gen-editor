@@ -266,6 +266,13 @@ export interface RecoveryReport {
      *  never written (the journal failed): the recovery could not replay
      *  them. Absent / `0` = none. */
     journalGap?: number;
+    /** Issue #503 - values in the restored snapshot outside Word's
+     *  font-size / page / paragraph limits that the restore clamped into
+     *  them. Absent / `0` = none. */
+    boundsRepaired?: number;
+    /** Issue #503 - replayed log-tail commands the engine's argument guards
+     *  refused (skipped, not applied). Absent / `0` = none. */
+    refusedCommands?: number;
     /** Issue #270 — why the recovery ran: a worker `trap`, or an in-place
      *  `renderer-retry` (a planned respawn, no crash). Absent = `trap`. */
     cause?: 'trap' | 'renderer-retry' | 'engine-reload' | 'page-reload' | 'session-restore';
