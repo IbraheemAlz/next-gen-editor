@@ -305,8 +305,9 @@ fn paragraph_heights(e: &Engine) -> Vec<f32> {
 /// default): read from a Word package (`document_envelope` captured) the
 /// pitch is Word's — 1.149 em per single line (win extent + external
 /// leading), doubled, floored at 30, exactly 20, and the empty line sized
-/// by its mark's face; an engine-authored document keeps the configured
-/// 26 px pitch.
+/// by its mark's face. Issue #475 — an engine-authored document (no
+/// captured envelope) takes exactly the same pitch: one model, whatever
+/// the configured 26 px `line_height` says.
 #[test]
 fn a_word_document_takes_its_line_pitch_from_the_faces() {
     let para = |text: &str, line_height| {
@@ -327,8 +328,7 @@ fn a_word_document_takes_its_line_pitch_from_the_faces() {
         para("", None),
     ];
     let mut doc = DocumentTree::from_blocks(blocks);
-    let configured = paragraph_heights(&tests::test_engine_with_doc(doc.clone()));
-    assert_eq!(configured, [26.0, 52.0, 30.0, 20.0, 26.0]);
+    let engine_built = paragraph_heights(&tests::test_engine_with_doc(doc.clone()));
 
     doc.document_envelope = engine::DocumentEnvelope {
         root_tag: b"<w:document>".to_vec(),
@@ -342,6 +342,7 @@ fn a_word_document_takes_its_line_pitch_from_the_faces() {
     for (got, want) in word.iter().zip(want) {
         assert!((got - want).abs() < 1e-3, "{word:?} vs {want}");
     }
+    assert_eq!(engine_built, word, "one line-pitch model (issue #475)");
 }
 
 /// Under Word's pitch an empty paragraph is as tall as its MARK's face at

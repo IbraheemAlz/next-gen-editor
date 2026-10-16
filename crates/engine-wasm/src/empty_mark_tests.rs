@@ -3,13 +3,27 @@
 //! style), not by the document default, through the production
 //! `build_pages` (body, cache, cells) and the interactive Enter path.
 //!
-//! The test engine lays out at `line_height` 26 / `px_size` 16 (the
-//! document default run: no `docDefaults` size); every layout here runs
-//! at scale 1, so the nominal line is 26 pt.
+//! The test engine lays out at `px_size` 16 (the document default run:
+//! no `docDefaults` size) in Liberation Sans; every layout here runs at
+//! scale 1. Issue #475 — every document takes Word's font-derived pitch,
+//! so the nominal line is one single line of that face at 16 px (win
+//! ascent + external leading over win descent, 2355 / 2048 em), not the
+//! configured 26 px `line_height`, and the baseline sits one descent above
+//! the line's bottom.
 
 use super::*;
 
-const NOMINAL: f32 = 26.0;
+/// Liberation Sans' single line at 16 px: (1854 + 67 + 434) / 2048 em.
+const NOMINAL: f32 = 16.0 * 2355.0 / 2048.0;
+/// Its baseline: ascent + line gap, (1854 + 67) / 2048 em.
+const NOMINAL_BASELINE: f32 = 16.0 * 1921.0 / 2048.0;
+
+fn assert_close(got: (f32, f32), want: (f32, f32)) {
+    assert!(
+        (got.0 - want.0).abs() < 1e-3 && (got.1 - want.1).abs() < 1e-3,
+        "{got:?} vs {want:?}"
+    );
+}
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, Waker};
@@ -77,22 +91,22 @@ fn line(b: &ParagraphBox) -> (f32, f32) {
 #[test]
 fn an_empty_paragraph_without_mark_properties_keeps_the_nominal_line() {
     let b = middle_box(empty_with(None));
-    assert_eq!(line(&b), (NOMINAL, NOMINAL));
-    assert_eq!(b.size.height.to_bits(), NOMINAL.to_bits());
+    assert_close(line(&b), (NOMINAL_BASELINE, NOMINAL));
+    assert!((b.size.height - NOMINAL).abs() < 1e-3, "{}", b.size.height);
     /* A mark that formats like the base (bold only, same size) too. */
     let bold = middle_box(empty_with(Some(SpanStyle {
         bold: Some(true),
         ..Default::default()
     })));
-    assert_eq!(line(&bold), (NOMINAL, NOMINAL));
+    assert_close(line(&bold), (NOMINAL_BASELINE, NOMINAL));
 }
 
 #[test]
 fn a_small_mark_makes_a_thin_spacer_line() {
     let (baseline, height) = line(&middle_box(empty_with(Some(sized(4.0)))));
-    /* 4 pt against the 16 pt base: a quarter of the nominal line. */
-    assert!((height - NOMINAL / 4.0).abs() < 0.01, "{height}");
-    assert_eq!(baseline, height);
+    /* 4 pt against the 16 pt base: a quarter of the nominal line, the
+    baseline a quarter of the nominal one. */
+    assert_close((baseline, height), (NOMINAL_BASELINE / 4.0, NOMINAL / 4.0));
 }
 
 #[test]
@@ -179,7 +193,10 @@ fn exact_line_spacing_ignores_the_mark() {
 fn at_least_spacing_keeps_its_floor() {
     let mut p = empty_with(Some(sized(4.0)));
     p.props.line_height = Some(engine::LineHeight::AtLeast { twips: 400 });
-    assert_eq!(line(&middle_box(p)), (20.0, 20.0));
+    /* The 20 pt floor; the extra space goes above the 4 pt mark's text,
+    whose baseline sits one (4 pt) descent above the line's bottom. */
+    let descent = (NOMINAL - NOMINAL_BASELINE) / 4.0;
+    assert_close(line(&middle_box(p)), (20.0 - descent, 20.0));
 }
 
 #[test]
@@ -201,9 +218,9 @@ fn an_rtl_paragraphs_mark_uses_its_complex_script_size() {
     let (_, height) = line(&middle_box(rtl));
     assert!((height - NOMINAL / 4.0).abs() < 0.01, "{height}");
     /* The same mark in an LTR paragraph: its Latin size is the default. */
-    assert_eq!(
+    assert_close(
         line(&middle_box(empty_with(Some(mark)))),
-        (NOMINAL, NOMINAL)
+        (NOMINAL_BASELINE, NOMINAL),
     );
 }
 
@@ -235,7 +252,7 @@ fn an_empty_cell_paragraph_is_sized_by_its_mark() {
             other => panic!("cell content {other:?}"),
         })
         .collect();
-    assert_eq!(heights[0], NOMINAL);
+    assert!((heights[0] - NOMINAL).abs() < 1e-3, "{heights:?}");
     assert!((heights[1] - NOMINAL / 4.0).abs() < 0.01, "{heights:?}");
 }
 
@@ -246,7 +263,7 @@ fn the_layout_cache_sees_a_mark_change() {
         empty_with(None),
         para("Below"),
     ]));
-    assert_eq!(line(&nth_box(&engine, 1)), (NOMINAL, NOMINAL));
+    assert_close(line(&nth_box(&engine, 1)), (NOMINAL_BASELINE, NOMINAL));
     /* Same text, same spans — only the mark differs: a key blind to it
     would serve the cached nominal box. */
     engine.undo.push(doc_of(vec![
