@@ -2946,10 +2946,14 @@ pub(crate) fn parse_document_xml_with_events(
                         /* Issue #84 — unmodeled `<w:pPr>` leaf child
                         (`<w:framePr>`, `<w:cnfStyle>`, `<w:widowControl>`,
                         `<w:outlineLvl>`, …) → the paragraph's grab bag. */
-                        if n == b"w:outlineLvl" || n == b"w:suppressAutoHyphens" {
+                        if n == b"w:outlineLvl"
+                            || n == b"w:suppressAutoHyphens"
+                            || n == b"w:suppressLineNumbers"
+                        {
                             /* Issue #81 — also read it (TOC `\u`); the
                             grab bag stays the writer's source. Issue #326
-                            — likewise the hyphenation switch. */
+                            — likewise the hyphenation switch; issue #487
+                            — and the line-numbering switch. */
                             apply_ppr(n, &e, &mut direct_ppr);
                         }
                         let end = reader.buffer_position() as usize;

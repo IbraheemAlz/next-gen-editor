@@ -395,6 +395,40 @@ fn suppress_auto_hyphens_emits_on_styles_not_on_paragraphs() {
     assert!(!out.contains("<w:pPr>"), "no empty pPr: {out}");
 }
 
+/// Issue #487 — `<w:suppressLineNumbers>` follows the same contract: a
+/// style's value is written, a paragraph never bakes a style-inherited
+/// value in (its own element rides the bag).
+#[test]
+fn suppress_line_numbers_emits_on_styles_not_on_paragraphs() {
+    let mut doc = engine::DocumentTree::default();
+    doc.styles.insert(
+        "NoNumbers".into(),
+        engine::ParagraphStyle {
+            id: "NoNumbers".into(),
+            name: "No Numbers".into(),
+            para: ParaProperties {
+                suppress_line_numbers: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let xml = String::from_utf8(build_styles_xml(&doc)).expect("utf8");
+    assert!(xml.contains("<w:suppressLineNumbers/>"), "{xml}");
+    let para = Paragraph {
+        text: "x".into(),
+        props: ParaProperties {
+            suppress_line_numbers: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut out = String::new();
+    serialize_paragraph(&para, &mut out, &HashMap::new());
+    assert!(!out.contains("suppressLineNumbers"), "{out}");
+    assert!(!out.contains("<w:pPr>"), "no empty pPr: {out}");
+}
+
 /// A run style that differs from the default only in its (read-only)
 /// language writes no `<w:rPr>` at all — text typed into an empty
 /// paragraph inherits the mark's `<w:lang>` but never an empty element.

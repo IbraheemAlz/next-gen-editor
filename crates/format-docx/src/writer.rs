@@ -1022,6 +1022,22 @@ fn ppr_children(
             },
         );
     }
+    /* Issue #487 — a style's `<w:suppressLineNumbers>`; same contract as
+    `suppressAutoHyphens` above. */
+    if let Some(on) = props.suppress_line_numbers
+        && !engine::GrabBag::fragments_of(&props.grab_bag)
+            .iter()
+            .any(|f| f.starts_with(b"<w:suppressLineNumbers"))
+    {
+        ch.push(
+            rank(b"w:suppressLineNumbers"),
+            if on {
+                "<w:suppressLineNumbers/>".into()
+            } else {
+                "<w:suppressLineNumbers w:val=\"0\"/>".into()
+            },
+        );
+    }
     /* Phase 3 (#40) — a marker paragraph's interior `<w:sectPr>`: the
     genuinely-last CT_PPr content child (only the never-emitted
     pPrChange follows it in the schema). */
@@ -1071,6 +1087,7 @@ fn serialize_paragraph_body(
     let props = if para.props.outline_level.is_some()
         || para.props.widow_control.is_some()
         || para.props.suppress_auto_hyphens.is_some()
+        || para.props.suppress_line_numbers.is_some()
         || inherited_bidi
     {
         let mut p = para.props.clone();
@@ -1079,6 +1096,8 @@ fn serialize_paragraph_body(
         /* Issue #326 — read-only like the two above (the direct element
         rides the grab bag; a style-inherited value is not baked in). */
         p.suppress_auto_hyphens = None;
+        /* Issue #487 — read-only likewise. */
+        p.suppress_line_numbers = None;
         if inherited_bidi {
             p.direction = None;
         }
@@ -1361,6 +1380,7 @@ fn splice_source_ppr(sp: &SourcePPr, para: &Paragraph, live: &ParaProperties) ->
     rec.widow_control = None;
     /* Issue #326 — cleared on the live side too (read-only). */
     rec.suppress_auto_hyphens = None;
+    rec.suppress_line_numbers = None;
     /* The live direction was dropped as inherited from the style
     (issue #202): the same value recorded is inherited too. */
     if live.direction.is_none()
@@ -8736,6 +8756,7 @@ mod tests {
             outline_level: None,
             widow_control: None,
             suppress_auto_hyphens: None,
+            suppress_line_numbers: None,
         };
         let para = Paragraph {
             text: "hello world".into(),

@@ -218,13 +218,28 @@ pub fn drop_cap_from_bag(bag: &Option<Box<GrabBag>>) -> Option<DropCap> {
 /// `true` when a paragraph's `<w:pPr>` grab bag carries an ON
 /// `<w:suppressLineNumbers>`.
 pub fn suppresses_line_numbers(bag: &Option<Box<GrabBag>>) -> bool {
-    GrabBag::fragments_of(bag).iter().any(|frag| {
-        let Ok(s) = std::str::from_utf8(frag) else {
-            return false;
-        };
-        let s = s.trim_start();
-        is_element(s, "w:suppressLineNumbers") && on_off(attr_in_tag(s, "w:val"))
+    suppress_line_numbers_in_bag(bag) == Some(true)
+}
+
+/// What a paragraph's own `<w:pPr>` grab bag says about
+/// `<w:suppressLineNumbers>`: `Some(on)` for an explicit element (its
+/// `w:val` honoured), `None` when it is absent.
+fn suppress_line_numbers_in_bag(bag: &Option<Box<GrabBag>>) -> Option<bool> {
+    GrabBag::fragments_of(bag).iter().find_map(|frag| {
+        let s = std::str::from_utf8(frag).ok()?.trim_start();
+        is_element(s, "w:suppressLineNumbers").then(|| on_off(attr_in_tag(s, "w:val")))
     })
+}
+
+/// Issue #487 — whether a paragraph's RESOLVED properties keep it out
+/// of the line numbering: the paragraph's own `<w:suppressLineNumbers>`
+/// (the grab-bag element, a `w:val="0"` switching it off) wins, else the
+/// style cascade's value (`ParaProperties::suppress_line_numbers`, the
+/// `basedOn` chain folded) — the same precedence as every other pPr
+/// toggle.
+pub fn paragraph_suppresses_line_numbers(props: &crate::ParaProperties) -> bool {
+    suppress_line_numbers_in_bag(&props.grab_bag)
+        .unwrap_or_else(|| props.suppress_line_numbers == Some(true))
 }
 
 #[cfg(test)]
@@ -265,6 +280,25 @@ mod tests {
             drop_cap_from_bag(&bag(&[r#"<w:framePr w:dropCap="none"/>"#])),
             None
         );
+    }
+
+    #[test]
+    fn style_cascade_value_applies_unless_the_paragraph_overrides_it() {
+        let mut props = crate::ParaProperties {
+            suppress_line_numbers: Some(true),
+            ..Default::default()
+        };
+        assert!(paragraph_suppresses_line_numbers(&props));
+        /* A direct `w:val="0"` beats the style's ON. */
+        props.grab_bag = bag(&[r#"<w:suppressLineNumbers w:val="0"/>"#]);
+        assert!(!paragraph_suppresses_line_numbers(&props));
+        /* A direct ON with no style value. */
+        let direct = crate::ParaProperties {
+            grab_bag: bag(&["<w:suppressLineNumbers/>"]),
+            ..Default::default()
+        };
+        assert!(paragraph_suppresses_line_numbers(&direct));
+        assert!(!paragraph_suppresses_line_numbers(&Default::default()));
     }
 
     #[test]

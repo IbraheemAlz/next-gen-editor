@@ -5333,10 +5333,19 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             bytes: format_docx::test_fixtures::line_numbers_docx(),
             entry: page_decor_fixture_entry({
                 let [a, b, c] = format_docx::test_fixtures::PAGE_DECOR_TEXTS;
-                [a, b, format_docx::test_fixtures::SUPPRESSED_TEXT, c]
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect()
+                [
+                    a,
+                    b,
+                    format_docx::test_fixtures::SUPPRESSED_TEXT,
+                    c,
+                    /* Issue #487 — the style-suppressed paragraph and
+                    the numbered one after it. */
+                    format_docx::test_fixtures::STYLE_SUPPRESSED_TEXT,
+                    format_docx::test_fixtures::AFTER_STYLE_TEXT,
+                ]
+                .iter()
+                .map(|t| t.to_string())
+                .collect()
             }),
         },
         /* Issue #328 — drop caps (`<w:framePr w:dropCap>` rides the

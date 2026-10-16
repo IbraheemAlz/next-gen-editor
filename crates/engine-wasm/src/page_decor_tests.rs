@@ -199,13 +199,15 @@ fn line_numbers_count_body_lines_and_skip_suppressed_paragraphs_and_tables() {
     assert_eq!(pages.len(), 1);
     let page = &pages[0];
     assert!(page.decor.borders.is_none());
-    /* Every line of the counted paragraphs, in order; the suppressed
-    paragraph (block 2) and the table cell take no number. */
+    /* Every line of the counted paragraphs, in order; the directly
+    suppressed paragraph (block 2), the table cell and — issue #487 —
+    the paragraph whose STYLE (`basedOn` chain) suppresses (block 5)
+    take no number, and the count continues after them. */
     let counted: Vec<(&layout::ParagraphBox, &layout::LineBox)> = page
         .blocks
         .iter()
         .enumerate()
-        .filter(|(j, _)| *j != 2)
+        .filter(|(j, _)| !matches!(*j, 2 | 5))
         .filter_map(|(_, b)| b.as_paragraph())
         .flat_map(|p| p.lines.iter().map(move |l| (p, l)))
         .collect();
@@ -236,7 +238,64 @@ fn line_numbers_count_body_lines_and_skip_suppressed_paragraphs_and_tables() {
 }
 
 /// Pinned geometry (page + numbers) of `line_numbers_docx`.
-const LINE_NUMBERS_FINGERPRINT: &str = "0x89ec82341f3f5d79";
+const LINE_NUMBERS_FINGERPRINT: &str = "0x0dbe46684adcde38";
+
+/// Issue #487 — `w:suppressLineNumbers` on a paragraph STYLE is read
+/// into the style table (and through the `basedOn` chain into the
+/// paragraph's resolved properties), and the paragraph's own element
+/// beats it either way (`w:val="0"` numbers a paragraph whose style
+/// suppresses).
+#[test]
+fn style_suppress_line_numbers_cascades_and_a_direct_off_overrides_it() {
+    let doc = format_docx::read_docx(&format_docx::test_fixtures::line_numbers_docx())
+        .expect("read")
+        .document;
+    assert_eq!(
+        doc.styles["NoNumbers"].para.suppress_line_numbers,
+        Some(true)
+    );
+    assert_eq!(
+        doc.styles["NoNumbersChild"].para.suppress_line_numbers,
+        None
+    );
+    let styled = doc
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .find(|p| p.text == format_docx::test_fixtures::STYLE_SUPPRESSED_TEXT)
+        .expect("styled paragraph");
+    assert_eq!(styled.props.suppress_line_numbers, Some(true));
+    assert!(styled.direct_overrides.suppress_line_numbers.is_none());
+
+    let styled_p = |text: &str, direct: &str| {
+        format!(
+            "<w:p><w:pPr><w:pStyle w:val=\"NoNumbers\"/>{direct}</w:pPr>\
+             <w:r><w:t>{text}</w:t></w:r></w:p>"
+        )
+    };
+    let body = format!(
+        "{}{}",
+        styled_p("Suppressed by its style.", ""),
+        styled_p("Numbered anyway.", "<w:suppressLineNumbers w:val=\"0\"/>"),
+    );
+    let docx = format_docx::test_fixtures::package_with_styles(
+        &body,
+        "<w:lnNumType w:countBy=\"1\" w:distance=\"360\"/>",
+        format_docx::test_fixtures::LINE_NUMBER_STYLES,
+    );
+    let pages = pages_of(&decor_engine(&docx));
+    let numbers: Vec<&str> = pages[0]
+        .decor
+        .line_numbers
+        .iter()
+        .map(|n| n.text.as_str())
+        .collect();
+    assert_eq!(numbers, ["1"], "only the direct-off paragraph is numbered");
+    let second = pages[0].blocks[1].as_paragraph().expect("paragraph");
+    let (n, line) = (&pages[0].decor.line_numbers[0], &second.lines[0]);
+    let line_baseline = pages[0].margins.top + second.origin.y + line.origin.y + line.baseline;
+    assert!((n.origin.y + n.baseline - line_baseline).abs() < 0.01);
+}
 
 /// The line-number strings of each page of `doc`.
 fn numbers_per_page(doc: DocumentTree) -> Vec<Vec<String>> {

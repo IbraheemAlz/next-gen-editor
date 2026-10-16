@@ -212,6 +212,11 @@ pub fn apply_ppr(name: &[u8], e: &BytesStart, props: &mut ParaProperties) {
         rides the grab bag; the cascaded value switches automatic
         hyphenation off for the paragraph. */
         b"w:suppressAutoHyphens" => props.suppress_auto_hyphens = Some(toggle_on(e)),
+        /* Issue #487 — read-only like `suppressAutoHyphens`: the direct
+        element rides the grab bag; the cascaded value (a paragraph
+        STYLE's `<w:suppressLineNumbers>` included, `basedOn` chain
+        folded) keeps the paragraph out of the line numbering. */
+        b"w:suppressLineNumbers" => props.suppress_line_numbers = Some(toggle_on(e)),
         _ => {}
     }
 }

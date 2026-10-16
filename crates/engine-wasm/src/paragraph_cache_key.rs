@@ -294,6 +294,8 @@ pub(crate) fn paragraph_layout_key(
         outline_level: _,
         widow_control: _,
         suppress_auto_hyphens,
+        // Issue #487 — a page decoration's switch, not a layout input.
+        suppress_line_numbers: _,
     } = props;
     engine_align_disc(*alignment).hash(&mut h);
     /* Phase 9c — paragraph base direction is part of the layout contract

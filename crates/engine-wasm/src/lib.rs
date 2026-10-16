@@ -4083,7 +4083,7 @@ fn apply_page_decor(
                                 .and_then(|i| doc.blocks.get(i as usize))
                                 .and_then(engine::Block::as_paragraph)
                                 .is_some_and(|p| {
-                                    !engine::page_decor::suppresses_line_numbers(&p.props.grab_bag)
+                                    !engine::page_decor::paragraph_suppresses_line_numbers(&p.props)
                                         && engine::page_decor::drop_cap_from_bag(&p.props.grab_bag)
                                             .is_none()
                                 })

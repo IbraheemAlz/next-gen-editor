@@ -3834,6 +3834,14 @@ pub struct ParaProperties {
     /// the direct element rides the grab bag verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppress_auto_hyphens: Option<bool>,
+    /// Issue #487 — `<w:suppressLineNumbers>` resolved through the style
+    /// cascade (tri-state like [`Self::widow_control`]: an explicit
+    /// `w:val="0"` switches an inherited ON off). READ-ONLY on the model:
+    /// the direct element rides the grab bag verbatim, a style definition
+    /// emits it. Line numbering reads it through
+    /// [`page_decor::paragraph_suppresses_line_numbers`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppress_line_numbers: Option<bool>,
 }
 
 impl ParaProperties {
@@ -3930,6 +3938,7 @@ impl ParaProperties {
             outline_level: patch.outline_level.or(self.outline_level),
             widow_control: patch.widow_control.or(self.widow_control),
             suppress_auto_hyphens: patch.suppress_auto_hyphens.or(self.suppress_auto_hyphens),
+            suppress_line_numbers: patch.suppress_line_numbers.or(self.suppress_line_numbers),
         }
     }
 
