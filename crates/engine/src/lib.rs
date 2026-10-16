@@ -60,6 +60,12 @@ use serde::{Deserialize, Serialize};
 
 mod block_remap;
 pub use block_remap::CellMove;
+/// Issue #459 - the 22-inch bound on drawing extents and offsets.
+mod emu_bounds;
+pub use emu_bounds::{
+    MAX_DRAWING_EMU, clamp_extent_emu, clamp_offset_emu, first_image_beyond_bound,
+    fit_extent_within_bound,
+};
 pub mod fields;
 mod revision_refs;
 pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};
@@ -9557,8 +9563,9 @@ impl DocumentTree {
                         ..
                     } = &mut io.kind
                 {
-                    *w = width_emu.max(1);
-                    *h = height_emu.max(1);
+                    /* Issue #459 - never past Word's 22 in, whoever calls. */
+                    *w = clamp_extent_emu(width_emu);
+                    *h = clamp_extent_emu(height_emu);
                 }
             }
         });
@@ -9622,8 +9629,8 @@ impl DocumentTree {
                         anchor.position_h.relative_from = HRelativeFrom::Page;
                         anchor.position_v.relative_from = VRelativeFrom::Page;
                     }
-                    anchor.position_h.offset = FloatOffset::Emu(offset_h_emu);
-                    anchor.position_v.offset = FloatOffset::Emu(offset_v_emu);
+                    anchor.position_h.offset = FloatOffset::Emu(clamp_offset_emu(offset_h_emu));
+                    anchor.position_v.offset = FloatOffset::Emu(clamp_offset_emu(offset_v_emu));
                     anchor.simple_pos = false;
                 }
             }
