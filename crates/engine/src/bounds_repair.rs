@@ -192,6 +192,9 @@ impl DocumentTree {
         n += repair_section(&mut self.body_section);
         n += repair_para_props(&mut self.style_defaults);
         n += repair_span_style_sizes(&mut self.style_run_defaults);
+        if let Some(style) = self.line_number_style.as_mut() {
+            n += repair_span_style_sizes(style);
+        }
         for style in self.styles.values_mut() {
             n += repair_para_props(&mut style.para);
             n += repair_span_style_sizes(&mut style.run);

@@ -228,8 +228,10 @@ fn line_numbers_count_body_lines_and_skip_suppressed_paragraphs_and_tables() {
         assert!((right - (column_left - 18.0)).abs() < 0.01, "{right}");
         let line_baseline = page.margins.top + p.origin.y + l.origin.y + l.baseline;
         assert!((n.origin.y + n.baseline - line_baseline).abs() < 0.01);
-        /* The `LineNumber` style: docDefaults' 11 pt. */
-        assert_eq!(n.run.attrs.px_size, 11.0);
+        /* Issue #487 — the `LineNumber` character style (10 pt, grey),
+        not docDefaults' 11 pt black. */
+        assert_eq!(n.run.attrs.px_size, 10.0);
+        assert_eq!(n.run.attrs.color, [0x7F, 0x7F, 0x7F, 255]);
     }
     assert_eq!(
         format!("{:#018x}", layout::geometry_fingerprint(&pages)),
@@ -238,7 +240,7 @@ fn line_numbers_count_body_lines_and_skip_suppressed_paragraphs_and_tables() {
 }
 
 /// Pinned geometry (page + numbers) of `line_numbers_docx`.
-const LINE_NUMBERS_FINGERPRINT: &str = "0x0dbe46684adcde38";
+const LINE_NUMBERS_FINGERPRINT: &str = "0x526587202909f420";
 
 /// Issue #487 — `w:suppressLineNumbers` on a paragraph STYLE is read
 /// into the style table (and through the `basedOn` chain into the
@@ -295,6 +297,64 @@ fn style_suppress_line_numbers_cascades_and_a_direct_off_overrides_it() {
     let (n, line) = (&pages[0].decor.line_numbers[0], &second.lines[0]);
     let line_baseline = pages[0].margins.top + second.origin.y + line.origin.y + line.baseline;
     assert!((n.origin.y + n.baseline - line_baseline).abs() < 0.01);
+}
+
+/// The numbers' run attributes of the first page of a one-paragraph
+/// document numbered under `extra_styles`.
+fn number_attrs(extra_styles: &str) -> layout::TextAttrs {
+    let docx = format_docx::test_fixtures::package_with_styles(
+        "<w:p><w:r><w:t>Numbered.</w:t></w:r></w:p>",
+        "<w:lnNumType w:countBy=\"1\" w:distance=\"360\"/>",
+        extra_styles,
+    );
+    let pages = pages_of(&decor_engine(&docx));
+    pages[0].decor.line_numbers[0].run.attrs.clone()
+}
+
+/// Issue #487 — the numbers paint in the `LineNumber` character style
+/// when the document defines it: found by its Word id or — a localized
+/// id — by its built-in name, the `basedOn` chain folded root-first, size
+/// / colour / weight / slant honoured; without it they take the document
+/// defaults (11 pt, black).
+#[test]
+fn line_numbers_paint_in_the_line_number_character_style() {
+    let defaults = number_attrs("");
+    assert_eq!(defaults.px_size, 11.0);
+    assert_eq!(defaults.color, [0, 0, 0, 255]);
+    assert!(!defaults.faux_bold && !defaults.faux_italic);
+
+    let doc = format_docx::read_docx(&format_docx::test_fixtures::line_numbers_docx())
+        .expect("read")
+        .document;
+    let style = doc.line_number_style.as_ref().expect("LineNumber read");
+    assert_eq!(style.font_size, Some(10.0));
+    assert_eq!(style.color, Some([0x7F, 0x7F, 0x7F, 255]));
+
+    /* A chain: the leaf sets the size, the base the weight + slant. */
+    let chained = number_attrs(
+        "<w:style w:type=\"character\" w:styleId=\"Base\"><w:name w:val=\"Base\"/>\
+         <w:rPr><w:b/><w:i/><w:color w:val=\"C00000\"/></w:rPr></w:style>\
+         <w:style w:type=\"character\" w:styleId=\"LineNumber\">\
+         <w:name w:val=\"line number\"/><w:basedOn w:val=\"Base\"/>\
+         <w:rPr><w:sz w:val=\"16\"/></w:rPr></w:style>",
+    );
+    assert_eq!(chained.px_size, 8.0);
+    assert_eq!(chained.color, [0xC0, 0, 0, 255]);
+    assert!(chained.faux_bold && chained.faux_italic, "{chained:?}");
+
+    /* A localized id is found by the built-in name. */
+    let localized = number_attrs(
+        "<w:style w:type=\"character\" w:styleId=\"Zeilennummer\">\
+         <w:name w:val=\"Line Number\"/><w:rPr><w:sz w:val=\"18\"/></w:rPr></w:style>",
+    );
+    assert_eq!(localized.px_size, 9.0);
+
+    /* A PARAGRAPH style of that id is not the character style. */
+    let paragraph_style = number_attrs(
+        "<w:style w:type=\"paragraph\" w:styleId=\"LineNumber\">\
+         <w:name w:val=\"line number\"/><w:rPr><w:sz w:val=\"16\"/></w:rPr></w:style>",
+    );
+    assert_eq!(paragraph_style.px_size, 11.0);
 }
 
 /// The line-number strings of each page of `doc`.

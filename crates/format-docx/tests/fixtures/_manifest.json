@@ -176,12 +176,14 @@
       "generator": "handcrafted",
       "phase_introduced": 12,
       "asserts": {
-        "paragraph_count": 4,
+        "paragraph_count": 6,
         "paragraph_texts": [
           "Line numbering, page borders and drop caps are section and paragraph decorations that Word paints outside the text flow: the numbers sit in the left margin, the border box frames the page.",
           "This second paragraph keeps the count going across a paragraph break, and it wraps onto a second line so the count is visibly per line.",
           "This paragraph suppresses its line numbers.",
-          "A short closing paragraph."
+          "A short closing paragraph.",
+          "This paragraph is suppressed by its style.",
+          "A final numbered paragraph after the styled one."
         ]
       },
       "roundtrip": {

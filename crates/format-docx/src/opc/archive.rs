@@ -652,6 +652,9 @@ fn read_docx_scoped(
     constructors otherwise zero the field. */
     document.style_defaults = style_table.defaults.para.clone();
     document.style_run_defaults = style_table.defaults.run.clone();
+    /* Issue #487 — the `LineNumber` character style the line-number
+    gutter paints with (character styles are not mirrored above). */
+    document.line_number_style = resolver.builtin_character_style("LineNumber", "line number");
     for (id, def) in &style_table.by_id {
         if !matches!(def.kind, crate::parts::styles::StyleKind::Paragraph) {
             continue;

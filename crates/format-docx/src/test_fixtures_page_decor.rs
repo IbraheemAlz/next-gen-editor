@@ -27,9 +27,18 @@ pub const STYLE_SUPPRESSED_TEXT: &str = "This paragraph is suppressed by its sty
 /// The numbered paragraph that follows it: the count continues here.
 pub const AFTER_STYLE_TEXT: &str = "A final numbered paragraph after the styled one.";
 
-/// Issue #487 — the styles of `line_numbers.docx`: a paragraph style
-/// carrying `w:suppressLineNumbers` and a child style `basedOn` it.
+/// Issue #487 — the styles of `line_numbers.docx`: Word's `LineNumber`
+/// character style (10 pt, grey — smaller than the 11 pt docDefaults,
+/// `basedOn` `DefaultParagraphFont`), a paragraph style carrying
+/// `w:suppressLineNumbers` and a child style `basedOn` it.
 pub const LINE_NUMBER_STYLES: &str = "\
+<w:style w:type=\"character\" w:default=\"1\" w:styleId=\"DefaultParagraphFont\">\
+<w:name w:val=\"Default Paragraph Font\"/><w:uiPriority w:val=\"1\"/><w:semiHidden/>\
+<w:unhideWhenUsed/></w:style>\
+<w:style w:type=\"character\" w:styleId=\"LineNumber\"><w:name w:val=\"line number\"/>\
+<w:basedOn w:val=\"DefaultParagraphFont\"/><w:uiPriority w:val=\"99\"/><w:semiHidden/>\
+<w:unhideWhenUsed/><w:rPr><w:color w:val=\"7F7F7F\"/><w:sz w:val=\"20\"/>\
+<w:szCs w:val=\"20\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"NoNumbers\"><w:name w:val=\"No Numbers\"/>\
 <w:pPr><w:suppressLineNumbers/></w:pPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"NoNumbersChild\"><w:name w:val=\"No Numbers Child\"/>\

@@ -4005,6 +4005,7 @@ fn apply_page_decor(
     sections: &[engine::Section],
     doc: &DocumentTree,
     fonts: &FontStack,
+    sctx: StyleContext,
     base_px: f32,
     scale: f32,
 ) {
@@ -4023,11 +4024,22 @@ fn apply_page_decor(
         Some(engine::PathStep::Block(i)) if path.steps.len() == 1 => Some(*i),
         _ => None,
     };
-    let defaults = &doc.style_run_defaults;
+    /* Issue #487 — the numbers paint in Word's `LineNumber` character
+    style (size, colour, face, weight / slant) folded over the document
+    run defaults; a document without the style numbers in the defaults. */
+    let number_run = sctx
+        .run_defaults
+        .clone()
+        .merged_with(doc.line_number_style.clone().unwrap_or_default());
+    let number_family = sctx.run_font_ids(&number_run, "0").0;
     let style = layout::decor::LineNumberStyle {
-        family: defaults.font_family.as_ref().map(engine::FontFamily::id),
-        px_size: defaults.font_size.unwrap_or(base_px) * scale,
-        color: [0, 0, 0, 255],
+        family: number_family.as_deref(),
+        px_size: number_run.font_size.unwrap_or(base_px) * scale,
+        color: number_run
+            .resolve_color(sctx.theme)
+            .unwrap_or([0, 0, 0, 255]),
+        bold: number_run.bold.unwrap_or(false),
+        italic: number_run.italic.unwrap_or(false),
     };
     let mut prev_sect: Option<usize> = None;
     let mut page_in_section = 0_usize;
@@ -11340,6 +11352,7 @@ impl Engine {
             &sections,
             &doc,
             &font_stack,
+            sctx,
             cfg.px_size,
             scale,
         );

@@ -68,18 +68,25 @@ pub fn page_border_box(
     })
 }
 
-/// Shape `text` in the default Latin face at `px_size` into one
-/// left-to-right run. Returns the run and its advance.
+/// Shape `text` in `style`'s Latin face (the default Latin face when the
+/// family does not resolve) into one left-to-right run, a missing
+/// weight / slant synthesized like a text run's. Returns the run and its
+/// advance.
 pub fn shape_gutter_run(
     fonts: &FontStack,
-    family: Option<&str>,
     text: &str,
-    px_size: f32,
-    color: [u8; 4],
+    style: LineNumberStyle<'_>,
 ) -> Option<(VisualRun, f32)> {
-    let (font_id, face, _) = fonts
-        .resolve(Script::Latin, family, false, false)
-        .or_else(|| fonts.resolve(Script::Latin, None, false, false))?;
+    let LineNumberStyle {
+        family,
+        px_size,
+        color,
+        bold,
+        italic,
+    } = style;
+    let (font_id, face, synthesis) = fonts
+        .resolve(Script::Latin, family, bold, italic)
+        .or_else(|| fonts.resolve(Script::Latin, None, bold, italic))?;
     let shaped = shape_text(face, text, ShapingDirection::Ltr, px_size);
     let glyphs: Vec<PositionedGlyph> = shaped
         .glyphs
@@ -113,8 +120,8 @@ pub fn shape_gutter_run(
                 bg_color: None,
                 underline: engine::UnderlineStyle::None,
                 strike: false,
-                faux_bold: false,
-                faux_italic: false,
+                faux_bold: synthesis.faux_bold,
+                faux_italic: synthesis.faux_italic,
                 baseline_shift_px: 0.0,
             },
             metrics_font: None,
@@ -124,12 +131,15 @@ pub fn shape_gutter_run(
 }
 
 /// How the numbers look: the face family (`None` = the default Latin
-/// face), the size and colour — the `LineNumber` character style.
+/// face), the size, colour and weight / slant — the `LineNumber`
+/// character style folded over the document's run defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct LineNumberStyle<'a> {
     pub family: Option<&'a str>,
     pub px_size: f32,
     pub color: [u8; 4],
+    pub bold: bool,
+    pub italic: bool,
 }
 
 /// Number the lines of `page`'s top-level paragraphs into
@@ -166,9 +176,7 @@ pub fn number_page_lines(
                 continue;
             }
             let text = n.to_string();
-            let Some((run, width)) =
-                shape_gutter_run(fonts, style.family, &text, style.px_size, style.color)
-            else {
+            let Some((run, width)) = shape_gutter_run(fonts, &text, style) else {
                 continue;
             };
             let right = left + para.origin.x - distance;

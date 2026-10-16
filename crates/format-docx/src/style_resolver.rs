@@ -101,6 +101,44 @@ impl<'a> StyleResolver<'a> {
         run.merged_with(direct_rpr)
     }
 
+    /// Issue #487 — the run formatting of a built-in CHARACTER style the
+    /// engine needs outside any run (`LineNumber`: the line-number
+    /// gutter's), its `basedOn` chain folded root-first and WITHOUT the
+    /// docDefaults (the caller folds `defaults → this`). The style is
+    /// found by its `w:styleId` (`id`, Word's own spelling) first, else
+    /// by its `<w:name>` (`name`, compared ASCII case-insensitively —
+    /// a localized id keeps Word's English built-in name); a name shared
+    /// by several styles resolves to the smallest id so the answer never
+    /// depends on map order. `None` when the document defines none.
+    pub fn builtin_character_style(&self, id: &str, name: &str) -> Option<SpanStyle> {
+        let by_id = self
+            .table
+            .by_id
+            .get(id)
+            .filter(|d| d.kind == StyleKind::Character);
+        let leaf = by_id.or_else(|| {
+            self.table
+                .by_id
+                .values()
+                .filter(|d| {
+                    d.kind == StyleKind::Character
+                        && d.name
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                })
+                .min_by(|a, b| a.id.cmp(&b.id))
+        })?;
+        let mut run = SpanStyle::default();
+        for s in self
+            .collect_chain(&leaf.id, StyleKind::Character)
+            .iter()
+            .rev()
+        {
+            run = run.merged_with(s.run.clone());
+        }
+        Some(run)
+    }
+
     /// Walk the `<w:basedOn>` chain leaf → root. Stops on cycle (visited),
     /// missing parent, kind mismatch, or [`MAX_CHAIN`] depth. Returns
     /// **leaf-first**; callers reverse for cascade application.
