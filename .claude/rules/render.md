@@ -157,6 +157,31 @@ hard failure so CI catches a new loop instead of a silent recovery.
   stored with the entry and replayed on a hit, so a cached paint reports
   what a fresh one would. `tools/corpus-native` re-lays every document
   warm (`engine_repaint_consistent`) to prove warm == cold.
+- **The paragraph cache is weighted in BYTES, not entries (issue #457).**
+  `engine-wasm/src/paragraph_cache.rs` (`ParagraphCache`, inside
+  `LayoutCache`): an estimated-bytes budget over the cached
+  `ParagraphBox`es (`paragraph_box_bytes` — inline `size_of`s, every
+  `Vec` / `String` / `Box` behind a glyph, line or field, a fixed
+  per-allocation allowance; the table cache's `table_box_bytes` shares
+  it), `PARAGRAPH_CACHE_BUDGET_BYTES` = 192 MiB, an entry ceiling of
+  65 536 as a sanity bound only, and a box over an eighth of the budget
+  is never cached. The old 4096-ENTRY LRU was smaller than the
+  paragraphs of a long document (the `250p` / `500p` perf fixtures had
+  5 000 / 10 000 before issue #476 re-calibrated them to 1 500 / 3 000),
+  and a document-order sweep over an LRU smaller than its working set
+  hits NOTHING — a warm full re-layout (PDF export, `ExpandLayout` to
+  the end, the save restamp) cost the same as a cold one. 10 000
+  paragraphs are ~113 MiB of boxes at native pointer width (~87 MiB on
+  wasm32), so the budget fits a 500-page document with headroom;
+  re-measure (the `dense-5000` / `dense-10000` harness documents keep
+  the old fixtures' shape) with
+  `cargo test -p engine-wasm --release profile_paragraph_cache -- --ignored --nocapture`
+  (sizing + warm/cold) before moving the budget, and re-run
+  `node tools/memory-profile/run.mjs --budgets`. A scene larger than
+  the budget thrashes exactly like the old cap did — the budget is the
+  trade, not a guarantee. A new owned field on `ParagraphBox` /
+  `LineBox` / `VisualRun` / `PositionedGlyph` that holds heap memory
+  must be added to `paragraph_box_bytes`, or the budget under-counts it.
 
 ## PDF export
 

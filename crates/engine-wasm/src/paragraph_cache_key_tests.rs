@@ -448,7 +448,7 @@ fn verified_hit_backstop_still_catches_a_bad_entry() {
         .and_then(engine::Block::as_paragraph)
         .expect("paragraph")
         .clone();
-    let mut cache = LruCache::new(NonZeroUsize::new(8).expect("cap"));
+    let mut cache = crate::paragraph_cache::ParagraphCache::with_limits(1 << 20, 8);
     let good = layout_paragraph_cached(&para, &fonts, &cfg, 1.0, 400.0, sctx, &mut cache);
     let k = paragraph_layout_key(&para, &cfg, 1.0, 400.0, sctx);
     let mut bad = good.clone();
