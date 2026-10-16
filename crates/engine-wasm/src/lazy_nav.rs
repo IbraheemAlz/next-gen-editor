@@ -969,6 +969,84 @@ mod tests {
             .expect("reach a page past the band");
     }
 
+    /// Issue #499 — the smoke sweep's input #3196 in its command shape
+    /// (the `repro_499_nav_expansion_stalled` corpus seed), driven through
+    /// the real dispatcher: a 1e33 pt font, a table after it, a
+    /// word-delete, then `MoveCaret { Left, extend: true }`. Before the
+    /// move the band is provably stuck (a 1e30 pt target lays nothing
+    /// more — the pre-#499 loop's backstop round repeated forever); the
+    /// move returns, over one full layout noted `NavExpansionStalled`,
+    /// and the move's repaint carries the note.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn repro_499_shift_left_after_an_oversize_font_and_a_table_returns() {
+        let mut engine = Engine::new_headless(DocumentTree::from_text(""));
+        let size = TextAttrsPatch {
+            bold: None,
+            italic: None,
+            underline: None,
+            strike: None,
+            font_family: None,
+            font_size: Some(1.095_157_5e33),
+            color: None,
+            bg_color: None,
+            script: None,
+            language: None,
+            caps: None,
+            small_caps: None,
+            font_slot: None,
+        };
+        for cmd in [
+            Command::InsertText {
+                at: None,
+                text: "Huge".to_string(),
+            },
+            Command::SelectAll,
+            Command::ApplyFormatting {
+                range: None,
+                attrs: size,
+            },
+            Command::InsertTable {
+                at: bridge::BlockPath::top(1),
+                rows: 5,
+                cols: 4,
+            },
+            Command::DeleteAtCaret {
+                forward: false,
+                by_word: true,
+            },
+        ] {
+            let evt = engine.apply_sync(cmd);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        }
+        let scale = engine.scale();
+        engine
+            .ensure_layout_snapshot(scale, false, Some(MAX_BAND_TARGET_PT * scale))
+            .expect("deep band");
+        assert!(
+            !snapshot_pages(&engine).1,
+            "the band is stuck: a 1e30 pt target still culls behind the oversize line"
+        );
+        let evt = engine.apply_sync(Command::MoveCaret {
+            direction: MoveDirection::Left,
+            extend: true,
+        });
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(snapshot_pages(&engine).1, "fell back to one full layout");
+        assert!(noted_stall(&engine), "the stall is reported, never silent");
+        assert!(engine.selection_is_valid());
+        /* The move repainted over the grown band: its paint carries it. */
+        assert!(
+            engine
+                .last_paint_dims
+                .layout_degraded
+                .iter()
+                .any(|d| d.reason == LayoutDegradeReason::NavExpansionStalled),
+            "{:?}",
+            engine.last_paint_dims.layout_degraded
+        );
+    }
+
     /// Manual timing harness (#462 acceptance: a 500-page document must
     /// still answer Ctrl+End). Run with:
     /// `cargo test -p engine-wasm --release --lib time_ctrl_end_500p -- --ignored --nocapture`
