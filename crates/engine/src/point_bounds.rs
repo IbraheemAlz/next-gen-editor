@@ -39,6 +39,9 @@ pub const MAX_POINT_FIELD_PT: f32 = 1584.0;
 /// and line heights (`schema::measure::MAX_TWIPS` spells the same number).
 pub const MAX_POINT_FIELD_TWIPS: i32 = 31_680;
 
+/// Word's longest tab-stop list: 64 stops per paragraph.
+pub const MAX_TAB_STOPS: usize = 64;
+
 /// Word's shortest page side, in points: 0.1 in (`PAGE_SIZE` min 144 twips).
 pub const MIN_PAGE_SIDE_PT: f32 = 7.2;
 
@@ -200,6 +203,12 @@ fn scan_props(p: &ParaProperties) -> Option<String> {
             ));
         }
     }
+    if p.tab_stops.len() > MAX_TAB_STOPS {
+        return Some(format!(
+            "{} tab stops, more than Word's {MAX_TAB_STOPS}",
+            p.tab_stops.len()
+        ));
+    }
     for stop in &p.tab_stops {
         if !tab_position_in_bound(stop.position_pt) {
             return Some(format!(
@@ -340,7 +349,9 @@ pub fn first_point_field_beyond_bound(doc: &DocumentTree) -> Option<String> {
             return Some(format!("note {id}: {why}"));
         }
     }
-    None
+    /* Issue #503 (residue) - a border stroke's width is a paragraph / page
+    measure in Word's eyes too; its scan lives in `border_bounds`. */
+    crate::first_border_beyond_bound(doc)
 }
 
 #[cfg(test)]

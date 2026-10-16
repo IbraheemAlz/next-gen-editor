@@ -70,11 +70,17 @@ pub use emu_bounds::{
 /// (margins, indents, gutters, tab stops, line-spacing multiples).
 mod point_bounds;
 pub use point_bounds::{
-    MAX_LINE_SPACING_MULTIPLE, MAX_POINT_FIELD_PT, MAX_POINT_FIELD_TWIPS,
+    MAX_LINE_SPACING_MULTIPLE, MAX_POINT_FIELD_PT, MAX_POINT_FIELD_TWIPS, MAX_TAB_STOPS,
     MIN_LINE_SPACING_MULTIPLE, MIN_PAGE_SIDE_PT, MIN_TEXT_AREA_PT, TextAreaAxis,
     column_gutter_in_bound, first_point_field_beyond_bound, fit_margins_to_text_area,
     indent_in_bound, line_spacing_multiple_in_bound, margin_in_bound, margins_leave_text_area,
     tab_position_in_bound,
+};
+/// Issue #503 (residue) - Word's 2..=48 eighth-point border stroke width.
+mod border_bounds;
+pub use border_bounds::{
+    MAX_BORDER_EIGHTH_PT, MIN_BORDER_EIGHTH_PT, border_size_in_bound, border_size_range,
+    clamp_border_eighth_pt, first_border_beyond_bound,
 };
 /// Issue #503 (item 1) - the restore-side clamp of both bounds above
 /// (`DocumentTree::repair_bounds`).

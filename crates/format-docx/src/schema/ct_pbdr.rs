@@ -15,9 +15,42 @@
 //!   re-orients them to the paragraph's FINAL direction
 //!   (`engine::ParaProperties::cascade`).
 
+use crate::error::{DocxWarning, warn};
 use crate::schema::ct_rpr::{attr_val, parse_hex_color};
+use crate::schema::measure::describe;
 use engine::{BorderStroke, BorderStyle, CellBorders, ParaProperties, TextDirection};
 use quick_xml::events::BytesStart;
+
+/// Issue #503 (residue) - the `w:sz` of a border edge, in eighths of a
+/// point, clamped into Word's range for a stroke of `style`
+/// (`engine::border_size_range`: `2..=48` for a drawn line, `0..=48` for
+/// `none` / `nil`) and reported as `DocxWarning::MeasureClamped` (in twips,
+/// like every measure; the source bytes are kept, so the verified
+/// passthroughs re-derive the same clamped model). An absent or unusable
+/// (non-numeric, negative) `w:sz` is `default` - already inside the range;
+/// a digit string past `u16` is a width, just an absurd one, and clamps
+/// like any other (it used to read as the default). Shared by the
+/// paragraph / page (`parse_pbdr_stroke`) and table / cell
+/// (`parts::table`) edges.
+pub(crate) fn border_size_eighth_pt(e: &BytesStart, style: &BorderStyle, default: u16) -> u16 {
+    let Some(raw) = attr_val(e, b"w:sz") else {
+        return default;
+    };
+    let n = match raw.trim().parse::<u64>() {
+        Ok(n) => n,
+        Err(err) if *err.kind() == std::num::IntErrorKind::PosOverflow => u64::MAX,
+        Err(_) => return default,
+    };
+    let size = engine::clamp_border_eighth_pt(style, u16::try_from(n).unwrap_or(u16::MAX));
+    if u64::from(size) != n {
+        warn(DocxWarning::MeasureClamped {
+            attr: describe(e, b"w:sz"),
+            value: raw,
+            twips: (f64::from(size) * 2.5).round() as i64,
+        });
+    }
+    size
+}
 
 /// Parse `<w:top|left|bottom|right|between|start|end w:val w:sz w:color/>`
 /// into a stroke. `w:val="none"` / `"nil"` is a `BorderStyle::None`
@@ -34,9 +67,7 @@ pub(crate) fn parse_pbdr_stroke(e: &BytesStart) -> Option<BorderStroke> {
         other => BorderStyle::Other(other.to_string()),
     };
     let none = matches!(style, BorderStyle::None);
-    let size_eighth_pt: u16 = attr_val(e, b"w:sz")
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(if none { 0 } else { 4 });
+    let size_eighth_pt = border_size_eighth_pt(e, &style, if none { 0 } else { 4 });
     let color = attr_val(e, b"w:color").and_then(|v| {
         if none || v.trim().eq_ignore_ascii_case("auto") {
             None

@@ -55,6 +55,9 @@ mod pdf_semantics;
 mod read_report;
 mod save_report;
 pub(crate) use paragraph_cache_key::paragraph_layout_key;
+/// Issue #503 (residue) - the command-boundary border stroke width guard
+/// (`2..=48` eighths of a point, Word's 1/4 pt ..= 6 pt).
+mod border_guard;
 /// Issue #459 — the command-boundary EMU range guard (picture extents and
 /// offsets stay inside Word's 22 in).
 mod emu_guard;
@@ -8493,6 +8496,12 @@ impl Engine {
         `1e33` pt margin, indent, gutter or tab stop is refused
         `OutOfRange` (Word's 22 in) before any handler. */
         if let Err(refused) = point_guard::check_command(&cmd) {
+            return *refused;
+        }
+        /* Issue #503 (residue) - and for a border stroke's width: Word
+        draws 1/4 pt ..= 6 pt (`size_eighth_pt` 2..=48), the wire `u16`
+        took 8191 pt. */
+        if let Err(refused) = border_guard::check_command(&cmd) {
             return *refused;
         }
         if let Some(rejected) = self.story_gate(&cmd) {
@@ -30293,6 +30302,11 @@ mod font_size_guard_tests;
 /// (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod point_guard_tests;
+
+/// Issue #503 (residue) - border stroke widths and the tab-stop list length
+/// vs Word's limits (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod border_guard_tests;
 
 /// Issue #498 - `RenderConfig::shell_default` pinned to the TS boot config
 /// (the headless-engine tests need `fuzz-native`).

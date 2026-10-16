@@ -500,6 +500,37 @@ fn gen_ppr(u: &mut Unstructured, allow_sect_pr: bool) -> String {
             attr_num(u, 720)
         ));
     }
+    /* Issue #503 (residue) - paragraph borders with stroke widths around
+    Word's 2..=48 eighths of a point (and hostile ones), and a tab-stop
+    list around Word's 64. */
+    if u.ratio(1, 4).unwrap_or(false) {
+        s.push_str("<w:pBdr>");
+        for edge in ["top", "left", "bottom", "right", "between"] {
+            if u.ratio(1, 2).unwrap_or(false) {
+                let val = pick(u, &["single", "double", "dotted", "nil", "none", "wave"]);
+                s.push_str(&format!(
+                    r#"<w:{edge} w:val="{val}" w:sz="{}" w:space="1" w:color="auto"/>"#,
+                    attr_num(u, 120)
+                ));
+            }
+        }
+        s.push_str("</w:pBdr>");
+    }
+    if u.ratio(1, 6).unwrap_or(false) {
+        let n = if u.ratio(1, 2).unwrap_or(false) {
+            60 + u.int_in_range(0u32..=20).unwrap_or(0)
+        } else {
+            u.int_in_range(0u32..=4).unwrap_or(0)
+        };
+        s.push_str("<w:tabs>");
+        for i in 0..n {
+            s.push_str(&format!(
+                r#"<w:tab w:val="left" w:pos="{}"/>"#,
+                100 + i64::from(i) * 10
+            ));
+        }
+        s.push_str("</w:tabs>");
+    }
     s.push_str(&maybe_bool_element(u, "w:bidi"));
     s.push_str(&maybe_bool_element(u, "w:pageBreakBefore"));
     if u.ratio(1, 3).unwrap_or(false) {
@@ -559,6 +590,20 @@ fn gen_cell(u: &mut Unstructured, rels: &mut Rels, depth: u32) -> String {
     if u.ratio(1, 3).unwrap_or(false) {
         let v = pick(u, &["restart", "continue", "bogus"]);
         tc_pr.push_str(&format!(r#"<w:vMerge w:val="{v}"/>"#));
+    }
+    /* Issue #503 (residue) - cell border stroke widths around Word's
+    2..=48 eighths of a point. */
+    if u.ratio(1, 4).unwrap_or(false) {
+        tc_pr.push_str("<w:tcBorders>");
+        for edge in ["top", "left", "bottom", "right"] {
+            if u.ratio(1, 2).unwrap_or(false) {
+                tc_pr.push_str(&format!(
+                    r#"<w:{edge} w:val="single" w:sz="{}" w:space="0" w:color="auto"/>"#,
+                    attr_num(u, 120)
+                ));
+            }
+        }
+        tc_pr.push_str("</w:tcBorders>");
     }
     tc_pr.push_str("</w:tcPr>");
     let mut content = String::new();

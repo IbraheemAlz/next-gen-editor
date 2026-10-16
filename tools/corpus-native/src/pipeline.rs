@@ -811,6 +811,18 @@ pub struct DocResult {
     /// plus the margin repair above; capped list, lower bound).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub point_field_clamps: usize,
+    /// Issue #503 (residue) - how many border `w:sz` widths the reader
+    /// clamped into Word's 2..=48 eighths of a point
+    /// (`DocxWarning::MeasureClamped` naming `w:top/@w:sz` ... on a
+    /// paragraph, cell, table or page border edge; capped list, lower
+    /// bound).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub border_width_clamps: usize,
+    /// Issue #503 (residue) - how many `<w:tabs>` lists held more than
+    /// Word's 64 stops and were cut to the first 64
+    /// (`DocxWarning::MeasureClamped` naming `w:tabs`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tab_list_clamps: usize,
     /// Issue #384 — `--regen-check`: every clean paragraph regenerated
     /// with no edit and compared with its source bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1238,6 +1250,19 @@ pub fn run_one(
                     .iter()
                     .any(|p| attr.starts_with(p)))
         })
+        .count();
+    rec.border_width_clamps = archive_a
+        .warnings
+        .iter()
+        .filter(|w| {
+            matches!(w, format_docx::DocxWarning::MeasureClamped { attr, .. }
+                if attr.starts_with("w:") && attr.ends_with("/@w:sz"))
+        })
+        .count();
+    rec.tab_list_clamps = archive_a
+        .warnings
+        .iter()
+        .filter(|w| matches!(w, format_docx::DocxWarning::MeasureClamped { attr, .. } if attr == "w:tabs"))
         .count();
 
     /* 2. Full layout (native — `crates/layout`, no browser). */

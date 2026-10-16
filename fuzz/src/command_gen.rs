@@ -41,11 +41,11 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use bridge::{
-    Alignment, BlockPath, BridgeCellBorders, BridgeParaPropertiesPatch, BridgeStyleProperties,
-    BridgeTabKind, BridgeTabStop, Command, Direction, FieldKind, HeaderFooterArea, ImageBlob,
-    ImageFit, ImageWrapMode, InsertSide, ListKind, LogicalPos, LogicalRange, MoveDirection,
-    SectionBreakKind, SelectionModifier, TablePropertiesPatch, TextAttrsPatch, TextBoxHop,
-    UnderlineStyle,
+    Alignment, BlockPath, BridgeBorderStroke, BridgeBorderStyle, BridgeCellBorders,
+    BridgeParaPropertiesPatch, BridgeStyleProperties, BridgeTabKind, BridgeTabStop, Command,
+    Direction, FieldKind, HeaderFooterArea, ImageBlob, ImageFit, ImageWrapMode, InsertSide,
+    ListKind, LogicalPos, LogicalRange, MoveDirection, SectionBreakKind, SelectionModifier,
+    TablePropertiesPatch, TextAttrsPatch, TextBoxHop, UnderlineStyle,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -222,6 +222,51 @@ fn unsigned_points_or_hostile(u: &mut Unstructured, max: u32) -> f32 {
         hostile_points(u)
     } else {
         small(u, max) as f32
+    }
+}
+
+/// Issue #503 (residue) - a border stroke width in eighths of a point:
+/// usually an ordinary Word width (`2..=48`), a third of the time one of the
+/// edges of Word's `2..=48` range (0, 1, 2, 3, 47, 48, 49, 50, 96, 4000,
+/// 8191, `u16::MAX`). A drawn line outside the range must be refused
+/// `OutOfRange` (a `None` stroke may also be 0) and leave the document
+/// alone; one inside must never leave a stroke past the bound.
+fn border_size_or_hostile(u: &mut Unstructured) -> u16 {
+    const EDGES: [u16; 12] = [0, 1, 2, 3, 47, 48, 49, 50, 96, 4000, 8191, u16::MAX];
+    if u.ratio(1, 3).unwrap_or(false) {
+        u.choose(&EDGES).copied().unwrap_or(4)
+    } else {
+        (small(u, 46) as u16) + 2
+    }
+}
+
+fn border_stroke(u: &mut Unstructured) -> Option<BridgeBorderStroke> {
+    if u.ratio(1, 4).unwrap_or(false) {
+        return None;
+    }
+    let style = *u
+        .choose(&[
+            BridgeBorderStyle::Single,
+            BridgeBorderStyle::Double,
+            BridgeBorderStyle::Dotted,
+            BridgeBorderStyle::Dashed,
+            BridgeBorderStyle::None,
+        ])
+        .ok()?;
+    Some(BridgeBorderStroke {
+        style,
+        size_eighth_pt: border_size_or_hostile(u),
+        color: None,
+    })
+}
+
+/// Four edges, each absent or a stroke of [`border_size_or_hostile`] width.
+fn hostile_borders(u: &mut Unstructured) -> BridgeCellBorders {
+    BridgeCellBorders {
+        top: border_stroke(u),
+        left: border_stroke(u),
+        bottom: border_stroke(u),
+        right: border_stroke(u),
     }
 }
 
@@ -1100,8 +1145,20 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
 /// finite values) a quarter of the time per field, so the command path's
 /// `OutOfRange` refusals and the section-aware text-area check are
 /// exercised, and every accepted value is held to the model invariant.
+/// Residue: `SetCellBorders` / `SetParagraphBorders` with stroke widths at
+/// Word's 2..=48 edges, and tab-stop lists around Word's 64.
 fn gen_measure_command(u: &mut Unstructured) -> Option<Command> {
-    Some(match small(u, 2) {
+    Some(match small(u, 4) {
+        2 => Command::SetCellBorders {
+            table_path: BlockPath::top(small(u, 3)),
+            row: small(u, 2),
+            col: small(u, 2),
+            borders: hostile_borders(u),
+        },
+        3 => Command::SetParagraphBorders {
+            range: range(u),
+            borders: hostile_borders(u),
+        },
         0 => Command::SetPageMargins {
             at: pos(u),
             top_pt: unsigned_points_or_hostile(u, 120),
@@ -1117,7 +1174,12 @@ fn gen_measure_command(u: &mut Unstructured) -> Option<Command> {
                 BridgeTabKind::Decimal,
                 BridgeTabKind::Clear,
             ];
-            let n = small(u, 3) as usize + 1;
+            /* A quarter of the time a list around Word's 64-stop limit. */
+            let n = if u.ratio(1, 4).unwrap_or(false) {
+                60 + small(u, 9) as usize
+            } else {
+                small(u, 3) as usize + 1
+            };
             let mut stops = Vec::with_capacity(n);
             for _ in 0..n {
                 stops.push(BridgeTabStop {
@@ -1605,7 +1667,7 @@ classify_variants! {
     MergeCells { .. } => true, // gen_targeted_command
     SplitCell { .. } => false,
     SetCellShading { .. } => true, // gen_targeted_command
-    SetCellBorders { .. } => true, // gen_targeted_command
+    SetCellBorders { .. } => true, // gen_targeted_command + gen_measure_command (#503 residue)
     SetTableProperties { .. } => true, // gen_targeted_command (#177)
     SetColumns { .. } => true,                 // gen_targeted_command
     InsertPageBreak { .. } => false,
@@ -1624,7 +1686,7 @@ classify_variants! {
     SetFieldCodeView { .. } => false,
     SetFieldInstruction { .. } => false,
     InsertToc { .. } => true, // gen_field_command
-    SetParagraphBorders { .. } => false,
+    SetParagraphBorders { .. } => true, // gen_measure_command (#503 residue)
     SetPageMargins { .. } => true, // gen_measure_command (#503)
     SetPageOrientation { .. } => false,
     ToggleList { .. } => true, // gen_targeted_command
