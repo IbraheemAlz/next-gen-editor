@@ -107,6 +107,18 @@ paths:
   `error::warn` into the read's sink (`collect_read_warnings`; a no-op in
   the writer's re-parses). Verified-reuse equality never uses float `==`:
   `writer::same_section_props` compares geometry by bits.
+- **Drawing EMU (issues #407 / #459).** DrawingML / VML extents and offsets
+  go through `measure::emu` (`attr_emu`, `text_emu`, `css_length_emu`):
+  never `NaN` / infinite (`DocxWarning::InvalidMeasure`), clamped to
+  `engine::MAX_DRAWING_EMU` (22 in = 20 116 800 EMU, `EmuClamped`) — the ONE
+  number the reader, `emu_guard` (engine-wasm: `ResizeImage` / `MoveImage`
+  are refused `OutOfRange` outside `1..=bound` / `±bound`), `InsertImage`
+  and the HTML paste door share. `wp:wrapPolygon` vertices
+  (`wp_anchor::parse_wrap_fragment`) read through `attr_emu_required`: a
+  malformed `x` / `y` (or an absent one) drops the WHOLE polygon (layout
+  falls back to the extent rectangle, the source element stays verbatim) —
+  never a partial polygon. A NEW command field carrying a drawing extent or
+  offset must be added to `emu_guard::check_command`.
 - **Namespace prefixes (issues #325 / #394).** The parsers match literal
   qnames (`w:p`), so every WordprocessingML part the reader walks — the
   main part, `styles.xml`, `numbering.xml`, `settings.xml`, the note
