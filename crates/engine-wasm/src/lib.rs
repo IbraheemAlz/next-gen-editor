@@ -97,6 +97,51 @@ struct RenderConfig {
     zoom: f32,
 }
 
+/// Issue #498 - the editor shell's boot layout config, the values
+/// `ts/src/App.tsx` sends in its boot `RENDER_PAGE`: 24 px text on 36 px
+/// lines (logical; the line pitch itself is the font-derived one since
+/// #475, this is the nominal fallback), start alignment, an RTL document
+/// base (the seed paragraph is Arabic + Latin; it is the direction a
+/// paragraph with no strong character falls back to, and it routes an
+/// empty paragraph's mark through the complex-script size).
+#[cfg(any(test, feature = "fuzz-native"))]
+const SHELL_PX_SIZE: f32 = 24.0;
+#[cfg(any(test, feature = "fuzz-native"))]
+const SHELL_LINE_HEIGHT: f32 = 36.0;
+/// `devicePixelRatio x SCREEN_DPI_SCALE` (`ts/src/state/engine-store.ts`,
+/// 96 / 72 = 4 / 3) at a `devicePixelRatio` of 1 - what a harness without a
+/// display has. A page count does not depend on it (layout scales
+/// linearly); the geometry fingerprints do.
+#[cfg(any(test, feature = "fuzz-native"))]
+const SHELL_BASE_SCALE: f32 = (4.0_f64 / 3.0) as f32;
+/// The seed / fallback-root face id: the first Latin entry of
+/// `ts/public/fonts.json` `defaults_by_script`.
+#[cfg(any(test, feature = "fuzz-native"))]
+const SHELL_SEED_FONT_ID: &str = "liberation";
+
+#[cfg(any(test, feature = "fuzz-native"))]
+impl RenderConfig {
+    /// The layout config the editor boots with, at a `devicePixelRatio` of 1
+    /// (issue #498). ONE definition for every canvas-less consumer
+    /// (`Engine::new_headless`: the fuzz crate, `tools/corpus-native`, the
+    /// native tests), so a page count measured there is the shell's page
+    /// count. Pinned against the TypeScript constants by
+    /// `shell_default_tests::shell_default_is_the_ts_boot_config` - change
+    /// `App.tsx`'s boot `RENDER_PAGE` and this together.
+    fn shell_default() -> Self {
+        Self {
+            font_id: SHELL_SEED_FONT_ID.to_string(),
+            base_direction: ShapingDirection::Rtl,
+            px_size: SHELL_PX_SIZE,
+            line_height: SHELL_LINE_HEIGHT,
+            alignment: Alignment::Start,
+            scale: SHELL_BASE_SCALE,
+            base_scale: SHELL_BASE_SCALE,
+            zoom: 1.0,
+        }
+    }
+}
+
 /// Issue #280 — ceiling on the effective paint scale (device px per
 /// layout pt) that a user zoom may push the backing store to. Zoom now
 /// visibly grows every page card, and its canvas backing store grows with
@@ -19152,15 +19197,12 @@ impl Engine {
         fonts.insert("fuzz-latin".to_string(), font);
         let mut engine = assemble_engine(None, None);
         engine.fonts = fonts;
+        /* Issue #498 - the shell's boot config, not a private 16 px / 26 px
+        one: a layout measured here is the one the editor shows. Only the
+        face id differs (the one face this engine holds). */
         engine.layout_cfg = Some(RenderConfig {
             font_id: "fuzz-latin".to_string(),
-            base_direction: ShapingDirection::Ltr,
-            px_size: 16.0,
-            line_height: 26.0,
-            alignment: Alignment::Start,
-            scale: 1.0,
-            base_scale: 1.0,
-            zoom: 1.0,
+            ..RenderConfig::shell_default()
         });
         engine.undo = UndoStack::new(doc, 100);
         engine.selection = Some(SelectionState {
@@ -28378,23 +28420,34 @@ mod tests {
         let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
         assert!(info.degradations.is_empty());
         let fp = layout::geometry_fingerprint(&pages);
-        let want = PINNED_ENGINE_FINGERPRINTS
-            .iter()
-            .find(|(n, _)| *n == "50p_full_x2")
-            .map(|(_, v)| *v)
-            .expect("50p_full_x2 pinned");
-        assert_eq!(fp, want, "50p_full_x2 fingerprint moved");
+        eprintln!("HEADLESS SHELL-CONFIG 50p_full_x2 = {fp:#x}");
+        assert_eq!(
+            fp, PINNED_HEADLESS_50P_FULL_X2,
+            "50p_full_x2 fingerprint moved"
+        );
 
         let (pages, _, _, info) = engine.build_pages(2.0, false, Some(2000.0)).expect("band");
         assert!(info.degradations.is_empty());
         let fp = layout::geometry_fingerprint(&pages);
-        let want = PINNED_ENGINE_FINGERPRINTS
-            .iter()
-            .find(|(n, _)| *n == "50p_band_2000_x2")
-            .map(|(_, v)| *v)
-            .expect("50p_band_2000_x2 pinned");
-        assert_eq!(fp, want, "50p_band_2000_x2 fingerprint moved");
+        eprintln!("HEADLESS SHELL-CONFIG 50p_band_2000_x2 = {fp:#x}");
+        assert_eq!(
+            fp, PINNED_HEADLESS_50P_BAND_2000_X2,
+            "50p_band_2000_x2 fingerprint moved"
+        );
     }
+
+    /// Issue #498 - the two values above are pinned for the HEADLESS engine,
+    /// which now lays out with the shell's boot config
+    /// (`RenderConfig::shell_default`: 24 px / 36 px, scale 4 / 3, RTL base).
+    /// They were `0x341267f577563dc0` / `0xd014bb2dc81283ce` while
+    /// `Engine::new_headless` used a private 16 px / 26 px, scale 1.0 config
+    /// - the values `PINNED_ENGINE_FINGERPRINTS` still carries for the
+    ///   `test_engine_with_doc` engine. The move is the purpose of #498, not
+    ///   drift.
+    #[cfg(feature = "fuzz-native")]
+    const PINNED_HEADLESS_50P_FULL_X2: u64 = 0x57fb28b16c14ab90;
+    #[cfg(feature = "fuzz-native")]
+    const PINNED_HEADLESS_50P_BAND_2000_X2: u64 = 0xa38ba1345cb87735;
 
     /* ================================================================
     Issue #81 — Table of Contents: insertion, F9 regeneration, the
@@ -30191,6 +30244,11 @@ mod font_size_guard_tests;
 /// (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod point_guard_tests;
+
+/// Issue #498 - `RenderConfig::shell_default` pinned to the TS boot config
+/// (the headless-engine tests need `fuzz-native`).
+#[cfg(test)]
+mod shell_default_tests;
 
 /// Issue #503 (item 1) - the restore / replay door of the same bounds
 /// (`fuzz-native`).

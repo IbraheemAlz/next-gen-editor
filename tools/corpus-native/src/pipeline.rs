@@ -1507,6 +1507,10 @@ fn engine_layout(rec: &mut DocResult, doc: &engine::DocumentTree, budget: Durati
             let cold_took = std::cell::Cell::new(Duration::ZERO);
             let report = panics::catch(
                 || -> Result<(engine_wasm::LayoutProbe, WarmRepaint), String> {
+                    /* Issue #498 - `new_headless` lays out with the shell's
+                    boot config (`RenderConfig::shell_default`, 24 px / 36 px,
+                    scale 4 / 3), so `engine_page_count` IS the page count the
+                    editor shows (`tests/perf/50p.docx` -> 50). */
                     let mut engine = engine_wasm::Engine::new_headless(doc);
                     /* Issue #476 - the editor's boot fonts, not the lone
                     Liberation Sans `new_headless` holds. */

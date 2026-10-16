@@ -92,6 +92,11 @@ async function setupEngine(
         text: 'Hello world مرحبا بالعالم',
         font_id: seedFont,
         base_direction: 'RTL',
+        /* MIRRORED in `RenderConfig::shell_default` (crates/engine-wasm,
+           issue #498): the canvas-less engine every native harness uses
+           (`Engine::new_headless`) lays out with exactly these values, and
+           the Rust test `shell_default_is_the_ts_boot_config` reads this
+           block - change both together. */
         px_size: 24,
         line_height: 36,
         align: 'START',
