@@ -852,14 +852,32 @@ struct RunGeom {
     slots: Vec<CaretSlot>,
 }
 
+/// Issue #497 — one page `<canvas>` (its 2D context) and the display
+/// list last painted into it. `render_document` skips a canvas whose
+/// record equals the page's new display list, so an edit repaints only the
+/// pages it changed. `None` = paint on the next repaint (a fresh surface,
+/// or one whose inputs outside the display list — fonts, decoded images —
+/// changed, see [`Engine::forget_painted_pages`]).
+struct PageCanvas {
+    ctx: OffscreenCanvasRenderingContext2d,
+    painted: Option<render::scene::DisplayList>,
+}
+
+impl PageCanvas {
+    fn new(ctx: OffscreenCanvasRenderingContext2d) -> Self {
+        Self { ctx, painted: None }
+    }
+}
+
 #[wasm_bindgen]
 pub struct Engine {
     /// Phase 6c multi-canvas refactor — one entry per page (`None` for
     /// pages whose TS-side canvas has not been transferred yet). Index
     /// `0` is the boot canvas; later indexes are filled by
     /// `set_page_canvas` as the TS shell mounts more `<canvas>`
-    /// elements for additional pages.
-    page_ctxs: Vec<Option<OffscreenCanvasRenderingContext2d>>,
+    /// elements for additional pages. Issue #497 — each canvas also
+    /// remembers the display list last painted into it ([`PageCanvas`]).
+    page_ctxs: Vec<Option<PageCanvas>>,
     /// Legacy accessor — `page_ctxs[0]` for backwards compatibility
     /// with code paths that still expect the single-canvas world.
     /// Internal mirror only; never set independently.
@@ -1070,7 +1088,7 @@ fn assemble_engine(
     ctx: Option<OffscreenCanvasRenderingContext2d>,
     vello: Option<VelloRenderer>,
 ) -> Engine {
-    let page_ctxs = vec![ctx.clone()];
+    let page_ctxs = vec![ctx.clone().map(PageCanvas::new)];
     Engine {
         page_ctxs,
         ctx,
@@ -1201,6 +1219,9 @@ impl Engine {
     /// DPR change without leaking).
     pub fn register_image(&mut self, rel_id: String, bitmap: web_sys::ImageBitmap) {
         self.image_cache.insert(rel_id, bitmap);
+        /* Issue #497 — a page whose display list names this image paints
+        differently now, though its scene is unchanged. */
+        self.forget_painted_pages();
     }
 
     /// Phase 6c — multi-canvas DOM refactor. Register an `OffscreenCanvas`
@@ -1223,10 +1244,11 @@ impl Engine {
         while self.page_ctxs.len() <= target {
             self.page_ctxs.push(None);
         }
-        self.page_ctxs[target] = Some(ctx);
         if target == 0 {
-            self.ctx = self.page_ctxs[0].clone();
+            self.ctx = Some(ctx.clone());
         }
+        /* Issue #497 — a fresh surface has nothing painted on it. */
+        self.page_ctxs[target] = Some(PageCanvas::new(ctx));
         Ok(())
     }
 
@@ -8350,6 +8372,9 @@ impl Engine {
                     /* The font set feeds layout; stale boxes must not survive. */
                     self.layout_cache.get_mut().clear();
                     self.invalidate_layout_snapshot();
+                    /* Issue #497 — nor stale pixels: a face reloaded under
+                    the same id draws an unchanged scene differently. */
+                    self.forget_painted_pages();
                     Event::FontLoaded {
                         id,
                         metrics: bridge_metrics,
@@ -8820,6 +8845,9 @@ impl Engine {
             }
         };
         let scaled = font.metrics(px_size);
+        /* Issue #497 — this harness path draws on canvas 0 outside
+        `render_document`; its painted record no longer holds. */
+        self.forget_painted_pages();
         if let Some(ctx) = &self.ctx {
             if let Err(e) = render::canvas2d_backend::paint_alpha_glyph(
                 ctx,
@@ -8865,6 +8893,8 @@ impl Engine {
         let shaped = shape_text(&font, &text, dir, px_size);
         let scaled = font.metrics(px_size);
 
+        /* Issue #497 — as in `raster_glyph`: canvas 0 is drawn directly. */
+        self.forget_painted_pages();
         if let Some(ctx) = &self.ctx {
             let mut pen_x = POC_BASELINE_X;
             let pen_y = POC_BASELINE_Y;
@@ -9284,6 +9314,7 @@ impl Engine {
     /// context, which cannot be re-transferred.
     fn reset_session_state(&mut self) {
         self.fonts.clear();
+        self.forget_painted_pages();
         self.font_priority.clear();
         self.install_undo_stack(UndoStack::new(DocumentTree::new(), UNDO_CAP));
         self.layout_cfg = None;
@@ -11351,16 +11382,27 @@ impl Engine {
         let _ = clip;
         let image_cache = &self.image_cache;
         for (idx, page) in pages.iter().enumerate() {
-            let Some(ctx_opt) = self.page_ctxs.get(idx) else {
-                continue;
-            };
-            let Some(ctx) = ctx_opt.clone() else {
+            let Some(Some(slot)) = self.page_ctxs.get_mut(idx) else {
                 continue;
             };
             let page_scene = render::scene::build_single_page_scene(page);
-            let canvas = ctx.canvas();
+            let canvas = slot.ctx.canvas();
             let want_w = page.size.width.max(1.0).ceil() as u32;
             let want_h = page.size.height.max(1.0).ceil() as u32;
+            /* Issue #497 — a canvas that already shows exactly this
+            display list keeps its pixels: an edit near the top of a
+            fully laid-out document used to re-rasterize every page
+            (30 of them on tests/perf/tables-30p.docx) on every keystroke.
+            The display list is the renderer's sole input; what it reads
+            besides (the font map, the decoded images) clears the record
+            when it changes (`forget_painted_pages`). */
+            if canvas.width() == want_w
+                && canvas.height() == want_h
+                && slot.painted.as_ref() == Some(&page_scene)
+            {
+                continue;
+            }
+            slot.painted = None;
             if canvas.width() != want_w {
                 canvas.set_width(want_w);
             }
@@ -11369,7 +11411,7 @@ impl Engine {
             }
             let clip_rect = Rect::new(0.0, 0.0, f64::from(want_w), f64::from(want_h));
             if let Err(e) = render_canvas2d(
-                &ctx,
+                &slot.ctx,
                 &page_scene,
                 &mut self.atlas,
                 |id| self.fonts.get(id).cloned(),
@@ -11381,6 +11423,7 @@ impl Engine {
                     format!("paint page {idx}: {e:?}"),
                 )));
             }
+            slot.painted = Some(page_scene);
         }
 
         self.last_paint_ms = (now_ms() - paint_t0) as f32;
@@ -11731,7 +11774,21 @@ impl Engine {
         self.do_request_paint(rect, None)
     }
 
+    /// Issue #497 — every page canvas repaints on the next
+    /// `render_document`, unchanged display list or not: called when an
+    /// input the display list does not carry changes (the font map, the
+    /// decoded-image cache) and before an explicit `RequestPaint`.
+    fn forget_painted_pages(&mut self) {
+        for slot in self.page_ctxs.iter_mut().flatten() {
+            slot.painted = None;
+        }
+    }
+
     fn do_request_paint(&mut self, viewport: BridgeRect, dirty: Option<BridgeRect>) -> Event {
+        /* Issue #497 — an explicit paint request repaints every canvas
+        (the shell's boot settle frame, a newly registered page canvas);
+        only the automatic repaint after an edit skips unchanged pages. */
+        self.forget_painted_pages();
         let drained = self.dirty.drain();
         let region = dirty
             .map(bridge_to_kurbo)
@@ -17593,6 +17650,7 @@ impl Engine {
         self.caret_affinity = CaretAffinity::default();
         self.a11y_cache = None;
         self.image_cache.clear();
+        self.forget_painted_pages();
         self.last_paint_dims = LastPaintDims::default();
         self.layout_cache.get_mut().clear();
         /* Issue #77 — a document opens in the result view. */
