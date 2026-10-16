@@ -34,14 +34,17 @@ use std::mem::size_of;
 
 /// Estimated bytes of cached paragraph boxes kept across paints.
 ///
-/// Measured on the perf fixtures (see `profile_paragraph_cache_sizing`):
-/// `500p.docx` is 10 000 paragraphs and ~110 MiB of boxes at native
-/// pointer width (a 64-bit `PositionedGlyph` is 96 bytes, wasm32's is
-/// smaller, so native is the upper bound). The budget leaves a real
-/// 500-page document — denser than the synthetic fixture — headroom.
+/// Measured on the perf fixtures (`profile_paragraph_cache_sizing`, native
+/// pointer width — wasm32's boxes are smaller, so native is the upper
+/// bound): `50p` 1 000 paragraphs / 11.3 MiB, `250p` 5 000 / 56.3 MiB,
+/// `500p` 10 000 paragraphs / 112.6 MiB (11 808 B per paragraph of ~110
+/// glyphs, 107 B per glyph; a 64-bit `PositionedGlyph` is 96 bytes). The
+/// budget is 1.7x the 500-page fixture (more on wasm32, whose boxes are a
+/// quarter smaller), which leaves a real 500-page document — denser than
+/// the synthetic fixture — and a PDF export's second set of scale-1.0
+/// keys some headroom. The 4096-entry cap it replaces pinned only 46 MiB
+/// and fit neither the 250p nor the 500p fixture.
 pub(crate) const PARAGRAPH_CACHE_BUDGET_BYTES: usize = 192 << 20;
-/// A box estimated larger than this is laid out every time, uncached.
-pub(crate) const PARAGRAPH_CACHE_MAX_ENTRY_BYTES: usize = PARAGRAPH_CACHE_BUDGET_BYTES / 8;
 /// Sanity ceiling on the entry count, on top of the byte budget (an empty
 /// paragraph box is ~200 bytes, so the bytes alone would admit ~1M of
 /// them; the LRU's bookkeeping is per entry).
@@ -54,9 +57,11 @@ struct CachedParagraph {
     bytes: usize,
 }
 
-/// Hit / miss counts of [`ParagraphCache::get`] since creation (profiling;
-/// a hit that fails the verified-hit check still counts as a hit here —
-/// the mismatch is reported by `LayoutDegradeReason::CacheMismatch`).
+/// Hit / miss counts of [`ParagraphCache::get`] since creation (tests and
+/// profiling; a hit that fails the verified-hit check still counts as a
+/// hit here — the mismatch is reported by
+/// `LayoutDegradeReason::CacheMismatch`).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ParagraphCacheStats {
     pub(crate) hits: u64,
@@ -72,6 +77,7 @@ pub(crate) struct ParagraphCache {
     budget_bytes: usize,
     max_entry_bytes: usize,
     max_entries: usize,
+    #[cfg(test)]
     stats: ParagraphCacheStats,
 }
 
@@ -81,8 +87,9 @@ impl ParagraphCache {
         Self::with_limits(PARAGRAPH_CACHE_BUDGET_BYTES, PARAGRAPH_CACHE_MAX_ENTRIES)
     }
 
-    /// A cache with explicit byte and entry limits (tests, profiling). A
-    /// box over an eighth of `budget_bytes` is not cached.
+    /// A cache with explicit byte and entry limits. A box estimated at
+    /// over an eighth of `budget_bytes` is laid out every time, uncached
+    /// (it would evict most of the cache to make room for itself).
     pub(crate) fn with_limits(budget_bytes: usize, max_entries: usize) -> Self {
         Self {
             entries: LruCache::unbounded(),
@@ -90,22 +97,21 @@ impl ParagraphCache {
             budget_bytes,
             max_entry_bytes: budget_bytes / 8,
             max_entries: max_entries.max(1),
+            #[cfg(test)]
             stats: ParagraphCacheStats::default(),
         }
     }
 
     /// The cached box for `key`, marked most recently used.
     pub(crate) fn get(&mut self, key: &u64) -> Option<&ParagraphBox> {
-        match self.entries.get(key) {
-            Some(entry) => {
-                self.stats.hits += 1;
-                Some(&entry.laid)
-            }
-            None => {
-                self.stats.misses += 1;
-                None
-            }
+        let found = self.entries.get(key);
+        #[cfg(test)]
+        if found.is_some() {
+            self.stats.hits += 1;
+        } else {
+            self.stats.misses += 1;
         }
+        found.map(|entry| &entry.laid)
     }
 
     pub(crate) fn contains(&self, key: &u64) -> bool {
@@ -143,26 +149,31 @@ impl ParagraphCache {
         }
     }
 
-    /// Number of cached paragraph boxes.
+    /// Number of cached paragraph boxes (tests / profiling).
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Estimated bytes held by the cached boxes.
+    /// Estimated bytes held by the cached boxes (tests / profiling).
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// The byte budget this cache evicts to.
+    /// The byte budget this cache evicts to (tests / profiling).
+    #[cfg(test)]
     pub(crate) fn budget_bytes(&self) -> usize {
         self.budget_bytes
     }
 
-    /// Hit / miss counts since creation (profiling).
+    /// Hit / miss counts since creation (tests / profiling).
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> ParagraphCacheStats {
         self.stats
     }
