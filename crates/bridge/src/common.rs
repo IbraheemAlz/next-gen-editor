@@ -328,6 +328,21 @@ pub enum Script {
     Unknown,
 }
 
+/// Issue #472 — the default faces for one script: what text in `script`
+/// is shaped with when its run names no font family (or a family nothing
+/// resolves), in preference order. `ids` are loaded font ids. The engine
+/// keeps the scripts its font stack distinguishes - `Latin`, `Arabic`,
+/// `Common` (script-neutral text) - and treats every other script as
+/// `Unknown` (one shared list). An id that is not loaded, or does not
+/// cover Latin / Arabic text for those two scripts, is skipped when the
+/// list is applied (see `text_pipeline::FontStack::with_priority`).
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct FontPriority {
+    pub script: Script,
+    pub ids: Vec<String>,
+}
+
 /// Resolved (fully-specified) inline text attributes at a position or range.
 /// The sparse-patch counterpart is [`crate::TextAttrsPatch`].
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]

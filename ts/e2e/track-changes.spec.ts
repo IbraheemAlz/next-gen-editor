@@ -274,12 +274,16 @@ test('select two table rows in review mode, Delete, accept', async ({ page }) =>
     const sidebar = page.getByRole('complementary', { name: 'Track changes' });
     const rows = sidebar.locator('.nge-tc__row');
     await sidebar.getByRole('button', { name: 'Refresh' }).click();
-    await expect(rows).toHaveCount(2);
+    /* Issue #440 — the cells' deleted text is listed too (depth 1), each
+       row change ahead of its cells: 2 rows + 2 × 2 cell texts. */
+    await expect(rows).toHaveCount(6);
     await expect(rows.first()).toContainText('Table row deleted');
     await expect(rows.first()).toContainText('row 1');
+    await expect(rows.first()).toHaveAttribute('data-depth', '1');
 
     await rows.first().getByRole('button', { name: 'Accept revision' }).click();
-    await expect(rows).toHaveCount(1);
+    /* The row went, its cells' text changes with it. */
+    await expect(rows).toHaveCount(3);
     await expect(tableRows).toHaveCount(2);
 
     await run(page, [{ type: 'ACCEPT_ALL_REVISIONS' }]);

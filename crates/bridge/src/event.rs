@@ -7,8 +7,8 @@ use crate::command::{
     BridgeCellBorders, BridgeTabStop, FontSlot, HeaderFooterArea, PageOrientation,
 };
 use crate::common::{
-    Alignment, Color, Direction, DocFormat, ImageRect, LogicalPos, LogicalRange, Rect,
-    RendererDowngrade, Script, SelectionKind, TextAttrs,
+    Alignment, Color, Direction, DocFormat, FontPriority, ImageRect, LogicalPos, LogicalRange,
+    Rect, RendererDowngrade, Script, SelectionKind, TextAttrs,
 };
 
 /// `serde(default)` for the user-zoom fields: an absent value means the
@@ -553,6 +553,13 @@ pub enum Event {
     FontMissing {
         script: Script,
         requested: String,
+    },
+    /// Issue #472 - reply to `Command::SetFontPriority`: the EFFECTIVE
+    /// per-script default faces now in force (loaded ids, covering the
+    /// script, in declared order); a script whose declared list resolved to
+    /// nothing is absent.
+    FontPriorityApplied {
+        priorities: Vec<FontPriority>,
     },
 
     /* Errors */

@@ -153,6 +153,7 @@ export const COMMAND_FACADE: { readonly [K in CommandType]: FacadeTarget<K> } = 
     RESOLVE_COMMENT: 'resolveComment',
     REPLY_TO_COMMENT: 'replyToComment',
     MODIFY_STYLE: 'modifyStyle',
+    SET_FONT_PRIORITY: 'internal', // FontRegistry.applyScriptDefaults (issue #472)
 };
 
 /** What a facade member dispatches: live command types, `'host'` (a host

@@ -49,6 +49,8 @@ mod table_markup;
 mod table_merge;
 mod theme;
 mod tracked_coverage;
+mod tracked_nesting;
+mod tracked_structure;
 
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
@@ -385,6 +387,10 @@ fn run_default() -> Result<()> {
     /* Step 61 — issue #471: a merge enclosing earlier merges saves and
     re-reads with the same grid; one cutting a merge is refused. */
     table_merge::run_table_merge_roundtrip()?;
+    /* Step 62 — issue #440: revisions inside a table nested in a cell. */
+    tracked_nesting::run_nested_table_revisions_roundtrip()?;
+    /* Step 63 — issue #442: structural edits recorded in review mode. */
+    tracked_structure::run_tracked_structure_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -5145,6 +5151,41 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 },
             },
         },
+        /* Issue #328 — page borders / line numbers (the visual-diff
+        `page-borders` / `line-numbers` goldens load them). Zero-edit
+        drift 0: the typed `<w:pgBorders>` / `<w:lnNumType>` re-parse
+        equal, so the `<w:sectPr>` bytes replay verbatim. */
+        PrebuiltFixture {
+            name: "page_borders.docx",
+            bytes: format_docx::test_fixtures::page_borders_docx(),
+            entry: page_decor_fixture_entry(
+                format_docx::test_fixtures::PAGE_DECOR_TEXTS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            ),
+        },
+        PrebuiltFixture {
+            name: "line_numbers.docx",
+            bytes: format_docx::test_fixtures::line_numbers_docx(),
+            entry: page_decor_fixture_entry({
+                let [a, b, c] = format_docx::test_fixtures::PAGE_DECOR_TEXTS;
+                [a, b, format_docx::test_fixtures::SUPPRESSED_TEXT, c]
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect()
+            }),
+        },
+        /* Issue #328 — drop caps (`<w:framePr w:dropCap>` rides the
+        pPr grab bag; the visual-diff `drop-cap` golden loads it). */
+        PrebuiltFixture {
+            name: "drop_cap.docx",
+            bytes: format_docx::test_fixtures::drop_cap_docx(),
+            entry: page_decor_fixture_entry({
+                let [a, b] = format_docx::test_fixtures::DROP_CAP_TEXTS;
+                ["D", a, "M", b].iter().map(|t| t.to_string()).collect()
+            }),
+        },
         /* Issue #326 — automatic hyphenation on / off (the visual-diff
         `hyphenation` / `hyphenation-off` goldens load them). Zero-edit
         drift 0; the default harness's step 59i–k edits both. */
@@ -5162,6 +5203,21 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
 }
 
 /// Issue #326 — the manifest entry both hyphenation fixtures share.
+/// Issue #328 — the manifest entry of a page-decoration fixture.
+fn page_decor_fixture_entry(texts: Vec<String>) -> FixtureEntry {
+    FixtureEntry {
+        generator: "handcrafted".into(),
+        phase_introduced: 12,
+        asserts: FixtureAsserts {
+            paragraph_count: texts.len() as u32,
+            paragraph_texts: texts,
+        },
+        roundtrip: RoundtripBounds {
+            document_xml_drift_bytes: 0,
+        },
+    }
+}
+
 fn hyphenation_fixture_entry() -> FixtureEntry {
     let texts = format_docx::test_fixtures::HYPHENATION_TEXTS;
     FixtureEntry {

@@ -45,6 +45,8 @@ importers:
         specifier: ^7.0.0
         version: 7.0.0
 
+  tools/lib: {}
+
   tools/memory-profile:
     devDependencies:
       playwright:

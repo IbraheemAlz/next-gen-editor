@@ -25,6 +25,83 @@ export async function boot(page: Page): Promise<void> {
     });
 }
 
+/** The editor viewport's scroll metrics (CSS px). */
+export interface ViewportScroll {
+    scrollTop: number;
+    scrollHeight: number;
+    clientHeight: number;
+}
+
+/** Read `.editor-viewport`'s scroll metrics without touching them. */
+export async function viewportScroll(page: Page): Promise<ViewportScroll> {
+    return page.evaluate(() => {
+        const v = document.querySelector<HTMLElement>('.editor-viewport')!;
+        return { scrollTop: v.scrollTop, scrollHeight: v.scrollHeight, clientHeight: v.clientHeight };
+    });
+}
+
+/* Issue #473 - WHY a scroll precondition must be re-applied and checked for
+ * stability, not set once.
+ *
+ * Two things move `.editor-viewport.scrollTop` behind a test's back:
+ *
+ *  1. A pending caret reveal. Every selection move (`SET_SELECTION` too)
+ *     stamps `SELECTION_CHANGED.reveal_caret`; the shell scrolls the caret
+ *     into view one frame later (rAF, with a 120 ms timer as the hidden-tab
+ *     fallback - `createCaretReveal`). A spec that dispatches `caretAt(0)`
+ *     and immediately scrolls away can have that reveal land AFTER its
+ *     scroll and pull the viewport back to the caret (`scrollTop` 104, the
+ *     caret's reveal position): the merge-gate flake read 104 for the whole
+ *     5 s poll, because nothing ever scrolls away again.
+ *  2. Lazy layout. The document is laid out in bands (`LazyLayoutState` +
+ *     `Command::ExpandLayout`) and `scrollHeight` only grows as they land,
+ *     so a single `scrollTop = n` clamps to the height that exists at that
+ *     instant, and nothing re-applies it.
+ *
+ * So the scroll is applied, given a settle window, then read back. */
+
+/** Scroll `.editor-viewport` to `target` CSS px from the top and prove it
+ *  STAYED there: each attempt writes `scrollTop`, waits two frames plus a
+ *  150 ms timer (queued after the caret reveal's 120 ms fallback timer, so a
+ *  pending reveal has fired by then, and after the rAF that turns the scroll
+ *  event into an `EXPAND_LAYOUT`), and reads it back. A document that is
+ *  still too short is waited for - the next attempt re-raises the scroll
+ *  event that drives the expansion. Resolves with the achieved metrics
+ *  (`scrollTop >= target`); on timeout throws with the achieved
+ *  `scrollHeight` / `clientHeight`, which tells a still-growing layout from
+ *  a document that is too short for `target`. */
+export async function scrollViewportTo(
+    page: Page,
+    target: number,
+    opts: { timeout?: number } = {},
+): Promise<ViewportScroll> {
+    const deadline = Date.now() + (opts.timeout ?? 30_000);
+    for (;;) {
+        const got = await page.evaluate(async (y) => {
+            const v = document.querySelector<HTMLElement>('.editor-viewport')!;
+            v.scrollTop = y;
+            await new Promise<void>((resolve) =>
+                requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 150))),
+            );
+            return {
+                scrollTop: v.scrollTop,
+                scrollHeight: v.scrollHeight,
+                clientHeight: v.clientHeight,
+            };
+        }, target);
+        if (got.scrollTop >= target - 1) return got;
+        if (Date.now() >= deadline) {
+            throw new Error(
+                `could not scroll .editor-viewport to ${target}px: reached ${got.scrollTop}px ` +
+                    `(scrollHeight ${got.scrollHeight}, clientHeight ${got.clientHeight}, so the ` +
+                    `laid-out document allows at most ${got.scrollHeight - got.clientHeight}px) - ` +
+                    'either the lazy layout never grew, a caret reveal keeps pulling the view ' +
+                    'back, or the document is too short',
+            );
+        }
+    }
+}
+
 /** The whole document as plain text (paragraphs joined by the engine). Goes
  *  through the worker queue, so it observes every command already posted. */
 export async function documentText(page: Page): Promise<string> {

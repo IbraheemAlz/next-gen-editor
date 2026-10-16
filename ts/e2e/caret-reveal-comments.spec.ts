@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Locator } from '@playwright/test';
-import { boot, settle } from './helpers/editor';
+import { boot, settle, viewportScroll } from './helpers/editor';
 
 /* Issue #387 — through the REAL worker + WASM engine and the shell:
  *
@@ -84,7 +84,14 @@ test('arrow down 60 lines scrolls the caret into view; a pointer click does not 
         await settle(page);
     }
 
-    await expect.poll(() => scrollTop(page), { timeout: 10_000 }).toBeGreaterThan(300);
+    /* 60 lines is well past the first screen, so the view must have moved by
+       more than half a viewport - relative to the ACHIEVED viewport height,
+       not a fixed pixel count (issue #473: a fixed offset is a precondition
+       on the window size and on how much the lazy layout has grown). */
+    const { clientHeight } = await viewportScroll(page);
+    await expect
+        .poll(() => scrollTop(page), { timeout: 10_000 })
+        .toBeGreaterThan(clientHeight / 2);
     await expect.poll(() => caretVisible(page), { timeout: 10_000 }).toBe(true);
     /* The engine caret really is 60 lines down. */
     const caretPara = await page.evaluate(async () => {

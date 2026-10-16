@@ -82,16 +82,27 @@ mod tracked_paste_tests;
 mod tracked_table_tests;
 #[cfg(test)]
 mod tracked_tests;
-pub use text_remap::TextEdit;
+pub use revisions::{MAX_REVISION_TABLE_DEPTH, for_each_paragraph_nested};
 use text_remap::join_at_seam;
+pub use text_remap::{
+    TextEdit, check_revision_ranges, hyperlinks_through_edit, revisions_through_edit,
+};
 pub use tracked::{TrackedDeletion, TrackedEditError};
 pub mod html;
 pub mod numbering;
 pub mod package;
+pub mod page_decor;
+pub use page_decor::{
+    DropCap, DropCapKind, LineNumberRestart, LineNumbering, PageBorderDisplay, PageBorderOffset,
+    PageBorders,
+};
 /// Issue #345 — `w:documentProtection` model + form-region predicates.
 pub mod protection;
 pub mod run_content;
 pub mod snapshot;
+/// Issue #467 — the input boundary's text normalisation (one table for
+/// every door text enters the model by).
+pub mod text_input;
 pub mod theme;
 
 pub mod toc;
@@ -751,6 +762,12 @@ pub struct Section {
     pub footnote_props: NoteProps,
     /// Issue #80 — `<w:sectPr><w:endnotePr>` overrides.
     pub endnote_props: NoteProps,
+    /// Issue #328 — `<w:pgBorders>`; `None` = no page border.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_borders: Option<PageBorders>,
+    /// Issue #328 — `<w:lnNumType>`; `None` = no line numbering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_numbering: Option<LineNumbering>,
     /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes this section
     /// was read from (see [`SectionProps::source_xml`]).
     #[serde(default, with = "serde_bytes")]
@@ -920,6 +937,12 @@ pub struct SectionProps {
     pub footnote_props: NoteProps,
     /// Issue #80 — `<w:endnotePr>` overrides.
     pub endnote_props: NoteProps,
+    /// Issue #328 — `<w:pgBorders>`; `None` = no page border.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_borders: Option<PageBorders>,
+    /// Issue #328 — `<w:lnNumType>`; `None` = no line numbering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_numbering: Option<LineNumbering>,
     /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes these
     /// properties were read from. The `.docx` writer re-emits them
     /// verbatim as long as a re-parse of the bytes still yields these
@@ -948,6 +971,8 @@ impl SectionProps {
             section_type: self.section_type,
             footnote_props: self.footnote_props,
             endnote_props: self.endnote_props,
+            page_borders: self.page_borders,
+            line_numbering: self.line_numbering,
             source_xml: self.source_xml,
         }
     }
@@ -974,6 +999,8 @@ impl From<&Section> for SectionProps {
             section_type: s.section_type,
             footnote_props: s.footnote_props,
             endnote_props: s.endnote_props,
+            page_borders: s.page_borders.clone(),
+            line_numbering: s.line_numbering,
             source_xml: s.source_xml.clone(),
         }
     }
@@ -5019,19 +5046,15 @@ impl Paragraph {
                 })
             })
             .collect();
-        out.revisions = self
-            .revisions
-            .iter()
-            .filter_map(|r| {
-                let (ns, ne) = (map_start(r.start), map_end(r.end));
-                (ns < ne).then(|| {
-                    let mut nr = r.clone();
-                    nr.start = ns;
-                    nr.end = ne;
-                    nr
-                })
-            })
-            .collect();
+        /* Issue #283 — revisions through the one range rule. */
+        out.revisions = revisions_through_edit(
+            &self.revisions,
+            TextEdit {
+                at: start,
+                removed: old_len,
+                inserted: rep_len,
+            },
+        );
         out.fields = self
             .fields
             .iter()
@@ -7647,29 +7670,16 @@ impl DocumentTree {
             /* Issue #242 — hyperlinks follow their text the same way
             (typing at either boundary stays outside the link); a stale
             range re-anchored every link of an edited paragraph onto the
-            wrong bytes on save. */
-            for h in &mut para.hyperlinks {
-                if h.start >= off {
-                    h.start += len;
-                    h.end += len;
-                } else if h.end > off {
-                    h.end += len;
-                }
-            }
-            /* Issue #247 — tracked-change overlays (a move, an ins / del
-            read from the file) follow their text like a span: typing at
-            a revision's start stays outside it (shift), strictly inside
-            grows it, at its end stays outside. `tracked_insert_text`
-            builds on this shift (a Delete it lands in grows and is split
-            back around the new insertion there). */
-            for r in &mut para.revisions {
-                if r.start >= off {
-                    r.start += len;
-                }
-                if r.end > off {
-                    r.end += len;
-                }
-            }
+            wrong bytes on save. Issues #247 / #283 — so do the
+            tracked-change overlays (a move, an ins / del read from the
+            file, a formatting change): typing at a revision's start
+            stays outside it (shift), strictly inside grows it, at its
+            end stays outside — the ONE range rule
+            (`Paragraph::shift_revisions`, through the same `TextEdit`
+            the source markup and the comment anchors see).
+            `tracked_insert_text` builds on this shift (a Delete it lands
+            in grows and is split back around the new insertion there). */
+            para.remap_range_overlays(e);
             /* Issue #69 / #80 — inline-object anchors (images, note
             references) slide right with their sentinel byte. Typing
             exactly AT the anchor inserts before it (the sentinel keeps its
@@ -11935,14 +11945,9 @@ fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) -> 
             h.end += sentinel_len;
         }
     }
-    for r in &mut para.revisions {
-        if r.start >= off {
-            r.start += sentinel_len;
-        }
-        if r.end >= off {
-            r.end += sentinel_len;
-        }
-    }
+    /* Issue #283 — the one revision range rule: an object inserted at a
+    revision's end stays outside it (it is not part of that change). */
+    para.shift_revisions(edit);
     for f in &mut para.fields {
         if f.start >= off {
             f.start += sentinel_len;

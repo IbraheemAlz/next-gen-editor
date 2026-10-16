@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { boot, settle } from './helpers/editor';
+import { boot, scrollViewportTo, settle, viewportScroll } from './helpers/editor';
 
 /* Issue #465 — through the real worker + WASM engine and the shell:
  *   - a comment (ranged or on a point) draws a dotted connector path from
@@ -125,21 +125,35 @@ test('clicking a card selects the commented text and reveals it', async ({ page 
     const card = page.locator('.nge-cm__card');
     await expect(card).toHaveCount(1);
 
-    /* Scroll the caret far away, then click the card text. */
+    /* Scroll the caret far away, then click the card text. A single
+       `scrollTop = 1200` is not a precondition (issue #473: it read 104
+       under load and nothing ever re-applied it) - the reveal that
+       `caretAt(0)` queued can land after it and pull the view back to the
+       caret, and the lazy layout clamps it to the height laid out so far.
+       `scrollViewportTo` re-applies the scroll until it has STAYED at 1200
+       through a settle window and returns what it achieved. */
     await dispatch(page, caretAt(0));
-    await page.evaluate(() => {
-        document.querySelector<HTMLElement>('.editor-viewport')!.scrollTop = 1200;
-    });
-    await expect
-        .poll(() =>
-            page.evaluate(() => document.querySelector<HTMLElement>('.editor-viewport')!.scrollTop),
-        )
-        .toBeGreaterThan(500);
+    const far = await scrollViewportTo(page, 1200);
+    expect(far.scrollHeight).toBeGreaterThanOrEqual(far.scrollTop + far.clientHeight);
+    expect((await viewportScroll(page)).scrollTop).toBeGreaterThanOrEqual(far.scrollTop - 1);
     await card.locator('.nge-cm__text').click();
     await expect(card).toHaveClass(/nge-cm__card--active/);
+    /* Revealed = scrolled back up from where it was AND the selected text is
+       inside the viewport (not a fixed pixel offset). */
     await expect
-        .poll(() =>
-            page.evaluate(() => document.querySelector<HTMLElement>('.editor-viewport')!.scrollTop),
-        )
-        .toBeLessThan(100);
+        .poll(async () => (await viewportScroll(page)).scrollTop)
+        .toBeLessThan(far.scrollTop);
+    await expect.poll(() => selectionRevealed(page)).toBe(true);
 });
+
+/** Whether the first selection rect (the commented text the card selected)
+ *  lies fully inside the viewport's visible box. */
+async function selectionRevealed(page: Page): Promise<boolean> {
+    return page.evaluate(() => {
+        const v = document.querySelector<HTMLElement>('.editor-viewport')!.getBoundingClientRect();
+        const el = document.querySelector<HTMLElement>('.selection-rect');
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.height > 0 && r.top >= v.top && r.bottom <= v.bottom;
+    });
+}

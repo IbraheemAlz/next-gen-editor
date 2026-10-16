@@ -506,6 +506,14 @@ pub struct FontStack {
     /// each face under its own id's key, then under every `name`-table
     /// family name. Sorted, deduplicated.
     by_family: HashMap<String, Vec<FontId>>,
+    /// Issue #472 — the **explicit** per-script priority: the face ids a
+    /// caller declared (via [`FontStack::with_priority`]) as the default
+    /// for a script, in preference order. Consulted BEFORE the id-sorted
+    /// `by_script` list and the fallback chain, so "Latin text with no
+    /// family goes to Liberation Sans" no longer depends on how the faces
+    /// happen to be named. Only ids that are loaded (and, for Latin /
+    /// Arabic, cover the script) are kept.
+    priority: HashMap<Script, Vec<FontId>>,
 }
 
 impl FontStack {
@@ -561,7 +569,61 @@ impl FontStack {
             by_script,
             fallback_chain,
             by_family,
+            priority: HashMap::new(),
         }
+    }
+
+    /// Issue #472 — declare the default faces for `script`, in preference
+    /// order, and return the stack (builder form of
+    /// [`Self::set_priority`]).
+    ///
+    /// [`Self::resolve`] for a run that names no family (or a family nothing
+    /// resolves) walks, in this order: the script's **priority** list, then
+    /// the faces that cover the script sorted by id, then the fallback
+    /// chain (the primary face, then every face by id). Without a priority
+    /// the order is by id alone, which is how a dual-script face such as
+    /// Amiri (`amiri` < `liberation`) used to win Latin text.
+    ///
+    /// An id that is not loaded is skipped; so is a face that does not
+    /// cover the script (Latin is probed with `A`, Arabic with BEH, the
+    /// same probes [`Self::from_faces`] classifies with). `Script::Common`
+    /// and `Script::Other` have no probe, so any loaded id is accepted for
+    /// them. A later call for the same script replaces the earlier list.
+    pub fn with_priority<S: AsRef<str>>(mut self, script: Script, ids: &[S]) -> Self {
+        self.set_priority(script, ids);
+        self
+    }
+
+    /// Issue #472 — [`Self::with_priority`] in place. An empty (or fully
+    /// filtered-out) list clears the script's priority.
+    pub fn set_priority<S: AsRef<str>>(&mut self, script: Script, ids: &[S]) {
+        let probe = match script {
+            Script::Arabic => Some('\u{0628}'),
+            Script::Latin => Some('A'),
+            Script::Common | Script::Other => None,
+        };
+        let mut ordered: Vec<FontId> = Vec::new();
+        for id in ids {
+            let id = id.as_ref();
+            let Some(face) = self.faces.get(id) else {
+                continue;
+            };
+            if probe.is_some_and(|c| !face.covers(c)) || ordered.iter().any(|o| o == id) {
+                continue;
+            }
+            ordered.push(id.to_string());
+        }
+        if ordered.is_empty() {
+            self.priority.remove(&script);
+        } else {
+            self.priority.insert(script, ordered);
+        }
+    }
+
+    /// Issue #472 — the effective explicit priority for `script` (loaded,
+    /// covering ids in the order they were declared); empty when none.
+    pub fn priority(&self, script: Script) -> &[FontId] {
+        self.priority.get(&script).map_or(&[], Vec::as_slice)
     }
 
     /// Issue #329 — the loaded face a document's `family` name stands for
@@ -594,7 +656,9 @@ impl FontStack {
                 metrics_id: None,
             });
         }
-        if let Some((id, face)) = self.pick_family(&family_key(family), None, bold, italic) {
+        if let Some((id, face)) =
+            self.pick_family(&family_key(family), None, bold, italic, Some(script))
+        {
             return Some(FamilyResolution {
                 id,
                 face,
@@ -605,11 +669,17 @@ impl FontStack {
         let class = ScriptClass::of(script);
         let row = substitution_for(family, class)?;
         let (id, face) = row.substitutes.iter().find_map(|name| {
-            self.pick_family(&family_key(name), Some(class.probe()), bold, italic)
+            self.pick_family(
+                &family_key(name),
+                Some(class.probe()),
+                bold,
+                italic,
+                Some(script),
+            )
         })?;
         let metrics_id = row
             .metrics_from
-            .and_then(|m| self.pick_family(&family_key(m), None, false, false))
+            .and_then(|m| self.pick_family(&family_key(m), None, false, false, None))
             .map(|(id, _)| id);
         Some(FamilyResolution {
             id,
@@ -621,14 +691,23 @@ impl FontStack {
 
     /// The face answering to family `key` (see [`Self::resolve_family`]):
     /// one covering `probe` when given, the weight / slant match first.
+    ///
+    /// Issue #472 — when several loaded faces answer to one name (the same
+    /// family registered under two ids, a regular and a bold file, …) the
+    /// ones in `script`'s explicit [priority](Self::with_priority) come
+    /// first, in declared order; the rest keep their id order. The
+    /// substitution row's own family order is untouched: it is the
+    /// document's mapping, the priority only orders faces that answer to
+    /// the same name.
     fn pick_family(
         &self,
         key: &str,
         probe: Option<char>,
         bold: bool,
         italic: bool,
+        script: Option<Script>,
     ) -> Option<(&FontId, &LoadedFont)> {
-        let candidates: Vec<(&FontId, &LoadedFont)> = self
+        let mut candidates: Vec<(&FontId, &LoadedFont)> = self
             .by_family
             .get(key)?
             .iter()
@@ -636,6 +715,11 @@ impl FontStack {
             .map(|(id, face)| (id, face.as_ref()))
             .filter(|(_, face)| probe.is_none_or(|c| face.covers(c)))
             .collect();
+        if let Some(ranked) = script.and_then(|s| self.priority.get(&s)) {
+            /* Stable: ties (ids outside the priority) keep id order. */
+            candidates
+                .sort_by_key(|(id, _)| ranked.iter().position(|r| r == *id).unwrap_or(usize::MAX));
+        }
         candidates
             .iter()
             .find(|(_, face)| face.is_bold() == bold && face.is_italic() == italic)
@@ -701,8 +785,14 @@ impl FontStack {
                 metrics_id: None,
             }
         }
+        /* Issue #472 — the explicit priority first, then the id-sorted
+        covering faces, then the fallback chain. */
+        let explicit = self.priority.get(&script).into_iter().flatten();
         let preferred = self.by_script.get(&script).into_iter().flatten();
-        let chain: Vec<&FontId> = preferred.chain(self.fallback_chain.iter()).collect();
+        let chain: Vec<&FontId> = explicit
+            .chain(preferred)
+            .chain(self.fallback_chain.iter())
+            .collect();
         /* A real variant whose own metadata matches the request — no faux. */
         for id in &chain {
             if let Some((key, face)) = self.faces.get_key_value(*id)
@@ -982,6 +1072,121 @@ mod tests {
             .resolve(Script::Latin, Some("Times New Roman"), true, false)
             .expect("resolve");
         assert!(synth.faux_bold);
+    }
+
+    /* Issue #472 — the explicit per-script priority. `amiri` sorts before
+    `liberation` and covers Latin too, so by id alone it wins Latin text
+    (the interactive editor's bug); the priority declares the Latin face
+    without renaming anything. */
+    fn resolve_id(stack: &FontStack, script: Script, family: Option<&str>) -> String {
+        stack
+            .resolve(script, family, false, false)
+            .map(|(id, _, _)| id.clone())
+            .expect("a face")
+    }
+
+    /// `n` copies of Liberation Sans under the given ids.
+    fn liberation_copies(ids: &[&str]) -> HashMap<FontId, Arc<LoadedFont>> {
+        let mut faces: HashMap<FontId, Arc<LoadedFont>> = HashMap::new();
+        for id in ids {
+            let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+            faces.insert(
+                (*id).to_string(),
+                Arc::new(LoadedFont::parse((*id).to_string(), bytes).expect("parse")),
+            );
+        }
+        faces
+    }
+
+    #[test]
+    fn id_order_alone_picks_the_dual_script_face_for_latin() {
+        /* The behaviour #472 fixes, pinned so the priority tests below
+        are known to change something. */
+        let stack = shipped_stack(true);
+        assert_eq!(resolve_id(&stack, Script::Latin, None), "amiri");
+        assert!(stack.priority(Script::Latin).is_empty());
+    }
+
+    #[test]
+    fn priority_puts_latin_on_the_declared_face_and_leaves_arabic_alone() {
+        let stack = shipped_stack(true).with_priority(Script::Latin, &["liberation"]);
+        assert_eq!(resolve_id(&stack, Script::Latin, None), "liberation");
+        assert_eq!(stack.priority(Script::Latin), ["liberation".to_string()]);
+        /* Liberation Sans has no Arabic and no Arabic priority is declared:
+        the id-sorted covering list still answers (`amiri` < `noto-naskh`). */
+        assert_eq!(resolve_id(&stack, Script::Arabic, None), "amiri");
+        /* An explicit family still wins over the priority. */
+        assert_eq!(resolve_id(&stack, Script::Latin, Some("amiri")), "amiri");
+    }
+
+    #[test]
+    fn arabic_priority_follows_the_configured_order() {
+        let pick = |order: &[&str]| {
+            let stack = shipped_stack(true).with_priority(Script::Arabic, order);
+            resolve_id(&stack, Script::Arabic, None)
+        };
+        assert_eq!(pick(&["amiri", "noto-naskh"]), "amiri");
+        assert_eq!(pick(&["noto-naskh", "amiri"]), "noto-naskh");
+        /* An id that is not loaded, and a face without Arabic coverage,
+        are skipped. */
+        assert_eq!(pick(&["missing", "liberation", "noto-naskh"]), "noto-naskh");
+        let stack = shipped_stack(true).with_priority(Script::Arabic, &["liberation", "missing"]);
+        assert!(stack.priority(Script::Arabic).is_empty());
+        assert_eq!(resolve_id(&stack, Script::Arabic, None), "amiri");
+        /* Duplicates collapse; a later call replaces the earlier list. */
+        let stack = shipped_stack(true)
+            .with_priority(Script::Arabic, &["noto-naskh", "noto-naskh", "amiri"])
+            .with_priority(Script::Arabic, &["amiri"]);
+        assert_eq!(stack.priority(Script::Arabic), ["amiri".to_string()]);
+    }
+
+    #[test]
+    fn scripts_without_a_priority_keep_the_primary_then_id_chain() {
+        /* `Other` / `Common` have no covering list: the fallback chain
+        answers - the primary face first, whatever it is called. */
+        let stack = shipped_stack(true).with_priority(Script::Latin, &["liberation"]);
+        assert_eq!(resolve_id(&stack, Script::Other, None), "liberation");
+        assert_eq!(resolve_id(&stack, Script::Common, None), "liberation");
+        /* No loaded primary: the first id of the chain. */
+        let stack = FontStack::from_faces(liberation_copies(&["zeta", "alpha"]), "absent");
+        assert_eq!(resolve_id(&stack, Script::Other, None), "alpha");
+        /* A priority for such a script is honoured too. */
+        let stack = stack.with_priority(Script::Other, &["zeta"]);
+        assert_eq!(resolve_id(&stack, Script::Other, None), "zeta");
+    }
+
+    #[test]
+    fn priority_face_carries_the_faux_synthesis() {
+        /* No bold file is loaded: the declared Latin face is synthesized
+        bold, not a different face picked for having "no variant". */
+        let stack = shipped_stack(true).with_priority(Script::Latin, &["liberation"]);
+        let (id, _, synth) = stack
+            .resolve(Script::Latin, None, true, true)
+            .expect("a face");
+        assert_eq!(id, "liberation");
+        assert!(synth.faux_bold && synth.faux_italic);
+    }
+
+    #[test]
+    fn priority_orders_faces_that_answer_to_one_family_name() {
+        /* The same family registered under two ids: id order picks `a-lib`;
+        the script's priority picks the declared one, through both the
+        name match and a substitution row (Arial -> Liberation Sans). */
+        let faces = liberation_copies(&["a-lib", "b-lib"]);
+        let plain = FontStack::from_faces(faces.clone(), "a-lib");
+        assert_eq!(
+            resolve_id(&plain, Script::Latin, Some("Liberation Sans")),
+            "a-lib"
+        );
+        assert_eq!(resolve_id(&plain, Script::Latin, Some("Arial")), "a-lib");
+        let ranked = FontStack::from_faces(faces, "a-lib").with_priority(Script::Latin, &["b-lib"]);
+        assert_eq!(
+            resolve_id(&ranked, Script::Latin, Some("Liberation Sans")),
+            "b-lib"
+        );
+        assert_eq!(resolve_id(&ranked, Script::Latin, Some("Arial")), "b-lib");
+        /* The Arabic slot is a different script: untouched. */
+        assert_eq!(resolve_id(&ranked, Script::Arabic, None), "a-lib");
     }
 
     /* Issue #329 — Word's line metrics, against the published vertical

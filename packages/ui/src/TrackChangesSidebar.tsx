@@ -24,6 +24,7 @@ import {
     useEngine,
     type RevisionSnapshot,
 } from '@nge/core';
+import { locationLabel } from './revisionLocation';
 import './TrackChangesSidebar.css';
 
 export interface TrackChangesSidebarProps {
@@ -169,6 +170,7 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
                                 class={`nge-tc__row nge-tc__row--${rev.kind}`}
                                 data-block={rev.block}
                                 data-revision-id={rev.revision_id}
+                                data-depth={rev.depth ?? 0}
                             >
                                 <div class="nge-tc__row-head">
                                     <span class={`nge-tc__kind nge-tc__kind--${rev.kind}`}>
@@ -178,11 +180,7 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
                                 </div>
                                 <div class="nge-tc__meta">
                                     <span>{fmtDate(rev.date)}</span>
-                                    <span class="nge-tc__loc">
-                                        {rev.row !== undefined
-                                            ? `block ${rev.block} · row ${rev.row + 1}`
-                                            : `block ${rev.block} · ${rev.start}–${rev.end}`}
-                                    </span>
+                                    <span class="nge-tc__loc">{locationLabel(rev)}</span>
                                 </div>
                                 <div class="nge-tc__actions">
                                     <button

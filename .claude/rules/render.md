@@ -32,22 +32,50 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   the table (and the face to `fonts.json` `substitutes`), never a special
   case in layout; `every_shipped_substitute_resolves_through_its_name_table`
   pins the shipped faces against it.
-- **Line pitch has two models.** A document read from a Word package
-  (`DocumentEnvelope::is_captured`, `StyleContext::word_line_metrics`)
-  lays out with Word's font-derived pitch (`layout::FontLinePitch`): a
-  line is the largest `ascent + line gap` plus the largest `descent` of
-  its runs' faces under `LoadedFont::line_metrics` (Windows Word's rule:
-  win extent + GDI external leading, typo metrics when
-  `USE_TYPO_METRICS`), × the `auto` multiple / floored by `atLeast`, the
-  extra space ABOVE the text; a runless line takes the paragraph mark's
-  face. A substituted run whose row names `metrics_from` measures that
-  face (`VisualRun::metrics_font`). Everything else (the seeded page,
-  `.txt` / `.html`, the `RenderPage` harness) keeps the configured
-  `line_height` — its goldens stay put. `exact` is the same in both.
+- **The per-script default is declared, never inferred from face ids
+  (issue #472).** A run that names no family (or one nothing resolves)
+  takes `FontStack::resolve`'s per-script default: the stack's explicit
+  **priority** for the script (`FontStack::with_priority(script, &[ids])`,
+  loaded faces that cover the script, in declared order), then the
+  id-sorted covering faces, then the fallback chain (the primary face,
+  then every face by id). Without a priority a dual-script face wins by
+  name: Amiri (`amiri` < `liberation`) used to shape the interactive
+  editor's Latin text with Amiri's glyphs. Every consumer declares the same
+  table: the shell sends `ts/public/fonts.json` `defaults_by_script`
+  (`latin: [liberation]`, `arabic: [amiri, noto-naskh]`) as
+  `Command::SetFontPriority` after the boot fonts load (and again after a
+  recovery, which wipes the engine's font setup with its font map);
+  `tools/harness-fonts` declares it as `DEFAULTS_BY_SCRIPT` (a unit test
+  pins the two together) and registers its faces under the manifest ids,
+  so no id has to sort a particular way. Build every engine-side stack
+  through `Engine::font_stack` (it applies the declared priority) — never
+  a bare `FontStack::from_faces(self.fonts.clone(), …)`. The script's
+  priority also orders faces that answer to ONE family name in
+  `resolve_family`; a substitution row's own family order stays the
+  document's mapping and wins over it. The shell's Latin default is also
+  its seed face (`cfg.font_id`, the fallback root), so script-neutral text
+  and scripts the stack does not specialise take it.
+- **Line pitch has ONE model (issue #475).** Every document — read from
+  a Word package or built in the editor (the seeded page, `.txt` /
+  `.html` opens, the `RenderPage` harness) — lays out with Word's
+  font-derived pitch (`layout::FontLinePitch`, engine-wasm
+  `paragraph_line_rule`): a line is the largest `ascent + line gap` plus
+  the largest `descent` of its runs' faces under
+  `LoadedFont::line_metrics` (Windows Word's rule: win extent + GDI
+  external leading, typo metrics when `USE_TYPO_METRICS`), × the `auto`
+  multiple / floored by `atLeast`, the extra space ABOVE the text; a
+  runless line takes the paragraph mark's face. A substituted run whose
+  row names `metrics_from` measures that face
+  (`VisualRun::metrics_font`). Only `exact` is absolute. The configured
+  `RenderConfig::line_height` sets no line's pitch any more (it is the
+  nominal fallback when no face can be measured), so a document typed
+  here lays out identically after `SaveDocx` + reopen (pinned by the
+  fuzz-native `a_typed_document_reopens_from_its_docx_with_identical_geometry`).
+  Never re-introduce a per-document pitch switch.
 - The rule is the Windows one on purpose (Arabic documents are authored
   there); Mac Word uses `hhea`. Whether Windows Word honours
   `USE_TYPO_METRICS` is unverified (Amiri: 1.758 em typo vs 2.760 em win)
-  — `word_line_metrics` is the one place to flip it.
+  — `text_pipeline::fonts::word_line_metrics` is the one place to flip it.
 
 ## Canvas2D backend
 

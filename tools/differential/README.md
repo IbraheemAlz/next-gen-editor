@@ -57,7 +57,19 @@ tools/differential/
 
 ## Running it
 
+JS dependencies (`pixelmatch`, `pngjs`) come from the **repository-root**
+install: `tools/differential` is a pnpm workspace member (the `tools/*` glob
+in `pnpm-workspace.yaml`, an importer entry in the root `pnpm-lock.yaml`), so
+`pnpm install --frozen-lockfile` at the repo root links them into
+`tools/differential/node_modules`. There is no per-directory install step -
+do not run `pnpm install` inside this directory. A fresh worktree has no
+`node_modules` at all until that root install has run in it (the symptom of
+skipping it is `Cannot find package 'pixelmatch'`; the harness now says so).
+
 ```sh
+# 0. (once per checkout / worktree) at the REPO ROOT:
+pnpm install --frozen-lockfile
+
 # 1. Build the native PDF exporter.
 cargo build -p differential-native --release
 

@@ -343,6 +343,7 @@ fn page_of(table: TableBox) -> PageBox {
         hf_role: layout::HeaderRole::Default,
         page_number: 1,
         floats: Vec::new(),
+        decor: Default::default(),
     }
 }
 
