@@ -54,7 +54,11 @@ describe('FontRegistry.applyScriptDefaults (#472)', () => {
         const effective = [{ script: 'Latin' as const, ids: ['liberation'] }];
         const { registry, sent } = registryFor(
             manifest({
-                defaults_by_script: { latin: ['liberation'], arabic: ['amiri', 'noto-naskh'] },
+                defaults_by_script: {
+                    latin: ['liberation'],
+                    arabic: ['amiri', 'noto-naskh'],
+                    common: ['liberation'],
+                },
             }),
             () => ({ type: 'FONT_PRIORITY_APPLIED', priorities: effective }),
         );
@@ -65,12 +69,16 @@ describe('FontRegistry.applyScriptDefaults (#472)', () => {
                 priorities: [
                     { script: 'Latin', ids: ['liberation'] },
                     { script: 'Arabic', ids: ['amiri', 'noto-naskh'] },
+                    /* Issue #490 - the explicit script-neutral default
+                     * (digits, punctuation, empty paragraphs, marker glyphs). */
+                    { script: 'Common', ids: ['liberation'] },
                 ],
             },
         ]);
         expect(registry.scriptDefaults()).toEqual({
             latin: ['liberation'],
             arabic: ['amiri', 'noto-naskh'],
+            common: ['liberation'],
         });
     });
 

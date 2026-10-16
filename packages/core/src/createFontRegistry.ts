@@ -71,7 +71,7 @@ export interface FontManifest {
     substitutes?: string[];
     /** Issue #472 — the default face(s) per script for text that names no
      *  font family, in preference order: keys are lower-case script names
-     *  (`latin`, `arabic`; see {@link SCRIPT_KEYS}), values an ordered id
+     *  (`latin`, `arabic`, `common`; see {@link SCRIPT_KEYS}), values an ordered id
      *  list (a bare id string is accepted). Optional: a manifest without
      *  the key leaves the engine's id-sorted fallback in force. */
     defaults_by_script?: Record<string, string | string[]>;

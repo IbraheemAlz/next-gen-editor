@@ -1,6 +1,6 @@
 //! Font loading + glyph metrics + glyph rasterization via `swash`.
 
-use crate::script::Script;
+use crate::script::{Script, script_of};
 use crate::substitution::{ScriptClass, Substitution, family_key, substitution_for};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -785,14 +785,7 @@ impl FontStack {
                 metrics_id: None,
             }
         }
-        /* Issue #472 — the explicit priority first, then the id-sorted
-        covering faces, then the fallback chain. */
-        let explicit = self.priority.get(&script).into_iter().flatten();
-        let preferred = self.by_script.get(&script).into_iter().flatten();
-        let chain: Vec<&FontId> = explicit
-            .chain(preferred)
-            .chain(self.fallback_chain.iter())
-            .collect();
+        let chain: Vec<&FontId> = self.walk_order(script).collect();
         /* A real variant whose own metadata matches the request — no faux. */
         for id in &chain {
             if let Some((key, face)) = self.faces.get_key_value(*id)
@@ -824,15 +817,41 @@ impl FontStack {
         self.faces.get(id).map(|f| f.as_ref())
     }
 
-    /// The first loaded face — in `fallback_chain` order — whose cmap
-    /// covers `ch`. Issue #68: `resolve` picks a face by script only and
-    /// never checks glyph coverage, so a direction-derived Arabic face
-    /// can be selected for a universal list-marker glyph (`◦`, `▪`) it
-    /// lacks, mapping it to `.notdef` (invisible). Callers use this to
-    /// swap in any loaded face that actually has the glyph before shaping.
+    /// Issues #472 / #490 — the ONE order in which the stack walks its
+    /// faces for `script`: the script's explicit **priority** (declared
+    /// via [`Self::with_priority`]), then the faces covering the script
+    /// sorted by id, then the fallback chain (the primary face, then every
+    /// face by id). [`Self::resolve_detailed`] picks the first face of this
+    /// walk that matches the requested weight / slant;
+    /// [`Self::resolve_covering`] the first one whose cmap has the glyph.
+    /// Both go through here, so no consumer can answer "which face?" from
+    /// the id-sorted chain while another honours the declared default.
+    fn walk_order(&self, script: Script) -> impl Iterator<Item = &FontId> + '_ {
+        let explicit = self.priority.get(&script).into_iter().flatten();
+        let preferred = self.by_script.get(&script).into_iter().flatten();
+        explicit.chain(preferred).chain(self.fallback_chain.iter())
+    }
+
+    /// The first loaded face whose cmap covers `ch`, walking the stack in
+    /// the declared order for `ch`'s own script ([`Self::walk_order`] of
+    /// [`script_of`]`(ch)`): the script's explicit priority first — a Latin
+    /// letter prefers the Latin default, an Arabic letter the Arabic
+    /// default, a script-neutral glyph (a bullet, a digit) the `common`
+    /// default — then the id-sorted covering faces, then the fallback chain
+    /// (the primary face first). A script with no declared priority keeps
+    /// the pre-#490 answer (the primary face when it covers, else the
+    /// first covering face by id); a glyph only one face has comes from
+    /// that face whatever the order.
+    ///
+    /// Issue #68: `resolve` picks a face by script only and never checks
+    /// glyph coverage, so a direction-derived Arabic face can be selected
+    /// for a universal list-marker glyph (`◦`, `▪`) it lacks, mapping it
+    /// to `.notdef` (invisible). Callers use this to swap in a loaded face
+    /// that actually has the glyph before shaping. Issue #490: that swap
+    /// used to walk the id-sorted chain alone, so a bullet could come from
+    /// Amiri beside Liberation text.
     pub fn resolve_covering(&self, ch: char) -> Option<(&FontId, &LoadedFont)> {
-        self.fallback_chain
-            .iter()
+        self.walk_order(script_of(ch))
             .filter_map(|id| self.faces.get_key_value(id))
             .find(|(_, face)| face.covers(ch))
             .map(|(key, face)| (key, face.as_ref()))
@@ -1187,6 +1206,165 @@ mod tests {
         assert_eq!(resolve_id(&ranked, Script::Latin, Some("Arial")), "b-lib");
         /* The Arabic slot is a different script: untouched. */
         assert_eq!(resolve_id(&ranked, Script::Arabic, None), "a-lib");
+    }
+
+    /* Issue #490 — `resolve_covering` (the list-marker / symbol glyph
+    fallback) walks the same declared order as `resolve`. Coverage of the
+    shipped faces, probed once (the `covers` asserts pin it): U+2022 is in
+    Liberation Sans AND Amiri, U+25E6 / U+25AA only in Liberation Sans,
+    U+2213 (Common) and U+061C (Arabic) only in Amiri, U+0661 (Arabic) in
+    Amiri and Noto Naskh Arabic. */
+    fn resolve_covering_id(stack: &FontStack, ch: char) -> Option<String> {
+        stack.resolve_covering(ch).map(|(id, _)| id.clone())
+    }
+
+    /// The shipped faces with `primary` as the fallback root.
+    fn shipped_stack_with_primary(primary: &str) -> FontStack {
+        let base = shipped_stack(true);
+        FontStack::from_faces(base.faces.clone(), primary)
+    }
+
+    #[test]
+    fn covering_fixture_coverage_is_as_documented() {
+        let stack = shipped_stack(true);
+        let covers = |id: &str, ch: char| stack.face(id).expect("face").covers(ch);
+        assert!(covers("liberation", '\u{2022}') && covers("amiri", '\u{2022}'));
+        assert!(covers("liberation", '\u{25E6}') && !covers("amiri", '\u{25E6}'));
+        assert!(covers("liberation", '\u{25AA}') && !covers("amiri", '\u{25AA}'));
+        for ch in ['\u{2213}', '\u{061C}'] {
+            assert!(covers("amiri", ch));
+            assert!(!covers("liberation", ch) && !covers("noto-naskh", ch));
+        }
+        assert!(covers("amiri", '\u{0661}') && covers("noto-naskh", '\u{0661}'));
+        assert!(!covers("liberation", '\u{0661}'));
+    }
+
+    #[test]
+    fn covering_follows_the_declared_common_default_for_a_bullet() {
+        /* The seed face is Amiri (the stack's primary), Amiri covers the
+        bullet, and by id it sorts first: before #490 the bullet came from
+        Amiri beside the Liberation text. The declared Common default
+        decides, whatever the primary or the id order. */
+        let bare = shipped_stack_with_primary("amiri");
+        assert_eq!(
+            resolve_covering_id(&bare, '\u{2022}').as_deref(),
+            Some("amiri")
+        );
+        let declared = shipped_stack_with_primary("amiri")
+            .with_priority(Script::Latin, &["liberation"])
+            .with_priority(Script::Common, &["liberation"]);
+        for bullet in ['\u{2022}', '\u{25E6}', '\u{25AA}', '1', '.'] {
+            assert_eq!(
+                resolve_covering_id(&declared, bullet).as_deref(),
+                Some("liberation"),
+                "{bullet:?}"
+            );
+        }
+        /* A Common default that does not cover the glyph falls through:
+        `resolve` and `resolve_covering` share the walk, so it is the
+        id-sorted tail then (`liberation` is the only face with U+25E6). */
+        let amiri_common =
+            shipped_stack_with_primary("liberation").with_priority(Script::Common, &["amiri"]);
+        assert_eq!(
+            resolve_covering_id(&amiri_common, '\u{2022}').as_deref(),
+            Some("amiri")
+        );
+        assert_eq!(
+            resolve_covering_id(&amiri_common, '\u{25E6}').as_deref(),
+            Some("liberation")
+        );
+    }
+
+    #[test]
+    fn covering_uses_the_script_of_the_glyph_for_letters() {
+        /* A Latin letter takes the Latin default, an Arabic letter the
+        Arabic default - the same lists `resolve` walks for those scripts. */
+        let stack = shipped_stack_with_primary("amiri")
+            .with_priority(Script::Latin, &["liberation"])
+            .with_priority(Script::Arabic, &["noto-naskh", "amiri"]);
+        assert_eq!(
+            resolve_covering_id(&stack, 'a').as_deref(),
+            Some("liberation")
+        );
+        assert_eq!(
+            resolve_covering_id(&stack, '\u{0661}').as_deref(),
+            Some("noto-naskh")
+        );
+        for (ch, script) in [('a', Script::Latin), ('\u{0661}', Script::Arabic)] {
+            let (resolved, _, _) = stack.resolve(script, None, false, false).expect("face");
+            assert_eq!(
+                resolve_covering_id(&stack, ch).as_deref(),
+                Some(resolved.as_str()),
+                "{ch:?} agrees with resolve({script:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn covering_finds_the_only_face_with_the_glyph_whatever_the_order() {
+        /* U+061C (Arabic) and U+2213 (Common) exist only in Amiri: no
+        declared order, primary or id layout can pick another face. */
+        for order in [&["amiri", "noto-naskh"][..], &["noto-naskh", "amiri"][..]] {
+            for primary in ["liberation", "amiri", "noto-naskh"] {
+                let stack = shipped_stack_with_primary(primary)
+                    .with_priority(Script::Latin, &["liberation"])
+                    .with_priority(Script::Common, &["liberation"])
+                    .with_priority(Script::Arabic, order);
+                for ch in ['\u{061C}', '\u{2213}'] {
+                    assert_eq!(
+                        resolve_covering_id(&stack, ch).as_deref(),
+                        Some("amiri"),
+                        "{ch:?} order {order:?} primary {primary}"
+                    );
+                }
+            }
+        }
+        /* A glyph nothing covers is `None`, not an arbitrary face. */
+        let stack = shipped_stack(true).with_priority(Script::Latin, &["liberation"]);
+        assert_eq!(resolve_covering_id(&stack, '\u{4E2D}'), None);
+    }
+
+    #[test]
+    fn covering_without_a_declared_priority_keeps_the_primary_first_walk() {
+        /* No priorities: the pre-#490 answer - the primary when it covers,
+        else the first covering face by id. */
+        let stack = shipped_stack_with_primary("liberation");
+        assert_eq!(
+            resolve_covering_id(&stack, '\u{2022}').as_deref(),
+            Some("liberation")
+        );
+        assert_eq!(
+            resolve_covering_id(&stack, '\u{0661}').as_deref(),
+            Some("amiri")
+        );
+        let stack = shipped_stack_with_primary("noto-naskh");
+        assert_eq!(
+            resolve_covering_id(&stack, '\u{2022}').as_deref(),
+            Some("amiri")
+        );
+    }
+
+    /* Issue #490 — a digits-only (script-neutral) run resolves through the
+    explicit `common` default, not the seed face. */
+    #[test]
+    fn a_digits_only_run_resolves_to_the_declared_common_face() {
+        use crate::script::segment_by_script;
+        let digits = "2026";
+        let runs = segment_by_script(digits);
+        assert_eq!(runs, vec![(0..4, Script::Common)]);
+        /* The seed face is Amiri (what an implicit common default would
+        pick): only the declaration moves the digits to Liberation. */
+        let implicit = shipped_stack_with_primary("amiri");
+        assert_eq!(resolve_id(&implicit, runs[0].1, None), "amiri");
+        let declared =
+            shipped_stack_with_primary("amiri").with_priority(Script::Common, &["liberation"]);
+        assert_eq!(resolve_id(&declared, runs[0].1, None), "liberation");
+        assert_eq!(
+            declared.priority(Script::Common),
+            ["liberation".to_string()]
+        );
+        /* Real-script runs are untouched by the common default. */
+        assert_eq!(resolve_id(&declared, Script::Arabic, None), "amiri");
     }
 
     /* Issue #329 — Word's line metrics, against the published vertical

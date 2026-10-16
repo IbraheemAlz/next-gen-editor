@@ -64,7 +64,9 @@ pub fn register_editor_fonts(engine: &mut engine_wasm::Engine) -> Result<(), Str
             let script = match script {
                 Script::Latin => Wire::Latin,
                 Script::Arabic => Wire::Arabic,
-                _ => return None,
+                /* Issue #490 - the explicit script-neutral default. */
+                Script::Common => Wire::Common,
+                Script::Other => return None,
             };
             Some(FontPriority {
                 script,

@@ -65,6 +65,9 @@ test('#472: the declared defaults are what moves Latin - an empty table falls ba
     expect(applied).toEqual([
         { script: 'Latin', ids: ['liberation'] },
         { script: 'Arabic', ids: ['amiri', 'noto-naskh'] },
+        /* Issue #490 - script-neutral text and the list-marker glyph
+         * fallback have an explicit default, not the seed face implicitly. */
+        { script: 'Common', ids: ['liberation'] },
     ]);
 
     /* Declaring nothing is the pre-#472 behaviour: `amiri` < `liberation`
