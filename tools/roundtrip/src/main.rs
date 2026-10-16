@@ -49,6 +49,8 @@ mod table_markup;
 mod table_merge;
 mod theme;
 mod tracked_coverage;
+mod tracked_nesting;
+mod tracked_structure;
 
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
@@ -385,6 +387,10 @@ fn run_default() -> Result<()> {
     /* Step 61 — issue #471: a merge enclosing earlier merges saves and
     re-reads with the same grid; one cutting a merge is refused. */
     table_merge::run_table_merge_roundtrip()?;
+    /* Step 62 — issue #440: revisions inside a table nested in a cell. */
+    tracked_nesting::run_nested_table_revisions_roundtrip()?;
+    /* Step 63 — issue #442: structural edits recorded in review mode. */
+    tracked_structure::run_tracked_structure_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

@@ -567,11 +567,10 @@ impl DocumentTree {
     /// (`<w:trPr><w:del/>`, unless already deleted) and its contents
     /// recorded as deleted — every paragraph of its cells like text (the
     /// reviewer's own insertions removed), every mark but each cell's
-    /// last swallowed, a nested table's rows deleted the same way (its
-    /// text is left alone: the resolver's text walk does not reach that
-    /// deep, and the row goes with its parent on accept anyway). A row
-    /// `author` inserted is removed outright. `true` when the table
-    /// itself left its container (every row was such a row).
+    /// last swallowed, a nested table's rows (and, issue #440, its text)
+    /// deleted the same way, down to [`crate::MAX_REVISION_TABLE_DEPTH`]
+    /// levels. A row `author` inserted is removed outright. `true` when
+    /// the table itself left its container (every row was such a row).
     pub(crate) fn mark_rows_deleted(
         &mut self,
         table: &BlockPath,
@@ -609,8 +608,9 @@ impl DocumentTree {
         let mut top = self.blocks.clone();
         let _ = crate::replace_block_in_top(&mut top, table, Block::Table(t));
         self.blocks = top;
-        /* The contents of every marked row, cell by cell. */
-        let reaches_text = table.steps.len() == 1;
+        /* The contents of every marked row, cell by cell (issue #440 —
+        at every depth the revision walkers reach). */
+        let inner_depth = crate::revisions::table_depth(&table.steps) + 1;
         for (r, cells) in marked {
             for c in 0..cells {
                 let cell = child_cell(table, r, c);
@@ -622,20 +622,20 @@ impl DocumentTree {
                 for k in (0..n).rev() {
                     let path = child(&cell.steps, k);
                     match &blocks[k as usize] {
-                        Block::Paragraph(p) if reaches_text => {
+                        Block::Paragraph(p) => {
                             let len = p.text.len() as u32;
                             self.tracked_delete_text(&path, 0, len, author, date);
                             if k + 1 < n {
                                 self.delete_mark(&cell.steps, k, author, date);
                             }
                         }
-                        Block::Paragraph(_) => {}
-                        Block::Table(inner) => {
+                        Block::Table(inner) if inner_depth < crate::MAX_REVISION_TABLE_DEPTH => {
                             let rows = inner.rows.len() as u32;
                             if rows > 0 {
                                 self.mark_rows_deleted(&path, 0, rows - 1, author, date);
                             }
                         }
+                        Block::Table(_) => {}
                     }
                 }
             }
@@ -674,6 +674,168 @@ impl DocumentTree {
             }
         }
         pos
+    }
+}
+
+/// Issue #442 — STRUCTURAL edits made by command with review mode on,
+/// recorded the way Word records them, so Accept / Reject (all, or the
+/// single row in the review pane) resolve them through the ordinary
+/// resolver ([`DocumentTree::resolve_revisions`]) and the writer saves
+/// them as `<w:trPr><w:ins/>` / `<w:del/>` and `<w:pPr><w:rPr><w:ins/>`:
+///
+/// - an inserted row is an inserted row (`RowProperties::revisions` +=
+///   `Insert`); rejecting removes it;
+/// - a deleted row is marked deleted whole, its contents as deleted text
+///   ([`DocumentTree::mark_rows_deleted`], the #365 tracked-range path) —
+///   or, when the reviewer inserted it, removed outright;
+/// - an inserted table is a pasted table (every row inserted, every cell
+///   paragraph break inserted — the #366 `stamp_inserted` rule); when the
+///   table needs a paragraph after it, that paragraph is made by a tracked
+///   split of the paragraph in front ([`DocumentTree::tracked_split_paragraph`]),
+///   so rejecting merges the two back and restores the document exactly;
+/// - a section break is a tracked paragraph split whose new mark carries
+///   the break: rejecting removes the mark, and the text joins the
+///   following section (the #367 merge rule).
+impl DocumentTree {
+    /// [`Self::insert_row`] with review mode on: the new row (at `at`,
+    /// clamped to the row count) is recorded as inserted by `author`.
+    pub fn tracked_insert_row(
+        &self,
+        table_path: BlockPath,
+        at: usize,
+        author: &str,
+        date: &str,
+    ) -> Self {
+        let Some(tp) = crate::top_level_block_index(&table_path).map(BlockPath::top) else {
+            return self.clone();
+        };
+        let Some(rows) = self.table_at_path(&tp).map(|t| t.rows.len()) else {
+            return self.clone();
+        };
+        let landed = at.min(rows);
+        let mut out = self.insert_row(table_path, at);
+        out.stamp_rows_inserted(&tp, landed..landed + 1, author, date);
+        out
+    }
+
+    /// [`Self::delete_row`] with review mode on: row `row` is marked
+    /// deleted by `author` with its contents (a row they inserted is
+    /// removed outright). A row index past the table is a no-op.
+    pub fn tracked_delete_row(
+        &self,
+        table_path: BlockPath,
+        row: u32,
+        author: &str,
+        date: &str,
+    ) -> Self {
+        let Some(tp) = crate::top_level_block_index(&table_path).map(BlockPath::top) else {
+            return self.clone();
+        };
+        if self
+            .table_at_path(&tp)
+            .is_none_or(|t| row as usize >= t.rows.len())
+        {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        out.mark_rows_deleted(&tp, row, row, author, date);
+        out
+    }
+
+    /// [`Self::insert_table`] with review mode on (module docs above): the
+    /// table lands at the same block index as the untracked insert.
+    pub fn tracked_insert_table(
+        &self,
+        at: BlockPath,
+        rows: u32,
+        cols: u32,
+        author: &str,
+        date: &str,
+    ) -> Self {
+        let len = self.blocks.len() as u32;
+        let idx = crate::top_level_block_index(&at).unwrap_or(len).min(len);
+        let needs_trailing = !matches!(self.blocks.get(idx as usize), Some(Block::Paragraph(_)));
+        let prev = idx
+            .checked_sub(1)
+            .and_then(|i| self.blocks.get(i as usize))
+            .and_then(Block::as_paragraph);
+        let mut out = match (needs_trailing, prev) {
+            /* Split the paragraph in front at its end: its text keeps a new
+            (inserted) mark, the original mark moves to the empty paragraph
+            that now follows the table. */
+            (true, Some(p)) => {
+                let end = LogicalPos::new(BlockPath::top(idx - 1), p.text.len() as u32);
+                self.tracked_split_paragraph(end, author, date)
+                    .insert_table(BlockPath::top(idx), rows, cols)
+            }
+            (true, None) => {
+                /* No paragraph in front: the escape paragraph is new
+                content of its own. */
+                let mut out = self.insert_table(BlockPath::top(idx), rows, cols);
+                let mut blocks = out.blocks.clone();
+                let _ = mutate_paragraph_in_top(&mut blocks, &BlockPath::top(idx + 1), |p| {
+                    p.mark_revisions = vec![mark_change(RevisionKind::Insert, author, date)];
+                });
+                out.blocks = blocks;
+                out
+            }
+            (false, _) => self.insert_table(BlockPath::top(idx), rows, cols),
+        };
+        if let Some(Block::Table(t)) = out.blocks.get(idx as usize) {
+            let stamped = stamp_inserted(&Block::Table(t.clone()), author, date);
+            out.blocks.set(idx as usize, stamped);
+        }
+        out
+    }
+
+    /// [`Self::insert_section_break_at`] with review mode on: the mark that
+    /// now ends the first half — the one carrying the new break — is
+    /// recorded as inserted by `author`. A position the untracked insert
+    /// refuses (inside a table cell) leaves the tree unchanged.
+    pub fn tracked_insert_section_break_at(
+        &self,
+        at: LogicalPos,
+        kind: crate::SectionType,
+        author: &str,
+        date: &str,
+    ) -> Self {
+        let mut out = self.insert_section_break_at(at.clone(), kind);
+        if out.blocks.len() == self.blocks.len() {
+            return out;
+        }
+        let mut blocks = out.blocks.clone();
+        let _ = mutate_paragraph_in_top(&mut blocks, &at.path, |p| {
+            if p.section_end.is_some() {
+                p.mark_revisions
+                    .push(mark_change(RevisionKind::Insert, author, date));
+            }
+        });
+        out.blocks = blocks;
+        out
+    }
+
+    /// Record rows `rows` of the table at `table` as inserted by `author`.
+    fn stamp_rows_inserted(
+        &mut self,
+        table: &BlockPath,
+        rows: std::ops::Range<usize>,
+        author: &str,
+        date: &str,
+    ) {
+        let Some(t) = self.table_at_path(table) else {
+            return;
+        };
+        let mut t = t.clone();
+        for row in t.rows.get_mut(rows).into_iter().flatten() {
+            row.props
+                .revisions
+                .push(mark_change(RevisionKind::Insert, author, date));
+        }
+        t.dirty = true;
+        t.source_xml = None;
+        let mut top = self.blocks.clone();
+        let _ = crate::replace_block_in_top(&mut top, table, Block::Table(t));
+        self.blocks = top;
     }
 }
 

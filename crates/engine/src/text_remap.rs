@@ -32,8 +32,8 @@
 //! undo snapshot carries its own consistent copy.
 
 use crate::{
-    BlockPath, DocumentTree, Hyperlink, LogicalPos, Paragraph, PathStep, Revision, STALE_TEXT_LEN,
-    SourceMarkup,
+    Block, BlockPath, DocumentTree, Hyperlink, LogicalPos, Paragraph, PathStep, Revision,
+    STALE_TEXT_LEN, SourceMarkup,
 };
 
 /// One in-place replacement of paragraph bytes `[at, at + removed)` by
@@ -88,8 +88,146 @@ impl Paragraph {
     /// (the old #56 limitation).
     pub(crate) fn remap_range_overlays(&mut self, edit: TextEdit) {
         remap_ranges(&mut self.hyperlinks, edit);
+        self.shift_revisions(edit);
+    }
+
+    /// Issue #283 — THE rule every byte-moving paragraph edit applies to
+    /// the tracked-change overlays ([`Paragraph::revisions`] — insertions,
+    /// deletions, moves and formatting changes alike): each range is
+    /// mapped through `edit` ([`TextEdit::map_range`]) and a range the
+    /// edit swallowed whole is dropped. Typing at either boundary of a
+    /// revision stays outside it; typing strictly inside grows it.
+    /// Routed through here: `insert_text` (typing, the IME commit, the
+    /// tracked typing path built on it, find / replace), the inline-object
+    /// splice (images, note references, text boxes), every removal
+    /// (`revisions::remove_text`, `Paragraph::delete_text`), both halves
+    /// of a split and the tail of a merge ([`Self::remap_range_overlays`])
+    /// and the field-result splice (`Paragraph::with_spliced_range`).
+    pub fn shift_revisions(&mut self, edit: TextEdit) {
         remap_ranges(&mut self.revisions, edit);
     }
+}
+
+/// Issue #283 — `revisions` as they read after `edit` (the
+/// [`Paragraph::shift_revisions`] rule, on a copy). For layout-only
+/// clones that splice text they never store — the live IME preview.
+pub fn revisions_through_edit(revisions: &[Revision], edit: TextEdit) -> Vec<Revision> {
+    let mut out = revisions.to_vec();
+    remap_ranges(&mut out, edit);
+    out
+}
+
+/// Issue #283 — `hyperlinks` as they read after `edit` (the same rule as
+/// [`revisions_through_edit`]).
+pub fn hyperlinks_through_edit(hyperlinks: &[Hyperlink], edit: TextEdit) -> Vec<Hyperlink> {
+    let mut out = hyperlinks.to_vec();
+    remap_ranges(&mut out, edit);
+    out
+}
+
+impl DocumentTree {
+    /// Issue #283 — make every revision range satisfy
+    /// [`check_revision_ranges`]: clamp to the paragraph, snap both ends
+    /// down to a char boundary, drop what is left empty. A no-op (and no
+    /// copy) on a tree that already holds — anything the engine itself
+    /// built. Run on a restored snapshot, whose bytes may come from
+    /// anywhere.
+    pub fn repair_revision_ranges(&mut self) {
+        if check_revision_ranges(self).is_ok() {
+            return;
+        }
+        fn repair_blocks<'a>(blocks: impl Iterator<Item = &'a mut Block>, depth: u32) {
+            for b in blocks {
+                match b {
+                    Block::Paragraph(p) => {
+                        let len = p.text.len() as u32;
+                        let text = &p.text;
+                        let snap = |o: u32| {
+                            let mut o = o.min(len);
+                            while !text.is_char_boundary(o as usize) {
+                                o -= 1;
+                            }
+                            o
+                        };
+                        let mut revs = std::mem::take(&mut p.revisions);
+                        revs.retain_mut(|r| {
+                            r.start = snap(r.start);
+                            r.end = snap(r.end);
+                            r.start < r.end
+                        });
+                        p.revisions = revs;
+                    }
+                    Block::Table(t) if depth < crate::MAX_REVISION_TABLE_DEPTH => {
+                        for row in t.rows.iter_mut() {
+                            for cell in row.cells.iter_mut() {
+                                repair_blocks(cell.blocks.iter_mut(), depth + 1);
+                            }
+                        }
+                    }
+                    Block::Table(_) => {}
+                }
+            }
+        }
+        repair_blocks(self.blocks.iter_mut(), 0);
+        for part in self.headers.values_mut().chain(self.footers.values_mut()) {
+            repair_blocks(part.iter_mut(), 0);
+        }
+        for note in self
+            .footnote_stories
+            .values_mut()
+            .chain(self.endnote_stories.values_mut())
+        {
+            repair_blocks(note.body.iter_mut(), 0);
+        }
+    }
+}
+
+/// Issue #283 — every revision range of `doc` (body, table cells at any
+/// nesting depth up to [`crate::MAX_REVISION_TABLE_DEPTH`], headers,
+/// footers, notes) lies inside its paragraph, is non-empty and starts and
+/// ends on a UTF-8 char boundary. `Err` names the first offender. The
+/// fuzz targets check it after every command
+/// (`Engine::check_invariants_for_fuzzing`).
+pub fn check_revision_ranges(doc: &DocumentTree) -> Result<(), String> {
+    let mut err = None;
+    let mut check = |story: &str, path: BlockPath, p: &Paragraph| {
+        if err.is_some() {
+            return;
+        }
+        let len = p.text.len() as u32;
+        for r in &p.revisions {
+            let ok = r.start < r.end
+                && r.end <= len
+                && p.text.is_char_boundary(r.start as usize)
+                && p.text.is_char_boundary(r.end as usize);
+            if !ok {
+                err = Some(format!(
+                    "issue #283: {story} paragraph {path:?} carries a {:?} revision \
+                     [{}, {}) that is empty, past its {len}-byte text or splits a \
+                     UTF-8 character",
+                    r.kind, r.start, r.end
+                ));
+                return;
+            }
+        }
+    };
+    crate::revisions::for_each_paragraph_nested(&doc.blocks, &mut |path, p| check("body", path, p));
+    for (story, parts) in [("header", &doc.headers), ("footer", &doc.footers)] {
+        for part in parts.values() {
+            crate::revisions::for_each_paragraph_nested(part, &mut |path, p| check(story, path, p));
+        }
+    }
+    for (story, notes) in [
+        ("footnote", &doc.footnote_stories),
+        ("endnote", &doc.endnote_stories),
+    ] {
+        for note in notes.values() {
+            crate::revisions::for_each_paragraph_nested(&note.body, &mut |path, p| {
+                check(story, path, p)
+            });
+        }
+    }
+    err.map_or(Ok(()), Err)
 }
 
 /// Issue #292 — a paragraph overlay addressed by a byte range
@@ -436,7 +574,7 @@ impl DocumentTree {
 mod tests {
     use crate::{
         Block, BlockPath, DocumentTree, ImageBlob, LogicalPos, NoteKind, Paragraph, PathStep,
-        Revision, RevisionKind, SourceMarkup, SourceRun, UndoStack,
+        Revision, RevisionKind, SourceMarkup, SourceRun, UndoStack, check_revision_ranges,
     };
 
     fn pos(block: u32, offset: u32) -> LogicalPos {
@@ -908,6 +1046,43 @@ mod tests {
         let r: Vec<_> = m.runs.iter().map(|r| (r.start, r.end)).collect();
         assert_eq!(r, vec![(0, 4), (4, 9), (9, 12)]);
         assert_eq!(m.text_len, 12);
+    }
+
+    /// Issue #283 — an inline object spliced in at a revision's END stays
+    /// outside the revision (the one range rule — it used to grow over
+    /// the sentinel, so an untracked image became part of someone's
+    /// tracked insertion); at its start the revision shifts, strictly
+    /// inside it grows; the range invariant holds throughout.
+    #[test]
+    fn an_inline_object_at_a_revision_boundary_stays_outside_it() {
+        let rev = |d: &DocumentTree| {
+            let p = d.nth_paragraph(0).unwrap();
+            let r = &p.revisions[0];
+            p.text[r.start as usize..r.end as usize].to_string()
+        };
+        let mut d = DocumentTree::from_text("ab INS cd");
+        let mut blocks = d.blocks.clone();
+        if let Block::Paragraph(p) = &mut blocks[0] {
+            p.revisions.push(Revision {
+                start: 3,
+                end: 6,
+                kind: crate::RevisionKind::Insert,
+                author: "Bob".into(),
+                date: String::new(),
+                id: None,
+                prev_attrs: None,
+                move_name: None,
+            });
+        }
+        d.blocks = blocks;
+        for at in [3, 6] {
+            let (n, _) = d.insert_note_at(pos(0, at), NoteKind::Footnote);
+            assert_eq!(rev(&n), "INS", "object at {at}");
+            check_revision_ranges(&n).unwrap();
+        }
+        let (n, _) = d.insert_note_at(pos(0, 4), NoteKind::Footnote);
+        assert_eq!(rev(&n), "I\u{FFFC}NS");
+        check_revision_ranges(&n).unwrap();
     }
 
     #[test]

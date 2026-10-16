@@ -1418,23 +1418,47 @@ struct RevisionOut {
     /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
     /// by edits elsewhere — two wrappers over one range are two ids.
     revision_id: u32,
+    /// Issue #440 — where the revision lives: the paragraph (a row
+    /// revision: the table) as a full path, so a change inside a table
+    /// cell — at any nesting depth — is listed and can be revealed. For a
+    /// top-level paragraph it is `[Block { idx: block }]`.
+    path: BridgeBlockPath,
+    /// Issue #440 — how many tables deep `path` is (0 = the body, 1 = a
+    /// top-level table's cell or row, 2 = a table nested in a cell, …):
+    /// the review pane's depth marker.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    depth: u32,
 }
 
-/// The `revisions_snapshot()` rows: every tracked change of the
-/// top-level paragraphs, in document order — per paragraph its text
-/// revisions, then its mark's changes (issue #262: the empty range at
-/// the paragraph end; issue #303: one row per change, in order) — and,
-/// issue #365, every row change of a top-level table — each with its
-/// issue #304 `revision_id` (the range alone addresses only a mark's
-/// FIRST change, and no row change; the id addresses each).
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// The `revisions_snapshot()` rows: every tracked change the resolver
+/// reaches, in document order — per paragraph its text revisions, then
+/// its mark's changes (issue #262: the empty range at the paragraph end;
+/// issue #303: one row per change, in order) — and, issue #365, every
+/// row change of a table — each with its issue #304 `revision_id` (the
+/// range alone addresses only a mark's FIRST change, and no row change;
+/// the id addresses each). Issue #440 — table cells at every nesting
+/// depth included (they used to be dropped: only top-level paragraphs
+/// and rows were listed), each with its full `path` and `depth`; `block`
+/// is the top-level block the change sits in.
 fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
     doc.revision_entries()
         .into_iter()
         .filter_map(|e| {
-            let block = match e.at.path.steps.as_slice() {
-                [EnginePathStep::Block(b)] => *b,
+            let block = match e.at.path.steps.first() {
+                Some(EnginePathStep::Block(b)) => *b,
                 _ => return None,
             };
+            let depth =
+                e.at.path
+                    .steps
+                    .iter()
+                    .filter(|s| matches!(s, EnginePathStep::Cell { .. }))
+                    .count() as u32
+                    + u32::from(matches!(e.at.slot, engine::RevisionSlot::Row { .. }));
             let r = e.revision;
             let mark = matches!(e.at.slot, engine::RevisionSlot::Mark(_));
             let row = match e.at.slot {
@@ -1460,6 +1484,8 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
                 mark,
                 row,
                 revision_id: e.id,
+                path: engine_to_bridge_path(e.at.path.clone()),
+                depth,
             })
         })
         .collect()
@@ -3143,27 +3169,17 @@ fn composition_overlay_ranges(
     off: u32,
     comp_len: u32,
 ) -> (Vec<engine::Hyperlink>, Vec<engine::Revision>) {
-    let start = |p: u32| if p >= off { p + comp_len } else { p };
-    let end = |p: u32| if p > off { p + comp_len } else { p };
-    let hyperlinks = para
-        .hyperlinks
-        .iter()
-        .map(|h| engine::Hyperlink {
-            start: start(h.start),
-            end: end(h.end),
-            ..h.clone()
-        })
-        .collect();
-    let revisions = para
-        .revisions
-        .iter()
-        .map(|r| engine::Revision {
-            start: start(r.start),
-            end: end(r.end),
-            ..r.clone()
-        })
-        .collect();
-    (hyperlinks, revisions)
+    /* Issue #283 — the engine's one range rule, on copies (the preview
+    text is never stored). */
+    let edit = engine::TextEdit {
+        at: off,
+        removed: 0,
+        inserted: comp_len,
+    };
+    (
+        engine::hyperlinks_through_edit(&para.hyperlinks, edit),
+        engine::revisions_through_edit(&para.revisions, edit),
+    )
 }
 
 /// Style spans for a paragraph with an IME composition spliced in at `off`.
@@ -3549,13 +3565,16 @@ fn layout_note_paragraph_with_composition(
     text.push_str(&para.text[..off]);
     text.push_str(&c.text);
     text.push_str(&para.text[off..]);
+    /* Issue #283 — the overlays shift past the preview text like the
+    body / band preview paths' do. */
+    let (links, revs) = composition_overlay_ranges(para, off as u32, ins);
     let spans = apply_revision_overlay(
         apply_hyperlink_overlay(
             composition_layout_spans(para, sctx, off as u32, ins, cfg.px_size, scale),
-            &para.hyperlinks,
+            &links,
             [0, 0, 0, 255],
         ),
-        &para.revisions,
+        &revs,
         [0, 0, 0, 255],
     );
     let mut infos = build_inline_object_infos(para, cfg, scale, sctx);
@@ -9667,6 +9686,11 @@ impl Engine {
             (None, None) => None,
         };
         let package_lost = named_package && package.is_none();
+        /* Issue #283 — snapshot bytes may come from anywhere: hold every
+        revision range to the in-paragraph / char-boundary invariant. */
+        for d in &mut s.doc_history {
+            d.repair_revision_ranges();
+        }
         if let Some(pkg) = &package {
             for d in &mut s.doc_history {
                 if d.source_package.is_none() {
@@ -18207,10 +18231,20 @@ impl Engine {
             SectionBreakKind::EvenPage => engine::SectionType::EvenPage,
             SectionBreakKind::OddPage => engine::SectionType::OddPage,
         };
-        let new_doc = self
-            .undo
-            .current()
-            .insert_section_break_at(to_engine_pos(at.clone()), engine_kind);
+        /* Issue #442 — with review mode on the new mark (the one carrying
+        the break) is recorded as inserted. */
+        let new_doc = if self.tracking_changes {
+            self.undo.current().tracked_insert_section_break_at(
+                to_engine_pos(at.clone()),
+                engine_kind,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            self.undo
+                .current()
+                .insert_section_break_at(to_engine_pos(at.clone()), engine_kind)
+        };
         let next_path = engine::bump_last_block_index(&bridge_to_engine_path(at.path));
         let caret = BridgeLogicalPos {
             path: engine_to_bridge_path(next_path),
@@ -18331,16 +18365,32 @@ impl Engine {
                 offset: 0,
             }
         };
+        /* Issue #442 — review mode on: every row (and the escape
+        paragraph's mark) recorded as inserted. */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let caret = first_cell(self.story_doc().map_or(0, |d| d.blocks.len()));
             let epath = bridge_to_engine_path(at);
-            return self.story_mutate(move |d| d.insert_table(epath, rows, cols), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_insert_table(epath, rows, cols, author, date),
+                    None => d.insert_table(epath, rows, cols),
+                },
+                caret,
+                false,
+            );
         }
         let caret = first_cell(self.undo.current().blocks.len());
-        let new_doc = self
-            .undo
-            .current()
-            .insert_table(bridge_to_engine_path(at), rows, cols);
+        let epath = bridge_to_engine_path(at);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_insert_table(epath, rows, cols, author, date),
+            None => self.undo.current().insert_table(epath, rows, cols),
+        };
         self.announce(
             AnnouncementPriority::Polite,
             format!("Table inserted, {rows} rows by {cols} columns"),
@@ -18393,6 +18443,10 @@ impl Engine {
         }) {
             return *e;
         }
+        /* Issue #442 — review mode on: the new row is an inserted row. */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -18400,12 +18454,23 @@ impl Engine {
                 .as_ref()
                 .map(|s| s.caret.clone())
                 .unwrap_or_else(|| bpos_top(0, 0));
-            return self.story_mutate(move |d| d.insert_row(epath, at), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_insert_row(epath, at, author, date),
+                    None => d.insert_row(epath, at),
+                },
+                caret,
+                false,
+            );
         }
-        let new_doc = self
-            .undo
-            .current()
-            .insert_row(bridge_to_engine_path(path), at);
+        let epath = bridge_to_engine_path(path);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_insert_row(epath, at, author, date),
+            None => self.undo.current().insert_row(epath, at),
+        };
         self.announce(AnnouncementPriority::Polite, "Row inserted");
         self.push_table_edit(new_doc, None)
     }
@@ -18413,6 +18478,11 @@ impl Engine {
         if let Err(e) = self.validate_table_cmd("DeleteRow", &path, Some(row), None, |_| Ok(())) {
             return *e;
         }
+        /* Issue #442 — review mode on: the row is marked deleted with its
+        contents (the reviewer's own inserted row goes outright). */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -18420,12 +18490,23 @@ impl Engine {
                 .as_ref()
                 .map(|s| s.caret.clone())
                 .unwrap_or_else(|| bpos_top(0, 0));
-            return self.story_mutate(move |d| d.delete_row(epath, row), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_delete_row(epath, row, author, date),
+                    None => d.delete_row(epath, row),
+                },
+                caret,
+                false,
+            );
         }
-        let new_doc = self
-            .undo
-            .current()
-            .delete_row(bridge_to_engine_path(path), row);
+        let epath = bridge_to_engine_path(path);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_delete_row(epath, row, author, date),
+            None => self.undo.current().delete_row(epath, row),
+        };
         self.announce(AnnouncementPriority::Polite, "Row deleted");
         self.push_table_edit(new_doc, None)
     }
@@ -18848,8 +18929,10 @@ impl Engine {
     /// Issue #341 — the engine's cheap structural invariants, checked after
     /// a restore + one `apply` round: the undo stack respects its cap, the
     /// live and the stashed selection resolve inside the document they
-    /// address, and an active note / text-box story still exists. `Err`
-    /// names the first violation.
+    /// address, an active note / text-box story still exists and — issue
+    /// #283 — every tracked-change range lies inside its paragraph on char
+    /// boundaries (`engine::check_revision_ranges`). `Err` names the first
+    /// violation.
     pub fn check_invariants_for_fuzzing(&self) -> Result<(), String> {
         if self.undo.depth() as usize > self.undo.cap() {
             return Err(format!(
@@ -18876,6 +18959,9 @@ impl Engine {
         {
             return Err("the active note / text-box story no longer exists".to_string());
         }
+        /* Issue #283 — every revision range inside its paragraph, on
+        char boundaries. */
+        engine::check_revision_ranges(self.undo.current())?;
         Ok(())
     }
 
@@ -29786,6 +29872,18 @@ mod revision_command_tests;
 
 #[cfg(test)]
 mod tracked_command_tests;
+
+/// Issue #283 — revision ranges through real commands (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod revision_range_tests;
+
+/// Issue #440 — revisions inside nested tables (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod nested_revision_tests;
+
+/// Issue #442 — structural edits tracked in review mode (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod tracked_structure_tests;
 
 #[cfg(test)]
 mod revision_address_tests;
