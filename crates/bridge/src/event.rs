@@ -1256,6 +1256,12 @@ pub enum LayoutDegradeReason {
     /// its post-conditions and the table was re-laid from scratch.
     /// Distinct from `CacheMismatch` (the paragraph cache).
     TableCacheMismatch,
+    /// Issues #499 / #501 — a synchronous band expansion (a caret move,
+    /// a click, a scroll-driven `ExpandLayout` / paint) stopped making
+    /// progress: the band grew no taller and no block was laid for a
+    /// round, because the running height passed every finite cull target.
+    /// The engine fell back to one full layout (document-level, no page).
+    NavExpansionStalled,
 }
 
 /// Issue #87 — one degradation note on `Event::Painted`. `page` is the

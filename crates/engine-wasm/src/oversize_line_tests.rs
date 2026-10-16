@@ -132,6 +132,33 @@ fn expand(engine: &mut Engine, target_y: f32) -> (u32, bool, Vec<bridge::LayoutD
     }
 }
 
+/// Item 2, the backstop: with the structural clamp switched off (the
+/// pre-#501 cull, standing in for a regression of it - or for any other
+/// way a running height could pass every target), a scroll-driven
+/// `ExpandLayout` used to leave the band where it was and say nothing; now
+/// the shared progress-bounded expansion notices the round that laid no
+/// more, falls back to ONE full layout and carries `NavExpansionStalled`.
+/// Runs on a worker thread with a deadline, so a regression to the old
+/// unbounded negotiation fails the test instead of hanging the suite.
+#[test]
+fn a_stalled_scroll_expansion_falls_back_to_a_full_layout_with_a_note() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        crate::CULL_CLAMP_OFF.with(|c| c.set(true));
+        let mut engine = test_engine_with_doc(doc_with_tall_paragraph(80, 0, 1.0951575e33));
+        small_band(&mut engine);
+        let _ = tx.send(expand(&mut engine, 12_000.0));
+    });
+    let (pages, full, notes) = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("ExpandLayout must end (the progress bound), not loop");
+    assert!(full, "the fallback is a full layout ({pages} pages)");
+    assert!(
+        notes.contains(&bridge::LayoutDegradeReason::NavExpansionStalled),
+        "the stall is reported: {notes:?}"
+    );
+}
+
 /// Item 2, the nominal path: a scroll-driven `ExpandLayout` over a document
 /// holding a page-tall line grows the band with the target and completes
 /// without a stall note - the structural clamp already delivered it.

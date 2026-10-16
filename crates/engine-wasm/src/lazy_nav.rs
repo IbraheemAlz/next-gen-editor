@@ -129,16 +129,23 @@ impl Engine {
         let start = self.lazy_layout.min_target_y;
         let mut want = first_target_pt;
         let mut rounds = 0u32;
+        /* Band height and unlaid block count after the previous round. */
+        let mut last: Option<(f32, u32)> = None;
         loop {
             let target = Some(self.lazy_layout.min_target_y * scale);
             self.ensure_layout_snapshot(scale, false, target)?;
-            let (done, full, band_pt) = {
+            let (done, full, band_pt, remaining) = {
                 let snap = self.layout_snapshot.borrow();
                 let s = snap
                     .as_ref()
                     .expect("ensure_layout_snapshot populated the memo");
                 let full = s.info.is_full_layout;
-                (full || covered(s), full, band_height_px(s, gap) / scale)
+                (
+                    full || covered(s),
+                    full,
+                    band_height_px(s, gap) / scale,
+                    s.info.remaining_blocks,
+                )
             };
             if done {
                 if full && self.lazy_layout.min_target_y > band_pt.max(start) {
@@ -146,6 +153,28 @@ impl Engine {
                 }
                 return Ok(self.lazy_layout.min_target_y != start);
             }
+            /* The progress bound: a round that raised the target but laid
+            no more (the band no taller, no block fewer unlaid) means the
+            running height already passes every target - no finite one
+            will clear it. Stop negotiating: one full layout, noted. */
+            if let Some((prev_band, prev_remaining)) = last
+                && band_pt <= prev_band
+                && remaining >= prev_remaining
+            {
+                self.lazy_nav_fall_back_to_full_layout(scale)?;
+                let full_pt = {
+                    let snap = self.layout_snapshot.borrow();
+                    let s = snap
+                        .as_ref()
+                        .expect("ensure_layout_snapshot populated the memo");
+                    band_height_px(s, gap) / scale
+                };
+                if self.lazy_layout.min_target_y > full_pt.max(start) {
+                    self.lazy_layout.min_target_y = full_pt.max(start);
+                }
+                return Ok(self.lazy_layout.min_target_y != start);
+            }
+            last = Some((band_pt, remaining));
             rounds += 1;
             if rounds > MAX_EXPAND_ROUNDS {
                 /* Backstop: one full layout ends the loop. */
@@ -155,6 +184,27 @@ impl Engine {
             self.lazy_layout.min_target_y = want.max(floor);
             want = (2.0 * self.lazy_layout.min_target_y).min(FULL_LAYOUT_TARGET_PT);
         }
+    }
+
+    /// Issues #499 / #501 — the stalled expansion's way out: one full
+    /// layout (no cull), carrying a `NavExpansionStalled` note that rides
+    /// the snapshot to the next `Painted`. The full snapshot then serves
+    /// every later target (`ensure_layout_snapshot` short-circuits on it).
+    fn lazy_nav_fall_back_to_full_layout(&mut self, scale: f32) -> Result<(), Box<Event>> {
+        self.ensure_layout_snapshot(scale, false, None)?;
+        if let Some(s) = self.layout_snapshot.borrow_mut().as_mut()
+            && !s
+                .info
+                .degradations
+                .iter()
+                .any(|d| d.reason == LayoutDegradeReason::NavExpansionStalled)
+        {
+            s.info.degradations.push(LayoutDegraded {
+                reason: LayoutDegradeReason::NavExpansionStalled,
+                page: None,
+            });
+        }
+        Ok(())
     }
 
     /// Issue #462 — make the band cover a caret at `pos`: its block's last
