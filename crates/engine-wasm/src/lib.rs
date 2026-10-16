@@ -30483,3 +30483,7 @@ mod wire_validation_tests {
 /// Issue #456 — the paragraph layout cache key sees every layout input.
 #[cfg(test)]
 mod paragraph_cache_key_tests;
+
+/// Issues #477–#481 — the nightly `snapshot_decode` findings, generator-free.
+#[cfg(test)]
+mod fuzz_finding_tests;

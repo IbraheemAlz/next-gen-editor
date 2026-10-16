@@ -729,6 +729,32 @@ mod tests {
         assert!(seen >= 1, "the #439 reproducer is committed");
     }
 
+    /// Issues #477–#481 — every committed `snapshot_decode` reproducer
+    /// (`corpus/snapshot_decode/repro_*`, raw nightly inputs that drive the
+    /// structure-aware session + mutation path) runs without a panic:
+    /// the base session's edits lay out, the restore answers `Ok` or a
+    /// typed error, the post-restore round keeps the engine invariants and
+    /// `Command::Recover` answers `Recovered`. The generator-independent
+    /// spellings are engine-wasm's `fuzz_finding_tests` and the engine's
+    /// `typing_after_an_anchor_inside_a_span_splits_the_span`.
+    #[test]
+    fn committed_snapshot_decode_reproducers_hold() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/snapshot_decode");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).expect("corpus/snapshot_decode") {
+            let path = entry.expect("entry").path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("repro_"))
+            {
+                run_snapshot_decode(&std::fs::read(&path).expect("seed"));
+                seen += 1;
+            }
+        }
+        assert!(seen >= 2, "the #477–#481 reproducers are committed");
+    }
+
     /// Issue #422 — the committed reproducer scenario runs to completion
     /// (one solid stroke per patterned underline, not millions of fills).
     #[test]
