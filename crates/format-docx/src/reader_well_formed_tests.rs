@@ -513,3 +513,53 @@ fn an_undeclared_prefix_in_a_sibling_is_bound_on_its_root() {
     let saved = write_docx(&a, &a.document).expect("write");
     crate::check_part_xml_well_formed(&saved, "word/styles.xml").expect("well-formed styles");
 }
+
+/* ------------------------------------------------------------------ */
+/* Issue #468 item 2 — XML name syntax                                  */
+/* ------------------------------------------------------------------ */
+
+/// Issue #468 — a byte flip that puts `;` / `=` / `"` / a leading digit in
+/// a tag or attribute name is a structural defect: the main part refuses
+/// with a typed error (no faithful repair — which name was meant?).
+#[test]
+fn an_invalid_tag_name_in_the_main_part_refuses_typed() {
+    for flipped in [
+        "<w:p;><w:r><w:t>a</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p=x/>",
+        "<w:p><w:r w:rsidR\"\"=\"1\"><w:t>a</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>a</w:t></w:r></w:p><1w:p/>",
+        "<w:p><w:r><w:t>a</w:t></w:r></w:p><mc:A;lternateContent/>",
+    ] {
+        let xml = document(flipped.as_bytes());
+        let err = read_docx(&package_with_document_xml_bytes(&xml, &[]))
+            .expect_err("no faithful repair for a bad name");
+        assert!(
+            matches!(&err, crate::DocxError::MalformedXml(d) if d.contains("not a valid XML name")),
+            "{flipped}: {err:?}"
+        );
+    }
+}
+
+/// Issue #468 — the same in a sibling part: reported (`repaired: false`),
+/// the part stays byte-identical, the document opens.
+#[test]
+fn an_invalid_tag_name_in_a_sibling_is_reported_and_kept() {
+    let styles: &[u8] = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="A"><w:na;me w:val="A"/></w:style></w:styles>"#;
+    let xml = document(b"<w:p><w:r><w:t>a</w:t></w:r></w:p>");
+    let docx = package_with_document_xml_bytes(&xml, &[("word/styles.xml", styles)]);
+    let a = read_docx(&docx).expect("the document opens");
+    assert_eq!(
+        malformed_parts(&a.warnings),
+        vec![("word/styles.xml", false)]
+    );
+    assert!(
+        a.warnings.iter().any(|w| matches!(
+            w,
+            DocxWarning::MalformedPart { detail, .. } if detail.contains("`w:na;me`")
+        )),
+        "{:?}",
+        a.warnings
+    );
+    assert_eq!(a.part_by_name("word/styles.xml"), Some(styles));
+    assert_eq!(a.document.to_plain_text(), "a");
+}

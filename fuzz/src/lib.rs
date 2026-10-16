@@ -63,11 +63,23 @@ pub fn read_raw_package(data: &[u8]) -> Result<format_docx::DocxArchive, format_
 /// on the SECOND save (e.g. a `dirty` flag that doesn't reset) would slip
 /// past a single read/write/read.
 pub fn run_docx_roundtrip(data: &[u8]) {
+    /* Issue #468 — a committed `.docx` seed (the well-formedness seeds of
+    `corpus/docx_reader/wf_*`, a mutation of one) is also taken as the
+    package itself, so the read => write => read invariants run over the
+    exact malformed shapes, not only over what the generator can spell. */
+    if data.starts_with(b"PK\x03\x04") {
+        check_roundtrip(data);
+    }
     let mut u = Unstructured::new(data);
     let Some(bytes) = docx_gen::build_docx(&mut u) else {
         return;
     };
-    let Ok(archive_a) = format_docx::read_docx(&bytes) else {
+    check_roundtrip(&bytes);
+}
+
+/// [`run_docx_roundtrip`]'s invariants over one package `bytes`.
+pub fn check_roundtrip(bytes: &[u8]) {
+    let Ok(archive_a) = format_docx::read_docx(bytes) else {
         return;
     };
     let doc_a = archive_a.document.clone();
@@ -774,9 +786,100 @@ pub fn hostile_docx_seeds() -> Vec<(&'static str, Vec<u8>, Option<format_docx::P
     ]
 }
 
+/// Issue #468 — what a well-formedness seed must reach through the raw
+/// package path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WfOutcome {
+    /// The package opens (repaired or reported), and read => write => read
+    /// keeps the text with a save that needs no repair.
+    Opens,
+    /// The main part has no faithful repair: `DocxError::MalformedXml`
+    /// (answered as the typed `DocumentUnreadable`).
+    Refused,
+}
+
+/// Issue #468 — the main part of a well-formedness seed: the stock prolog
+/// and `w` / `r` / `mc` root around `body`.
+fn wf_document(body: &[u8]) -> Vec<u8> {
+    [
+        wf_prolog(),
+        wf_root(),
+        b"<w:body>",
+        body,
+        b"<w:sectPr/></w:body></w:document>",
+    ]
+    .concat()
+}
+
+fn wf_prolog() -> &'static [u8] {
+    b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+}
+
+fn wf_root() -> &'static [u8] {
+    concat!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+        r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+        r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">"#
+    )
+    .as_bytes()
+}
+
+/// Issue #468 — the `.docx` seeds of `corpus/docx_reader/wf_*`: `(file name,
+/// package bytes, outcome)`, one per shape the well-formedness scan judges
+/// beyond a plain lexical repair (XML name syntax, UTF-16 parts, a root
+/// wrapped in junk). Built from `format_docx::test_fixtures`, written by
+/// `examples/regen-seeds`, pinned by `tests::well_formed_seeds_are_committed`.
+pub fn well_formed_docx_seeds() -> Vec<(&'static str, Vec<u8>, WfOutcome)> {
+    use format_docx::test_fixtures::package_with_document_xml_bytes as package;
+    let para = |t: &str| format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>").into_bytes();
+    let styles: &[u8] = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="A"><w:na;me w:val="A"/></w:style></w:styles>"#;
+    vec![
+        (
+            "wf_bad_tag_name_main.docx",
+            package(&wf_document(b"<w:p;><w:r><w:t>a</w:t></w:r></w:p>"), &[]),
+            WfOutcome::Refused,
+        ),
+        (
+            "wf_bad_tag_name_sibling.docx",
+            package(&wf_document(&para("a")), &[("word/styles.xml", styles)]),
+            WfOutcome::Opens,
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #468 — the committed well-formedness seeds are exactly what
+    /// [`well_formed_docx_seeds`] builds (re-run `examples/regen-seeds`), and
+    /// each reaches its outcome through the raw-package path; an opening seed
+    /// also holds the `docx_roundtrip` invariants.
+    #[test]
+    fn well_formed_seeds_are_committed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_reader");
+        for (name, bytes, outcome) in well_formed_docx_seeds() {
+            let committed = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("{name}: {e} — run examples/regen-seeds"));
+            assert!(
+                committed == bytes,
+                "{name} is stale — run examples/regen-seeds"
+            );
+            run_docx_reader(&bytes);
+            let got = read_raw_package(&bytes);
+            match outcome {
+                WfOutcome::Opens => {
+                    assert!(got.is_ok(), "{name}: {:?}", got.err());
+                    check_roundtrip(&bytes);
+                }
+                WfOutcome::Refused => assert!(
+                    matches!(&got, Err(format_docx::DocxError::MalformedXml(_))),
+                    "{name}: {:?}",
+                    got.as_ref().map(|_| "read")
+                ),
+            }
+        }
+    }
 
     /// libFuzzer always executes the zero-length input first, and under
     /// `-fork` every worker attributes an exit-time failure to it (that is

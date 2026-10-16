@@ -63,11 +63,20 @@
 //! `archive::check_part_xml_well_formed`), so the reader and the writer's
 //! well-formedness gate agree on what "well-formed" means.
 //!
-//! Not checked (known gaps): the XML `Name` production (a byte flip that
-//! turns a name character into `;` or `=` stays a name to quick-xml, and a
-//! prefix that is no `NCName` cannot be bound, so it is not reported
-//! either), and entity / attribute-list declarations inside a DOCTYPE
-//! (left as they are; OPC forbids DTDs and nothing is ever expanded).
+//! Issue #468 — **names** are checked too ([`is_xml_name`], the XML 1.0
+//! `Name` production, an ASCII fast path in front of the full
+//! `NameStartChar` / `NameChar` ranges): quick-xml accepts any bytes up to
+//! a space, `/` or `>` as an element or attribute name, so a byte flip that
+//! put `;`, `=`, `"` or a leading digit into a tag or prefix name used to be
+//! neither reported nor repaired — and a prefix that is no `NCName` cannot
+//! be bound by [`bind_on_root`]. There is no faithful repair (which name did
+//! the producer mean?), so an invalid element or attribute name is a
+//! STRUCTURAL defect: the main part refuses, a sibling is left verbatim and
+//! reported `repaired: false`.
+//!
+//! Not checked (known gap): entity / attribute-list declarations inside a
+//! DOCTYPE (left as they are; OPC forbids DTDs and nothing is ever
+//! expanded).
 
 use crate::error::{DocxError, DocxWarning};
 use crate::opc::limits::{PackageLimit, PackageLimits};
@@ -101,6 +110,66 @@ fn is_utf16(xml: &[u8]) -> bool {
 /// surrogates and U+FFFE / U+FFFF.
 fn is_xml_char(c: u32) -> bool {
     matches!(c, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+}
+
+/// XML 1.0 `NameStartChar` (colon included: the `Name` production, not
+/// `NCName`).
+fn is_name_start(c: char) -> bool {
+    matches!(c,
+        ':' | 'A'..='Z' | '_' | 'a'..='z'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+}
+
+/// XML 1.0 `NameChar`.
+fn is_name_char(c: char) -> bool {
+    is_name_start(c)
+        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+}
+
+/// Issue #468 — `true` when `name` (an element or attribute name as the
+/// tokenizer cut it) is an XML 1.0 `Name`: a `NameStartChar` then
+/// `NameChar`s. ASCII names (every real WordprocessingML name) take a byte
+/// loop; anything else is decoded (a name that is not UTF-8 is no name — the
+/// scan runs on UTF-8-repaired bytes, so U+FFFD is the only way one shows).
+pub(crate) fn is_xml_name(name: &[u8]) -> bool {
+    let Some((&first, rest)) = name.split_first() else {
+        return false;
+    };
+    if name.is_ascii() {
+        let start = |b: u8| b.is_ascii_alphabetic() || matches!(b, b'_' | b':');
+        return start(first)
+            && rest
+                .iter()
+                .all(|&b| start(b) || b.is_ascii_digit() || matches!(b, b'-' | b'.'));
+    }
+    let Ok(text) = std::str::from_utf8(name) else {
+        return false;
+    };
+    let mut chars = text.chars();
+    chars.next().is_some_and(is_name_start) && chars.all(is_name_char)
+}
+
+/// Issue #468 — the first element or attribute name of start / empty tag
+/// `e` that is no XML `Name`, if any.
+fn first_invalid_name<'a>(e: &'a BytesStart<'_>) -> Option<Cow<'a, str>> {
+    let name = e.name().into_inner();
+    if !is_xml_name(name) {
+        return Some(lossy(name));
+    }
+    /* Nothing after the name but `/` / whitespace: no attributes to read. */
+    let after = e.as_ref().get(name.len()..).unwrap_or_default();
+    if after.iter().all(|b| b.is_ascii_whitespace() || *b == b'/') {
+        return None;
+    }
+    for a in e.attributes().with_checks(false).flatten() {
+        if !is_xml_name(a.key.into_inner()) {
+            return Some(lossy(a.key.into_inner()));
+        }
+    }
+    None
 }
 
 /// What one strict scan found, per defect class (the warning's detail).
@@ -459,9 +528,9 @@ fn is_implicit_prefix(p: &[u8]) -> bool {
 
 /// `true` for an `NCName`-shaped prefix (ASCII letters, digits, `-`, `.`,
 /// `_`, any non-ASCII character; not starting with a digit, `-` or `.`).
-/// Only such a prefix can be bound by an `xmlns:` attribute; a "name"
-/// holding `"` or `=` is an XML `Name` defect, which the scan does not
-/// judge (see the module docs).
+/// Only such a prefix can be bound by an `xmlns:` attribute. (A name that
+/// is no XML `Name` at all never reaches here: the scan refuses it first,
+/// [`first_invalid_name`].)
 fn is_ncname(p: &[u8]) -> bool {
     let ok = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_') || b >= 0x80;
     match p.first() {
@@ -658,6 +727,11 @@ fn scan(body: &[u8]) -> Scan {
                     return Scan::Structural(format!("a second root element at byte {prev}"));
                 }
                 root_seen = true;
+                if let Some(bad) = first_invalid_name(e) {
+                    return Scan::Structural(format!(
+                        "`{bad}` in the tag at byte {prev} is not a valid XML name"
+                    ));
+                }
                 let empty = matches!(event, Event::Empty(_));
                 let level = open.len() + 1;
                 check_prefixes(e, level, &mut decls, &mut tally.unbound);
@@ -1241,12 +1315,75 @@ mod tests {
         for xml in [
             &br#"<w:document><w:p xml:space="preserve"/></w:document>"#[..],
             br#"<r xmlns:p="u"><p:a/><s xmlns:q="v"><q:b p:c="1"/></s></r>"#,
-            b"<r><a=b:c/><d e;f:g=\"1\"/></r>",
         ] {
             let (out, w) = run(xml);
             assert_eq!(out, xml);
             assert!(w.is_empty(), "{}: {w:?}", lossy(xml));
         }
+    }
+
+    /// Issue #468 — a tag or attribute name that is no XML `Name` (a byte
+    /// flip put `;` `=` `"` or a leading digit in it) is a structural
+    /// defect: reported, left as it is.
+    #[test]
+    fn an_invalid_xml_name_is_a_structural_defect() {
+        for xml in [
+            &b"<r><a=b:c/></r>"[..],
+            b"<r><d e;f:g=\"1\"/></r>",
+            b"<r><1a/></r>",
+            b"<r><a:b\"c\"/></r>",
+            b"<r><a 1b=\"x\"/></r>",
+            b"<r><a b\"c\"=\"x\"/></r>",
+            b"<r>< a/></r>",
+            b"<r><a\x01b/></r>",
+        ] {
+            let (out, w) = run(xml);
+            assert_eq!(out, xml, "left as it is");
+            assert!(
+                matches!(
+                    w.as_slice(),
+                    [DocxWarning::MalformedPart { detail, repaired: false, .. }]
+                        if detail.contains("not a valid XML name")
+                ),
+                "{}: {w:?}",
+                lossy(xml)
+            );
+            assert!(defects(xml).is_some_and(|d| d.contains("not a valid XML name")));
+        }
+    }
+
+    #[test]
+    fn xml_names_follow_the_name_production() {
+        for ok in [
+            "w:p",
+            "_a",
+            ":x",
+            "a-b.c1",
+            "w14:paraId",
+            "\u{E9}t\u{E9}",
+            "\u{FFFD}:a",
+            "a\u{B7}b",
+            "\u{10000}x",
+        ] {
+            assert!(is_xml_name(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            "",
+            "1a",
+            "-a",
+            ".a",
+            "a;b",
+            "a=b",
+            "a\"b",
+            "a b",
+            "a\u{D7}b",
+            "\u{37E}",
+            "\u{B7}a",
+            "a\u{FFFE}",
+        ] {
+            assert!(!is_xml_name(bad.as_bytes()), "{bad:?}");
+        }
+        assert!(!is_xml_name(b"a\xFFb"));
     }
 
     #[test]
