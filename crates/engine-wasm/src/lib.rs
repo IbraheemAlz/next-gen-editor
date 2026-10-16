@@ -11773,7 +11773,7 @@ impl Engine {
     /// Issue #497 — every page canvas repaints on the next
     /// `render_document`, unchanged display list or not: called when an
     /// input the display list does not carry changes (the font map, the
-    /// decoded-image cache) and before an explicit `RequestPaint`.
+    /// decoded-image cache) or a path draws on a canvas directly.
     fn forget_painted_pages(&mut self) {
         for slot in self.page_ctxs.iter_mut().flatten() {
             slot.painted = None;
@@ -11781,10 +11781,11 @@ impl Engine {
     }
 
     fn do_request_paint(&mut self, viewport: BridgeRect, dirty: Option<BridgeRect>) -> Event {
-        /* Issue #497 — an explicit paint request repaints every canvas
-        (the shell's boot settle frame, a newly registered page canvas);
-        only the automatic repaint after an edit skips unchanged pages. */
-        self.forget_painted_pages();
+        /* Issue #497 — a paint request brings every registered canvas up
+        to date: a freshly registered one (the worker's page-canvas repaint)
+        has no record and paints, the others keep pixels that already show
+        their page. Forgetting here made every canvas registration after a
+        band expansion re-rasterize all pages again. */
         let drained = self.dirty.drain();
         let region = dirty
             .map(bridge_to_kurbo)

@@ -77,7 +77,10 @@ pub(crate) fn shell_engine() -> Engine {
                 bytes: bytes.to_vec(),
             },
         );
-        assert!(!matches!(evt, Event::Error { .. }), "LoadFont {id}: {evt:?}");
+        assert!(
+            !matches!(evt, Event::Error { .. }),
+            "LoadFont {id}: {evt:?}"
+        );
     }
     let evt = apply(
         &mut e,
@@ -94,7 +97,10 @@ pub(crate) fn shell_engine() -> Engine {
             ],
         },
     );
-    assert!(!matches!(evt, Event::Error { .. }), "SetFontPriority: {evt:?}");
+    assert!(
+        !matches!(evt, Event::Error { .. }),
+        "SetFontPriority: {evt:?}"
+    );
     e.layout_cfg = Some(RenderConfig {
         font_id: "liberation".to_string(),
         base_direction: ShapingDirection::Ltr,
@@ -198,7 +204,10 @@ fn profile_font_resolution() {
         }
         engine.font_priority = HashMap::from([
             (S::Latin, vec!["liberation".to_string()]),
-            (S::Arabic, vec!["amiri".to_string(), "noto-naskh".to_string()]),
+            (
+                S::Arabic,
+                vec!["amiri".to_string(), "noto-naskh".to_string()],
+            ),
         ]);
         if let Some(cfg) = engine.layout_cfg.as_mut() {
             cfg.font_id = "liberation".to_string();
@@ -235,4 +244,102 @@ fn profile_font_resolution() {
             time(S::Latin, Some("liberation")),
         );
     }
+}
+
+/// Issue #497 — an edit repaints only the page canvases whose display list
+/// changed, and a paint request only the canvases that are not up to date.
+/// A marker drawn on each canvas shows which canvases a repaint touched (a
+/// repaint clears the canvas first). Browser-only: an `OffscreenCanvas` needs a JS global scope
+/// (`wasm-pack test --headless --chrome crates/engine-wasm`).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn an_edit_repaints_only_the_pages_it_changed() {
+    use web_sys::OffscreenCanvas;
+    const MARK: [u8; 3] = [0xff, 0x00, 0xff];
+    let mut e = tests::test_engine_with_doc(DocumentTree::from_paragraphs(
+        (1..=200).map(|i| format!("Line {i}")),
+    ));
+    let evt = apply(&mut e, Command::ExpandLayout { target_y: 1e9 });
+    let Event::Painted { page_count, .. } = evt else {
+        panic!("EXPAND_LAYOUT: {evt:?}");
+    };
+    assert!(
+        page_count >= 3,
+        "fixture must span 3+ pages, got {page_count}"
+    );
+    let fresh_canvas = || {
+        let canvas = OffscreenCanvas::new(1, 1).expect("OffscreenCanvas");
+        let ctx = canvas
+            .get_context("2d")
+            .expect("2d")
+            .expect("2d")
+            .dyn_into::<OffscreenCanvasRenderingContext2d>()
+            .expect("2d ctx");
+        (canvas, ctx)
+    };
+    let mut ctxs: Vec<OffscreenCanvasRenderingContext2d> = (0..3)
+        .map(|i| {
+            let (canvas, ctx) = fresh_canvas();
+            e.set_page_canvas(i, canvas).expect("register");
+            ctx
+        })
+        .collect();
+    fn mark_all(ctxs: &[OffscreenCanvasRenderingContext2d]) {
+        for ctx in ctxs {
+            ctx.set_fill_style_str("#ff00ff");
+            ctx.fill_rect(0.0, 0.0, 2.0, 2.0);
+        }
+    }
+    fn marked(ctxs: &[OffscreenCanvasRenderingContext2d]) -> Vec<bool> {
+        ctxs.iter()
+            .map(|ctx| {
+                let px = ctx.get_image_data(0.0, 0.0, 1.0, 1.0).expect("read").data();
+                px[..3] == MARK
+            })
+            .collect()
+    }
+    /* A paint request paints every freshly registered canvas. */
+    let paint = Command::RequestPaint {
+        viewport: BridgeRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        },
+        dirty: None,
+    };
+    assert!(matches!(
+        apply(&mut e, paint.clone()),
+        Event::Painted { .. }
+    ));
+    mark_all(&ctxs);
+    assert_eq!(marked(&ctxs), vec![true, true, true]);
+    /* A same-width edit on page 1 (the first) leaves pages 2 and 3 alone. */
+    let evt = apply(
+        &mut e,
+        Command::InsertText {
+            at: Some(bpos_top(0, 0)),
+            text: "x".into(),
+        },
+    );
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    assert_eq!(
+        marked(&ctxs),
+        vec![false, true, true],
+        "only page 1 repaints"
+    );
+    /* A paint request with nothing changed keeps every canvas ... */
+    mark_all(&ctxs);
+    assert!(matches!(
+        apply(&mut e, paint.clone()),
+        Event::Painted { .. }
+    ));
+    assert_eq!(marked(&ctxs), vec![true, true, true]);
+    /* ... but paints a canvas registered since (a fresh surface). */
+    let (canvas, ctx) = fresh_canvas();
+    mark_all(std::slice::from_ref(&ctx));
+    e.set_page_canvas(2, canvas).expect("re-register");
+    ctxs[2] = ctx;
+    assert!(matches!(apply(&mut e, paint), Event::Painted { .. }));
+    assert_eq!(marked(&ctxs), vec![true, true, false]);
 }
