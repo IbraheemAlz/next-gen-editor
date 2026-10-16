@@ -129,6 +129,14 @@ hard failure so CI catches a new loop instead of a silent recovery.
 - The nominal path stays output-identical: `geometry_fingerprint` pins
   the pre-watchdog geometry for every paginator and engine fixture. A
   self-defense change that moves a pinned fingerprint moves the goldens.
+- **A deeper cull target is not a full layout (issue #499).** The
+  viewport cull compares the paginator's RUNNING height (an oversize
+  line's cursor can run far past its page), not the band's page sizes,
+  so a band can stay put under any finite target. A loop that grows the
+  band (`lazy_nav_expand_until`) is bounded by band PROGRESS — more pages
+  or fewer unlaid blocks per round, else ONE target-less
+  `build_pages(None)` noted `NavExpansionStalled` — never by "the target
+  will get big enough".
 - **Bound slow progress, not only churn (issue #318).** The watchdog
   catches non-progress; a recursion that re-does a subtree per ancestor
   pass makes progress and still never finishes (nested-table autofit
