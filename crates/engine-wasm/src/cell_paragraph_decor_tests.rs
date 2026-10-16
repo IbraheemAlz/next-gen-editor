@@ -270,8 +270,8 @@ fn pdf_export_paints_the_cell_paragraph_fill_and_rule() {
 /// Painting operators of a content stream outside any `BDC` / `BMC` …
 /// `EMC` sequence (the tagged-export rule of issue #360).
 fn unmarked_paint_operators(stream: &str) -> Vec<String> {
-    const PAINT: [&str; 12] = [
-        "f", "F", "f*", "S", "s", "B", "B*", "b", "b*", "sh", "Do", "Tj",
+    const PAINT: [&str; 13] = [
+        "f", "F", "f*", "S", "s", "B", "B*", "b", "b*", "sh", "Do", "Tj", "TJ",
     ];
     let mut depth = 0usize;
     let mut loose = Vec::new();
@@ -279,16 +279,7 @@ fn unmarked_paint_operators(stream: &str) -> Vec<String> {
         match tok {
             "BDC" | "BMC" => depth += 1,
             "EMC" => depth = depth.saturating_sub(1),
-            "TJ" => {
-                if depth == 0 {
-                    loose.push(tok.to_string());
-                }
-            }
-            t if PAINT.contains(&t) => {
-                if depth == 0 {
-                    loose.push(t.to_string());
-                }
-            }
+            t if depth == 0 && PAINT.contains(&t) => loose.push(t.to_string()),
             _ => {}
         }
     }

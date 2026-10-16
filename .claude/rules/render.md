@@ -215,6 +215,18 @@ hard failure so CI catches a new loop instead of a silent recovery.
   stored with the entry and replayed on a hit, so a cached paint reports
   what a fresh one would. `tools/corpus-native` re-lays every document
   warm (`engine_repaint_consistent`) to prove warm == cold.
+- **Paragraph decorations are stamped by ONE helper (issue #455).**
+  `pBdr` borders, `shd` shading and the tracked-mark pilcrow colour are
+  paint-only, so `paragraph_layout_key` leaves them out and the paragraph
+  LRU holds an undecorated box; every path that puts a paragraph on a
+  page copies them from the model through
+  `paragraph_decor::stamp_paragraph_decor` (the body loop, the note /
+  header / footer / text-box story loop, the table-cell loop incl. its
+  nesting-cap flatten branch) — never a fourth hand copy. The #379 table
+  cache stores the STAMPED cell boxes, so `paragraph_content_key` mixes
+  `paragraph_decor::decor_key` into every cell paragraph's key and the
+  verified hit checks `decor_matches`; a new decoration goes into all
+  three functions.
 - **The caches are observable in production (issue #500).** Both caches
   keep always-on counters (paragraph `ParagraphCacheStats`, table-box
   `TableCacheStats`: a table hit is a verified served box, a miss is
