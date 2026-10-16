@@ -8,8 +8,12 @@
  *   node run.mjs <case> [tol]   — single case (back-compat)
  *   UPDATE=1 node run.mjs ...   — regenerate goldens instead of diffing
  *
- * Assumes the Vite dev server is running on http://localhost:5173/. Override
- * the origin with the URL env var. Uses Playwright with the system Chrome
+ * Issue #470 — needs the Vite dev server and finds it the way
+ * `ts/playwright.config.ts` does (`tools/lib/port.mjs`): the `URL` env var,
+ * else `PW_PORT`, else a port hashed from this checkout's path (so a
+ * worktree never captures a sibling's server). When nothing answers there
+ * the harness boots `vite` itself and stops it on exit; the URL it captured
+ * from is printed first. Uses Playwright with the system Chrome
  * (channel:'chrome') — no extra browser download. Waits for
  * `window.__paintIdle === true` before capturing.
  *
@@ -25,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
 import { chromium } from 'playwright';
+import { ensureDevServerOrExit } from '../lib/dev-server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 /* PR #19 cherry-pick — dual-tier goldens. Canvas2D goldens live at
@@ -47,7 +52,8 @@ const TIERS = {
 };
 const PIXELMATCH_THRESHOLD = 0.1;
 
-const ORIGIN = process.env.URL ?? 'http://localhost:5173';
+/* Resolved (and, if need be, booted) once the arguments check out. */
+let ORIGIN = '';
 const update = process.env.UPDATE === '1';
 
 /* Per-case viewport. A4 cases render a full 595x842 pt page 1:1; single-glyph
@@ -65,6 +71,9 @@ const VIEWPORTS = {
     'list-bullet-numbered': { width: 595, height: 842 },
     'rich-text-caps': { width: 595, height: 842 },
     'rich-text-cs-size': { width: 595, height: 842 },
+    'page-borders': { width: 595, height: 842 },
+    'line-numbers': { width: 595, height: 842 },
+    'drop-cap': { width: 595, height: 842 },
     'theme-fonts': { width: 1190, height: 360 },
     'font-substitution': { width: 1190, height: 640 },
     'soft-hyphen': { width: 1190, height: 400 },
@@ -161,6 +170,10 @@ if (!singleCase && !TIERS[tier]) {
     process.exit(2);
 }
 
+const devServer = await ensureDevServerOrExit({ label: 'visual-diff' });
+ORIGIN = devServer.origin;
+console.log(`[visual-diff] origin=${devServer.describe()}`);
+
 const browser = await chromium.launch({ headless: true, channel: 'chrome' });
 let exitCode = 0;
 try {
@@ -226,5 +239,6 @@ try {
     }
 } finally {
     await browser.close();
+    await devServer.stop();
 }
 process.exit(exitCode);

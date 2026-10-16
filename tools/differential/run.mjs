@@ -140,8 +140,22 @@ if (!havePdftoppm) {
 
 let pixelmatch, PNG;
 if (havePdftoppm) {
-    ({ default: pixelmatch } = await import('pixelmatch'));
-    ({ PNG } = await import('pngjs'));
+    try {
+        ({ default: pixelmatch } = await import('pixelmatch'));
+        ({ PNG } = await import('pngjs'));
+    } catch (e) {
+        /* Issue #470 - `tools/differential` is a pnpm WORKSPACE member
+           (`tools/*` in pnpm-workspace.yaml; pixelmatch + pngjs are in the
+           root lockfile), so the dependencies come from the ROOT install -
+           there is no per-directory install step, and a fresh worktree has
+           no node_modules at all until the root install runs. */
+        console.error(`[differential] cannot load pixelmatch/pngjs (${e.code ?? e.message}).`);
+        console.error(
+            '[differential] run `pnpm install --frozen-lockfile` at the REPOSITORY ROOT ' +
+                '(not in tools/differential) - this checkout has no installed node_modules yet.',
+        );
+        process.exit(1);
+    }
 }
 
 /* ---------------------------------------------------------------- */

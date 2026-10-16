@@ -426,15 +426,7 @@ pub fn build_numbering_xml(defs: &engine::numbering::NumberingDefinitions) -> Ve
             };
             s.push_str(&format!("<w:numFmt w:val=\"{fmt_tok}\"/>"));
             s.push_str("<w:lvlText w:val=\"");
-            for ch in lvl.lvl_text.chars() {
-                match ch {
-                    '&' => s.push_str("&amp;"),
-                    '<' => s.push_str("&lt;"),
-                    '>' => s.push_str("&gt;"),
-                    '"' => s.push_str("&quot;"),
-                    other => s.push(other),
-                }
-            }
+            crate::writer::push_escaped_attr(&lvl.lvl_text, &mut s);
             s.push_str("\"/>");
             if let Some(restart) = lvl.lvl_restart {
                 s.push_str(&format!("<w:lvlRestart w:val=\"{restart}\"/>"));

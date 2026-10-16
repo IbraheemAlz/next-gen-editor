@@ -123,7 +123,7 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **Hierarchical box model** (`layout/boxes.rs`): `PageBox → ParagraphBox → LineBox → VisualRun → PositionedGlyph`. Every box's `origin` is parent-relative; the renderer accumulates origins down the tree. `layout_paragraph` owns all geometry — line stacking and the alignment offset are baked into `LineBox.origin`, so the renderer is a pure traversal.
 - **ICU 2.x** — `icu_segmenter` / `icu_properties` bumped 1.5 → 2.2; `LineSegmenter::new_auto` now takes `LineBreakOptions`.
 - **Priority-band Kashida** (`text-pipeline/justify_kashida.rs`): candidates from Unicode `Joining_Type`, scored into Microsoft P1–P5 bands; one Kashida per word at its best stroke. Width is an `x_advance` bump, not yet a `U+0640` tatweel glyph.
-- **FontStack** (`text-pipeline/fonts.rs`, §13.A): per-script font fallback. `build_line` segments runs by BiDi level × script × style span.
+- **FontStack** (`text-pipeline/fonts.rs`, §13.A): per-script font fallback. `build_line` segments runs by BiDi level × script × style span. Issue #472: the per-script default is an explicit priority (`FontStack::with_priority`, declared by the shell's `fonts.json` `defaults_by_script` via `Command::SetFontPriority`, mirrored by `tools/harness-fonts`), not whichever covering face sorts first by id — see `.claude/rules/render.md`.
 - **Rich text** — `engine::Paragraph` carries `Vec<StyleRun>` style spans; `Command::ApplyFormatting` applies font-size + colour, plus bold/italic/underline **flags** stored on `SpanStyle` in Phase 4 (rendering of bold/italic faces + underline strokes was deferred at the time — shipped later, see "Where the deferred work landed" below).
 - **PDF export** (`format-pdf`, D3.7): box tree → single-page PDF, Y-axis inverted, full `Type0`/`CIDFontType2` font embedding. Not PDF/A-1b at the time — strict PDF/A-1b shipped later (D5.4, see below).
 - **DirtyTracker** (`render/dirty.rs`, D3.8): bounding-rect invalidation; `render_canvas2d` clips fills/strokes and culls off-region glyph runs (`put_image_data` ignores the canvas clip).
@@ -481,6 +481,7 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
 - After every mutation, if a `layout_cfg` was cached, the engine **auto-repaints** the full document and invalidates the `DirtyTracker`. `Command::RequestPaint` does a clipped partial repaint (D3.8); the auto-repaint path stays full.
 - BiDi runs **per line**, not paragraph-wide. UAX #9 requires this. Don't flatten visual order across line breaks.
 - Line break opportunities come from `icu_segmenter::LineSegmenter::new_auto()`. Greedy fit is fine for PoC; Knuth-Plass is Phase 3.
+- **Text enters the model clean (issue #467).** XML 1.0 cannot carry C0 controls other than TAB / LF / CR, `U+FFFE` or `U+FFFF`, so ONE table (`engine::text_input`) decides what every text door accepts: C0 controls are dropped, `U+000B` becomes a line break (`U+2028`), `U+000C` stays the model's page break, `U+FFFE` / `U+FFFF` are refused with `Event::Error { kind: InvalidArgument }` (nothing applied). The dispatcher runs it over every text-bearing command argument (`engine-wasm/src/text_input_guard.rs`, right after the #407 finiteness guard — a NEW text-bearing `Command` field must be added there); text the user cannot retype (a decoded HTML entity, a `.txt` / `.html` file) is repaired to `U+FFFD` instead of refused. A lone UTF-16 surrogate cannot reach Rust (the wasm string glue substitutes `U+FFFD`), so the worker refuses it first (`ts/src/engine/text-guard.ts`, unlogged). The writer is the last line: `push_escaped` / `push_escaped_attr` write any forbidden character as `U+FFFD` and the save report (`format_docx::save_docx_with_notes`) carries `WriteNote::ForbiddenCharactersReplaced`.
 
 ## `.docx` round-trip invariants
 
@@ -553,6 +554,17 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
   instead of a fixed 5173, so a sibling worktree's already-running Vite
   server can no longer be silently reused as the wrong tree under test —
   override with `PW_PORT`, or opt back into reuse with `PW_REUSE_SERVER=1`.
+  The `tools/*` browser harnesses (`perf`, `memory-profile`, `pdf-validate`,
+  `visual-diff`) resolve the very same port (issue #470): the derivation
+  lives in ONE module, `tools/lib/port.mjs` (imported by
+  `playwright.config.ts`, the telemetry specs and the harnesses), and
+  `tools/lib/dev-server.mjs` `ensureDevServer` picks the origin as `URL` >
+  `PW_PORT` > the path hash, reuses a server already answering there and
+  otherwise boots `pnpm exec vite --port N --strictPort` itself (stopped on
+  exit). Each report header names the measured URL; they no longer assume
+  5173 (`URL=http://localhost:5173` still pins a harness to it, as `ci.yml`
+  does). `pnpm --filter tools-lib test` covers the derivation (pinned
+  values) and the boot/reuse paths.
 
 ## Things to never do
 

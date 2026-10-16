@@ -182,15 +182,30 @@ fn family_docx_name(f: &FontFamily) -> &str {
 
 /// XML-escape character data (`&`, `<`, `>`) into `out`. Quotes don't matter
 /// inside character data.
-fn push_escaped(text: &str, out: &mut String) {
+///
+/// Issue #467 — the last line of defence: a character XML 1.0 cannot carry
+/// (a C0 control other than TAB / LF / CR, `U+FFFE`, `U+FFFF`) is written
+/// as U+FFFD, never raw, and counted for the save report
+/// ([`WriteNote::ForbiddenCharactersReplaced`]). The input boundary
+/// (`engine::text_input`) keeps these out of the model; this only catches
+/// what reached it another way (an old snapshot, a command nobody
+/// classified).
+pub(crate) fn push_escaped(text: &str, out: &mut String) {
     for c in text.chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            c if !engine::text_input::is_xml_char(c) => push_replacement(out),
             _ => out.push(c),
         }
     }
+}
+
+/// Issue #467 — write U+FFFD for a forbidden character and count it.
+fn push_replacement(out: &mut String) {
+    out.push(engine::text_input::REPLACEMENT);
+    FORBIDDEN_REPLACED.with(|n| n.set(n.get().saturating_add(1)));
 }
 
 /// Issue #84 — ordered child sink for one property container (`<w:rPr>`,
@@ -584,13 +599,16 @@ fn push_text_element(text: &str, delete_kind: bool, src: Option<&SourceRun>, out
 
 /// Escape `&` `<` `>` `"` for an XML attribute value. Quotes matter here
 /// (unlike character data) because attribute values are quote-delimited.
-fn push_escaped_attr(text: &str, out: &mut String) {
+///
+/// Issue #467 — forbidden characters become U+FFFD like in [`push_escaped`].
+pub(crate) fn push_escaped_attr(text: &str, out: &mut String) {
     for c in text.chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            c if !engine::text_input::is_xml_char(c) => push_replacement(out),
             _ => out.push(c),
         }
     }
@@ -2476,6 +2494,35 @@ fn note(n: WriteNote) {
     });
 }
 
+thread_local! {
+    /// Issue #467 — characters XML cannot carry that the escape helpers
+    /// ([`push_escaped`], [`push_escaped_attr`]) wrote as U+FFFD during the
+    /// running save; drained into one
+    /// [`WriteNote::ForbiddenCharactersReplaced`] by
+    /// [`run_collecting_notes`].
+    static FORBIDDEN_REPLACED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run one save with the writer's notes collected (restoring an enclosing
+/// collector afterwards) and the #467 replacement count folded in as the
+/// last note.
+fn run_collecting_notes<T>(
+    f: impl FnOnce() -> Result<T, DocxError>,
+) -> Result<(T, Vec<WriteNote>), DocxError> {
+    let outer = WRITE_NOTES.with(|c| c.borrow_mut().replace(Vec::new()));
+    let outer_count = FORBIDDEN_REPLACED.with(|n| n.replace(0));
+    let res = f();
+    let replaced = FORBIDDEN_REPLACED.with(|n| n.replace(outer_count));
+    let notes = WRITE_NOTES.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
+    res.map(|v| {
+        let mut notes = notes.unwrap_or_default();
+        if replaced > 0 {
+            notes.push(WriteNote::ForbiddenCharactersReplaced { count: replaced });
+        }
+        (v, notes)
+    })
+}
+
 /// Issue #246 — open a local field in its source form when the source
 /// bytes still spell its instruction ([`engine::FieldSource`]): a
 /// `<w:fldSimple>` start tag (only when the element nests with every
@@ -3916,6 +3963,8 @@ fn same_section_props(a: &engine::SectionProps, b: &engine::SectionProps) -> boo
         section_type,
         footnote_props,
         endnote_props,
+        page_borders,
+        line_numbering,
         source_xml: _,
     } = a;
     let same = |x: f32, y: f32| x.to_bits() == y.to_bits();
@@ -3953,6 +4002,65 @@ fn same_section_props(a: &engine::SectionProps, b: &engine::SectionProps) -> boo
         && *section_type == b.section_type
         && *footnote_props == b.footnote_props
         && *endnote_props == b.endnote_props
+        && *page_borders == b.page_borders
+        && same_line_numbering(line_numbering, &b.line_numbering)
+}
+
+/// Issue #328 — `<w:lnNumType>` equality with the distance compared by
+/// bits (the #349 rule: verified reuse never uses float `==`).
+fn same_line_numbering(
+    a: &Option<engine::LineNumbering>,
+    b: &Option<engine::LineNumbering>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.count_by == y.count_by
+                && x.start == y.start
+                && x.restart == y.restart
+                && x.distance_pt.map(f32::to_bits) == y.distance_pt.map(f32::to_bits)
+        }
+        _ => false,
+    }
+}
+
+/// Issue #328 — `<w:pgBorders>` (CT_PageBorders) from the typed model.
+fn emit_pg_borders(b: &engine::PageBorders, out: &mut String) {
+    out.push_str("<w:pgBorders");
+    if b.z_back {
+        out.push_str(" w:zOrder=\"back\"");
+    }
+    match b.display {
+        engine::PageBorderDisplay::AllPages => {}
+        engine::PageBorderDisplay::FirstPage => out.push_str(" w:display=\"firstPage\""),
+        engine::PageBorderDisplay::NotFirstPage => out.push_str(" w:display=\"notFirstPage\""),
+    }
+    if b.offset_from == engine::PageBorderOffset::Page {
+        out.push_str(" w:offsetFrom=\"page\"");
+    }
+    out.push('>');
+    emit_border_edge("w:top", &b.top, out);
+    emit_border_edge("w:left", &b.left, out);
+    emit_border_edge("w:bottom", &b.bottom, out);
+    emit_border_edge("w:right", &b.right, out);
+    out.push_str("</w:pgBorders>");
+}
+
+/// Issue #328 — `<w:lnNumType>` from the typed model.
+fn emit_ln_num_type(n: &engine::LineNumbering, out: &mut String) {
+    out.push_str(&format!("<w:lnNumType w:countBy=\"{}\"", n.count_by));
+    if n.start != 0 {
+        out.push_str(&format!(" w:start=\"{}\"", n.start));
+    }
+    if let Some(d) = n.distance_pt {
+        out.push_str(&format!(" w:distance=\"{}\"", (d * 20.0).round() as i64));
+    }
+    match n.restart {
+        engine::LineNumberRestart::NewPage => {}
+        engine::LineNumberRestart::NewSection => out.push_str(" w:restart=\"newSection\""),
+        engine::LineNumberRestart::Continuous => out.push_str(" w:restart=\"continuous\""),
+    }
+    out.push_str("/>");
 }
 
 thread_local! {
@@ -4149,15 +4257,7 @@ fn emit_hf_references(elem: &str, refs: &engine::HeaderFooterRefs, out: &mut Str
     ] {
         if let Some(rid) = rid {
             out.push_str(&format!("<{elem} w:type=\"{role}\" r:id=\""));
-            for ch in rid.chars() {
-                match ch {
-                    '&' => out.push_str("&amp;"),
-                    '<' => out.push_str("&lt;"),
-                    '>' => out.push_str("&gt;"),
-                    '"' => out.push_str("&quot;"),
-                    other => out.push(other),
-                }
-            }
+            push_escaped_attr(rid, out);
             out.push_str("\"/>");
         }
     }
@@ -4212,6 +4312,14 @@ fn emit_sect_pr(props: &engine::SectionProps, out: &mut String) {
         tw(g.header_offset),
         tw(g.footer_offset)
     ));
+    /* Issue #328 — CT_SectPr order: pgMar, paperSrc, pgBorders,
+    lnNumType, pgNumType. */
+    if let Some(b) = &props.page_borders {
+        emit_pg_borders(b, out);
+    }
+    if let Some(n) = &props.line_numbering {
+        emit_ln_num_type(n, out);
+    }
     emit_pg_num_type(props.page_num, out);
     if props.columns.is_multi() {
         emit_cols(props.columns, out);
@@ -4259,10 +4367,7 @@ pub fn write_docx_with_notes(
     let _source_scope = AgainstSourceScope::enter(true);
     /* Issue #325 — every URI / rel type minted below follows the source's family. */
     let _family = FamilyScope::enter(doc_family(doc));
-    let outer = WRITE_NOTES.with(|c| c.borrow_mut().replace(Vec::new()));
-    let res = write_docx_inner(archive, doc);
-    let notes = WRITE_NOTES.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
-    res.map(|bytes| (bytes, notes.unwrap_or_default()))
+    run_collecting_notes(|| write_docx_inner(archive, doc))
 }
 
 /// [`write_docx`] without choosing whether recorded source markup is
@@ -5253,8 +5358,16 @@ fn write_docx_raw(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
 /// `[Content_Types].xml` / rels. An engine-authored document (no package)
 /// saves through [`build_minimal_docx`], unchanged.
 pub fn save_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    save_docx_with_notes(doc).map(|(bytes, _)| bytes)
+}
+
+/// [`save_docx`], also returning the writer's best-effort decisions
+/// ([`WriteNote`]) — the save report. Issue #467 — among them, how many
+/// characters XML cannot carry were written as U+FFFD
+/// ([`WriteNote::ForbiddenCharactersReplaced`]).
+pub fn save_docx_with_notes(doc: &DocumentTree) -> Result<(Vec<u8>, Vec<WriteNote>), DocxError> {
     let Some(package) = doc.source_package.as_deref() else {
-        return build_minimal_docx(doc);
+        return run_collecting_notes(|| build_minimal_docx(doc));
     };
     let other_entries: Vec<(String, Vec<u8>)> = package
         .entries
@@ -5275,7 +5388,7 @@ pub fn save_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
         warnings: Vec::new(),
         part_names,
     };
-    write_docx(&archive, doc)
+    write_docx_with_notes(&archive, doc)
 }
 
 /// Build a minimal valid `.docx` from a freshly created document — no
@@ -11788,3 +11901,8 @@ mod styles_patch_tests;
 #[cfg(test)]
 #[path = "writer_run_content_tests.rs"]
 mod run_content_tests;
+
+/// Issue #467 — forbidden characters are written as U+FFFD, with a note.
+#[cfg(test)]
+#[path = "writer_forbidden_chars_tests.rs"]
+mod forbidden_chars_tests;

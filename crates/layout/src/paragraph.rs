@@ -218,8 +218,11 @@ pub struct ParagraphConfig<'a> {
     /// Word's rule) times [`FontLinePitch::multiple`] instead of
     /// [`Self::line_height`]; `line_height` then only feeds the heuristics
     /// that need a nominal line (float-cutout band minimums). Ignored when
-    /// [`Self::line_height_exact`] is set. `None` is the configured-pitch
-    /// model every engine-authored document uses.
+    /// [`Self::line_height_exact`] is set. Issue #475 — engine-wasm passes
+    /// `Some` for every document (one model); `None` is the configured-
+    /// pitch model, left for layout callers outside a document (unit
+    /// fixtures, `format-pdf` tests, `tools/corpus-native`'s reduced
+    /// layout).
     pub font_line: Option<FontLinePitch>,
     /// Issue #326 — automatic hyphenation for this paragraph (`None`: off —
     /// `<w:autoHyphenation/>` unset, `<w:suppressAutoHyphens/>`, or no text
@@ -240,9 +243,12 @@ pub struct FontLinePitch {
     pub multiple: f32,
     /// `lineRule="atLeast"` floor in layout px; `0.0` for `auto`.
     pub at_least: f32,
-    /// `(ascent + line gap, descent)` in layout px for a line with no text
-    /// run — an empty paragraph, a doubled soft break — taken from the
-    /// paragraph mark's face at its size.
+    /// `(ascent + line gap, descent)` in layout px of one line in the
+    /// paragraph MARK's face at its size: what sizes a line with no text
+    /// run — an empty paragraph, a doubled soft break — and, issue #463,
+    /// what the paragraph's LAST line holds besides its text (Word sizes
+    /// the last line by the pilcrow too, so a smaller mark never props it
+    /// up past its text and a larger one raises it).
     pub empty: (f32, f32),
 }
 
@@ -374,6 +380,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     stays a pure accumulator. */
     let mut lines: Vec<LineBox> = Vec::with_capacity(composed.len());
     let mut y = 0.0_f32;
+    let last_line = composed.len().saturating_sub(1);
     for (i, (mut line, _)) in composed.into_iter().enumerate() {
         let (ascent, descent) = line_extents(
             &line,
@@ -381,6 +388,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             cfg.line_height,
             cfg.line_height_exact,
             cfg.font_line.as_ref(),
+            i == last_line,
         );
         /* First-line indent / hanging: hanging shifts the first line *back*
         toward the leading edge; firstLine shifts it *forward* into the body.
@@ -457,7 +465,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         if let Some(pitch) = cfg.font_line.as_ref()
             && !cfg.line_height_exact
         {
-            let (a, d) = font_line_extents(&line, cfg.fonts, pitch);
+            let (a, d) = font_line_extents(&line, cfg.fonts, pitch, true);
             line.baseline = a;
             line.height = a + d;
         }
@@ -757,6 +765,7 @@ fn compose_band(
             cfg.line_height,
             cfg.line_height_exact,
             cfg.font_line.as_ref(),
+            paragraph_last,
         );
         ascent = ascent.max(a);
         descent = descent.max(d);
@@ -1391,11 +1400,12 @@ fn line_extents(
     line_height: f32,
     exact: bool,
     font_line: Option<&FontLinePitch>,
+    last: bool,
 ) -> (f32, f32) {
     if let Some(pitch) = font_line
         && !exact
     {
-        return font_line_extents(line, fonts, pitch);
+        return font_line_extents(line, fonts, pitch, last);
     }
     let mut font_ascent = 0.0_f32;
     let mut font_descent = 0.0_f32;
@@ -1463,11 +1473,19 @@ fn line_extents(
 /// `descent` among the line's runs (Word's rule, `text_pipeline::
 /// LineMetrics`; a run's [`VisualRun::metrics_font`] stands in for its
 /// face), an inline image raising the ascent; a line with no text run
-/// takes [`FontLinePitch::empty`]. The line is `multiple ×` that, at least
-/// [`FontLinePitch::at_least`], and the extra (or missing) space goes
-/// ABOVE the text, as in Word: the baseline sits one descent above the
-/// line's bottom.
-fn font_line_extents(line: &LineBox, fonts: &FontStack, pitch: &FontLinePitch) -> (f32, f32) {
+/// takes [`FontLinePitch::empty`]. Issue #463 — the paragraph's `last`
+/// line also holds the paragraph mark ([`FontLinePitch::empty`] folded
+/// into the maxima, as Word sizes it), and nothing else floors a line:
+/// no document default, so 8 pt text gets an 8 pt line. The line is
+/// `multiple ×` that, at least [`FontLinePitch::at_least`], and the extra
+/// (or missing) space goes ABOVE the text, as in Word: the baseline sits
+/// one descent above the line's bottom.
+fn font_line_extents(
+    line: &LineBox,
+    fonts: &FontStack,
+    pitch: &FontLinePitch,
+    last: bool,
+) -> (f32, f32) {
     let mut ascent = 0.0_f32;
     let mut descent = 0.0_f32;
     let mut measured = false;
@@ -1494,6 +1512,9 @@ fn font_line_extents(line: &LineBox, fonts: &FontStack, pitch: &FontLinePitch) -
     }
     if !measured {
         (ascent, descent) = pitch.empty;
+    } else if last {
+        ascent = ascent.max(pitch.empty.0);
+        descent = descent.max(pitch.empty.1);
     }
     let ascent = ascent.max(inline_image_h);
     let single = ascent + descent;

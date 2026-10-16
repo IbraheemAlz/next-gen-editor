@@ -5,6 +5,7 @@
 //! `layout_paragraph` owns all geometry; the renderer is a pure tree walk.
 
 pub mod boxes;
+pub mod decor;
 pub mod floats;
 pub mod hyphen;
 pub mod mark;
@@ -23,9 +24,10 @@ mod wrap_fixtures;
 pub use boxes::{
     CellAnchorRef, ComplexScriptAttrs, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx,
     FloatSpec, FloatWrap, FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField,
-    LineBox, LineHyphen, LineSegment, MarkerBox, NoteBand, PageBox, ParaFlow, ParagraphBox, Point,
-    PositionedGlyph, Size, SpanFace, StyleSpan, TabLeaderKind, TableBox, TableCellBox, TableRowBox,
-    TextAttrs, TextBoxFrame, TextBoxGlyph, VisualRun, WrapSide,
+    LineBox, LineHyphen, LineSegment, MarkerBox, NoteBand, PageBorderBox, PageBox, PageDecor,
+    ParaFlow, ParagraphBox, Point, PositionedGlyph, Size, SpanFace, StyleSpan, TabLeaderKind,
+    TableBox, TableCellBox, TableRowBox, TextAttrs, TextBoxFrame, TextBoxGlyph, VisualRun,
+    WrapSide,
 };
 pub use floats::{ColumnLayout, resolve_page_floats, story_frame_page};
 pub use mark::{empty_line_extents, empty_mark_pitch, mark_line_ratio};

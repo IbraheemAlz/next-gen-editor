@@ -6,7 +6,12 @@ user-invocable: true
 ---
 
 Start vite dev in the background and block until it's listening on
-:5173. Required before running visual-diff tests.
+:5173, for manual browsing. NOT required by the `tools/*` harnesses
+(visual-diff, perf, memory-profile, pdf-validate): since issue #470 they
+find this checkout's server the way Playwright does (`URL` > `PW_PORT` > a
+port hashed from the checkout path, `tools/lib/port.mjs`) and boot one
+themselves when nothing answers. To point a harness at THIS :5173 server
+anyway, run it with `URL=http://localhost:5173`.
 
 ```bash
 cd ts

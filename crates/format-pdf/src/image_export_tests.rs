@@ -185,6 +185,7 @@ fn image_page(stack: &FontStack) -> PageBox {
                 2,
             ),
         ],
+        decor: Default::default(),
     }
 }
 

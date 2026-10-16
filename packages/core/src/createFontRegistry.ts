@@ -20,6 +20,13 @@
  *     Simplified Arabic, …) — so an opened document lays out in
  *     metric-compatible faces from its first paint. A substitute that fails
  *     to load only loses its substitution (warned, never thrown).
+ *   - `applyScriptDefaults()` (boot, issue #472) sends the manifest's
+ *     `defaults_by_script` to the engine as `SET_FONT_PRIORITY`: per script,
+ *     the loaded face(s) that shape text naming no font family, in
+ *     preference order. Without it the engine falls back by sorted face id,
+ *     and the dual-script Amiri (`amiri` < `liberation`) wins Latin text.
+ *     Call it after `loadDefaults()` / `loadSubstitutes()` and again after
+ *     every recovery (`Command::Recover` wipes the engine's font setup).
  *   - `reset()` clears the resident set — call it on crash recovery, since
  *     `Command::Recover` wipes the engine's font map and the boot `loadDefaults`
  *     must re-push.
@@ -41,7 +48,7 @@
  */
 import { createSignal, type Accessor } from 'solid-js';
 import { createStore } from 'solid-js/store';
-import type { Command, Event } from './types';
+import type { Command, Event, FontPriority } from './types';
 
 /** One declared font in the manifest. */
 export interface FontDescriptor {
@@ -62,9 +69,23 @@ export interface FontManifest {
     /** Issue #329 — substitute faces loaded at boot next to `defaults`
      *  (optional: a manifest without the key loads none). */
     substitutes?: string[];
+    /** Issue #472 — the default face(s) per script for text that names no
+     *  font family, in preference order: keys are lower-case script names
+     *  (`latin`, `arabic`; see {@link SCRIPT_KEYS}), values an ordered id
+     *  list (a bare id string is accepted). Optional: a manifest without
+     *  the key leaves the engine's id-sorted fallback in force. */
+    defaults_by_script?: Record<string, string | string[]>;
     /** Every declared font. */
     fonts: FontDescriptor[];
 }
+
+/** Issue #472 — the `defaults_by_script` keys the engine's font stack
+ *  distinguishes, mapped to the bridge `Script` it takes. */
+export const SCRIPT_KEYS = {
+    latin: 'Latin',
+    arabic: 'Arabic',
+    common: 'Common',
+} as const satisfies Record<string, FontPriority['script']>;
 
 /** Per-id residency state in the engine. */
 export type FontLoadState = 'idle' | 'loading' | 'loaded' | 'error';
@@ -96,14 +117,41 @@ export interface FontRegistry {
     loadManifest: () => Promise<FontManifest>;
     /** JIT load: fetch + push `id` to the engine if not already resident. */
     ensureFont: (id: string) => Promise<void>;
+    /** Issue #472 — reactive `defaults_by_script`, normalised to ordered id
+     *  lists under lower-case script keys (empty until the manifest
+     *  resolves, or when it declares none). */
+    scriptDefaults: Accessor<Record<string, string[]>>;
     /** Boot: load the manifest's `defaults` set into the engine. */
     loadDefaults: () => Promise<void>;
+    /** Issue #472 — declare the manifest's `defaults_by_script` to the
+     *  engine (`SET_FONT_PRIORITY`; replaces the whole table, so it is safe
+     *  to repeat). Resolves with the EFFECTIVE lists the engine reports
+     *  (loaded ids only) - empty when the manifest declares nothing, in
+     *  which case nothing is sent. Never rejects: a refused or failed call
+     *  is warned about and the engine keeps its id-sorted fallback. */
+    applyScriptDefaults: () => Promise<FontPriority[]>;
     /** Issue #329 — boot: load the manifest's `substitutes` into the
      *  engine. Never rejects: a face that fails is warned about and skipped
      *  (its family falls back to the per-script default). */
     loadSubstitutes: () => Promise<void>;
     /** Forget every resident font — call on crash recovery (engine wiped them). */
     reset: () => void;
+}
+
+/** Issue #472 — `defaults_by_script` as ordered id lists under lower-case
+ *  script keys; a bare id string becomes a one-element list, empty and
+ *  non-string entries are dropped. */
+export function normalizeScriptDefaults(
+    raw: FontManifest['defaults_by_script'],
+): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    for (const [key, value] of Object.entries(raw ?? {})) {
+        const ids = (Array.isArray(value) ? value : [value]).filter(
+            (id): id is string => typeof id === 'string' && id !== '',
+        );
+        if (ids.length > 0) out[key.toLowerCase()] = ids;
+    }
+    return out;
 }
 
 /** Resolve a manifest-relative URL against the document base. */
@@ -122,6 +170,7 @@ export function createFontRegistry(
     const [fonts, setFonts] = createSignal<FontDescriptor[]>([]);
     const [defaults, setDefaults] = createSignal<string[]>([]);
     const [substitutes, setSubstitutes] = createSignal<string[]>([]);
+    const [scriptDefaults, setScriptDefaults] = createSignal<Record<string, string[]>>({});
     const [manifestReady, setManifestReady] = createSignal(false);
 
     /* Per-id residency, fine-grained reactive so a dropdown row re-renders
@@ -149,6 +198,7 @@ export function createFontRegistry(
                     setFonts(m.fonts ?? []);
                     setDefaults(m.defaults ?? []);
                     setSubstitutes(m.substitutes ?? []);
+                    setScriptDefaults(normalizeScriptDefaults(m.defaults_by_script));
                     setManifestReady(true);
                     return m;
                 });
@@ -215,6 +265,32 @@ export function createFontRegistry(
         );
     };
 
+    const applyScriptDefaults = async (): Promise<FontPriority[]> => {
+        const manifest = await loadManifest();
+        const declared = normalizeScriptDefaults(manifest.defaults_by_script);
+        const priorities: FontPriority[] = [];
+        for (const [key, ids] of Object.entries(declared)) {
+            const script = (SCRIPT_KEYS as Record<string, FontPriority['script']>)[key];
+            if (script === undefined) {
+                console.warn(`[@nge/core] defaults_by_script: unknown script '${key}'`);
+                continue;
+            }
+            priorities.push({ script, ids });
+        }
+        if (priorities.length === 0) return [];
+        try {
+            const evt = await engine.dispatch({ type: 'SET_FONT_PRIORITY', priorities });
+            if (evt.type === 'FONT_PRIORITY_APPLIED') return evt.priorities;
+            console.warn(
+                '[@nge/core] SET_FONT_PRIORITY:',
+                evt.type === 'ERROR' ? evt.message : evt.type,
+            );
+        } catch (e) {
+            console.warn('[@nge/core] SET_FONT_PRIORITY failed:', e);
+        }
+        return [];
+    };
+
     const reset = (): void => {
         inflight.clear();
         /* Drop every residency flag back to idle. The store has no `clear`,
@@ -231,9 +307,11 @@ export function createFontRegistry(
         manifestReady,
         stateOf: (id) => states[id] ?? 'idle',
         isLoaded: (id) => states[id] === 'loaded',
+        scriptDefaults,
         loadManifest,
         ensureFont,
         loadDefaults,
+        applyScriptDefaults,
         loadSubstitutes,
         reset,
     };

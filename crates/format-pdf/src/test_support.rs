@@ -391,6 +391,7 @@ mod tests {
             hf_role: HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         };
         let mut out = Vec::new();
         crate::export_pdf(

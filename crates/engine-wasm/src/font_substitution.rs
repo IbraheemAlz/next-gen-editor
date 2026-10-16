@@ -23,7 +23,7 @@ impl Engine {
             return Vec::new();
         }
         let primary = self.layout_cfg.as_ref().map_or("", |c| c.font_id.as_str());
-        let stack = FontStack::from_faces(self.fonts.clone(), primary);
+        let stack = self.font_stack(primary);
         document_font_substitutions(self.undo.current(), &stack)
     }
 }

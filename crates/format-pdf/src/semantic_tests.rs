@@ -109,6 +109,7 @@ pub(crate) fn page(mut blocks: Vec<LayoutBlock>) -> PageBox {
         hf_role: layout::HeaderRole::Default,
         page_number: 1,
         floats: Vec::new(),
+        decor: Default::default(),
     }
 }
 

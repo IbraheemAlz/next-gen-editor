@@ -1,7 +1,7 @@
 import { defineConfig } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { join, dirname, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
+import { devServerPort, telemetrySinkPort } from '../tools/lib/port.mjs';
 
 /* Phase 2 exit-gate e2e suite (PHASE_2_BRIDGE_MEMORY.md §11).
  *
@@ -32,18 +32,13 @@ const REPO_ROOT = resolve(HERE, '..');
  * cross-worktree collision risk as the dev server: it is a stateful HTTP
  * service on a fixed port, and `telemetry.spec.ts` mutates that state
  * — `POST /reset` — mid-test, so two worktrees silently sharing one sink
- * process doesn't just misattribute samples, it makes both suites flaky). */
-function stablePortFor(seed: string, rangeStart: number, rangeSize: number): number {
-    const digest = createHash('sha256').update(seed).digest();
-    return rangeStart + (digest.readUInt32BE(0) % rangeSize);
-}
-
-// 5200-5999 (800-wide): plenty of headroom for concurrent checkouts, well
-// clear of the well-known-port range and of the fixed 5173/4173 Vite
-// defaults.
-const PORT = process.env.PW_PORT
-    ? Number.parseInt(process.env.PW_PORT, 10)
-    : stablePortFor(REPO_ROOT, 5200, 800);
+ * process doesn't just misattribute samples, it makes both suites flaky).
+ *
+ * Issue #470 — the derivation (and `PW_PORT`) now lives in ONE shared module,
+ * `tools/lib/port.mjs`, so the `tools/*` harnesses (perf, memory-profile,
+ * pdf-validate, visual-diff) resolve the very same port instead of assuming
+ * 5173. 5200-5999 (800-wide) for the dev server, 4200-4999 for the sink. */
+const PORT = devServerPort(REPO_ROOT);
 const REUSE_SERVER = process.env.PW_REUSE_SERVER === '1';
 const BASE_URL = `http://localhost:${PORT}`;
 
@@ -58,7 +53,7 @@ const BASE_URL = `http://localhost:${PORT}`;
  * the derivation itself is the contract. If you change the algorithm, salt,
  * or range here, change it there too. */
 const TELEMETRY_SINK_ENTRY = join(HERE, '..', 'tools', 'telemetry-sink', 'run.mjs');
-const TELEMETRY_SINK_PORT = stablePortFor(`${REPO_ROOT}::telemetry-sink`, 4200, 800);
+const TELEMETRY_SINK_PORT = telemetrySinkPort(REPO_ROOT);
 const TELEMETRY_SINK_OUT = join(HERE, '..', 'tools', 'telemetry-sink', '.e2e-received.jsonl');
 
 export default defineConfig({

@@ -1107,9 +1107,13 @@ struct ParaBuilder {
 
 impl ParaBuilder {
     fn push_text(&mut self, text: &str, style: SpanStyle) {
+        /* Issue #467 — an entity (`&#1;`) or a raw control character in
+        pasted / opened markup must not reach the model: repaired, never
+        refused (the user cannot retype a decoded entity). */
+        let text = crate::text_input::sanitize_input_text_lossy(text);
         if !text.is_empty() {
             self.events
-                .push(BuilderEvent::Text(text.to_string(), style));
+                .push(BuilderEvent::Text(text.into_owned(), style));
         }
     }
 

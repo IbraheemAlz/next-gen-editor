@@ -61,6 +61,22 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "drop_cap.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 4,
+        "paragraph_texts": [
+          "D",
+          "rop caps open a chapter or an article: the first letter is set in a frame three lines tall, and the first three lines of the paragraph wrap around it while the following lines return to the full width of the column, exactly as the frame properties of the cap paragraph ask. The cap paragraph itself takes no room in the flow: this paragraph starts at its top, and the cap's baseline meets the third line's.",
+          "M",
+          "argin caps hang in the left margin instead: the letter sits outside the text column, two lines tall, and every line of this paragraph keeps the full column width."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "floating_image_anchor.docx": {
       "generator": "handcrafted",
       "phase_introduced": 11,
@@ -156,6 +172,22 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "line_numbers.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 4,
+        "paragraph_texts": [
+          "Line numbering, page borders and drop caps are section and paragraph decorations that Word paints outside the text flow: the numbers sit in the left margin, the border box frames the page.",
+          "This second paragraph keeps the count going across a paragraph break, and it wraps onto a second line so the count is visibly per line.",
+          "This paragraph suppresses its line numbers.",
+          "A short closing paragraph."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "list_bullet_numbered.docx": {
       "generator": "handcrafted",
       "phase_introduced": 4,
@@ -238,6 +270,21 @@
       },
       "roundtrip": {
         "document_xml_drift_bytes": 141
+      }
+    },
+    "page_borders.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 3,
+        "paragraph_texts": [
+          "Line numbering, page borders and drop caps are section and paragraph decorations that Word paints outside the text flow: the numbers sit in the left margin, the border box frames the page.",
+          "This second paragraph keeps the count going across a paragraph break, and it wraps onto a second line so the count is visibly per line.",
+          "A short closing paragraph."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
       }
     },
     "run_content.docx": {
@@ -434,6 +481,19 @@
       },
       "roundtrip": {
         "document_xml_drift_bytes": 0
+      }
+    },
+    "table_merge_absorb.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "intro"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 141
       }
     },
     "table_nested_200_deep.docx": {
