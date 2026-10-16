@@ -192,6 +192,9 @@ export function App() {
        these handles on `window`. */
     installDevHook('__engineClient', client);
     installDevHook('__dispatch', dispatch);
+    installDevHook('__forceContextLoss', (pageIndex, phase) =>
+        client.forceContextLoss(pageIndex, phase),
+    );
 
     /* Issue #51 — the engine restarts its lazy-layout band at the top on
        a document swap; mirror it DOM-side, or the first SET_VIEWPORT

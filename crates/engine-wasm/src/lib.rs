@@ -1299,6 +1299,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Issue #502 - forget what page `idx`'s canvas shows, so the next
+    /// paint of that page is unconditional. The worker calls it when the
+    /// canvas's 2D context is restored: a lost-and-restored context comes
+    /// back BLANK, and the #497 memo would otherwise skip the page for as
+    /// long as its display list stays the same. Only that canvas is
+    /// forgotten - the other pages keep their pixels and keep skipping.
+    /// Returns whether a canvas is registered at `idx` (a Vello boot
+    /// surface owns no 2D context, so page 0 may not be). Not a bridge
+    /// `Command`: it is a worker-side canvas fact, never document state,
+    /// so it is neither logged nor replayed.
+    pub fn forget_canvas_memo(&mut self, idx: u32) -> bool {
+        match self.page_ctxs.get_mut(idx as usize) {
+            Some(Some(slot)) => {
+                slot.painted = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Last `render_document` output dimensions, exposed so the worker
     /// can side-channel a synthetic `Painted` event after every mutating
     /// command. Returns `{document_height, page_count}` (device px). The

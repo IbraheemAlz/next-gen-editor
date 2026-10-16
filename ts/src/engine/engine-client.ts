@@ -85,6 +85,9 @@ type WorkerReply = {
     revisions?: RevisionSnapshot[];
     /** Issue #96 — payload of the DEV-only `PROBE_PAGE_INK` reply. */
     ink?: Record<number, number>;
+    /** Issue #502 — payload of the dev-only `FORCE_CONTEXT_LOSS` reply:
+     *  how the worker hears context loss (`events` / `polling` / `none`). */
+    mode?: string;
 };
 
 /** Phase 8a — read-only snapshot row for the comments sidebar. */
@@ -1257,6 +1260,27 @@ export class EngineClient {
         const r = await this.send({ type: 'PROBE_PAGE_INK' });
         if (!r.ok) throw new Error(r.error);
         return r.ink ?? {};
+    }
+
+    /**
+     * Issue #502 test hook (dev server / `VITE_NGE_DEV_HOOKS=1` builds
+     * only; the worker refuses it otherwise): make page `pageIndex`'s
+     * surface behave as if its 2D context were lost and/or restored. A 2D
+     * canvas has no `WEBGL_lose_context` equivalent, so the worker blanks
+     * the surface (what a restored context looks like) and dispatches
+     * synthetic `contextlost` / `contextrestored` events on it - the same
+     * listeners the real events reach. `phase` `'lost'` alone leaves the
+     * page lost (the "restored never arrives" state the Dev HUD shows);
+     * `'restored'` completes it; `'both'` (default) is a full cycle.
+     * Resolves with the watcher mode in force (`'events'` / `'polling'`).
+     */
+    async forceContextLoss(
+        pageIndex: number,
+        phase: 'lost' | 'restored' | 'both' = 'both',
+    ): Promise<string> {
+        const r = await this.send({ type: 'FORCE_CONTEXT_LOSS', idx: pageIndex, phase });
+        if (!r.ok) throw new Error(r.error);
+        return typeof r.mode === 'string' ? r.mode : 'none';
     }
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {

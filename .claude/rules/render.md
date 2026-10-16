@@ -97,6 +97,18 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   the Canvas2D spec. Glyphs are blitted with `put_image_data`, so `ctx.clip()`
   does **not** skip off-region glyphs — cull glyph runs by a bounding-box test
   in the Rust loop instead. The clip only bounds `fill_rect` / `stroke_rect`.
+- **A lost 2D context repaints on restore (issue #502).** A page canvas
+  whose context is lost and restored comes back blank, and the #497
+  per-canvas display-list memo would skip an unchanged page forever. The
+  worker (`ts/src/engine/canvas-context.ts`, `CanvasContextWatcher`)
+  listens for `contextlost` / `contextrestored` on every `OffscreenCanvas`
+  it holds (an `isContextLost()` poll only where a surface lacks the
+  events) and, on a restore, calls `Engine::forget_canvas_memo(idx)` (that
+  one canvas; the other pages keep skipping) and repaints. Every change
+  broadcasts the additive `Event::CanvasContext` (Dev HUD "Canvas context"
+  row, telemetry `ERROR / CANVAS_CONTEXT_LOST`). Not a `Command`: it is a
+  worker-side canvas fact, never document state. A new path that draws on
+  a page canvas outside `render_document` must clear its memo the same way.
 - A clip covering the whole page is a no-op: every run intersects it, nothing
   is culled, so a full repaint is byte-identical to the unclipped path. Pure
   render refactors must keep the visual-diff goldens at 0.000 %.

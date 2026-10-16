@@ -28,6 +28,7 @@ import {
 import { newSnapshotState, takeSnapshotFlow } from './snapshot-flow';
 import { countJournalGap, pickRecoveryBase } from './recovery-plan';
 import { journalSafe } from './journal-safe';
+import { CanvasContextWatcher, forcedEvents, type ForcedPhase } from './canvas-context';
 import type { LoggedCommand, RecoveryCandidate } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
@@ -136,6 +137,11 @@ type ArmTrapMsg = { id: number; type: 'ARM_TRAP'; after_commands: number };
 /* Issue #96 — DEV-only test hook: per-page opaque-ink counts read back
    from the surfaces this worker holds (see the handler). */
 type ProbePageInkMsg = { id: number; type: 'PROBE_PAGE_INK' };
+/* Issue #502 - DEV / dev-hooks-build test hook: dispatch synthetic
+   `contextlost` / `contextrestored` events on page `idx`'s surface (a 2D
+   canvas has no `WEBGL_lose_context` equivalent), blanking it on the loss
+   the way a restored context comes back. Refused in a release build. */
+type ForceContextLossMsg = { id: number; type: 'FORCE_CONTEXT_LOSS'; idx: number; phase: ForcedPhase };
 /* Issue #270 — planned retirement (the Dev HUD's in-place "retry Vello"):
    finish everything already queued, snapshot the log head, flush the
    event log, reply, close. The client then respawns a generation that
@@ -153,6 +159,7 @@ type Msg =
     | RegisterPageCanvasMsg
     | ArmTrapMsg
     | ProbePageInkMsg
+    | ForceContextLossMsg
     | RetireMsg;
 
 const LATIN_ID = 'liberation-sans';
@@ -247,6 +254,46 @@ const startsNewDocument = (cmd: Command): boolean => commandMeta(cmd.type).new_d
    reads it; the engine owns the contexts. A fresh worker starts empty, so
    a page the shell failed to re-register after a trap is visibly absent. */
 const pageSurfaces = new Map<number, OffscreenCanvas>();
+
+/* Issue #502 - a 2D context that is lost and restored comes back blank, and
+   the engine's per-canvas display-list memo (#497) would skip repainting a
+   page whose list did not change. The watcher hears `contextlost` /
+   `contextrestored` on every surface this generation holds (polling
+   `isContextLost()` where the events are missing - see `canvas-context.ts`);
+   a restore makes the engine forget THAT canvas's memo and repaints it, and
+   every change broadcasts `Event::CanvasContext` (Dev HUD row, telemetry). */
+const canvasContext = new CanvasContextWatcher({
+    onHealth: (h) => {
+        const evt = {
+            type: 'CANVAS_CONTEXT',
+            lost_pages: h.lostPages,
+            losses: h.losses,
+            restores: h.restores,
+        } satisfies Event;
+        self.postMessage({ evt });
+    },
+    onRestored: (idx) => {
+        void enqueue(async () => {
+            /* `false` = no engine canvas at `idx` (a Vello boot surface owns
+               no 2D context): nothing to repaint. */
+            if (engine?.forget_canvas_memo(idx)) schedulePageCanvasRepaint();
+        });
+    },
+});
+
+/** Hand `surface` (page `idx`) to the context watcher. */
+function watchSurface(idx: number, surface: OffscreenCanvas): void {
+    const mode = canvasContext.watch(idx, surface);
+    if (mode === 'polling') {
+        console.warn(
+            `[worker] OffscreenCanvas context events unavailable for page ${idx}; polling isContextLost()`,
+        );
+    }
+}
+
+/* The synthetic-loss hook is a capability: a dev server, or a build made
+   with VITE_NGE_DEV_HOOKS=1 (see `ts/src/dev-hooks.ts`). */
+const devHooks = import.meta.env.DEV || import.meta.env.VITE_NGE_DEV_HOOKS === '1';
 
 /**
  * Issue #99 — pick the backend for a fresh surface. `mock === 'vello'` is
@@ -1213,6 +1260,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         const renderer = probe.renderer;
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
+        watchSurface(0, msg.canvas);
         if (msg.logDb) setActiveLogDb(msg.logDb);
         await openEventLog(msg.documentId);
         cleanState = true;
@@ -1273,6 +1321,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
         const probed = probe.renderer;
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
+        watchSurface(0, msg.canvas);
         /* Resume the event-log sequence past what was already persisted, so
            post-recovery appends don't collide with or shadow prior rows. */
         logSequence = msg.lastSeq;
@@ -1837,6 +1886,39 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
         return;
     }
 
+    if (msg.type === 'FORCE_CONTEXT_LOSS') {
+        void enqueue(async () => {
+            if (!devHooks) {
+                self.postMessage({
+                    id: msg.id,
+                    ok: false,
+                    error: 'FORCE_CONTEXT_LOSS is a dev-hooks capability',
+                });
+                return;
+            }
+            const surface = pageSurfaces.get(msg.idx);
+            if (!surface) {
+                self.postMessage({ id: msg.id, ok: false, error: `no page surface ${msg.idx}` });
+                return;
+            }
+            for (const type of forcedEvents(msg.phase)) {
+                if (type === 'contextlost') {
+                    /* A restored context is blank: show that. */
+                    const ctx = surface.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+                    if (ctx) {
+                        ctx.save();
+                        ctx.setTransform(1, 0, 0, 1, 0, 0);
+                        ctx.clearRect(0, 0, surface.width, surface.height);
+                        ctx.restore();
+                    }
+                }
+                surface.dispatchEvent(new globalThis.Event(type));
+            }
+            self.postMessage({ id: msg.id, ok: true, mode: canvasContext.mode() });
+        });
+        return;
+    }
+
     if (msg.type === 'GET_COMMENTS') {
         void enqueue(async () => {
             if (!engine) {
@@ -1880,6 +1962,7 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
                    simply (re)filled with the fresh surface. */
                 engine.set_page_canvas(msg.idx, msg.canvas);
                 pageSurfaces.set(msg.idx, msg.canvas);
+                watchSurface(msg.idx, msg.canvas);
                 self.postMessage({ id: msg.id, ok: true });
             } catch (e: unknown) {
                 replyError(msg.id, e);

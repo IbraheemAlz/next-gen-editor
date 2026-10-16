@@ -46,6 +46,7 @@ export type { ErrorEventLike } from './errorCommand';
 export type {
     EditorState,
     CheckpointHealth,
+    CanvasContextHealth,
     EditorError,
 } from './createEditorState';
 

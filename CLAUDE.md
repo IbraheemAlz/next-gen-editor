@@ -469,7 +469,9 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 ### Live validation hooks (issue #340)
 
 `window.__dispatch`, `__engineClient`, `__fontRegistry`,
-`__setTelemetryEnabled`, `__telemetryFlush`, `__clipboardPrefetch` and
+`__setTelemetryEnabled`, `__telemetryFlush`, `__clipboardPrefetch`,
+`__forceContextLoss` (issue #502 — synthetic 2D `contextlost` /
+`contextrestored` on a page's `OffscreenCanvas`) and
 `__lastStats` — and the `?telemetryEndpoint=` and `?clipboardPrefetch=0`
 URL parameters, and the `@nge/ui` `SettingsMenu`'s URL-driven renderer
 switch (`<EngineProvider debugSurfaces>`, issue #389) — are
