@@ -1,0 +1,117 @@
+{
+  "$comment": "Issue #476 - the multi-page real documents of the tools/corpus set that tools/differential compares against LibreOffice by default (the committed fixtures are mostly one page, so page-count parity barely responded to a line-pitch change). The corpus is downloaded, never committed (tools/corpus/fetch.mjs, Apache-2.0 sources, see tools/corpus/manifest.json for the provenance of every entry); run.mjs resolves each path under $NGE_CORPUS_DIR (default /data/corpus/files), skips a missing file with one warning, and flags a sha256 that no longer matches the manifest.",
+  "root_env": "NGE_CORPUS_DIR",
+  "default_root": "/data/corpus/files",
+  "documents": [
+    {
+      "path": "apache-poi-test-data-document/bug65649.docx",
+      "sha256": "f98d2bfcca5d091cda26539b00318bb2b2b1e6d8aa644e370175e99ca9c1b4ad",
+      "bytes": 474844
+    },
+    {
+      "path": "docx4j-sample-docs/ArialUnicodeMS.docx",
+      "sha256": "0115732f11677776fac8a1a20b7b0dd8badff306feae64e5ea0b39e3a188b1f4",
+      "bytes": 25403
+    },
+    {
+      "path": "docx4j-sample-docs/chart.docx",
+      "sha256": "85ba6d56dc8484a0f98242ce099b20ba4563217d5888da244fe9959294cd49fd",
+      "bytes": 24067
+    },
+    {
+      "path": "docx4j-sample-docs/chunk.docx",
+      "sha256": "d3c9c8fdfd47c643269a5eeb6cb2548af9e5f949a50ecc3440a654eac66bf8e9",
+      "bytes": 13630
+    },
+    {
+      "path": "docx4j-sample-docs/decracdiscrim1.docx",
+      "sha256": "9ac66331cc12691a52c8a585455370c2e949f338f4cdec452354c35aebecc88f",
+      "bytes": 22140
+    },
+    {
+      "path": "docx4j-sample-docs/DOCPROP_builtin.docx",
+      "sha256": "4631e53aa06190f94193c66bd11a70356d3b2f2bf7d15f7202c405eb8c8f75ec",
+      "bytes": 148128
+    },
+    {
+      "path": "docx4j-sample-docs/docProps.docx",
+      "sha256": "c915cf971f3376b033880fc42da45ac19b5a56855edafe5f254553948287b8b7",
+      "bytes": 10780
+    },
+    {
+      "path": "docx4j-sample-docs/FontEmbedded.docx",
+      "sha256": "4dd7e8cd2d620d8c406044a6161bed27abf10f48d97ddcfd0fc618515d405f84",
+      "bytes": 1212630
+    },
+    {
+      "path": "docx4j-sample-docs/fonts-modesOfApplication.docx",
+      "sha256": "93ab6b3ba56c92507f28c2aa92f5cbca376ae999387572ea7cc24afc2b4d9071",
+      "bytes": 11945
+    },
+    {
+      "path": "docx4j-sample-docs/Headers.docx",
+      "sha256": "7bdaf60ef968ea43882309b48677229c7d194394ee032633a2252c3f4f8536f2",
+      "bytes": 93161
+    },
+    {
+      "path": "docx4j-sample-docs/hyperlinks-internal.docx",
+      "sha256": "e06670ede7135c32ef404ae63ee072bdf466476608002def811f6d2c0b66181e",
+      "bytes": 13972
+    },
+    {
+      "path": "docx4j-sample-docs/Images.docx",
+      "sha256": "612570a1ef38d8bdebbfda2c38498a9b904374e7e8fa324eb116861dc0ba8ea7",
+      "bytes": 185779
+    },
+    {
+      "path": "docx4j-sample-docs/MergeWithNext.docx",
+      "sha256": "e71f89dbe9d082c0b692504ed42081db1e812d77b87fe5c147a49aa90a67ce31",
+      "bytes": 13577
+    },
+    {
+      "path": "docx4j-sample-docs/sample-docx.docx",
+      "sha256": "f527fe32f4bf9e152d86a8e7f1971033e7404929c624e3bdc26853c6a0cfa25e",
+      "bytes": 142893
+    },
+    {
+      "path": "docx4j-sample-docs/sample-docxv2.docx",
+      "sha256": "d0c53cbd31a1044fe7699814f26f035b44a21add9c0086757ba50b804bccfd13",
+      "bytes": 142888
+    },
+    {
+      "path": "docx4j-sample-docs/Symbol Fonts Iteration.docx",
+      "sha256": "a94b4fd3b147f3a54f800ee42027d773ef756b99476318b3a486756aa8b76378",
+      "bytes": 39617
+    },
+    {
+      "path": "docx4j-sample-docs/Symbols.docx",
+      "sha256": "1e671e24826e833afb446ef2be4d21051fd36b91f8d0cdbf9ff149db305c0da1",
+      "bytes": 76840
+    },
+    {
+      "path": "docx4j-sample-docs/tables.docx",
+      "sha256": "50ea2fd62761aedc66e307c30ca1191a4e6baf8fa9d8d849ba1d9c20eb5921f4",
+      "bytes": 433587
+    },
+    {
+      "path": "docx4j-sample-docs/toc.docx",
+      "sha256": "f1c2bab7ac6eb58e38e1ae4245d31fd306f75bc319c118385a11b8abbdfe8a49",
+      "bytes": 34793
+    },
+    {
+      "path": "docx4j-sample-docs/unmarshallFromTemplateDirtyExample.docx",
+      "sha256": "d19e09dd6ce93d720914b0b23d481e12b5b9dcb619f6fc0c9657b2bd0a73cb42",
+      "bytes": 16840
+    },
+    {
+      "path": "docx4j-sample-docs/unmarshallFromTemplateExample.docx",
+      "sha256": "292fc4be231bb5b240251f182605c3c31e15aea1ec59bf5521f4b9bdb02fa247",
+      "bytes": 3135
+    },
+    {
+      "path": "docx4j-sample-docs/Word2007-fonts.docx",
+      "sha256": "7acb6260223ccb548bd374d02f9d7b80aa3fc37973cf42560a95c1fbadb15aeb",
+      "bytes": 18697
+    }
+  ]
+}

@@ -102,9 +102,9 @@ pub fn harness_stack_with_substitutes() -> FontStack {
 }
 
 /// Issue #476 - every face the shell loads at boot (`fonts.json` `defaults`
-/// + `substitutes`) as `(manifest id, TTF bytes)`: the two defaults, then the
-/// substitutes. [`harness_stack_with_substitutes`] is built from exactly this
-/// list; a harness that drives a real `Engine` (`corpus-native`'s production
+/// and `substitutes`) as `(manifest id, TTF bytes)`: the two defaults, then
+/// the substitutes. [`harness_stack_with_substitutes`] is built from exactly
+/// this list; a harness that drives a real `Engine` (`corpus-native`'s production
 /// layout) registers the same faces with `Command::LoadFont` and then sends
 /// [`DEFAULTS_BY_SCRIPT`] as `Command::SetFontPriority`, so it lays out with
 /// the stack the editor boots with instead of a lone Liberation Sans.

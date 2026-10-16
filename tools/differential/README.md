@@ -53,6 +53,19 @@ tools/differential/
                                   declared 42pt with the overflow
                                   clipped; the same content under
                                   `atLeast` grows to 84pt.
+  fixtures/corpus-multipage.json Issue #476 - the multi-page real documents
+                                  of the downloaded `tools/corpus` set
+                                  (bug65649 + the docx4j samples), added to the
+                                  default run. The files are NOT committed
+                                  (Apache-2.0 sources, fetched by
+                                  `tools/corpus/fetch.mjs`): `run.mjs` resolves
+                                  each path under `$NGE_CORPUS_DIR` (default
+                                  `/data/corpus/files`), skips a missing one
+                                  with a warning and flags a sha256 mismatch.
+                                  The committed fixtures are mostly one page,
+                                  so only these respond to a line-pitch change;
+                                  the run ends with `page-count parity: X/Y`
+                                  overall and on the multi-page subset.
 ```
 
 ## Running it
