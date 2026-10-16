@@ -797,6 +797,20 @@ pub struct DocResult {
     /// whose sizes were all in range.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub font_size_clamps: usize,
+    /// Issue #503 - how many `<w:pgMar>` margins the reader repaired
+    /// because the four together left less than 0.1 in of text area
+    /// (`DocxWarning::MeasureClamped` naming `w:pgMar/@w:...` with the
+    /// "margins leave" note; the warning list is capped, so a large count
+    /// is a lower bound).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub margin_text_area_clamps: usize,
+    /// Issue #503 - how many page / paragraph point attributes the reader
+    /// clamped into Word's 22 in (`DocxWarning::MeasureClamped` naming
+    /// `w:pgSz` / `w:pgMar` / `w:ind` / `w:spacing` / `w:tab` / `w:cols`
+    /// attributes - the measure reader's per-attribute clamp, #349/#407,
+    /// plus the margin repair above; capped list, lower bound).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub point_field_clamps: usize,
     /// Issue #384 — `--regen-check`: every clean paragraph regenerated
     /// with no edit and compared with its source bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1010,6 +1024,8 @@ impl DocResult {
             engine_repaint_consistent: None,
             normalized_parts: Vec::new(),
             font_size_clamps: 0,
+            margin_text_area_clamps: 0,
+            point_field_clamps: 0,
             regen_check: None,
             main_part_regenerate_only: false,
         }
@@ -1203,6 +1219,24 @@ pub fn run_one(
         .filter(|w| {
             matches!(w, format_docx::DocxWarning::MeasureClamped { attr, .. }
                 if attr == "w:sz/@w:val" || attr == "w:szCs/@w:val")
+        })
+        .count();
+    rec.margin_text_area_clamps = archive_a
+        .warnings
+        .iter()
+        .filter(|w| {
+            matches!(w, format_docx::DocxWarning::MeasureClamped { attr, value, .. }
+                if attr.starts_with("w:pgMar/@") && value.contains("margins leave"))
+        })
+        .count();
+    rec.point_field_clamps = archive_a
+        .warnings
+        .iter()
+        .filter(|w| {
+            matches!(w, format_docx::DocxWarning::MeasureClamped { attr, .. }
+                if ["w:pgSz/", "w:pgMar/", "w:ind/", "w:spacing/", "w:tab/", "w:cols/"]
+                    .iter()
+                    .any(|p| attr.starts_with(p)))
         })
         .count();
 

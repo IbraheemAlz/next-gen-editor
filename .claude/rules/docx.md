@@ -132,6 +132,29 @@ paths:
   `px_size` fields outside it. A NEW command field that sets a font size must
   be added to `font_size_guard::first_refused`; `rpc_command` checks
   `first_font_size_beyond_bound` after every size-setting command.
+- **Page / paragraph point fields (issue #503).** Word holds a margin, indent,
+  paragraph spacing, tab position and column gutter to 22 in (1584 pt =
+  31 680 twips), a page side to 0.1..=22 in, and a "Multiple" line spacing to
+  0.06..=132 lines; `engine::point_bounds` is the ONE module (constants,
+  predicates, `first_point_field_beyond_bound`, `fit_margins_to_text_area`).
+  The reader's per-attribute clamp is `schema::measure` (`TWIPS` /
+  `SIGNED_TWIPS` / `PAGE_SIZE`, #349 / #407 — `w:pgSz`, `w:pgMar`, `w:ind`,
+  `w:spacing`, `w:tab`, `w:cols w:space` all go through it, nothing to add);
+  what no single attribute shows — four margins that together leave less than
+  0.1 in of text area — `SectPrAccum::into_geometry` repairs
+  (`fit_margins_to_text_area`, `DocxWarning::MeasureClamped` naming
+  `w:pgMar/@w:…` with a "margins leave" note; the source bytes stay, so the
+  verified `<w:sectPr>` passthrough re-derives the same repaired model).
+  HTML paste imports none of these properties. `engine-wasm` `point_guard`
+  REFUSES (`OutOfRange`, field named) `SetPageMargins` (0..=1584 each),
+  `SetColumns.gutter_pt` (0..=1584), `SetParagraphIndent` (±1584),
+  `SetLineSpacing.multiplier` (≤ 0 clears, else 0.06..=132),
+  `SetTabStops.stops[i].position_pt` (±1584) and `ModifyStyle`'s paragraph
+  patch; `do_set_page_margins` also refuses margins that leave under 0.1 in
+  of text area on THE SECTION'S page (`DocumentTree::section_geometry_at`).
+  A NEW command field carrying such a measure must be added to
+  `point_guard::first_refused`; `rpc_command` checks
+  `check_point_fields_for_fuzzing` after every command that can set one.
 - **Namespace prefixes (issues #325 / #394).** The parsers match literal
   qnames (`w:p`), so every WordprocessingML part the reader walks — the
   main part, `styles.xml`, `numbering.xml`, `settings.xml`, the note

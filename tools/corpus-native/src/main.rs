@@ -529,6 +529,9 @@ fn main() -> ExitCode {
     /* Issue #501 - documents whose `<w:sz>` / `<w:szCs>` the reader clamped. */
     let mut font_clamp_docs = 0usize;
     let mut font_clamp_values = 0usize;
+    let mut margin_repair_docs = 0usize;
+    let mut point_clamp_docs = 0usize;
+    let mut point_clamp_values = 0usize;
     /* Issue #318 — production-layout timings `(ms, label)`, the
     documents that blew the budget, and a degradation-reason histogram. */
     let mut engine_times: Vec<(u128, String)> = Vec::new();
@@ -691,6 +694,13 @@ fn main() -> ExitCode {
         if rec.font_size_clamps > 0 {
             font_clamp_docs += 1;
             font_clamp_values += rec.font_size_clamps;
+        }
+        if rec.margin_text_area_clamps > 0 {
+            margin_repair_docs += 1;
+        }
+        if rec.point_field_clamps > 0 {
+            point_clamp_docs += 1;
+            point_clamp_values += rec.point_field_clamps;
         }
 
         if let Some(t) = &rec.theme_fonts {
@@ -882,6 +892,11 @@ fn main() -> ExitCode {
     println!(
         "[corpus-native] font sizes clamped to Word's 1..=1638 pt (#501): {font_clamp_docs} \
          documents, {font_clamp_values} <w:sz>/<w:szCs> values"
+    );
+    println!(
+        "[corpus-native] page/paragraph point fields clamped to Word's 22 in (#503): \
+         {point_clamp_docs} documents, {point_clamp_values} attribute values; margins repaired \
+         because they swallowed the page: {margin_repair_docs} documents"
     );
     println!(
         "[corpus-native] font substitution (#329): {substituting_docs}/{} documents substitute \
