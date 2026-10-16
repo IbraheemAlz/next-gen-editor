@@ -74,9 +74,10 @@ test('arrow down 60 lines scrolls the caret into view; a pointer click does not 
     expect(await caretVisible(page)).toBe(true);
 
     /* Real key presses through the hidden textarea, at typing speed (each
-       answered before the next: a burst outruns the lazy layout band —
-       `MOVE_CARET Down` stops at the band's last line until the shell's
-       scroll-driven `EXPAND_LAYOUT` catches up). */
+       answered before the next, so every reveal scroll is observable). The
+       burst form — 60 presses in one synchronous task crossing the lazy
+       band edge — is `lazy-nav.spec.ts` (issue #462: the engine expands
+       the band inside the move). */
     await page.locator('textarea[data-nge-hidden-input]').focus();
     for (let i = 0; i < 60; i++) {
         await page.keyboard.press('ArrowDown');

@@ -7480,6 +7480,20 @@ fn text_file_over_limits(
 /// "unchanged by clamping" is exactly the validity test
 /// (`Engine::selection_is_valid`).
 fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    let engine_path = bridge_to_engine_path(pos.path);
+    /* Issues #479 / #480 — a position that addresses a real paragraph
+    keeps it (offset snapped to a char boundary) in EVERY tree. The
+    table-only fallback below used to run first and collapse every
+    position — a valid one in any cell included — to the first cell's
+    start, so a word / paragraph selection in a table-only story (or a
+    restored table-only body) never survived its own clamp. */
+    if let Some(p) = doc.paragraph_at_path(&engine_path) {
+        let offset = p.snap_offset(pos.offset);
+        return BridgeLogicalPos {
+            path: engine_to_bridge_path(engine_path),
+            offset,
+        };
+    }
     /* Design review B6 — a TABLE-ONLY tree (a letterhead header whose
     sole block is a table) has paragraph_count() == 0 but real caret
     homes inside the cells; the old `bpos_top(0, 0)` fast-path parked
@@ -7495,21 +7509,14 @@ fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
             None => bpos_top(0, 0),
         };
     }
-    let engine_path = bridge_to_engine_path(pos.path.clone());
-    let (resolved_path, offset) = match doc.paragraph_at_path(&engine_path) {
-        Some(p) => (engine_path, p.snap_offset(pos.offset)),
-        None => {
-            let fallback = doc
-                .path_to_last_paragraph_deep()
-                .unwrap_or(EngineBlockPath::top(0));
-            let offset = doc
-                .paragraph_at_path(&fallback)
-                .map_or(0, |p| p.snap_offset(pos.offset));
-            (fallback, offset)
-        }
-    };
+    let fallback = doc
+        .path_to_last_paragraph_deep()
+        .unwrap_or(EngineBlockPath::top(0));
+    let offset = doc
+        .paragraph_at_path(&fallback)
+        .map_or(0, |p| p.snap_offset(pos.offset));
     BridgeLogicalPos {
-        path: engine_to_bridge_path(resolved_path),
+        path: engine_to_bridge_path(fallback),
         offset,
     }
 }
@@ -8553,7 +8560,10 @@ impl Engine {
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => self.do_select_all(),
-            Command::MoveCaret { direction, extend } => self.do_move_caret(direction, extend),
+            /* Issue #462 — a move past the lazy band grows it first. */
+            Command::MoveCaret { direction, extend } => {
+                self.do_move_caret_reaching(direction, extend)
+            }
             Command::BeginComposition { at } => self.do_begin_composition(at),
             Command::UpdateComposition { text, target_range } => {
                 self.do_update_composition(text, target_range)
@@ -12071,6 +12081,23 @@ impl Engine {
             });
             self.selection = Some(clamped);
         }
+        /* Issue #478 — F9 inside a header / footer / note / text-box
+        story restamps the BODY too (a PAGE result shrinking from "12" to
+        "1", a TOC gaining or losing entries): carry the stashed body
+        selection across the regenerated TOCs and clamp it, exactly like
+        a body caret, so it never addresses text that is gone. */
+        if self.story_active()
+            && let Some(stashed) = self.stashed_body_selection.clone()
+        {
+            let new_doc = self.undo.current();
+            let carry = |p| clamp_pos(new_doc, shift_pos_across_tocs(&old_doc, new_doc, p));
+            self.stashed_body_selection = Some(SelectionState {
+                anchor: carry(stashed.anchor),
+                caret: carry(stashed.caret),
+                ideal_x: None,
+                kind: stashed.kind,
+            });
+        }
         self.caret_affinity = CaretAffinity::default();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -12768,38 +12795,33 @@ impl Engine {
             }
             Some(top)
         };
-        let target_y = Some(self.lazy_layout.min_target_y * scale);
-        if let Err(e) = self.ensure_layout_snapshot(scale, false, target_y) {
+        /* Issue #65 — a page past the band: grow the band to it
+        synchronously, estimating the missing pages from the sections'
+        real page size and looping until the page is laid (no A4
+        guess, no first-miss clamp). */
+        let grew = match self.lazy_nav_reach_page(page_idx) {
+            Ok(g) => g,
+            Err(e) => return *e,
+        };
+        if grew && let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
-        let mut page_top = {
-            let snap_cell = self.layout_snapshot.borrow();
-            page_top_in_band(snap_cell.as_ref().expect("snapshot populated"))
-        };
-        if page_top.is_none() {
-            let assumed_pt = (page_idx as f32 + 1.0)
-                * (engine::PageGeometry::a4().height + render::scene::PAGE_GAP_PT);
-            if assumed_pt > self.lazy_layout.min_target_y {
-                self.lazy_layout.min_target_y = assumed_pt;
-            }
-            let target_y = Some(self.lazy_layout.min_target_y * scale);
-            if let Err(e) = self.ensure_layout_snapshot(scale, false, target_y) {
-                return *e;
-            }
+        let page_top = {
             let snap_cell = self.layout_snapshot.borrow();
             let snap = snap_cell.as_ref().expect("snapshot populated");
-            /* Still short (non-A4 geometry taller than assumed): clamp
-            to the last laid page rather than hit-testing thin air. */
-            page_top = Some(page_top_in_band(snap).unwrap_or_else(|| {
+            /* Still short only when even the full layout has no such
+            page (a stale canvas after content was deleted): clamp to
+            the last page rather than hit-testing thin air. */
+            page_top_in_band(snap).unwrap_or_else(|| {
                 let mut top = 0.0f32;
                 let all_but_last = snap.pages.len().saturating_sub(1);
                 for page in snap.pages.iter().take(all_but_last) {
                     top += page.size.height + gap;
                 }
                 top
-            }));
-        }
-        let global_y = at.y + page_top.unwrap_or(0.0);
+            })
+        };
+        let global_y = at.y + page_top;
         match self.document_geometry() {
             Ok(geom) => Event::HitResult {
                 pos: hit_test_geom(&geom, at.x, global_y),
@@ -13223,6 +13245,13 @@ impl Engine {
                     }
                 }
             }
+            /* Issue #462 — one viewport height, through the lazy band. */
+            MoveDirection::PageDown | MoveDirection::PageUp => {
+                match self.page_step(&sel, direction == MoveDirection::PageDown) {
+                    Ok(target) => target,
+                    Err(e) => return *e,
+                }
+            }
             MoveDirection::Up | MoveDirection::Down => {
                 let geom = match self.document_geometry() {
                     Ok(g) => g,
@@ -13420,6 +13449,8 @@ impl Engine {
             }
             MoveDirection::Up
             | MoveDirection::Down
+            | MoveDirection::PageDown
+            | MoveDirection::PageUp
             | MoveDirection::LineHome
             | MoveDirection::LineEnd => self.snap_nearest_field_boundary(new_caret),
             _ => new_caret,
@@ -16398,6 +16429,18 @@ impl Engine {
     /// Idempotent, so running it both before the repaint and again in
     /// `after_history_change` is harmless.
     fn reclamp_selection(&mut self) {
+        /* Issue #478 — the body a story stashed its caret in may have
+        changed under it too (undo / redo of a body edit while a story is
+        active): keep the stash inside the current body. */
+        if let Some(stashed) = self.stashed_body_selection.clone() {
+            let body = self.undo.current();
+            self.stashed_body_selection = Some(SelectionState {
+                anchor: clamp_pos(body, stashed.anchor),
+                caret: clamp_pos(body, stashed.caret),
+                ideal_x: stashed.ideal_x,
+                kind: stashed.kind,
+            });
+        }
         let Some(sel) = self.selection.clone() else {
             return;
         };
@@ -29924,6 +29967,11 @@ mod document_protection_tests;
 /// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
 mod protection_gate;
 
+/// Issues #462 / #65 — keyboard moves and page hit-tests past the lazy
+/// band expand it synchronously (`Engine::do_move_caret_reaching`,
+/// `Engine::lazy_nav_reach_page`).
+mod lazy_nav;
+
 /// Issue #329 — the font substitutions the open document's layout makes.
 mod font_substitution;
 
@@ -30959,3 +31007,7 @@ mod paragraph_cache_key_tests;
 /// Issue #457 — the paragraph layout cache is weighted in bytes.
 #[cfg(test)]
 mod paragraph_cache_tests;
+
+/// Issues #477–#481 — the nightly `snapshot_decode` findings, generator-free.
+#[cfg(test)]
+mod fuzz_finding_tests;
