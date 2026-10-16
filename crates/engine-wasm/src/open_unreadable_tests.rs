@@ -18,8 +18,7 @@ fn open(engine: &mut Engine, bytes: Vec<u8>) -> Event {
 }
 
 /// The stock part with a SECOND root element spliced behind the real one:
-/// the structural defect `check_main_root` / the strict scan cannot repair
-/// (#483).
+/// the structural defect the strict scan cannot repair (#483).
 fn two_root_package() -> Vec<u8> {
     let part = document_xml_with_body(r#"<w:p><w:r><w:t>zzalpha</w:t></w:r></w:p>"#);
     let second = document_xml_with_body(r#"<w:p><w:r><w:t>zzbeta</w:t></w:r></w:p>"#);
@@ -68,6 +67,30 @@ fn a_two_root_main_part_is_document_unreadable_and_changes_nothing() {
     });
     assert_unreadable(&evt, "word/document.xml");
     assert_eq!(engine.state_fingerprint_for_fuzzing(), before);
+}
+
+/// Issue #468 — a junk root wrapping NO `document` (or several), and a
+/// byte-flipped tag name, have no faithful repair either: the typed
+/// refusal, nothing changed. (A junk root wrapping exactly ONE `document`
+/// is unwrapped and opens — `format-docx`'s `reader_well_formed_tests`.)
+#[test]
+fn a_junk_root_and_a_bad_tag_name_are_document_unreadable() {
+    let stock = document_xml_with_body(r#"<w:p><w:r><w:t>zzalpha</w:t></w:r></w:p>"#);
+    let wrapped_none = format!(
+        r#"<?xml version="1.0"?><w:t xml:space="preserve">junk<w:body><w:p/></w:body></w:t>"#
+    );
+    let bad_name = stock.replace("<w:p>", "<w:p;>");
+    let mut engine = Engine::new_headless(DocumentTree::from_text("keep me"));
+    let before = engine.state_fingerprint_for_fuzzing();
+    for part in [wrapped_none, bad_name] {
+        let evt = open(
+            &mut engine,
+            package_with_document_xml_bytes(part.as_bytes(), &[]),
+        );
+        let message = assert_unreadable(&evt, "word/document.xml");
+        assert!(!message.contains("zzalpha"), "{message}");
+        assert_eq!(engine.state_fingerprint_for_fuzzing(), before);
+    }
 }
 
 /// A truncated archive is damaged too (not "an unknown format"); a legacy

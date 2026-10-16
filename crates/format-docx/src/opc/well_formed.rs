@@ -1118,38 +1118,246 @@ pub(crate) fn verify_part(name: &str, data: &[u8]) -> Result<(), DocxError> {
     }
 }
 
-/// Issue #435 — a main part whose root element is no `document` (markup
-/// spliced in front of the real root now wraps it — `<w:t><w:document …>`)
-/// is beyond a faithful repair: the reader walks it leniently, but the
-/// writer synthesizes a `<w:document>` root that re-declares the FIRST
-/// element's bindings only, so whatever the wrapped root declared is lost
-/// on save. Reported (`repaired: false`) — the part reads as before. A
-/// root that is no WordprocessingML at all is `NotWordprocessingMl`'s
-/// business, not this check's.
-pub(crate) fn check_main_root(name: &str, xml: &[u8], warnings: &mut Vec<DocxWarning>) {
-    use crate::schema::family::RootBinding;
-    let (_, body) = split_bom(xml);
+/// Issue #468 — the qualified name of a part's root element when it is no
+/// `document` (`None`: it is one, or the part has no readable root).
+fn non_document_root(body: &[u8]) -> Option<String> {
     let mut reader = Reader::from_reader(body);
-    let qname = loop {
+    loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if e.local_name().as_ref() == b"document" {
-                    return;
-                }
-                break lossy(e.name().as_ref()).into_owned();
+                return (e.local_name().as_ref() != b"document")
+                    .then(|| lossy(e.name().as_ref()).into_owned());
             }
-            Ok(Event::Eof) | Err(_) => return,
+            Ok(Event::Eof) | Err(_) => return None,
             Ok(_) => {}
         }
+    }
+}
+
+/// One WordprocessingML `document` element found inside a wrapper.
+struct WrappedDocument {
+    /// Byte range of the whole element, and the end of its start tag.
+    start: usize,
+    tag_end: usize,
+    end: usize,
+    /// Length of the element's qualified name.
+    name_len: usize,
+    /// `xmlns` declarations in scope from the wrapper chain that the
+    /// element does not redeclare itself, `(attribute, raw value)`.
+    inherited: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// What [`find_wrapped_documents`] saw.
+struct Wrapped {
+    /// Start of the root element (end of the prolog), end of the root
+    /// element (start of the epilog).
+    root_start: usize,
+    root_end: usize,
+    /// The outermost WordprocessingML `document` elements, at most two
+    /// (two is "more than one").
+    documents: Vec<WrappedDocument>,
+}
+
+/// The `xmlns` / `xmlns:*` attributes of a start tag, `(key, raw value)`.
+fn namespace_declarations(e: &BytesStart<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    e.attributes()
+        .with_checks(false)
+        .flatten()
+        .filter(|a| {
+            let k = a.key.as_ref();
+            k == b"xmlns" || k.starts_with(b"xmlns:")
+        })
+        .map(|a| (a.key.as_ref().to_vec(), a.value.to_vec()))
+        .collect()
+}
+
+/// `true` when `e` is a `document` element bound to a WordprocessingML
+/// namespace (either family) by `own` or the enclosing declarations; a `w`
+/// prefix nothing binds counts too (the reader's lenient Transitional fast
+/// path, see [`is_implicit_prefix`]).
+fn is_wordprocessing_document(
+    e: &BytesStart<'_>,
+    own: &[(Vec<u8>, Vec<u8>)],
+    open: &[Vec<(Vec<u8>, Vec<u8>)>],
+) -> bool {
+    if e.local_name().as_ref() != b"document" {
+        return false;
+    }
+    let name = e.name().into_inner();
+    let key: Vec<u8> = match name.iter().position(|&b| b == b':') {
+        Some(i) => [b"xmlns:".as_slice(), &name[..i]].concat(),
+        None => b"xmlns".to_vec(),
     };
-    if crate::schema::ns_normalize::inspect_root(xml) != RootBinding::NotWordprocessingMl {
-        warnings.push(DocxWarning::MalformedPart {
-            part: name.to_string(),
-            detail: format!(
-                "the root element is `{qname}`, not a WordprocessingML `document` (its own namespace bindings are not re-declared on save)"
-            ),
-            repaired: false,
-        });
+    let bound = own
+        .iter()
+        .rev()
+        .chain(open.iter().rev().flat_map(|d| d.iter().rev()))
+        .find(|(k, _)| *k == key);
+    match bound {
+        Some((_, uri)) => std::str::from_utf8(uri)
+            .ok()
+            .and_then(crate::schema::family::family_of_w_uri)
+            .is_some(),
+        None => key == b"xmlns:w",
+    }
+}
+
+/// Issue #468 — walk the whole of a (structurally well-formed) part and
+/// collect its outermost WordprocessingML `document` elements.
+fn find_wrapped_documents(body: &[u8]) -> Result<Wrapped, String> {
+    let mut reader = Reader::from_reader(body);
+    /* Declarations of every open element, outermost first. */
+    let mut open: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    let mut root_start = None;
+    let mut root_end = None;
+    /* The candidate being walked: the nesting depth it sits at. */
+    let mut active: Option<(usize, WrappedDocument)> = None;
+    let mut documents = Vec::new();
+    let mut prev = 0usize;
+    loop {
+        let event = reader.read_event().map_err(|e| e.to_string())?;
+        let pos = reader.buffer_position() as usize;
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                let own = namespace_declarations(e);
+                root_start.get_or_insert(prev);
+                if active.is_none() && is_wordprocessing_document(e, &own, &open) {
+                    let mut inherited: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    for (k, v) in open.iter().flatten() {
+                        if own.iter().any(|(ok, _)| ok == k) {
+                            continue;
+                        }
+                        match inherited.iter_mut().find(|(ik, _)| ik == k) {
+                            Some(slot) => slot.1 = v.clone(),
+                            None => inherited.push((k.clone(), v.clone())),
+                        }
+                    }
+                    let document = WrappedDocument {
+                        start: prev,
+                        tag_end: pos,
+                        end: pos,
+                        name_len: e.name().as_ref().len(),
+                        inherited,
+                    };
+                    if matches!(event, Event::Empty(_)) {
+                        documents.push(document);
+                    } else {
+                        active = Some((open.len(), document));
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    open.push(own);
+                } else if open.is_empty() {
+                    root_end = Some(pos);
+                }
+            }
+            Event::End(_) => {
+                open.pop();
+                if active
+                    .as_ref()
+                    .is_some_and(|(depth, _)| open.len() == *depth)
+                    && let Some((_, mut document)) = active.take()
+                {
+                    document.end = pos;
+                    documents.push(document);
+                }
+                if open.is_empty() {
+                    root_end = Some(pos);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        if documents.len() >= 2 {
+            break;
+        }
+        prev = pos;
+    }
+    Ok(Wrapped {
+        root_start: root_start.unwrap_or(0),
+        root_end: root_end.unwrap_or(body.len()),
+        documents,
+    })
+}
+
+/// Issues #435 / #468 — a main part whose root element is no `document`:
+/// markup spliced in front of the real root wraps it
+/// (`<w:t><w:document …>…</w:document></w:t>`). The reader walked that
+/// leniently, but the writer synthesizes a `<w:document>` root that can
+/// only re-declare the FIRST element's bindings, so whatever the wrapped
+/// root declared was lost on save (a namespace-ill-formed part Word
+/// refuses). Decided per shape, on a part already known to be structurally
+/// well-formed:
+///
+/// - **exactly one** WordprocessingML `document` element inside (the
+///   outermost one, in either family): the wrapper is junk, so the part is
+///   UNWRAPPED to that element — prolog and epilog kept, the wrapper and
+///   everything else inside it dropped, any namespace declaration the
+///   wrapper chain contributed and the element does not redeclare added to
+///   the element's start tag (the element's own bytes are otherwise
+///   verbatim) — and reported `MalformedPart { repaired: true }`;
+/// - **none, or more than one**: no faithful repair (which one was
+///   meant? where is the document?) — the open is refused with
+///   `DocxError::MalformedXml` (the typed `DocumentUnreadable`), so a part
+///   the writer cannot re-declare is never written;
+/// - a root that is no WordprocessingML at all (and wraps no `document`) is
+///   `NotWordprocessingMl`'s business and is returned untouched.
+pub(crate) fn unwrap_main_root(
+    name: &str,
+    xml: Vec<u8>,
+    warnings: &mut Vec<DocxWarning>,
+) -> Result<Vec<u8>, DocxError> {
+    use crate::schema::family::RootBinding;
+    let (bom, body) = split_bom(&xml);
+    let Some(qname) = non_document_root(body) else {
+        return Ok(xml);
+    };
+    let wrapped = find_wrapped_documents(body)
+        .map_err(|e| DocxError::MalformedXml(format!("{name}: unreadable under `{qname}`: {e}")))?;
+    match wrapped.documents.as_slice() {
+        [] if crate::schema::ns_normalize::inspect_root(&xml)
+            == RootBinding::NotWordprocessingMl =>
+        {
+            Ok(xml)
+        }
+        [] => Err(DocxError::MalformedXml(format!(
+            "{name}: the root element is `{qname}`, not a WordprocessingML `document`, and it wraps none (no faithful repair)"
+        ))),
+        [document] => {
+            let tag = &body[document.start..document.tag_end];
+            let (head, tail) = tag.split_at((1 + document.name_len).min(tag.len()));
+            let mut out = Vec::with_capacity(xml.len());
+            out.extend_from_slice(bom);
+            out.extend_from_slice(&body[..wrapped.root_start]);
+            out.extend_from_slice(head);
+            for (key, value) in &document.inherited {
+                out.push(b' ');
+                out.extend_from_slice(key);
+                out.extend_from_slice(b"=\"");
+                for &b in value {
+                    if b == b'"' {
+                        out.extend_from_slice(b"&quot;");
+                    } else {
+                        out.push(b);
+                    }
+                }
+                out.push(b'"');
+            }
+            out.extend_from_slice(tail);
+            out.extend_from_slice(&body[document.tag_end..document.end]);
+            out.extend_from_slice(&body[wrapped.root_end..]);
+            warnings.push(DocxWarning::MalformedPart {
+                part: name.to_string(),
+                detail: format!(
+                    "the root element is `{qname}`, not a WordprocessingML `document`: unwrapped the one `document` inside it (the wrapper and its other content were dropped)"
+                ),
+                repaired: true,
+            });
+            Ok(out)
+        }
+        _ => Err(DocxError::MalformedXml(format!(
+            "{name}: the root element is `{qname}`, not a WordprocessingML `document`, and it wraps more than one (no faithful repair)"
+        ))),
     }
 }
 

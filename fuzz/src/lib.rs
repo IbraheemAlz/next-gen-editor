@@ -855,7 +855,42 @@ pub fn well_formed_docx_seeds() -> Vec<(&'static str, Vec<u8>, WfOutcome)> {
         }
         package(&out, &[])
     };
+    /* A root wrapped in junk: `<w:t>` around the real `<w:document>`. */
+    let wrapped = |inner: &[u8]| {
+        package(
+            &[
+                wf_prolog(),
+                b"<w:t xml:space=\"preserve\">junk".as_slice(),
+                inner,
+                b"</w:t>",
+            ]
+            .concat(),
+            &[],
+        )
+    };
+    let one_document: Vec<u8> = [
+        wf_root(),
+        b"<w:body>",
+        &para("wrapped"),
+        b"<w:sectPr/></w:body></w:document>",
+    ]
+    .concat();
     vec![
+        (
+            "wf_wrapped_root.docx",
+            wrapped(&one_document),
+            WfOutcome::Opens,
+        ),
+        (
+            "wf_wrapped_two_roots.docx",
+            wrapped(&[one_document.clone(), one_document.clone()].concat()),
+            WfOutcome::Refused,
+        ),
+        (
+            "wf_wrapped_no_root.docx",
+            wrapped(b"<w:body><w:p/></w:body>"),
+            WfOutcome::Refused,
+        ),
         (
             "wf_utf16le_document.docx",
             utf16_main(true),

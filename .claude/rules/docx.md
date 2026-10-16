@@ -78,12 +78,28 @@ paths:
   regenerate-only like a #325 normalised one (a sibling's repaired bytes
   replace its `other_entries` row). STRUCTURAL defects (an end tag that
   closes the wrong element or nothing, markup cut inside a tag, a second
-  root, no root) have no faithful repair: the part is left as it is with
-  `repaired: false` — the main part's typed parse refuses it (typed
-  error), a sibling reads as before. So is a main part whose root is no
-  `document` (junk spliced in front wraps the real root): the writer's
-  synthesized root cannot re-declare the wrapped root's bindings
-  (`well_formed::check_main_root`). `check_part_xml_well_formed` (the
+  root, no root, issue #468 — an element or attribute name that is no XML
+  1.0 `Name`, `well_formed::is_xml_name`: a byte flip put `;` `=` `"` or a
+  leading digit in it, UTF-32) have no faithful repair: the part is left as
+  it is with `repaired: false` — the main part's typed parse refuses it
+  (typed error → `DocumentUnreadable`), a sibling reads as before. Issue
+  #468 — a UTF-16 part (BOM, LE or BE) is DECODED to UTF-8 before the scan
+  (`char::decode_utf16`; an unpaired surrogate / odd trailing byte → U+FFFD;
+  `encoding="UTF-16"` rewritten to `UTF-8`), reported `repaired: true` with
+  the encoding named, and held to the #348 shape caps again; the decoded
+  bytes replace the source's, so every save writes it as UTF-8. A main part
+  whose root is no `document` (junk spliced in front wraps the real root —
+  the writer's synthesized root cannot re-declare the wrapped root's
+  bindings) goes through `well_formed::unwrap_main_root`: exactly ONE
+  WordprocessingML `document` inside (outermost, either family) → the part
+  is unwrapped to it (wrapper and siblings dropped, declarations the wrapper
+  chain contributed added to the element's start tag, `repaired: true`);
+  none or several → `DocxError::MalformedXml` (typed `DocumentUnreadable`),
+  never a part the writer cannot declare; a root that is no WordprocessingML
+  at all still reads as `NotWordprocessingMl`. Seeds
+  `fuzz/corpus/docx_reader/wf_*.docx` (`fuzz::well_formed_docx_seeds`, pinned
+  by `well_formed_seeds_are_committed`; `run_docx_roundtrip` also takes a raw
+  `PK` package). `check_part_xml_well_formed` (the
   save-side gate) runs the same scan (`well_formed::defects`), and the
   `docx_roundtrip` fuzz target asserts a save's re-read needs no repair.
   Harness: `tools/roundtrip` step 60 (`malformed.rs`); seeds

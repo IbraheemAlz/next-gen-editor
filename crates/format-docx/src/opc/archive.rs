@@ -463,7 +463,10 @@ fn read_docx_scoped(
             part_names.main
         )));
     }
-    crate::opc::well_formed::check_main_root(&part_names.main, &xml, &mut warnings);
+    /* Issues #435 / #468 — a root wrapped in junk is unwrapped (exactly one
+    `document` inside) or refused (none / several): the writer's
+    synthesized root could not re-declare the wrapped root's bindings. */
+    let xml = crate::opc::well_formed::unwrap_main_root(&part_names.main, xml, &mut warnings)?;
     /* Issue #325 — validate the root's namespace bindings; a non-canonical
     spelling is normalised (regenerate-only) instead of reading empty. */
     let xml = canonical_main_part(&part_names.main, xml, &mut warnings);
