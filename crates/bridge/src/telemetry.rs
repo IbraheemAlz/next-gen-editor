@@ -175,8 +175,9 @@ pub struct LayoutCacheTelemetry {
 
 /// Issue #500 - `hits / (hits + misses)`, `None` before the first lookup.
 pub fn cache_hit_ratio(hits: u64, misses: u64) -> Option<f32> {
-    let total = hits.saturating_add(misses);
-    (total > 0).then(|| (hits as f64 / total as f64) as f32)
+    /* In f64: a saturating u64 sum would skew the ratio of two huge counts. */
+    let total = hits as f64 + misses as f64;
+    (total > 0.0).then(|| (hits as f64 / total) as f32)
 }
 
 impl LayoutCacheTelemetry {

@@ -215,6 +215,17 @@ hard failure so CI catches a new loop instead of a silent recovery.
   stored with the entry and replayed on a hit, so a cached paint reports
   what a fresh one would. `tools/corpus-native` re-lays every document
   warm (`engine_repaint_consistent`) to prove warm == cold.
+- **The caches are observable in production (issue #500).** Both caches
+  keep always-on counters (paragraph `ParagraphCacheStats`, table-box
+  `TableCacheStats`: a table hit is a verified served box, a miss is
+  everything laid out fresh) and `LayoutCache::observed()` feeds
+  `EngineStats.{paragraph,table}_cache_{bytes,entries,hits,misses}` on the
+  `REQUEST_STATS` reply (`Event::Painted` carries no stats). The shell
+  surfaces them as `createEditorState().layoutCacheStats()`, the Dev HUD
+  "Layout caches" row and `PAINT_TIMING.layout_caches` in telemetry — a
+  hit rate that collapses (#497) shows there before it shows as a slow
+  paint. Counters count since the engine was created (a recovery's fresh
+  engine restarts at 0) and survive `LayoutCache::clear`.
 - **The paragraph cache is weighted in BYTES, not entries (issue #457).**
   `engine-wasm/src/paragraph_cache.rs` (`ParagraphCache`, inside
   `LayoutCache`): an estimated-bytes budget over the cached
