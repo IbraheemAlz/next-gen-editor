@@ -376,3 +376,85 @@ fn a_save_after_a_hostile_paste_never_fails() {
         saved_document_xml(&mut e);
     }
 }
+
+/// Issue #485 - the writer's last-line repair rides the save reply: a
+/// model that holds characters XML cannot carry (an old snapshot, an
+/// unclassified entry point) still saves, and the reply SAYS how many
+/// characters were replaced; a clean save carries no notes.
+#[test]
+fn a_save_that_replaced_characters_says_so() {
+    let mut e = engine_with(DocumentTree::from_text("a\u{1}b\u{2}c"));
+    let Event::DocumentSaved { bytes, notes, .. } = apply(&mut e, Command::SaveDocx) else {
+        panic!("SaveDocx must succeed");
+    };
+    assert_eq!(format_docx::first_forbidden_character(&bytes), None);
+    assert_eq!(
+        notes,
+        vec![bridge::SaveNote::ForbiddenCharactersReplaced { count: 2 }]
+    );
+    let mut clean = engine_with(DocumentTree::from_text("plain"));
+    let Event::DocumentSaved { notes, .. } = apply(&mut clean, Command::SaveDocx) else {
+        panic!("SaveDocx must succeed");
+    };
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+/// Issue #485 - the HTML / plain-text exports have no writer decisions:
+/// they answer `DocumentSaved` with no notes.
+#[test]
+fn text_exports_carry_no_save_notes() {
+    let mut e = engine_with(DocumentTree::from_text("a\u{1}b"));
+    for format in [bridge::DocFormat::Html, bridge::DocFormat::PlainText] {
+        let Event::DocumentSaved { notes, .. } = apply(&mut e, Command::SaveDocument { format })
+        else {
+            panic!("export must succeed");
+        };
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+}
+
+/// Issue #485 - the door the e2e takes: a snapshot whose text holds a
+/// control character (an older build wrote it, or the bytes were edited)
+/// restores as is - the input boundary only guards COMMANDS - and the next
+/// save is repaired AND says so.
+#[test]
+fn a_restored_snapshot_with_a_control_character_saves_with_a_note() {
+    let mut e = engine_with(DocumentTree::from_text("QQQQ"));
+    let Event::Snapshot { mut bytes, .. } = apply(
+        &mut e,
+        Command::Snapshot {
+            seq: None,
+            detach_package: None,
+            known_package_hash: None,
+        },
+    ) else {
+        panic!("Snapshot must answer Snapshot");
+    };
+    let at = bytes
+        .windows(4)
+        .position(|w| w == b"QQQQ")
+        .expect("the paragraph text is a plain msgpack string");
+    bytes[at + 1] = 0x01;
+    bytes[at + 2] = 0x02;
+    let recovered = apply(
+        &mut e,
+        Command::Recover {
+            snapshot: bytes,
+            log_tail: vec![],
+            renderer_downgrade: None,
+            package: None,
+        },
+    );
+    assert!(
+        matches!(recovered, Event::Recovered { .. }),
+        "{recovered:?}"
+    );
+    let Event::DocumentSaved { bytes, notes, .. } = apply(&mut e, Command::SaveDocx) else {
+        panic!("SaveDocx must succeed");
+    };
+    assert_eq!(format_docx::first_forbidden_character(&bytes), None);
+    assert_eq!(
+        notes,
+        vec![bridge::SaveNote::ForbiddenCharactersReplaced { count: 2 }]
+    );
+}

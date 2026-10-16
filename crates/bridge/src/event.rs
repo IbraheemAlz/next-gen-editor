@@ -118,6 +118,19 @@ pub enum Event {
         #[tsify(type = "Uint8Array")]
         bytes: Vec<u8>,
         size: u32,
+        /// Issue #485 - the writer's best-effort decisions for this save
+        /// (`format_docx::WriteNote`, coalesced to one entry per kind):
+        /// characters XML cannot carry that were written as U+FFFD,
+        /// stale markup written at a clamped position, a content control
+        /// widened around a wrapper. Non-empty means the file was saved
+        /// REPAIRED and the shell must say so (`@nge/core`
+        /// `lastSaveNotes()`). Additive: skipped on the wire when empty
+        /// (every clean save, the HTML / plain-text exports and the
+        /// Phase-1 `SaveDocx` harness keep the pre-#485 `{ type, bytes,
+        /// size }` shape), and a pre-#485 payload decodes with no notes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[tsify(optional)]
+        notes: Vec<SaveNote>,
     },
     Error {
         message: String,
@@ -893,6 +906,65 @@ pub enum ReadWarningKind {
     /// regenerate-only on save — else read as it is (the detail says
     /// which).
     MalformedPart,
+}
+
+/// Issue #485 - one coalesced write decision on
+/// [`Event::DocumentSaved::notes`]: the bridge mirror of
+/// `format_docx::WriteNote`, one entry per kind (the engine sums the
+/// repeats). Tagged like every bridge enum: `{ type:
+/// "FORBIDDEN_CHARACTERS_REPLACED", count: 3 }`. The spelling is a stable
+/// code (the telemetry [`SaveNoteKind`] mirrors the variants) - never
+/// rename a variant, only add.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SaveNote {
+    /// Issue #467 - `count` characters XML 1.0 cannot carry (a C0 control
+    /// other than TAB / LF / CR, `U+FFFE`, `U+FFFF`) reached the writer
+    /// and were written as U+FFFD instead.
+    ForbiddenCharactersReplaced { count: u32 },
+    /// A regenerated paragraph's source markup was stale: `markers`
+    /// must-survive markers (legacy form fields, content-control
+    /// boundaries) were written at positions clamped to the current text.
+    StaleMarkupClamped { markers: u32 },
+    /// Issue #245 - `count` run-level content controls would have crossed
+    /// a regenerated wrapper (hyperlink, revision, field) or another
+    /// control after an edit and were widened to enclose it so the part
+    /// stays well-formed.
+    InlineWrapperWidened { count: u32 },
+}
+
+/// Issue #485 - the class of a [`SaveNote`], the telemetry code
+/// (`TelemetryKind::DocSave`): PascalCase on the wire like
+/// [`ReadWarningKind`]. Never rename a variant, only add.
+#[derive(
+    Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+pub enum SaveNoteKind {
+    ForbiddenCharactersReplaced,
+    StaleMarkupClamped,
+    InlineWrapperWidened,
+}
+
+impl SaveNote {
+    /// This note's class.
+    pub const fn kind(&self) -> SaveNoteKind {
+        match self {
+            SaveNote::ForbiddenCharactersReplaced { .. } => {
+                SaveNoteKind::ForbiddenCharactersReplaced
+            }
+            SaveNote::StaleMarkupClamped { .. } => SaveNoteKind::StaleMarkupClamped,
+            SaveNote::InlineWrapperWidened { .. } => SaveNoteKind::InlineWrapperWidened,
+        }
+    }
+
+    /// How many occurrences the note stands for.
+    pub const fn count(&self) -> u32 {
+        match self {
+            SaveNote::ForbiddenCharactersReplaced { count }
+            | SaveNote::InlineWrapperWidened { count } => *count,
+            SaveNote::StaleMarkupClamped { markers } => *markers,
+        }
+    }
 }
 
 impl Event {
@@ -1672,6 +1744,51 @@ mod a11y_note_wire_tests {
         .unwrap();
         assert_eq!(no_count.count, 1);
         assert_eq!(no_count.part, None);
+    }
+
+    /// Issue #485 - a repaired save carries its write notes; a clean one
+    /// keeps the pre-#485 shape, and an old payload decodes with none.
+    #[test]
+    fn document_saved_notes_are_additive_on_the_wire() {
+        let clean = serde_json::to_value(Event::DocumentSaved {
+            bytes: vec![1, 2],
+            size: 2,
+            notes: vec![],
+        })
+        .unwrap();
+        assert!(clean.get("notes").is_none(), "{clean}");
+        let old: Event = serde_json::from_value(serde_json::json!({
+            "type": "DOCUMENT_SAVED",
+            "bytes": [1, 2],
+            "size": 2,
+        }))
+        .unwrap();
+        assert!(matches!(old, Event::DocumentSaved { notes, .. } if notes.is_empty()));
+        let repaired = serde_json::to_value(Event::DocumentSaved {
+            bytes: vec![],
+            size: 0,
+            notes: vec![
+                SaveNote::ForbiddenCharactersReplaced { count: 3 },
+                SaveNote::StaleMarkupClamped { markers: 1 },
+                SaveNote::InlineWrapperWidened { count: 2 },
+            ],
+        })
+        .unwrap();
+        assert_eq!(
+            repaired["notes"],
+            serde_json::json!([
+                { "type": "FORBIDDEN_CHARACTERS_REPLACED", "count": 3 },
+                { "type": "STALE_MARKUP_CLAMPED", "markers": 1 },
+                { "type": "INLINE_WRAPPER_WIDENED", "count": 2 },
+            ])
+        );
+        let back: Event = serde_json::from_value(repaired).unwrap();
+        let Event::DocumentSaved { notes, .. } = back else {
+            panic!("not a DocumentSaved");
+        };
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0].kind(), SaveNoteKind::ForbiddenCharactersReplaced);
+        assert_eq!(notes[1].count(), 1);
     }
 
     /// Issue #364 - the tracked-deletion refusal is a typed error kind.

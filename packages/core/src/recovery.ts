@@ -23,7 +23,9 @@ export type RecoveryNoticeKind =
     | 'checkpoint-failing'
     | 'journal-failing'
     | 'journal-gap'
-    | 'previous-session';
+    | 'previous-session'
+    /* Issue #485 - a save that was repaired (`DOCUMENT_SAVED.notes`). */
+    | 'save-notes';
 
 export interface RecoveryNotice {
     kind: RecoveryNoticeKind;
@@ -31,6 +33,9 @@ export interface RecoveryNotice {
     title: string;
     /** What was lost (or changed), concretely. */
     detail: string;
+    /** Issue #485 - one line per item (a save's notes, one per kind),
+     *  listed under `detail`; absent for single-sentence notices. */
+    lines?: string[];
     /** What the user should do about it. */
     action: string;
 }

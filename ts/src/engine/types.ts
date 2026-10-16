@@ -52,6 +52,8 @@ export type {
     Rect,
     ReadWarning,
     ReadWarningKind,
+    SaveNote,
+    SaveNoteKind,
     Script,
     SelectionKind,
     SelectionModifier,

@@ -23,6 +23,9 @@ import {
     openWarningCount,
     type ReadWarning,
     type RecoveryReport,
+    type SaveNote,
+    saveNoteCount,
+    saveNoteKind,
 } from '@nge/core';
 import './DevHud.css';
 
@@ -58,6 +61,16 @@ function openWarningKinds(ws: readonly ReadWarning[]): string {
     const byKind = new Map<string, number>();
     for (const w of ws) byKind.set(w.kind, (byKind.get(w.kind) ?? 0) + Math.max(1, w.count ?? 1));
     return [...byKind].map(([k, n]) => `${k} ×${n}`).join(', ');
+}
+
+/** Issue #485 — the last save's write notes, per kind. */
+function saveNoteKinds(ns: readonly SaveNote[]): string {
+    const byKind = new Map<string, number>();
+    for (const n of ns) {
+        const k = saveNoteKind(n);
+        byKind.set(k, (byKind.get(k) ?? 0) + saveNoteCount([n]));
+    }
+    return [...byKind].map(([k, c]) => `${k} ×${c}`).join(', ');
 }
 
 /** Issue #315 — every way the last recovery degraded (`[]` = none). */
@@ -236,6 +249,20 @@ export const DevHud: Component<DevHudProps> = (props) => {
                         {state.openWarnings().length > 0
                             ? `${openWarningCount(state.openWarnings())} (${openWarningKinds(state.openWarnings())})`
                             : 'none'}
+                    </dd>
+
+                    {/* Issue #485 - the writer's report for the last save
+                        (the same notes the save-notes banner and the
+                        telemetry DOC_SAVE sample carry). */}
+                    <dt>Last save</dt>
+                    <dd
+                        class="nge-hud__save-notes"
+                        classList={{ 'nge-hud__warn': state.lastSaveNotes().length > 0 }}
+                        title={saveNoteKinds(state.lastSaveNotes())}
+                    >
+                        {state.lastSaveNotes().length > 0
+                            ? `repaired (${saveNoteKinds(state.lastSaveNotes())})`
+                            : 'clean'}
                     </dd>
 
                     {/* Issue #364 - the last engine error any command
