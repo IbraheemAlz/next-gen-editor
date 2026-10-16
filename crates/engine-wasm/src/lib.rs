@@ -420,6 +420,27 @@ thread_local! {
     static CULL_CLAMP_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Issue #501 - scoped switch for [`CULL_CLAMP_OFF`]: the clamp is off
+/// while the guard lives (a test that needs the unclamped cull to build a
+/// stalled band, #499), restored on drop.
+#[cfg(test)]
+pub(crate) struct CullClampOff;
+
+#[cfg(test)]
+impl CullClampOff {
+    pub(crate) fn on() -> Self {
+        CULL_CLAMP_OFF.with(|c| c.set(true));
+        CullClampOff
+    }
+}
+
+#[cfg(test)]
+impl Drop for CullClampOff {
+    fn drop(&mut self) {
+        CULL_CLAMP_OFF.with(|c| c.set(false));
+    }
+}
+
 /// The in-progress page's contribution to the running height the cull
 /// compares with its budget (issue #501): the paginator's cursor bounded
 /// by its page, so one line taller than the page adds at most the page.

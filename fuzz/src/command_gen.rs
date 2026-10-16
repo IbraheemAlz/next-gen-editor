@@ -308,7 +308,12 @@ pub enum Scenario {
     /// paragraph set at a 1e33 pt font keeps the paginator's running
     /// height above any cull target, so `MoveCaret { Left, extend }` from
     /// a table past the band raised the target forever. Now one full
-    /// layout noted `NavExpansionStalled`.
+    /// layout noted `NavExpansionStalled`. Issue #501 - the size itself is
+    /// refused at the door (`ApplyFormatting` past 1638 pt answers
+    /// `OutOfRange`, nothing applied), so this sequence now pins that
+    /// refusal and the rest of the flow on an unformatted document; the
+    /// stall itself is reproduced by `lazy_nav`'s fuzz-native tests, which
+    /// write the size into the model.
     NavExpansionStalled,
 }
 

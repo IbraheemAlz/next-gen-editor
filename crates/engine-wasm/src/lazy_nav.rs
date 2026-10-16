@@ -926,6 +926,9 @@ mod tests {
     /// paragraph — so only a target-less build can lay the tail.
     #[test]
     fn the_stalled_band_culls_at_any_finite_target() {
+        /* Issue #501 - the cull clamp makes this unreachable from a line;
+        switch it off to keep the #499 backstop under test. */
+        let _unclamped = crate::CullClampOff::on();
         let engine = stalled_band_engine();
         let scale = engine.scale();
         let (pages, full) = snapshot_pages(&engine);
@@ -947,6 +950,7 @@ mod tests {
     /// character.
     #[test]
     fn shift_left_past_a_stalled_band_falls_back_to_a_full_layout() {
+        let _unclamped = crate::CullClampOff::on();
         let mut engine = stalled_band_engine();
         let last = engine.undo.current().blocks.len() as u32 - 1;
         let evt = move_via_dispatch(&mut engine, MoveDirection::Left, true);
@@ -974,6 +978,7 @@ mod tests {
     /// past the band (`lazy_nav_reach_page`).
     #[test]
     fn every_expansion_over_a_stalled_band_terminates() {
+        let _unclamped = crate::CullClampOff::on();
         let mut engine = stalled_band_engine();
         let evt = move_via_dispatch(&mut engine, MoveDirection::DocEnd, false);
         assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
@@ -1013,6 +1018,12 @@ mod tests {
     #[cfg(feature = "fuzz-native")]
     #[test]
     fn repro_499_shift_left_after_an_oversize_font_and_a_table_returns() {
+        /* Issue #501 - the 1e33 pt size can no longer arrive by command
+        (ApplyFormatting refuses past 1638 pt) and the cull clamp keeps a
+        finite target working; a restored snapshot can still carry the
+        size, so the model gets it directly below and the unclamped cull
+        stands in for the pre-#501 one. */
+        let _unclamped = crate::CullClampOff::on();
         let mut engine = Engine::new_headless(DocumentTree::from_text(""));
         let size = TextAttrsPatch {
             bold: None,
@@ -1020,7 +1031,7 @@ mod tests {
             underline: None,
             strike: None,
             font_family: None,
-            font_size: Some(1.095_157_5e33),
+            font_size: Some(engine::MAX_FONT_SIZE_PT),
             color: None,
             bg_color: None,
             script: None,
@@ -1052,6 +1063,15 @@ mod tests {
             let evt = engine.apply_sync(cmd);
             assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
         }
+        let mut doc = engine.undo.current().clone();
+        if let Some(p) = doc.blocks.get_mut(0).and_then(|b| b.as_paragraph_mut()) {
+            for run in &mut p.spans {
+                run.style.font_size = Some(1.095_157_5e33);
+                run.style.font_size_cs = Some(1.095_157_5e33);
+            }
+        }
+        engine.undo.replace_current(doc);
+        engine.invalidate_layout_snapshot();
         let scale = engine.scale();
         engine
             .ensure_layout_snapshot(scale, false, Some(MAX_BAND_TARGET_PT * scale))
