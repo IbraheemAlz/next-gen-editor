@@ -23,12 +23,16 @@ pub const LATIN_ID: &str = "liberation";
 pub const ARABIC_ID: &str = "amiri";
 
 /// The per-script defaults, in preference order - `fonts.json`
-/// `defaults_by_script` (`latin`, `arabic`). An id the stack does not hold
-/// is skipped, so [`harness_stack`] (no Noto Naskh) and
-/// [`harness_stack_with_substitutes`] share the one table.
+/// `defaults_by_script` (`latin`, `arabic`, `common`). An id the stack does
+/// not hold is skipped, so [`harness_stack`] (no Noto Naskh) and
+/// [`harness_stack_with_substitutes`] share the one table. Issue #490:
+/// `common` is the script-neutral default (digits, punctuation, an empty
+/// paragraph, the list-marker glyph fallback), declared rather than left to
+/// the fallback root.
 pub const DEFAULTS_BY_SCRIPT: &[(Script, &[&str])] = &[
     (Script::Latin, &[LATIN_ID]),
     (Script::Arabic, &[ARABIC_ID, "noto-naskh"]),
+    (Script::Common, &[LATIN_ID]),
 ];
 
 const LIBERATION_SANS: &[u8] = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf");
@@ -182,6 +186,50 @@ mod tests {
         assert!(face.covers('\u{0628}'));
     }
 
+    /// Issue #490 - script-neutral text resolves through the DECLARED
+    /// `common` default (`fonts.json` `defaults_by_script.common`), not the
+    /// fallback root: a digits-only run, a punctuation-only run and the
+    /// marker-glyph fallback all land on it. Pinned against a stack whose
+    /// root is a different face, so the test fails if the entry is dropped.
+    #[test]
+    fn script_neutral_text_resolves_to_the_declared_common_face() {
+        let common = DEFAULTS_BY_SCRIPT
+            .iter()
+            .find(|(s, _)| *s == Script::Common)
+            .map(|(_, ids)| *ids)
+            .expect("DEFAULTS_BY_SCRIPT declares a common default");
+        assert_eq!(common, &[LATIN_ID]);
+        for stack in [harness_stack(), harness_stack_with_substitutes()] {
+            assert_eq!(stack.priority(Script::Common), [LATIN_ID.to_string()]);
+            for text in ["2026", ".,;", "1.", "\u{2022}"] {
+                let runs = text_pipeline::segment_by_script(text);
+                assert_eq!(runs.len(), 1, "{text:?} is one run");
+                assert_eq!(runs[0].1, Script::Common, "{text:?} is script-neutral");
+                assert_eq!(id_of(&stack, runs[0].1, None), LATIN_ID, "{text:?}");
+            }
+            let bullet = stack.resolve_covering('\u{2022}').expect("a bullet face");
+            assert_eq!(bullet.0, LATIN_ID);
+        }
+        /* The same two faces, root = Amiri, no declaration: the root wins
+        (the implicit behaviour #490 makes explicit) - and the declaration
+        moves script-neutral text off it. */
+        let mut faces = HashMap::new();
+        for (id, bytes) in [(LATIN_ID, LIBERATION_SANS), (ARABIC_ID, AMIRI)] {
+            let face = LoadedFont::parse(id.to_string(), bytes.to_vec()).expect("parse");
+            faces.insert(id.to_string(), Arc::new(face));
+        }
+        let implicit = FontStack::from_faces(faces, ARABIC_ID);
+        assert_eq!(id_of(&implicit, Script::Common, None), ARABIC_ID);
+        let declared = implicit.with_priority(Script::Common, common);
+        assert_eq!(id_of(&declared, Script::Common, None), LATIN_ID);
+        assert_eq!(
+            declared
+                .resolve_covering('\u{2022}')
+                .map(|(id, _)| id.as_str()),
+            Some(LATIN_ID)
+        );
+    }
+
     /// Issue #472 - no id trick: Amiri's id sorts BEFORE Liberation Sans's
     /// (`amiri` < `liberation`) and Amiri covers Latin, so by id alone it
     /// would win Latin text. The priority keeps Latin on Liberation Sans
@@ -223,7 +271,11 @@ mod tests {
                 other => panic!("defaults_by_script.{key}: {other}"),
             }
         };
-        for (script, key) in [(Script::Latin, "latin"), (Script::Arabic, "arabic")] {
+        for (script, key) in [
+            (Script::Latin, "latin"),
+            (Script::Arabic, "arabic"),
+            (Script::Common, "common"),
+        ] {
             let ours: Vec<String> = DEFAULTS_BY_SCRIPT
                 .iter()
                 .find(|(s, _)| *s == script)

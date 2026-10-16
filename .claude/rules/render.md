@@ -42,8 +42,8 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   name: Amiri (`amiri` < `liberation`) used to shape the interactive
   editor's Latin text with Amiri's glyphs. Every consumer declares the same
   table: the shell sends `ts/public/fonts.json` `defaults_by_script`
-  (`latin: [liberation]`, `arabic: [amiri, noto-naskh]`) as
-  `Command::SetFontPriority` after the boot fonts load (and again after a
+  (`latin: [liberation]`, `arabic: [amiri, noto-naskh]`, `common:
+  [liberation]`) as `Command::SetFontPriority` after the boot fonts load (and again after a
   recovery, which wipes the engine's font setup with its font map);
   `tools/harness-fonts` declares it as `DEFAULTS_BY_SCRIPT` (a unit test
   pins the two together) and registers its faces under the manifest ids,
@@ -53,8 +53,22 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   priority also orders faces that answer to ONE family name in
   `resolve_family`; a substitution row's own family order stays the
   document's mapping and wins over it. The shell's Latin default is also
-  its seed face (`cfg.font_id`, the fallback root), so script-neutral text
-  and scripts the stack does not specialise take it.
+  its seed face (`cfg.font_id`, the fallback root), so scripts the stack
+  does not specialise take it.
+- **ONE walk order for "which face?" (issue #490).** `FontStack::walk_order`
+  (the script's explicit priority, then the id-sorted covering faces, then
+  the fallback chain) is the only place that order lives: `resolve_detailed`
+  takes the first face of it that matches the weight / slant,
+  `resolve_covering(ch)` (the list-marker / `<w:sym>` glyph fallback) the
+  first one whose cmap has the glyph, walked for `script_of(ch)` — a bullet
+  or a digit is `Script::Common`, so the **`common`** default
+  (`defaults_by_script.common`, declared explicitly since #490, also in
+  `harness_fonts::DEFAULTS_BY_SCRIPT` and in `corpus-native`'s
+  `register_editor_fonts`) decides it, a letter its own script's default.
+  A glyph the declared defaults lack still comes from the first covering
+  face of the id-sorted tail (primary face first); a glyph only one face
+  has comes from that face whatever the order. Never reintroduce a second
+  hand-rolled walk over `fallback_chain` / `by_script`.
 - **Line pitch has ONE model (issue #475).** Every document — read from
   a Word package or built in the editor (the seeded page, `.txt` /
   `.html` opens, the `RenderPage` harness) — lays out with Word's

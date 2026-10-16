@@ -227,3 +227,64 @@ fn an_override_applies_on_every_line_it_spans() {
     let para = lay(&fonts, &emb, &[], 1000.0, ShapingDirection::Ltr);
     assert_eq!(para.lines.len(), 1);
 }
+
+/// Issue #490 — the list-marker glyph fallback (`FontStack::resolve_covering`)
+/// follows the DECLARED per-script default, not the id-sorted chain. An RTL
+/// paragraph resolves its marker through the Arabic face (Amiri), which lacks
+/// the hollow bullet U+25E6; two faces cover it: `a-copy` (sorts first by id)
+/// and `latin`. The id-sorted chain used to hand the bullet to `a-copy`; the
+/// declared `common` default (`fonts.json` `defaults_by_script.common`) puts
+/// it on `latin`.
+#[test]
+fn a_marker_glyph_fallback_takes_the_declared_common_face() {
+    let face = |id: &str, bytes: &[u8]| {
+        Arc::new(text_pipeline::LoadedFont::parse(id.into(), bytes.to_vec()).expect("font"))
+    };
+    let liberation = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf");
+    let amiri = include_bytes!("../../../ts/fonts/Amiri-Regular.ttf");
+    let build = |declare: bool| {
+        let mut faces = HashMap::new();
+        faces.insert("naskh".to_string(), face("naskh", amiri));
+        faces.insert("a-copy".to_string(), face("a-copy", liberation));
+        faces.insert("latin".to_string(), face("latin", liberation));
+        let mut stack = FontStack::from_faces(faces, "naskh");
+        if declare {
+            stack.set_priority(text_pipeline::Script::Arabic, &["naskh"]);
+            stack.set_priority(text_pipeline::Script::Latin, &["latin"]);
+            stack.set_priority(text_pipeline::Script::Common, &["latin"]);
+        }
+        stack
+    };
+    let marker_font = |stack: &FontStack| {
+        let text = "\u{0628}";
+        let para = layout_paragraph(ParagraphConfig {
+            text,
+            fonts: stack,
+            inline_objects: &[],
+            spans: &[span(text.len())],
+            base_direction: ShapingDirection::Rtl,
+            max_width: 300.0,
+            line_height: 14.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 36.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 18.0,
+            marker_text: Some("\u{25E6}".to_string()),
+            px_size_for_marker: PX,
+            tab_stops_px: &[],
+            hyphenation: None,
+            font_line: None,
+        });
+        let marker = para.marker.expect("marker box");
+        assert!(marker.run.glyphs.iter().any(|g| g.id != 0), "a real glyph");
+        marker.run.font
+    };
+    let bare = build(false);
+    assert!(!bare.face("naskh").unwrap().covers('\u{25E6}'));
+    /* Pre-#490 behaviour (no declaration): the first covering face by id. */
+    assert_eq!(marker_font(&bare), "a-copy");
+    /* Declared: the common default. */
+    assert_eq!(marker_font(&build(true)), "latin");
+}
