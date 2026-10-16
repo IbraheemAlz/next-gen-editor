@@ -47,6 +47,7 @@ use web_sys::OffscreenCanvasRenderingContext2d;
 mod error_reply;
 /// Issue #379 — the content-keyed table layout cache that survives
 /// between paints.
+mod paragraph_cache;
 mod paragraph_cache_key;
 mod pdf_semantics;
 mod read_report;
@@ -1070,15 +1071,10 @@ pub struct Engine {
     paint_geometry_seq: u64,
 }
 
-/// Capacity of the paragraph layout cache — comfortably covers a 50-page
-/// document (1000 paragraphs) plus edit churn.
-const LAYOUT_CACHE_CAP: usize = 4096;
-
-/// A fresh, empty paragraph + table layout cache.
+/// A fresh, empty paragraph + table layout cache (issue #457: both are
+/// weighted in estimated bytes, see `paragraph_cache.rs`).
 fn new_layout_cache() -> RefCell<LayoutCache> {
-    RefCell::new(LayoutCache::new(
-        NonZeroUsize::new(LAYOUT_CACHE_CAP).expect("LAYOUT_CACHE_CAP is non-zero"),
-    ))
+    RefCell::new(LayoutCache::new())
 }
 
 /// Assemble an `Engine` around a chosen renderer surface. Exactly one of `ctx`
@@ -5617,7 +5613,7 @@ fn layout_paragraph_cached(
     scale: f32,
     max_width: f32,
     sctx: StyleContext,
-    cache: &mut LruCache<u64, ParagraphBox>,
+    cache: &mut paragraph_cache::ParagraphCache,
 ) -> ParagraphBox {
     let key = paragraph_layout_key(para, cfg, scale, max_width, sctx);
     if let Some(cached) = cache.get(&key) {
@@ -31142,6 +31138,10 @@ mod wire_validation_tests {
 /// Issue #456 — the paragraph layout cache key sees every layout input.
 #[cfg(test)]
 mod paragraph_cache_key_tests;
+
+/// Issue #457 — the paragraph layout cache is weighted in bytes.
+#[cfg(test)]
+mod paragraph_cache_tests;
 
 /// Issues #477–#481 — the nightly `snapshot_decode` findings, generator-free.
 #[cfg(test)]
