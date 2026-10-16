@@ -1038,6 +1038,8 @@ impl DocResult {
             font_size_clamps: 0,
             margin_text_area_clamps: 0,
             point_field_clamps: 0,
+            border_width_clamps: 0,
+            tab_list_clamps: 0,
             regen_check: None,
             main_part_regenerate_only: false,
         }

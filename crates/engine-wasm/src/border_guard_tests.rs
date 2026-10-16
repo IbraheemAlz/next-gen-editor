@@ -102,7 +102,7 @@ const DRAWN_BAD: [u16; 8] = [0, 1, 49, 50, 96, 4000, 8191, u16::MAX];
 const DRAWN_OK: [u16; 5] = [2, 3, 4, 47, 48];
 
 fn edge_cases(size: u16, style: BridgeBorderStyle) -> [(&'static str, BridgeCellBorders); 4] {
-    let p = || pen(style.clone(), size);
+    let p = || pen(style, size);
     [
         (
             "borders.top.size_eighth_pt",
@@ -144,7 +144,7 @@ fn set_cell_borders_refuses_each_edge_outside_2_to_48_naming_the_field() {
         BridgeBorderStyle::Dashed,
     ] {
         for bad in DRAWN_BAD {
-            for (field, borders) in edge_cases(bad, style.clone()) {
+            for (field, borders) in edge_cases(bad, style) {
                 let mut e = engine_with_table();
                 let before = e.state_fingerprint_for_fuzzing();
                 let evt = e.apply_sync(cell_borders(borders));
