@@ -429,7 +429,11 @@ Engine backlog" references a real issue.
   export of the Latin + Arabic CFF / TrueType fixtures, capped at 2 min;
   its `cargo test -p format-pdf --lib --no-run` pre-build is a separate
   uncapped step) — the whole job stays non-blocking because golden pixel-reproducibility on the GitHub
-  runner's Chrome is still unproven across machines. `tools/memory-profile`
+  runner's Chrome is still unproven across machines. Issue #486: the
+  visual-diff and pdf-validate steps start no dev server and pin no `URL` —
+  each harness boots (and stops) its own Vite through `ensureDevServer` on
+  the per-checkout port, with that boot inside the step's `timeout` cap.
+  `tools/memory-profile`
   and `tools/perf` are **not** wired into `ci.yml` at all — the heavier
   fixtures (100p/250p/500p) blew the runner's time cap; run them locally
   (`node tools/memory-profile/run.mjs --budgets`, `node tools/perf/run.mjs
@@ -578,9 +582,11 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
   `PW_PORT` > the path hash, reuses a server already answering there and
   otherwise boots `pnpm exec vite --port N --strictPort` itself (stopped on
   exit). Each report header names the measured URL; they no longer assume
-  5173 (`URL=http://localhost:5173` still pins a harness to it, as `ci.yml`
-  does). `pnpm --filter tools-lib test` covers the derivation (pinned
-  values) and the boot/reuse paths.
+  5173 (`URL=http://localhost:5173` still pins a harness to a server you
+  started yourself; `ci.yml` no longer does — since issue #486 the
+  `qa-harness` steps let the harnesses boot their own server, so CI runs
+  on the hashed port like a local run). `pnpm --filter tools-lib test`
+  covers the derivation (pinned values) and the boot/reuse paths.
 
 ## Things to never do
 
