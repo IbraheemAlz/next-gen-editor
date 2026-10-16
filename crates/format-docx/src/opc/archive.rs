@@ -441,6 +441,28 @@ fn read_docx_scoped(
     /* Issues #439 / #434 — a part that is not well-formed XML is repaired
     up front (regenerate-only) before anything captures its bytes. */
     let xml = repair_part(&part_names.main, xml, limits, &mut warnings)?;
+    /* Issue #483 — a main part with a STRUCTURAL defect (a second root,
+    an end tag closing the wrong element, markup cut inside a tag, no
+    root, UTF-16) has no faithful repair, and its lexical defects are not
+    repaired either (the scan stops at the structural one). quick-xml
+    walked some of those shapes leniently, so the document opened — but
+    its clean paragraphs' bytes could not be replayed (not UTF-8) and the
+    regenerated save showed a different text than the open had. Refused
+    with a typed error, as the module contract always said; a well-formed
+    part whose single root merely is not `document` (#435) still opens. */
+    if let Some(detail) = warnings.iter().find_map(|w| match w {
+        DocxWarning::MalformedPart {
+            part,
+            detail,
+            repaired: false,
+        } if *part == part_names.main => Some(detail.clone()),
+        _ => None,
+    }) {
+        return Err(DocxError::MalformedXml(format!(
+            "{}: {detail} (no faithful repair)",
+            part_names.main
+        )));
+    }
     crate::opc::well_formed::check_main_root(&part_names.main, &xml, &mut warnings);
     /* Issue #325 — validate the root's namespace bindings; a non-canonical
     spelling is normalised (regenerate-only) instead of reading empty. */
