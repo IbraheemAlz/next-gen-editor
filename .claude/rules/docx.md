@@ -174,9 +174,10 @@ paths:
   `Event::Recovered.bounds_repaired` counts the CURRENT document's repairs
   (not once per undo step); the replay runs the logged tail through the same
   guards as a live command and `Recovered.refused_commands` counts the
-  commands they answered `OutOfRange` / `InvalidArgument` (skipped, not in
-  `applied_commands` — the worker logs a command whatever it answered, so a
-  live-refused one is refused again on replay). The shell surfaces them as
+  commands they answered `OutOfRange` / `InvalidArgument` (skipped; a subset
+  of `applied_commands`, which has always counted every replayed command —
+  the worker logs a command whatever it answered, so a live-refused one is
+  refused again on replay). The shell surfaces them as
   `RecoveryInfo.boundsRepaired` / `refusedCommands`, the `bounds-repaired` /
   `commands-refused` `recoveryNotices()` and a Dev HUD "Losses" entry. A NEW
   model field that holds a font size or a point measure must be repaired in

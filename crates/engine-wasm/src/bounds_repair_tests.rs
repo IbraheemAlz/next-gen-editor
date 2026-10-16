@@ -226,8 +226,8 @@ fn a_refused_log_tail_command_is_skipped_and_counted() {
         bytes,
         vec![insert("X"), size_command(1.0e33), insert("Y")],
     );
-    /* The two inserts replay; the hostile size is refused, not applied. */
-    assert_eq!(counts(&evt), (2, 0, 1));
+    /* All three are replayed; the hostile size is refused, not applied. */
+    assert_eq!(counts(&evt), (3, 0, 1));
     assert_eq!(b.check_font_sizes_for_fuzzing(), Ok(()));
     let text = b.undo.current().nth_paragraph(0).unwrap().text.clone();
     assert!(text.contains('X') && text.contains('Y'), "{text}");
@@ -258,7 +258,7 @@ fn every_guard_kind_counts_in_the_tail() {
     );
     /* OutOfRange (point guard), InvalidArgument (finiteness) and
     InvalidArgument (forbidden text) are refused; the plain insert lands. */
-    assert_eq!(counts(&evt), (1, 0, 3));
+    assert_eq!(counts(&evt), (4, 0, 3));
     assert_eq!(b.check_point_fields_for_fuzzing(), Ok(()));
     let _ = &mut a;
 }

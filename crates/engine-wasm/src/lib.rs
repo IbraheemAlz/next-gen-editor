@@ -9511,6 +9511,7 @@ impl Engine {
             whatever it answered - or the row is damaged) is SKIPPED, not
             applied raw and not fatal to the recovery. It is counted so
             the shell can say so. */
+            applied_commands += 1;
             if matches!(
                 reply,
                 Event::Error {
@@ -9519,8 +9520,6 @@ impl Engine {
                 }
             ) {
                 refused_commands += 1;
-            } else {
-                applied_commands += 1;
             }
             /* A replayed `RenderPage` re-seeds the config; keep it stashed
             so the next replayed edit does not paint without fonts. */

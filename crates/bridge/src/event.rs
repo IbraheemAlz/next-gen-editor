@@ -162,7 +162,9 @@ pub enum Event {
     },
     /// Reply to `Command::Recover` (issue #85).
     Recovered {
-        /// Replay-log commands applied on top of the base snapshot.
+        /// Replay-log commands replayed on top of the base snapshot: every
+        /// one handed to the engine, including those a guard refused
+        /// (`refused_commands` counts those, a subset of this number).
         applied_commands: u32,
         /// `true` when a base snapshot was decoded and restored; `false`
         /// when none was supplied or it was unreadable (the engine then
@@ -213,7 +215,8 @@ pub enum Event {
         /// Issue #503 - replayed log-tail commands the argument guards
         /// refused (`OutOfRange` / `InvalidArgument`: a size or point
         /// outside Word's limits, a non-finite number, forbidden text):
-        /// skipped, not applied, and not counted in `applied_commands`.
+        /// skipped, never applied. A subset of `applied_commands` (which
+        /// has always counted every replayed command, refused or not).
         /// `0` on an ordinary recovery.
         #[serde(default)]
         refused_commands: u32,
