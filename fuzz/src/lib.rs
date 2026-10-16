@@ -95,7 +95,7 @@ pub fn check_roundtrip(bytes: &[u8]) {
             if trace_enabled() {
                 eprintln!(
                     "[docx_roundtrip] re-read refused: {e}\n  source document.xml: {}\n  saved document.xml: {}",
-                    String::from_utf8_lossy(&document_xml_of(&bytes)),
+                    String::from_utf8_lossy(&document_xml_of(bytes)),
                     String::from_utf8_lossy(&document_xml_of(&written_a)),
                 );
             }
@@ -131,7 +131,7 @@ pub fn check_roundtrip(bytes: &[u8]) {
             "[docx_roundtrip] text drift:\n  before: {:?}\n  after:  {:?}\n  source document.xml: {}\n  saved document.xml: {}",
             doc_a.to_plain_text(),
             archive_b.document.to_plain_text(),
-            String::from_utf8_lossy(&document_xml_of(&bytes)),
+            String::from_utf8_lossy(&document_xml_of(bytes)),
             String::from_utf8_lossy(&document_xml_of(&written_a)),
         );
     }
