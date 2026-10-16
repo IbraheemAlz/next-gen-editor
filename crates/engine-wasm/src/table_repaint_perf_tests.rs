@@ -172,3 +172,67 @@ fn profile_table_body_edit() {
         samples.iter().cloned().fold(0.0, f64::max),
     );
 }
+
+/// Issue #497 item 2 — font resolution with the shell's full face set: the
+/// old 10,000-paragraph `500p` shape (`dense-10000`, mixed Latin / Arabic)
+/// laid out cold with the first `n` boot faces, and `FontStack::resolve`
+/// timed per call for the lookups a layout makes (no family, a substituted
+/// family, an exact id). Run with:
+/// `cargo test -p engine-wasm --release --lib profile_font_resolution -- --ignored --nocapture`
+#[test]
+#[ignore = "manual timing harness, not a correctness gate"]
+fn profile_font_resolution() {
+    use std::time::Instant;
+    use text_pipeline::Script as S;
+    const FILLER: &str = "The quick brown fox jumps over the lazy dog. \
+        مرحبا بالعالم، هذا نص حشو لقياس استهلاك الذاكرة.";
+    const CALLS: u32 = 200_000;
+    let doc =
+        DocumentTree::from_paragraphs((0..10_000).map(|i| format!("Paragraph {i:05}. {FILLER}")));
+    for n in [2usize, 3, EDITOR_FACES.len()] {
+        let mut engine = tests::test_engine_with_doc(doc.clone());
+        engine.fonts.clear();
+        for (id, bytes) in &EDITOR_FACES[..n] {
+            let font = LoadedFont::parse((*id).to_string(), bytes.to_vec()).expect("face");
+            engine.fonts.insert((*id).to_string(), Arc::new(font));
+        }
+        engine.font_priority = HashMap::from([
+            (S::Latin, vec!["liberation".to_string()]),
+            (S::Arabic, vec!["amiri".to_string(), "noto-naskh".to_string()]),
+        ]);
+        if let Some(cfg) = engine.layout_cfg.as_mut() {
+            cfg.font_id = "liberation".to_string();
+        }
+        let t = Instant::now();
+        let (pages, ..) = engine
+            .build_pages(2.0, false, None)
+            .expect("cold full layout");
+        let cold = t.elapsed();
+        let t = Instant::now();
+        let stack = engine.font_stack("liberation");
+        let build = t.elapsed();
+        let time = |script, family: Option<&str>| {
+            let t = Instant::now();
+            for _ in 0..CALLS {
+                std::hint::black_box(stack.resolve(
+                    script,
+                    std::hint::black_box(family),
+                    false,
+                    false,
+                ));
+            }
+            t.elapsed().as_nanos() as f64 / f64::from(CALLS)
+        };
+        eprintln!(
+            "[#497] {n} faces: dense-10000 cold full layout {cold:>9.2?} ({} pages); \
+             FontStack build {build:>8.2?}; resolve ns/call: Latin none {:.0}, Arabic none {:.0}, \
+             Latin 'Calibri' {:.0}, Arabic 'Arial' {:.0}, exact 'liberation' {:.0}",
+            pages.len(),
+            time(S::Latin, None),
+            time(S::Arabic, None),
+            time(S::Latin, Some("Calibri")),
+            time(S::Arabic, Some("Arial")),
+            time(S::Latin, Some("liberation")),
+        );
+    }
+}
