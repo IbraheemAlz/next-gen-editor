@@ -162,6 +162,11 @@ fn a_substituted_slot_reads_back_substituted() {
     );
     assert_eq!(font_source.latin, FontSource::Theme, "no Carlito loaded");
     assert_eq!(font_source.complex_script, FontSource::Substituted);
+    /* Issue #474 — the substituted slot still says a theme binding named
+    its family (the picker's "(theme → Noto Naskh Arabic)"); the
+    theme-resolved Latin slot carries the same flag as `Theme`. */
+    assert!(font_source.latin_from_theme);
+    assert!(font_source.complex_script_from_theme);
 }
 
 /// A Latin row: a document naming Arial lays its Latin text out in
@@ -195,6 +200,10 @@ fn a_latin_family_substitutes_its_metric_clone() {
     };
     assert_eq!(font_source.latin, FontSource::Substituted);
     assert_eq!(font_source.complex_script, FontSource::Style);
+    /* Issue #474 — Arial here is named by docDefaults, not the theme: a
+    substituted style font is not a theme font. */
+    assert!(!font_source.latin_from_theme);
+    assert!(!font_source.complex_script_from_theme);
 }
 
 /// Issue #329 — every face the shell's boot sequence loads (`fonts.json`

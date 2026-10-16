@@ -91,3 +91,46 @@ test('#329: an opened document reports its font substitutions and the Dev HUD li
     await expect(rows.nth(0)).not.toHaveClass(/nge-hud__substitution--approx/);
     await expect(rows.nth(2)).toHaveClass(/nge-hud__substitution--approx/);
 });
+
+/* Issue #474 item 6 — the picker marks a substituted THEME font with its
+ * origin. Word's default template binds the body text to the theme
+ * (`minorHAnsi` -> Calibri), which the editor does not ship: the engine
+ * lays it out with Carlito and reads the slot back `Substituted`, so the
+ * source alone cannot tell the picker the theme named it; the
+ * `latin_from_theme` flag beside it does. The label reads "(theme ->
+ * Carlito)", not "(Carlito)". */
+test('#474: a substituted theme font reads "(theme → Carlito)" in the font picker', async ({
+    page,
+}) => {
+    test.setTimeout(45_000);
+    await boot(page);
+    const bytes = Array.from(readFileSync(THEME_FIXTURE));
+    const reply = await page.evaluate(async (arr) => {
+        const w = window as any;
+        const loaded = await w.__dispatch({
+            type: 'OPEN_DOCUMENT',
+            bytes: new Uint8Array(arr),
+            format: 'docx',
+            name: 'theme_word_default.docx',
+        });
+        if (loaded.type === 'ERROR') throw new Error(loaded.message);
+        /* A caret in the first body paragraph (Calibri via the theme). */
+        const at = { path: { steps: [{ kind: 'BLOCK', idx: 1 }] }, offset: 3 };
+        return w.__dispatch({
+            type: 'SET_SELECTION',
+            range: { start: at, end: at },
+            caret: at,
+        });
+    }, bytes);
+    expect(reply.type).toBe('SELECTION_CHANGED');
+    expect(reply.resolved_font_latin).toBe('Calibri');
+    expect(reply.font_source.latin).toBe('Substituted');
+    expect(reply.font_source.latin_from_theme).toBe(true);
+
+    const marker = page.locator('.nge-font__source');
+    await expect(marker).toHaveText('(theme → Carlito)');
+    await expect(marker).toHaveAttribute('data-nge-font-source', 'substituted');
+    await expect(marker).toHaveAttribute('data-nge-font-theme', '');
+    /* One marker, not a "(theme)" beside a "(Carlito)". */
+    await expect(page.locator('.nge-font__source')).toHaveCount(1);
+});

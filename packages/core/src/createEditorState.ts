@@ -92,7 +92,9 @@ export interface EditorState {
     /** Issue #423 — where each slot's family came from (`Explicit` /
      *  `Theme` / `Style` / `Default`, and — issue #329 — `Substituted`
      *  when a substitute face serves the named family); a picker marks
-     *  `Theme` fonts. */
+     *  `Theme` fonts. Issue #474 — `latin_from_theme` /
+     *  `complex_script_from_theme` keep the theme origin of a
+     *  `Substituted` slot ("(theme → Carlito)"). */
     fontSource: Accessor<BridgeFontSources | undefined>;
     /** Issue #420 — the caret run's resolved family id / size / bold /
      *  italic PER SCRIPT SLOT — the Font dialog's "Latin text" and
