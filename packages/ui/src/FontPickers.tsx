@@ -29,7 +29,9 @@
  * Issue #329 — a family the editor does not ship but lays out with a
  * substitute (`fontSource() === 'Substituted'`: Calibri shown with
  * Carlito) keeps its own name and carries the substitute's name as the
- * marker, "(Carlito)".
+ * marker, "(Carlito)". Issue #474 — when a theme binding named that
+ * family (`font_source.*_from_theme`, which `Substituted` alone cannot
+ * say) the marker keeps the origin: "(theme → Carlito)".
  */
 import { createSignal, createMemo, createEffect, For, Show, type Component } from 'solid-js';
 import {
@@ -38,6 +40,7 @@ import {
     useFontRegistry,
 } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { slotFromTheme, substituteMarker, substituteMarkerTitle } from './fontSourceMarkers';
 import { FontDialog } from './FontDialog';
 import './FontPickers.css';
 
@@ -62,7 +65,9 @@ export const FontPickers: Component = () => {
     const resolvedName = () =>
         (slotKey() === 'complex_script' ? state.resolvedFontCs() : state.resolvedFontLatin()) ??
         currentFamily();
-    const fromTheme = () => state.fontSource()?.[slotKey()] === 'Theme';
+    /* Issue #474 — a theme binding named the family, even when it is then
+       substituted (`Substituted` hides the origin; the flag keeps it). */
+    const fromTheme = () => slotFromTheme(state.fontSource(), slotKey());
     /* Issue #329 — the face standing in for the resolved family, when the
        engine substitutes it (`undefined` otherwise). */
     const substitute = createMemo(() => {
@@ -122,7 +127,7 @@ export const FontPickers: Component = () => {
                     disabled={!ready() || pending()}
                     title={
                         substitute()
-                            ? `${resolvedName()} — not installed; laid out with ${substitute()}`
+                            ? `${resolvedName()} — ${fromTheme() ? 'from the document theme, ' : ''}not installed; laid out with ${substitute()}`
                             : fromTheme()
                               ? `${resolvedName()} — from the document theme`
                               : 'Font family'
@@ -151,7 +156,7 @@ export const FontPickers: Component = () => {
                     <span class="nge-font__spinner" aria-hidden="true" />
                 </Show>
             </div>
-            <Show when={fromTheme()}>
+            <Show when={fromTheme() && !substitute()}>
                 <span
                     class="nge-font__source"
                     data-nge-font-source="theme"
@@ -165,9 +170,10 @@ export const FontPickers: Component = () => {
                     <span
                         class="nge-font__source"
                         data-nge-font-source="substituted"
-                        title={`${resolvedName()} is not installed; the document is laid out with ${sub()}`}
+                        data-nge-font-theme={fromTheme() ? '' : undefined}
+                        title={substituteMarkerTitle(resolvedName(), sub(), fromTheme())}
                     >
-                        ({sub()})
+                        {substituteMarker(sub(), fromTheme())}
                     </span>
                 )}
             </Show>

@@ -84,10 +84,14 @@ fn theme_engine() -> Engine {
     tests::test_engine_with_doc(doc)
 }
 
+/// The sources of two slots whose theme origin is just `Theme` itself
+/// (issue #474: the flag only carries information next to `Substituted`).
 fn sources(latin: FontSource, complex_script: FontSource) -> BridgeFontSources {
     BridgeFontSources {
         latin,
         complex_script,
+        latin_from_theme: latin == FontSource::Theme,
+        complex_script_from_theme: complex_script == FontSource::Theme,
     }
 }
 

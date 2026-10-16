@@ -39,6 +39,7 @@ import {
     type SlotFormatPatch,
 } from '@nge/core';
 import { Dialog } from './Dialog';
+import { slotFromTheme } from './fontSourceMarkers';
 import './FontDialog.css';
 
 type SlotKey = 'latin' | 'complex_script';
@@ -129,7 +130,7 @@ export const FontDialog: Component<FontDialogProps> = (props) => {
         return {
             family,
             name: name ?? family,
-            fromTheme: state.fontSource()?.[key] === 'Theme',
+            fromTheme: slotFromTheme(state.fontSource(), key),
             size: roundPt(format?.font_size ?? attrs?.font_size ?? 12),
             bold: format?.bold ?? false,
             italic: format?.italic ?? false,

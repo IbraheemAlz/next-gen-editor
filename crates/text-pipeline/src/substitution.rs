@@ -242,59 +242,72 @@ mod tests {
     registered under its `fonts.json` id) answers to the spelling the
     table uses, through its `name` table, and covers its row's class:
     a typo in a row or a renamed font file fails here, not as a silent
-    fallback in the field. Scheherazade New is the one listed substitute
-    not shipped. */
-    #[test]
-    fn every_shipped_substitute_resolves_through_its_name_table() {
-        use crate::{FamilyMatch, FontStack, LoadedFont, Script};
+    fallback in the field. Issue #474: every name a row lists is a face
+    the editor ships (`every_listed_substitute_is_a_shipped_face`) — a
+    listed fallback nothing can resolve is dead table. */
+    const SHIPPED: &[(&str, &[u8])] = &[
+        (
+            "amiri",
+            include_bytes!("../../../ts/public/fonts/Amiri-Regular.ttf"),
+        ),
+        (
+            "liberation",
+            include_bytes!("../../../ts/public/fonts/LiberationSans-Regular.ttf"),
+        ),
+        (
+            "noto-naskh",
+            include_bytes!("../../../ts/public/fonts/NotoNaskhArabic-Regular.ttf"),
+        ),
+        (
+            "carlito",
+            include_bytes!("../../../ts/public/fonts/Carlito-Regular.ttf"),
+        ),
+        (
+            "caladea",
+            include_bytes!("../../../ts/public/fonts/Caladea-Regular.ttf"),
+        ),
+        (
+            "liberation-serif",
+            include_bytes!("../../../ts/public/fonts/LiberationSerif-Regular.ttf"),
+        ),
+        (
+            "liberation-mono",
+            include_bytes!("../../../ts/public/fonts/LiberationMono-Regular.ttf"),
+        ),
+        (
+            "gelasio",
+            include_bytes!("../../../ts/public/fonts/Gelasio-Regular.ttf"),
+        ),
+        (
+            "selawik",
+            include_bytes!("../../../ts/public/fonts/Selawik-Regular.ttf"),
+        ),
+        (
+            "scheherazade-new",
+            include_bytes!("../../../ts/public/fonts/ScheherazadeNew-Regular.ttf"),
+        ),
+    ];
+
+    /// The shipped faces as a font stack, minus any id in `without`.
+    fn shipped_stack(without: &[&str]) -> crate::FontStack {
+        use crate::{FontStack, LoadedFont};
         use std::collections::HashMap;
         use std::sync::Arc;
-        let shipped: &[(&str, &[u8])] = &[
-            (
-                "amiri",
-                include_bytes!("../../../ts/public/fonts/Amiri-Regular.ttf"),
-            ),
-            (
-                "liberation",
-                include_bytes!("../../../ts/public/fonts/LiberationSans-Regular.ttf"),
-            ),
-            (
-                "noto-naskh",
-                include_bytes!("../../../ts/public/fonts/NotoNaskhArabic-Regular.ttf"),
-            ),
-            (
-                "carlito",
-                include_bytes!("../../../ts/public/fonts/Carlito-Regular.ttf"),
-            ),
-            (
-                "caladea",
-                include_bytes!("../../../ts/public/fonts/Caladea-Regular.ttf"),
-            ),
-            (
-                "liberation-serif",
-                include_bytes!("../../../ts/public/fonts/LiberationSerif-Regular.ttf"),
-            ),
-            (
-                "liberation-mono",
-                include_bytes!("../../../ts/public/fonts/LiberationMono-Regular.ttf"),
-            ),
-            (
-                "gelasio",
-                include_bytes!("../../../ts/public/fonts/Gelasio-Regular.ttf"),
-            ),
-            (
-                "selawik",
-                include_bytes!("../../../ts/public/fonts/Selawik-Regular.ttf"),
-            ),
-        ];
-        let faces: HashMap<String, Arc<LoadedFont>> = shipped
+        let faces: HashMap<String, Arc<LoadedFont>> = SHIPPED
             .iter()
+            .filter(|(id, _)| !without.contains(id))
             .map(|(id, bytes)| {
                 let face = LoadedFont::parse(id.to_string(), bytes.to_vec()).expect("parse");
                 (id.to_string(), Arc::new(face))
             })
             .collect();
-        let stack = FontStack::from_faces(faces, "liberation");
+        FontStack::from_faces(faces, "liberation")
+    }
+
+    #[test]
+    fn every_shipped_substitute_resolves_through_its_name_table() {
+        use crate::{FamilyMatch, Script};
+        let stack = shipped_stack(&[]);
         for row in SUBSTITUTIONS {
             let script = match row.class {
                 ScriptClass::Latin => Script::Latin,
@@ -313,8 +326,8 @@ mod tests {
                 r.matched
             );
             assert!(r.face.covers(row.class.probe()));
-            /* The first listed substitute is the one shipped (Scheherazade
-            New only ever follows Amiri). */
+            /* The first listed substitute wins while it is loaded
+            (Scheherazade New only ever follows Amiri). */
             assert_eq!(
                 family_key(row.substitutes[0]),
                 family_key(&r.face.family_names()[0]),
@@ -330,6 +343,53 @@ mod tests {
                     family_key(&stack.face(id).unwrap().family_names()[0])
                 );
             }
+        }
+    }
+    /* Issue #474 — a row may only list a family the editor ships: every
+    name of every row answers, through its `name` table, to one of the
+    shipped faces, and that face covers the row's class. The `fonts.json`
+    `substitutes` list is the shell's half of the same promise
+    (`tools/harness-fonts` pins it against the manifest), so a row naming
+    an unshipped face - Scheherazade New used to be one - fails here. */
+    #[test]
+    fn every_listed_substitute_is_a_shipped_face() {
+        use crate::LoadedFont;
+        for row in SUBSTITUTIONS {
+            for name in row.substitutes {
+                let shipped = SHIPPED.iter().any(|(id, bytes)| {
+                    let face = LoadedFont::parse(id.to_string(), bytes.to_vec()).expect("parse");
+                    face.family_names()
+                        .iter()
+                        .any(|n| family_key(n) == family_key(name))
+                        && face.covers(row.class.probe())
+                });
+                assert!(
+                    shipped,
+                    "{} / {:?} lists {name}, which no shipped face provides",
+                    row.family, row.class
+                );
+            }
+        }
+    }
+
+    /* Issue #474 — Scheherazade New is reachable, not just present: with
+    Amiri (the first listed substitute) out of the stack, Traditional
+    Arabic and Arabic Typesetting resolve to it as a substitution row. */
+    #[test]
+    fn scheherazade_new_follows_amiri_for_the_traditional_arabic_rows() {
+        use crate::{FamilyMatch, Script};
+        let stack = shipped_stack(&["amiri"]);
+        for family in ["Traditional Arabic", "Arabic Typesetting"] {
+            let r = stack
+                .resolve_family(family, Script::Arabic, false, false)
+                .unwrap_or_else(|| panic!("{family} resolves nothing without Amiri"));
+            assert!(matches!(r.matched, FamilyMatch::Substituted(_)), "{family}");
+            assert_eq!(
+                family_key(&r.face.family_names()[0]),
+                family_key("Scheherazade New"),
+                "{family}"
+            );
+            assert!(r.face.covers(ScriptClass::ComplexScript.probe()));
         }
     }
 }
