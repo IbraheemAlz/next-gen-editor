@@ -1171,15 +1171,17 @@ fn namespace_declarations(e: &BytesStart<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
+/// Declarations in scope while [`find_wrapped_documents`] walks: attribute
+/// name → the values of every open element declaring it, innermost last
+/// (a hash lookup, so a hostile part with a million declarations stays
+/// linear).
+type Scope = std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>;
+
 /// `true` when `e` is a `document` element bound to a WordprocessingML
-/// namespace (either family) by `own` or the enclosing declarations; a `w`
-/// prefix nothing binds counts too (the reader's lenient Transitional fast
-/// path, see [`is_implicit_prefix`]).
-fn is_wordprocessing_document(
-    e: &BytesStart<'_>,
-    own: &[(Vec<u8>, Vec<u8>)],
-    open: &[Vec<(Vec<u8>, Vec<u8>)>],
-) -> bool {
+/// namespace (either family) by the declarations in `scope` (the element's
+/// own already pushed); a `w` prefix nothing binds counts too (the reader's
+/// lenient Transitional fast path, see [`is_implicit_prefix`]).
+fn is_wordprocessing_document(e: &BytesStart<'_>, scope: &Scope) -> bool {
     if e.local_name().as_ref() != b"document" {
         return false;
     }
@@ -1188,13 +1190,8 @@ fn is_wordprocessing_document(
         Some(i) => [b"xmlns:".as_slice(), &name[..i]].concat(),
         None => b"xmlns".to_vec(),
     };
-    let bound = own
-        .iter()
-        .rev()
-        .chain(open.iter().rev().flat_map(|d| d.iter().rev()))
-        .find(|(k, _)| *k == key);
-    match bound {
-        Some((_, uri)) => std::str::from_utf8(uri)
+    match scope.get(&key).and_then(|values| values.last()) {
+        Some(uri) => std::str::from_utf8(uri)
             .ok()
             .and_then(crate::schema::family::family_of_w_uri)
             .is_some(),
@@ -1205,9 +1202,12 @@ fn is_wordprocessing_document(
 /// Issue #468 — walk the whole of a (structurally well-formed) part and
 /// collect its outermost WordprocessingML `document` elements.
 fn find_wrapped_documents(body: &[u8]) -> Result<Wrapped, String> {
+    use std::collections::{HashMap, HashSet};
     let mut reader = Reader::from_reader(body);
-    /* Declarations of every open element, outermost first. */
+    /* Declarations of every open element, outermost first, and the same
+    as a lookup table. */
     let mut open: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    let mut scope = Scope::new();
     let mut root_start = None;
     let mut root_end = None;
     /* The candidate being walked: the nesting depth it sits at. */
@@ -1221,15 +1221,25 @@ fn find_wrapped_documents(body: &[u8]) -> Result<Wrapped, String> {
             Event::Start(e) | Event::Empty(e) => {
                 let own = namespace_declarations(e);
                 root_start.get_or_insert(prev);
-                if active.is_none() && is_wordprocessing_document(e, &own, &open) {
+                for (k, v) in &own {
+                    scope.entry(k.clone()).or_default().push(v.clone());
+                }
+                if active.is_none() && is_wordprocessing_document(e, &scope) {
+                    /* What the wrapper chain declares and the element does
+                    not: the innermost value of each name. */
+                    let own_keys: HashSet<&[u8]> = own.iter().map(|(k, _)| k.as_slice()).collect();
+                    let mut slot_of: HashMap<&[u8], usize> = HashMap::new();
                     let mut inherited: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                     for (k, v) in open.iter().flatten() {
-                        if own.iter().any(|(ok, _)| ok == k) {
+                        if own_keys.contains(k.as_slice()) {
                             continue;
                         }
-                        match inherited.iter_mut().find(|(ik, _)| ik == k) {
-                            Some(slot) => slot.1 = v.clone(),
-                            None => inherited.push((k.clone(), v.clone())),
+                        match slot_of.get(k.as_slice()) {
+                            Some(&i) => inherited[i].1 = v.clone(),
+                            None => {
+                                slot_of.insert(k.as_slice(), inherited.len());
+                                inherited.push((k.clone(), v.clone()));
+                            }
                         }
                     }
                     let document = WrappedDocument {
@@ -1247,12 +1257,24 @@ fn find_wrapped_documents(body: &[u8]) -> Result<Wrapped, String> {
                 }
                 if matches!(event, Event::Start(_)) {
                     open.push(own);
-                } else if open.is_empty() {
-                    root_end = Some(pos);
+                } else {
+                    /* An empty element's declarations scope itself only. */
+                    for (k, _) in &own {
+                        if let Some(values) = scope.get_mut(k) {
+                            values.pop();
+                        }
+                    }
+                    if open.is_empty() {
+                        root_end = Some(pos);
+                    }
                 }
             }
             Event::End(_) => {
-                open.pop();
+                for (k, _) in open.pop().iter().flatten() {
+                    if let Some(values) = scope.get_mut(k) {
+                        values.pop();
+                    }
+                }
                 if active
                     .as_ref()
                     .is_some_and(|(depth, _)| open.len() == *depth)

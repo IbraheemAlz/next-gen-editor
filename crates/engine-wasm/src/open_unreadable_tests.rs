@@ -76,9 +76,9 @@ fn a_two_root_main_part_is_document_unreadable_and_changes_nothing() {
 #[test]
 fn a_junk_root_and_a_bad_tag_name_are_document_unreadable() {
     let stock = document_xml_with_body(r#"<w:p><w:r><w:t>zzalpha</w:t></w:r></w:p>"#);
-    let wrapped_none = format!(
+    let wrapped_none =
         r#"<?xml version="1.0"?><w:t xml:space="preserve">junk<w:body><w:p/></w:body></w:t>"#
-    );
+            .to_string();
     let bad_name = stock.replace("<w:p>", "<w:p;>");
     let mut engine = Engine::new_headless(DocumentTree::from_text("keep me"));
     let before = engine.state_fingerprint_for_fuzzing();
