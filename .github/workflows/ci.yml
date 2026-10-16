@@ -335,21 +335,15 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run visual-diff harness
-        # Issue #470 - the harnesses resolve the dev-server origin like
-        # Playwright does (URL > PW_PORT > a port hashed from the checkout
-        # path) and boot Vite themselves when nothing answers. This step
-        # starts Vite on `pnpm dev`'s fixed 5173 and says so, so the
-        # harness reuses it instead of booting a second server.
-        env:
-          URL: http://localhost:5173
+        # Issues #470 / #486 - no dev server is started here: the harness
+        # resolves the origin like Playwright does (URL > PW_PORT > a port
+        # hashed from the checkout path, `tools/lib/port.mjs`), boots
+        # `vite` itself through `ensureDevServer` (`tools/lib/dev-server.mjs`,
+        # VITE_NGE_DEV_HOOKS=1, `--strictPort`) when nothing answers there,
+        # and stops it on exit. The boot time is therefore inside the
+        # `timeout` below.
         run: |
           set -uo pipefail
-          pnpm --dir ts dev &
-          DEV_PID=$!
-          for _ in $(seq 1 60); do
-            curl -sf http://localhost:5173 >/dev/null 2>&1 && break
-            sleep 1
-          done
           # Visual-diff alone runs every push — 7 tier-A cases × ~3 s on
           # the runner ≈ 21 s real, capped at 3 min by `timeout`.
           # `timeout` exits 124 on the cap; `continue-on-error: true`
@@ -364,7 +358,6 @@ jobs:
           # against a dedicated runner.
           timeout 180 node tools/visual-diff/run.mjs --tier A
           VD=$?
-          kill "$DEV_PID" 2>/dev/null || true
           echo "visual-diff exit=$VD"
           [ "$VD" -eq 0 ]
 
@@ -425,21 +418,13 @@ jobs:
         # veraPDF a failure instead of a silent skip. The job stays
         # non-blocking regardless (see the job header).
         #
-        # Issue #470 - see the visual-diff step: `URL` pins the harness to
-        # the server started below.
-        env:
-          URL: http://localhost:5173
+        # Issues #470 / #486 - see the visual-diff step: the harness boots
+        # (and stops) its own Vite through `ensureDevServer`; no server or
+        # `URL` pin here, and the boot is inside the 60 s `timeout`.
         run: |
           set -uo pipefail
-          pnpm --dir ts dev &
-          DEV_PID=$!
-          for _ in $(seq 1 60); do
-            curl -sf http://localhost:5173 >/dev/null 2>&1 && break
-            sleep 1
-          done
           timeout 60 node tools/pdf-validate/run.mjs --corpus tier-a --profile 1b --strict
           PV=$?
-          kill "$DEV_PID" 2>/dev/null || true
           echo "pdf-validate exit=$PV"
           [ "$PV" -eq 0 ]
 
