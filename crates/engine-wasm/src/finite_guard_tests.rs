@@ -341,13 +341,17 @@ fn recovery_replays_around_a_logged_non_finite_command() {
     );
     let Event::Recovered {
         applied_commands,
+        refused_commands,
         zoom,
         ..
     } = evt
     else {
         panic!("expected Recovered, got {evt:?}");
     };
-    assert_eq!(applied_commands, 4);
+    assert_eq!(applied_commands, 4, "every logged command is replayed");
+    /* Issue #503 - the NaN zoom and the infinite size are the two the
+    guards refused, and the recovery says so. */
+    assert_eq!(refused_commands, 2);
     assert_eq!(zoom, 2.0, "the NaN zoom is not folded into the view");
     /* The insert landed at the restored caret (offset 0). */
     assert_eq!(b.undo.current().to_plain_text(), "!alpha");

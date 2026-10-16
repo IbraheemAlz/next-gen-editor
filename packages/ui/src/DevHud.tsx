@@ -82,6 +82,12 @@ function recoveryLosses(r: RecoveryReport): string[] {
     if (r.journalGap !== undefined && r.journalGap > 0) {
         losses.push(`journal gap (${r.journalGap} cmds)`);
     }
+    if (r.refusedCommands !== undefined && r.refusedCommands > 0) {
+        losses.push(`edits refused (${r.refusedCommands})`);
+    }
+    if (r.boundsRepaired !== undefined && r.boundsRepaired > 0) {
+        losses.push(`values clamped (${r.boundsRepaired})`);
+    }
     if (r.rendererDowngraded) losses.push('renderer downgraded');
     return losses;
 }

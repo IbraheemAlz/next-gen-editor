@@ -76,8 +76,12 @@ pub use point_bounds::{
     indent_in_bound, line_spacing_multiple_in_bound, margin_in_bound, margins_leave_text_area,
     tab_position_in_bound,
 };
+/// Issue #503 (item 1) - the restore-side clamp of both bounds above
+/// (`DocumentTree::repair_bounds`).
+mod bounds_repair;
 /// Issue #501 - Word's 1638 pt / 1 pt font-size bound.
 mod font_size_bounds;
+pub use bounds_repair::repair_span_style_sizes;
 pub use font_size_bounds::{
     MAX_FONT_SIZE_PT, MIN_FONT_SIZE_PT, clamp_font_size_pt, first_font_size_beyond_bound,
     font_size_in_bound,
