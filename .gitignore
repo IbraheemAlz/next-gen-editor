@@ -49,3 +49,8 @@ Thumbs.db
 
 # Private cargo cache for merge gates on main (never commit)
 target-main/
+
+# Merge-gate private caches (the fuzz workspace must never share target-main, 2026-10-16)
+target-main-fuzz/
+# Agent scratch inside a worktree
+.agent-scratch/
