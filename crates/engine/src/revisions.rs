@@ -26,6 +26,63 @@ use crate::{
     replace_block_in_top,
 };
 
+/// Issues #440 / #378 — how many levels of table nesting the revision
+/// walkers ([`for_each_paragraph_nested`], the mark / row resolver, the
+/// review listing) descend: the `.docx` reader's own cap
+/// (`format_docx::parts::table::MAX_TABLE_NESTING_DEPTH`), so every table
+/// a file can carry is reached, while a command-built tower deeper than
+/// that cannot run the walkers off the stack. Depth 1 = a table in the
+/// body; its cells' tables are depth 2.
+pub const MAX_REVISION_TABLE_DEPTH: u32 = 64;
+
+/// Issue #440 — every paragraph of `blocks` with its full path: top-level
+/// paragraphs, then — in document order — the paragraphs of every table
+/// cell, recursing through nested tables down to
+/// [`MAX_REVISION_TABLE_DEPTH`] levels (`fields::for_each_paragraph_deep`
+/// stops after one). The single walk behind `has_revisions`, the text
+/// pass of the resolver, the move-range-marker sweep and the #283 range
+/// invariant.
+pub fn for_each_paragraph_nested<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    f: &mut impl FnMut(BlockPath, &'a Paragraph),
+) {
+    let mut steps = Vec::new();
+    nested_paragraphs_in(blocks, &mut steps, 0, f);
+}
+
+fn nested_paragraphs_in<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    steps: &mut Vec<PathStep>,
+    depth: u32,
+    f: &mut impl FnMut(BlockPath, &'a Paragraph),
+) {
+    for (bi, block) in blocks.into_iter().enumerate() {
+        steps.push(PathStep::Block(bi as u32));
+        match block {
+            Block::Paragraph(p) => f(
+                BlockPath {
+                    steps: steps.clone(),
+                },
+                p,
+            ),
+            Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => {
+                for (ri, row) in t.rows.iter().enumerate() {
+                    for (ci, cell) in row.cells.iter().enumerate() {
+                        steps.push(PathStep::Cell {
+                            row: ri as u32,
+                            col: ci as u32,
+                        });
+                        nested_paragraphs_in(cell.blocks.iter(), steps, depth + 1, f);
+                        steps.pop();
+                    }
+                }
+            }
+            Block::Table(_) => {}
+        }
+        steps.pop();
+    }
+}
+
 impl DocumentTree {
     /// `true` when any body paragraph (table cells included) carries a
     /// tracked change — text overlay or paragraph mark — or, issue #365,
@@ -33,7 +90,7 @@ impl DocumentTree {
     /// deletion.
     pub fn has_revisions(&self) -> bool {
         let mut any = false;
-        crate::fields::for_each_paragraph_deep(&self.blocks, &mut |_, p| {
+        for_each_paragraph_nested(&self.blocks, &mut |_, p| {
             any |= !p.revisions.is_empty() || !p.mark_revisions.is_empty();
         });
         any || self.blocks.iter().any(block_has_row_revisions)
@@ -83,7 +140,7 @@ impl DocumentTree {
         let mut out = self.clone();
         let mut moves = ResolvedMoves::default();
         let mut paths = Vec::new();
-        crate::fields::for_each_paragraph_deep(&out.blocks, &mut |path, p| {
+        for_each_paragraph_nested(&out.blocks, &mut |path, p| {
             let mut picked_text = false;
             for (i, r) in p.revisions.iter().enumerate() {
                 if pick.text(&path, i) {
@@ -131,7 +188,7 @@ impl DocumentTree {
         /* The ends carry only `w:id`: pair them through their starts. */
         let mut ends: HashSet<(bool, String)> = HashSet::new();
         if let Some(names) = names {
-            crate::fields::for_each_paragraph_deep(&self.blocks, &mut |_, p| {
+            for_each_paragraph_nested(&self.blocks, &mut |_, p| {
                 for mk in p.source_markup.iter().flat_map(|m| m.markers.iter()) {
                     if let Some((from, true)) = move_range_role(&mk.xml)
                         && xml_attr(&mk.xml, b"w:name").is_some_and(|n| names.contains(&n))
@@ -153,7 +210,7 @@ impl DocumentTree {
             }
         };
         let mut marked = Vec::new();
-        crate::fields::for_each_paragraph_deep(&self.blocks, &mut |path, p| {
+        for_each_paragraph_nested(&self.blocks, &mut |path, p| {
             if p.source_markup
                 .as_deref()
                 .is_some_and(|m| m.markers.iter().any(|mk| drops(&mk.xml)))
@@ -176,14 +233,18 @@ impl DocumentTree {
     /// container `container` (the steps leading INTO a block list: empty
     /// = the body), deepest first, from the container's end — so a merge
     /// never moves a block this walk has still to visit.
+    ///
+    /// Issue #440 — nested tables recurse like the body's, down to
+    /// [`MAX_REVISION_TABLE_DEPTH`] levels (the walkers' shared bound).
     fn resolve_marks_in(&mut self, container: &[PathStep], accept: bool, pick: &RevisionPick) {
         let Some(blocks) = container_blocks(self, container) else {
             return;
         };
+        let depth = table_depth(container);
         for i in (0..blocks.len() as u32).rev() {
             let path = child(container, i);
             match self.block_at(&path) {
-                Some(Block::Table(t)) => {
+                Some(Block::Table(t)) if depth < MAX_REVISION_TABLE_DEPTH => {
                     let cells: Vec<(u32, u32)> = t
                         .rows
                         .iter()
@@ -498,18 +559,30 @@ impl DocumentTree {
     }
 }
 
-/// Issue #365 — `block` is (or holds, at any depth) a table row carrying
-/// a tracked change.
+/// Issue #365 — `block` is (or holds, down to [`MAX_REVISION_TABLE_DEPTH`]
+/// levels — issue #440) a table row carrying a tracked change.
 fn block_has_row_revisions(block: &Block) -> bool {
-    match block {
-        Block::Paragraph(_) => false,
-        Block::Table(t) => t.rows.iter().any(|r| {
-            !r.props.revisions.is_empty()
-                || r.cells
-                    .iter()
-                    .any(|c| c.blocks.iter().any(block_has_row_revisions))
-        }),
+    fn at(block: &Block, depth: u32) -> bool {
+        match block {
+            Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => t.rows.iter().any(|r| {
+                !r.props.revisions.is_empty()
+                    || r.cells
+                        .iter()
+                        .any(|c| c.blocks.iter().any(|b| at(b, depth + 1)))
+            }),
+            _ => false,
+        }
     }
+    at(block, 0)
+}
+
+/// Issue #440 — how many tables deep `container` (the steps leading into
+/// a block list) is: one per `Cell` step.
+pub(crate) fn table_depth(steps: &[PathStep]) -> u32 {
+    steps
+        .iter()
+        .filter(|s| matches!(s, PathStep::Cell { .. }))
+        .count() as u32
 }
 
 /// `container` + `Block(i)`.
@@ -642,11 +715,12 @@ pub(crate) fn shift_overlays_after_removal(para: &mut Paragraph, from: u32, remo
         shift(&mut h.end);
     }
     para.hyperlinks.retain(|h| h.start < h.end);
-    for r in &mut para.revisions {
-        shift(&mut r.start);
-        shift(&mut r.end);
-    }
-    para.revisions.retain(|r| r.start < r.end);
+    /* Issue #283 — the one revision range rule. */
+    para.shift_revisions(TextEdit {
+        at: from,
+        removed: removed_len,
+        inserted: 0,
+    });
     for f in &mut para.fields {
         shift(&mut f.start);
         shift(&mut f.end);

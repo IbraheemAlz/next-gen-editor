@@ -286,7 +286,7 @@ fn cell_and_text_box_notes_land_in_their_pages_band() {
     assert_eq!(fp, PINNED_NOTE_CELL_AND_BOX, "cell/box note fixture moved");
 }
 
-const PINNED_NOTE_CELL_AND_BOX: u64 = 0x962426db020f8674;
+const PINNED_NOTE_CELL_AND_BOX: u64 = 0xfe01e691593acc15;
 
 /// Acceptance (#278): a header footnote is placed once, in the band of
 /// the first page showing the header, ahead of that page's body note;
@@ -327,7 +327,7 @@ fn header_footnote_lands_once_on_the_first_page_showing_the_header() {
     assert_eq!(fp, PINNED_NOTE_HEADER, "header note fixture moved");
 }
 
-const PINNED_NOTE_HEADER: u64 = 0x9009be57586d03e5;
+const PINNED_NOTE_HEADER: u64 = 0xa9c8e63978ee734a;
 
 /// Issue #317 — the committed `footnotes_endnotes.docx` (3 footnotes, 2
 /// endnotes, one page): each footnote paints once in the page's footnote

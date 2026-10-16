@@ -53,7 +53,7 @@ test('NaN / infinite numeric arguments are refused as InvalidArgument and change
 
     /* The refusal is visible (#427), and the Dev HUD records the last one. */
     await expect(page.locator('.nge-toast__message')).toContainText(
-        'A value was not a valid number, so nothing was changed',
+        'A value was not valid (a number, or text holding a character a document cannot contain), so nothing was changed',
     );
     await page.locator('textarea[data-nge-hidden-input]').focus();
     await page.keyboard.press('Control+Shift+D');

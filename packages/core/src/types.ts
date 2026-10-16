@@ -282,6 +282,15 @@ export interface RevisionSnapshot {
      *  Pass it to `acceptRevision` / `rejectRevision`. Optional so
      *  engines that pre-date it still satisfy the contract. */
     revision_id?: number;
+    /** Issue #440 — the full path of the paragraph the revision lives in
+     *  (a row revision: the table) — a change inside a table cell, at any
+     *  nesting depth, is listed too; `block` is the top-level block it
+     *  sits in. Optional — engines that pre-date #440 omit it. */
+    path?: BlockPath;
+    /** Issue #440 — how many tables deep the change is (absent / 0 = the
+     *  body, 1 = a top-level table's cell or row, 2 = a table nested in a
+     *  cell, …). */
+    depth?: number;
 }
 
 /** Read-only comment row consumed by the Comments rail. Sprint 7

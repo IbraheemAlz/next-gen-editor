@@ -112,10 +112,10 @@ pub struct RevisionEntry<'a> {
 
 impl DocumentTree {
     /// Issue #304 — every tracked change the resolver reaches (the body
-    /// and one level of table cells), in document order — per paragraph
+    /// and, issue #440, table cells at every nesting depth), in document order — per paragraph
     /// its text revisions, then its mark's changes in order (one entry
-    /// each, issue #303); issue #365 — per row of a top-level table its
-    /// row changes, ahead of the row's cell paragraphs — each with its
+    /// each, issue #303); issue #365 — per row of a table (issue #440: at
+    /// any depth) its row changes, ahead of the row's cell contents — each with its
     /// stable `revision_id`. Ids are unique within the document.
     pub fn revision_entries(&self) -> Vec<RevisionEntry<'_>> {
         let mut used = HashSet::new();
@@ -292,9 +292,10 @@ fn move_of(r: &Revision) -> Option<&str> {
     }
 }
 
-/// Every paragraph the resolver walks — the body and one level of table
-/// cells, `fields::for_each_paragraph_deep`'s reach — with its path, in
-/// document order.
+/// Every paragraph the resolver walks — the body and, issue #440, the
+/// cells of tables at every nesting depth down to
+/// [`crate::MAX_REVISION_TABLE_DEPTH`] (`revisions::for_each_paragraph_nested`'s
+/// reach) — with its path, in document order.
 fn paragraphs_deep(blocks: &im::Vector<Block>) -> Vec<(BlockPath, &Paragraph)> {
     items_deep(blocks)
         .into_iter()
@@ -308,41 +309,56 @@ fn paragraphs_deep(blocks: &im::Vector<Block>) -> Vec<(BlockPath, &Paragraph)> {
 /// One stop of [`items_deep`].
 enum Item<'a> {
     Paragraph(BlockPath, &'a Paragraph),
-    /// Issue #365 — row `.1` of the top-level table at `.0`.
+    /// Issue #365 — row `.1` of the table at `.0` (issue #440: at any
+    /// nesting depth).
     Row(BlockPath, u32, &'a TableRow),
 }
 
 /// Every paragraph [`paragraphs_deep`] walks and, issue #365, every row
-/// of a top-level table (ahead of its cell paragraphs), in document
-/// order.
+/// of a table (ahead of its cell paragraphs) — issue #440: nested tables
+/// too, each row ahead of its cells' contents — in document order.
 fn items_deep(blocks: &im::Vector<Block>) -> Vec<Item<'_>> {
     let mut out = Vec::new();
-    for (bi, block) in blocks.iter().enumerate() {
+    let mut steps = Vec::new();
+    items_in(blocks.iter(), &mut steps, 0, &mut out);
+    out
+}
+
+fn items_in<'a>(
+    blocks: impl Iterator<Item = &'a Block>,
+    steps: &mut Vec<PathStep>,
+    depth: u32,
+    out: &mut Vec<Item<'a>>,
+) {
+    for (bi, block) in blocks.enumerate() {
+        steps.push(PathStep::Block(bi as u32));
         match block {
-            Block::Paragraph(p) => out.push(Item::Paragraph(BlockPath::top(bi as u32), p)),
-            Block::Table(t) => {
+            Block::Paragraph(p) => out.push(Item::Paragraph(
+                BlockPath {
+                    steps: steps.clone(),
+                },
+                p,
+            )),
+            Block::Table(t) if depth < crate::MAX_REVISION_TABLE_DEPTH => {
+                let table = BlockPath {
+                    steps: steps.clone(),
+                };
                 for (ri, row) in t.rows.iter().enumerate() {
-                    out.push(Item::Row(BlockPath::top(bi as u32), ri as u32, row));
+                    out.push(Item::Row(table.clone(), ri as u32, row));
                     for (ci, cell) in row.cells.iter().enumerate() {
-                        for (pi, nested) in cell.blocks.iter().enumerate() {
-                            if let Block::Paragraph(p) = nested {
-                                let steps = vec![
-                                    PathStep::Block(bi as u32),
-                                    PathStep::Cell {
-                                        row: ri as u32,
-                                        col: ci as u32,
-                                    },
-                                    PathStep::Block(pi as u32),
-                                ];
-                                out.push(Item::Paragraph(BlockPath { steps }, p));
-                            }
-                        }
+                        steps.push(PathStep::Cell {
+                            row: ri as u32,
+                            col: ci as u32,
+                        });
+                        items_in(cell.blocks.iter(), steps, depth + 1, out);
+                        steps.pop();
                     }
                 }
             }
+            Block::Table(_) => {}
         }
+        steps.pop();
     }
-    out
 }
 
 /// Issue #365 — the content half of a row revision's id: what the

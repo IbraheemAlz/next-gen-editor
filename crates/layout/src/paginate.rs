@@ -2536,6 +2536,7 @@ impl Paginator {
             hf_role: role,
             page_number,
             floats: Vec::new(),
+            decor: Default::default(),
         };
         /* Issue #69 — floating objects are a pure function of the placed
         blocks (no wrap yet, so no feedback into the flow): resolve them
@@ -6964,6 +6965,7 @@ mod tests {
             hf_role: HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         }
     }
 

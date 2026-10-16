@@ -15,6 +15,7 @@ paths:
 ## XML serialization
 - `<w:t xml:space="preserve">` on **every** engine-authored text element. Without `preserve`, leading/trailing whitespace gets collapsed; matters for Arabic diacritics + RTL trailing space. Exception (issue #199): a run regenerated inside a *source* run keeps the source `<w:t>`'s attributes, and a source bare `<w:t>` gains `preserve` only when its text now has edge whitespace — the invariant's purpose, without re-spelling every Word run.
 - XML escapes: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`. Quotes don't matter inside character data.
+- **Forbidden characters (issue #467).** Every text writer goes through `writer::push_escaped` / `push_escaped_attr` (the comments and numbering writers share them — no private copies): a character XML 1.0 cannot carry (`engine::text_input::is_xml_char` is false: C0 other than TAB / LF / CR, `U+FFFE`, `U+FFFF`) is written as `U+FFFD`, never raw, and counted into `WriteNote::ForbiddenCharactersReplaced` on the save report (`save_docx_with_notes` / `write_docx_with_notes`). The input boundary (`engine::text_input`) keeps them out of the model; this only catches a text door that bypassed it, so a note on a real save is a bug to chase. `format_docx::first_forbidden_character` scans every XML part of a package (the fuzz / unit invariant "no saved package holds one").
 - Header: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">`.
 - Footer: `<w:sectPr/></w:body></w:document>`.
 
@@ -416,6 +417,18 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   positioned verbatim markers. Untracked `insert_text` carries every
   revision with its text (shift at / after the start, grow strictly
   inside).
+- **One revision range rule (issue #283).** Every byte-moving paragraph
+  edit maps `Paragraph::revisions` through `Paragraph::shift_revisions`
+  (= `TextEdit::map_range`, the record the source markup and comment
+  anchors see): `insert_text`, the inline-object splice (an object at a
+  revision's END stays outside it), `revisions::remove_text`,
+  `delete_text` / `split_at` / `concat` (`remap_range_overlays`) and the
+  field-result splice; layout-only clones (the IME preview, body / band /
+  note) use `engine::revisions_through_edit`. Never hand-roll a revision
+  shift loop. `engine::check_revision_ranges` (in-paragraph, non-empty,
+  char boundaries; body, cells at every depth, headers / footers, notes)
+  runs in `Engine::check_invariants_for_fuzzing`; a restored snapshot is
+  held to it by `DocumentTree::repair_revision_ranges`.
 - **Paragraph-mark revisions (issues #262 / #303).** `<w:pPr><w:rPr><w:ins/>`
   (`<w:del/>`, `<w:moveFrom/>`, `<w:moveTo/>`) — ALL of them, in source
   order (a mark one reviewer inserted and another deleted carries two) —
@@ -518,6 +531,33 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   top-level tables as `RevisionSlot::Row { row, index }` (path = the
   table), `revisions_snapshot` rows carry `row`. `<w:tblPrChange>` /
   `<w:trPrChange>` stay verbatim grab-bag bytes (not resolved).
+- **Structural edits by command (issue #442).** With review mode on,
+  `InsertRow` / `DeleteRow` / `InsertTable` / `InsertSectionBreak` go
+  through `engine::tracked` recorders (`tracked_insert_row` /
+  `tracked_delete_row` / `tracked_insert_table` /
+  `tracked_insert_section_break_at`; body and story paths): a new row is
+  an inserted row, a deleted row is `mark_rows_deleted` (marked whole +
+  its text, the reviewer's own inserted row removed), a new table is
+  `stamp_inserted` (every row inserted) and — when it needs an escape
+  paragraph — a tracked split of the paragraph in front (so reject
+  restores the document exactly), a section break marks the mark that
+  carries it inserted (reject = the #367 merge). No new `Command`. The
+  writer emits them through the existing `<w:trPr>` / mark-revision
+  paths; untouched source rows re-emit byte for byte. Harness:
+  `tools/roundtrip` step 63.
+- **Nested tables (issue #440).** Every revision walker reaches every
+  nesting depth down to `engine::MAX_REVISION_TABLE_DEPTH` (64, the
+  reader's `MAX_TABLE_NESTING_DEPTH`; the #378 bound): the resolver's
+  text pass / `has_revisions` / the move-marker sweep walk
+  `engine::for_each_paragraph_nested` (NOT `fields::for_each_paragraph_deep`,
+  which stops after one level), the mark / row walk (`resolve_marks_in`)
+  recurses with the same bound, `revision_entries` lists rows and cell
+  paragraphs of nested tables (so `AcceptRevision` / `RejectRevision`
+  by `revision_id` reach them), and a tracked row deletion records the
+  text of nested tables too (`mark_rows_deleted`). `revisions_snapshot`
+  lists every entry — cell paragraphs included — with its full `path`
+  and table `depth` (the review pane's depth marker); `block` is the
+  top-level block. Harness: `tools/roundtrip` step 62.
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

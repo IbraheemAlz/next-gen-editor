@@ -15,7 +15,6 @@ fn sctx() -> StyleContext<'static> {
         theme: None,
         theme_key: 0,
         settings: None,
-        word_line_metrics: false,
     }
 }
 
@@ -325,13 +324,6 @@ fn layout_irrelevant_fields_do_not_change_the_key() {
             p.mark_revisions
                 .push(revision(engine::RevisionKind::Insert))
         }),
-        // Only an EMPTY paragraph is sized by its mark (issue #370).
-        ("mark_style (paragraph with text)", |p| {
-            p.mark_style = Some(Box::new(engine::SpanStyle {
-                font_size: Some(40.0),
-                ..Default::default()
-            }))
-        }),
         ("revisions.author", |p| p.revisions[0].author = "bob".into()),
         ("revisions.date", |p| p.revisions[0].date = "x".into()),
         ("revisions.id", |p| p.revisions[0].id = Some(77)),
@@ -389,27 +381,18 @@ fn empty_paragraph_mark_style_is_hashed() {
     assert_ne!(key(&marked), key(&bold));
 }
 
-/// Issue #329 — the line-pitch model is an input, and under Word's
-/// font-derived pitch so is the mark of a paragraph WITH text (it sizes a
-/// runless line such as a doubled soft break); under the configured pitch
-/// a text paragraph's mark is not.
+/// Issues #329 / #475 — under Word's font-derived pitch (every
+/// document's model) the mark of a paragraph WITH text is an input too: it
+/// sizes a runless line such as a doubled soft break.
 #[test]
-fn the_line_pitch_model_and_its_mark_are_hashed() {
+fn the_mark_of_a_text_paragraph_is_hashed() {
     let p = base();
-    let word = StyleContext {
-        word_line_metrics: true,
-        ..sctx()
-    };
-    let key_in =
-        |p: &engine::Paragraph, s: StyleContext| paragraph_layout_key(p, &cfg(), 1.0, 400.0, s);
-    assert_ne!(key_in(&p, sctx()), key_in(&p, word));
     let mut marked = p.clone();
     marked.mark_style = Some(Box::new(engine::SpanStyle {
         font_size: Some(40.0),
         ..Default::default()
     }));
-    assert_ne!(key_in(&p, word), key_in(&marked, word));
-    assert_eq!(key_in(&p, sctx()), key_in(&marked, sctx()));
+    assert_ne!(key(&p), key(&marked));
 }
 
 /// The config / width / scale half of the key.

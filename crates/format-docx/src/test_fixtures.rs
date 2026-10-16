@@ -1515,3 +1515,7 @@ pub fn styles_patch_docx() -> Vec<u8> {
 #[path = "test_fixtures_run_content.rs"]
 mod run_content;
 pub use run_content::*;
+
+#[path = "test_fixtures_page_decor.rs"]
+mod page_decor;
+pub use page_decor::*;

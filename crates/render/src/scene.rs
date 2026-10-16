@@ -190,6 +190,11 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         band and body glyph (right after the page card), lowest z-order
         first. The in-front group closes the page below. */
         paint_floats(page, top, true, &mut cmds);
+        /* Issue #328 — a `w:zOrder="back"` page border sits under every
+        band and body glyph. */
+        if let Some(b) = page.decor.borders.as_ref().filter(|b| b.behind) {
+            paint_page_borders(b, top, &mut cmds);
+        }
 
         /* Phase 6 — header band painted before body so a wide header doesn't
         sit on top of body text. Phase 3 (#39): band placement comes from
@@ -207,6 +212,10 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
 
         for block in &page.blocks {
             paint_block(block, content_x, content_y, &mut cmds);
+        }
+        /* Issue #328 — line numbers (page-relative gutter runs). */
+        for n in &page.decor.line_numbers {
+            paint_marker(n, 0.0, top, &mut cmds);
         }
 
         /* Issue #80 — note bands. The paginator owns placement
@@ -231,6 +240,11 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         body and footnotes, lowest `relativeHeight` first so a higher
         z-order lands on top. */
         paint_floats(page, top, false, &mut cmds);
+        /* Issue #328 — the default (`front`) page border closes the
+        page, over the text. */
+        if let Some(b) = page.decor.borders.as_ref().filter(|b| !b.behind) {
+            paint_page_borders(b, top, &mut cmds);
+        }
 
         top += page.size.height + gap;
     }
@@ -557,6 +571,50 @@ fn paint_border_edge(
     });
 }
 
+/// A gutter run ([`layout::MarkerBox`]: a list marker, a line number)
+/// whose origin is relative to `(base_x, base_y)`.
+fn paint_marker(marker: &layout::MarkerBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd>) {
+    let m_x = base_x + marker.origin.x;
+    let m_baseline = (base_y + marker.origin.y + marker.baseline) as f64;
+    let mut pen = 0.0_f32;
+    let mut glyphs: Vec<RunGlyph> = Vec::with_capacity(marker.run.glyphs.len());
+    for glyph in &marker.run.glyphs {
+        if glyph.id != 0 {
+            glyphs.push(RunGlyph {
+                glyph_id: glyph.id,
+                x: (m_x as f64) + (pen as f64) + (glyph.x_offset as f64),
+                y: m_baseline - (glyph.y_offset as f64),
+            });
+        }
+        pen += glyph.x_advance;
+    }
+    if !glyphs.is_empty() {
+        let [r, g, b, a] = marker.run.attrs.color;
+        cmds.push(DisplayCmd::DrawGlyphRun(GlyphRun {
+            font: marker.run.font.clone(),
+            px_size: marker.run.attrs.px_size,
+            paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+            glyphs,
+            faux_bold: marker.run.attrs.faux_bold,
+            faux_italic: marker.run.attrs.faux_italic,
+            bg_color: marker.run.attrs.bg_color,
+        }));
+    }
+}
+
+/// Issue #328 — the `<w:pgBorders>` box, edges centred on its rect
+/// (the table / paragraph border primitive).
+fn paint_page_borders(b: &layout::PageBorderBox, top: f32, cmds: &mut Vec<DisplayCmd>) {
+    let x0 = b.origin.x;
+    let y0 = top + b.origin.y;
+    let x1 = x0 + b.size.width;
+    let y1 = y0 + b.size.height;
+    paint_border_edge(&b.edges.top, x0, y0, x1, y0, cmds);
+    paint_border_edge(&b.edges.left, x0, y0, x0, y1, cmds);
+    paint_border_edge(&b.edges.right, x1, y0, x1, y1, cmds);
+    paint_border_edge(&b.edges.bottom, x0, y1, x1, y1, cmds);
+}
+
 fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd>) {
     let para_x = base_x + para.origin.x;
     let para_y = base_y + para.origin.y;
@@ -593,32 +651,7 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
         sits visually beside the body text — z-order doesn't matter here,
         but rendering first keeps the loop structure simple. */
         if let Some(marker) = &para.marker {
-            let m_x = para_x + marker.origin.x;
-            let m_baseline = (para_y + marker.origin.y + marker.baseline) as f64;
-            let mut pen = 0.0_f32;
-            let mut glyphs: Vec<RunGlyph> = Vec::with_capacity(marker.run.glyphs.len());
-            for glyph in &marker.run.glyphs {
-                if glyph.id != 0 {
-                    glyphs.push(RunGlyph {
-                        glyph_id: glyph.id,
-                        x: (m_x as f64) + (pen as f64) + (glyph.x_offset as f64),
-                        y: m_baseline - (glyph.y_offset as f64),
-                    });
-                }
-                pen += glyph.x_advance;
-            }
-            if !glyphs.is_empty() {
-                let [r, g, b, a] = marker.run.attrs.color;
-                cmds.push(DisplayCmd::DrawGlyphRun(GlyphRun {
-                    font: marker.run.font.clone(),
-                    px_size: marker.run.attrs.px_size,
-                    paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
-                    glyphs,
-                    faux_bold: marker.run.attrs.faux_bold,
-                    faux_italic: marker.run.attrs.faux_italic,
-                    bg_color: marker.run.attrs.bg_color,
-                }));
-            }
+            paint_marker(marker, para_x, para_y, cmds);
         }
         for line in &para.lines {
             let line_x = para_x + line.origin.x;

@@ -973,6 +973,41 @@ pub struct PageBox {
     /// treat an empty list as "no geometry", so fixed-geometry documents
     /// keep their pinned values.
     pub floats: Vec<FloatBox>,
+    /// Issue #328 — page-level decorations outside the flow: the
+    /// section's page border box and its line numbers. Empty for
+    /// documents without either (no geometry for the fingerprint).
+    pub decor: PageDecor,
+}
+
+/// Issue #328 — what a page paints besides its flow: the `<w:pgBorders>`
+/// box and the `<w:lnNumType>` numbers. Filled by the engine after
+/// pagination (a pure function of the placed lines), painted by the
+/// renderer and the PDF exporter (as artifacts — never document
+/// content).
+#[derive(Debug, Clone, Default)]
+pub struct PageDecor {
+    pub borders: Option<PageBorderBox>,
+    /// One shaped number per numbered line, page-relative (`origin` is
+    /// the number's left edge at the line's top; `baseline` below it).
+    pub line_numbers: Vec<MarkerBox>,
+}
+
+impl PageDecor {
+    pub fn is_empty(&self) -> bool {
+        self.borders.is_none() && self.line_numbers.is_empty()
+    }
+}
+
+/// Issue #328 — one page's border box: the rectangle the edge strokes
+/// are centred on (page-relative, already resolved from `w:offsetFrom`
+/// and each edge's `w:space`) and the strokes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageBorderBox {
+    pub origin: Point,
+    pub size: Size,
+    pub edges: engine::CellBorders,
+    /// `w:zOrder="back"` — painted beneath the page's content.
+    pub behind: bool,
 }
 
 impl PageBox {

@@ -18,6 +18,7 @@ import {
     clearJournalGap,
 } from './event-log';
 import { nextCleanState } from './clean-state';
+import { refuseIllFormedText } from './text-guard';
 import {
     buildCheckpointState,
     createJournalRetry,
@@ -47,6 +48,10 @@ import RUN_CONTENT_DOCX_URL from '../../../crates/format-docx/tests/fixtures/run
 /* Issue #326 — the `hyphenation` / `hyphenation-off` goldens. */
 import HYPHENATION_ON_DOCX_URL from '../../../crates/format-docx/tests/fixtures/hyphenation_on.docx?url';
 import HYPHENATION_OFF_DOCX_URL from '../../../crates/format-docx/tests/fixtures/hyphenation_off.docx?url';
+/* Issue #328 — the `page-borders` / `line-numbers` goldens. */
+import PAGE_BORDERS_DOCX_URL from '../../../crates/format-docx/tests/fixtures/page_borders.docx?url';
+import LINE_NUMBERS_DOCX_URL from '../../../crates/format-docx/tests/fixtures/line_numbers.docx?url';
+import DROP_CAP_DOCX_URL from '../../../crates/format-docx/tests/fixtures/drop_cap.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -1068,6 +1073,34 @@ async function handleInit(msg: InitMsg): Promise<void> {
             break;
         }
 
+        case 'page-borders':
+        case 'line-numbers':
+        case 'drop-cap': {
+            /* Issue #328 — `<w:pgBorders>` / `<w:lnNumType>` /
+               `<w:framePr w:dropCap>` fixtures (`tools/roundtrip
+               --gen-seed`), A4 at 1:1. */
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 15,
+                line_height: 22,
+                align: 'START',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'LOAD_DOCX',
+                bytes: await fetchBytes(
+                    testCase === 'page-borders'
+                        ? PAGE_BORDERS_DOCX_URL
+                        : testCase === 'line-numbers'
+                          ? LINE_NUMBERS_DOCX_URL
+                          : DROP_CAP_DOCX_URL,
+                ),
+            } as Command);
+            break;
+        }
+
         case 'font-substitution': {
             /* Issue #329 — a document naming Calibri (Latin) and
                Simplified Arabic (complex script), neither shipped: the
@@ -1427,7 +1460,13 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
     }
     try {
         const t0 = performance.now();
-        const evt = await dispatch(msg.cmd);
+        /* Issue #467 - a lone UTF-16 surrogate would reach the engine as
+           U+FFFD (the wasm string glue substitutes it): refuse it here,
+           typed, and leave it out of the log (a replay would insert the
+           U+FFFD the live session refused). The engine owns the rest of
+           the text table (control characters, U+FFFE / U+FFFF). */
+        const refusedText = refuseIllFormedText(msg.cmd);
+        const evt = refusedText ?? (await dispatch(msg.cmd));
         const elapsed = performance.now() - t0;
         notePaintVersion(evt);
         self.postMessage({ id: msg.id, ok: true, evt, elapsed });
@@ -1437,7 +1476,7 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         /* D2.8 backpressure (PHASE_2_BRIDGE_MEMORY.md §12 risk 5): persist to
            the event log OFF the critical path. The RPC response is already
            sent, so event-log latency never throttles command throughput. */
-        if (shouldLogCommand(msg.cmd)) {
+        if (refusedText === undefined && shouldLogCommand(msg.cmd)) {
             const seq = logCommand(msg.cmd);
             /* Issue #268 — a new document: its first snapshot is pinned. */
             if (startsNewDocument(msg.cmd) && evt.type !== 'ERROR') {

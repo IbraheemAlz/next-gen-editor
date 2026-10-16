@@ -52,6 +52,9 @@ mod pdf_semantics;
 mod read_report;
 pub(crate) use paragraph_cache_key::paragraph_layout_key;
 mod table_cache;
+/// Issue #467 — the command-boundary text guard (control characters,
+/// noncharacters) every text-bearing command passes through.
+mod text_input_guard;
 
 #[wasm_bindgen(start)]
 pub fn boot() {
@@ -1421,23 +1424,47 @@ struct RevisionOut {
     /// `RejectRevision` take as `revision_id`. Unique per row, unchanged
     /// by edits elsewhere — two wrappers over one range are two ids.
     revision_id: u32,
+    /// Issue #440 — where the revision lives: the paragraph (a row
+    /// revision: the table) as a full path, so a change inside a table
+    /// cell — at any nesting depth — is listed and can be revealed. For a
+    /// top-level paragraph it is `[Block { idx: block }]`.
+    path: BridgeBlockPath,
+    /// Issue #440 — how many tables deep `path` is (0 = the body, 1 = a
+    /// top-level table's cell or row, 2 = a table nested in a cell, …):
+    /// the review pane's depth marker.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    depth: u32,
 }
 
-/// The `revisions_snapshot()` rows: every tracked change of the
-/// top-level paragraphs, in document order — per paragraph its text
-/// revisions, then its mark's changes (issue #262: the empty range at
-/// the paragraph end; issue #303: one row per change, in order) — and,
-/// issue #365, every row change of a top-level table — each with its
-/// issue #304 `revision_id` (the range alone addresses only a mark's
-/// FIRST change, and no row change; the id addresses each).
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// The `revisions_snapshot()` rows: every tracked change the resolver
+/// reaches, in document order — per paragraph its text revisions, then
+/// its mark's changes (issue #262: the empty range at the paragraph end;
+/// issue #303: one row per change, in order) — and, issue #365, every
+/// row change of a table — each with its issue #304 `revision_id` (the
+/// range alone addresses only a mark's FIRST change, and no row change;
+/// the id addresses each). Issue #440 — table cells at every nesting
+/// depth included (they used to be dropped: only top-level paragraphs
+/// and rows were listed), each with its full `path` and `depth`; `block`
+/// is the top-level block the change sits in.
 fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
     doc.revision_entries()
         .into_iter()
         .filter_map(|e| {
-            let block = match e.at.path.steps.as_slice() {
-                [EnginePathStep::Block(b)] => *b,
+            let block = match e.at.path.steps.first() {
+                Some(EnginePathStep::Block(b)) => *b,
                 _ => return None,
             };
+            let depth =
+                e.at.path
+                    .steps
+                    .iter()
+                    .filter(|s| matches!(s, EnginePathStep::Cell { .. }))
+                    .count() as u32
+                    + u32::from(matches!(e.at.slot, engine::RevisionSlot::Row { .. }));
             let r = e.revision;
             let mark = matches!(e.at.slot, engine::RevisionSlot::Mark(_));
             let row = match e.at.slot {
@@ -1463,6 +1490,8 @@ fn revision_rows(doc: &DocumentTree) -> Vec<RevisionOut> {
                 mark,
                 row,
                 revision_id: e.id,
+                path: engine_to_bridge_path(e.at.path.clone()),
+                depth,
             })
         })
         .collect()
@@ -2842,14 +2871,6 @@ struct StyleContext<'a> {
     /// into every paragraph layout key: the same text and bindings under
     /// another theme must never hit a cached box.
     theme_key: u64,
-    /// Issue #329 — lay the document out with Word's font-derived line
-    /// pitch ([`layout::FontLinePitch`], `text_pipeline::LineMetrics`)
-    /// instead of the configured one: `true` for a document read from a
-    /// Word package (its `document.xml` envelope was captured), whose
-    /// `<w:spacing>` values mean what they mean in Word. Engine-authored
-    /// documents (the seeded editor page, `.txt` / `.html` opens, the
-    /// `RenderPage` harness) keep the configured `line_height`.
-    word_line_metrics: bool,
     /// Issue #326 — the document's hyphenation settings (`None`: a
     /// layout outside a document — automatic hyphenation off).
     settings: Option<&'a engine::DocumentSettings>,
@@ -2871,7 +2892,6 @@ impl<'a> StyleContext<'a> {
                 t.hash(&mut h);
                 h.finish()
             }),
-            word_line_metrics: doc.document_envelope.is_captured(),
         }
     }
 
@@ -3146,27 +3166,17 @@ fn composition_overlay_ranges(
     off: u32,
     comp_len: u32,
 ) -> (Vec<engine::Hyperlink>, Vec<engine::Revision>) {
-    let start = |p: u32| if p >= off { p + comp_len } else { p };
-    let end = |p: u32| if p > off { p + comp_len } else { p };
-    let hyperlinks = para
-        .hyperlinks
-        .iter()
-        .map(|h| engine::Hyperlink {
-            start: start(h.start),
-            end: end(h.end),
-            ..h.clone()
-        })
-        .collect();
-    let revisions = para
-        .revisions
-        .iter()
-        .map(|r| engine::Revision {
-            start: start(r.start),
-            end: end(r.end),
-            ..r.clone()
-        })
-        .collect();
-    (hyperlinks, revisions)
+    /* Issue #283 — the engine's one range rule, on copies (the preview
+    text is never stored). */
+    let edit = engine::TextEdit {
+        at: off,
+        removed: 0,
+        inserted: comp_len,
+    };
+    (
+        engine::hyperlinks_through_edit(&para.hyperlinks, edit),
+        engine::revisions_through_edit(&para.revisions, edit),
+    )
 }
 
 /// Style spans for a paragraph with an IME composition spliced in at `off`.
@@ -3297,15 +3307,19 @@ fn resolve_line_height(
 /// 132 lines); a hostile `w:line` cannot collapse or explode the pitch.
 const WORD_LINE_MULTIPLE_RANGE: (f32, f32) = (0.06, 132.0);
 
-/// Issue #329 — a paragraph's line pitch as `layout_paragraph` takes it:
-/// `(line_height_px, exact, font_line)`. Under the configured model
-/// (`!sctx.word_line_metrics`) and for `lineRule="exact"` this is
-/// [`resolve_line_height`] with no font pitch. Under Word's model the
-/// pitch is font-derived — `auto` is a multiple of each line's single
+/// Issues #329 / #475 — a paragraph's line pitch as `layout_paragraph`
+/// takes it: `(line_height_px, exact, font_line)`. ONE model for every
+/// document — read from a Word package or built in the editor (the seeded
+/// page, `.txt` / `.html` opens, the `RenderPage` harness), so a document
+/// typed here and re-opened from its own `.docx` lays out identically:
+/// Word's font-derived pitch — `auto` is a multiple of each line's single
 /// height (`w:line / 240`; no `w:spacing` = single), `atLeast` that single
 /// height floored at the value — and `line_height_px` is the nominal pitch
 /// of a line in the paragraph mark's face (what the float-cutout band
-/// heuristics size against).
+/// heuristics size against). Only `lineRule="exact"` is absolute
+/// ([`resolve_line_height`], no font pitch). The configured
+/// `RenderConfig::line_height` no longer sets any line's pitch; it is the
+/// fallback when the stack holds no face to measure.
 fn paragraph_line_rule(
     para: &engine::Paragraph,
     cfg: &RenderConfig,
@@ -3315,7 +3329,7 @@ fn paragraph_line_rule(
     base_direction: ShapingDirection,
 ) -> (f32, bool, Option<layout::FontLinePitch>) {
     let (lh_px, exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
-    if !sctx.word_line_metrics || exact {
+    if exact {
         return (lh_px, exact, None);
     }
     let empty = mark_line_extents(para, cfg, scale, sctx, fonts, base_direction)
@@ -3552,13 +3566,16 @@ fn layout_note_paragraph_with_composition(
     text.push_str(&para.text[..off]);
     text.push_str(&c.text);
     text.push_str(&para.text[off..]);
+    /* Issue #283 — the overlays shift past the preview text like the
+    body / band preview paths' do. */
+    let (links, revs) = composition_overlay_ranges(para, off as u32, ins);
     let spans = apply_revision_overlay(
         apply_hyperlink_overlay(
             composition_layout_spans(para, sctx, off as u32, ins, cfg.px_size, scale),
-            &para.hyperlinks,
+            &links,
             [0, 0, 0, 255],
         ),
-        &para.revisions,
+        &revs,
         [0, 0, 0, 255],
     );
     let mut infos = build_inline_object_infos(para, cfg, scale, sctx);
@@ -3745,6 +3762,198 @@ fn endnote_entries_for(
         out.push((r.anchor, mark, body.clone()));
     }
     out
+}
+
+/// Issue #328 — a laid-out drop-cap frame paragraph (`<w:framePr
+/// w:dropCap>`) waiting for the paragraph it anchors to. Word lays the
+/// frame out as a float `w:lines` lines tall at that paragraph's top:
+/// `drop` inside the text column, the anchor's first lines indented
+/// around it; `margin` hanging in the margin left of the column.
+struct DropCapCarry {
+    cap: engine::DropCap,
+    /// `w:hSpace` in layout units.
+    h_space: f32,
+    frame: ParagraphBox,
+    path: EngineBlockPath,
+}
+
+impl DropCapCarry {
+    /// Widest line of the frame (the cap glyphs' advance).
+    fn cap_width(&self) -> f32 {
+        self.frame
+            .lines
+            .iter()
+            .map(|l| {
+                l.runs
+                    .iter()
+                    .flat_map(|r| r.glyphs.iter())
+                    .map(|g| g.x_advance)
+                    .sum::<f32>()
+            })
+            .fold(0.0, f32::max)
+    }
+
+    /// The anchor line the cap's baseline sits on: line `w:lines` (or
+    /// the anchor's last line when it is shorter).
+    fn anchor_line<'a>(&self, anchor: &'a ParagraphBox) -> Option<&'a layout::LineBox> {
+        let n = usize::from(self.cap.lines.max(1));
+        anchor.lines.get(n - 1).or(anchor.lines.last())
+    }
+
+    /// The left cutout of the anchor paragraph (`drop` only): from the
+    /// column edge to the cap's right edge plus `w:hSpace`, down to the
+    /// bottom of the anchor line (`anchor` = the anchor's uncut layout).
+    fn cutout(&self, anchor: &ParagraphBox) -> Option<layout::WrapCutout> {
+        if self.cap.kind != engine::DropCapKind::Drop {
+            return None;
+        }
+        let line = self.anchor_line(anchor)?;
+        let x0 = self.frame.lines.first().map_or(0.0, |l| l.origin.x);
+        Some(layout::WrapCutout {
+            x0: 0.0,
+            x1: x0 + self.cap_width() + self.h_space,
+            y0: 0.0,
+            /* Just above the next band, so exactly `w:lines` bands cut. */
+            y1: (line.origin.y + line.height - 0.5).max(0.5),
+        })
+    }
+
+    /// The frame as it is pushed: zero flow height, its line moved so
+    /// its baseline meets the anchor line's (and, for `margin`, left of
+    /// the column), kept with the anchor.
+    fn into_frame(mut self, anchor: &ParagraphBox) -> ParagraphBox {
+        let target = self.anchor_line(anchor).map(|l| l.origin.y + l.baseline);
+        let cap_w = self.cap_width();
+        let margin = self.cap.kind == engine::DropCapKind::Margin;
+        if let (Some(target), Some(first)) = (target, self.frame.lines.first()) {
+            let dy = target - (first.origin.y + first.baseline);
+            for line in &mut self.frame.lines {
+                line.origin.y += dy;
+                if margin {
+                    line.origin.x = -(cap_w + self.h_space);
+                }
+            }
+        }
+        self.frame.size.height = 0.0;
+        self.frame.keep_next = true;
+        self.frame.flow.widow_control = false;
+        self.frame
+    }
+}
+
+/// Issue #328 — fill every page's [`layout::PageDecor`]: the section's
+/// `<w:pgBorders>` box (per `w:display`) and its `<w:lnNumType>` line
+/// numbers. A page belongs to the section of its first block (a blank
+/// page to the previous page's); a block's lines are numbered under its
+/// own section, so a continuous section break mid-page switches
+/// numbering there. Tables, paragraphs with `w:suppressLineNumbers` and
+/// drop-cap frames are neither counted nor numbered (Word's rule);
+/// headers, footers and notes never are.
+fn apply_page_decor(
+    pages: &mut [PageBox],
+    page_paths: &[Vec<EngineBlockPath>],
+    sections: &[engine::Section],
+    doc: &DocumentTree,
+    fonts: &FontStack,
+    base_px: f32,
+    scale: f32,
+) {
+    if !sections
+        .iter()
+        .any(|s| s.page_borders.is_some() || s.line_numbering.is_some())
+    {
+        return;
+    }
+    let section_of = |block: u32| {
+        sections
+            .iter()
+            .position(|s| s.start_block <= block && block < s.end_block)
+    };
+    let top_block = |path: &EngineBlockPath| match path.steps.first() {
+        Some(engine::PathStep::Block(i)) if path.steps.len() == 1 => Some(*i),
+        _ => None,
+    };
+    let defaults = &doc.style_run_defaults;
+    let style = layout::decor::LineNumberStyle {
+        family: defaults.font_family.as_ref().map(engine::FontFamily::id),
+        px_size: defaults.font_size.unwrap_or(base_px) * scale,
+        color: [0, 0, 0, 255],
+    };
+    let mut prev_sect: Option<usize> = None;
+    let mut page_in_section = 0_usize;
+    /* The line-number count: the next number, and the section whose
+    lines it last numbered. */
+    let mut counter: Option<u32> = None;
+    let mut counted_sect: Option<usize> = None;
+    for (pi, page) in pages.iter_mut().enumerate() {
+        let paths = page_paths.get(pi).map(Vec::as_slice).unwrap_or(&[]);
+        let block_sects: Vec<Option<usize>> = (0..page.blocks.len())
+            .map(|j| paths.get(j).and_then(top_block).and_then(section_of))
+            .collect();
+        let page_sect = block_sects.iter().flatten().next().copied().or(prev_sect);
+        if page_sect != prev_sect {
+            page_in_section = 0;
+        } else {
+            page_in_section += 1;
+        }
+        prev_sect = page_sect;
+        if let Some(b) = page_sect
+            .and_then(|s| sections[s].page_borders.as_ref())
+            .filter(|b| b.shows_on(page_in_section))
+        {
+            page.decor.borders = layout::decor::page_border_box(b, page.size, page.margins, scale);
+        }
+        /* Line numbers, one run of same-section blocks at a time. */
+        let mut page_started = false;
+        let mut j = 0;
+        while j < block_sects.len() {
+            let Some(s) = block_sects[j] else {
+                j += 1;
+                continue;
+            };
+            let end = (j..block_sects.len())
+                .find(|&k| block_sects[k] != Some(s))
+                .unwrap_or(block_sects.len());
+            if let Some(numbering) = sections[s].line_numbering {
+                let restart = counter.is_none()
+                    || (counted_sect != Some(s)
+                        && numbering.restart != engine::LineNumberRestart::Continuous)
+                    || (!page_started && numbering.restart == engine::LineNumberRestart::NewPage);
+                if restart {
+                    counter = Some(numbering.first_number());
+                }
+                counted_sect = Some(s);
+                page_started = true;
+                let counted: Vec<bool> = (0..page.blocks.len())
+                    .map(|k| {
+                        (j..end).contains(&k)
+                            && paths
+                                .get(k)
+                                .and_then(top_block)
+                                .and_then(|i| doc.blocks.get(i as usize))
+                                .and_then(engine::Block::as_paragraph)
+                                .is_some_and(|p| {
+                                    !engine::page_decor::suppresses_line_numbers(&p.props.grab_bag)
+                                        && engine::page_decor::drop_cap_from_bag(&p.props.grab_bag)
+                                            .is_none()
+                                })
+                    })
+                    .collect();
+                let mut n = counter.unwrap_or(1);
+                layout::decor::number_page_lines(
+                    page,
+                    &counted,
+                    &numbering,
+                    &mut n,
+                    numbering.distance() * scale,
+                    fonts,
+                    style,
+                );
+                counter = Some(n);
+            }
+            j = end;
+        }
+    }
 }
 
 /// Phase 2 audit (gap D.1 follow-up) — lay out one section's header
@@ -5520,9 +5729,10 @@ fn layout_paragraph_wrapped_uncached(
         paragraph_line_rule(para, cfg, scale, sctx, fonts, base_direction);
     let (spans, mark_lh) =
         paragraph_layout_spans(para, sctx, fonts, cfg, scale, base_direction, lh_px);
-    /* Issues #370 / #329 — the mark-scaled nominal pitch under the
-    configured model; Word's font pitch already sizes the mark's line
-    from its face (`FontLinePitch::empty`). */
+    /* Issues #370 / #329 / #475 — the mark-resolved nominal pitch for an
+    `exact` paragraph (the only rule without a font pitch); Word's font
+    pitch already sizes the mark's line from its face
+    (`FontLinePitch::empty`). */
     let lh_px = if font_line.is_some() { lh_px } else { mark_lh };
     /* Issue #326 — automatic hyphenation (document setting, paragraph
     not suppressing it, text in a language with patterns). */
@@ -8078,7 +8288,7 @@ impl Engine {
         self.mutation_seq += 1;
     }
 
-    async fn apply_command(&mut self, cmd: Command) -> Event {
+    async fn apply_command(&mut self, mut cmd: Command) -> Event {
         /* Issue #407 — argument validation first: a NaN / infinite number
         anywhere in the command (a JS `NaN` crosses `serde-wasm-bindgen`
         into an `f32` unchanged, and `f32::clamp` passes it through) is
@@ -8089,6 +8299,13 @@ impl Engine {
                 kind: Some(bridge::ErrorKind::InvalidArgument),
                 command: None,
             };
+        }
+        /* Issue #467 — and the same for text: control characters the XML
+        part cannot carry are dropped / mapped (a vertical tab is a line
+        break, a form feed a page break) and a `U+FFFE` / `U+FFFF` is
+        refused, so every handler below sees clean text. */
+        if let Err(refused) = text_input_guard::sanitize_command(&mut cmd) {
+            return *refused;
         }
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
@@ -8265,7 +8482,11 @@ impl Engine {
                         .as_deref()
                         .map(file_base_name)
                         .filter(|n| !n.is_empty());
+                    /* Issue #467 — a file's control characters are
+                    repaired, never refused (the user cannot retype a
+                    byte): the same table as typed text. */
                     let text = decode_text_file(&bytes);
+                    let text = engine::text_input::sanitize_input_text_lossy(&text);
                     let doc = if matches!(format, DocFormat::Html) {
                         let parsed = engine::html::from_html_document(&text);
                         if parsed.blocks.is_empty() {
@@ -9470,6 +9691,11 @@ impl Engine {
             (None, None) => None,
         };
         let package_lost = named_package && package.is_none();
+        /* Issue #283 — snapshot bytes may come from anywhere: hold every
+        revision range to the in-paragraph / char-boundary invariant. */
+        for d in &mut s.doc_history {
+            d.repair_revision_ranges();
+        }
         if let Some(pkg) = &package {
             for d in &mut s.doc_history {
                 if d.source_package.is_none() {
@@ -10148,6 +10374,9 @@ impl Engine {
         /* Issue #95 — the last body block pushed was a keep-with-next
         paragraph (see the cull stop below). */
         let mut after_keep_next = false;
+        /* Issue #328 — a laid-out drop-cap frame paragraph waiting for
+        the paragraph it is anchored to (pushed right before it). */
+        let mut drop_carry: Option<DropCapCarry> = None;
         /* Issue #87 — degradation notes for this build: paginator
         watchdog notes join here as each paginator finishes; the
         sub-paginator sink is drained at the end. Clear leftovers from
@@ -10244,6 +10473,7 @@ impl Engine {
                         hf_role: layout::HeaderRole::Default,
                         page_number: incoming,
                         floats: Vec::new(),
+                        decor: Default::default(),
                     });
                     emitted_paths.push(Vec::new());
                 }
@@ -10516,8 +10746,31 @@ impl Engine {
                         });
                         /* Issue #82 — this paragraph's wrap cutouts
                         (the id `next_para_id` is about to be stamped). */
-                        let cuts: &[layout::WrapCutout] =
-                            plan.get(&next_para_id).map_or(&[], Vec::as_slice);
+                        let mut owned_cuts: Vec<layout::WrapCutout> =
+                            plan.get(&next_para_id).cloned().unwrap_or_default();
+                        /* Issue #328 — the paragraph a drop cap anchors
+                        to: its first `w:lines` lines wrap around the cap
+                        (a left cutout down to the bottom of line N of
+                        the uncut layout — the cap never changes line
+                        heights, only widths). */
+                        let carry = drop_carry.take();
+                        let drop_probe = carry.as_ref().map(|_| {
+                            layout_paragraph_cached(
+                                para,
+                                &font_stack,
+                                &cfg,
+                                scale,
+                                pag.column_width(),
+                                sctx,
+                                &mut cache,
+                            )
+                        });
+                        if let (Some(c), Some(probe)) = (carry.as_ref(), drop_probe.as_ref())
+                            && let Some(cut) = c.cutout(probe)
+                        {
+                            owned_cuts.push(cut);
+                        }
+                        let cuts: &[layout::WrapCutout] = &owned_cuts;
                         let para_box = if let Some((c, off)) = comp {
                             let mut text = String::with_capacity(para.text.len() + c.text.len());
                             text.push_str(&para.text[..off]);
@@ -10602,9 +10855,30 @@ impl Engine {
                                 &mut cache,
                             )
                         };
-                        let before_px = twips_to_layout_px(para.props.spacing.before_twips, scale);
+                        let mut before_px =
+                            twips_to_layout_px(para.props.spacing.before_twips, scale);
                         let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
                         let mut para_box = para_box;
+                        /* Issue #328 — push the waiting drop cap first,
+                        zero-height, at this paragraph's top (it takes
+                        the spacing above), baseline-aligned with line N. */
+                        if let (Some(c), Some(probe)) = (carry, drop_probe.as_ref()) {
+                            let prev_pages_in_pag = pag.page_count_emitted();
+                            let cap_path = c.path.clone();
+                            pag.push_block(
+                                LayoutBlock::Paragraph(c.into_frame(probe)),
+                                before_px,
+                                0.0,
+                            );
+                            attach_block_paths(
+                                pag,
+                                prev_pages_in_pag,
+                                &mut page_paths,
+                                &cap_path,
+                                &para_paths,
+                            );
+                            before_px = 0.0;
+                        }
                         para_box.source_paragraph_id = next_para_id;
                         para_paths.insert(next_para_id, para_path.clone());
                         next_para_id += 1;
@@ -10664,6 +10938,29 @@ impl Engine {
                         footer, note and text-box paragraphs are laid
                         out elsewhere and ignore it, as Word does. */
                         para_box.flow.page_break_before = para.props.page_break_before;
+                        /* Issue #328 — a drop-cap frame (`<w:framePr
+                        w:dropCap>`) followed by a paragraph of the same
+                        section waits for it instead of taking flow. */
+                        if let Some(dc) =
+                            engine::page_decor::drop_cap_from_bag(&para.props.grab_bag)
+                            && block_idx + 1 < section.end_block
+                            && matches!(
+                                doc.blocks.get(block_idx as usize + 1),
+                                Some(engine::Block::Paragraph(_))
+                            )
+                        {
+                            drop_carry = Some(DropCapCarry {
+                                cap: dc,
+                                h_space: dc.h_space_pt * scale,
+                                frame: para_box,
+                                path: para_path.clone(),
+                            });
+                            /* The cull never stops between the frame and
+                            its anchor (it would drop the cap). */
+                            after_keep_next = true;
+                            processed_blocks += 1;
+                            continue;
+                        }
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(
@@ -10773,6 +11070,17 @@ impl Engine {
             );
         }
         drop(cache);
+        /* Issue #328 — page borders + line numbers: a pure function of
+        the placed pages, never fed back into the flow. */
+        apply_page_decor(
+            &mut emitted_pages,
+            &emitted_paths,
+            &sections,
+            &doc,
+            &font_stack,
+            cfg.px_size,
+            scale,
+        );
         /* Always at least one page so downstream consumers can index `[0]`. */
         if emitted_pages.is_empty() {
             let default_geom = scaled_paginator_geometry(engine::PageGeometry::a4(), scale);
@@ -10792,6 +11100,7 @@ impl Engine {
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
                 floats: Vec::new(),
+                decor: Default::default(),
             });
             emitted_paths.push(Vec::new());
         }
@@ -10834,6 +11143,7 @@ impl Engine {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         });
         let p0 = paths.drain(..).next().unwrap_or_default();
         Ok((page, fonts, p0))
@@ -17926,10 +18236,20 @@ impl Engine {
             SectionBreakKind::EvenPage => engine::SectionType::EvenPage,
             SectionBreakKind::OddPage => engine::SectionType::OddPage,
         };
-        let new_doc = self
-            .undo
-            .current()
-            .insert_section_break_at(to_engine_pos(at.clone()), engine_kind);
+        /* Issue #442 — with review mode on the new mark (the one carrying
+        the break) is recorded as inserted. */
+        let new_doc = if self.tracking_changes {
+            self.undo.current().tracked_insert_section_break_at(
+                to_engine_pos(at.clone()),
+                engine_kind,
+                &self.review_author,
+                &self.current_review_date(),
+            )
+        } else {
+            self.undo
+                .current()
+                .insert_section_break_at(to_engine_pos(at.clone()), engine_kind)
+        };
         let next_path = engine::bump_last_block_index(&bridge_to_engine_path(at.path));
         let caret = BridgeLogicalPos {
             path: engine_to_bridge_path(next_path),
@@ -18050,16 +18370,32 @@ impl Engine {
                 offset: 0,
             }
         };
+        /* Issue #442 — review mode on: every row (and the escape
+        paragraph's mark) recorded as inserted. */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let caret = first_cell(self.story_doc().map_or(0, |d| d.blocks.len()));
             let epath = bridge_to_engine_path(at);
-            return self.story_mutate(move |d| d.insert_table(epath, rows, cols), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_insert_table(epath, rows, cols, author, date),
+                    None => d.insert_table(epath, rows, cols),
+                },
+                caret,
+                false,
+            );
         }
         let caret = first_cell(self.undo.current().blocks.len());
-        let new_doc = self
-            .undo
-            .current()
-            .insert_table(bridge_to_engine_path(at), rows, cols);
+        let epath = bridge_to_engine_path(at);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_insert_table(epath, rows, cols, author, date),
+            None => self.undo.current().insert_table(epath, rows, cols),
+        };
         self.announce(
             AnnouncementPriority::Polite,
             format!("Table inserted, {rows} rows by {cols} columns"),
@@ -18112,6 +18448,10 @@ impl Engine {
         }) {
             return *e;
         }
+        /* Issue #442 — review mode on: the new row is an inserted row. */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -18119,12 +18459,23 @@ impl Engine {
                 .as_ref()
                 .map(|s| s.caret.clone())
                 .unwrap_or_else(|| bpos_top(0, 0));
-            return self.story_mutate(move |d| d.insert_row(epath, at), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_insert_row(epath, at, author, date),
+                    None => d.insert_row(epath, at),
+                },
+                caret,
+                false,
+            );
         }
-        let new_doc = self
-            .undo
-            .current()
-            .insert_row(bridge_to_engine_path(path), at);
+        let epath = bridge_to_engine_path(path);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_insert_row(epath, at, author, date),
+            None => self.undo.current().insert_row(epath, at),
+        };
         self.announce(AnnouncementPriority::Polite, "Row inserted");
         self.push_table_edit(new_doc, None)
     }
@@ -18132,6 +18483,11 @@ impl Engine {
         if let Err(e) = self.validate_table_cmd("DeleteRow", &path, Some(row), None, |_| Ok(())) {
             return *e;
         }
+        /* Issue #442 — review mode on: the row is marked deleted with its
+        contents (the reviewer's own inserted row goes outright). */
+        let tracked = self
+            .tracking_changes
+            .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -18139,12 +18495,23 @@ impl Engine {
                 .as_ref()
                 .map(|s| s.caret.clone())
                 .unwrap_or_else(|| bpos_top(0, 0));
-            return self.story_mutate(move |d| d.delete_row(epath, row), caret, false);
+            return self.story_mutate(
+                move |d| match &tracked {
+                    Some((author, date)) => d.tracked_delete_row(epath, row, author, date),
+                    None => d.delete_row(epath, row),
+                },
+                caret,
+                false,
+            );
         }
-        let new_doc = self
-            .undo
-            .current()
-            .delete_row(bridge_to_engine_path(path), row);
+        let epath = bridge_to_engine_path(path);
+        let new_doc = match &tracked {
+            Some((author, date)) => self
+                .undo
+                .current()
+                .tracked_delete_row(epath, row, author, date),
+            None => self.undo.current().delete_row(epath, row),
+        };
         self.announce(AnnouncementPriority::Polite, "Row deleted");
         self.push_table_edit(new_doc, None)
     }
@@ -18567,8 +18934,10 @@ impl Engine {
     /// Issue #341 — the engine's cheap structural invariants, checked after
     /// a restore + one `apply` round: the undo stack respects its cap, the
     /// live and the stashed selection resolve inside the document they
-    /// address, and an active note / text-box story still exists. `Err`
-    /// names the first violation.
+    /// address, an active note / text-box story still exists and — issue
+    /// #283 — every tracked-change range lies inside its paragraph on char
+    /// boundaries (`engine::check_revision_ranges`). `Err` names the first
+    /// violation.
     pub fn check_invariants_for_fuzzing(&self) -> Result<(), String> {
         if self.undo.depth() as usize > self.undo.cap() {
             return Err(format!(
@@ -18595,6 +18964,9 @@ impl Engine {
         {
             return Err("the active note / text-box story no longer exists".to_string());
         }
+        /* Issue #283 — every revision range inside its paragraph, on
+        char boundaries. */
+        engine::check_revision_ranges(self.undo.current())?;
         Ok(())
     }
 
@@ -20139,7 +20511,6 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
-            word_line_metrics: false,
             settings: None,
         }
     }
@@ -20173,7 +20544,6 @@ mod tests {
             note_self_mark: None,
             theme: None,
             theme_key: 0,
-            word_line_metrics: false,
             settings: None,
         };
         let mut para = engine::Paragraph {
@@ -20240,7 +20610,6 @@ mod tests {
             note_self_mark: None,
             theme,
             theme_key: key,
-            word_line_metrics: false,
             settings: None,
         };
         let theme: &'static engine::DocumentTheme = Box::leak(Box::new(theme));
@@ -21886,7 +22255,7 @@ mod tests {
     }
 
     /// Recorded on this change via `--nocapture` (issue #130).
-    const PINNED_NOTE_SECTION_WIDTHS: u64 = 0xd6cfac1cc9cef805;
+    const PINNED_NOTE_SECTION_WIDTHS: u64 = 0xfb3118be9b2a6c44;
 
     /* ================================================================
     Issue #129 — `<w:numRestart w:val="eachPage"/>` footnote numbering.
@@ -21984,7 +22353,7 @@ mod tests {
     }
 
     /// Recorded on this change via `--nocapture` (issue #129).
-    const PINNED_NOTE_EACH_PAGE: u64 = 0x34081f7fb7e9e11c;
+    const PINNED_NOTE_EACH_PAGE: u64 = 0xa21954d2c06ba3bc;
 
     /// Continuous stays the default: the same document numbers 1–4, and
     /// no relabelling pass runs (the rule table is empty).
@@ -22756,7 +23125,7 @@ mod tests {
         assert_eq!(fp, PINNED_SQUARE_WRAP_X2);
     }
 
-    const PINNED_SQUARE_WRAP_X2: u64 = 0xe26a96b1e1df3649;
+    const PINNED_SQUARE_WRAP_X2: u64 = 0x517ada704ca16aef;
 
     /* ------------------------ Issue #83 — text boxes ------------------------ */
 
@@ -22886,7 +23255,7 @@ mod tests {
         assert_eq!(fp, PINNED_TEXT_BOXES_X1);
     }
 
-    const PINNED_TEXT_BOXES_X1: u64 = 0x36dc281bfc45e4a1;
+    const PINNED_TEXT_BOXES_X1: u64 = 0x1f94faae327b3643;
 
     /// An overflowing story is clipped at the shape's bottom edge (lines
     /// past it are culled from the scene) and a centred story shifts down
@@ -23112,7 +23481,7 @@ mod tests {
         assert_eq!(fp, PINNED_NESTED_TEXT_BOXES);
     }
 
-    const PINNED_NESTED_TEXT_BOXES: u64 = 0x0effc1fd111fcc44;
+    const PINNED_NESTED_TEXT_BOXES: u64 = 0xd1bba4abc5dee080;
 
     /// Issue #197 — a 0.75" × 0.5" square-wrapped floating picture
     /// anchored at the head of a story paragraph.
@@ -23239,7 +23608,7 @@ mod tests {
         assert_eq!(fp, PINNED_BOXED_FLOAT_IMAGE);
     }
 
-    const PINNED_BOXED_FLOAT_IMAGE: u64 = 0xce020097437da437;
+    const PINNED_BOXED_FLOAT_IMAGE: u64 = 0xd70e2d81e7d7dbf7;
 
     /// Issue #196 — the committed `text_boxes_nested.docx` (outer box at
     /// 1", 3" on the page, 3" × 2"; nested box 1" / 0.5" into its
@@ -26591,30 +26960,33 @@ mod tests {
     /// Recorded on the pre-#87 adapter via `--nocapture`. Issue #329 — the
     /// two 50-page entries (the only fixture read from a Word package) moved
     /// with Word's font-derived line pitch: `0xf565e610ffdbc22d` (116 pages)
-    /// and `0x3b2d3d53655395a1` before; 82 pages now.
+    /// and `0x3b2d3d53655395a1` before; 82 pages now. Issue #475 — every
+    /// engine-built entry (all but the two 50-page ones) moved when
+    /// engine-built documents took the same font-derived pitch; the old
+    /// values are listed in the #475 commit body.
     const PINNED_ENGINE_FINGERPRINTS: &[(&str, u64)] = &[
         ("50p_full_x2", 0x341267f577563dc0),
         ("50p_band_2000_x2", 0xd014bb2dc81283ce),
-        ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("two_page_form_feed", 0xcbf3d391561b7991),
         /* Issue #75 — `<w:pageBreakBefore/>` alone (new fixture, recorded
         on the #75 adapter; every other value is unchanged by it). */
-        ("two_page_break_before", 0xc9a32cc093e20dbd),
-        ("autofit_table", 0x92435b9636de4c72),
+        ("two_page_break_before", 0x245084a28a724bc3),
+        ("autofit_table", 0x3de31dd133d4d97e),
         /* Issue #169 — an overflowing exact-height row, recorded on the
         #169 adapter (new fixture; every other value is unchanged). */
-        ("exact_row_overflow_table", 0x33d0f55718ea079f),
-        ("prose_300_full", 0xd3d662539c126b7d),
-        ("prose_300_band_1200", 0x5e704685f3cc770c),
+        ("exact_row_overflow_table", 0xc6547a8e88ba6840),
+        ("prose_300_full", 0xfdaf02cf90471c56),
+        ("prose_300_band_1200", 0x3f0ed621ac0153a8),
         /* Issue #79 — recorded with the `<w:bidiVisual>` mirror in place
         (column 1 rightmost); every value above is unchanged by it. */
-        ("rtl_bidi_visual_table", 0xa105472832896e3f),
+        ("rtl_bidi_visual_table", 0x5df34fc4e1e582a8),
         /* Issue #173 — recorded with `<w:jc>` / `<w:tblInd>` placement in
         place (new fixtures; every value above is unchanged by it —
         autofit tables fill the column, so they have no slack to move). */
-        ("ltr_center_fixed_table", 0x392d9b82e26033b8),
-        ("ltr_right_fixed_table", 0x93457cced5c21beb),
-        ("ltr_indented_fixed_table", 0x327125e1450360f6),
-        ("rtl_narrow_bidi_visual_table", 0x840944f9156e942e),
+        ("ltr_center_fixed_table", 0x37d3aeb3f1d7e7d8),
+        ("ltr_right_fixed_table", 0x9cf0480ead6b3eb8),
+        ("ltr_indented_fixed_table", 0x76902c7d1ccfaeb6),
+        ("rtl_narrow_bidi_visual_table", 0x38b1758f1a852aac),
     ];
 
     /// Issue #95 — the same fixtures with widow / orphan control at its
@@ -26623,15 +26995,18 @@ mod tests {
     /// lines at page edges); the other four equal the OFF anchor.
     /// Issue #329 — the 50-page entries moved with Word's font-derived line
     /// pitch: `0xa7f584534ce2ac6f` / `0x25ddf363691ee633` before; 84 pages.
+    /// Issue #475 — the engine-built entries moved with the same switch
+    /// (old values in the #475 commit body); `prose_300_*` now differ from
+    /// the OFF anchor (the denser pitch leaves single lines at page edges).
     const PINNED_WIDOW_DEFAULT_FINGERPRINTS: &[(&str, u64)] = &[
         ("50p_full_x2", 0x2859dac37f27b6af),
         ("50p_band_2000_x2", 0xbd7ba49646a045a3),
-        ("two_page_form_feed", 0xd804a22dcd3af5fd),
-        ("two_page_break_before", 0xc9a32cc093e20dbd),
-        ("autofit_table", 0x92435b9636de4c72),
-        ("exact_row_overflow_table", 0x33d0f55718ea079f),
-        ("prose_300_full", 0xd3d662539c126b7d),
-        ("prose_300_band_1200", 0x5e704685f3cc770c),
+        ("two_page_form_feed", 0xcbf3d391561b7991),
+        ("two_page_break_before", 0x245084a28a724bc3),
+        ("autofit_table", 0x3de31dd133d4d97e),
+        ("exact_row_overflow_table", 0xc6547a8e88ba6840),
+        ("prose_300_full", 0x208933ac898379a9),
+        ("prose_300_band_1200", 0x86fd4ad84f42fc34),
     ];
 
     #[test]
@@ -27153,6 +27528,7 @@ mod tests {
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
+            decor: Default::default(),
         }
     }
 
@@ -27266,6 +27642,11 @@ mod tests {
     /// Issue #468 — after a hostile `InsertText`, `SaveDocx` either answers
     /// a typed error or returns a package whose parts all pass the strict
     /// well-formedness check; it never returns malformed bytes.
+    ///
+    /// Issue #467 — and since the input boundary cleans the text, it ANSWERS
+    /// with a package (a control character no longer blocks saving) whose
+    /// XML parts hold no character XML 1.0 forbids, whichever text-bearing
+    /// command brought the string in.
     #[cfg(feature = "fuzz-native")]
     #[test]
     fn save_docx_after_hostile_insert_text_is_never_malformed() {
@@ -27279,22 +27660,53 @@ mod tests {
             "\"'><\u{7f}\u{85}",
         ];
         for text in hostile {
-            let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
-            let _ = engine.apply_sync(Command::InsertText {
-                at: None,
-                text: text.to_string(),
-            });
-            match engine.apply_sync(Command::SaveDocx) {
-                Event::DocumentSaved { bytes, .. } => {
-                    for part in ["word/document.xml", "[Content_Types].xml"] {
-                        format_docx::check_part_xml_well_formed(&bytes, part)
-                            .unwrap_or_else(|e| panic!("{text:?}: {part}: {e}"));
+            let range = BridgeLogicalRange {
+                start: bpos_top(0, 0),
+                end: bpos_top(0, 4),
+            };
+            let carriers = [
+                Command::InsertText {
+                    at: None,
+                    text: text.to_string(),
+                },
+                Command::PastePlain {
+                    text: text.to_string(),
+                },
+                Command::ReplaceRange {
+                    range: range.clone(),
+                    text: text.to_string(),
+                },
+                Command::PasteHtml {
+                    html: format!("<p>{text}</p>"),
+                },
+                Command::InsertComment {
+                    range,
+                    text: text.to_string(),
+                    author: text.to_string(),
+                },
+                Command::SetReviewIdentity {
+                    author: text.to_string(),
+                    date: text.to_string(),
+                },
+            ];
+            for carrier in carriers {
+                let name = carrier.kind().name();
+                let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+                let _ = engine.apply_sync(carrier);
+                match engine.apply_sync(Command::SaveDocx) {
+                    Event::DocumentSaved { bytes, .. } => {
+                        for part in ["word/document.xml", "[Content_Types].xml"] {
+                            format_docx::check_part_xml_well_formed(&bytes, part)
+                                .unwrap_or_else(|e| panic!("{name} {text:?}: {part}: {e}"));
+                        }
+                        assert_eq!(
+                            format_docx::first_forbidden_character(&bytes),
+                            None,
+                            "{name} {text:?}: a saved package holds a forbidden character"
+                        );
                     }
+                    other => panic!("{name} {text:?}: a save must succeed, got {other:?}"),
                 }
-                Event::Error { kind, .. } => {
-                    assert_eq!(kind, Some(bridge::ErrorKind::Internal), "{text:?}");
-                }
-                other => panic!("{text:?}: unexpected {other:?}"),
             }
         }
     }
@@ -27735,7 +28147,7 @@ mod tests {
     }
 
     /// Recorded on this change via `--nocapture` (issue #81).
-    const PINNED_TOC_FINGERPRINT: u64 = 0xe2f7683e6b40ee7f;
+    const PINNED_TOC_FINGERPRINT: u64 = 0xf80dba0148668bac;
 
     #[test]
     fn f9_regenerates_after_a_heading_edit_and_a_page_shift() {
@@ -28637,10 +29049,14 @@ mod snapshot_tests {
         include_bytes!("../../format-docx/tests/fixtures/word_package_parts.docx");
 
     /// Issue #468 — the production save-side well-formedness gate. A raw
-    /// control character the writer leaves in a regenerated part (the #467
-    /// shape) is refused with a typed `Event::Error`, yields no bytes, and
-    /// leaves the document state alone (#341 invariant); the same save
-    /// succeeds once the character is gone.
+    /// control character the writer leaves in a regenerated part is refused
+    /// with a typed `Event::Error`, yields no bytes, and leaves the document
+    /// state alone (#341 invariant).
+    ///
+    /// Issue #467 — typed / pasted text can no longer carry such a character
+    /// (the input boundary cleans it and the writer's escape helpers repair
+    /// what slips past), so the malformed part is injected through a block's
+    /// VERBATIM passthrough markup, which the writer replays byte for byte.
     #[test]
     fn save_refuses_a_part_the_writer_left_malformed() {
         let mut e = opened_engine(PACKAGE_FIXTURE);
@@ -28650,7 +29066,19 @@ mod snapshot_tests {
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
-        let evt = apply(&mut e, insert("a\u{1}b"));
+        let mut doc = e.undo.current().clone();
+        match doc.blocks.get_mut(4) {
+            Some(engine::Block::Paragraph(p)) => {
+                p.body_xml = Some(Box::new(engine::BodyPassthrough {
+                    before: vec![engine::BodyFragment::Verbatim {
+                        xml: b"<w:bookmarkStart w:id=\"90\" w:name=\"a\x01b\"/>".to_vec(),
+                    }],
+                    after: Vec::new(),
+                }));
+            }
+            other => panic!("block 4 is not a paragraph: {other:?}"),
+        }
+        let evt = e.commit_edit(doc, bpos_top(4, 4));
         assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
         #[cfg(feature = "fuzz-native")]
         let before = e.state_fingerprint_for_fuzzing();
@@ -29390,6 +29818,9 @@ mod toc_pdf_export_tests;
 #[cfg(test)]
 mod pdf_validate_fixtures_tests;
 
+/// Issue #328 — page borders, line numbers and drop caps, end to end.
+#[cfg(test)]
+mod page_decor_tests;
 /// Issue #360 — PDF outline / links / XMP / tagging, end to end.
 #[cfg(test)]
 mod pdf_semantics_tests;
@@ -29441,6 +29872,10 @@ mod pbdr_style_cascade_tests;
 #[cfg(test)]
 mod empty_mark_tests;
 
+/// Issues #475 / #463 — one line-pitch model for every document.
+#[cfg(test)]
+mod line_pitch_tests;
+
 /// Issue #387 — comment highlights + the caret-reveal stamp.
 #[cfg(test)]
 mod comment_highlight_tests;
@@ -29456,6 +29891,18 @@ mod revision_command_tests;
 
 #[cfg(test)]
 mod tracked_command_tests;
+
+/// Issue #283 — revision ranges through real commands (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod revision_range_tests;
+
+/// Issue #440 — revisions inside nested tables (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod nested_revision_tests;
+
+/// Issue #442 — structural edits tracked in review mode (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod tracked_structure_tests;
 
 #[cfg(test)]
 mod revision_address_tests;
@@ -29497,6 +29944,9 @@ mod font_priority_tests;
 /// Issue #329 — substitution reporting + the `Substituted` font source.
 #[cfg(test)]
 mod font_substitution_tests;
+/// Issue #467 — control characters / noncharacters at the input boundary.
+#[cfg(test)]
+mod text_input_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {
