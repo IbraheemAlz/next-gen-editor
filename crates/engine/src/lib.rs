@@ -7639,13 +7639,35 @@ impl DocumentTree {
             let off = e.at;
             let len = text.len() as u32;
             let donor = grow.map(|i| para.spans[i].style.clone());
+            /* Issues #477 / #481 — a span that STRADDLES the insertion
+            point without continuing over it (the character before is an
+            inline-object anchor, which never passes its formatting on —
+            see `inheriting_span`) splits around the unstyled new text.
+            Leaving it alone kept its old `end`: the span then ended
+            inside the inserted text (possibly mid-character, which
+            panicked the layout's span slicing) and the text after the
+            insertion lost its formatting. */
+            let mut tail = None;
             for (i, s) in para.spans.iter_mut().enumerate() {
                 if Some(i) == grow {
                     s.end += len;
                 } else if s.start >= off {
                     s.start += len;
                     s.end += len;
+                } else if s.end > off {
+                    tail = Some((
+                        i + 1,
+                        StyleRun {
+                            start: off + len,
+                            end: s.end + len,
+                            style: s.style.clone(),
+                        },
+                    ));
+                    s.end = off;
                 }
+            }
+            if let Some((at, run)) = tail {
+                para.spans.insert(at, run);
             }
             /* ... minus revision records: a donor run's tracked
             formatting change (`<w:rPrChange>`, grab bag) describes an
@@ -13348,6 +13370,63 @@ mod tests {
         assert_eq!(p.style_at(2), sup, "the reference keeps its own style");
         assert_eq!(p.style_at(5), SpanStyle::default());
         assert_eq!(p.style_at(9), SpanStyle::default());
+    }
+
+    /// Issues #477 / #481 (nightly `snapshot_decode`) — typing right after
+    /// an inline anchor that sits INSIDE a styled span (an endnote
+    /// reference inserted mid-word) splits that span around the unstyled
+    /// new text. The span used to keep its old end: it ended inside the
+    /// inserted text — mid-character after a combining mark, which
+    /// panicked the layout's span slicing — and the text after the
+    /// insertion lost its formatting.
+    #[test]
+    fn typing_after_an_anchor_inside_a_span_splits_the_span() {
+        let mut d = DocumentTree::from_text("ab\u{FFFC}cd");
+        let italic = SpanStyle {
+            italic: Some(true),
+            ..SpanStyle::default()
+        };
+        {
+            let p = d.blocks[0].as_paragraph_mut().unwrap();
+            p.inline_objects = vec![InlineObject {
+                at: 2,
+                kind: InlineKind::EndnoteRef {
+                    id: 1,
+                    custom_mark_follows: false,
+                },
+                anchor: None,
+                source_xml: None,
+            }];
+            p.spans = vec![StyleRun {
+                start: 0,
+                end: 7,
+                style: italic.clone(),
+            }];
+        }
+        let typed = "x \u{301}y";
+        let after = d.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
+            typed,
+        );
+        let p = after.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "ab\u{FFFC}x \u{301}ycd");
+        let len = typed.len() as u32;
+        let edges: Vec<(u32, u32)> = p.spans.iter().map(|s| (s.start, s.end)).collect();
+        assert_eq!(edges, vec![(0, 5), (5 + len, 7 + len)]);
+        for s in &p.spans {
+            assert!(p.text.is_char_boundary(s.start as usize));
+            assert!(p.text.is_char_boundary(s.end as usize));
+        }
+        assert_eq!(p.style_at(2), italic, "the anchor keeps its span");
+        assert_eq!(p.style_at(5), SpanStyle::default(), "typed text is plain");
+        assert_eq!(
+            p.style_at(5 + len),
+            italic,
+            "the text after keeps its style"
+        );
     }
 
     /// Issue #276 — typed text continues a run's formatting but never its

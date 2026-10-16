@@ -271,7 +271,7 @@ fn a_truncated_main_part_is_closed_and_a_cut_tag_refuses() {
     assert_eq!(assert_repaired_round_trip(cut), "first\nsec");
     let docx = package_with_document_xml_bytes(&cut[..cut.len() - 9], &[]);
     let err = read_docx(&docx).expect_err("cut inside `<w:t>`");
-    assert!(matches!(err, crate::DocxError::Xml(_)), "{err:?}");
+    assert!(matches!(err, crate::DocxError::MalformedXml(_)), "{err:?}");
 }
 
 /// Issue #434 (the #439 package's prolog) — junk text between the XML
@@ -326,7 +326,57 @@ fn an_unclosed_tag_inside_a_preserved_span_refuses_typed() {
     ] {
         let docx = package_with_document_xml_bytes(&document(body), &[]);
         let err = read_docx(&docx).expect_err("structurally broken");
-        assert!(matches!(err, crate::DocxError::Xml(_)), "{err:?}");
+        assert!(matches!(err, crate::DocxError::MalformedXml(_)), "{err:?}");
+    }
+}
+
+/// Issue #482 (nightly `docx_roundtrip`, crash `9dded4b484a5`) — a stray
+/// `<w:t>` in front of `<w:body>` (inside the root, so the up-front repair
+/// keeps it; the truncated part is closed at EOF). The reader raised its
+/// text flag for it, the flag stayed up into the first run, and that run's
+/// `<w:rPr>` character data read as text until the run's own `</w:t>` —
+/// text the save (whose envelope drops the stray element, and which never
+/// re-emits character data inside `<w:rPr>`) did not have. Only a run's
+/// `<w:t>` holds text now.
+#[test]
+fn a_stray_text_element_outside_every_run_reads_no_text() {
+    let xml = [
+        ROOT,
+        "<w:t>junk<w:body><w:p><w:r><w:rPr><w:b/>\u{301}&gt;<w:sz w:val=\"20\"/></w:rPr>"
+            .as_bytes(),
+        br#"<w:t xml:space="preserve">hello</w:t></w:r></w:p><w:p><w:r><w:t>next</w:t></w:r>"#,
+    ]
+    .concat();
+    assert_eq!(assert_repaired_round_trip(&xml), "hello\nnext");
+}
+
+/// Issue #483 (nightly `docx_roundtrip`, crash `83d5a8bccb8a`) — the
+/// structural defects quick-xml itself walks leniently: a second root (an
+/// element spliced in front of the real root), no root at all. The scan
+/// stops at the structural defect, so a lexical one behind it (here a
+/// byte-flipped attribute name, not UTF-8) was never repaired either: the
+/// document opened, its clean paragraph's bytes could not be replayed, and
+/// the regenerated save showed text the open had hidden as field code.
+/// The main part is refused with a typed error instead — like the shapes
+/// quick-xml refuses on its own.
+#[test]
+fn a_main_part_with_a_second_root_or_none_refuses_typed() {
+    let (decl, root) = prolog_and_root();
+    let second_root = [
+        decl,
+        b"<w:instrText> PAGE </w:instrText><w:t>",
+        root,
+        b"<w:body><w:p>",
+        BEGIN,
+        br#"<w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:t>code</w:t></w:r>"#,
+        b"<w:r><w:fldChar \xF7:fldCharType=\"end\"/></w:r><w:r><w:t>tail</w:t></w:r>",
+        b"</w:p><w:sectPr/></w:body></w:document>",
+    ]
+    .concat();
+    for xml in [second_root, b"  just text ".to_vec()] {
+        let err =
+            read_docx(&package_with_document_xml_bytes(&xml, &[])).expect_err("no faithful repair");
+        assert!(matches!(err, crate::DocxError::MalformedXml(_)), "{err:?}");
     }
 }
 
