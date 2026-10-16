@@ -12,6 +12,7 @@
 //!   the stashed body selection.
 
 use super::*;
+use bridge::PathStep;
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, Waker};
@@ -149,3 +150,84 @@ fn typing_after_a_mid_span_endnote_reference_keeps_spans_on_char_boundaries() {
     );
 }
 
+/// A body whose only top-level block is a 2×1 table, cell (1, 0) holding
+/// `text` — a table-only tree (`paragraph_count() == 0`).
+fn table_only(text: &str) -> DocumentTree {
+    let mut d = DocumentTree::from_text("tail").insert_table(EngineBlockPath::top(0), 2, 1);
+    d.blocks.pop_back();
+    assert_eq!(d.paragraph_count(), 0, "table-only");
+    d.insert_text(
+        engine::LogicalPos {
+            path: bridge_to_engine_path(cell_path(1)),
+            offset: 0,
+        },
+        text,
+    )
+}
+
+fn cell_path(row: u32) -> bridge::BlockPath {
+    bridge::BlockPath {
+        steps: vec![
+            PathStep::Block { idx: 0 },
+            PathStep::Cell { row, col: 0 },
+            PathStep::Block { idx: 0 },
+        ],
+    }
+}
+
+fn cpos(row: u32, offset: u32) -> BridgeLogicalPos {
+    BridgeLogicalPos {
+        path: cell_path(row),
+        offset,
+    }
+}
+
+/// Issues #479 / #480 — in a table-only tree a position inside any cell
+/// survives its own clamp (only its offset snaps to a char boundary); an
+/// unresolvable path still falls back to the first cell's start (design
+/// review B6).
+#[test]
+fn clamp_pos_keeps_a_valid_position_in_a_table_only_tree() {
+    let text = "b1س\u{301}hello";
+    let d = table_only(text);
+    let end = text.len() as u32;
+    assert_eq!(clamp_pos(&d, cpos(1, end)), cpos(1, end));
+    assert_eq!(clamp_pos(&d, cpos(1, 2)), cpos(1, 2));
+    assert_eq!(clamp_pos(&d, cpos(1, 3)), cpos(1, 2), "snapped into `س`");
+    assert_eq!(clamp_pos(&d, cpos(1, 99)), cpos(1, end), "capped");
+    assert_eq!(clamp_pos(&d, cpos(0, 0)), cpos(0, 0));
+    assert_eq!(clamp_pos(&d, bpos_top(7, 3)), cpos(0, 0), "B6 fallback");
+}
+
+/// Issues #479 / #480 — the engine-level symptom: a selection set inside a
+/// table-only document's second cell is kept, and it is valid (the
+/// reproducers' `SelectWordAt` / `SelectParagraphAt` selected exactly
+/// such a range, then failed the selection invariant).
+#[test]
+fn a_selection_in_a_table_only_document_stays_valid() {
+    let text = "\u{301}a & b\u{301}";
+    let mut e = engine_with(table_only(text));
+    let evt = apply(
+        &mut e,
+        Command::SetSelection {
+            range: BridgeLogicalRange {
+                start: cpos(1, 0),
+                end: cpos(1, 2),
+            },
+            caret: cpos(1, 2),
+        },
+    );
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    let sel = e.selection.clone().expect("selection");
+    assert_eq!(
+        (sel.anchor.clone(), sel.caret.clone()),
+        (cpos(1, 0), cpos(1, 2))
+    );
+    let doc = e.undo.current();
+    assert_eq!(
+        clamp_pos(doc, sel.anchor.clone()),
+        sel.anchor,
+        "valid anchor"
+    );
+    assert_eq!(clamp_pos(doc, sel.caret.clone()), sel.caret, "valid caret");
+}

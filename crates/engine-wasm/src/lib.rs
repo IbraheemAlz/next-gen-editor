@@ -7268,6 +7268,20 @@ fn text_file_over_limits(
 /// "unchanged by clamping" is exactly the validity test
 /// (`Engine::selection_is_valid`).
 fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    let engine_path = bridge_to_engine_path(pos.path);
+    /* Issues #479 / #480 — a position that addresses a real paragraph
+    keeps it (offset snapped to a char boundary) in EVERY tree. The
+    table-only fallback below used to run first and collapse every
+    position — a valid one in any cell included — to the first cell's
+    start, so a word / paragraph selection in a table-only story (or a
+    restored table-only body) never survived its own clamp. */
+    if let Some(p) = doc.paragraph_at_path(&engine_path) {
+        let offset = p.snap_offset(pos.offset);
+        return BridgeLogicalPos {
+            path: engine_to_bridge_path(engine_path),
+            offset,
+        };
+    }
     /* Design review B6 — a TABLE-ONLY tree (a letterhead header whose
     sole block is a table) has paragraph_count() == 0 but real caret
     homes inside the cells; the old `bpos_top(0, 0)` fast-path parked
@@ -7283,21 +7297,14 @@ fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
             None => bpos_top(0, 0),
         };
     }
-    let engine_path = bridge_to_engine_path(pos.path.clone());
-    let (resolved_path, offset) = match doc.paragraph_at_path(&engine_path) {
-        Some(p) => (engine_path, p.snap_offset(pos.offset)),
-        None => {
-            let fallback = doc
-                .path_to_last_paragraph_deep()
-                .unwrap_or(EngineBlockPath::top(0));
-            let offset = doc
-                .paragraph_at_path(&fallback)
-                .map_or(0, |p| p.snap_offset(pos.offset));
-            (fallback, offset)
-        }
-    };
+    let fallback = doc
+        .path_to_last_paragraph_deep()
+        .unwrap_or(EngineBlockPath::top(0));
+    let offset = doc
+        .paragraph_at_path(&fallback)
+        .map_or(0, |p| p.snap_offset(pos.offset));
     BridgeLogicalPos {
-        path: engine_to_bridge_path(resolved_path),
+        path: engine_to_bridge_path(fallback),
         offset,
     }
 }
