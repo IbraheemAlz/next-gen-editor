@@ -21,6 +21,7 @@ import { errorCommand } from '@nge/core';
 import type { Command, ErrorKind, Event } from '../engine/types';
 import { readWarningCounts, type ReadWarningCount } from './read-warning-counts';
 import { saveNoteCounts, type SaveNoteCount } from './save-note-counts';
+import { layoutCachesSample, type LayoutCachesSample } from './layout-cache-sample';
 import { installDevHook } from '../dev-hooks';
 
 type ErrorCode =
@@ -112,7 +113,16 @@ function recoveryFlags(r: TelemetryRecoveryReport): RecoveryFlags {
 }
 
 type TelemetryKind =
-    | { type: 'PAINT_TIMING'; p50: number; p95: number; p99: number }
+    | {
+          type: 'PAINT_TIMING';
+          p50: number;
+          p95: number;
+          p99: number;
+          /** Issue #500 - the engine's layout caches (bytes, entries, hit
+           *  ratio) as of this batch's stats read; omitted when the engine
+           *  did not answer, like the Rust `skip_serializing_if`. */
+          layout_caches?: LayoutCachesSample;
+      }
     | { type: 'COMMAND_TIMING'; kind: string; p50: number; p95: number }
     | {
           type: 'ENGINE_STATS';
@@ -539,37 +549,43 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
         }
         const events: TelemetryEvent[] = pending.splice(0, pending.length);
 
+        /* Always sample EngineStats so a window's batch is never empty.
+           Read BEFORE the paint sample is built (issue #500): the layout
+           caches ride on it. */
+        let stats: Event | undefined;
+        try {
+            stats = await originalDispatch({ type: 'REQUEST_STATS' });
+        } catch {
+            /* Engine unavailable (e.g. mid-crash) — skip the stats sample. */
+        }
+
         if (paintSamples.length) {
+            const layoutCaches = stats?.type === 'STATS' ? layoutCachesSample(stats) : undefined;
             events.push(
                 sample({
                     type: 'PAINT_TIMING',
                     p50: percentile(paintSamples, 50),
                     p95: percentile(paintSamples, 95),
                     p99: percentile(paintSamples, 99),
+                    ...(layoutCaches === undefined ? {} : { layout_caches: layoutCaches }),
                 }),
             );
             paintSamples.length = 0;
         }
 
-        /* Always sample EngineStats so a window's batch is never empty. */
-        try {
-            const stats = await originalDispatch({ type: 'REQUEST_STATS' });
-            if (stats.type === 'STATS') {
-                events.push(
-                    sample({
-                        type: 'ENGINE_STATS',
-                        wasm_heap_bytes: stats.wasm_heap_bytes,
-                        document_tree_bytes: stats.document_tree_bytes,
-                        glyph_cache_entries: stats.glyph_cache_entries,
-                        undo_stack_depth: stats.undo_stack_depth,
-                        fonts_resident: stats.fonts_resident,
-                        last_paint_ms: stats.last_paint_ms,
-                        last_command_ms: stats.last_command_ms,
-                    }),
-                );
-            }
-        } catch {
-            /* Engine unavailable (e.g. mid-crash) — skip the stats sample. */
+        if (stats?.type === 'STATS') {
+            events.push(
+                sample({
+                    type: 'ENGINE_STATS',
+                    wasm_heap_bytes: stats.wasm_heap_bytes,
+                    document_tree_bytes: stats.document_tree_bytes,
+                    glyph_cache_entries: stats.glyph_cache_entries,
+                    undo_stack_depth: stats.undo_stack_depth,
+                    fonts_resident: stats.fonts_resident,
+                    last_paint_ms: stats.last_paint_ms,
+                    last_command_ms: stats.last_command_ms,
+                }),
+            );
         }
 
         if (!events.length) return;

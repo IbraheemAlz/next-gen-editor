@@ -28,7 +28,21 @@ pub struct TelemetryEvent {
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TelemetryKind {
     /// Paint-latency percentiles over a sampling window.
-    PaintTiming { p50: f32, p95: f32, p99: f32 },
+    PaintTiming {
+        p50: f32,
+        p95: f32,
+        p99: f32,
+        /// Issue #500 (item 3) - the engine's layout caches as of this
+        /// batch (`EngineStats.paragraph_cache_*` / `table_cache_*`, read
+        /// when the batch flushes): bytes, entry counts and the hit ratio
+        /// since the engine started, so a cache regression (#497) shows
+        /// up in the field. Numbers only, no document content. Omitted
+        /// from the wire when the engine did not answer the stats request,
+        /// so a sender that predates it keeps its exact shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        layout_caches: Option<LayoutCacheTelemetry>,
+    },
     /// RPC command-latency percentiles for one command `kind`.
     CommandTiming { kind: String, p50: f32, p95: f32 },
     /// A memory / performance counter snapshot.
@@ -133,6 +147,53 @@ pub enum TelemetryKind {
         size_bytes: u32,
         save_notes: Vec<SaveNoteCount>,
     },
+}
+
+/// Issue #500 (item 3) - the layout caches on
+/// [`TelemetryKind::PaintTiming::layout_caches`]: the paragraph cache
+/// (#457) and the content-keyed table box cache (#379). A hit ratio is
+/// `hits / (hits + misses)` over the engine's lifetime (`0.0..=1.0`),
+/// omitted while the cache has seen no lookup.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct LayoutCacheTelemetry {
+    /// Estimated bytes held by the paragraph cache.
+    pub paragraph_bytes: u64,
+    /// Paragraph boxes cached.
+    pub paragraph_entries: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub paragraph_hit_ratio: Option<f32>,
+    /// Estimated bytes held by the table box cache.
+    pub table_bytes: u64,
+    /// Table boxes cached.
+    pub table_entries: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub table_hit_ratio: Option<f32>,
+}
+
+/// Issue #500 - `hits / (hits + misses)`, `None` before the first lookup.
+pub fn cache_hit_ratio(hits: u64, misses: u64) -> Option<f32> {
+    let total = hits.saturating_add(misses);
+    (total > 0).then(|| (hits as f64 / total as f64) as f32)
+}
+
+impl LayoutCacheTelemetry {
+    /// The sample a stats reply stands for.
+    pub fn from_stats(stats: &EngineStats) -> Self {
+        Self {
+            paragraph_bytes: stats.paragraph_cache_bytes,
+            paragraph_entries: stats.paragraph_cache_entries,
+            paragraph_hit_ratio: cache_hit_ratio(
+                stats.paragraph_cache_hits,
+                stats.paragraph_cache_misses,
+            ),
+            table_bytes: stats.table_cache_bytes,
+            table_entries: stats.table_cache_entries,
+            table_hit_ratio: cache_hit_ratio(stats.table_cache_hits, stats.table_cache_misses),
+        }
+    }
 }
 
 /// Issue #485 - one note kind's count on [`TelemetryKind::DocSave::
@@ -553,6 +614,67 @@ mod tests {
             legacy,
             TelemetryKind::DocOpen { read_warnings, .. } if read_warnings.is_empty()
         ));
+    }
+
+    #[test]
+    fn paint_timing_carries_the_layout_caches_and_omits_them_when_absent() {
+        // Issue #500 - additive `layout_caches` on the existing PAINT_TIMING
+        // sample: a sender without it keeps the exact pre-#500 shape.
+        let bare = TelemetryKind::PaintTiming {
+            p50: 1.0,
+            p95: 2.0,
+            p99: 3.0,
+            layout_caches: None,
+        };
+        assert_eq!(
+            roundtrip(&bare),
+            serde_json::json!({ "type": "PAINT_TIMING", "p50": 1.0, "p95": 2.0, "p99": 3.0 })
+        );
+        let stats = EngineStats {
+            wasm_heap_bytes: 0,
+            document_tree_bytes: 0,
+            glyph_cache_entries: 0,
+            undo_stack_depth: 0,
+            fonts_resident: 0,
+            last_paint_ms: 0.0,
+            last_command_ms: 0.0,
+            paragraph_count: 0,
+            word_count: 0,
+            character_count: 0,
+            paragraph_cache_bytes: 1024,
+            paragraph_cache_entries: 4,
+            paragraph_cache_hits: 3,
+            paragraph_cache_misses: 1,
+            table_cache_bytes: 0,
+            table_cache_entries: 0,
+            table_cache_hits: 0,
+            table_cache_misses: 0,
+        };
+        let kind = TelemetryKind::PaintTiming {
+            p50: 1.0,
+            p95: 2.0,
+            p99: 3.0,
+            layout_caches: Some(LayoutCacheTelemetry::from_stats(&stats)),
+        };
+        assert_eq!(
+            roundtrip(&kind),
+            serde_json::json!({
+                "type": "PAINT_TIMING", "p50": 1.0, "p95": 2.0, "p99": 3.0,
+                "layout_caches": {
+                    "paragraph_bytes": 1024, "paragraph_entries": 4,
+                    "paragraph_hit_ratio": 0.75,
+                    "table_bytes": 0, "table_entries": 0
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn cache_hit_ratio_is_none_before_the_first_lookup() {
+        assert_eq!(cache_hit_ratio(0, 0), None);
+        assert_eq!(cache_hit_ratio(0, 5), Some(0.0));
+        assert_eq!(cache_hit_ratio(5, 0), Some(1.0));
+        assert_eq!(cache_hit_ratio(u64::MAX, u64::MAX), Some(0.5));
     }
 
     #[test]

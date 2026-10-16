@@ -20,6 +20,7 @@
 import { createRoot, createSignal, onCleanup, type Accessor } from 'solid-js';
 import { useEngine, type EngineHandle } from './EngineProvider';
 import { errorCommand } from './errorCommand';
+import { layoutCacheStatsFrom, type LayoutCacheStats } from './layoutCaches';
 import type {
     Alignment,
     AttrsMixed,
@@ -118,6 +119,14 @@ export interface EditorState {
     canRedo: Accessor<boolean>;
     /** Latest engine stats; updates every `REQUEST_STATS` reply. */
     stats: Accessor<EngineStats | undefined>;
+    /**
+     * Issue #500 - the engine's layout caches (the paragraph cache, #457,
+     * and the table box cache, #379) as the latest `STATS` reply reports
+     * them: bytes, entry count, lookup counters and the hit ratio since
+     * the engine started. `undefined` before the first reply. Moves only
+     * when stats are requested (the Dev HUD polls while it is open).
+     */
+    layoutCacheStats: Accessor<LayoutCacheStats | undefined>;
     /** Last paint timing in ms; updates every PAINTED event. */
     lastPaintMs: Accessor<number>;
     /** Latest paint version — bumps every repaint. */
@@ -748,6 +757,7 @@ export function createEditorState(): EditorState {
         canUndo,
         canRedo,
         stats,
+        layoutCacheStats: () => layoutCacheStatsFrom(stats()),
         lastPaintMs,
         paintVersion,
         estimatedDocumentHeight,

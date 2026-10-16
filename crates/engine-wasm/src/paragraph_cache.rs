@@ -58,11 +58,11 @@ struct CachedParagraph {
     bytes: usize,
 }
 
-/// Hit / miss counts of [`ParagraphCache::get`] since creation (tests and
-/// profiling; a hit that fails the verified-hit check still counts as a
-/// hit here — the mismatch is reported by
-/// `LayoutDegradeReason::CacheMismatch`).
-#[cfg(test)]
+/// Hit / miss counts of [`ParagraphCache::get`] since creation. Issue #500
+/// (item 3): maintained always — two `u64` increments per lookup — and
+/// reported on `EngineStats`; a hit that fails the verified-hit check
+/// still counts as a hit here — the mismatch is reported by
+/// `LayoutDegradeReason::CacheMismatch`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ParagraphCacheStats {
     pub(crate) hits: u64,
@@ -78,7 +78,6 @@ pub(crate) struct ParagraphCache {
     budget_bytes: usize,
     max_entry_bytes: usize,
     max_entries: usize,
-    #[cfg(test)]
     stats: ParagraphCacheStats,
 }
 
@@ -98,7 +97,6 @@ impl ParagraphCache {
             budget_bytes,
             max_entry_bytes: budget_bytes / 8,
             max_entries: max_entries.max(1),
-            #[cfg(test)]
             stats: ParagraphCacheStats::default(),
         }
     }
@@ -106,7 +104,6 @@ impl ParagraphCache {
     /// The cached box for `key`, marked most recently used.
     pub(crate) fn get(&mut self, key: &u64) -> Option<&ParagraphBox> {
         let found = self.entries.get(key);
-        #[cfg(test)]
         if found.is_some() {
             self.stats.hits += 1;
         } else {
@@ -150,8 +147,7 @@ impl ParagraphCache {
         }
     }
 
-    /// Number of cached paragraph boxes (tests / profiling).
-    #[cfg(test)]
+    /// Number of cached paragraph boxes.
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -161,8 +157,7 @@ impl ParagraphCache {
         self.entries.is_empty()
     }
 
-    /// Estimated bytes held by the cached boxes (tests / profiling).
-    #[cfg(test)]
+    /// Estimated bytes held by the cached boxes.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -173,8 +168,8 @@ impl ParagraphCache {
         self.budget_bytes
     }
 
-    /// Hit / miss counts since creation (tests / profiling).
-    #[cfg(test)]
+    /// Hit / miss counts since creation (the counters survive
+    /// [`ParagraphCache::clear`]).
     pub(crate) fn stats(&self) -> ParagraphCacheStats {
         self.stats
     }

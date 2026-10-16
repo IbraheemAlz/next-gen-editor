@@ -130,6 +130,16 @@ export type { RecoveryNotice, RecoveryNoticeKind, RecoveryNoticeOptions } from '
 /* Issue #485 - the writer's save report (`lastSaveNotes()`), worded. */
 export { describeSaveNote, saveNoteCount, saveNoteKind, saveNotices } from './saveNotes';
 
+/* Issue #500 - the engine's layout caches (`layoutCacheStats()`), worded. */
+export {
+    cacheHitRatio,
+    formatCacheBytes,
+    formatHitRatio,
+    formatLayoutCaches,
+    layoutCacheStatsFrom,
+} from './layoutCaches';
+export type { LayoutCacheFigures, LayoutCacheStats } from './layoutCaches';
+
 /* Issue #406 — the reader's warning report for the open document. */
 export { READ_WARNING_LABELS, openWarningCount, describeReadWarning } from './openWarnings';
 

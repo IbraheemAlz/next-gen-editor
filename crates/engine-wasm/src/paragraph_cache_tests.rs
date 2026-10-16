@@ -400,3 +400,98 @@ fn profile_paragraph_cache_warm_vs_cold() {
     }
     eprintln!("loadavg at end: {}", load());
 }
+
+/* ====================================================================
+Issue #500 (item 3) — the layout caches are observable on `EngineStats`.
+==================================================================== */
+
+/// `Command::RequestStats` through the real dispatcher.
+#[cfg(feature = "fuzz-native")]
+fn request_stats(engine: &mut Engine) -> bridge::EngineStats {
+    match engine.apply_sync(Command::RequestStats) {
+        Event::Stats(stats) => stats,
+        other => panic!("expected Stats, got {other:?}"),
+    }
+}
+
+/// Open a document of many paragraphs and a table, repaint it twice, and
+/// read the caches off `EngineStats`: the first paint filled them (misses,
+/// bytes, entries), the second is served from them (hits grow, nothing
+/// new is laid out) and the bytes stay inside the paragraph budget.
+#[cfg(feature = "fuzz-native")]
+#[test]
+fn engine_stats_report_the_layout_caches_and_a_repaint_hits() {
+    let mut body = String::new();
+    for i in 0..40 {
+        body.push_str(&format!(
+            "<w:p><w:r><w:t>Paragraph {i:03}: the quick brown fox jumps over the lazy dog.</w:t></w:r></w:p>"
+        ));
+    }
+    body.push_str(
+        "<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/></w:tblPr>\
+         <w:tblGrid><w:gridCol w:w=\"2000\"/><w:gridCol w:w=\"2000\"/></w:tblGrid>\
+         <w:tr><w:tc><w:p><w:r><w:t>cell a</w:t></w:r></w:p></w:tc>\
+         <w:tc><w:p><w:r><w:t>cell b</w:t></w:r></w:p></w:tc></w:tr></w:tbl>",
+    );
+    let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+    let opened = engine.apply_sync(Command::OpenDocument {
+        bytes: format_docx::test_fixtures::docx_with_body(&body),
+        format: DocFormat::Docx,
+        name: None,
+        limits: None,
+        defaults: None,
+        password: None,
+    });
+    assert!(
+        matches!(opened, Event::DocumentLoaded { .. }),
+        "expected DocumentLoaded, got {opened:?}"
+    );
+
+    engine.build_pages(1.0, false, None).expect("first paint");
+    let first = request_stats(&mut engine);
+    assert!(first.paragraph_cache_entries >= 40, "{first:?}");
+    assert!(first.paragraph_cache_bytes > 0, "{first:?}");
+    assert!(first.paragraph_cache_misses >= 40, "{first:?}");
+    assert!(first.table_cache_entries >= 1, "{first:?}");
+    assert!(first.table_cache_bytes > 0, "{first:?}");
+    assert!(first.table_cache_misses >= 1, "{first:?}");
+
+    engine.build_pages(1.0, false, None).expect("second paint");
+    let second = request_stats(&mut engine);
+    assert!(
+        second.paragraph_cache_hits > first.paragraph_cache_hits,
+        "{first:?} -> {second:?}"
+    );
+    assert_eq!(
+        second.paragraph_cache_misses, first.paragraph_cache_misses,
+        "the repaint must not lay a paragraph out again"
+    );
+    assert!(
+        second.table_cache_hits > first.table_cache_hits,
+        "{first:?} -> {second:?}"
+    );
+    assert_eq!(second.table_cache_misses, first.table_cache_misses);
+    assert_eq!(
+        (second.paragraph_cache_entries, second.paragraph_cache_bytes),
+        (first.paragraph_cache_entries, first.paragraph_cache_bytes),
+        "a warm repaint adds nothing"
+    );
+    assert!(second.paragraph_cache_bytes <= PARAGRAPH_CACHE_BUDGET_BYTES as u64);
+    assert!(second.table_cache_bytes > 0);
+
+    /* The counters outlive a clear; the contents do not. */
+    engine.layout_cache.get_mut().clear();
+    let cleared = request_stats(&mut engine);
+    assert_eq!(
+        (
+            cleared.paragraph_cache_entries,
+            cleared.paragraph_cache_bytes
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        (cleared.table_cache_entries, cleared.table_cache_bytes),
+        (0, 0)
+    );
+    assert_eq!(cleared.paragraph_cache_hits, second.paragraph_cache_hits);
+}
