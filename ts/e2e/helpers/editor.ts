@@ -47,12 +47,16 @@ export async function viewportScroll(page: Page): Promise<ViewportScroll> {
  *
  *  1. A pending caret reveal. Every selection move (`SET_SELECTION` too)
  *     stamps `SELECTION_CHANGED.reveal_caret`; the shell scrolls the caret
- *     into view one frame later (rAF, with a 120 ms timer as the hidden-tab
- *     fallback - `createCaretReveal`). A spec that dispatches `caretAt(0)`
- *     and immediately scrolls away can have that reveal land AFTER its
- *     scroll and pull the viewport back to the caret (`scrollTop` 104, the
- *     caret's reveal position): the merge-gate flake read 104 for the whole
- *     5 s poll, because nothing ever scrolls away again.
+ *     into view (`createCaretReveal`). It used to do so one frame later
+ *     (rAF, with a 120 ms timer as the hidden-tab fallback), so a spec that
+ *     dispatched `caretAt(0)` and immediately scrolled away had that reveal
+ *     land AFTER its scroll and pull the viewport back to the caret
+ *     (`scrollTop` 104, the caret's reveal position): the merge-gate flake
+ *     read 104 for the whole 5 s poll, because nothing ever scrolls away
+ *     again. Issue #486 fixed the cause (the reveal is synchronous with the
+ *     event and yields to a later scroll - `caret-reveal-intent.spec.ts`);
+ *     the settle window below stays as a belt for hosts whose geometry
+ *     arrives late.
  *  2. Lazy layout. The document is laid out in bands (`LazyLayoutState` +
  *     `Command::ExpandLayout`) and `scrollHeight` only grows as they land,
  *     so a single `scrollTop = n` clamps to the height that exists at that
@@ -133,12 +137,17 @@ export async function settle(page: Page): Promise<void> {
  *  - `{ key }`: a keydown of `key` (a `KeyboardEvent.key`, e.g.
  *    `'ArrowDown'`, `'End'`, `'PageDown'`) on the hidden textarea, with
  *    optional Shift / Ctrl(Cmd on macOS) — the shell's real key handler
+ *  - `{ wheel }`: a user wheel flick over `.editor-viewport` (issue #486):
+ *    the real `wheel` event, then the scroll it would have performed
+ *    (`scrollTop += dy`) - a synthetic wheel event has no default action
+ *    of its own
  *  - any other string: an `insertText` beforeinput carrying that text */
 export type BurstStep =
     | string
     | { pointerdown: { x: number; y: number; page?: number; shift?: boolean } }
     | { pointerup: true; page?: number }
-    | { key: string; shift?: boolean; ctrl?: boolean };
+    | { key: string; shift?: boolean; ctrl?: boolean }
+    | { wheel: { dy: number } };
 
 /** Fire `steps` as ONE synchronous burst on the main thread (see the file
  *  header). Resolves once the burst has been POSTED; read results through
@@ -183,7 +192,18 @@ export async function burst(page: Page, steps: BurstStep[]): Promise<void> {
         };
         for (const s of steps) {
             if (typeof s !== 'string') {
-                if ('key' in s) {
+                if ('wheel' in s) {
+                    const v = document.querySelector<HTMLElement>('.editor-viewport');
+                    if (!v) throw new Error('editor viewport missing');
+                    v.dispatchEvent(
+                        new WheelEvent('wheel', {
+                            deltaY: s.wheel.dy,
+                            bubbles: true,
+                            cancelable: true,
+                        }),
+                    );
+                    v.scrollTop += s.wheel.dy;
+                } else if ('key' in s) {
                     const ctrl = s.ctrl === true;
                     ta.dispatchEvent(
                         new KeyboardEvent('keydown', {

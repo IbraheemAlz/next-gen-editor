@@ -372,6 +372,8 @@ export class EngineClient {
      *  event fans out to subscribers) and whenever in-flight writes are
      *  abandoned (trap / respawn / retire). See `writeEpoch`. */
     private writeEpochCounter = 0;
+    /** Issue #486 — see `lastSelectionMoveSentAt`. */
+    private selectionMoveSentAt: number | undefined;
     private documentId: string;
     private onCrash: () => void;
     private recovering = false;
@@ -1259,6 +1261,9 @@ export class EngineClient {
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {
         const write = isWrite(cmd);
+        if (commandMeta(cmd.type).moves_selection) {
+            this.selectionMoveSentAt = performance.now();
+        }
         if (write) this.pendingWrites += 1;
         let r: WorkerReply;
         try {
@@ -1269,6 +1274,14 @@ export class EngineClient {
         if (!r.ok) throw new Error(r.error);
         this.clean = nextCleanState(this.clean, cmd, r.evt!);
         return r.evt!;
+    }
+
+    /** Issue #486 — `performance.now()` when the last selection-moving
+     *  command (`CommandMeta.moves_selection`) was dispatched: the caret
+     *  reveal tells a user scroll made after it (even before its reply)
+     *  from one made before. `undefined` until the first one. */
+    get lastSelectionMoveSentAt(): number | undefined {
+        return this.selectionMoveSentAt;
     }
 
     /** Issue #57 — dispatched commands that may move the selection or

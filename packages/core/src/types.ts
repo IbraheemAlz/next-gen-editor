@@ -188,6 +188,17 @@ export interface EngineClientLike {
      */
     readonly lastRecovery?: RecoveryReport | undefined;
     onRecovery?(fn: (report: RecoveryReport) => void): () => void;
+    /**
+     * Issue #486 - optional: `performance.now()` at which the most recent
+     * selection-moving command (`CommandMeta.moves_selection`) was handed
+     * to the worker, `undefined` before any. The caret reveal (#387) is the
+     * consequence of such a command; a user scroll made AFTER it was sent
+     * (even before the engine's reply arrives) is the user's last word and
+     * the reveal must not undo it. A client that omits it makes the
+     * reveal fall back to "the reply arrived", which still protects the
+     * window between the reply and the scroll.
+     */
+    readonly lastSelectionMoveSentAt?: number | undefined;
 }
 
 /** Issue #388 - see `EngineClientLike.previousSession`. */
