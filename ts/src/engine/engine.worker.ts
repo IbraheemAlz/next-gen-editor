@@ -1395,6 +1395,10 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             tailDropped,
             /* Issue #390 - replay-tail commands whose row was never written. */
             journalGap,
+            /* Issue #503 - values the restore clamped into Word's limits, and
+               replayed commands the argument guards refused (skipped). */
+            boundsRepaired: recovered?.bounds_repaired ?? 0,
+            refusedCommands: recovered?.refused_commands ?? 0,
             /* Issue #315 — when the restored snapshot was persisted, so
                the shell can say since when edits were lost. */
             ...(restored && base.takenAt !== undefined ? { baseTakenAt: base.takenAt } : {}),

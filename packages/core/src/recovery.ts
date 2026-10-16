@@ -23,6 +23,9 @@ export type RecoveryNoticeKind =
     | 'checkpoint-failing'
     | 'journal-failing'
     | 'journal-gap'
+    /* Issue #503 - restore / replay held to Word's size and point limits. */
+    | 'commands-refused'
+    | 'bounds-repaired'
     | 'previous-session'
     /* Issue #485 - a save that was repaired (`DOCUMENT_SAVED.notes`). */
     | 'save-notes';
@@ -108,6 +111,30 @@ export function recoveryNotices(
                 'before it crashed (browser storage was failing), so the recovered document ' +
                 'is missing them.',
             action: 'Review the document and redo your most recent edits before saving.',
+        });
+    }
+    if (report.refusedCommands !== undefined && report.refusedCommands > 0) {
+        const n = report.refusedCommands;
+        notices.push({
+            kind: 'commands-refused',
+            title: 'Some edits could not be replayed',
+            detail:
+                `${n} logged ${n === 1 ? 'edit' : 'edits'} outside Word’s limits ` +
+                `${n === 1 ? 'was' : 'were'} skipped while recovering, so the recovered ` +
+                'document does not include them.',
+            action: 'Review the document and redo any edit you expected to see.',
+        });
+    }
+    if (report.boundsRepaired !== undefined && report.boundsRepaired > 0) {
+        const n = report.boundsRepaired;
+        notices.push({
+            kind: 'bounds-repaired',
+            title: 'Some values were adjusted during recovery',
+            detail:
+                `${n} ${n === 1 ? 'value' : 'values'} outside Word’s limits ` +
+                `${n === 1 ? 'was' : 'were'} clamped (font sizes to 1–1638 pt; margins, ` +
+                'indents, spacing and tab stops to 22 in).',
+            action: 'Check sizes and spacing in the recovered document.',
         });
     }
     if (report.rendererDowngraded && report.rendererDowngrade) {

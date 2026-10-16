@@ -201,6 +201,22 @@ pub enum Event {
         /// package, and reports it when none does. `false` otherwise.
         #[serde(default)]
         package_lost: bool,
+        /// Issue #503 - values the restored snapshot carried outside
+        /// Word's font-size / page / paragraph limits (a `1e33` pt run, a
+        /// `1e9` pt margin) that `Engine::restore` clamped into them: the
+        /// command guards and the readers refuse or clamp those on their
+        /// doors, and a snapshot is a door they never see. Counted for the
+        /// current document (not once per undo step that shares the
+        /// value). `0` for a snapshot the engine wrote itself.
+        #[serde(default)]
+        bounds_repaired: u32,
+        /// Issue #503 - replayed log-tail commands the argument guards
+        /// refused (`OutOfRange` / `InvalidArgument`: a size or point
+        /// outside Word's limits, a non-finite number, forbidden text):
+        /// skipped, not applied, and not counted in `applied_commands`.
+        /// `0` on an ordinary recovery.
+        #[serde(default)]
+        refused_commands: u32,
     },
     /// Reply to `Command::Snapshot` (issue #85): the versioned snapshot
     /// envelope (`engine::snapshot`, magic + format version + payload).

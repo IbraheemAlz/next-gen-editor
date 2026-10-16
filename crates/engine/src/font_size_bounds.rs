@@ -45,14 +45,50 @@ pub fn clamp_font_size_pt(pt: f32) -> f32 {
 /// scan stops at the same kind of cap rather than trusting the tree.
 const MAX_SCAN_DEPTH: u32 = 32;
 
-/// The first run (or paragraph-mark) size in `doc` outside
-/// [`MIN_FONT_SIZE_PT`]`..=`[`MAX_FONT_SIZE_PT`], described for a failure
-/// message; `None` when every size is inside it. The executable form of
-/// the rule for the `rpc_command` fuzz target: no command may leave a size
-/// Word cannot hold. Walks the body, table cells at every depth and
-/// text-box stories; an unset size is the document default, not checked.
+/// The first run, paragraph-mark, tracked-format or style size in `doc`
+/// outside [`MIN_FONT_SIZE_PT`]`..=`[`MAX_FONT_SIZE_PT`], described for a
+/// failure message; `None` when every size is inside it. The executable
+/// form of the rule for the `rpc_command` and `snapshot_decode` fuzz
+/// targets: no command may leave - and no restored snapshot may hold - a
+/// size Word cannot hold. Walks the body, table cells at every depth,
+/// text-box stories, header / footer / note stories, the style table and
+/// the document run defaults (issue #503: what `DocumentTree::
+/// repair_bounds` repairs, so "restore, then the rule holds"); an unset
+/// size is the document default, not checked.
 pub fn first_font_size_beyond_bound(doc: &crate::DocumentTree) -> Option<String> {
-    scan_blocks(doc.blocks.iter(), 0)
+    if let Some(why) = scan_style(&doc.style_run_defaults) {
+        return Some(format!("document run defaults: {why}"));
+    }
+    let mut style_ids: Vec<&String> = doc.styles.keys().collect();
+    style_ids.sort();
+    for id in style_ids {
+        if let Some(why) = doc.styles.get(id).and_then(|s| scan_style(&s.run)) {
+            return Some(format!("style {id}: {why}"));
+        }
+    }
+    if let Some(why) = scan_blocks(doc.blocks.iter(), 0) {
+        return Some(why);
+    }
+    let mut stories: Vec<(&String, &Vec<crate::Block>)> =
+        doc.headers.iter().chain(doc.footers.iter()).collect();
+    stories.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, blocks) in stories {
+        if let Some(why) = scan_blocks(blocks.iter(), 0) {
+            return Some(format!("story {id}: {why}"));
+        }
+    }
+    let mut notes: Vec<_> = doc
+        .footnote_stories
+        .iter()
+        .chain(doc.endnote_stories.iter())
+        .collect();
+    notes.sort_by_key(|(id, _)| **id);
+    for (id, note) in notes {
+        if let Some(why) = scan_blocks(note.body.iter(), 0) {
+            return Some(format!("note {id}: {why}"));
+        }
+    }
+    None
 }
 
 fn scan_blocks<'a>(
@@ -92,6 +128,11 @@ fn scan_paragraph(para: &crate::Paragraph, depth: u32) -> Option<String> {
     }
     if let Some(why) = para.mark_style.as_deref().and_then(scan_style) {
         return Some(format!("paragraph mark: {why}"));
+    }
+    for rev in &para.revisions {
+        if let Some(why) = rev.prev_attrs.as_ref().and_then(scan_style) {
+            return Some(format!("tracked format change: {why}"));
+        }
     }
     for io in &para.inline_objects {
         if let crate::InlineKind::TextBox { story, .. } = &io.kind
