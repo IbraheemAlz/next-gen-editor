@@ -14493,57 +14493,63 @@ impl Engine {
                 .as_deref()
                 .is_some_and(|n| !n.trim().is_empty());
         let cs_named = direct.font_family_cs.is_some();
+        /* Issue #474 — the third element is the theme origin, kept apart
+        from the source: a substituted family reads `Substituted` and
+        would otherwise lose the fact that a theme binding named it. */
         let resolve = |class, hint, named: bool| match caret.full.resolve_font(theme, class, hint) {
-            Some(r) if r.from_theme => (Some(r.family), bridge::FontSource::Theme),
-            Some(r) if named => (Some(r.family), bridge::FontSource::Explicit),
-            Some(r) => (Some(r.family), bridge::FontSource::Style),
-            None => (None, bridge::FontSource::Default),
+            Some(r) if r.from_theme => (Some(r.family), bridge::FontSource::Theme, true),
+            Some(r) if named => (Some(r.family), bridge::FontSource::Explicit, false),
+            Some(r) => (Some(r.family), bridge::FontSource::Style, false),
+            None => (None, bridge::FontSource::Default, false),
         };
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let full = &caret.full;
         /* Built at most once, and only when a slot falls to `Default` or
         names a family the substitution table may serve (issue #329). */
         let stack = std::cell::OnceCell::new();
-        let slot = |(family, source): (Option<EngineFontFamily>, bridge::FontSource),
-                    script: text_pipeline::Script,
-                    size: Option<f32>,
-                    bold: Option<bool>,
-                    italic: Option<bool>| {
-            let (bold, italic) = (bold.unwrap_or(false), italic.unwrap_or(false));
-            /* Issue #329 — a named family the engine does not have, served
-            by the substitution table, reports `Substituted`. */
-            let source = match &family {
-                Some(f) if self.is_substituted(&stack, font_family_id(f), script, bold, italic) => {
-                    bridge::FontSource::Substituted
-                }
-                _ => source,
+        let slot =
+            |(family, source, from_theme): (Option<EngineFontFamily>, bridge::FontSource, bool),
+             script: text_pipeline::Script,
+             size: Option<f32>,
+             bold: Option<bool>,
+             italic: Option<bool>| {
+                let (bold, italic) = (bold.unwrap_or(false), italic.unwrap_or(false));
+                /* Issue #329 — a named family the engine does not have, served
+                by the substitution table, reports `Substituted`. */
+                let source = match &family {
+                    Some(f)
+                        if self.is_substituted(&stack, font_family_id(f), script, bold, italic) =>
+                    {
+                        bridge::FontSource::Substituted
+                    }
+                    _ => source,
+                };
+                let (id, name) = match family {
+                    Some(f) => (font_family_id(&f).to_string(), f.display_name().to_string()),
+                    None => {
+                        let id = self.default_face_for(&stack, script, bold, italic);
+                        let name = EngineFontFamily::from_id(&id)
+                            .map(|f| f.display_name().to_string())
+                            .unwrap_or_default();
+                        (id, name)
+                    }
+                };
+                let format = bridge::BridgeSlotFormat {
+                    font_family: id,
+                    font_size: size.unwrap_or(default_size),
+                    bold,
+                    italic,
+                };
+                (name, (source, from_theme), format)
             };
-            let (id, name) = match family {
-                Some(f) => (font_family_id(&f).to_string(), f.display_name().to_string()),
-                None => {
-                    let id = self.default_face_for(&stack, script, bold, italic);
-                    let name = EngineFontFamily::from_id(&id)
-                        .map(|f| f.display_name().to_string())
-                        .unwrap_or_default();
-                    (id, name)
-                }
-            };
-            let format = bridge::BridgeSlotFormat {
-                font_family: id,
-                font_size: size.unwrap_or(default_size),
-                bold,
-                italic,
-            };
-            (name, source, format)
-        };
-        let (latin_name, latin_source, latin) = slot(
+        let (latin_name, (latin_source, latin_theme), latin) = slot(
             resolve(engine::FontClass::Latin, None, latin_named),
             text_pipeline::Script::Latin,
             full.font_size,
             full.bold,
             full.italic,
         );
-        let (cs_name, cs_source, complex_script) = slot(
+        let (cs_name, (cs_source, cs_theme), complex_script) = slot(
             resolve(
                 engine::FontClass::ComplexScript,
                 Some(caret.script_hint),
@@ -14560,6 +14566,8 @@ impl Engine {
             sources: bridge::BridgeFontSources {
                 latin: latin_source,
                 complex_script: cs_source,
+                latin_from_theme: latin_theme,
+                complex_script_from_theme: cs_theme,
             },
             formats: bridge::BridgeSlotFormats {
                 latin,

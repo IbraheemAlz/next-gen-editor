@@ -1257,10 +1257,29 @@ pub struct FontSubstitution {
 }
 
 /// Issue #423 — [`FontSource`] per script slot.
+///
+/// Issue #474 — `*_from_theme` records the theme origin independently of
+/// `latin` / `complex_script`: a family the engine substitutes reads
+/// `Substituted` whatever cascade level named it, which used to hide that
+/// the document's theme did ("Calibri" through `+Body` shows "(Carlito)",
+/// not "(theme → Carlito)"). It is `true` whenever the slot's family was
+/// named by a theme binding — so it is redundant with `Theme` and is the
+/// only carrier of the origin when the source reads `Substituted`.
+/// Additive: skipped on the wire when `false`, absent decodes as `false`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BridgeFontSources {
     pub latin: FontSource,
     pub complex_script: FontSource,
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[tsify(optional)]
+    pub latin_from_theme: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[tsify(optional)]
+    pub complex_script_from_theme: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Issue #420 — one script slot of the formatting at the caret, fully
@@ -2097,6 +2116,42 @@ mod a11y_note_wire_tests {
             "{json}"
         );
         assert_eq!(serde_json::from_str::<A11yRun>(&json).unwrap(), r);
+    }
+
+    /// Issue #474 — the theme origin rides on the existing font-source
+    /// struct additively: `false` is skipped on the wire (the pre-#474
+    /// shape), an old payload decodes as `false`, `true` spells its slot.
+    #[test]
+    fn font_source_theme_origin_wire_shape() {
+        let plain = BridgeFontSources {
+            latin: FontSource::Substituted,
+            complex_script: FontSource::Style,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(plain).unwrap(),
+            serde_json::json!({ "latin": "Substituted", "complex_script": "Style" })
+        );
+        let old: BridgeFontSources = serde_json::from_value(
+            serde_json::json!({ "latin": "Theme", "complex_script": "Default" }),
+        )
+        .unwrap();
+        assert!(!old.latin_from_theme && !old.complex_script_from_theme);
+        let themed = BridgeFontSources {
+            latin: FontSource::Substituted,
+            latin_from_theme: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(themed).unwrap(),
+            serde_json::json!({ "latin": "Substituted", "complex_script": "Default",
+                "latin_from_theme": true })
+        );
+        assert_eq!(
+            serde_json::from_value::<BridgeFontSources>(serde_json::to_value(themed).unwrap())
+                .unwrap(),
+            themed
+        );
     }
 
     /// Issue #329 — `substituted` is additive on `FontLoaded` /
