@@ -757,7 +757,10 @@ fn parse_img(body: &str) -> Option<InlineObject> {
                 .and_then(|s| s.trim().trim_end_matches("px").parse::<i64>().ok())
                 .map(css_px_to_emu)
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+        /* Issue #459 - pasted markup is as untrusted as a command: an
+        extent past Word's 22 in (or negative) never reaches layout. */
+        .clamp(0, crate::MAX_DRAWING_EMU);
     let height_emu = extract_attr(body, "data-height-emu")
         .and_then(|s| s.trim().parse::<i64>().ok())
         .or_else(|| {
@@ -765,7 +768,8 @@ fn parse_img(body: &str) -> Option<InlineObject> {
                 .and_then(|s| s.trim().trim_end_matches("px").parse::<i64>().ok())
                 .map(css_px_to_emu)
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .clamp(0, crate::MAX_DRAWING_EMU);
     Some(InlineObject {
         /* `at` is filled in by the caller once the paragraph's running
         text length is known. */
@@ -1706,6 +1710,42 @@ mod tests {
             _ => panic!("expected InlineKind::Image, got {kind:?}"),
         }
     }
+
+    /// Issue #459 - a pasted `<img>` never carries an extent past Word's
+    /// 22 in (or a negative one), whichever attribute spelled it.
+    #[test]
+    fn from_html_clamps_pasted_image_extents() {
+        let extents = |html: &str| {
+            let parsed = from_html(html);
+            match &parsed[0].inline_objects[0].kind {
+                InlineKind::Image {
+                    width_emu,
+                    height_emu,
+                    ..
+                } => (*width_emu, *height_emu),
+                other => panic!("expected an image, got {other:?}"),
+            }
+        };
+        let max = crate::MAX_DRAWING_EMU;
+        assert_eq!(
+            extents(
+                r#"<p><img data-rel-id="r" data-width-emu="9223372036854775807" data-height-emu="-5"/></p>"#
+            ),
+            (max, 0)
+        );
+        assert_eq!(
+            extents(
+                r#"<p><img data-rel-id="r" width="9223372036854775807" height="99999999"/></p>"#
+            ),
+            (max, max)
+        );
+        assert_eq!(
+            extents(r#"<p><img data-rel-id="r" data-width-emu="20116800" height="96"/></p>"#),
+            (max, 914_400),
+            "the bound itself and an ordinary px height pass untouched"
+        );
+    }
+
     fn dirs(paras: &[Paragraph]) -> Vec<Option<TextDirection>> {
         paras.iter().map(|p| p.props.direction).collect()
     }

@@ -332,6 +332,7 @@ fn run_default() -> Result<()> {
     run_ui_save_root_bindings()?;
     run_table_cell_runs_survival()?;
     run_wrap_modes_roundtrip()?;
+    run_wrap_polygon_vertices_roundtrip()?;
     run_toc_roundtrip()?;
     run_text_boxes_roundtrip()?;
     run_nested_text_boxes_roundtrip()?;
@@ -1022,6 +1023,11 @@ fn wrap_modes_document_xml() -> String {
     for (i, (label, attrs, wrap)) in WRAP_CASES.iter().enumerate() {
         body.push_str(&wrap_anchor_paragraph(label, attrs, wrap, 10 + i as u32));
     }
+    wrap_document_xml(&body)
+}
+
+/// The wrap fixtures' `word/document.xml` around `body`.
+fn wrap_document_xml(body: &str) -> String {
     format!(
         concat!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
@@ -1178,6 +1184,144 @@ fn run_wrap_modes_roundtrip() -> Result<()> {
     println!(
         "[roundtrip] step 14c OK — a wrap-mode change regenerates one element, distances kept"
     );
+    Ok(())
+}
+
+/// Issue #459 — the wrap-polygon vertex fixture's three tight-wrap
+/// pictures: a valid polygon, one with a `NaN` vertex coordinate (the
+/// reader reports it and the polygon falls back to the extent rectangle,
+/// never a partial polygon) and one with an out-of-range coordinate
+/// (clamped to 22 in). The source elements ride verbatim either way.
+const POLYGON_CASES: &[(&str, &str)] = &[
+    (
+        "valid",
+        concat!(
+            r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="1">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/>"#,
+            r#"<wp:lineTo x="21600" y="0"/><wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>"#
+        ),
+    ),
+    (
+        "nan",
+        concat!(
+            r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="1">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="NaN" y="21600"/><wp:lineTo x="21600" y="0"/>"#,
+            r#"<wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>"#
+        ),
+    ),
+    (
+        "huge",
+        concat!(
+            r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="1">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="99999999999" y="21600"/><wp:lineTo x="21600" y="0"/>"#,
+            r#"<wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>"#
+        ),
+    ),
+];
+
+fn wrap_polygon_vertices_document_xml() -> String {
+    let body: String = POLYGON_CASES
+        .iter()
+        .enumerate()
+        .map(|(i, (label, wrap))| {
+            wrap_anchor_paragraph(
+                label,
+                r#"distT="0" distB="0" distL="91440" distR="91440" "#,
+                wrap,
+                30 + i as u32,
+            )
+        })
+        .collect();
+    wrap_document_xml(&body)
+}
+
+/// Issue #459 fixture: wrap-polygon vertices that are valid, malformed and
+/// out of range. Rides the `--fixtures` passthrough at drift 0 (the source
+/// wrap element is kept verbatim whatever the reader made of it) and the
+/// default harness's step 14d.
+fn build_wrap_polygon_vertices_docx() -> Vec<u8> {
+    pack_docx_with_png(&wrap_polygon_vertices_document_xml())
+}
+
+/// Issue #459 — step 14d: a polygon vertex goes through the validating
+/// EMU reader. (a) valid → all five vertices; a malformed coordinate →
+/// the polygon is dropped whole (extent-rectangle fallback), never a
+/// partial one; an out-of-range one → clamped to 22 in with every vertex
+/// kept; (b) the zero-edit save is byte-identical for all three; (c) a
+/// wrap-mode change on the dropped-polygon picture writes Word's
+/// full-rectangle polygon, not a remnant of the broken one.
+fn run_wrap_polygon_vertices_roundtrip() -> Result<()> {
+    use engine::{BlockPath, WrapKind};
+
+    let xml = wrap_polygon_vertices_document_xml();
+    let fixture = build_wrap_polygon_vertices_docx();
+    let archive = read_docx(&fixture).context("read polygon fixture")?;
+    let polygons: Vec<Option<Vec<(i64, i64)>>> = archive
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .filter_map(|p| p.inline_objects.first())
+        .filter_map(|o| o.anchor.as_deref())
+        .map(|a| a.wrap_polygon.clone())
+        .collect();
+    let expect: [Option<Vec<(i64, i64)>>; 3] = [
+        Some(vec![(0, 0), (0, 21600), (21600, 21600), (21600, 0), (0, 0)]),
+        None,
+        Some(vec![(0, 0), (20_116_800, 21600), (21600, 0), (0, 0)]),
+    ];
+    if polygons != expect {
+        bail!("polygon fixture lowered wrongly: {polygons:?}, expected {expect:?}");
+    }
+    let details: Vec<String> = archive
+        .warnings
+        .iter()
+        .map(format_docx::DocxWarning::detail)
+        .collect();
+    for want in [
+        r#"wp:lineTo/@x = "NaN""#,
+        r#"wp:lineTo/@x = "99999999999" → 20116800 EMU"#,
+    ] {
+        if !details.iter().any(|d| d == want) {
+            bail!("polygon fixture: no reader warning {want:?} in {details:?}");
+        }
+    }
+    println!("[roundtrip] step 14d OK — polygon vertices read through the EMU reader");
+
+    let untouched = write_docx(&archive, &archive.document).context("untouched polygon save")?;
+    if extract_doc_xml(&untouched)? != xml.as_bytes() {
+        bail!("polygon fixture: the zero-edit save drifted");
+    }
+    println!(
+        "[roundtrip] step 14e OK — the zero-edit save keeps every polygon element byte-for-byte"
+    );
+
+    /* The NaN picture is the second paragraph; switching its wrap mode
+    regenerates the element from the model. */
+    let at = archive
+        .document
+        .paragraph_at_path(&BlockPath::top(1))
+        .and_then(|p| p.inline_objects.first())
+        .map(|o| o.at)
+        .context("nan picture")?;
+    let switched = archive.document.set_floating_image_wrap_at(
+        &BlockPath::top(1),
+        at,
+        WrapKind::Through,
+        false,
+    );
+    let saved = write_docx(&archive, &switched).context("write switched polygon")?;
+    assert_document_xml_well_formed(&saved).context("switched polygon .docx")?;
+    let doc = String::from_utf8(extract_doc_xml(&saved)?).context("utf8 switched")?;
+    if !doc.contains(concat!(
+        r#"<wp:wrapThrough wrapText="bothSides"><wp:wrapPolygon edited="0">"#,
+        r#"<wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/>"#,
+        r#"<wp:lineTo x="21600" y="0"/><wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapThrough>"#
+    )) || doc.matches("NaN").count() != 0
+    {
+        bail!("a dropped polygon did not regenerate as the extent rectangle:\n{doc}");
+    }
+    println!("[roundtrip] step 14f OK — a dropped polygon regenerates as the extent rectangle");
     Ok(())
 }
 
@@ -4494,6 +4638,25 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_texts: WRAP_CASES
                         .iter()
                         .map(|(label, _, _)| format!("{label} \u{FFFC}text"))
+                        .collect(),
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        /* Issue #459 — wrap-polygon vertices: valid, malformed (`NaN`) and
+        out of range; passthrough drift 0 on a zero-edit resave, the reader
+        outcome pinned by step 14d. */
+        PrebuiltFixture {
+            name: "wrap_polygon_vertices.docx",
+            bytes: build_wrap_polygon_vertices_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 3,
+                    paragraph_texts: POLYGON_CASES
+                        .iter()
+                        .map(|(label, _)| format!("{label} \u{FFFC}text"))
                         .collect(),
                 },
                 roundtrip: RoundtripBounds::default(),

@@ -80,13 +80,12 @@ pub(crate) const PAGE_SIZE: MeasureSpec = MeasureSpec {
     max: MAX_TWIPS,
 };
 
-/// EMU per twip (914 400 EMU per inch / 1 440 twips per inch).
-pub(crate) const EMU_PER_TWIP: f64 = 635.0;
-
 /// Word's largest shape extent / offset, 22 in, in EMU (20 116 800) — the
 /// same bound as [`MAX_TWIPS`], and exactly DrawingML's `ST_LineWidth`
-/// maximum.
-pub(crate) const MAX_EMU: f64 = MAX_TWIPS * EMU_PER_TWIP;
+/// maximum. Issue #459 — the number itself lives in the model
+/// (`engine::MAX_DRAWING_EMU`) so the command path shares it; a test pins
+/// the two spellings together.
+pub(crate) const MAX_EMU: f64 = engine::MAX_DRAWING_EMU as f64;
 
 /// `ST_PositiveCoordinate` / `ST_WrapDistance` / `ST_LineWidth` (EMU) —
 /// drawing extents, wrap distances, line widths: non-negative, ≤ 22 in.
@@ -279,6 +278,21 @@ pub(crate) fn attr_emu(e: &BytesStart, key: &[u8], spec: MeasureSpec) -> Option<
     report(emu(&raw, spec), &raw, || describe(e, key)).map(|v| v.round() as i64)
 }
 
+/// Issue #459 — [`attr_emu`] for an attribute the schema REQUIRES (a wrap
+/// polygon vertex's `x` / `y`): absent is as unusable as `NaN`, so it is
+/// reported as [`DocxWarning::InvalidMeasure`] (empty value) rather than
+/// vanishing silently. `None` when absent or unusable.
+pub(crate) fn attr_emu_required(e: &BytesStart, key: &[u8], spec: MeasureSpec) -> Option<i64> {
+    if attr_val(e, key).is_none() {
+        warn(DocxWarning::InvalidMeasure {
+            attr: describe(e, key),
+            value: String::new(),
+        });
+        return None;
+    }
+    attr_emu(e, key, spec)
+}
+
 /// Issue #407 — [`emu`] of an element's TEXT content (`<wp:posOffset>`),
 /// reported as `element`. `None` when unusable.
 pub(crate) fn text_emu(text: &str, spec: MeasureSpec, element: &str) -> Option<i64> {
@@ -390,6 +404,12 @@ mod tests {
         assert_eq!(emu("1e30", EMU_EXTENT), Measure::Clamped(MAX_EMU));
         assert_eq!(emu("-99999999999", EMU_COORD), Measure::Clamped(-MAX_EMU));
         assert_eq!(MAX_EMU, 20_116_800.0, "22 in, DrawingML's ST_LineWidth max");
+        assert_eq!(
+            MAX_EMU,
+            MAX_TWIPS * 635.0,
+            "the model's EMU bound is the twips bound in EMU (914 400 EMU per \
+             inch / 1 440 twips per inch = 635 EMU per twip)"
+        );
     }
 
     /// Issue #407 — VML `style` lengths: units, the caller's bare unit,
