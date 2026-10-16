@@ -45,6 +45,8 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod error_reply;
+/// Issue #491 — open-time `DocxError` → typed `Event::Error` (one table).
+mod open_error;
 /// Issue #379 — the content-keyed table layout cache that survives
 /// between paints.
 mod paragraph_cache;
@@ -17899,26 +17901,11 @@ impl Engine {
                     warnings,
                 }
             }
-            Err(e) => {
-                let kind = match e {
-                    format_docx::DocxError::PackageTooLarge { .. } => {
-                        Some(bridge::ErrorKind::PackageTooLarge)
-                    }
-                    /* Issue #345 — an encrypted (password-protected)
-                    package: the shell says so instead of "not a zip". */
-                    format_docx::DocxError::Encrypted
-                    | format_docx::DocxError::UnsupportedEncryption(_) => {
-                        Some(bridge::ErrorKind::EncryptedDocument)
-                    }
-                    format_docx::DocxError::WrongPassword => Some(bridge::ErrorKind::WrongPassword),
-                    _ => Some(bridge::ErrorKind::InvalidDocument),
-                };
-                Event::Error {
-                    message: format!("{origin}: {e}"),
-                    kind,
-                    command: None,
-                }
-            }
+            /* Issue #491 - one classification table for every open-time
+            failure (`open_error`): the encrypted / too-large / wrong-
+            password kinds as before, a damaged package `DocumentUnreadable`
+            with a scrubbed part + offset message. */
+            Err(e) => open_error::open_error_event(origin, &e),
         }
     }
 
@@ -30249,6 +30236,11 @@ mod document_lifecycle_tests;
 /// Issue #345 — encrypted packages + document protection enforcement.
 #[cfg(test)]
 mod document_protection_tests;
+
+/// Issue #491 — a damaged package answers the typed `DocumentUnreadable`
+/// with the open document untouched (the dispatcher path needs `fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod open_unreadable_tests;
 
 /// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
 mod protection_gate;

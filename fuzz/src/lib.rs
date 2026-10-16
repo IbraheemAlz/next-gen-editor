@@ -890,6 +890,47 @@ mod tests {
         assert!(seen >= 1, "the #439 reproducer is committed");
     }
 
+    /// Issue #491 (item 2) — the #483 reproducer's generated package has a
+    /// main part beyond a faithful repair (`DocxError::MalformedXml`).
+    /// Opened through the real dispatcher it answers the typed
+    /// `DocumentUnreadable` — not an untyped error — naming the part, with
+    /// the open document untouched (issue #341).
+    #[test]
+    fn the_483_reproducer_opens_as_document_unreadable() {
+        let seed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("corpus/docx_roundtrip/repro_483");
+        let data = std::fs::read(&seed).expect("repro_483 is committed");
+        let mut u = Unstructured::new(&data);
+        let bytes = docx_gen::build_docx(&mut u).expect("the generator builds a package");
+        let err = format_docx::read_docx(&bytes).expect_err("#483: refused, not repaired");
+        assert!(
+            matches!(err, format_docx::DocxError::MalformedXml(_)),
+            "{err:?}"
+        );
+
+        let mut engine =
+            engine_wasm::Engine::new_headless(engine::DocumentTree::from_text("keep me"));
+        let before = engine.state_fingerprint_for_fuzzing();
+        let evt = engine.apply_sync(bridge::Command::OpenDocument {
+            bytes,
+            format: bridge::DocFormat::Docx,
+            name: Some("repro_483.docx".to_string()),
+            defaults: None,
+            limits: None,
+            password: None,
+        });
+        let bridge::Event::Error { kind, message, .. } = evt else {
+            panic!("a damaged package answers Error, got {evt:?}");
+        };
+        assert_eq!(
+            kind,
+            Some(bridge::ErrorKind::DocumentUnreadable),
+            "{message}"
+        );
+        assert!(message.contains("word/document.xml"), "{message}");
+        assert_eq!(engine.state_fingerprint_for_fuzzing(), before);
+    }
+
     /// Issues #477–#481 — every committed `snapshot_decode` reproducer
     /// (`corpus/snapshot_decode/repro_*`, raw nightly inputs that drive the
     /// structure-aware session + mutation path) runs without a panic:
