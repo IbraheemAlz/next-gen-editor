@@ -601,6 +601,7 @@ fn print_variant_coverage() {
         "InsertTextBox",
         "SetTableProperties",
         "MoveImage",
+        "ResizeImage",
         "SetSelection",
         "ExtendSelection",
         "SelectAll",

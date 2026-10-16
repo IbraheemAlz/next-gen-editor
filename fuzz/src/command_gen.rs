@@ -104,6 +104,43 @@ fn small_i64(u: &mut Unstructured, max: i64) -> i64 {
     u.int_in_range(-max..=max).unwrap_or(0)
 }
 
+/// Issue #459 - the values the 22 in drawing bound
+/// (`engine::MAX_DRAWING_EMU`) pivots on, for an integer EMU command field:
+/// the `i64` extremes, zero and +-1, the bound and one past it on each
+/// side. The command path must refuse every one that is outside (extent
+/// `1..=bound`, offset `-bound..=bound`) with `OutOfRange` and leave the
+/// document alone, and a value inside must never push a picture past it.
+fn hostile_emu(u: &mut Unstructured) -> i64 {
+    const BOUND: i64 = engine::MAX_DRAWING_EMU;
+    const EDGES: [i64; 14] = [
+        i64::MAX,
+        i64::MAX - 1,
+        i64::MIN,
+        i64::MIN + 1,
+        0,
+        1,
+        -1,
+        BOUND,
+        BOUND + 1,
+        BOUND - 1,
+        -BOUND,
+        -BOUND - 1,
+        -BOUND + 1,
+        i32::MAX as i64,
+    ];
+    u.choose(&EDGES).copied().unwrap_or(0)
+}
+
+/// An EMU extent / offset: usually a small bounded value (`small`), a
+/// quarter of the time one of [`hostile_emu`]'s edges (issue #459).
+fn emu_or_hostile(u: &mut Unstructured, small: i64) -> i64 {
+    if u.ratio(1, 4).unwrap_or(false) {
+        hostile_emu(u)
+    } else {
+        small_i64(u, small)
+    }
+}
+
 fn pos(u: &mut Unstructured) -> LogicalPos {
     LogicalPos {
         path: BlockPath::top(small(u, 3)),
@@ -936,8 +973,8 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
         25 => Command::MoveImage {
             path: BlockPath::top(small(u, 3)),
             at: small(u, 40),
-            offset_h_emu: small_i64(u, 2_000_000),
-            offset_v_emu: small_i64(u, 2_000_000),
+            offset_h_emu: emu_or_hostile(u, 2_000_000),
+            offset_v_emu: emu_or_hostile(u, 2_000_000),
             story: story_chain(u),
         },
         _ => Command::ExitHeaderFooter,
@@ -1035,7 +1072,7 @@ fn gen_note_command(u: &mut Unstructured) -> Option<Command> {
 /// path + byte offset — curated so it actually hits an image often,
 /// with every wrap mode, instead of only the blind half's reject path.
 fn gen_image_command(u: &mut Unstructured) -> Option<Command> {
-    Some(match small(u, 2) {
+    Some(match small(u, 3) {
         0 => Command::InsertImage {
             at: pos(u),
             image: ImageBlob {
@@ -1055,6 +1092,22 @@ fn gen_image_command(u: &mut Unstructured) -> Option<Command> {
             fit: *u
                 .choose(&[ImageFit::Original, ImageFit::FitWidth, ImageFit::FitPage])
                 .ok()?,
+        },
+        /* Issue #459 - `ResizeImage` with hostile integer extents: the
+        `i64` extremes, zero, and the 22 in bound +-1 (the guard refuses the
+        out-of-range ones; an in-range one must keep every picture inside
+        the bound). `at` is often 0 so a resize lands on a freshly inserted
+        picture. */
+        1 => Command::ResizeImage {
+            path: BlockPath::top(small(u, 3)),
+            at: if u.ratio(1, 2).unwrap_or(true) {
+                0
+            } else {
+                small(u, 40)
+            },
+            width_emu: emu_or_hostile(u, 5_000_000),
+            height_emu: emu_or_hostile(u, 5_000_000),
+            story: story_chain(u),
         },
         _ => {
             let at = pos(u);
@@ -1331,7 +1384,7 @@ classify_variants! {
     SplitParagraph { .. } => true, // gen_targeted_command
     MergeParagraph { .. } => false,
     InsertImage { .. } => true, // gen_image_command
-    ResizeImage { .. } => false,
+    ResizeImage { .. } => true, // gen_image_command (#459)
     MoveImage { .. } => true, // gen_targeted_command (#177)
     SetImageWrap { .. } => true, // gen_image_command
     SetSelection { .. } => true, // gen_selection_command

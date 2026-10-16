@@ -36,6 +36,7 @@
  * fixture failing to convert on both sides).
  */
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
     existsSync,
     mkdirSync,
@@ -96,7 +97,49 @@ function findDocx(paths) {
     return [...new Set(out)].sort();
 }
 
-const corpus = findDocx(positional.length ? positional : DEFAULT_CORPUS_DIRS);
+/**
+ * Issue #476 - the multi-page real documents of the downloaded corpus
+ * (`fixtures/corpus-multipage.json`: bug65649 + the docx4j samples). The
+ * committed fixtures are mostly one page, so page-count parity barely moved
+ * when the line pitch did. The files are NOT in the repo (`tools/corpus`
+ * downloads them, Apache-2.0 sources): each path is resolved under
+ * `$NGE_CORPUS_DIR` (default `/data/corpus/files`), a missing file is skipped
+ * with one warning, and a file whose sha256 no longer matches the manifest
+ * is still compared but flagged (the page counts would describe another
+ * document).
+ */
+function corpusListDocs() {
+    const listPath = join(REPO, 'tools/differential/fixtures/corpus-multipage.json');
+    if (!existsSync(listPath)) return [];
+    const list = JSON.parse(readFileSync(listPath, 'utf8'));
+    const root = process.env[list.root_env] || list.default_root;
+    const found = [];
+    const missing = [];
+    for (const d of list.documents) {
+        const p = join(root, d.path);
+        if (!existsSync(p)) {
+            missing.push(d.path);
+            continue;
+        }
+        const sha = createHash('sha256').update(readFileSync(p)).digest('hex');
+        if (sha !== d.sha256) {
+            console.error(`[differential] WARN: ${p} does not match its manifest sha256 - compared anyway`);
+        }
+        found.push(p);
+    }
+    if (missing.length) {
+        console.error(
+            `[differential] WARN: ${missing.length}/${list.documents.length} multi-page corpus documents ` +
+                `not found under ${root} (run tools/corpus/fetch.mjs): ${missing.slice(0, 3).join(', ')}` +
+                (missing.length > 3 ? ', ...' : ''),
+        );
+    }
+    return found;
+}
+
+const corpus = findDocx(
+    positional.length ? positional : [...DEFAULT_CORPUS_DIRS, ...corpusListDocs()],
+);
 if (corpus.length === 0) {
     console.error('[differential] no .docx fixtures found in the corpus');
     process.exit(1);
@@ -552,8 +595,31 @@ for (const r of ranked) {
     );
 }
 
+/* Issue #476 - page-count parity, overall and on the multi-page subset (>= 2
+ * pages on either side): a one-page fixture agrees whatever the line pitch
+ * is, so only the multi-page number responds to a pitch change. */
+const compared = results.filter((r) => !r.error);
+const parityOf = (rs) => rs.filter((r) => r.pageCountDelta === 0).length;
+const multiPage = compared.filter((r) => Math.max(r.ourPages, r.loPages) >= 2);
+const summary = {
+    compared: compared.length,
+    pageCountParity: parityOf(compared),
+    multiPageCompared: multiPage.length,
+    multiPagePageCountParity: parityOf(multiPage),
+    multiPageTotalPages: {
+        ours: multiPage.reduce((n, r) => n + r.ourPages, 0),
+        libreOffice: multiPage.reduce((n, r) => n + r.loPages, 0),
+    },
+};
+console.log(
+    `\npage-count parity: ${summary.pageCountParity}/${summary.compared} fixtures; ` +
+        `multi-page (>= 2 pages on either side): ${summary.multiPagePageCountParity}/${summary.multiPageCompared} ` +
+        `(${summary.multiPageTotalPages.ours} pages ours vs ${summary.multiPageTotalPages.libreOffice} LibreOffice)`,
+);
+
 const report = {
     generatedAt: new Date().toISOString(),
+    summary,
     rasterDpi: RASTER_DPI,
     tools: { soffice: haveSoffice, pdftotext: havePdftotext, pdfinfo: havePdfinfo, pdftoppm: havePdftoppm },
     corpus: corpus.map((p) => relative(REPO, p)),
