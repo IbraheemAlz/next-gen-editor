@@ -32,6 +32,20 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "cell_paragraph_decor.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "Paragraph decorations inside table cells",
+          "A closing paragraph after the table."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "complex_script_size.docx": {
       "generator": "handcrafted",
       "phase_introduced": 12,

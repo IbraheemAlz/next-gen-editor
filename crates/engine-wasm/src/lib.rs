@@ -51,6 +51,7 @@ mod open_error;
 /// between paints.
 mod paragraph_cache;
 mod paragraph_cache_key;
+mod paragraph_decor;
 mod pdf_semantics;
 mod read_report;
 mod save_report;
@@ -3661,9 +3662,7 @@ fn layout_story_blocks_cut(
                         })
                         .collect()
                 };
-                p.borders = para.props.borders.clone();
-                p.shading = para.props.shading;
-                p.review_mark = review_mark_color(para);
+                paragraph_decor::stamp_paragraph_decor(&mut p, para);
                 LayoutBlock::Paragraph(p)
             }
             engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
@@ -6024,35 +6023,33 @@ fn layout_cell_blocks(
         y += lb.size().height;
         out.push(lb);
     };
+    /* Issue #455 — a cell paragraph is stamped with its decorations like
+    a body / story one (it used to render bare). The paragraph LRU holds
+    the undecorated box, so the stamp never reaches that cache. */
+    let cell_paragraph = |tl: &mut TableLayout<'_, '_>, p: &engine::Paragraph| {
+        let mut pb = layout_paragraph_cached(
+            p,
+            tl.fonts,
+            tl.cfg,
+            tl.scale,
+            content_width_px.max(1.0),
+            tl.sctx,
+            tl.cache,
+        );
+        paragraph_decor::stamp_paragraph_decor(&mut pb, p);
+        LayoutBlock::Paragraph(pb)
+    };
     for b in blocks {
         match b {
-            engine::Block::Paragraph(p) => stack(
-                LayoutBlock::Paragraph(layout_paragraph_cached(
-                    p,
-                    tl.fonts,
-                    tl.cfg,
-                    tl.scale,
-                    content_width_px.max(1.0),
-                    tl.sctx,
-                    tl.cache,
-                )),
-                &mut out,
-            ),
+            engine::Block::Paragraph(p) => {
+                let lb = cell_paragraph(tl, p);
+                stack(lb, &mut out);
+            }
             engine::Block::Table(t) if depth >= MAX_TABLE_LAYOUT_DEPTH => {
                 tl.nesting_capped = true;
                 for p in flatten_table_paragraphs(t) {
-                    stack(
-                        LayoutBlock::Paragraph(layout_paragraph_cached(
-                            p,
-                            tl.fonts,
-                            tl.cfg,
-                            tl.scale,
-                            content_width_px.max(1.0),
-                            tl.sctx,
-                            tl.cache,
-                        )),
-                        &mut out,
-                    );
+                    let lb = cell_paragraph(tl, p);
+                    stack(lb, &mut out);
                 }
             }
             engine::Block::Table(t) => stack(
@@ -11198,17 +11195,11 @@ impl Engine {
                         height. */
                         para_box.page_break_after_line =
                             compute_page_break_lines(&para.text, &para_box);
-                        /* Audit gap A.M4 — propagate `<w:pBdr>` strokes
-                        into the laid-out box so the renderer can paint
-                        them against the paragraph rect. Cloning the
-                        engine model's `CellBorders` is cheap (a handful
-                        of `Option<BorderStroke>` slots). */
-                        para_box.borders = para.props.borders.clone();
-                        /* Sprint 6 (UI Edition) — propagate `<w:shd>`
-                        paragraph shading into the laid-out box. */
-                        para_box.shading = para.props.shading;
-                        /* Issue #262 — the pilcrow of a tracked mark. */
-                        para_box.review_mark = review_mark_color(para);
+                        /* Audit gap A.M4 / Sprint 6 / issue #262 — `<w:pBdr>`
+                        strokes, `<w:shd>` shading and the tracked-mark
+                        pilcrow, stamped by the ONE helper every
+                        paragraph path shares (issue #455). */
+                        paragraph_decor::stamp_paragraph_decor(&mut para_box, para);
                         /* Issue #95 / #178 / #179 — pagination
                         constraints from the resolved (style-cascaded)
                         properties. keepNext/keepLines are tri-state
@@ -30382,6 +30373,10 @@ mod pbdr_start_end_tests;
 /// Issue #395 — paragraph borders defined on styles, on canvas.
 #[cfg(test)]
 mod pbdr_style_cascade_tests;
+
+/// Issue #455 — decorations on paragraphs inside table cells.
+#[cfg(test)]
+mod cell_paragraph_decor_tests;
 
 /// Issue #370 — an empty paragraph's line is sized by its mark.
 #[cfg(test)]

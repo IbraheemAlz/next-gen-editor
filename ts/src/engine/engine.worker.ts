@@ -53,6 +53,8 @@ import HYPHENATION_OFF_DOCX_URL from '../../../crates/format-docx/tests/fixtures
 import PAGE_BORDERS_DOCX_URL from '../../../crates/format-docx/tests/fixtures/page_borders.docx?url';
 import LINE_NUMBERS_DOCX_URL from '../../../crates/format-docx/tests/fixtures/line_numbers.docx?url';
 import DROP_CAP_DOCX_URL from '../../../crates/format-docx/tests/fixtures/drop_cap.docx?url';
+/* Issue #455 — the `cell-paragraph-decor` golden. */
+import CELL_DECOR_DOCX_URL from '../../../crates/format-docx/tests/fixtures/cell_paragraph_decor.docx?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -1122,6 +1124,7 @@ async function handleInit(msg: InitMsg): Promise<void> {
 
         case 'page-borders':
         case 'line-numbers':
+        case 'cell-paragraph-decor':
         case 'drop-cap': {
             /* Issue #328 — `<w:pgBorders>` / `<w:lnNumType>` /
                `<w:framePr w:dropCap>` fixtures (`tools/roundtrip
@@ -1142,7 +1145,9 @@ async function handleInit(msg: InitMsg): Promise<void> {
                         ? PAGE_BORDERS_DOCX_URL
                         : testCase === 'line-numbers'
                           ? LINE_NUMBERS_DOCX_URL
-                          : DROP_CAP_DOCX_URL,
+                          : testCase === 'cell-paragraph-decor'
+                            ? CELL_DECOR_DOCX_URL
+                            : DROP_CAP_DOCX_URL,
                 ),
             } as Command);
             break;

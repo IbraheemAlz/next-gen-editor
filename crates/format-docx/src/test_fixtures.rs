@@ -1519,3 +1519,8 @@ pub use run_content::*;
 #[path = "test_fixtures_page_decor.rs"]
 mod page_decor;
 pub use page_decor::*;
+
+/* Issue #455 — paragraph decorations inside table cells. */
+#[path = "test_fixtures_cell_decor.rs"]
+mod cell_decor;
+pub use cell_decor::*;

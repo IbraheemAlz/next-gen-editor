@@ -74,6 +74,7 @@ const VIEWPORTS = {
     'page-borders': { width: 595, height: 842 },
     'line-numbers': { width: 595, height: 842 },
     'drop-cap': { width: 595, height: 842 },
+    'cell-paragraph-decor': { width: 595, height: 330 },
     'theme-fonts': { width: 1190, height: 360 },
     'font-substitution': { width: 1190, height: 640 },
     'soft-hyphen': { width: 1190, height: 400 },

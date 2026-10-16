@@ -5348,6 +5348,19 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 .collect()
             }),
         },
+        /* Issue #455 — `<w:pBdr>` / `<w:shd>` / a tracked paragraph mark
+        on paragraphs inside table cells (the visual-diff
+        `cell-paragraph-decor` golden loads it). Zero-edit drift 0. */
+        PrebuiltFixture {
+            name: "cell_paragraph_decor.docx",
+            bytes: format_docx::test_fixtures::cell_paragraph_decor_docx(),
+            entry: page_decor_fixture_entry(
+                format_docx::test_fixtures::CELL_DECOR_TEXTS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            ),
+        },
         /* Issue #328 — drop caps (`<w:framePr w:dropCap>` rides the
         pPr grab bag; the visual-diff `drop-cap` golden loads it). */
         PrebuiltFixture {

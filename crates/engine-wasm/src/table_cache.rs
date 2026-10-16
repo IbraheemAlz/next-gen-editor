@@ -263,7 +263,14 @@ fn hash_debug<T: std::fmt::Debug, H: Hasher>(value: &T, h: &mut H) {
 /// placeholder width; the width a cell paragraph is laid out at follows
 /// from the enclosing table's structure, which the table key covers.
 fn paragraph_content_key(tl: &TableLayout<'_, '_>, para: &engine::Paragraph) -> u64 {
-    paragraph_layout_key(para, tl.cfg, tl.scale, 0.0, tl.sctx)
+    /* Issue #455 — the cached cell box carries the paragraph's
+    post-layout decorations (`<w:pBdr>`, `<w:shd>`, the tracked-mark
+    pilcrow), which the paragraph LRU key leaves out as paint-only: the
+    table key must see them or an edit to one would serve a stale box. */
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    paragraph_layout_key(para, tl.cfg, tl.scale, 0.0, tl.sctx).hash(&mut h);
+    paragraph_decor::decor_key(para).hash(&mut h);
+    h.finish()
 }
 
 /// Issue #379 — content fingerprint of `table` laid out at nesting
@@ -660,7 +667,7 @@ fn cell_content_is_consistent(
 ) -> bool {
     let paragraph_width = content_width.max(1.0);
     let mut boxes = content.iter();
-    let paragraph_ok = |p: &engine::Paragraph, b: Option<&LayoutBlock>| matches!(b, Some(LayoutBlock::Paragraph(pb)) if cached_paragraph_is_consistent(pb, p, paragraph_width));
+    let paragraph_ok = |p: &engine::Paragraph, b: Option<&LayoutBlock>| matches!(b, Some(LayoutBlock::Paragraph(pb)) if cached_paragraph_is_consistent(pb, p, paragraph_width) && paragraph_decor::decor_matches(pb, p));
     for block in blocks {
         match block {
             engine::Block::Paragraph(p) => {

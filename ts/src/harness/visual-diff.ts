@@ -40,6 +40,7 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
         testCase === 'rich-text-cs-size' ||
         testCase === 'page-borders' ||
         testCase === 'line-numbers' ||
+        testCase === 'cell-paragraph-decor' ||
         testCase === 'drop-cap'
     ) {
         return { w: 595, h: 842 };
