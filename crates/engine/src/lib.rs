@@ -66,6 +66,16 @@ pub use emu_bounds::{
     MAX_DRAWING_EMU, clamp_extent_emu, clamp_offset_emu, first_image_beyond_bound,
     fit_extent_within_bound,
 };
+/// Issue #503 - Word's bounds for the page / paragraph point fields
+/// (margins, indents, gutters, tab stops, line-spacing multiples).
+mod point_bounds;
+pub use point_bounds::{
+    MAX_LINE_SPACING_MULTIPLE, MAX_POINT_FIELD_PT, MAX_POINT_FIELD_TWIPS,
+    MIN_LINE_SPACING_MULTIPLE, MIN_PAGE_SIDE_PT, MIN_TEXT_AREA_PT, TextAreaAxis,
+    column_gutter_in_bound, first_point_field_beyond_bound, fit_margins_to_text_area,
+    indent_in_bound, line_spacing_multiple_in_bound, margin_in_bound, margins_leave_text_area,
+    tab_position_in_bound,
+};
 /// Issue #501 - Word's 1638 pt / 1 pt font-size bound.
 mod font_size_bounds;
 pub use font_size_bounds::{
@@ -8050,7 +8060,12 @@ impl DocumentTree {
     /// silently no-op — the pre-Phase-3 setters skipped the whole
     /// mutation on any document with an empty `sections` table (every
     /// non-imported document).
-    fn update_section_props_at(&self, pos: &LogicalPos, f: impl FnOnce(&mut SectionProps)) -> Self {
+    /// Index of the marker paragraph that closes the section covering
+    /// `pos` (`None`: the body's terminal section covers it). The covering
+    /// section is closed by the FIRST marker paragraph at index >= the
+    /// position's top-level block; markers before it close earlier
+    /// sections.
+    fn covering_section_marker(&self, pos: &LogicalPos) -> Option<u32> {
         let block_idx = pos
             .path
             .steps
@@ -8060,19 +8075,34 @@ impl DocumentTree {
                 PathStep::Cell { .. } => None,
             })
             .unwrap_or(0);
-        let mut blocks = self.blocks.clone();
-        let mut body_section = self.body_section.clone();
-        /* The covering section is closed by the FIRST marker paragraph at
-        index >= block_idx; markers before it close earlier sections. */
-        let marker_idx = self
-            .blocks
+        self.blocks
             .iter()
             .enumerate()
             .skip(block_idx as usize)
             .find_map(|(i, b)| match b {
                 Block::Paragraph(p) if p.section_end.is_some() => Some(i as u32),
                 _ => None,
-            });
+            })
+    }
+
+    /// Issue #503 - the page geometry of the section covering `pos`, picked
+    /// the way [`Self::update_section_props_at`] picks the section it
+    /// writes, so a command can validate a new margin against the page it
+    /// is about to change.
+    pub fn section_geometry_at(&self, pos: &LogicalPos) -> PageGeometry {
+        let marker =
+            self.covering_section_marker(pos)
+                .and_then(|idx| match self.blocks.get(idx as usize) {
+                    Some(Block::Paragraph(p)) => p.section_end.as_ref().map(|s| s.geometry),
+                    _ => None,
+                });
+        marker.unwrap_or(self.body_section.geometry)
+    }
+
+    fn update_section_props_at(&self, pos: &LogicalPos, f: impl FnOnce(&mut SectionProps)) -> Self {
+        let mut blocks = self.blocks.clone();
+        let mut body_section = self.body_section.clone();
+        let marker_idx = self.covering_section_marker(pos);
         if let Some(idx) = marker_idx {
             let _ = mutate_paragraph_in_top(&mut blocks, &BlockPath::top(idx), |para| {
                 if let Some(props) = &mut para.section_end {

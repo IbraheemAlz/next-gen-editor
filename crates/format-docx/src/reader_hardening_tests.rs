@@ -175,6 +175,72 @@ fn font_sizes_are_clamped_into_words_bound_and_reported() {
     }
 }
 
+/// Issue #503 - every margin is inside +-22 in on its own (the measure
+/// reader), but together they can swallow the page: the reader repairs the
+/// pair so at least 0.1 in of text area survives, reports each margin that
+/// moved as `MeasureClamped` (`w:pgMar/@w:left` ...), leaves a sane
+/// `<w:sectPr>` alone, and the zero-edit save stays byte-identical.
+#[test]
+fn margins_that_swallow_the_page_leave_a_tenth_of_an_inch() {
+    let body = r#"<w:p><w:r><w:t>x</w:t></w:r></w:p>"#;
+    for (pg_mar, swallowed) in [
+        // US Letter, stock 1 in margins.
+        (
+            r#"<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720"/>"#,
+            false,
+        ),
+        // Exactly 0.1 in of width left: 12240 - 144 = 12096 twips of margin.
+        (
+            r#"<w:pgMar w:top="0" w:right="6048" w:bottom="0" w:left="6048"/>"#,
+            false,
+        ),
+        // 22 in each side on an 8.5 in page.
+        (
+            r#"<w:pgMar w:top="1440" w:right="31680" w:bottom="1440" w:left="31680"/>"#,
+            true,
+        ),
+        // Past the unit range: clamped to 22 in first, then repaired.
+        (
+            r#"<w:pgMar w:top="99999999" w:right="1440" w:bottom="99999999" w:left="1440"/>"#,
+            true,
+        ),
+    ] {
+        let xml = document(
+            body,
+            &format!(r#"<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>{pg_mar}</w:sectPr>"#),
+        );
+        let archive = assert_zero_edit_identity(&xml);
+        let g = archive.document.body_section.geometry;
+        assert!(
+            engine::margins_leave_text_area(
+                g.width,
+                g.height,
+                g.margin_top,
+                g.margin_right,
+                g.margin_bottom,
+                g.margin_left
+            )
+            .is_ok(),
+            "{pg_mar}: {g:?}"
+        );
+        assert!(
+            g.content_width() >= 7.19 && g.content_height() >= 7.19,
+            "{g:?}"
+        );
+        let moved = archive.warnings.iter().any(|w| {
+            matches!(w, DocxWarning::MeasureClamped { attr, value, .. }
+                if attr.starts_with("w:pgMar/@") && value.contains("margins leave"))
+        });
+        assert_eq!(moved, swallowed, "{pg_mar}: {:?}", archive.warnings);
+        if !swallowed {
+            assert!(
+                (g.margin_left - g.margin_right).abs() < 0.01,
+                "an untouched pair stays as read: {g:?}"
+            );
+        }
+    }
+}
+
 /// An edit elsewhere in the document still re-emits the hostile
 /// `<w:sectPr>` bytes verbatim (the verified passthrough holds), and the
 /// edited paragraph keeps its source `<w:pPr>` (its model is unchanged).

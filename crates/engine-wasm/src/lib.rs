@@ -58,6 +58,10 @@ mod emu_guard;
 /// Issue #501 — the command-boundary font-size range guard (a run / mark /
 /// style size stays inside Word's 1..=1638 pt).
 mod font_size_guard;
+/// Issue #503 - the command-boundary range guard for the page / paragraph
+/// point fields (margins, indents, column gutter, tab stops, line-spacing
+/// multiples stay inside Word's limits).
+mod point_guard;
 mod table_cache;
 /// Issue #467 — the command-boundary text guard (control characters,
 /// noncharacters) every text-bearing command passes through.
@@ -8389,6 +8393,12 @@ impl Engine {
         a line taller than any page and stalled the cull; a size outside
         Word's 1..=1638 pt is refused `OutOfRange` before any handler. */
         if let Err(refused) = font_size_guard::check_command(&cmd) {
+            return *refused;
+        }
+        /* Issue #503 - and for the page / paragraph point fields: a finite
+        `1e33` pt margin, indent, gutter or tab stop is refused
+        `OutOfRange` (Word's 22 in) before any handler. */
+        if let Err(refused) = point_guard::check_command(&cmd) {
             return *refused;
         }
         if let Some(rejected) = self.story_gate(&cmd) {
@@ -17623,6 +17633,33 @@ impl Engine {
         bottom_pt: f32,
         left_pt: f32,
     ) -> Event {
+        /* Issue #503 - what no single field shows (the guard bounded each
+        margin to 0..=1584): the pair on one axis must leave at least 0.1 in
+        of text area on THIS section's page. */
+        let page = self
+            .undo
+            .current()
+            .section_geometry_at(&to_engine_pos(at.clone()));
+        if let Err(axis) = engine::margins_leave_text_area(
+            page.width,
+            page.height,
+            top_pt,
+            right_pt,
+            bottom_pt,
+            left_pt,
+        ) {
+            return Event::error_kind(
+                bridge::ErrorKind::OutOfRange,
+                format!(
+                    "SetPageMargins: {} swallows the page - the margins must leave at least \
+                     {} pt (0.1 in) of text area on a {} x {} pt page",
+                    axis.fields(),
+                    engine::MIN_TEXT_AREA_PT,
+                    page.width,
+                    page.height
+                ),
+            );
+        }
         let new_doc = self.undo.current().set_section_margins_at(
             to_engine_pos(at),
             top_pt,
@@ -19193,6 +19230,23 @@ impl Engine {
         match engine::first_font_size_beyond_bound(self.undo.current()) {
             Some(why) => Err(format!(
                 "the document model holds an out-of-bound size: {why}"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Issue #503 - no page size, margin, column gutter, indent, spacing,
+    /// line height or tab stop the session holds may be outside Word's
+    /// limits ([`engine::first_point_field_beyond_bound`]), and the margins
+    /// of every section leave 0.1 in of text area. Kept apart like the font
+    /// size / picture bounds: a hostile snapshot may restore to anything,
+    /// the COMMAND path (and the `.docx` reader behind `LoadDocx` /
+    /// `OpenDocument`) must not produce it. `Err` names the first
+    /// violation.
+    pub fn check_point_fields_for_fuzzing(&self) -> Result<(), String> {
+        match engine::first_point_field_beyond_bound(self.undo.current()) {
+            Some(why) => Err(format!(
+                "the document model holds an out-of-bound point field: {why}"
             )),
             None => Ok(()),
         }
@@ -30041,6 +30095,11 @@ mod emu_guard_tests;
 /// expansion of a document with a page-tall line (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod font_size_guard_tests;
+
+/// Issue #503 - the page / paragraph point fields vs Word's limits
+/// (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod point_guard_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;

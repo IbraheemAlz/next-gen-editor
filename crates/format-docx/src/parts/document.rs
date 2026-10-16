@@ -11,7 +11,7 @@
 //!   when the engine has not mutated the paragraph (the passthrough
 //!   optimisation; zero document.xml drift on untouched paragraphs).
 
-use crate::error::{DocxError, DocxWarning};
+use crate::error::{DocxError, DocxWarning, warn};
 use crate::parts::table::parse_table_bytes_with_events;
 use crate::parts::textbox;
 use crate::schema::block_envelope::BlockEnvelopes;
@@ -1127,7 +1127,7 @@ impl SectPrAccum {
     /// `engine::DefaultPageSize::geometry()` down instead.
     fn into_geometry(self, default_geometry: PageGeometry) -> PageGeometry {
         let d = default_geometry;
-        PageGeometry {
+        let mut g = PageGeometry {
             width: self.width.unwrap_or(d.width),
             height: self.height.unwrap_or(d.height),
             margin_top: self.margin_top.unwrap_or(d.margin_top),
@@ -1136,7 +1136,33 @@ impl SectPrAccum {
             margin_left: self.margin_left.unwrap_or(d.margin_left),
             header_offset: self.header_offset.unwrap_or(d.header_offset),
             footer_offset: self.footer_offset.unwrap_or(d.footer_offset),
+        };
+        /* Issue #503 - each margin is already inside +-22 in (the measure
+        reader), but four of them can together swallow the page. Repair
+        the pair that does, report each margin that moved, and keep the
+        source bytes (`source_xml`) - a verified passthrough re-derives the
+        same repaired model from the same bytes. */
+        let before = [g.margin_top, g.margin_right, g.margin_bottom, g.margin_left];
+        if engine::fit_margins_to_text_area(&mut g) {
+            let after = [g.margin_top, g.margin_right, g.margin_bottom, g.margin_left];
+            for ((attr, was), now) in ["w:top", "w:right", "w:bottom", "w:left"]
+                .into_iter()
+                .zip(before)
+                .zip(after)
+            {
+                if was != now {
+                    warn(DocxWarning::MeasureClamped {
+                        attr: format!("w:pgMar/@{attr}"),
+                        value: format!(
+                            "{} twips (margins leave < 0.1 in of text)",
+                            (was * 20.0).round()
+                        ),
+                        twips: (now * 20.0).round() as i64,
+                    });
+                }
+            }
         }
+        g
     }
 
     /// Materialize the range-stamped [`Section`] `[start_block, end_block)`

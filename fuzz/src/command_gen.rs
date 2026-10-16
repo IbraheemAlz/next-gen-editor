@@ -41,10 +41,11 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use bridge::{
-    Alignment, BlockPath, BridgeCellBorders, Command, Direction, FieldKind, HeaderFooterArea,
-    ImageBlob, ImageFit, ImageWrapMode, InsertSide, ListKind, LogicalPos, LogicalRange,
-    MoveDirection, SectionBreakKind, SelectionModifier, TablePropertiesPatch, TextAttrsPatch,
-    TextBoxHop, UnderlineStyle,
+    Alignment, BlockPath, BridgeCellBorders, BridgeParaPropertiesPatch, BridgeStyleProperties,
+    BridgeTabKind, BridgeTabStop, Command, Direction, FieldKind, HeaderFooterArea, ImageBlob,
+    ImageFit, ImageWrapMode, InsertSide, ListKind, LogicalPos, LogicalRange, MoveDirection,
+    SectionBreakKind, SelectionModifier, TablePropertiesPatch, TextAttrsPatch, TextBoxHop,
+    UnderlineStyle,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -173,6 +174,78 @@ fn font_size_or_hostile(u: &mut Unstructured) -> f32 {
         hostile_font_size(u)
     } else {
         small(u, 96) as f32 + 1.0
+    }
+}
+
+/// Issue #503 - the values Word's 22 in bound (`engine::MAX_POINT_FIELD_PT`,
+/// 1584 pt) pivots on, for a page / paragraph point command field: zero,
+/// +-1, one under / at / one over the bound on each side, the #499-style
+/// `1.0951575e33`, `f32::MAX` / `MIN`. The command path must refuse every
+/// one that is outside its field's range with `OutOfRange` and leave the
+/// document alone; a value inside must never leave a field past the bound.
+fn hostile_points(u: &mut Unstructured) -> f32 {
+    const EDGES: [f32; 16] = [
+        0.0,
+        1.0,
+        -1.0,
+        1583.0,
+        1584.0,
+        1584.5,
+        1585.0,
+        -1583.0,
+        -1584.0,
+        -1585.0,
+        1e33,
+        -1e33,
+        1.0951575e33,
+        f32::MAX,
+        f32::MIN,
+        7.2,
+    ];
+    u.choose(&EDGES).copied().unwrap_or(0.0)
+}
+
+/// A signed point value (indent, tab position): usually ordinary
+/// (`+-max`), a quarter of the time one of [`hostile_points`]'s edges.
+fn points_or_hostile(u: &mut Unstructured, max: i32) -> f32 {
+    if u.ratio(1, 4).unwrap_or(false) {
+        hostile_points(u)
+    } else {
+        small_f32(u, max)
+    }
+}
+
+/// An unsigned point value (margin, gutter): usually `0..=max`, a quarter
+/// of the time one of [`hostile_points`]'s edges.
+fn unsigned_points_or_hostile(u: &mut Unstructured, max: u32) -> f32 {
+    if u.ratio(1, 4).unwrap_or(false) {
+        hostile_points(u)
+    } else {
+        small(u, max) as f32
+    }
+}
+
+/// A line-spacing multiplier: usually `0, 0.5, .. 2`, a quarter of the
+/// time an edge of Word's `0.06 ..= 132` Multiple range (or the `<= 0`
+/// clear sentinel).
+fn multiplier_or_hostile(u: &mut Unstructured) -> f32 {
+    const EDGES: [f32; 11] = [
+        0.0,
+        -1.0,
+        0.01,
+        0.059,
+        0.06,
+        132.0,
+        132.5,
+        133.0,
+        1e33,
+        f32::MAX,
+        f32::MIN,
+    ];
+    if u.ratio(1, 4).unwrap_or(false) {
+        u.choose(&EDGES).copied().unwrap_or(0.0)
+    } else {
+        (small(u, 4) as f32) * 0.5
     }
 }
 
@@ -863,13 +936,13 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
         },
         9 => Command::SetLineSpacing {
             range: range(u),
-            multiplier: (small(u, 4) as f32) * 0.5,
+            multiplier: multiplier_or_hostile(u),
         },
         10 => Command::SetParagraphIndent {
             range: range(u),
-            start_pt: small_f32(u, 200),
-            end_pt: small_f32(u, 200),
-            first_line_pt: small_f32(u, 200),
+            start_pt: points_or_hostile(u, 200),
+            end_pt: points_or_hostile(u, 200),
+            first_line_pt: points_or_hostile(u, 200),
         },
         // ---- table --------------------------------------------------------------
         11 => Command::InsertTable {
@@ -924,7 +997,7 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
         18 => Command::SetColumns {
             at: pos(u),
             count: (small(u, 3) as u8) + 1,
-            gutter_pt: small_f32(u, 40),
+            gutter_pt: unsigned_points_or_hostile(u, 40),
         },
         // ---- story (header/footer) -----------------------------------------------
         19 => Command::EnterHeaderFooter {
@@ -1018,6 +1091,66 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
             story: story_chain(u),
         },
         _ => Command::ExitHeaderFooter,
+    })
+}
+
+/// Issue #503 - the page / paragraph point commands the curated arms above
+/// do not reach: `SetPageMargins`, `SetTabStops` and `ModifyStyle`'s
+/// paragraph patch, each with Word's 22 in bound's edges (and absurd
+/// finite values) a quarter of the time per field, so the command path's
+/// `OutOfRange` refusals and the section-aware text-area check are
+/// exercised, and every accepted value is held to the model invariant.
+fn gen_measure_command(u: &mut Unstructured) -> Option<Command> {
+    Some(match small(u, 2) {
+        0 => Command::SetPageMargins {
+            at: pos(u),
+            top_pt: unsigned_points_or_hostile(u, 120),
+            right_pt: unsigned_points_or_hostile(u, 120),
+            bottom_pt: unsigned_points_or_hostile(u, 120),
+            left_pt: unsigned_points_or_hostile(u, 120),
+        },
+        1 => {
+            let kinds = [
+                BridgeTabKind::Left,
+                BridgeTabKind::Center,
+                BridgeTabKind::Right,
+                BridgeTabKind::Decimal,
+                BridgeTabKind::Clear,
+            ];
+            let n = small(u, 3) as usize + 1;
+            let mut stops = Vec::with_capacity(n);
+            for _ in 0..n {
+                stops.push(BridgeTabStop {
+                    position_pt: points_or_hostile(u, 400),
+                    kind: *u.choose(&kinds).ok()?,
+                    leader: None,
+                });
+            }
+            Command::SetTabStops {
+                range: range(u),
+                stops,
+            }
+        }
+        _ => {
+            let some = |u: &mut Unstructured| u.ratio(1, 2).unwrap_or(false);
+            let indent_start_pt = some(u).then(|| points_or_hostile(u, 200));
+            let indent_end_pt = some(u).then(|| points_or_hostile(u, 200));
+            let first_line_pt = some(u).then(|| points_or_hostile(u, 200));
+            let line_spacing_multiplier = some(u).then(|| multiplier_or_hostile(u));
+            Command::ModifyStyle {
+                style_id: "Normal".to_string(),
+                properties: BridgeStyleProperties {
+                    para_props: Some(BridgeParaPropertiesPatch {
+                        indent_start_pt,
+                        indent_end_pt,
+                        first_line_pt,
+                        line_spacing_multiplier,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            }
+        }
     })
 }
 
@@ -1201,7 +1334,9 @@ fn story_chain(u: &mut Unstructured) -> Vec<TextBoxHop> {
 /// - ~3% field authoring (`gen_field_command`).
 /// - ~4% footnotes / endnotes (`gen_note_command`, issue #80).
 /// - ~5% images + wrap (`gen_image_command`, issue #82).
-/// - ~33% blind `Command::arbitrary` — full wire-schema breadth, including
+/// - ~5% page / paragraph point commands (`gen_measure_command`, issue
+///   #503): margins, tab stops, style paragraph patches at Word's bound.
+/// - ~28% blind `Command::arbitrary` — full wire-schema breadth, including
 ///   variants the curated generator never touches (`LoadDocx`, `Recover`,
 ///   `SaveDocument`, viewport / zoom / IME commands, …) and out-of-range
 ///   addresses that stress the reject paths.
@@ -1241,6 +1376,7 @@ pub fn gen_command_sequence(u: &mut Unstructured, max_len: usize) -> Vec<Command
             55..=57 => gen_field_command(u),
             58..=61 => gen_note_command(u),
             62..=66 => gen_image_command(u),
+            67..=71 => gen_measure_command(u),
             // Blind, full-schema coverage — `Arbitrary::arbitrary` only
             // consumes what it needs from `u`, so the byte stream still has
             // entropy left for further loop iterations afterward.
@@ -1489,7 +1625,7 @@ classify_variants! {
     SetFieldInstruction { .. } => false,
     InsertToc { .. } => true, // gen_field_command
     SetParagraphBorders { .. } => false,
-    SetPageMargins { .. } => false,
+    SetPageMargins { .. } => true, // gen_measure_command (#503)
     SetPageOrientation { .. } => false,
     ToggleList { .. } => true, // gen_targeted_command
     ChangeListLevel { .. } => false,
@@ -1503,12 +1639,12 @@ classify_variants! {
     RejectAllRevisions => false,
     InsertComment { .. } => false,
     DeleteComment { .. } => false,
-    SetTabStops { .. } => false,
+    SetTabStops { .. } => true, // gen_measure_command (#503)
     SetReviewIdentity { .. } => false,
     ApplyStyle { .. } => false,
     ResolveComment { .. } => false,
     ReplyToComment { .. } => false,
-    ModifyStyle { .. } => false,
+    ModifyStyle { .. } => true, // gen_measure_command (#503, paragraph patch)
     SetFontPriority { .. } => false,
 }
 

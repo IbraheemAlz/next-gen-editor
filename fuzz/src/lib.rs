@@ -326,6 +326,18 @@ pub fn run_rpc_command(data: &[u8]) {
                 format!("{evt:?}").chars().take(160).collect::<String>()
             );
         }
+        /* Issue #503 - and a command that sets a page / paragraph point
+        field (or brings a document in) never leaves one outside Word's
+        22 in, nor margins that swallow a page. */
+        if touches_point_fields(&keep)
+            && let Err(why) = engine.check_point_fields_for_fuzzing()
+        {
+            panic!(
+                "{} left a point field past Word's limits: {why} [{}]",
+                variant_name(&keep),
+                format!("{evt:?}").chars().take(160).collect::<String>()
+            );
+        }
     }
     /* Issue #467 — and whatever the sequence left, saving it yields no
     forbidden character (a typed refusal is a different invariant's). */
@@ -343,6 +355,31 @@ pub fn run_rpc_command(data: &[u8]) {
             panic!("the sequence left a picture past the 22 in bound: {why}");
         }
     }
+}
+
+/// Issue #503 - the commands that can put a page size, margin, column
+/// gutter, indent, spacing, line height or tab stop into the model (the
+/// ones `check_point_fields_for_fuzzing` is run after): the direct setters,
+/// a style edit, the doors that bring a whole document in (the `.docx`
+/// reader clamps per attribute and repairs margins that swallow the page;
+/// HTML paste reads none of these properties) and the commands that copy
+/// or reshape a section.
+fn touches_point_fields(cmd: &bridge::Command) -> bool {
+    use bridge::Command as C;
+    matches!(
+        cmd,
+        C::SetPageMargins { .. }
+            | C::SetPageOrientation { .. }
+            | C::SetColumns { .. }
+            | C::SetParagraphIndent { .. }
+            | C::SetLineSpacing { .. }
+            | C::SetTabStops { .. }
+            | C::ModifyStyle { .. }
+            | C::InsertSectionBreak { .. }
+            | C::PasteHtml { .. }
+            | C::LoadDocx { .. }
+            | C::OpenDocument { .. }
+    )
 }
 
 /// Issue #501 - the commands that can put a font size on a run or a mark
