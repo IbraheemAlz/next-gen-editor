@@ -790,6 +790,15 @@ error_kinds! {
     /// mistake, but like every #427 refusal it is shown (toast copy), never
     /// silent.
     InvalidArgument,
+    /// Issue #491 — the package opened as a ZIP but is damaged: a part is
+    /// not well-formed XML beyond a faithful repair (two root elements, an
+    /// end tag that closes nothing, markup cut off — `DocxError::
+    /// MalformedXml`, #483), a required part is missing, or the archive is
+    /// not a readable ZIP. The message names the part and the offset (never
+    /// document bytes); the open was refused and the previous document stays
+    /// open. A legacy / unknown format (`.doc`) stays
+    /// [`ErrorKind::InvalidDocument`].
+    DocumentUnreadable,
 }
 
 /// Issue #345 — an enforced editing restriction (`w:documentProtection`
@@ -1663,6 +1672,13 @@ mod a11y_note_wire_tests {
         })
         .unwrap();
         assert_eq!(invalid["kind"], "InvalidArgument");
+        /* Issue #491 - the damaged-package refusal. */
+        let unreadable = serde_json::to_value(Event::error_kind(
+            ErrorKind::DocumentUnreadable,
+            "OpenDocument: word/document.xml: a second root element near offset 12",
+        ))
+        .unwrap();
+        assert_eq!(unreadable["kind"], "DocumentUnreadable");
     }
 
     /// Issue #345 — protection modes spell `w:edit`; the typed refusal.

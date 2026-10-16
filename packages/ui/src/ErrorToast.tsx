@@ -63,13 +63,15 @@ export const ERROR_TOAST_COPY: Partial<Record<ErrorKind, string>> = {
 
 /** Kinds the toast deliberately does not cover: a surface of their own
  *  shows them (`PackageTooLarge` / `EncryptedDocument` / `WrongPassword` /
- *  `InvalidDocument` by the File menu's open banner; `Protected` by the
- *  engine's own mode-specific sentence, see [`toastMessageFor`]). */
+ *  `InvalidDocument` / `DocumentUnreadable` by the File menu's open banner,
+ *  copy in `openErrorCopy.ts`; `Protected` by the engine's own
+ *  mode-specific sentence, see [`toastMessageFor`]). */
 export const ERROR_KINDS_WITH_OWN_PRESENTATION = [
     'PackageTooLarge',
     'EncryptedDocument',
     'WrongPassword',
     'InvalidDocument',
+    'DocumentUnreadable',
     'Protected',
 ] as const satisfies readonly ErrorKind[];
 
@@ -96,6 +98,7 @@ export const ERROR_KIND_PRESENTATION: Record<ErrorKind, 'toast' | 'own'> = {
     EncryptedDocument: 'own',
     WrongPassword: 'own',
     InvalidDocument: 'own',
+    DocumentUnreadable: 'own',
     Protected: 'own',
 };
 

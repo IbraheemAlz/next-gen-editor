@@ -45,11 +45,11 @@ import {
 import {
     createEditorCommands,
     useEngine,
-    type ErrorKind,
     type Event,
     type PdfConformance,
 } from '@nge/core';
 import { Dialog } from './Dialog';
+import { openErrorMessage } from './openErrorCopy';
 import './FileMenu.css';
 
 /** Issue #339 — every format `OpenDocument` implements (see
@@ -95,24 +95,8 @@ function triggerDownload(bytes: Uint8Array, mime: string, filename: string): voi
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/** The banner text for an engine `ERROR`: typed refusals (issues #348 /
- *  #345) get a plain-language lead, everything else shows the engine's
- *  own message. */
-function errorMessage(kind: ErrorKind | undefined, message: string): string {
-    switch (kind) {
-        case 'PackageTooLarge':
-            return `This document is too large or too deeply nested to open safely. ${message}`;
-        case 'EncryptedDocument':
-            return (
-                'This document is encrypted with a password. Open it from the File menu to ' +
-                `enter the password. ${message}`
-            );
-        case 'WrongPassword':
-            return `The password does not open this document. ${message}`;
-        default:
-            return message;
-    }
-}
+/* The banner text for an engine `ERROR` lives in `openErrorCopy.ts`
+ * (`openErrorMessage`, issue #491: pure, unit-tested). */
 
 export const FileMenu: Component<FileMenuProps> = (props) => {
     const cmd = createEditorCommands();
@@ -182,7 +166,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                     ) {
                         break;
                     }
-                    setError(errorMessage(evt.kind, evt.message));
+                    setError(openErrorMessage(evt.kind, evt.message));
                     setPendingExportFormat(null);
                     setTimeout(() => setError(null), 6000);
                     break;

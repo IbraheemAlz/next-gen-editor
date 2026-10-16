@@ -78,6 +78,7 @@ export { ProtectionBadge, PROTECTION_LABELS } from './ProtectionBadge';
 export { SettingsMenu } from './SettingsMenu';
 
 export { ErrorToast, ERROR_TOAST_COPY, toastMessageFor } from './ErrorToast';
+export { openErrorMessage } from './openErrorCopy';
 export type { ErrorToastProps } from './ErrorToast';
 
 export { TrapOverlay } from './TrapOverlay';

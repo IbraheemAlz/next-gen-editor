@@ -57,6 +57,7 @@ export const ERROR_KIND_SAMPLING: Record<ErrorKind, 'sampled' | 'not-sampled'> =
     Unimplemented: 'sampled',
     Internal: 'sampled',
     InvalidDocument: 'sampled',
+    DocumentUnreadable: 'sampled',
     InvalidArgument: 'sampled',
 };
 type RecoveryOutcome = 'RECOVERED' | 'FAILED' | 'PENDING';
