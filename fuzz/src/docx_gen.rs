@@ -500,37 +500,6 @@ fn gen_ppr(u: &mut Unstructured, allow_sect_pr: bool) -> String {
             attr_num(u, 720)
         ));
     }
-    /* Issue #503 (residue) - paragraph borders with stroke widths around
-    Word's 2..=48 eighths of a point (and hostile ones), and a tab-stop
-    list around Word's 64. */
-    if u.ratio(1, 4).unwrap_or(false) {
-        s.push_str("<w:pBdr>");
-        for edge in ["top", "left", "bottom", "right", "between"] {
-            if u.ratio(1, 2).unwrap_or(false) {
-                let val = pick(u, &["single", "double", "dotted", "nil", "none", "wave"]);
-                s.push_str(&format!(
-                    r#"<w:{edge} w:val="{val}" w:sz="{}" w:space="1" w:color="auto"/>"#,
-                    attr_num(u, 120)
-                ));
-            }
-        }
-        s.push_str("</w:pBdr>");
-    }
-    if u.ratio(1, 6).unwrap_or(false) {
-        let n = if u.ratio(1, 2).unwrap_or(false) {
-            60 + u.int_in_range(0u32..=20).unwrap_or(0)
-        } else {
-            u.int_in_range(0u32..=4).unwrap_or(0)
-        };
-        s.push_str("<w:tabs>");
-        for i in 0..n {
-            s.push_str(&format!(
-                r#"<w:tab w:val="left" w:pos="{}"/>"#,
-                100 + i64::from(i) * 10
-            ));
-        }
-        s.push_str("</w:tabs>");
-    }
     s.push_str(&maybe_bool_element(u, "w:bidi"));
     s.push_str(&maybe_bool_element(u, "w:pageBreakBefore"));
     if u.ratio(1, 3).unwrap_or(false) {
@@ -590,20 +559,6 @@ fn gen_cell(u: &mut Unstructured, rels: &mut Rels, depth: u32) -> String {
     if u.ratio(1, 3).unwrap_or(false) {
         let v = pick(u, &["restart", "continue", "bogus"]);
         tc_pr.push_str(&format!(r#"<w:vMerge w:val="{v}"/>"#));
-    }
-    /* Issue #503 (residue) - cell border stroke widths around Word's
-    2..=48 eighths of a point. */
-    if u.ratio(1, 4).unwrap_or(false) {
-        tc_pr.push_str("<w:tcBorders>");
-        for edge in ["top", "left", "bottom", "right"] {
-            if u.ratio(1, 2).unwrap_or(false) {
-                tc_pr.push_str(&format!(
-                    r#"<w:{edge} w:val="single" w:sz="{}" w:space="0" w:color="auto"/>"#,
-                    attr_num(u, 120)
-                ));
-            }
-        }
-        tc_pr.push_str("</w:tcBorders>");
     }
     tc_pr.push_str("</w:tcPr>");
     let mut content = String::new();
@@ -900,6 +855,95 @@ pub fn build_docx(u: &mut Unstructured) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Issue #503 (residue) - a package whose body is nothing but measures at
+/// Word's edges: paragraph borders (`w:sz` around 2..=48 eighths of a point
+/// and hostile ones, every edge style incl. `nil`), tab-stop lists around
+/// Word's 64, a table with `tblBorders` / `tcBorders`, and a `pgBorders` box
+/// plus margins in the trailing `sectPr`. A SEPARATE generator beside
+/// [`build_docx`] - the committed reproducer seeds pin `build_docx`'s byte
+/// consumption, so its shapes never grow; `run_docx_reader` reads this one
+/// too and holds the model to `first_point_field_beyond_bound`.
+pub fn build_measure_docx(u: &mut Unstructured) -> Option<Vec<u8>> {
+    if u.is_empty() {
+        return None;
+    }
+    let edge = |u: &mut Unstructured, name: &str| {
+        let val = *pick(u, &["single", "double", "dotted", "nil", "none", "wave"]);
+        format!(
+            r#"<w:{name} w:val="{val}" w:sz="{}" w:space="1" w:color="auto"/>"#,
+            attr_num(u, 120)
+        )
+    };
+    let mut body = String::new();
+    for _ in 0..u.int_in_range(1u32..=4).unwrap_or(1) {
+        let mut ppr = String::from("<w:pPr>");
+        if u.ratio(2, 3).unwrap_or(false) {
+            ppr.push_str("<w:pBdr>");
+            for name in ["top", "left", "bottom", "right", "between"] {
+                if u.ratio(1, 2).unwrap_or(false) {
+                    ppr.push_str(&edge(u, name));
+                }
+            }
+            ppr.push_str("</w:pBdr>");
+        }
+        if u.ratio(2, 3).unwrap_or(false) {
+            let n = if u.ratio(1, 2).unwrap_or(false) {
+                60 + u.int_in_range(0u32..=20).unwrap_or(0)
+            } else {
+                u.int_in_range(0u32..=4).unwrap_or(0)
+            };
+            ppr.push_str("<w:tabs>");
+            for i in 0..n {
+                ppr.push_str(&format!(
+                    r#"<w:tab w:val="left" w:pos="{}"/>"#,
+                    100 + i64::from(i) * 10
+                ));
+            }
+            ppr.push_str("</w:tabs>");
+        }
+        ppr.push_str("</w:pPr>");
+        body.push_str(&format!("<w:p>{ppr}<w:r><w:t>x</w:t></w:r></w:p>"));
+    }
+    let mut tbl_borders = String::from("<w:tblBorders>");
+    for name in ["top", "left", "bottom", "right", "insideH", "insideV"] {
+        if u.ratio(1, 2).unwrap_or(false) {
+            tbl_borders.push_str(&edge(u, name));
+        }
+    }
+    tbl_borders.push_str("</w:tblBorders>");
+    let mut tc_borders = String::from("<w:tcBorders>");
+    for name in ["top", "left", "bottom", "right"] {
+        if u.ratio(1, 2).unwrap_or(false) {
+            tc_borders.push_str(&edge(u, name));
+        }
+    }
+    tc_borders.push_str("</w:tcBorders>");
+    body.push_str(&format!(
+        "<w:tbl><w:tblPr>{tbl_borders}</w:tblPr><w:tblGrid><w:gridCol w:w=\"2000\"/>\
+         </w:tblGrid><w:tr><w:tc><w:tcPr>{tc_borders}</w:tcPr><w:p/></w:tc></w:tr></w:tbl><w:p/>"
+    ));
+    let mut pg_borders = String::from(r#"<w:pgBorders w:offsetFrom="page">"#);
+    for name in ["top", "left", "bottom", "right"] {
+        if u.ratio(1, 2).unwrap_or(false) {
+            pg_borders.push_str(&edge(u, name));
+        }
+    }
+    pg_borders.push_str("</w:pgBorders>");
+    let sect = format!(
+        r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="720" w:footer="720"/>{pg_borders}</w:sectPr>"#,
+        attr_num(u, 5000),
+        attr_num(u, 5000),
+        attr_num(u, 5000),
+        attr_num(u, 5000),
+    );
+    let document_xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+         <w:body>{body}{sect}</w:body></w:document>"
+    );
+    Some(zip_opc(document_xml.as_bytes(), None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,6 +959,42 @@ mod tests {
         let mut v = Vec::new();
         let _ = f.read_to_end(&mut v);
         v.len()
+    }
+
+    /// Issue #503 (residue) - the measures generator really reaches the
+    /// clamps (a border width past 48, a tab list past 64), and what the
+    /// reader builds from it always holds Word's bounds.
+    #[test]
+    fn measure_packages_reach_the_border_and_tab_clamps_and_read_inside_bounds() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut border_clamps, mut tab_clamps, mut read) = (0, 0, 0);
+        for _ in 0..600 {
+            let mut noise = Vec::new();
+            for _ in 0..384 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                noise.push(state as u8);
+            }
+            let Some(docx) = build_measure_docx(&mut Unstructured::new(&noise)) else {
+                continue;
+            };
+            let archive = format_docx::read_docx(&docx).expect("a measures package reads");
+            read += 1;
+            assert_eq!(
+                engine::first_point_field_beyond_bound(&archive.document),
+                None
+            );
+            for w in &archive.warnings {
+                if let format_docx::DocxWarning::MeasureClamped { attr, .. } = w {
+                    border_clamps += usize::from(attr.ends_with("/@w:sz"));
+                    tab_clamps += usize::from(attr == "w:tabs");
+                }
+            }
+        }
+        assert!(read > 500, "{read}");
+        assert!(border_clamps > 50, "{border_clamps}");
+        assert!(tab_clamps > 20, "{tab_clamps}");
     }
 
     /// Issue #422 — whatever the bytes, a generated package stays within

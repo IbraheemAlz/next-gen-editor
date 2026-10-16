@@ -33,12 +33,23 @@ pub fn run_docx_reader(data: &[u8]) {
     let Some(bytes) = docx_gen::build_docx(&mut u) else {
         return;
     };
-    /* Issue #503 (residue) - whatever the generator spelled (border widths,
-    tab-stop lists, point measures), the reader's model holds Word's bounds. */
-    if let Ok(archive) = format_docx::read_docx(&bytes)
-        && let Some(why) = engine::first_point_field_beyond_bound(&archive.document)
+    if let Ok(archive) = format_docx::read_docx(&bytes) {
+        assert_reads_inside_bounds(&archive, "docx_reader");
+    }
+    /* Issue #503 (residue) - and a second package of nothing but measures at
+    Word's edges (border widths, tab-stop lists, margins). */
+    if let Some(bytes) = docx_gen::build_measure_docx(&mut Unstructured::new(data))
+        && let Ok(archive) = format_docx::read_docx(&bytes)
     {
-        panic!("docx_reader: the read model holds an out-of-bound field: {why}");
+        assert_reads_inside_bounds(&archive, "docx_reader (measures)");
+    }
+}
+
+/// Issue #503 - whatever a file spelled, the model the reader built holds
+/// Word's bounds (point fields, border widths, tab-stop lists).
+fn assert_reads_inside_bounds(archive: &format_docx::DocxArchive, target: &str) {
+    if let Some(why) = engine::first_point_field_beyond_bound(&archive.document) {
+        panic!("{target}: the read model holds an out-of-bound field: {why}");
     }
 }
 
