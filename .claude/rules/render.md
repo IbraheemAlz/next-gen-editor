@@ -120,6 +120,19 @@ hard failure so CI catches a new loop instead of a silent recovery.
   a full reflow on mismatch — never trust the prediction. A stale-layout
   bug becomes a perf blip plus a `FastPathMismatch` / `CacheMismatch`
   note, not corruption.
+- **The cull counts a line at most one page (issue #501).** The viewport
+  cull compares "finished pages + the paginator's in-progress cursor" with
+  its budget; a line taller than its page (clipped by the oversize guard)
+  leaves the cursor at the line's full height, so a size no page can hold
+  put the running height past EVERY finite target and the band stopped
+  behind that block for ever (#499). The comparison uses
+  `Paginator::cursor_y_within_page` (the cursor bounded by the page), so
+  each such block adds at most one page and a finite target keeps working;
+  a cursor inside the page is unchanged, so no normal band moves. Command
+  sizes are now bounded at the door (`engine::MAX_FONT_SIZE_PT`, see
+  `docx.md`), but a restored snapshot or an old logged command can still
+  hold any size: the clamp is the structural defence, the progress-bounded
+  expansion below the backstop.
 - A band's geometry must be self-consistent where it stops: never cull
   right behind a keep-with-next paragraph (issue #95), and mark pages
   that a pending pass will still rewrite — a continuous section's column

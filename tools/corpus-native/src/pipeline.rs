@@ -790,6 +790,13 @@ pub struct DocResult {
     /// archive as read) do not show. Empty for canonical packages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub normalized_parts: Vec<String>,
+    /// Issue #501 - how many `<w:sz>` / `<w:szCs>` values the reader
+    /// clamped into Word's 1..=1638 pt (`DocxWarning::MeasureClamped`
+    /// naming `w:sz/@w:val` or `w:szCs/@w:val`; the reader's warning list
+    /// is capped, so a large count is a lower bound). 0 for a document
+    /// whose sizes were all in range.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub font_size_clamps: usize,
     /// Issue #384 — `--regen-check`: every clean paragraph regenerated
     /// with no edit and compared with its source bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1002,6 +1009,7 @@ impl DocResult {
             engine_repaint_ms: None,
             engine_repaint_consistent: None,
             normalized_parts: Vec::new(),
+            font_size_clamps: 0,
             regen_check: None,
             main_part_regenerate_only: false,
         }
@@ -1189,6 +1197,14 @@ pub fn run_one(
         })
         .collect();
     rec.main_part_regenerate_only = rec.normalized_parts.contains(&archive_a.part_names.main);
+    rec.font_size_clamps = archive_a
+        .warnings
+        .iter()
+        .filter(|w| {
+            matches!(w, format_docx::DocxWarning::MeasureClamped { attr, .. }
+                if attr == "w:sz/@w:val" || attr == "w:szCs/@w:val")
+        })
+        .count();
 
     /* 2. Full layout (native — `crates/layout`, no browser). */
     let layout_t0 = Instant::now();
@@ -1732,4 +1748,8 @@ mod tests {
         let _ = classify_rewrite(xml, xml.len(), 1);
         let _ = classify_rewrite(xml, xml.len() + 1000, 1);
     }
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
