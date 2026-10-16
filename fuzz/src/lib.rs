@@ -706,11 +706,12 @@ mod tests {
         assert!(words.contains(b"<w:fldChar w:fldCharType=\"begin\"/>".as_slice()));
     }
 
-    /// Issues #439 / #434 — every committed `docx_roundtrip` reproducer
-    /// (`corpus/docx_roundtrip/repro_*`, raw fuzz inputs the generator
-    /// turns into malformed packages) holds the read => write => read
-    /// invariant. The generator-independent spellings of the same shapes
-    /// are `format_docx`'s `reader_well_formed_tests`.
+    /// Issues #439 / #434 (and #482 / #483) — every committed
+    /// `docx_roundtrip` reproducer (`corpus/docx_roundtrip/repro_*`, raw
+    /// fuzz inputs the generator turns into malformed packages) holds the
+    /// read => write => read invariant. The generator-independent
+    /// spellings of the same shapes are `format_docx`'s
+    /// `reader_well_formed_tests`.
     #[test]
     fn committed_docx_roundtrip_reproducers_hold() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_roundtrip");

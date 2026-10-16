@@ -330,6 +330,26 @@ fn an_unclosed_tag_inside_a_preserved_span_refuses_typed() {
     }
 }
 
+/// Issue #482 (nightly `docx_roundtrip`, crash `9dded4b484a5`) — a stray
+/// `<w:t>` in front of `<w:body>` (inside the root, so the up-front repair
+/// keeps it; the truncated part is closed at EOF). The reader raised its
+/// text flag for it, the flag stayed up into the first run, and that run's
+/// `<w:rPr>` character data read as text until the run's own `</w:t>` —
+/// text the save (whose envelope drops the stray element, and which never
+/// re-emits character data inside `<w:rPr>`) did not have. Only a run's
+/// `<w:t>` holds text now.
+#[test]
+fn a_stray_text_element_outside_every_run_reads_no_text() {
+    let xml = [
+        ROOT,
+        "<w:t>junk<w:body><w:p><w:r><w:rPr><w:b/>\u{301}&gt;<w:sz w:val=\"20\"/></w:rPr>"
+            .as_bytes(),
+        br#"<w:t xml:space="preserve">hello</w:t></w:r></w:p><w:p><w:r><w:t>next</w:t></w:r>"#,
+    ]
+    .concat();
+    assert_eq!(assert_repaired_round_trip(&xml), "hello\nnext");
+}
+
 /// Issue #434 — a structurally broken sibling is reported and left exactly
 /// as it is: the document still opens (default styles), and the part
 /// passes through byte-identical, as before.

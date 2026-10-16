@@ -1991,11 +1991,20 @@ pub(crate) fn parse_document_xml_with_events(
                         para_text.push(wrapper.opener());
                         bidi_wrappers_open += 1;
                     }
-                    b"w:t" => {
+                    /* Issue #482 — text only ever lives in a RUN's `<w:t>`
+                    (`CT_R`). A stray `<w:t>` outside every run (one
+                    wrapping `<w:body>`, junk spliced into the root) used
+                    to raise the flag anyway: it stayed up into the next
+                    run, whose `<w:rPr>` character data then read as text
+                    until that run's own `</w:t>` — text the writer (which
+                    never re-emits such character data) could not
+                    reproduce. Its own text never reached a run either
+                    (`run_text` restarts at every `<w:r>`). */
+                    b"w:t" if in_run => {
                         in_text_elt = true;
                         markup.run_text_elt(&e, &ns);
                     }
-                    b"w:delText" => {
+                    b"w:delText" if in_run => {
                         in_del_text_elt = true;
                         markup.run_text_elt(&e, &ns);
                     }
