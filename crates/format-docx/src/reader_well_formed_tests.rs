@@ -466,31 +466,130 @@ fn undeclared_prefixes_save_namespace_well_formed() {
     }
 }
 
-/// Issue #435 (a 50k-sweep finding) — markup spliced in front of the real
-/// root wraps it (`<w:t><w:document xmlns:…>`): the reader walks it
-/// leniently, but the writer's synthesized root re-declares only the
-/// first element's bindings, so the wrapped root's declarations cannot
-/// survive a save. Reported beyond repair; the document still opens.
+/// One entry of a saved package, by name.
+fn entry_bytes(package: &[u8], name: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(package)).expect("zip");
+    let mut v = Vec::new();
+    z.by_name(name)
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
+        .read_to_end(&mut v)
+        .expect("read");
+    v
+}
+
+const STYLES: &[u8] = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="A"><w:name w:val="A"/></w:style></w:styles>"#;
+const BODY_A: &[u8] =
+    b"<w:body><w:p><w:r><w:t>a</w:t></w:r></w:p><w:sectPr/></w:body></w:document>";
+
+/// Issues #435 / #468 item 1 (a 50k-sweep finding) — markup spliced in
+/// front of the real root wraps it (`<w:t><w:document xmlns:…>`). The
+/// writer's synthesized root could only re-declare the FIRST element's
+/// bindings, so the save was namespace-ill-formed. With exactly one
+/// WordprocessingML `document` inside, the part is unwrapped to it
+/// (repaired: true): the document's own declarations stay on the root it was
+/// authored with, the save is namespace-well-formed, the siblings are
+/// byte-identical.
 #[test]
-fn a_wrapped_main_root_is_reported_beyond_repair() {
+fn a_wrapped_main_root_is_unwrapped_to_the_one_document_inside() {
     let (decl, root) = prolog_and_root();
-    let xml = [
-        decl,
-        b"<w:t>",
-        root,
-        b"<w:body><w:p><w:r><w:t>a</w:t></w:r></w:p><w:sectPr/></w:body></w:document></w:t>",
-    ]
-    .concat();
-    let a = read_docx(&package_with_document_xml_bytes(&xml, &[])).expect("opens");
+    let xml = [decl, b"\n<w:t>junk", root, BODY_A, b"</w:t>"].concat();
+    let docx = package_with_document_xml_bytes(&xml, &[("word/styles.xml", STYLES)]);
+    let a = read_docx(&docx).expect("opens");
+    assert_eq!(
+        malformed_parts(&a.warnings),
+        vec![("word/document.xml", true)],
+        "{:?}",
+        a.warnings
+    );
     assert!(
         a.warnings.iter().any(|w| matches!(
             w,
-            DocxWarning::MalformedPart { part, detail, repaired: false }
-                if part == "word/document.xml" && detail.contains("`w:t`")
+            DocxWarning::MalformedPart { detail, .. }
+                if detail.contains("`w:t`") && detail.contains("unwrapped")
         )),
         "{:?}",
         a.warnings
     );
+    assert_eq!(a.document.to_plain_text(), "a");
+    let saved = write_docx(&a, &a.document).expect("write");
+    crate::check_document_xml_well_formed(&saved).expect("the save is namespace-well-formed");
+    let part = String::from_utf8(entry_bytes(&saved, "word/document.xml")).expect("utf-8");
+    assert!(
+        part.starts_with(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#)
+            && part.contains(r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="#)
+            && !part.contains("<w:t>junk"),
+        "{part}"
+    );
+    /* Unchanged siblings round-trip byte for byte. */
+    for name in ["word/styles.xml", "[Content_Types].xml", "_rels/.rels"] {
+        assert_eq!(
+            entry_bytes(&saved, name),
+            entry_bytes(&docx, name),
+            "{name}"
+        );
+    }
+    let b = read_docx(&saved).expect("re-read");
+    assert!(malformed_parts(&b.warnings).is_empty(), "{:?}", b.warnings);
+    assert_eq!(b.document.to_plain_text(), "a");
+}
+
+/// Issue #468 — the wrapper chain's declarations the document element does
+/// not redeclare move onto it (its other bytes stay verbatim), so what the
+/// document read under them still resolves; the wrapper's siblings and text
+/// are dropped.
+#[test]
+fn an_unwrapped_root_keeps_the_declarations_it_inherited() {
+    let xml = br#"<?xml version="1.0"?><x:junk xmlns:x="urn:x" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">text<y:a xmlns:y="urn:y"><y:b/></y:a><deep><w:document xmlns:x="urn:own"><w:body><w:p><w:r><w:t>a</w:t></w:r></w:p><w:p><mc:AlternateContent><mc:Fallback><w:r><w:t>b</w:t></w:r></mc:Fallback></mc:AlternateContent></w:p><w:p><w:r><w:t>c</w:t></w:r></w:p><w:sectPr/></w:body></w:document></deep>tail</x:junk>"#;
+    let docx = package_with_document_xml_bytes(xml, &[]);
+    let a = read_docx(&docx).expect("opens");
+    assert_eq!(
+        malformed_parts(&a.warnings),
+        vec![("word/document.xml", true)],
+        "{:?}",
+        a.warnings
+    );
+    assert_eq!(a.document.to_plain_text(), "a\nb\nc");
+    let saved = write_docx(&a, &a.document).expect("write");
+    crate::check_document_xml_well_formed(&saved).expect("namespace-well-formed");
+    let part = String::from_utf8(entry_bytes(&saved, "word/document.xml")).expect("utf-8");
+    /* `x` is redeclared by the element itself: not inherited twice. */
+    assert!(
+        part.contains(r#"xmlns:x="urn:own""#) && !part.contains("urn:x\""),
+        "{part}"
+    );
+    assert!(part.contains("xmlns:mc="), "{part}");
+    let b = read_docx(&saved).expect("re-read");
+    assert!(malformed_parts(&b.warnings).is_empty(), "{:?}", b.warnings);
+    assert_eq!(b.document.to_plain_text(), "a\nb\nc");
+}
+
+/// Issue #468 — a junk root that wraps NO WordprocessingML `document`, or
+/// SEVERAL (which one was meant?), has no faithful repair: the open is
+/// refused with the typed error rather than writing a part the writer cannot
+/// declare. A root that is no WordprocessingML at all keeps reading as
+/// before (reported `NotWordprocessingMl`).
+#[test]
+fn a_junk_root_with_no_document_or_two_is_refused_typed() {
+    let (decl, root) = prolog_and_root();
+    let none = [
+        decl,
+        b"\n<w:t xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">junk<w:body><w:p/></w:body></w:t>".as_slice(),
+    ]
+    .concat();
+    let two = [decl, b"\n<w:t>", root, BODY_A, root, BODY_A, b"</w:t>"].concat();
+    for (xml, what) in [(none, "wraps none"), (two, "wraps more than one")] {
+        let err =
+            read_docx(&package_with_document_xml_bytes(&xml, &[])).expect_err("no faithful repair");
+        assert!(
+            matches!(&err, crate::DocxError::MalformedXml(d) if d.contains(what) && d.contains("`w:t`")),
+            "{what}: {err:?}"
+        );
+    }
+    /* No WordprocessingML anywhere: not this check's business. */
+    let a = read_docx(&package_with_document_xml_bytes(b"<foo><bar/></foo>", &[]))
+        .expect("opens, reported");
+    assert_eq!(a.warnings, vec![DocxWarning::NotWordprocessingMl]);
 }
 
 /// Issue #435 — the same in a sibling part: an undeclared `w14:` attribute
@@ -512,4 +611,147 @@ fn an_undeclared_prefix_in_a_sibling_is_bound_on_its_root() {
     );
     let saved = write_docx(&a, &a.document).expect("write");
     crate::check_part_xml_well_formed(&saved, "word/styles.xml").expect("well-formed styles");
+}
+
+/* ------------------------------------------------------------------ */
+/* Issue #468 item 2 — XML name syntax                                  */
+/* ------------------------------------------------------------------ */
+
+/// Issue #468 — a byte flip that puts `;` / `=` / `"` / a leading digit in
+/// a tag or attribute name is a structural defect: the main part refuses
+/// with a typed error (no faithful repair — which name was meant?).
+#[test]
+fn an_invalid_tag_name_in_the_main_part_refuses_typed() {
+    for flipped in [
+        "<w:p;><w:r><w:t>a</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p=x/>",
+        "<w:p><w:r w:rsidR\"\"=\"1\"><w:t>a</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>a</w:t></w:r></w:p><1w:p/>",
+        "<w:p><w:r><w:t>a</w:t></w:r></w:p><mc:A;lternateContent/>",
+    ] {
+        let xml = document(flipped.as_bytes());
+        let err = read_docx(&package_with_document_xml_bytes(&xml, &[]))
+            .expect_err("no faithful repair for a bad name");
+        assert!(
+            matches!(&err, crate::DocxError::MalformedXml(d) if d.contains("not a valid XML name")),
+            "{flipped}: {err:?}"
+        );
+    }
+}
+
+/// `text` as a UTF-16 part with a byte-order mark.
+fn utf16_part(text: &str, little_endian: bool) -> Vec<u8> {
+    let mut out = if little_endian {
+        vec![0xFF, 0xFE]
+    } else {
+        vec![0xFE, 0xFF]
+    };
+    for u in text.encode_utf16() {
+        out.extend_from_slice(&if little_endian {
+            u.to_le_bytes()
+        } else {
+            u.to_be_bytes()
+        });
+    }
+    out
+}
+
+/// Issue #468 item 3 — a UTF-16 `word/document.xml` (either byte order,
+/// Arabic and a surrogate pair in the text) is decoded: the text is intact,
+/// the part is reported repaired with the encoding named, and the save
+/// writes UTF-8 — no byte-order mark, the declaration rewritten — that
+/// re-reads clean.
+#[test]
+fn a_utf16_main_part_is_decoded_and_saved_as_utf8() {
+    let text = "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64A}\u{629} \u{1F600} & é";
+    let (_, root) = prolog_and_root();
+    let source = format!(
+        "{}\n{}<w:body><w:p><w:r><w:t>{}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>",
+        r#"<?xml version="1.0" encoding="UTF-16" standalone="yes"?>"#,
+        String::from_utf8_lossy(root),
+        text.replace('&', "&amp;")
+    );
+    for (little_endian, name) in [(true, "UTF-16LE"), (false, "UTF-16BE")] {
+        let xml = utf16_part(&source, little_endian);
+        let docx = package_with_document_xml_bytes(&xml, &[]);
+        let a = read_docx(&docx).expect("a UTF-16 part opens");
+        assert_eq!(
+            malformed_parts(&a.warnings),
+            vec![("word/document.xml", true)],
+            "{name}"
+        );
+        assert!(
+            a.warnings.iter().any(|w| matches!(
+                w,
+                DocxWarning::MalformedPart { detail, .. } if detail.contains(name)
+            )),
+            "{:?}",
+            a.warnings
+        );
+        assert_eq!(a.document.to_plain_text(), text, "{name}");
+        let saved = write_docx(&a, &a.document).expect("write");
+        crate::check_document_xml_well_formed(&saved).expect("the save is well-formed");
+        let part = saved_document_xml(&xml);
+        assert!(
+            part.starts_with(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#),
+            "{name}: {part}"
+        );
+        assert!(!part.contains('\u{FEFF}'), "{name}: no byte-order mark");
+        let b = read_docx(&saved).expect("re-read");
+        assert!(
+            malformed_parts(&b.warnings).is_empty(),
+            "{name}: {:?}",
+            b.warnings
+        );
+        assert_eq!(b.document.to_plain_text(), text, "{name}");
+    }
+}
+
+/// Issue #468 — a UTF-16 sibling is decoded too: the row `other_entries`
+/// holds (what the save replays) is UTF-8, reported repaired.
+#[test]
+fn a_utf16_sibling_is_decoded_in_place() {
+    let styles = utf16_part(
+        r#"<?xml version="1.0" encoding="UTF-16"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="A"><w:name w:val="A"/></w:style></w:styles>"#,
+        true,
+    );
+    let xml = document(b"<w:p><w:r><w:t>a</w:t></w:r></w:p>");
+    let docx = package_with_document_xml_bytes(&xml, &[("word/styles.xml", &styles)]);
+    let a = read_docx(&docx).expect("read");
+    assert_eq!(
+        malformed_parts(&a.warnings),
+        vec![("word/styles.xml", true)]
+    );
+    let part = a.part_by_name("word/styles.xml").expect("styles");
+    assert!(
+        part.starts_with(br#"<?xml version="1.0" encoding="UTF-8"?><w:styles"#),
+        "{}",
+        String::from_utf8_lossy(part)
+    );
+    let saved = write_docx(&a, &a.document).expect("write");
+    crate::check_part_xml_well_formed(&saved, "word/styles.xml").expect("well-formed styles");
+}
+
+/// Issue #468 — the same in a sibling part: reported (`repaired: false`),
+/// the part stays byte-identical, the document opens.
+#[test]
+fn an_invalid_tag_name_in_a_sibling_is_reported_and_kept() {
+    let styles: &[u8] = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="A"><w:na;me w:val="A"/></w:style></w:styles>"#;
+    let xml = document(b"<w:p><w:r><w:t>a</w:t></w:r></w:p>");
+    let docx = package_with_document_xml_bytes(&xml, &[("word/styles.xml", styles)]);
+    let a = read_docx(&docx).expect("the document opens");
+    assert_eq!(
+        malformed_parts(&a.warnings),
+        vec![("word/styles.xml", false)]
+    );
+    assert!(
+        a.warnings.iter().any(|w| matches!(
+            w,
+            DocxWarning::MalformedPart { detail, .. } if detail.contains("`w:na;me`")
+        )),
+        "{:?}",
+        a.warnings
+    );
+    assert_eq!(a.part_by_name("word/styles.xml"), Some(styles));
+    assert_eq!(a.document.to_plain_text(), "a");
 }
