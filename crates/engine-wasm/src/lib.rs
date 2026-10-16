@@ -31088,3 +31088,7 @@ mod paragraph_cache_key_tests;
 /// Issues #477–#481 — the nightly `snapshot_decode` findings, generator-free.
 #[cfg(test)]
 mod fuzz_finding_tests;
+
+/// Issue #497 — the table-heavy body-edit repaint timing harness.
+#[cfg(test)]
+mod table_repaint_perf_tests;
