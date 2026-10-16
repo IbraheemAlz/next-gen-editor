@@ -437,6 +437,25 @@ mod tests {
         engine.do_move_caret_reaching(direction, extend)
     }
 
+    /// The document's line pitch in points, measured through the engine:
+    /// the caret-rect distance between two consecutive `Down` presses on a
+    /// short throwaway document. The pitch is font-derived (issue #475),
+    /// so a test that counts lines per viewport reads it instead of
+    /// hard-coding a number.
+    fn measured_line_pitch_pt() -> f32 {
+        let mut engine = test_engine_with_doc(lines_doc(4));
+        let mut ys = Vec::new();
+        for _ in 0..3 {
+            let Event::SelectionChanged { caret, .. } =
+                move_via_dispatch(&mut engine, MoveDirection::Down, false)
+            else {
+                panic!("Down answers SelectionChanged");
+            };
+            ys.push(caret.y);
+        }
+        (ys[2] - ys[1]) / engine.scale()
+    }
+
     /// Acceptance (#462): a run of ArrowDown never stops at the band's
     /// edge — 600 steps on a 900-line document land on line 601, and the
     /// band grew synchronously (no `ExpandLayout`, no viewport change).
@@ -589,8 +608,13 @@ mod tests {
     fn page_down_and_up_step_one_viewport_through_the_band() {
         let mut engine = test_engine_with_doc(lines_doc(900));
         small_band(&mut engine);
-        /* A 520 pt viewport: 20 lines of the 26 pt pitch per press. */
+        /* A 520 pt viewport: `520 / pitch` lines per press (the pitch is
+        font-derived since #475), less what a page break spends on margins
+        + the page gap. */
         engine.lazy_layout.viewport_h = 520.0;
+        let pitch = measured_line_pitch_pt();
+        assert!((10.0..=40.0).contains(&pitch), "a plausible pitch: {pitch}");
+        let per_press = (520.0 / pitch).ceil() as u32 + 1;
         let mut blocks = vec![caret_block(&engine)];
         for _ in 0..30 {
             let evt = move_via_dispatch(&mut engine, MoveDirection::PageDown, false);
@@ -599,11 +623,9 @@ mod tests {
         }
         for w in blocks.windows(2) {
             let d = w[1] - w[0];
-            /* 20 lines of text, less what a page break spends on
-            margins + the page gap. */
             assert!(
-                (8..=21).contains(&d),
-                "a press moves ~one viewport: {blocks:?}"
+                (8..=per_press).contains(&d),
+                "a press moves ~one viewport ({per_press} lines at {pitch} pt): {blocks:?}"
             );
         }
         assert!(
@@ -615,7 +637,10 @@ mod tests {
             move_via_dispatch(&mut engine, MoveDirection::PageUp, true);
         }
         let back = caret_block(&engine);
-        assert!((40..=105).contains(&(deep - back)), "{deep} → {back}");
+        assert!(
+            (40..=5 * per_press).contains(&(deep - back)),
+            "{deep} → {back} ({per_press} lines per press)"
+        );
         assert_eq!(
             engine.selection.as_ref().unwrap().anchor.path,
             bpos_top(deep, 0).path,
