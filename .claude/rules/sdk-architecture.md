@@ -52,11 +52,23 @@ discipline.
     A new engine event field lands here as one more signal, never as a
     second `subscribe`.
   - `src/createCaretReveal.ts` + `src/caretReveal.ts` — issue #387:
-    scroll the host viewport minimally (with a margin, one frame after
-    the event) so the caret stays visible after keyboard navigation and
-    typing; the host maps the device-px caret to its scroll content
-    (`EditorSurface` does it for its one canvas, the reference shell's
-    `CaretReveal` per page card).
+    scroll the host viewport minimally (with a margin) so the caret
+    stays visible after keyboard navigation and typing; the host maps
+    the device-px caret to its scroll content (`EditorSurface` does it
+    for its one canvas, the reference shell's `CaretReveal` per page
+    card). Issue #486: the reveal is a *consequence* of an earlier input
+    and must never undo a later user scroll — it scrolls in the same
+    task as the selection event when `caretBox` can place the caret (a
+    frame/timer pass only re-checks a late-settled layout or places a
+    caret that had no geometry yet), and stands down when
+    `src/revealIntent.ts` (`ScrollIntentLedger`, DOM-free) saw a user
+    scroll intent after the command was SENT (`wheel`, `touchmove`, a
+    scrollbar press, a key on the scroller; the client's optional
+    `EngineClientLike.lastSelectionMoveSentAt` says when) or a `scroll`
+    event that is not the echo of the reveal's own write (its write is
+    marked, never mistaken for the user's). A pointer click is
+    `reveals_caret: false` — a race spec for this needs a keyboard /
+    `SET_SELECTION` move (`ts/e2e/caret-reveal-intent.spec.ts`).
   - `src/types.ts` — re-exports every bridge type from the wasm-pack
     output plus the `EngineClientLike` + `EngineClientSnapshots`
     interface contracts. **Single point of coupling** to

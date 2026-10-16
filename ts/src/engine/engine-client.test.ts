@@ -108,6 +108,30 @@ describe('request routing', () => {
     });
 });
 
+describe('lastSelectionMoveSentAt (#486)', () => {
+    it('is undefined until a selection-moving command is dispatched', () => {
+        expect(client.lastSelectionMoveSentAt).toBeUndefined();
+    });
+
+    it('is stamped when a selection-moving command is SENT, not when it is answered', () => {
+        const spy = vi.spyOn(performance, 'now').mockReturnValue(1234);
+        void client.dispatch(insert);
+        spy.mockReturnValue(5678);
+        expect(client.lastSelectionMoveSentAt).toBe(1234);
+        worker().reply(worker().last.id, painted);
+        expect(client.lastSelectionMoveSentAt).toBe(1234);
+        spy.mockRestore();
+    });
+
+    it('ignores commands that leave the selection alone', () => {
+        const spy = vi.spyOn(performance, 'now').mockReturnValue(99);
+        void client.dispatch(select); // HIT_TEST: read-only, no selection move
+        void client.dispatch({ type: 'EXPAND_LAYOUT' } as unknown as Command);
+        expect(client.lastSelectionMoveSentAt).toBeUndefined();
+        spy.mockRestore();
+    });
+});
+
 describe('write epoch and writes in flight (#260 / #57)', () => {
     it('a write bumps the epoch when its reply lands, BEFORE subscribers see it', async () => {
         const epochs: number[] = [];
