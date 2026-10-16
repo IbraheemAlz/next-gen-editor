@@ -85,11 +85,18 @@ test('#423 / #329: the picker shows the theme-resolved family, marked with its s
     expect(body.type).toBe('SELECTION_CHANGED');
     expect(body.resolved_font_latin).toBe('Calibri');
     expect(body.resolved_font_cs).toBe('Arial');
-    expect(body.font_source).toEqual({ latin: 'Substituted', complex_script: 'Substituted' });
+    /* Issue #474: `Substituted` hides which cascade level named the
+     * family, so the theme origin rides beside it. */
+    expect(body.font_source).toEqual({
+        latin: 'Substituted',
+        complex_script: 'Substituted',
+        latin_from_theme: true,
+        complex_script_from_theme: true,
+    });
     expect(body.caret_font_slot).toBe('Latin');
     expect(body.slot_formats.latin.font_family).toBe('calibri');
     await expect.poll(() => pickerLabel(page)).toBe('Calibri');
-    await expect(page.locator('.nge-font__source')).toHaveText('(Carlito)');
+    await expect(page.locator('.nge-font__source')).toHaveText('(theme → Carlito)');
 
     /* Arabic paragraph: the complex-script slot is the active one; Arial
      * Arabic is laid out with the Naskh substitute. */
@@ -97,7 +104,7 @@ test('#423 / #329: the picker shows the theme-resolved family, marked with its s
     expect(arabic.caret_font_slot).toBe('ComplexScript');
     expect(arabic.resolved_font_cs).toBe('Arial');
     await expect.poll(() => pickerLabel(page)).toBe('Arial');
-    await expect(page.locator('.nge-font__source')).toHaveText('(Noto Naskh Arabic)');
+    await expect(page.locator('.nge-font__source')).toHaveText('(theme → Noto Naskh Arabic)');
 
     /* The run that rebinds only its cs slot (`w:cstheme="majorBidi"`). */
     const rebound = await caretAt(page, 2, byteOffset(ARABIC, 'العناوين', 4));
