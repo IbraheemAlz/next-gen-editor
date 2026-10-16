@@ -86,7 +86,10 @@ test('a degraded open shows "Opened with N issues" listing MeasureClamped; a cle
 
     /* "Details" expands the list: the clamped margin with its raw value. */
     await banner.locator('.nge-open-warnings__toggle').click();
-    const clamped = banner.locator('.nge-open-warnings__item[data-kind="MeasureClamped"]');
+    /* Three MeasureClamped items since #503 — pick the one carrying the raw clamped value. */
+    const clamped = banner.locator('.nge-open-warnings__item[data-kind="MeasureClamped"]', {
+        hasText: '99999',
+    });
     await expect(clamped).toBeVisible();
     await expect(clamped).toContainText('w:pgMar/@w:top = "99999" → 31680 twips');
     await expect(
