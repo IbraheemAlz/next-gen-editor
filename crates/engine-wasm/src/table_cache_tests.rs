@@ -490,7 +490,7 @@ fn every_layout_affecting_table_property_edit_misses_the_cache() {
 
 /// Issue #379 — manual profiling harness for the table cache on the
 /// table-heavy perf fixture (`tools/perf-fixtures` →
-/// `tests/perf/tables-30p.docx`, 22 three-deep nested towers). Each
+/// `tests/perf/tables-30p.docx`, 30 three-deep nested towers). Each
 /// repaint is timed twice: with the table cache as it stands (#379) and
 /// with it bypassed (`TABLE_CACHE_BYPASS`) — the pre-#379 behaviour,
 /// where nothing table-shaped survived a paint (the paragraph LRU stays

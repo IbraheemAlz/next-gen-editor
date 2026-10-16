@@ -45,9 +45,11 @@ const FILLER: &str = "The quick brown fox jumps over the lazy dog. \
 /// Issue #379 — short mixed-script cell text for the table fixture.
 const CELL_TEXT: &str = "fox مرحبا";
 
-/// Issue #379 — nested towers in the table fixture (~30 pages at the
-/// editor's boot text metrics, 24 px on 36 px lines).
-const TABLE_TOWERS: usize = 22;
+/// Issue #379 — nested towers in the table fixture: one tower per page at
+/// the editor's boot text metrics, so 30 towers lay out to the nominal 30
+/// pages (issue #476: 22 towers laid out to 22 pages, `tools/perf` now
+/// reports and checks it like the `Np` files).
+const TABLE_TOWERS: usize = 30;
 /// Nesting depth of every tower.
 const TOWER_DEPTH: usize = 3;
 

@@ -8,7 +8,7 @@
  *   - open a 50-page .docx
  *
  * plus, issue #379, the table-heavy repaint (report only, ungated): open
- * `tests/perf/tables-30p.docx` (22 three-deep nested autofit tables,
+ * `tests/perf/tables-30p.docx` (30 three-deep nested autofit tables,
  * `tools/perf-fixtures`) and time one-character body edits — each one a
  * repaint that re-lays (or, with the cross-paint table cache, reuses)
  * every table in the viewport band.
@@ -85,6 +85,9 @@ const INSERT_KEYSTROKES = 100;
    that. */
 const NOMINAL_PAGES = 50;
 const NOMINAL_PAGE_TOLERANCE = 0.1;
+/* ... and `tables-30p.docx`, whose repaint timing is only meaningful on the
+   30-page document it is named for. */
+const NOMINAL_TABLE_PAGES = 30;
 /* Issue #379 — body edits timed on the table-heavy fixture. */
 const TABLE_REPAINT_KEYSTROKES = 40;
 
@@ -275,7 +278,8 @@ if (tables !== null) {
             `[perf] table-heavy doc (#379)    : open ${tables.openMs.toFixed(0)} ms · ` +
                 `repaint after body edit x${tables.samples.length} p50 ${tp50.toFixed(2)} ms · ` +
                 `p95 ${tp95.toFixed(2)} ms (report only) · ` +
-                `${tables.pages === null ? 'UNKNOWN' : tables.pages} pages`,
+                `${tables.pages === null ? 'UNKNOWN' : tables.pages} pages ` +
+                `(nominal ${NOMINAL_TABLE_PAGES})`,
         );
     }
 }
@@ -306,6 +310,18 @@ if (openDocMs !== null) {
         breaches.push(
             `50p.docx lays out to ${openDocPages} pages, not ~${NOMINAL_PAGES} ` +
                 '(re-calibrate tools/perf-fixtures PARAS_PER_PAGE)',
+        );
+    }
+}
+
+if (tables !== null && tables.openMs >= 0) {
+    if (
+        tables.pages === null ||
+        Math.abs(tables.pages - NOMINAL_TABLE_PAGES) > NOMINAL_TABLE_PAGES * NOMINAL_PAGE_TOLERANCE
+    ) {
+        breaches.push(
+            `tables-30p.docx lays out to ${tables.pages ?? 'an unknown number of'} pages, ` +
+                `not ~${NOMINAL_TABLE_PAGES} (re-calibrate tools/perf-fixtures TABLE_TOWERS)`,
         );
     }
 }
