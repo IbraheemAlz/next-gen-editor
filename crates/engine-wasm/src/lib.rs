@@ -11763,6 +11763,23 @@ impl Engine {
             });
             self.selection = Some(clamped);
         }
+        /* Issue #478 — F9 inside a header / footer / note / text-box
+        story restamps the BODY too (a PAGE result shrinking from "12" to
+        "1", a TOC gaining or losing entries): carry the stashed body
+        selection across the regenerated TOCs and clamp it, exactly like
+        a body caret, so it never addresses text that is gone. */
+        if self.story_active()
+            && let Some(stashed) = self.stashed_body_selection.clone()
+        {
+            let new_doc = self.undo.current();
+            let carry = |p| clamp_pos(new_doc, shift_pos_across_tocs(&old_doc, new_doc, p));
+            self.stashed_body_selection = Some(SelectionState {
+                anchor: carry(stashed.anchor),
+                caret: carry(stashed.caret),
+                ideal_x: None,
+                kind: stashed.kind,
+            });
+        }
         self.caret_affinity = CaretAffinity::default();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -16090,6 +16107,18 @@ impl Engine {
     /// Idempotent, so running it both before the repaint and again in
     /// `after_history_change` is harmless.
     fn reclamp_selection(&mut self) {
+        /* Issue #478 — the body a story stashed its caret in may have
+        changed under it too (undo / redo of a body edit while a story is
+        active): keep the stash inside the current body. */
+        if let Some(stashed) = self.stashed_body_selection.clone() {
+            let body = self.undo.current();
+            self.stashed_body_selection = Some(SelectionState {
+                anchor: clamp_pos(body, stashed.anchor),
+                caret: clamp_pos(body, stashed.caret),
+                ideal_x: stashed.ideal_x,
+                kind: stashed.kind,
+            });
+        }
         let Some(sel) = self.selection.clone() else {
             return;
         };

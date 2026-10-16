@@ -231,3 +231,45 @@ fn a_selection_in_a_table_only_document_stays_valid() {
     );
     assert_eq!(clamp_pos(doc, sel.caret.clone()), sel.caret, "valid caret");
 }
+
+/// Issue #478 — F9 inside a footnote story restamps a stale PAGE result in
+/// the body ("12345" → "1"); the body caret the story stashed sat after
+/// the footnote reference, past the restamped paragraph's new end. It is
+/// clamped with the body now, so it never addresses text that is gone.
+#[test]
+fn update_fields_in_a_story_clamps_the_stashed_body_selection() {
+    let mut e = engine_with(DocumentTree::from_text("seed"));
+    open(
+        &mut e,
+        concat!(
+            r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r>"#,
+            r#"<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>12345</w:t></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t xml:space="preserve"> tail</w:t></w:r></w:p>"#
+        ),
+    );
+    let evt = apply(
+        &mut e,
+        Command::InsertFootnote {
+            at: bpos_top(0, 10),
+        },
+    );
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    assert!(e.story_active(), "inside the footnote story");
+    let stashed = e
+        .stashed_body_selection
+        .clone()
+        .expect("stashed body caret");
+    assert_eq!(stashed.caret.offset, 13, "after the reference");
+    let evt = apply(&mut e, Command::UpdateFields);
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    let body = e.undo.current();
+    assert_eq!(
+        body.nth_paragraph(0).expect("paragraph").text,
+        "1 tail\u{FFFC}",
+        "the PAGE result was restamped"
+    );
+    let stashed = e.stashed_body_selection.clone().expect("still stashed");
+    assert_eq!(clamp_pos(body, stashed.anchor.clone()), stashed.anchor);
+    assert_eq!(clamp_pos(body, stashed.caret.clone()), stashed.caret);
+}

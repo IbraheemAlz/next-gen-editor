@@ -752,7 +752,7 @@ mod tests {
                 seen += 1;
             }
         }
-        assert!(seen >= 2, "the #477–#481 reproducers are committed");
+        assert!(seen >= 5, "the #477–#481 reproducers are committed");
     }
 
     /// Issue #422 — the committed reproducer scenario runs to completion
