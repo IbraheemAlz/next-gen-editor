@@ -60,6 +60,19 @@ fn main() {
         "regen-seeds: done — {} hostile docx seed(s) rewritten",
         hostile.len()
     );
+    /* Issue #468 — the well-formedness `docx_reader` packages, pinned by
+    `tests::well_formed_seeds_are_committed`. */
+    let wf = engine_fuzz::well_formed_docx_seeds();
+    for (name, bytes, _) in &wf {
+        let path = docx_dir.join(name);
+        std::fs::write(&path, bytes)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        println!("wrote {} ({} bytes)", path.display(), bytes.len());
+    }
+    println!(
+        "regen-seeds: done — {} well-formedness docx seed(s) rewritten",
+        wf.len()
+    );
     /* Issue #341 — the `snapshot_decode` seeds: engine snapshots in the
     v1 (`pkg-<len>-<fnv>`) and v2 (`sha256-`) package-key formats plus the
     hostile envelopes, pinned by `tests::snapshot_seeds_are_committed`. */
