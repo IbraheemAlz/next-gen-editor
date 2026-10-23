@@ -73,9 +73,50 @@ pub struct StyleTable {
     pub defaults: DocDefaults,
     /// `style id → definition`. Lookup feeds [`crate::style_resolver`].
     pub by_id: HashMap<String, StyleDef>,
+    /// Issue #556 — the id of the DEFAULT paragraph style
+    /// (`<w:style w:type="paragraph" w:default="1">`: `Normal` in Word's
+    /// English files, `a` / `Standard` / … in localized ones), the style
+    /// every paragraph that names none is formatted with (ECMA-376
+    /// §17.7.4.17). Resolved once per part by the spec's rule: when
+    /// several paragraph styles claim it, the LAST one in the part wins.
+    /// `None` when no paragraph style claims it.
+    pub default_paragraph: Option<String>,
+    /// Issue #556 — the id of the default CHARACTER style
+    /// (`w:type="character" w:default="1"`, Word's `DefaultParagraphFont`),
+    /// same last-wins rule. Recorded only: the run cascade does not apply
+    /// it (issue #558 — its properties would have to stay out of the
+    /// spans, which bake the character style they name).
+    pub default_character: Option<String>,
+}
+
+impl StyleTable {
+    /// Issue #556 — the paragraph style a paragraph whose `<w:pStyle>` is
+    /// `p_style` is formatted with: that style when this part defines it
+    /// as a PARAGRAPH style, else the default paragraph style — a
+    /// paragraph naming no style, or one this part does not define as a
+    /// paragraph style, takes `Normal`, as in Word. `None` when neither
+    /// exists (the cascade is then the docDefaults alone). The engine's
+    /// `StyleCascade::applied_style` is the same rule over the mirrored
+    /// table.
+    pub fn applied_paragraph_style<'s>(&'s self, p_style: Option<&'s str>) -> Option<&'s str> {
+        p_style
+            .filter(|id| {
+                self.by_id
+                    .get(*id)
+                    .is_some_and(|d| d.kind == StyleKind::Paragraph)
+            })
+            .or(self.default_paragraph.as_deref())
+    }
 }
 
 /* ------------------------------------------------------------ helpers --- */
+
+/// Issue #556 — `<w:style w:default>` is an `ST_OnOff`: `1` / `true` /
+/// `on` claim the default, anything else (or no attribute) does not.
+fn default_attr_on(e: &BytesStart) -> bool {
+    attr_val(e, b"w:default")
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+}
 
 fn parse_kind(v: &str) -> Option<StyleKind> {
     match v.trim().to_ascii_lowercase().as_str() {
@@ -203,6 +244,13 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
             Event::Empty(e) => {
                 let name = e.name().as_ref().to_owned();
                 match name.as_slice() {
+                    /* Issue #556 — a self-closing `<w:style …/>` defines
+                    a style with no properties (`DefaultParagraphFont`):
+                    it exists, so a `pStyle` naming it is not undefined
+                    (which would take the default paragraph style). */
+                    b"w:style" => {
+                        finish_style(StyleScratch::from_start(&e), &mut table);
+                    }
                     b"w:basedOn" => {
                         if let Some(s) = cur_style.as_mut() {
                             s.based_on = attr_val(&e, b"w:val");
@@ -252,10 +300,8 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                         std::mem::take(&mut defaults_pbdr).fold_into(&mut table.defaults.para);
                     }
                     b"w:style" => {
-                        if let Some(s) = cur_style.take()
-                            && let Some(def) = s.into_def()
-                        {
-                            table.by_id.insert(def.id.clone(), def);
+                        if let Some(s) = cur_style.take() {
+                            finish_style(s, &mut table);
                         }
                     }
                     _ => {}
@@ -272,6 +318,24 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
     Ok(table)
 }
 
+/// A finished `<w:style>` joins the table (the last element of an id
+/// wins). Issue #556 — the LAST style of a type claiming `w:default` is
+/// that type's default (§17.7.4.17).
+fn finish_style(s: StyleScratch, table: &mut StyleTable) {
+    let claims_default = s.is_default;
+    let Some(def) = s.into_def() else {
+        return;
+    };
+    if claims_default {
+        match def.kind {
+            StyleKind::Paragraph => table.default_paragraph = Some(def.id.clone()),
+            StyleKind::Character => table.default_character = Some(def.id.clone()),
+            StyleKind::Table | StyleKind::Numbering => {}
+        }
+    }
+    table.by_id.insert(def.id.clone(), def);
+}
+
 #[derive(Debug)]
 struct StyleScratch {
     id: Option<String>,
@@ -284,6 +348,8 @@ struct StyleScratch {
     /// Issue #395 — the style's logical `<w:pBdr>` edges, folded by its
     /// own direction in [`Self::into_def`].
     pbdr_logical: PbdrLogical,
+    /// Issue #556 — the start tag's `w:default` claim.
+    is_default: bool,
 }
 
 impl StyleScratch {
@@ -297,6 +363,7 @@ impl StyleScratch {
             para: ParaProperties::default(),
             run: SpanStyle::default(),
             pbdr_logical: PbdrLogical::default(),
+            is_default: default_attr_on(e),
         }
     }
     fn into_def(self) -> Option<StyleDef> {
@@ -501,5 +568,42 @@ mod tests {
             t.by_id["Grid"].para.borders.is_none(),
             "a table style's tblBorders are not paragraph borders"
         );
+    }
+
+    /// Issue #556 — `w:default` per style type, the LAST claimant of a
+    /// type winning (§17.7.4.17); `0` / `false` / `off` claim nothing; a
+    /// table / numbering default is not a paragraph or character one.
+    #[test]
+    fn the_last_default_claimant_of_each_type_wins() {
+        let xml =
+            br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="First"/>
+  <w:style w:type="paragraph" w:default="true" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:default="0" w:styleId="NotIt"/>
+  <w:style w:type="paragraph" w:default="off" w:styleId="NorThis"/>
+  <w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"/>
+  <w:style w:type="table" w:default="1" w:styleId="TableNormal"/>
+  <w:style w:type="numbering" w:default="1" w:styleId="NoList"/>
+</w:styles>"#;
+        let t = parse_styles_xml(xml).expect("parse");
+        assert_eq!(t.default_paragraph.as_deref(), Some("Normal"));
+        assert_eq!(t.default_character.as_deref(), Some("DefaultParagraphFont"));
+        assert_eq!(t.applied_paragraph_style(None), Some("Normal"));
+        assert_eq!(t.applied_paragraph_style(Some("First")), Some("First"));
+        assert_eq!(
+            t.applied_paragraph_style(Some("Missing")),
+            Some("Normal"),
+            "an undefined pStyle takes the default"
+        );
+        assert_eq!(
+            t.applied_paragraph_style(Some("DefaultParagraphFont")),
+            Some("Normal"),
+            "a character style is no paragraph style"
+        );
+
+        let none = parse_styles_xml(SAMPLE).expect("parse");
+        assert_eq!(none.default_paragraph, None, "no claimant");
+        assert_eq!(none.applied_paragraph_style(None), None);
+        assert_eq!(none.applied_paragraph_style(Some("Missing")), None);
     }
 }

@@ -18,6 +18,7 @@
  *     page_count, is_full_layout, estimated_document_height.
  */
 import { createRoot, createSignal, onCleanup, type Accessor } from 'solid-js';
+import { caretMoved, type CaretPlacement } from './caretReveal';
 import { useEngine, type EngineHandle } from './EngineProvider';
 import { errorCommand } from './errorCommand';
 import { layoutCacheStatsFrom, type LayoutCacheStats } from './layoutCaches';
@@ -67,7 +68,9 @@ export interface EditorState {
      * edit, undo — `reveal_caret`), never for a pointer gesture, Ctrl+A or
      * a zoom. A host scrolls {@link EditorState.caret} into view when it
      * moves (`createCaretReveal`, which `EditorSurface` uses). `0` until
-     * the first such event.
+     * the first such event. Issue #557 — and only when the caret actually
+     * moved (`caretMoved`: another rect or story, or an edit): a reply
+     * that leaves it in place never scrolls.
      */
     caretRevealSeq: Accessor<number>;
     /** Per-line selection rectangles in device px. */
@@ -667,6 +670,8 @@ export function createEditorState(): EditorState {
     const [fieldAtCaret, setFieldAtCaret] =
         createSignal<BridgeFieldRef | undefined>(undefined);
 
+    /** Issue #557 — the caret the previous `SELECTION_CHANGED` left. */
+    let lastPlacement: CaretPlacement | undefined;
     const unsubscribe = engine.subscribe((evt: Event) => {
         switch (evt.type) {
             case 'SELECTION_CHANGED': {
@@ -699,8 +704,19 @@ export function createEditorState(): EditorState {
                 setEditingStory(evt.editing_story);
                 setFieldCodeView(evt.field_code_view);
                 setFieldAtCaret(evt.field_at_caret);
-                /* Issue #387 — last, so a reveal effect reads the new caret. */
-                if (evt.reveal_caret === true) setCaretRevealSeq((n) => n + 1);
+                /* Issue #387 — last, so a reveal effect reads the new caret.
+                   Issue #557 — and only when the caret moved: a reply that
+                   leaves it where it was keeps the view. */
+                const placement: CaretPlacement = {
+                    x: evt.caret.x,
+                    y: evt.caret.y,
+                    h: evt.caret.h,
+                    story: evt.editing_story ? JSON.stringify(evt.editing_story) : '',
+                    revision: evt.document_revision,
+                };
+                const moved = caretMoved(lastPlacement, placement);
+                lastPlacement = placement;
+                if (evt.reveal_caret === true && moved) setCaretRevealSeq((n) => n + 1);
                 break;
             }
             case 'UNDO_STATE_CHANGED': {

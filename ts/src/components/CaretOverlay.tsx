@@ -8,9 +8,18 @@
  * overlay. The overlay shows only when the caret's engine-Y falls within
  * THIS page's range; otherwise it renders nothing. CSS y from store is
  * already `engine_y_device / dpr`; the page top comes from the store's
- * engine-reported geometry (issue #26), uniform-A4 fallback pre-paint. */
-import { Show } from 'solid-js';
+ * engine-reported geometry (issue #26), uniform-A4 fallback pre-paint.
+ *
+ * Issue #557 (clean-room memo §11) — the rect is the ENGINE's: as tall as
+ * the caret run's font (ascent + descent; an empty paragraph's mark), hung
+ * off the line's baseline, never the line box. This overlay only converts
+ * it to page-local CSS px. It is drawn in the text colour at the caret
+ * (`attrs_at_caret.color`), and every caret update — an arrow press,
+ * typing, a click — restarts the blink in its visible phase, so a moving
+ * caret never vanishes mid-move. */
+import { Show, createEffect, on } from 'solid-js';
 import type { EngineStore } from '../state/engine-store';
+import { caretColorCss, restartBlink } from './caret-style';
 
 export function CaretOverlay(props: { store: EngineStore; pageIdx?: number }) {
     const idx = () => props.pageIdx ?? 0;
@@ -28,19 +37,30 @@ export function CaretOverlay(props: { store: EngineStore; pageIdx?: number }) {
         if (c.y + c.h < top || c.y > bottom) return null;
         return { x: c.x, y: c.y - top, w: c.w, h: c.h };
     };
+    const color = () => caretColorCss(props.store.attrsAtCaret()?.color);
     return (
         <Show when={visibleCaret()}>
-            {(caret) => (
-                <div
-                    class="caret"
-                    style={{
-                        left: `${caret().x}px`,
-                        top: `${caret().y}px`,
-                        width: `${caret().w}px`,
-                        height: `${caret().h}px`,
-                    }}
-                />
-            )}
+            {(caret) => {
+                let el: HTMLDivElement | undefined;
+                /* Every SELECTION_CHANGED carries a fresh caret object, so
+                   this fires once per engine caret update (even one that
+                   leaves the caret where it was: an arrow press at the end
+                   of the document still restarts the blink). */
+                createEffect(on(props.store.caret, () => restartBlink(el), { defer: true }));
+                return (
+                    <div
+                        ref={el}
+                        class="caret"
+                        style={{
+                            left: `${caret().x}px`,
+                            top: `${caret().y}px`,
+                            width: `${caret().w}px`,
+                            height: `${caret().h}px`,
+                            '--caret-color': color(),
+                        }}
+                    />
+                );
+            }}
         </Show>
     );
 }

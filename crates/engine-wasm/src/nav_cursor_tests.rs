@@ -171,6 +171,12 @@ fn select(e: &mut Engine, anchor: BridgeLogicalPos, caret: BridgeLogicalPos) {
 
 /* ----------------------------------------------------------- row 19 */
 
+/// The caret rect sits inside `line`'s vertical band (#557 sizes it to
+/// the text, so its top is not the line's top).
+fn on_line(rect: &BridgeRect, line: &LineGeom) -> bool {
+    rect.y >= line.y_top - 0.5 && rect.y + rect.h <= line.y_top + line.height + 0.5
+}
+
 /// A paragraph that wraps over several lines.
 fn wrapped() -> String {
     (0..40)
@@ -192,26 +198,31 @@ fn home_and_end_stay_on_the_line_the_caret_is_drawn_on() {
     park(&mut e, top(0, l1.start_byte + 3));
     let (range, rect) = press(&mut e, MoveDirection::LineHome, false);
     assert_eq!(range.end.offset, l1.start_byte);
-    assert_eq!(rect.y, l1.y_top, "Home stays on the second line");
+    assert!(on_line(&rect, l1), "Home stays on the second line");
     assert!((rect.x - l1.start_x).abs() < 1.0, "at the line's left edge");
     /* Home again: nowhere else to go (not the previous line's start). */
     let (range, rect) = press(&mut e, MoveDirection::LineHome, false);
     assert_eq!(range.end.offset, l1.start_byte);
-    assert_eq!(rect.y, l1.y_top);
+    assert!(on_line(&rect, l1));
 
     /* End: the same line's end, drawn at the end of THAT line. */
     let (range, rect) = press(&mut e, MoveDirection::LineEnd, false);
     assert_eq!(range.end.offset, l1.end_byte);
-    assert_eq!(rect.y, l1.y_top, "End stays at the end of the second line");
+    assert!(
+        on_line(&rect, l1),
+        "End stays at the end of the second line"
+    );
     /* End again stays; Home from there goes to this line's start. */
     let (range, rect) = press(&mut e, MoveDirection::LineEnd, false);
-    assert_eq!((range.end.offset, rect.y), (l1.end_byte, l1.y_top));
+    assert_eq!(range.end.offset, l1.end_byte);
+    assert!(on_line(&rect, l1));
     let (range, rect) = press(&mut e, MoveDirection::LineHome, false);
-    assert_eq!((range.end.offset, rect.y), (l1.start_byte, l1.y_top));
+    assert_eq!(range.end.offset, l1.start_byte);
+    assert!(on_line(&rect, l1));
     /* ... and Down from the line start walks from THAT line. */
     let (_, rect) = press(&mut e, MoveDirection::Down, false);
-    assert_eq!(
-        rect.y, l2.y_top,
+    assert!(
+        on_line(&rect, l2),
         "Down from the second line reaches the third"
     );
 
@@ -220,7 +231,7 @@ fn home_and_end_stay_on_the_line_the_caret_is_drawn_on() {
     park(&mut e, top(0, l0.end_byte - 1));
     let (range, rect) = press(&mut e, MoveDirection::Right, false);
     assert_eq!(range.end.offset, l0.end_byte);
-    assert_eq!(rect.y, l1.y_top, "drawn at the start of the next line");
+    assert!(on_line(&rect, l1), "drawn at the start of the next line");
 
     /* A click right of the first line's ink lands on its end and stays
     drawn there. */
@@ -237,7 +248,7 @@ fn home_and_end_stay_on_the_line_the_caret_is_drawn_on() {
     .1;
     let sel = e.selection.as_ref().expect("selection").caret.clone();
     assert_eq!(sel.offset, l0.end_byte);
-    assert_eq!(rect0.y, l0.y_top, "a click past the ink keeps its line");
+    assert!(on_line(&rect0, l0), "a click past the ink keeps its line");
 
     /* Ctrl+End / Ctrl+Home: the document edges. */
     assert_eq!(caret_after(&mut e, MoveDirection::DocEnd), top(1, 4));
