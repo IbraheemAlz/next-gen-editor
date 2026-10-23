@@ -217,6 +217,16 @@ pub struct ImageRect {
     /// use (`"1@0"`, `"1@0/1@0"`); empty for a body picture.
     #[serde(default)]
     pub story_rid: String,
+    /// Issue #554 — the picture's paragraph runs right-to-left (its
+    /// effective base direction, as `SelectionChanged.direction` reports
+    /// it for a caret there). The shell needs it to turn an arrow key on a
+    /// selected inline picture into the caret at the picture's VISUAL left
+    /// or right edge: in an RTL paragraph the sentinel's byte offset `at`
+    /// is the right edge and `at + 3` the left one. Absent / `false` for
+    /// an LTR paragraph and for floating pictures (they have no edge in
+    /// the text flow).
+    #[serde(default)]
+    pub rtl: bool,
 }
 
 /// Issue #206 — one step into a text-box story: the text box anchored at
