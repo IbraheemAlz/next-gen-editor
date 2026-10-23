@@ -949,6 +949,12 @@ struct LineGeom {
     height: f32,
     start_byte: u32,
     end_byte: u32,
+    /// Issue #553 — the paragraph's BASE direction is right-to-left. It
+    /// decides which visual side of the line is its logical START: the
+    /// left edge of an LTR paragraph, the right edge of an RTL one. A
+    /// click past a line's ink belongs to that logical end, whatever
+    /// directional runs the ink is made of (see [`line_edge_at`]).
+    rtl: bool,
     /// Caret slots in visual emission order — searched by nearest x or byte.
     /// The flat concatenation of every run's slots.
     slots: Vec<CaretSlot>,
@@ -6257,6 +6263,7 @@ fn collect_paragraph_line_geom(
             height: line.height,
             start_byte,
             end_byte,
+            rtl: para_box.direction == ShapingDirection::Rtl,
             slots,
             runs,
         });
@@ -6578,21 +6585,171 @@ fn collect_table_image_rects(
     }
 }
 
+/// One of a line's two LOGICAL ends (issue #553).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEdge {
+    /// The first character of the line in reading order.
+    Start,
+    /// The position after the last character of the line in reading order.
+    End,
+}
+
+/// Issue #553 — which logical end of `line` a pointer at `x` is beyond, or
+/// `None` when it is over the line's ink (`x` strictly between the
+/// outermost caret stops).
+///
+/// A click past the ink does not name the nearest caret slot: in a
+/// mixed-direction line the visually outermost slot is not an end of the
+/// line. An LTR paragraph that ends in an RTL run has the RTL run's
+/// logical START at its right edge, so "nearest slot to the right" put a
+/// click on the empty space after `Hello world مرحبا بالعالم` at the first
+/// Arabic word instead of after the last one. The side the pointer is on
+/// is a VISUAL fact; which end of the text it means follows from the
+/// paragraph's base direction alone (right of an LTR line / left of an
+/// RTL one = the end), the way Word and every browser resolve it.
+/// Single-direction lines are unchanged: there the outermost slot already
+/// is the matching end.
+fn line_edge_at(line: &LineGeom, x: f32) -> Option<LineEdge> {
+    let (lo, hi) = line
+        .slots
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s.x), hi.max(s.x))
+        });
+    if lo > hi {
+        return None; // no caret stop: an empty line
+    }
+    match (x <= lo, x >= hi) {
+        (false, false) => None,
+        /* One stop only: there is no direction to read the side from. */
+        (true, true) => Some(LineEdge::Start),
+        (false, true) => Some(if line.rtl {
+            LineEdge::Start
+        } else {
+            LineEdge::End
+        }),
+        (true, false) => Some(if line.rtl {
+            LineEdge::End
+        } else {
+            LineEdge::Start
+        }),
+    }
+}
+
+impl LineGeom {
+    /// Source byte of one of the line's logical ends.
+    fn edge_byte(&self, edge: LineEdge) -> u32 {
+        match edge {
+            LineEdge::Start => self.start_byte,
+            LineEdge::End => self.end_byte,
+        }
+    }
+}
+
 /// Map an absolute pixel to a logical position — nearest line by `y`, then
-/// nearest caret slot by `x`. The returned `path` is the line's owning
-/// paragraph path, descending into a cell when the hit lands inside one.
+/// nearest caret slot by `x`; a pointer past the line's ink resolves to the
+/// line's logical end on that side (issue #553, [`line_edge_at`]). The
+/// returned `path` is the line's owning paragraph path, descending into a
+/// cell when the hit lands inside one.
 fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
     let Some(line) = nearest_line(geom, x, y) else {
         return bpos_top(0, 0);
     };
-    let offset = line
-        .slots
-        .iter()
-        .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
-        .map_or(line.start_byte, |s| s.byte);
+    let offset = match line_edge_at(line, x) {
+        Some(edge) => line.edge_byte(edge),
+        None => line
+            .slots
+            .iter()
+            .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
+            .map_or(line.start_byte, |s| s.byte),
+    };
     BridgeLogicalPos {
         path: line.path.clone(),
         offset,
+    }
+}
+
+/// Issue #553 — what a double-click points at, in LOGICAL terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordTarget {
+    /// The character that starts at this byte is the one under the
+    /// pointer (a pointer before the line's first character names it).
+    Char(u32),
+    /// The pointer is past the line's last character: the target is the
+    /// last word of the line `[start, end)`, not the first character of
+    /// whatever comes next (the next line's first word, or — in a
+    /// mixed-direction line — the visually outermost run).
+    LineEnd { start: u32, end: u32 },
+}
+
+/// The byte of the first character, in `line`'s visual runs, whose cell
+/// contains `x` — `None` when `x` is over no run (the caller falls back
+/// to the nearest caret slot). A cell is the span between two ADJACENT
+/// caret stops of one run; its logical start is the smaller of the two
+/// stops' bytes whichever way the run reads, so no visual order enters
+/// the answer.
+fn char_start_under_x(line: &LineGeom, x: f32) -> Option<u32> {
+    for run in &line.runs {
+        let mut stops: Vec<(f32, u32)> = run.slots.iter().map(|s| (s.x, s.byte)).collect();
+        /* An RTL run lists its logical-end stop last, at its left edge. */
+        stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for pair in stops.windows(2) {
+            let ((x0, b0), (x1, b1)) = (pair[0], pair[1]);
+            if x >= x0 && x < x1 && b0 != b1 {
+                return Some(b0.min(b1));
+            }
+        }
+    }
+    None
+}
+
+/// Issue #553 — resolve a double-click at `(x, y)` to its paragraph and
+/// logical [`WordTarget`].
+///
+/// `hit_test_geom`'s nearest caret SLOT is the wrong probe for a word: a
+/// slot sits BETWEEN two characters, so the right half of a word's last
+/// letter and the left half of the space after it name the same offset
+/// and one of them selected the wrong thing (the space, or — past the end
+/// of a mixed-direction line — the first word of the trailing run). The
+/// word is chosen from the CHARACTER under the pointer, and from the
+/// line's logical last word when the pointer is past its end.
+fn word_target_geom(geom: &[LineGeom], x: f32, y: f32) -> (BridgeBlockPath, WordTarget) {
+    let Some(line) = nearest_line(geom, x, y) else {
+        return (bpos_top(0, 0).path, WordTarget::Char(0));
+    };
+    let target = match line_edge_at(line, x) {
+        Some(LineEdge::End) => WordTarget::LineEnd {
+            start: line.start_byte,
+            end: line.end_byte,
+        },
+        Some(LineEdge::Start) => WordTarget::Char(line.start_byte),
+        None => WordTarget::Char(char_start_under_x(line, x).unwrap_or_else(|| {
+            line.slots
+                .iter()
+                .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
+                .map_or(line.start_byte, |s| s.byte)
+        })),
+    };
+    (line.path.clone(), target)
+}
+
+/// The byte whose character `Paragraph::word_bounds` should classify for
+/// `target` in `text`. A line end probes the last NON-whitespace
+/// character of the line (its trailing space belongs to no word the user
+/// can be pointing at); an all-whitespace line probes its last character.
+fn word_probe_offset(text: &str, target: WordTarget) -> u32 {
+    match target {
+        WordTarget::Char(offset) => offset,
+        WordTarget::LineEnd { start, end } => {
+            let end = (end as usize).min(text.len());
+            let start = (start as usize).min(end);
+            let line = text.get(start..end).unwrap_or("");
+            line.char_indices()
+                .rev()
+                .find(|(_, c)| !c.is_whitespace())
+                .or_else(|| line.char_indices().next_back())
+                .map_or(start as u32, |(i, _)| (start + i) as u32)
+        }
     }
 }
 
@@ -13300,28 +13457,30 @@ impl Engine {
             Ok(g) => g,
             Err(e) => return *e,
         };
-        let hit = hit_test_geom(&geom, at.x, at.y);
-        let engine_path = bridge_to_engine_path(hit.path.clone());
+        /* Issue #553 — the word comes from the LOGICAL character the
+        pointer is on (or the line's logical last word past its end),
+        never from a visual slot: see `word_target_geom`. */
+        let (path, target) = word_target_geom(&geom, at.x, at.y);
+        let engine_path = bridge_to_engine_path(path.clone());
+        let unresolved = match target {
+            WordTarget::Char(at) | WordTarget::LineEnd { end: at, .. } => (at, at),
+        };
         let (lo, hi) = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path)
-                .map_or((hit.offset, hit.offset), |p| {
-                    /* Issue #77 — a word that reaches into a field takes
-                    the whole field (a double-click on "12" in "Page 12
-                    of 34" selects the PAGE field). */
-                    let (lo, hi) = p.word_bounds(hit.offset);
-                    p.expand_range_over_fields(lo, hi)
-                })
+            d.paragraph_at_path(&engine_path).map_or(unresolved, |p| {
+                /* Issue #77 — a word that reaches into a field takes
+                the whole field (a double-click on "12" in "Page 12
+                of 34" selects the PAGE field). */
+                let (lo, hi) = p.word_bounds(word_probe_offset(&p.text, target));
+                p.expand_range_over_fields(lo, hi)
+            })
         });
         self.pending_format = None;
         self.selection = Some(SelectionState {
             anchor: BridgeLogicalPos {
-                path: hit.path.clone(),
+                path: path.clone(),
                 offset: lo,
             },
-            caret: BridgeLogicalPos {
-                path: hit.path,
-                offset: hi,
-            },
+            caret: BridgeLogicalPos { path, offset: hi },
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
@@ -19997,6 +20156,7 @@ mod tests {
             height: 20.0,
             start_byte: 0,
             end_byte: 8,
+            rtl: false,
             slots: Vec::new(),
             runs: vec![ltr, rtl],
         };
@@ -20037,6 +20197,7 @@ mod tests {
             height: 20.0,
             start_byte: 0,
             end_byte: 4,
+            rtl: false,
             slots: Vec::new(),
             runs: vec![run],
         };
@@ -20072,6 +20233,7 @@ mod tests {
             height: 24.0,
             start_byte: 0,
             end_byte: 0,
+            rtl: false,
             slots: Vec::new(),
             runs: Vec::new(),
         };
@@ -20892,6 +21054,7 @@ mod tests {
             height: 20.0,
             start_byte: 0,
             end_byte: 8,
+            rtl: false,
             slots: vec![
                 CaretSlot { x: 20.0, byte: 4 },
                 CaretSlot { x: 80.0, byte: 4 },
@@ -31518,3 +31681,8 @@ mod fuzz_finding_tests;
 /// Issue #497 — the table-heavy body-edit repaint timing harness.
 #[cfg(test)]
 mod table_repaint_perf_tests;
+
+/// Issue #553 — double-click word selection follows the LOGICAL offset in
+/// mixed-direction paragraphs.
+#[cfg(test)]
+mod word_select_tests;
