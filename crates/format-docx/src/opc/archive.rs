@@ -509,9 +509,10 @@ fn read_docx_scoped(
     };
     if !numbering.num_instances.is_empty() {
         /* `im::Vector` clones cheaply; we collect into a Vec to mutate
-        in-place. `resolve_markers_blocks` only writes
-        `Paragraph::resolved_marker` and skips `Block::Table`, so tables
-        preserve their identity. Phase 3 (#40) — section markers ride the
+        in-place. `resolve_markers_blocks` only writes the derived
+        `Paragraph::resolved_marker` / `resolved_list_indent` stamps (cell
+        paragraphs too, issue #509) and never the tables' `dirty` /
+        `source_xml`, so tables preserve their identity. Phase 3 (#40) — section markers ride the
         paragraphs themselves and `body_section` never leaves `document`,
         so replacing the block list IS the whole rebuild (the old
         rebuild-via-`from_blocks_with_sections` zeroed unrelated fields

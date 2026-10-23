@@ -7202,6 +7202,29 @@ fn doc_paragraph_neighbor(
     Some((candidate, para))
 }
 
+/// Issue #509 — a `TABLE_CELLS` selection's rectangle: the table and the
+/// inclusive row / column cell-index bounds ([`Engine::cell_rect_for`]).
+struct CellRect {
+    table: BridgeBlockPath,
+    rows: (u32, u32),
+    cols: (u32, u32),
+}
+
+/// Issue #509 — per toggle flag: set on EVERY character of a range
+/// ([`Engine::range_flags`]). `ToggleFormatting` clears a flag only when
+/// all of the range has it.
+#[derive(Debug, Clone, Copy)]
+struct RangeFlags {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    underline: bool,
+    superscript: bool,
+    subscript: bool,
+    caps: bool,
+    small_caps: bool,
+}
+
 /// Issue #507 — Left / Right at a line's visual edge inside a table cell.
 /// `stepped` is the logical step the caret paragraph's direction chose
 /// (`visual_step_arrow`). While it stays inside the caret's innermost cell
@@ -7365,6 +7388,26 @@ fn sample_paragraph_styles(
     hi: u32,
     record: &mut dyn FnMut(SpanStyle),
 ) {
+    sample_paragraph_segments(para, lo, hi, &mut |style, complex| {
+        record(if complex {
+            style.complex_script_view()
+        } else {
+            style
+        });
+    });
+}
+
+/// [`sample_paragraph_styles`]' walk with the RAW span style and the
+/// script slot it is read in (`true` = the complex-script twins), so a
+/// caller can fold the paragraph's style-chain cascade UNDER the direct
+/// style before choosing the slot (issue #509: `ToggleFormatting` over a
+/// range reads the cascaded value, as the toolbar and the renderer do).
+fn sample_paragraph_segments(
+    para: &engine::Paragraph,
+    lo: u32,
+    hi: u32,
+    record: &mut dyn FnMut(SpanStyle, bool),
+) {
     if lo >= hi {
         return;
     }
@@ -7374,7 +7417,7 @@ fn sample_paragraph_styles(
     if lo == hi {
         /* Empty paragraph clipped to nothing — record the default so
         the toolbar still reports a uniform-default state. */
-        record(SpanStyle::default());
+        record(SpanStyle::default(), false);
         return;
     }
     /* Issues #359 / #104 — each script class present in a segment samples
@@ -7393,10 +7436,10 @@ fn sample_paragraph_styles(
             }
         }
         if cs {
-            record(style.complex_script_view());
+            record(style.clone(), true);
         }
         if latin || !cs {
-            record(style);
+            record(style, false);
         }
     };
     let mut cursor = lo;
@@ -9599,15 +9642,14 @@ impl Engine {
         } else {
             SpanStyle::default()
         };
-        let new_doc = self.undo.current().apply_style(
-            to_engine_pos(range.start.clone()),
-            to_engine_pos(range.end.clone()),
-            patch,
-        );
+        /* Issue #509 — every paragraph the range reaches (cells, rows,
+        nested tables; the whole rectangle of a `TABLE_CELLS` selection),
+        not the first one. */
+        let targets = self.format_targets_in(self.undo.current(), &range.start, &range.end);
+        let new_doc = self.undo.current().apply_style_targets(&targets, patch);
         let new_doc = if self.tracking_changes {
-            new_doc.tracked_format_change(
-                to_engine_pos(range.start.clone()),
-                to_engine_pos(range.end.clone()),
+            new_doc.tracked_format_change_targets(
+                &targets,
                 prev_attrs_for_revision,
                 self.review_author.clone(),
                 self.current_review_date(),
@@ -9664,6 +9706,15 @@ impl Engine {
         let collapsed = start == end;
         let current = self.attrs_at(start.clone(), collapsed);
         let mixed = self.attrs_mixed_over(&start, &end);
+        /* Issue #509 — a range's target state comes from EVERY character
+        it reaches (all on -> off, else on), cells and rectangles
+        included; a caret, or a range with nothing to read, keeps the
+        first-character rule. */
+        let flags = if collapsed {
+            None
+        } else {
+            self.range_flags(&start, &end)
+        };
         let mut patch = TextAttrsPatch {
             bold: None,
             italic: None,
@@ -9680,11 +9731,30 @@ impl Engine {
             font_slot: None,
         };
         match attr {
-            T::Bold => patch.bold = Some(mixed.bold || !current.bold),
-            T::Italic => patch.italic = Some(mixed.italic || !current.italic),
-            T::Strike => patch.strike = Some(mixed.strike || !current.strike),
+            T::Bold => {
+                let all_on = flags
+                    .as_ref()
+                    .map_or(!mixed.bold && current.bold, |f| f.bold);
+                patch.bold = Some(!all_on);
+            }
+            T::Italic => {
+                let all_on = flags
+                    .as_ref()
+                    .map_or(!mixed.italic && current.italic, |f| f.italic);
+                patch.italic = Some(!all_on);
+            }
+            T::Strike => {
+                let all_on = flags
+                    .as_ref()
+                    .map_or(!mixed.strike && current.strike, |f| f.strike);
+                patch.strike = Some(!all_on);
+            }
             T::Underline => {
-                let on = mixed.underline || matches!(current.underline, UnderlineStyle::None);
+                let all_on = flags.as_ref().map_or(
+                    !mixed.underline && !matches!(current.underline, UnderlineStyle::None),
+                    |f| f.underline,
+                );
+                let on = !all_on;
                 patch.underline = Some(if on {
                     underline_style
                         .filter(|s| !matches!(s, UnderlineStyle::None))
@@ -9694,21 +9764,31 @@ impl Engine {
                 });
             }
             T::Superscript => {
-                patch.script = Some(if matches!(current.script, VerticalScript::Superscript) {
+                let all_on = flags
+                    .as_ref()
+                    .map_or(matches!(current.script, VerticalScript::Superscript), |f| {
+                        f.superscript
+                    });
+                patch.script = Some(if all_on {
                     VerticalScript::Normal
                 } else {
                     VerticalScript::Superscript
                 });
             }
             T::Subscript => {
-                patch.script = Some(if matches!(current.script, VerticalScript::Subscript) {
+                let all_on = flags
+                    .as_ref()
+                    .map_or(matches!(current.script, VerticalScript::Subscript), |f| {
+                        f.subscript
+                    });
+                patch.script = Some(if all_on {
                     VerticalScript::Normal
                 } else {
                     VerticalScript::Subscript
                 });
             }
             T::Caps => {
-                if current.caps {
+                if flags.as_ref().map_or(current.caps, |f| f.caps) {
                     patch.caps = Some(false);
                 } else {
                     patch.caps = Some(true);
@@ -9716,7 +9796,7 @@ impl Engine {
                 }
             }
             T::SmallCaps => {
-                if current.small_caps {
+                if flags.as_ref().map_or(current.small_caps, |f| f.small_caps) {
                     patch.small_caps = Some(false);
                 } else {
                     patch.small_caps = Some(true);
@@ -12549,6 +12629,119 @@ impl Engine {
         self.with_selection_doc(|d| d.clone())
     }
 
+    /// Issue #509 — the cell rectangle a `TABLE_CELLS` selection covers,
+    /// when `[start, end]` IS that selection's range: a rectangle is not
+    /// the document-order range between its corners (anchor top-right,
+    /// caret bottom-left runs through cells outside it, and a rectangle
+    /// narrower than the table skips the cells beside it), so a command
+    /// acting on the selection must act on the rectangle. A range that
+    /// is not the live selection's (an explicit override) stays linear.
+    fn cell_rect_for(&self, start: &BridgeLogicalPos, end: &BridgeLogicalPos) -> Option<CellRect> {
+        let sel = self.selection.as_ref()?;
+        let SelectionKind::TableCells {
+            table_path,
+            from_row,
+            from_col,
+            to_row,
+            to_col,
+        } = &sel.kind
+        else {
+            return None;
+        };
+        let (s, e) = ordered(sel.anchor.clone(), sel.caret.clone());
+        (s == *start && e == *end).then(|| CellRect {
+            table: table_path.clone(),
+            rows: (*from_row, *to_row),
+            cols: (*from_col, *to_col),
+        })
+    }
+
+    /// Issue #509 — the paragraphs (with the bytes of each) a
+    /// character-formatting command over `[start, end]` acts on, resolved
+    /// against `doc` (the tree the selection's paths address): every
+    /// paragraph the range reaches across cells, rows and nested tables
+    /// ([`DocumentTree::range_targets`]), or the whole paragraphs of the
+    /// selected rectangle for a `TABLE_CELLS` selection.
+    fn format_targets_in(
+        &self,
+        doc: &DocumentTree,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+    ) -> Vec<engine::RangeTarget> {
+        if let Some(CellRect { table, rows, cols }) = self.cell_rect_for(start, end) {
+            let targets = doc.cell_rect_targets(&bridge_to_engine_path(table), rows, cols);
+            if !targets.is_empty() {
+                return targets;
+            }
+        }
+        doc.range_targets(&to_engine_pos(start.clone()), &to_engine_pos(end.clone()))
+    }
+
+    /// Issue #509 — the `(start, end)` ranges a PARAGRAPH-level command
+    /// folds over: one (the range itself) normally, one per selected
+    /// cell (its whole content, first paragraph to last) for a
+    /// `TABLE_CELLS` selection. Each range goes through the engine's
+    /// deep range walk, so a piece spanning a cell with a nested table
+    /// reaches the nested paragraphs too.
+    fn format_pieces(
+        &self,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+    ) -> Vec<(EnginePos, EnginePos)> {
+        let linear = || vec![(to_engine_pos(start.clone()), to_engine_pos(end.clone()))];
+        let Some(CellRect { table, rows, cols }) = self.cell_rect_for(start, end) else {
+            return linear();
+        };
+        let targets = self.undo.current().cell_rect_targets(
+            &bridge_to_engine_path(table.clone()),
+            rows,
+            cols,
+        );
+        /* The cell a path sits in: the table path plus the `Cell` step. */
+        let cell_key = table.steps.len() + 1;
+        let mut pieces: Vec<(EnginePos, EnginePos)> = Vec::new();
+        let mut current: Option<Vec<engine::PathStep>> = None;
+        for t in &targets {
+            let key: Vec<engine::PathStep> = t.path.steps.iter().take(cell_key).copied().collect();
+            let last = EnginePos {
+                path: t.path.clone(),
+                offset: t.hi,
+            };
+            match (&current, pieces.last_mut()) {
+                (Some(k), Some(piece)) if *k == key => piece.1 = last,
+                _ => {
+                    pieces.push((
+                        EnginePos {
+                            path: t.path.clone(),
+                            offset: 0,
+                        },
+                        last,
+                    ));
+                    current = Some(key);
+                }
+            }
+        }
+        if pieces.is_empty() { linear() } else { pieces }
+    }
+
+    /// Issue #509 — apply `f` (a paragraph-level range command of the
+    /// engine) to the live document over `[start, end]`, once per
+    /// [`Self::format_pieces`] piece, threading the result. The body
+    /// path of every paragraph-formatting command goes through here, so
+    /// a `TABLE_CELLS` selection formats exactly its rectangle.
+    fn fold_pieces(
+        &self,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+        mut f: impl FnMut(&DocumentTree, EnginePos, EnginePos) -> DocumentTree,
+    ) -> DocumentTree {
+        let mut doc = self.undo.current().clone();
+        for (s, e) in self.format_pieces(start, end) {
+            doc = f(&doc, s, e);
+        }
+        doc
+    }
+
     /* ===========================================================
     Issue #77 — field authoring v2: the evaluation environment, the
     Alt+F9 layout document, and the atomic-field invariant.
@@ -14658,14 +14851,13 @@ impl Engine {
 
     /// Compute the per-flag "mixed across the selection" bitmap. A
     /// collapsed caret has nothing to disagree over — all `false`. For
-    /// a real range we walk the paragraph(s) the selection spans and
-    /// compare each contributing `SpanStyle`'s flags against the first
-    /// observed value; any disagreement flips the flag to mixed.
-    ///
-    /// Cross-container ranges (paragraph in body + paragraph in cell)
-    /// fall back to scanning each endpoint's paragraph independently —
-    /// good enough until cross-container linear selections land
-    /// (UX_BEHAVIOR_SPEC §IV.6, GH #3).
+    /// a real range we walk every paragraph the selection reaches (issue
+    /// #509: across cells, rows, a body -> table boundary, nested tables
+    /// and, for a `TABLE_CELLS` selection, exactly its rectangle —
+    /// [`Self::format_targets_in`]) and compare each contributing
+    /// `SpanStyle`'s flags against the first observed value; any
+    /// disagreement flips the flag to mixed. An empty paragraph whose
+    /// mark the range covers contributes its mark style.
     fn attrs_mixed_over(
         &self,
         start: &BridgeLogicalPos,
@@ -14711,33 +14903,64 @@ impl Engine {
                 _ => {}
             }
         };
-        /* Same-paragraph range: sample every span-boundary-bracketed
-        sub-range that intersects `[start.offset, end.offset)`. */
-        if start.path == end.path {
-            let engine_path = bridge_to_engine_path(start.path.clone());
-            if let Some(p) = doc.paragraph_at_path(&engine_path) {
-                sample_paragraph_styles(p, start.offset, end.offset, &mut record);
+        for t in self.format_targets_in(doc, start, end) {
+            let Some(p) = doc.paragraph_at_path(&t.path) else {
+                continue;
+            };
+            sample_paragraph_styles(p, t.lo, t.hi, &mut record);
+            if t.mark && p.text.is_empty() {
+                record(p.mark_style.as_deref().cloned().unwrap_or_default());
             }
-            return mixed;
-        }
-        /* Cross-paragraph range: sample the head paragraph from
-        `start.offset` to its end, every full paragraph between, and
-        the tail paragraph from 0 to `end.offset`. Defensively cap at
-        each paragraph's `text.len()`. */
-        let engine_start = bridge_to_engine_path(start.path.clone());
-        let engine_end = bridge_to_engine_path(end.path.clone());
-        if let Some(p) = doc.paragraph_at_path(&engine_start) {
-            sample_paragraph_styles(p, start.offset, p.text.len() as u32, &mut record);
-        }
-        for path in doc_paragraph_paths_between(doc, &engine_start, &engine_end) {
-            if let Some(p) = doc.paragraph_at_path(&path) {
-                sample_paragraph_styles(p, 0, p.text.len() as u32, &mut record);
-            }
-        }
-        if let Some(p) = doc.paragraph_at_path(&engine_end) {
-            sample_paragraph_styles(p, 0, end.offset, &mut record);
         }
         mixed
+    }
+
+    /// Issue #509 — for each toggle flag, is it set on EVERY character of
+    /// `[start, end]` (Word's rule for a toggle button over a range: all
+    /// on -> clear it, anything else -> set it)? Reads the cascaded
+    /// values the toolbar and the renderer read (paragraph style chain
+    /// under the direct span style, the complex-script twins for
+    /// complex-script text), over the same paragraphs the formatting
+    /// itself reaches ([`Self::format_targets_in`]). `None` when the
+    /// range holds nothing to read.
+    fn range_flags(&self, start: &BridgeLogicalPos, end: &BridgeLogicalPos) -> Option<RangeFlags> {
+        let doc = self.selection_doc();
+        let mut samples: Vec<SpanStyle> = Vec::new();
+        for t in self.format_targets_in(&doc, start, end) {
+            let Some(p) = doc.paragraph_at_path(&t.path) else {
+                continue;
+            };
+            let cascade = doc.resolve_style_run_cascade(p.style_id.as_deref());
+            sample_paragraph_segments(p, t.lo, t.hi, &mut |raw, complex| {
+                let full = cascade.clone().merged_with(raw);
+                samples.push(if complex {
+                    full.complex_script_view()
+                } else {
+                    full
+                });
+            });
+            if t.mark && p.text.is_empty() {
+                let raw = p.mark_style.as_deref().cloned().unwrap_or_default();
+                samples.push(cascade.clone().merged_with(raw));
+            }
+        }
+        if samples.is_empty() {
+            return None;
+        }
+        let all = |pred: &dyn Fn(&SpanStyle) -> bool| samples.iter().all(pred);
+        Some(RangeFlags {
+            bold: all(&|s| s.bold == Some(true)),
+            italic: all(&|s| s.italic == Some(true)),
+            strike: all(&|s| s.strike == Some(true)),
+            underline: all(&|s| {
+                s.underline
+                    .is_some_and(|u| !matches!(u, engine::UnderlineStyle::None))
+            }),
+            superscript: all(&|s| s.vert_align == Some(engine::VertAlign::Superscript)),
+            subscript: all(&|s| s.vert_align == Some(engine::VertAlign::Subscript)),
+            caps: all(&|s| s.caps == Some(true)),
+            small_caps: all(&|s| s.small_caps == Some(true)),
+        })
     }
 
     /// Effective alignment of the paragraph at `path` for the toolbar
@@ -15404,11 +15627,10 @@ impl Engine {
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
         };
-        let new_doc = temp.apply_style(
-            to_engine_pos(start.clone()),
-            to_engine_pos(end.clone()),
-            style,
-        );
+        /* Issue #509 — the same targets as the body path: every paragraph
+        the range reaches, a `TABLE_CELLS` rectangle's cells included. */
+        let targets = self.format_targets_in(&temp, &start, &end);
+        let new_doc = temp.apply_style_targets(&targets, style);
         /* Keep the selection (a formatting change should not collapse
         it) — commit manually rather than through commit_story_edit. */
         let target = match &self.active_story {
@@ -15427,11 +15649,16 @@ impl Engine {
         let real = self.undo.current();
         let new_real = target.write_blocks(real, blocks);
         self.undo.push(new_real);
+        let kind = self
+            .selection
+            .as_ref()
+            .filter(|s| ordered(s.anchor.clone(), s.caret.clone()) == (start.clone(), end.clone()))
+            .map_or(SelectionKind::Linear, |s| s.kind.clone());
         self.selection = Some(SelectionState {
             anchor: start,
             caret: end,
             ideal_x: None,
-            kind: SelectionKind::Linear,
+            kind,
         });
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -17648,11 +17875,9 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().set_alignment(
-            to_engine_pos(start.clone()),
-            to_engine_pos(end),
-            engine_align(align),
-        );
+        let new_doc = self.fold_pieces(&start, &end, |d, s, e| {
+            d.set_alignment(s, e, engine_align(align))
+        });
         self.undo.push(new_doc);
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -17695,11 +17920,7 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().set_direction(
-            to_engine_pos(start.clone()),
-            to_engine_pos(end),
-            engine_dir,
-        );
+        let new_doc = self.fold_pieces(&start, &end, |d, s, e| d.set_direction(s, e, engine_dir));
         self.undo.push(new_doc);
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -17960,13 +18181,9 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().set_paragraph_indent(
-            to_engine_pos(start),
-            to_engine_pos(end),
-            start_pt,
-            end_pt,
-            first_line_pt,
-        );
+        let new_doc = self.fold_pieces(&start, &end, |d, s, e| {
+            d.set_paragraph_indent(s, e, start_pt, end_pt, first_line_pt)
+        });
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
@@ -18023,11 +18240,9 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().set_tab_stops(
-            to_engine_pos(start),
-            to_engine_pos(end),
-            engine_stops,
-        );
+        let new_doc = self.fold_pieces(&start, &end, |d, s, e| {
+            d.set_tab_stops(s, e, engine_stops.clone())
+        });
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
@@ -18055,11 +18270,9 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().set_paragraph_style(
-            to_engine_pos(start),
-            to_engine_pos(end),
-            style_id.clone(),
-        );
+        let new_doc = self.fold_pieces(&start, &end, |d, s, e| {
+            d.set_paragraph_style(s, e, style_id.clone())
+        });
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
@@ -18184,11 +18397,8 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().set_line_spacing(
-            to_engine_pos(start),
-            to_engine_pos(end),
-            multiplier,
-        );
+        let new_doc =
+            self.fold_pieces(&start, &end, |d, s, e| d.set_line_spacing(s, e, multiplier));
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
@@ -18215,11 +18425,9 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().set_paragraph_shading(
-            to_engine_pos(start),
-            to_engine_pos(end),
-            target,
-        );
+        let new_doc = self.fold_pieces(&start, &end, |d, s, e| {
+            d.set_paragraph_shading(s, e, target)
+        });
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
@@ -18268,26 +18476,19 @@ impl Engine {
         let (start, end) = ordered(range.start, range.end);
         let (new_doc, label) = match kind {
             bridge::ListKind::Off => {
-                let d = self
-                    .undo
-                    .current()
-                    .clear_list_item_on_range(to_engine_pos(start), to_engine_pos(end));
+                let d = self.fold_pieces(&start, &end, |d, s, e| d.clear_list_item_on_range(s, e));
                 (d, "List cleared")
             }
             bridge::ListKind::Bullet => {
-                let d = self.undo.current().toggle_list_on_range(
-                    to_engine_pos(start),
-                    to_engine_pos(end),
-                    engine::numbering::ListSynthesisKind::Bullet,
-                );
+                let d = self.fold_pieces(&start, &end, |d, s, e| {
+                    d.toggle_list_on_range(s, e, engine::numbering::ListSynthesisKind::Bullet)
+                });
                 (d, "Bullet list")
             }
             bridge::ListKind::Number => {
-                let d = self.undo.current().toggle_list_on_range(
-                    to_engine_pos(start),
-                    to_engine_pos(end),
-                    engine::numbering::ListSynthesisKind::Number,
-                );
+                let d = self.fold_pieces(&start, &end, |d, s, e| {
+                    d.toggle_list_on_range(s, e, engine::numbering::ListSynthesisKind::Number)
+                });
                 (d, "Numbered list")
             }
         };
@@ -18317,11 +18518,9 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().change_list_level_on_range(
-            to_engine_pos(start),
-            to_engine_pos(end),
-            delta,
-        );
+        let new_doc = self.fold_pieces(&start, &end, |d, s, e| {
+            d.change_list_level_on_range(s, e, delta)
+        });
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
@@ -19215,11 +19414,9 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.undo.current().set_paragraph_borders(
-            to_engine_pos(start),
-            to_engine_pos(end),
-            target,
-        );
+        let new_doc = self.fold_pieces(&start, &end, |d, s, e| {
+            d.set_paragraph_borders(s, e, target.clone())
+        });
         self.undo.push(new_doc);
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -30817,6 +31014,10 @@ mod mutation_signal_tests;
 /// Issue #471 - `MergeCells` vs the merged regions that already exist.
 #[cfg(all(test, feature = "fuzz-native"))]
 mod table_merge_tests;
+
+/// Issue #509 - formatting over ranges, rectangles and cell paragraphs.
+#[cfg(all(test, feature = "fuzz-native"))]
+mod cell_format_tests;
 
 /// Issue #459 - `ResizeImage` / `MoveImage` EMU fields vs Word's 22 in
 /// (`fuzz-native`).

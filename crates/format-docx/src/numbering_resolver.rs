@@ -31,15 +31,18 @@ use engine::{Block, ListItem, Paragraph};
 use std::collections::HashMap;
 
 /// Render every list paragraph's marker, writing it into
-/// `Paragraph::resolved_marker`. Non-list paragraphs and `Block::Table`
-/// entries are skipped — Phase 5 PR 1 keeps numbering counters running
-/// across intervening tables (matches Word's "list continues across
-/// non-list blocks of the same numId" semantics).
+/// `Paragraph::resolved_marker`. Non-list paragraphs are skipped, and
+/// numbering counters keep running across intervening non-list blocks
+/// (matches Word's "list continues across non-list blocks of the same
+/// numId" semantics).
+///
+/// Issue #509 — table cells (nested tables included) are numbered in
+/// document order with the body's paragraphs
+/// (`engine::rendered_paragraphs_mut`, the walk the editor's own
+/// `ToggleList` uses); this used to skip every `Block::Table`, so a
+/// bulleted cell paragraph of an opened `.docx` painted no marker.
 pub fn resolve_markers_blocks(blocks: &mut [Block], defs: &NumberingDefinitions) {
-    let mut paragraphs: Vec<&mut Paragraph> = blocks
-        .iter_mut()
-        .filter_map(|b| b.as_paragraph_mut())
-        .collect();
+    let mut paragraphs = engine::rendered_paragraphs_mut(blocks.iter_mut());
     resolve_markers_inner(&mut paragraphs, defs);
 }
 
@@ -258,6 +261,65 @@ mod tests {
         assert_eq!(paras[0].resolved_marker.as_deref(), Some("1."));
         assert_eq!(paras[1].resolved_marker.as_deref(), Some("2."));
         assert_eq!(paras[2].resolved_marker.as_deref(), Some("3."));
+    }
+
+    /// Issue #509 - a list paragraph inside a table cell (a nested table's
+    /// too) is numbered in document order with the body's: the resolver
+    /// used to skip every `Block::Table`, so an opened `.docx`'s bulleted
+    /// cell painted no marker.
+    #[test]
+    fn cells_and_nested_tables_are_numbered_in_document_order() {
+        use engine::{Block, Table, TableCell, TableRow};
+        let d = defs_with(
+            vec![AbstractNum {
+                id: 0,
+                levels: vec![lvl(0, NumFmt::Decimal, "%1.", 1)],
+            }],
+            vec![NumInstance {
+                num_id: 1,
+                abstract_num_id: 0,
+                overrides: vec![],
+            }],
+        );
+        let item = || Paragraph {
+            list_item: Some(ListItem { num_id: 1, ilvl: 0 }),
+            ..Default::default()
+        };
+        let cell_of = |blocks: Vec<Block>| TableCell {
+            blocks,
+            ..Default::default()
+        };
+        let table_of = |cells: Vec<TableCell>| {
+            Block::Table(Table {
+                rows: vec![TableRow {
+                    cells,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let nested = table_of(vec![cell_of(vec![Block::Paragraph(item())])]);
+        let mut blocks = vec![
+            Block::Paragraph(item()),
+            table_of(vec![
+                cell_of(vec![Block::Paragraph(item()), nested]),
+                cell_of(vec![Block::Paragraph(item())]),
+            ]),
+            Block::Paragraph(item()),
+        ];
+        resolve_markers_blocks(&mut blocks, &d);
+        let got: Vec<Option<String>> = engine::rendered_paragraphs_mut(blocks.iter_mut())
+            .into_iter()
+            .map(|p| p.resolved_marker.clone())
+            .collect();
+        assert_eq!(
+            got,
+            ["1.", "2.", "3.", "4.", "5."]
+                .iter()
+                .map(|m| Some((*m).to_string()))
+                .collect::<Vec<_>>(),
+            "body, cell, nested cell, next cell, body"
+        );
     }
 
     #[test]
