@@ -1415,27 +1415,35 @@ impl BlockPath {
     /// Compare two paths in document order (depth-first walk). Used to
     /// canonicalize selection endpoints before edit/range operations.
     pub fn cmp_doc_order(&self, other: &Self) -> core::cmp::Ordering {
-        use core::cmp::Ordering;
-        let n = self.steps.len().min(other.steps.len());
-        for i in 0..n {
-            let ord = match (&self.steps[i], &other.steps[i]) {
-                (PathStep::Block(a), PathStep::Block(b)) => a.cmp(b),
-                (PathStep::Cell { row: r1, col: c1 }, PathStep::Cell { row: r2, col: c2 }) => {
-                    r1.cmp(r2).then_with(|| c1.cmp(c2))
-                }
-                /* Shape mismatch in well-formed paths is unreachable
-                (a Cell step always follows a Block step that descends
-                into a table). Compare by surface index when it
-                happens — keeps doc-order stable. */
-                (PathStep::Block(a), PathStep::Cell { row: b, .. }) => a.cmp(b),
-                (PathStep::Cell { row: a, .. }, PathStep::Block(b)) => a.cmp(b),
-            };
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        }
-        self.steps.len().cmp(&other.steps.len())
+        cmp_steps_doc_order(&self.steps, &other.steps)
     }
+}
+
+/// [`BlockPath::cmp_doc_order`] over bare step slices, so a walker that
+/// keeps its path in one reused `Vec<PathStep>` can order every paragraph
+/// it visits against a range's ends without allocating a `BlockPath` per
+/// visit (issue #509).
+fn cmp_steps_doc_order(a: &[PathStep], b: &[PathStep]) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        let ord = match (&a[i], &b[i]) {
+            (PathStep::Block(a), PathStep::Block(b)) => a.cmp(b),
+            (PathStep::Cell { row: r1, col: c1 }, PathStep::Cell { row: r2, col: c2 }) => {
+                r1.cmp(r2).then_with(|| c1.cmp(c2))
+            }
+            /* Shape mismatch in well-formed paths is unreachable
+            (a Cell step always follows a Block step that descends
+            into a table). Compare by surface index when it
+            happens — keeps doc-order stable. */
+            (PathStep::Block(a), PathStep::Cell { row: b, .. }) => a.cmp(b),
+            (PathStep::Cell { row: a, .. }, PathStep::Block(b)) => a.cmp(b),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// A selectable font family (Backlog #9 / core-engine issue #23). `engine-wasm`
@@ -7506,6 +7514,10 @@ impl DocumentTree {
     /// pre-mutation `SpanStyle` snapshot (so reject can restore it).
     /// Caller still applies the formatting via the existing path —
     /// this helper only adds the overlay.
+    ///
+    /// Issue #509 — one revision per paragraph the range reaches
+    /// ([`Self::range_targets`]), across cells, rows and nested tables
+    /// too (a cross-container range used to record nothing).
     pub fn tracked_format_change(
         &self,
         start: LogicalPos,
@@ -7514,84 +7526,49 @@ impl DocumentTree {
         author: String,
         date: String,
     ) -> Self {
-        let (start, end) = order_positions(start, end);
-        if start == end || !same_parent(&start.path, &end.path) {
+        if start == end {
             return self.clone();
         }
-        let Some(s_idx) = start.path.last_block_index() else {
+        let targets = self.range_targets(&start, &end);
+        self.tracked_format_change_targets(&targets, prev_attrs, author, date)
+    }
+
+    /// Issue #509 — [`Self::tracked_format_change`] over resolved
+    /// [`RangeTarget`]s (a `TABLE_CELLS` rectangle's too). Only the
+    /// covered bytes get a revision; an empty paragraph has none.
+    pub fn tracked_format_change_targets(
+        &self,
+        targets: &[RangeTarget],
+        prev_attrs: SpanStyle,
+        author: String,
+        date: String,
+    ) -> Self {
+        let live: Vec<&RangeTarget> = targets.iter().filter(|t| t.lo < t.hi).collect();
+        if live.is_empty() {
             return self.clone();
-        };
-        let Some(e_idx) = end.path.last_block_index() else {
-            return self.clone();
-        };
-        let parent = start.path.parent();
-        /* Issue #115 — revision ranges are stored offsets the layout
-        slices by; snap them like every other stored offset. */
-        let s_off = self
-            .paragraph_at_path(&start.path)
-            .map_or(start.offset, |p| p.snap_offset(start.offset));
-        let e_off = self
-            .paragraph_at_path(&end.path)
-            .map_or(end.offset, |p| p.snap_offset(end.offset));
+        }
+        let paths: Vec<BlockPath> = live.iter().map(|t| t.path.clone()).collect();
         let mut blocks = self.blocks.clone();
-        let single_paragraph = s_idx == e_idx;
-        for idx in s_idx..=e_idx {
-            let child_path = parent.clone().push(PathStep::Block(idx));
-            let author_local = author.clone();
-            let date_local = date.clone();
-            let prev_local = prev_attrs.clone();
-            let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
-                let r_start = if single_paragraph { s_off } else { 0 };
-                let r_end = if single_paragraph {
-                    e_off
-                } else {
-                    para.text.len() as u32
-                };
-                if r_end <= r_start {
-                    return;
-                }
-                para.revisions.push(Revision {
-                    start: r_start,
-                    end: r_end,
-                    kind: RevisionKind::FormatChange,
-                    author: author_local,
-                    date: date_local,
-                    id: None,
-                    prev_attrs: Some(prev_local),
-                    move_name: None,
-                });
-                para.dirty = true;
+        mutate_paragraphs_in_top(&mut blocks, &paths, |k, para| {
+            /* Issue #115 — revision ranges are stored offsets the layout
+            slices by; snap them like every other stored offset. */
+            let r_start = para.snap_offset(live[k].lo);
+            let r_end = para.snap_offset(live[k].hi);
+            if r_end <= r_start {
+                return;
+            }
+            para.revisions.push(Revision {
+                start: r_start,
+                end: r_end,
+                kind: RevisionKind::FormatChange,
+                author: author.clone(),
+                date: date.clone(),
+                id: None,
+                prev_attrs: Some(prev_attrs.clone()),
+                move_name: None,
             });
-        }
-        Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            deleted_comments: self.deleted_comments.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            line_number_style: self.line_number_style.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-            theme: self.theme.clone(),
-        }
+        });
+        self.with_blocks(blocks)
     }
 
     pub fn insert_text(&self, at: LogicalPos, text: &str) -> Self {
@@ -7846,68 +7823,47 @@ impl DocumentTree {
 
     /// Apply a style `patch` over the logical range `[start, end)`. Splits and
     /// merges spans on every covered paragraph; unaffected paragraphs are
-    /// structurally shared. PR 4: full range support only when `start` and
-    /// `end` share a parent container (`same_parent`); cross-container
-    /// ranges clamp to the `start` endpoint's paragraph.
+    /// structurally shared.
+    ///
+    /// Issue #509 — the range may cross anything: siblings, table cells,
+    /// rows, a body -> table boundary, nested tables. Every paragraph it
+    /// reaches ([`Self::range_targets`]) is styled — the first from
+    /// `start.offset`, the last up to `end.offset`, the ones between
+    /// whole — and an empty paragraph the range passes through gets the
+    /// patch on its mark ([`Self::apply_style_targets`]). Before, ranges
+    /// whose ends had different parents styled the first paragraph only.
     pub fn apply_style(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
-        let (start, end) = order_positions(start, end);
-        if !same_parent(&start.path, &end.path) {
-            return self.apply_style_single(start, end, patch);
+        let targets = self.range_targets(&start, &end);
+        self.apply_style_targets(&targets, patch)
+    }
+
+    /// Issue #509 — [`Self::apply_style`] over resolved
+    /// [`RangeTarget`]s (a linear range's, or a `TABLE_CELLS`
+    /// rectangle's: [`Self::cell_rect_targets`]). A target with no
+    /// covered bytes and no mark to style is skipped (the paragraph is not
+    /// even marked dirty); an empty paragraph whose mark is covered takes
+    /// the patch on `Paragraph::mark_style`, so typing there continues it.
+    pub fn apply_style_targets(&self, targets: &[RangeTarget], patch: SpanStyle) -> Self {
+        let live: Vec<&RangeTarget> = targets
+            .iter()
+            .filter(|t| t.lo < t.hi || t.mark)
+            .collect();
+        if live.is_empty() {
+            return self.clone();
         }
-        let Some(start_idx) = start.path.last_block_index() else {
-            return self.clone();
-        };
-        let Some(end_idx) = end.path.last_block_index() else {
-            return self.clone();
-        };
-        let Some(container) = parent_container_snapshot(self, &start.path) else {
-            return self.clone();
-        };
+        let paths: Vec<BlockPath> = live.iter().map(|t| t.path.clone()).collect();
         let mut blocks = self.blocks.clone();
-        let parent = start.path.parent();
-        for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-            let Some(Block::Paragraph(p)) = container.get(idx as usize) else {
-                continue;
-            };
-            let lo = if idx == start_idx { start.offset } else { 0 };
-            let hi = if idx == end_idx {
-                end.offset
-            } else {
-                p.text.len() as u32
-            };
-            let styled = p.apply_style(lo, hi, patch.clone());
-            let child_path = parent.clone().push(PathStep::Block(idx));
-            replace_block_in_top(&mut blocks, &child_path, Block::Paragraph(styled));
-        }
-        Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            deleted_comments: self.deleted_comments.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            line_number_style: self.line_number_style.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-            theme: self.theme.clone(),
-        }
+        mutate_paragraphs_in_top(&mut blocks, &paths, |k, para| {
+            let target = live[k];
+            if target.lo < target.hi {
+                *para = para.apply_style(target.lo, target.hi, patch.clone());
+            }
+            if target.mark && para.text.is_empty() {
+                let mark = para.mark_style.as_deref().cloned().unwrap_or_default();
+                para.mark_style = Some(Box::new(mark.merged_with(patch.clone())));
+            }
+        });
+        self.with_blocks(blocks)
     }
 
     /// Issue #276 — give bytes `[at.offset, end)` of the paragraph at
@@ -7922,49 +7878,6 @@ impl DocumentTree {
         out
     }
 
-    fn apply_style_single(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
-        let Some(p) = self.paragraph_at_path(&start.path) else {
-            return self.clone();
-        };
-        let hi = if start.path == end.path {
-            end.offset
-        } else {
-            p.text.len() as u32
-        };
-        let styled = p.apply_style(start.offset, hi, patch);
-        let mut blocks = self.blocks.clone();
-        replace_block_in_top(&mut blocks, &start.path, Block::Paragraph(styled));
-        Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            deleted_comments: self.deleted_comments.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            line_number_style: self.line_number_style.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-            theme: self.theme.clone(),
-        }
-    }
-
     /// Set `align` on every paragraph the logical range `[start, end)` spans
     /// (Backlog #9). Paragraphs outside the range are structurally shared.
     /// `start`/`end` are expected in document order. PR 4: same-parent
@@ -7973,29 +7886,13 @@ impl DocumentTree {
     pub fn set_alignment(&self, start: LogicalPos, end: LogicalPos, align: Alignment) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| {
                     para.props.alignment = Some(align);
                     /* Sprint 12 (#11) — shadow direct_overrides so a
                     subsequent ApplyStyle preserves this user edit. */
                     para.direct_overrides.alignment = Some(align);
                 });
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
-                para.props.alignment = Some(align);
-                para.direct_overrides.alignment = Some(align);
-            });
-        }
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -8043,27 +7940,11 @@ impl DocumentTree {
     ) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| {
                     para.props.direction = Some(direction);
                     para.direct_overrides.direction = Some(direction);
                 });
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
-                para.props.direction = Some(direction);
-                para.direct_overrides.direction = Some(direction);
-            });
-        }
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -8778,21 +8659,8 @@ impl DocumentTree {
             /* Sprint 12 (#11) — shadow into direct_overrides. */
             para.direct_overrides.indent = new_ind;
         };
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
-        }
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| apply(para));
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -8892,21 +8760,8 @@ impl DocumentTree {
             para.style_id = style_id.clone();
             recompute_paragraph_props(para, &styles_for_apply, &defaults_for_apply);
         };
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
-        }
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| apply(para));
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -9092,21 +8947,8 @@ impl DocumentTree {
             /* Sprint 12 (#11) — shadow into direct_overrides. */
             para.direct_overrides.tab_stops = resolved;
         };
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
-        }
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| apply(para));
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -9156,21 +8998,8 @@ impl DocumentTree {
             /* Sprint 12 (#11) — shadow into direct_overrides. */
             para.direct_overrides.line_height = target;
         };
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
-        }
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| apply(para));
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -9223,21 +9052,8 @@ impl DocumentTree {
                 para.direct_overrides.shading_pattern = None;
             }
         };
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
-        }
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| apply(para));
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -9270,18 +9086,26 @@ impl DocumentTree {
     }
 
     /// Issue #50 — re-stamp `resolved_marker` / `resolved_list_indent`
-    /// across the top-level paragraphs after a structural mutation
+    /// across the document's paragraphs after a structural mutation
     /// (split / merge / splice). `Paragraph::split_at` / `concat` clone
     /// the stamped fields onto both outputs, so without a refresh an
     /// Enter inside a numbered list shows the head's marker twice
     /// instead of renumbering the tail. Cheap early-out when the
     /// document carries no list paragraphs.
+    ///
+    /// Issue #509 — the walk is document-order DEEP (table cells and
+    /// nested tables, [`visit_rendered_paragraphs`]): a list item in a
+    /// cell is numbered in sequence with the body's and keeps a marker
+    /// through every edit. It used to see top-level paragraphs only, so a
+    /// Bullet applied to a cell paragraph set `list_item` and never got a
+    /// marker to paint.
     fn with_list_markers_refreshed(mut self) -> Self {
-        let has_lists = self
-            .blocks
-            .iter()
-            .any(|b| b.as_paragraph().is_some_and(|p| p.list_item.is_some()));
-        if !has_lists {
+        let mut items: Vec<Option<ListItem>> = Vec::new();
+        let mut steps = Vec::new();
+        visit_rendered_paragraphs(self.blocks.iter(), &mut steps, 0, &mut |_, p| {
+            items.push(p.list_item);
+        });
+        if items.iter().all(Option::is_none) {
             return self;
         }
         /* Two passes so `im::Vector` structural sharing survives the hot
@@ -9291,18 +9115,33 @@ impl DocumentTree {
         edit touches only the renumbered tail — a blanket `iter_mut()`
         would thaw every chunk of the shared tree (and un-share every
         UndoStack snapshot) on each split/merge/paste. */
-        let (para_indices, items): (Vec<usize>, Vec<Option<ListItem>>) = self
-            .blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, b)| b.as_paragraph().map(|p| (idx, p.list_item)))
-            .unzip();
         let expected = numbering::compute_markers(&items, &self.numbering);
-        for (idx, (marker, indent)) in para_indices.into_iter().zip(expected) {
-            let stale = self.blocks[idx]
-                .as_paragraph()
-                .is_some_and(|p| p.resolved_marker != marker || p.resolved_list_indent != indent);
-            if stale && let Some(p) = self.blocks.get_mut(idx).and_then(|b| b.as_paragraph_mut()) {
+        let mut stale: Vec<(BlockPath, Option<String>, Option<Indent>)> = Vec::new();
+        let mut k = 0;
+        visit_rendered_paragraphs(self.blocks.iter(), &mut steps, 0, &mut |steps, p| {
+            if let Some((marker, indent)) = expected.get(k)
+                && (p.resolved_marker != *marker || p.resolved_list_indent != *indent)
+            {
+                stale.push((
+                    BlockPath {
+                        steps: steps.to_vec(),
+                    },
+                    marker.clone(),
+                    *indent,
+                ));
+            }
+            k += 1;
+        });
+        for (path, marker, indent) in stale {
+            let Some(PathStep::Block(n)) = path.steps.first().copied() else {
+                continue;
+            };
+            let Some(block) = self.blocks.get_mut(n as usize) else {
+                continue;
+            };
+            /* A stamp is derived state: it must not dirty the table it
+            sits in (the writer regenerates dirty tables). */
+            if let Some(p) = paragraph_in_block_mut(block, &path.steps[1..], false) {
                 p.resolved_marker = marker;
                 p.resolved_list_indent = indent;
             }
@@ -9345,27 +9184,11 @@ impl DocumentTree {
             resolver bails on a malformed cascade. */
             para.resolved_marker = None;
         };
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
-        }
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| apply(para));
         /* Document-wide marker refresh — counters reset at the top
         because the toggled range might appear in the middle. */
-        let mut paragraph_refs: Vec<&mut Paragraph> = blocks
-            .iter_mut()
-            .filter_map(|b| b.as_paragraph_mut())
-            .collect();
+        let mut paragraph_refs = rendered_paragraphs_mut(blocks.iter_mut());
         numbering::resolve_markers_in_place(&mut paragraph_refs, &next_numbering);
         Self {
             blocks,
@@ -9423,27 +9246,11 @@ impl DocumentTree {
                 para.resolved_marker = None;
             }
         };
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
-        }
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| apply(para));
         /* Document-wide marker refresh — counters reset at the top
         because the changed range might appear in the middle. */
-        let mut paragraph_refs: Vec<&mut Paragraph> = blocks
-            .iter_mut()
-            .filter_map(|b| b.as_paragraph_mut())
-            .collect();
+        let mut paragraph_refs = rendered_paragraphs_mut(blocks.iter_mut());
         numbering::resolve_markers_in_place(&mut paragraph_refs, &self.numbering);
         Self {
             blocks,
@@ -9479,29 +9286,12 @@ impl DocumentTree {
     pub fn clear_list_item_on_range(&self, start: LogicalPos, end: LogicalPos) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| {
                     para.list_item = None;
                     para.resolved_marker = None;
                     para.resolved_list_indent = None;
                 });
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
-                para.list_item = None;
-                para.resolved_marker = None;
-                para.resolved_list_indent = None;
-            });
-        }
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -10005,25 +9795,10 @@ impl DocumentTree {
     ) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
-        if same_parent(&start.path, &end.path) {
-            let Some(start_idx) = start.path.last_block_index() else {
-                return self.clone();
-            };
-            let Some(end_idx) = end.path.last_block_index() else {
-                return self.clone();
-            };
-            let parent = start.path.parent();
-            for idx in self.sibling_range(&start.path, start_idx, end_idx) {
-                let child_path = parent.clone().push(PathStep::Block(idx));
-                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+        let paths = self.range_paragraph_paths(&start, &end);
+        mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| {
                     para.props.borders = borders.clone();
                 });
-            }
-        } else {
-            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
-                para.props.borders = borders.clone();
-            });
-        }
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -12524,27 +12299,6 @@ pub fn parent_container_len(doc: &DocumentTree, path: &BlockPath) -> Option<usiz
     )
 }
 
-impl DocumentTree {
-    /// Issue #422 — the sibling indices `start_idx..=end_idx` of a
-    /// same-parent range, clipped to the blocks that exist in `path`'s
-    /// container. The indices come off the wire: an end index of ~4
-    /// billion used to drive the range loops of `set_line_spacing` & co.
-    /// through 4 billion iterations (88 s for one fuzz-generated
-    /// `SetLineSpacing`), each building a path to a block that is not
-    /// there. A missing index addresses nothing, so the clipped loop
-    /// mutates exactly the paragraphs the unclipped one did.
-    fn sibling_range(
-        &self,
-        path: &BlockPath,
-        start_idx: u32,
-        end_idx: u32,
-    ) -> std::ops::Range<u32> {
-        let len = parent_container_len(self, path).unwrap_or(0) as u64;
-        let stop = (u64::from(end_idx) + 1).min(len) as u32;
-        start_idx..stop
-    }
-}
-
 /// Same parent container? Two paragraph paths share a container
 /// when every step but the last is identical.
 pub fn same_parent(a: &BlockPath, b: &BlockPath) -> bool {
@@ -12573,6 +12327,369 @@ pub fn order_positions(a: LogicalPos, b: LogicalPos) -> (LogicalPos, LogicalPos)
         Ordering::Equal => a.offset > b.offset,
     };
     if swap { (b, a) } else { (a, b) }
+}
+
+/// Issue #509 — visit every paragraph of `blocks` in the document order
+/// list numbering runs in: top-level paragraphs and, depth first, the
+/// paragraphs of every table cell (nested tables included, bounded by
+/// [`MAX_REVISION_TABLE_DEPTH`]); a vertically merged continuation cell
+/// is skipped — its content is ignored at render time. `f` gets the
+/// paragraph's full path. [`rendered_paragraphs_mut`] is the mutable twin;
+/// both must enumerate identically.
+fn visit_rendered_paragraphs<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    steps: &mut Vec<PathStep>,
+    depth: u32,
+    f: &mut impl FnMut(&[PathStep], &'a Paragraph),
+) {
+    for (bi, block) in blocks.into_iter().enumerate() {
+        steps.push(PathStep::Block(bi as u32));
+        match block {
+            Block::Paragraph(p) => f(steps, p),
+            Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => {
+                for (ri, row) in t.rows.iter().enumerate() {
+                    for (ci, cell) in row.cells.iter().enumerate() {
+                        if cell.props.v_merge == VMergeRole::Continue {
+                            continue;
+                        }
+                        steps.push(PathStep::Cell {
+                            row: ri as u32,
+                            col: ci as u32,
+                        });
+                        visit_rendered_paragraphs(cell.blocks.iter(), steps, depth + 1, f);
+                        steps.pop();
+                    }
+                }
+            }
+            Block::Table(_) => {}
+        }
+        steps.pop();
+    }
+}
+
+/// Issue #509 — [`visit_rendered_paragraphs`]' enumeration as mutable
+/// references: what `numbering::resolve_markers_in_place` stamps. Public
+/// so the `.docx` reader numbers a cell's list the same way.
+pub fn rendered_paragraphs_mut<'a>(
+    blocks: impl IntoIterator<Item = &'a mut Block>,
+) -> Vec<&'a mut Paragraph> {
+    fn push<'a>(block: &'a mut Block, depth: u32, out: &mut Vec<&'a mut Paragraph>) {
+        match block {
+            Block::Paragraph(p) => out.push(p),
+            Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => {
+                for row in t.rows.iter_mut() {
+                    for cell in row.cells.iter_mut() {
+                        if cell.props.v_merge == VMergeRole::Continue {
+                            continue;
+                        }
+                        for inner in cell.blocks.iter_mut() {
+                            push(inner, depth + 1, out);
+                        }
+                    }
+                }
+            }
+            Block::Table(_) => {}
+        }
+    }
+    let mut out = Vec::new();
+    for block in blocks {
+        push(block, 0, &mut out);
+    }
+    out
+}
+
+/// Issue #509 — one paragraph a logical range reaches, with the bytes of
+/// it the range covers. Produced by [`DocumentTree::range_targets`] /
+/// [`DocumentTree::cell_rect_targets`]; every character- and
+/// paragraph-formatting command that acts on a RANGE resolves it to these
+/// first, so a range that crosses cells, rows, a body → table boundary or
+/// a nested table reaches EVERY paragraph in it (the old same-parent
+/// loops formatted the first paragraph only once the two ends had
+/// different parents).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeTarget {
+    pub path: BlockPath,
+    /// First covered byte (the range start's offset in the first
+    /// paragraph, else 0).
+    pub lo: u32,
+    /// One past the last covered byte (the range end's offset in the last
+    /// paragraph, else the paragraph's length).
+    pub hi: u32,
+    /// The paragraph MARK is covered and the paragraph has no text: Word
+    /// formats an empty paragraph's mark (its only character) with the
+    /// selection, so typing into it afterwards continues the formatting
+    /// (`Paragraph::mark_style`, issue #293). Never set on a paragraph
+    /// that has text (its mark is not folded into the runs, issue #369).
+    pub mark: bool,
+}
+
+/// Collect the paragraphs of one block that fall inside `[start, end]`.
+/// `steps` is the block's path, extended in place and restored on return.
+/// Returns `false` once the walk has passed `end` (stop).
+fn collect_range_block(
+    block: &Block,
+    steps: &mut Vec<PathStep>,
+    depth: u32,
+    start: &LogicalPos,
+    end: &LogicalPos,
+    out: &mut Vec<RangeTarget>,
+) -> bool {
+    use core::cmp::Ordering;
+    match block {
+        Block::Paragraph(p) => {
+            if cmp_steps_doc_order(steps, &start.path.steps) == Ordering::Less {
+                return true;
+            }
+            if cmp_steps_doc_order(steps, &end.path.steps) == Ordering::Greater {
+                return false;
+            }
+            let len = p.text.len() as u32;
+            let is_start = steps.as_slice() == start.path.steps.as_slice();
+            let is_end = steps.as_slice() == end.path.steps.as_slice();
+            out.push(RangeTarget {
+                path: BlockPath {
+                    steps: steps.clone(),
+                },
+                lo: if is_start { start.offset.min(len) } else { 0 },
+                hi: if is_end { end.offset.min(len) } else { len },
+                mark: len == 0 && !is_end,
+            });
+            !is_end
+        }
+        Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => {
+            for (ri, row) in t.rows.iter().enumerate() {
+                for (ci, cell) in row.cells.iter().enumerate() {
+                    if cell.props.v_merge == VMergeRole::Continue {
+                        continue;
+                    }
+                    steps.push(PathStep::Cell {
+                        row: ri as u32,
+                        col: ci as u32,
+                    });
+                    for (bi, inner) in cell.blocks.iter().enumerate() {
+                        steps.push(PathStep::Block(bi as u32));
+                        let keep_going =
+                            collect_range_block(inner, steps, depth + 1, start, end, out);
+                        steps.pop();
+                        if !keep_going {
+                            steps.pop();
+                            return false;
+                        }
+                    }
+                    steps.pop();
+                }
+            }
+            true
+        }
+        Block::Table(_) => true,
+    }
+}
+
+/// Every paragraph under `blocks` (nested tables included), WHOLE, with
+/// the mark covered: the shape a cell-rectangle selection formats.
+fn collect_whole_paragraphs(
+    blocks: &[Block],
+    steps: &mut Vec<PathStep>,
+    depth: u32,
+    out: &mut Vec<RangeTarget>,
+) {
+    for (bi, block) in blocks.iter().enumerate() {
+        steps.push(PathStep::Block(bi as u32));
+        match block {
+            Block::Paragraph(p) => out.push(RangeTarget {
+                path: BlockPath {
+                    steps: steps.clone(),
+                },
+                lo: 0,
+                hi: p.text.len() as u32,
+                mark: p.text.is_empty(),
+            }),
+            Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => {
+                for (ri, row) in t.rows.iter().enumerate() {
+                    for (ci, cell) in row.cells.iter().enumerate() {
+                        if cell.props.v_merge == VMergeRole::Continue {
+                            continue;
+                        }
+                        steps.push(PathStep::Cell {
+                            row: ri as u32,
+                            col: ci as u32,
+                        });
+                        collect_whole_paragraphs(&cell.blocks, steps, depth + 1, out);
+                        steps.pop();
+                    }
+                }
+            }
+            Block::Table(_) => {}
+        }
+        steps.pop();
+    }
+}
+
+impl DocumentTree {
+    /// Issue #509 — every paragraph the logical range between `a` and `b`
+    /// reaches, in document order, at any nesting depth: the paragraphs
+    /// of a table the range crosses (cells row by row, vertically merged
+    /// continuation cells skipped — their content is ignored at render
+    /// time), nested tables included. The first paragraph is covered from
+    /// the start's offset, the last up to the end's, every other one
+    /// whole. Endpoints are ordered first; an endpoint that does not
+    /// address a paragraph reaches whatever follows / precedes it in
+    /// document order. Bounded by [`MAX_REVISION_TABLE_DEPTH`].
+    pub fn range_targets(&self, a: &LogicalPos, b: &LogicalPos) -> Vec<RangeTarget> {
+        let (start, end) = order_positions(a.clone(), b.clone());
+        let (Some(PathStep::Block(first)), Some(PathStep::Block(last))) = (
+            start.path.steps.first().copied(),
+            end.path.steps.first().copied(),
+        ) else {
+            return Vec::new();
+        };
+        /* The indices come off the wire (#422): clip to the blocks that
+        exist instead of iterating up to a billion missing ones. */
+        let stop = (u64::from(last) + 1).min(self.blocks.len() as u64) as u32;
+        let mut out = Vec::new();
+        let mut steps = Vec::new();
+        for i in first..stop {
+            let Some(block) = self.blocks.get(i as usize) else {
+                break;
+            };
+            steps.push(PathStep::Block(i));
+            let keep_going = collect_range_block(block, &mut steps, 0, &start, &end, &mut out);
+            steps.pop();
+            if !keep_going {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The paths of [`Self::range_targets`] — what the paragraph-level
+    /// range commands (alignment, indent, list, style, borders, …) act on.
+    pub fn range_paragraph_paths(&self, a: &LogicalPos, b: &LogicalPos) -> Vec<BlockPath> {
+        self.range_targets(a, b)
+            .into_iter()
+            .map(|t| t.path)
+            .collect()
+    }
+
+    /// Issue #509 — the paragraphs of the cell rectangle
+    /// `rows.0..=rows.1` x `cols.0..=cols.1` of the table at `table`
+    /// (cell indices, as `PathStep::Cell` counts them), WHOLE and with
+    /// their marks covered: a `TABLE_CELLS` selection formats every
+    /// paragraph of every selected cell, nested tables included. Empty
+    /// when `table` addresses no table.
+    pub fn cell_rect_targets(
+        &self,
+        table: &BlockPath,
+        rows: (u32, u32),
+        cols: (u32, u32),
+    ) -> Vec<RangeTarget> {
+        let Some(t) = self.table_at_path(table) else {
+            return Vec::new();
+        };
+        let depth = (table.steps.len() / 2) as u32;
+        let mut out = Vec::new();
+        let mut steps = table.steps.clone();
+        for (ri, row) in t.rows.iter().enumerate() {
+            if (ri as u32) < rows.0 || (ri as u32) > rows.1 {
+                continue;
+            }
+            for (ci, cell) in row.cells.iter().enumerate() {
+                if (ci as u32) < cols.0
+                    || (ci as u32) > cols.1
+                    || cell.props.v_merge == VMergeRole::Continue
+                {
+                    continue;
+                }
+                steps.push(PathStep::Cell {
+                    row: ri as u32,
+                    col: ci as u32,
+                });
+                collect_whole_paragraphs(&cell.blocks, &mut steps, depth + 1, &mut out);
+                steps.pop();
+            }
+        }
+        out
+    }
+
+    /// `self` with its block list replaced by `blocks` (every other
+    /// field shared).
+    fn with_blocks(&self, blocks: Vector<Block>) -> Self {
+        let mut out = self.clone();
+        out.blocks = blocks;
+        out
+    }
+}
+
+/// The paragraph `steps` (relative to the top-level block `block`, whose
+/// own step is already consumed) addresses, for mutation. With
+/// `mark_dirty`, every table on the way is marked dirty so the writer
+/// regenerates it (the PR 3 passthrough invariant
+/// `mutate_paragraph_in_vec` keeps); derived stamps pass `false`.
+fn paragraph_in_block_mut<'a>(
+    block: &'a mut Block,
+    steps: &[PathStep],
+    mark_dirty: bool,
+) -> Option<&'a mut Paragraph> {
+    match steps {
+        [] => block.as_paragraph_mut(),
+        [PathStep::Cell { row, col }, PathStep::Block(n), rest @ ..] => {
+            let Block::Table(t) = block else {
+                return None;
+            };
+            let cell = t
+                .rows
+                .get_mut(*row as usize)?
+                .cells
+                .get_mut(*col as usize)?;
+            let inner = cell.blocks.get_mut(*n as usize)?;
+            let found = paragraph_in_block_mut(inner, rest, mark_dirty)?;
+            if mark_dirty {
+                t.dirty = true;
+                t.source_xml = None;
+            }
+            Some(found)
+        }
+        _ => None,
+    }
+}
+
+/// Issue #509 — run `f(i, paragraph)` on the paragraph each `paths[i]`
+/// addresses (document order, so targets of one top-level block are
+/// adjacent), marking each one dirty like [`mutate_paragraph_in_top`].
+/// Unlike a loop over that function, each top-level block that holds a
+/// target is cloned ONCE: a 5 000-cell table formatted cell by cell cost
+/// 5 000 deep table clones.
+fn mutate_paragraphs_in_top(
+    top: &mut Vector<Block>,
+    paths: &[BlockPath],
+    mut f: impl FnMut(usize, &mut Paragraph),
+) {
+    let mut i = 0;
+    while i < paths.len() {
+        let head = paths[i].steps.first().copied();
+        let mut j = i + 1;
+        while j < paths.len() && paths[j].steps.first().copied() == head {
+            j += 1;
+        }
+        if let Some(PathStep::Block(n)) = head
+            && let Some(original) = top.get(n as usize)
+        {
+            let mut block = original.clone();
+            let mut touched = false;
+            for (k, path) in paths.iter().enumerate().take(j).skip(i) {
+                if let Some(p) = paragraph_in_block_mut(&mut block, &path.steps[1..], true) {
+                    f(k, p);
+                    p.dirty = true;
+                    p.source_xml = None;
+                    touched = true;
+                }
+            }
+            if touched {
+                top.set(n as usize, block);
+            }
+        }
+        i = j;
+    }
 }
 
 /// Delete the block at `path` from its parent container.
