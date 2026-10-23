@@ -113,7 +113,10 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         window.removeEventListener('focus', onWindowFocus);
     });
 
+    /* The composed text the engine last saw (`UPDATE_COMPOSITION`). */
+    let composed = '';
     const onCompositionStart = (): void => {
+        composed = '';
         /* Issue #64 — anchor at the engine's live caret (`at:
            undefined`); the UI mirror may still hold the pre-click
            position. The mirror is only a readiness gate here. */
@@ -122,13 +125,29 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         }
     };
     const onCompositionUpdate = (e: CompositionEvent): void => {
+        composed = e.data;
         void props.client.dispatch({
             type: 'UPDATE_COMPOSITION',
             text: e.data,
             target_range: undefined,
         });
     };
-    const onCompositionEnd = (): void => {
+    const onCompositionEnd = (e: CompositionEvent): void => {
+        /* Epic #555 row 37 (memo §10) — `compositionend.data` IS the
+           commit. A cancelled composition (Escape in the IME) ends with
+           empty data and no final `compositionupdate`, so committing the
+           last UPDATE's text inserted what the user had just thrown away
+           (and replaced the selection with it). Hand the engine the final
+           text first; an empty commit leaves the document and the
+           selection as they were before the composition. */
+        if (e.data !== composed) {
+            composed = e.data;
+            void props.client.dispatch({
+                type: 'UPDATE_COMPOSITION',
+                text: e.data,
+                target_range: undefined,
+            });
+        }
         void props.client.dispatch({ type: 'END_COMPOSITION', commit: true });
         if (ref) ref.value = '';
     };
