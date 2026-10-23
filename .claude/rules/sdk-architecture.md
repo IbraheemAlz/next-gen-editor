@@ -72,6 +72,10 @@ discipline.
     marked, never mistaken for the user's). A pointer click is
     `reveals_caret: false` — a race spec for this needs a keyboard /
     `SET_SELECTION` move (`ts/e2e/caret-reveal-intent.spec.ts`).
+    Issue #557: `createEditorState` bumps `caretRevealSeq` only when the
+    caret MOVED (`caretReveal.ts` `caretMoved`: another rect or story, or
+    a new `document_revision`), so a key that leaves the caret in place
+    never scrolls (`ts/e2e/caret-extent.spec.ts`).
   - `src/types.ts` — re-exports every bridge type from the wasm-pack
     output plus the `EngineClientLike` + `EngineClientSnapshots`
     interface contracts. **Single point of coupling** to

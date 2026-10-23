@@ -535,6 +535,7 @@ fn synthetic_line(rtl: bool, slots: &[(f32, u32)]) -> LineGeom {
         hit_width: 200.0,
         y_top: 0.0,
         height: 20.0,
+        baseline: 16.0,
         start_byte: 0,
         end_byte: 9,
         rtl,

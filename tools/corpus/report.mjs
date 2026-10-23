@@ -315,6 +315,34 @@ function main() {
         }
     }
 
+    /* --- Issue #556 — the default paragraph style (`w:default="1"`):
+    the paragraphs that name no style take it; the ones whose layout the
+    fix changed are those of documents where it carries formatting. --- */
+    const censused = records.filter((r) => typeof r.unstyled_paragraphs === 'number');
+    const withDefault = censused.filter((r) => r.default_paragraph_style);
+    const formatting = withDefault.filter((r) => r.default_style_formats);
+    const sum = (rs, f) => rs.reduce((n, r) => n + f(r), 0);
+    const unstyledTotal = sum(censused, (r) => r.unstyled_paragraphs);
+    const paragraphsTotal = sum(censused, (r) => r.paragraph_count ?? 0);
+    const affected = sum(formatting, (r) => r.unstyled_paragraphs);
+    const defaultIds = new Map();
+    for (const r of withDefault) {
+        defaultIds.set(r.default_paragraph_style, (defaultIds.get(r.default_paragraph_style) || 0) + 1);
+    }
+    const sortedDefaultIds = [...defaultIds.entries()].sort((a, b) => b[1] - a[1]);
+    if (censused.length > 0) {
+        console.log(
+            `\n=== Default paragraph style (#556): ${unstyledTotal}/${paragraphsTotal} top-level paragraphs name no style; ` +
+                `${withDefault.length}/${censused.length} documents define a default style, ${formatting.length} with formatting ` +
+                `(${affected} unstyled paragraphs take it) ===`,
+        );
+        for (const [id, count] of sortedDefaultIds) console.log(`  ${String(count).padStart(4)}  ${id}`);
+        const top = [...formatting].sort((a, b) => b.unstyled_paragraphs - a.unstyled_paragraphs);
+        for (const r of top.slice(0, TOP_N)) {
+            console.log(`    ${r.path} (${r.unstyled_paragraphs}/${r.paragraph_count ?? '?'} paragraphs, style ${r.default_paragraph_style})`);
+        }
+    }
+
     /* --- Layout-time outliers. --- */
     const withLayoutTime = records.filter((r) => typeof r.layout_ms === 'number').sort((a, b) => b.layout_ms - a.layout_ms);
     console.log(`\n=== Layout-time outliers (top ${Math.min(10, withLayoutTime.length)}) ===`);
@@ -387,6 +415,16 @@ function main() {
             paragraphs: regenParagraphs,
             mismatched: regenMismatched,
             classes: Object.fromEntries(sortedRegenClasses),
+        },
+        /* Issue #556 — the default paragraph style's reach. */
+        default_paragraph_style: {
+            documents: censused.length,
+            paragraphs: paragraphsTotal,
+            unstyled_paragraphs: unstyledTotal,
+            documents_with_default: withDefault.length,
+            documents_where_it_formats: formatting.length,
+            unstyled_paragraphs_formatted: affected,
+            ids: Object.fromEntries(sortedDefaultIds),
         },
         layout: {
             budget_ms: LAYOUT_BUDGET_MS,
