@@ -30479,6 +30479,10 @@ mod mutation_signal_tests;
 #[cfg(all(test, feature = "fuzz-native"))]
 mod table_merge_tests;
 
+/// Issue #509 - formatting over ranges, rectangles and cell paragraphs.
+#[cfg(all(test, feature = "fuzz-native"))]
+mod cell_format_tests;
+
 /// Issue #459 - `ResizeImage` / `MoveImage` EMU fields vs Word's 22 in
 /// (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
