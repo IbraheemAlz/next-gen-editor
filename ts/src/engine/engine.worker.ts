@@ -1180,12 +1180,13 @@ async function handleInit(msg: InitMsg): Promise<void> {
         case 'interactive':
             /* Blank A4 page seeded with one empty paragraph. RenderPage
                caches the layout config so subsequent InsertText / Undo /
-               Redo commands from the textarea auto-repaint. */
+               Redo commands from the textarea auto-repaint. LTR like the
+               editor's own boot document (issue #552). */
             paintEvt = await dispatch({
                 type: 'RENDER_PAGE',
                 text: '',
                 font_id: DUAL_ID,
-                base_direction: 'RTL',
+                base_direction: 'LTR',
                 px_size: 24,
                 line_height: 36,
                 align: 'START',
