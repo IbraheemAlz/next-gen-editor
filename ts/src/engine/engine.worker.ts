@@ -7,6 +7,7 @@ import type {
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { commandMeta } from '@nge/core/command-meta';
+import { MediaDecoder, mediaDecodePlan, type MediaEntry } from './media-decode';
 import {
     openEventLog,
     setActiveLogDb,
@@ -139,6 +140,15 @@ type ArmTrapMsg = { id: number; type: 'ARM_TRAP'; after_commands: number };
 /* Issue #96 — DEV-only test hook: per-page opaque-ink counts read back
    from the surfaces this worker holds (see the handler). */
 type ProbePageInkMsg = { id: number; type: 'PROBE_PAGE_INK' };
+/* Issue #506 — DEV-only test hook: the RGBA of single pixels of one page
+   surface (page-local DEVICE px), so a spec can tell a decoded bitmap from
+   the grey placeholder the renderer draws on a decode miss. */
+type ProbePagePixelsMsg = {
+    id: number;
+    type: 'PROBE_PAGE_PIXELS';
+    page: number;
+    points: Array<{ x: number; y: number }>;
+};
 /* Issue #502 - DEV / dev-hooks-build test hook: dispatch synthetic
    `contextlost` / `contextrestored` events on page `idx`'s surface (a 2D
    canvas has no `WEBGL_lose_context` equivalent), blanking it on the loss
@@ -161,6 +171,7 @@ type Msg =
     | RegisterPageCanvasMsg
     | ArmTrapMsg
     | ProbePageInkMsg
+    | ProbePagePixelsMsg
     | ForceContextLossMsg
     | RetireMsg;
 
@@ -338,6 +349,22 @@ function countOpaqueInk(surface: OffscreenCanvas): number {
     return ink;
 }
 
+/** Issue #506 — RGBA at each page-local point (`null` outside the surface or
+ *  for a surface without a 2d context). */
+function readPixels(
+    surface: OffscreenCanvas,
+    points: ReadonlyArray<{ x: number; y: number }>,
+): Array<[number, number, number, number] | null> {
+    const ctx = surface.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+    return points.map(({ x, y }) => {
+        const px = Math.floor(x);
+        const py = Math.floor(y);
+        if (!ctx || px < 0 || py < 0 || px >= surface.width || py >= surface.height) return null;
+        const d = ctx.getImageData(px, py, 1, 1).data;
+        return [d[0] ?? 0, d[1] ?? 0, d[2] ?? 0, d[3] ?? 0];
+    });
+}
+
 /* Issue #194 — the engine `document_mutation_seq` the last accessibility
    delta was broadcast for. A fresh engine (INIT, crash recovery — a new
    worker every time) starts at 0, matching this. */
@@ -402,18 +429,24 @@ function schedulePageCanvasRepaint(): void {
         void enqueue(async () => {
             pageCanvasRepaintQueued = false;
             try {
-                const evt = await dispatch({
-                    type: 'REQUEST_PAINT',
-                    viewport: { x: 0, y: 0, w: 0, h: 0 },
-                    dirty: undefined,
-                });
-                notePaintVersion(evt);
-                self.postMessage({ evt });
+                await repaintAllPages();
             } catch (e: unknown) {
                 console.error('[worker] page-canvas repaint failed', e);
             }
         });
     }, 0);
+}
+
+/** Bring every registered page canvas up to date and broadcast the
+ *  resulting `Painted`. Runs INSIDE a queue task (the callers hold it). */
+async function repaintAllPages(): Promise<void> {
+    const evt = await dispatch({
+        type: 'REQUEST_PAINT',
+        viewport: { x: 0, y: 0, w: 0, h: 0 },
+        dirty: undefined,
+    });
+    notePaintVersion(evt);
+    self.postMessage({ evt });
 }
 
 async function fetchBytes(url: string): Promise<Uint8Array> {
@@ -1180,12 +1213,13 @@ async function handleInit(msg: InitMsg): Promise<void> {
         case 'interactive':
             /* Blank A4 page seeded with one empty paragraph. RenderPage
                caches the layout config so subsequent InsertText / Undo /
-               Redo commands from the textarea auto-repaint. */
+               Redo commands from the textarea auto-repaint. LTR like the
+               editor's own boot document (issue #552). */
             paintEvt = await dispatch({
                 type: 'RENDER_PAGE',
                 text: '',
                 font_id: DUAL_ID,
-                base_direction: 'RTL',
+                base_direction: 'LTR',
                 px_size: 24,
                 line_height: 36,
                 align: 'START',
@@ -1556,12 +1590,20 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
                 engine.debug_force_trap();
             }
         }
-        /* Phase 7 — after `OPEN_DOCUMENT`, enumerate the engine's parsed
-           inline-image media blobs, decode each into an `ImageBitmap` via
-           the browser's native pipeline, and register the result back on
-           the engine. The first paint after this picks the bitmaps up. */
-        if (msg.cmd.type === 'OPEN_DOCUMENT') {
-            await decodeAndRegisterMedia();
+        /* Phase 7 / issue #506 — after a command that can have put a
+           picture blob into the document (`OPEN_DOCUMENT` parses them,
+           `INSERT_IMAGE` mints one, an undo / paste can bring one back),
+           decode what the engine has no bitmap for with the browser's
+           native pipeline and register the results back on the engine.
+           A new document's first paint picks them up; any other command
+           already painted with the placeholder, so repaint once the
+           bitmaps are in. Queued behind this task: every later command
+           (and the shell's `GET_IMAGE_RECTS`) sees the painted picture. */
+        const mediaPlan = mediaDecodePlan(commandMeta(msg.cmd.type), evt.type);
+        if (mediaPlan.decode) {
+            if (startsNewDocument(msg.cmd)) mediaDecoder.reset();
+            const decoded = await decodeAndRegisterMedia();
+            if (decoded > 0 && mediaPlan.repaint) await repaintAllPages();
         }
         /* §10 / Backlog #10: after a document mutation, broadcast an
            accessibility delta. The message carries no `id`, so EngineClient
@@ -1742,28 +1784,31 @@ function broadcastAnnouncements(): void {
     }
 }
 
+/* Issue #506 - the picture decoder. It decodes with the browser's own
+   pipeline (`createImageBitmap`) and installs each bitmap on the engine; a
+   blob that does not decode keeps the renderer's placeholder and is
+   reported once (see `media-decode.ts`). */
+const mediaDecoder = new MediaDecoder<ImageBitmap>({
+    decode: (blob) => createImageBitmap(blob),
+    register: (relId, bitmap) => engine?.register_image(relId, bitmap),
+    warn: (message, error) => console.warn(message, error),
+});
+
 /**
- * Phase 7 — decode every inline-image media blob the engine parsed into an
- * `ImageBitmap` and install it back on the engine. Run after `OPEN_DOCUMENT`
- * succeeds; on decode failure the bitmap is skipped and the renderer falls
- * back to the placeholder rectangle for that image.
+ * Phase 7 / issue #506 - decode every picture blob the engine holds but has
+ * no up-to-date bitmap for, and install the bitmaps on the engine. The engine
+ * answers `pending_media_entries()` - after an open or a recovery that is
+ * every blob (its cache was just cleared), after an `INSERT_IMAGE` or an
+ * undo it is the one new picture, and on any other command it is empty - so
+ * this is cheap enough to run after every command that can change the
+ * document. Resolves with how many bitmaps were registered. Callers hold the
+ * worker's command queue (nothing edits the document between the engine's
+ * answer and `register_image`, which fingerprints the blob it decoded).
  */
-async function decodeAndRegisterMedia(): Promise<void> {
-    if (!engine) return;
-    const entries = engine.media_entries() as Array<{
-        rel_id: string;
-        mime: string;
-        bytes: Uint8Array;
-    }>;
-    for (const entry of entries) {
-        try {
-            const blob = new Blob([entry.bytes as BlobPart], { type: entry.mime });
-            const bitmap = await createImageBitmap(blob);
-            engine.register_image(entry.rel_id, bitmap);
-        } catch (e: unknown) {
-            console.warn(`[worker] image decode failed (${entry.rel_id}):`, e);
-        }
-    }
+async function decodeAndRegisterMedia(): Promise<number> {
+    if (!engine) return 0;
+    const entries = engine.pending_media_entries() as MediaEntry[];
+    return mediaDecoder.run(entries);
 }
 
 /** Issue #388 - persist a change of the document's clean state. */
@@ -1891,6 +1936,22 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
                 ink[idx] = countOpaqueInk(surface);
             }
             self.postMessage({ id: msg.id, ok: true, ink });
+        });
+        return;
+    }
+
+    if (msg.type === 'PROBE_PAGE_PIXELS') {
+        void enqueue(async () => {
+            if (!import.meta.env.DEV) {
+                self.postMessage({ id: msg.id, ok: false, error: 'PROBE_PAGE_PIXELS is dev-only' });
+                return;
+            }
+            const surface = pageSurfaces.get(msg.page);
+            if (!surface) {
+                self.postMessage({ id: msg.id, ok: false, error: `no page surface ${msg.page}` });
+                return;
+            }
+            self.postMessage({ id: msg.id, ok: true, pixels: readPixels(surface, msg.points) });
         });
         return;
     }

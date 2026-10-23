@@ -6,8 +6,10 @@ import { fileURLToPath } from 'node:url';
  * that paragraph's OWN resolved base direction (explicit bidi →
  * first-strong auto-direction → document base; the engine's layout
  * resolution), not the document base direction. The interactive editor
- * boots an RTL document, so before the fix a Latin paragraph was mirrored
- * `dir="rtl"` and read with the wrong UAX #9 base.
+ * booted an RTL document then, so before the fix a Latin paragraph was
+ * mirrored `dir="rtl"` and read with the wrong UAX #9 base. Since issue
+ * #552 it boots LTR (Word's default), so a neutral-only paragraph is LTR
+ * and an explicit / Arabic one RTL.
  *
  * Mixed-direction fixture through the REAL worker + WASM engine, DOM-only
  * assertions (the mirror is plain DOM, valid under headless Chrome). */
@@ -67,11 +69,11 @@ test('each mirrored paragraph carries its own resolved dir', async ({ page }) =>
     await expect(paragraphs.nth(4)).toHaveText('12345');
     const dirs = await paragraphs.evaluateAll((els) => els.map((el) => el.getAttribute('dir')));
     expect(dirs).toEqual([
-        'ltr', // Latin, auto-direction — the RTL document base must not win
-        'rtl', // Arabic, auto-direction
+        'ltr', // Latin, auto-direction
+        'rtl', // Arabic, auto-direction — the LTR document base must not win
         'rtl', // explicit RTL over Latin text
         'ltr', // explicit LTR over Arabic text
-        'rtl', // neutral digits → the (RTL) document base
+        'ltr', // neutral digits → the (LTR, issue #552) document base
     ]);
 
     /* A direction flip re-mirrors just that paragraph with the new dir. */

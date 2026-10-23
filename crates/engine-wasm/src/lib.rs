@@ -45,6 +45,9 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod error_reply;
+/// Issue #506 - which media blobs still need a decoded bitmap (content
+/// fingerprints, so a re-minted key is decoded again).
+mod media_registry;
 /// Issue #491 — open-time `DocxError` → typed `Event::Error` (one table).
 mod open_error;
 /// Issue #379 — the content-keyed table layout cache that survives
@@ -104,10 +107,11 @@ struct RenderConfig {
 /// Issue #498 - the editor shell's boot layout config, the values
 /// `ts/src/App.tsx` sends in its boot `RENDER_PAGE`: 24 px text on 36 px
 /// lines (logical; the line pitch itself is the font-derived one since
-/// #475, this is the nominal fallback), start alignment, an RTL document
-/// base (the seed paragraph is Arabic + Latin; it is the direction a
-/// paragraph with no strong character falls back to, and it routes an
-/// empty paragraph's mark through the complex-script size).
+/// #475, this is the nominal fallback), start alignment, an LTR document
+/// base (issue #552: Word's default - the direction a paragraph with no
+/// direction of its own, no strong character and no `<w:docDefaults>`
+/// `<w:bidi>` falls back to; it was RTL, which laid every empty paragraph
+/// and table cell out right to left in a Latin document).
 #[cfg(any(test, feature = "fuzz-native"))]
 const SHELL_PX_SIZE: f32 = 24.0;
 #[cfg(any(test, feature = "fuzz-native"))]
@@ -135,13 +139,30 @@ impl RenderConfig {
     fn shell_default() -> Self {
         Self {
             font_id: SHELL_SEED_FONT_ID.to_string(),
-            base_direction: ShapingDirection::Rtl,
+            base_direction: ShapingDirection::Ltr,
             px_size: SHELL_PX_SIZE,
             line_height: SHELL_LINE_HEIGHT,
             alignment: Alignment::Start,
             scale: SHELL_BASE_SCALE,
             base_scale: SHELL_BASE_SCALE,
             zoom: 1.0,
+        }
+    }
+}
+
+impl RenderConfig {
+    /// Issue #552 — this config with `base_direction` resolved for `doc`
+    /// ([`document_base_direction`]: the document's `<w:docDefaults>`
+    /// direction, else the boot base). Every layout pass and every
+    /// direction read-back (caret, toolbar, a11y mirror) runs on it, so a
+    /// paragraph with no direction and no strong character resolves the
+    /// same way everywhere — and, because the paragraph / table cache keys
+    /// hash the config they are handed, an entry laid out under one
+    /// document default never serves another.
+    fn for_document(&self, doc: &DocumentTree) -> RenderConfig {
+        RenderConfig {
+            base_direction: document_base_direction(doc, self.base_direction),
+            ..self.clone()
         }
     }
 }
@@ -949,6 +970,12 @@ struct LineGeom {
     height: f32,
     start_byte: u32,
     end_byte: u32,
+    /// Issue #553 — the paragraph's BASE direction is right-to-left. It
+    /// decides which visual side of the line is its logical START: the
+    /// left edge of an LTR paragraph, the right edge of an RTL one. A
+    /// click past a line's ink belongs to that logical end, whatever
+    /// directional runs the ink is made of (see [`line_edge_at`]).
+    rtl: bool,
     /// Caret slots in visual emission order — searched by nearest x or byte.
     /// The flat concatenation of every run's slots.
     slots: Vec<CaretSlot>,
@@ -1081,8 +1108,11 @@ pub struct Engine {
     /// `ImageBitmap` after the document loads and installs the result
     /// here via the direct wasm method [`Engine::register_image`]. The
     /// Canvas2D backend looks each painted inline image up here; a miss
-    /// falls back to a placeholder.
-    image_cache: HashMap<String, web_sys::ImageBitmap>,
+    /// falls back to a placeholder. Issue #506 - each entry remembers the
+    /// fingerprint of the bytes it was decoded from
+    /// (`media_registry::fingerprint`), so [`Engine::pending_media_entries`]
+    /// can tell a stale bitmap (a re-minted key) from a current one.
+    image_cache: HashMap<String, RegisteredImage>,
     /// Last `render_document` output dimensions, cached so the worker
     /// can post a synthetic `Painted` side-channel after every mutating
     /// command without re-rendering. The TS shell drives the CSS
@@ -1292,6 +1322,34 @@ impl Engine {
             .map_err(|e| JsValue::from_str(&format!("encode media entries: {e}")))
     }
 
+    /// Issue #506 - the media blobs that still need a decoded bitmap:
+    /// nothing is cached under their key, or what is cached was decoded
+    /// from different bytes (a key the engine re-minted after an undone
+    /// insert). Same `{ rel_id, mime, bytes }` shape as
+    /// [`Engine::media_entries`] but only the pending ones, sorted by key -
+    /// an empty array on the common path, so the worker can ask after every
+    /// command that may have changed the document without copying a single
+    /// blob. The worker decodes each and hands it to
+    /// [`Engine::register_image`].
+    pub fn pending_media_entries(&self) -> Result<JsValue, JsValue> {
+        let doc = self.undo.current();
+        let pending = media_registry::pending_keys(&doc.media, |key| {
+            self.image_cache.get(key).map(|r| r.fingerprint)
+        });
+        let entries: Vec<MediaEntryOut> = pending
+            .into_iter()
+            .filter_map(|key| {
+                doc.media.get(key).map(|blob| MediaEntryOut {
+                    rel_id: key.to_string(),
+                    mime: blob.content_type.clone(),
+                    bytes: blob.data.clone(),
+                })
+            })
+            .collect();
+        serde_wasm_bindgen::to_value(&entries)
+            .map_err(|e| JsValue::from_str(&format!("encode pending media entries: {e}")))
+    }
+
     /// Issue #85 — `Engine::snapshot()`: serialize the session (document
     /// + styles + stories + undo window + selection + layout config) into
     /// the versioned `engine::snapshot` envelope. Same bytes as
@@ -1327,7 +1385,23 @@ impl Engine {
     /// registrations overwrite earlier ones (lets the worker re-decode on
     /// DPR change without leaking).
     pub fn register_image(&mut self, rel_id: String, bitmap: web_sys::ImageBitmap) {
-        self.image_cache.insert(rel_id, bitmap);
+        /* Issue #506 - the bitmap was decoded from the blob the document
+        holds under `rel_id` right now (the worker decodes inside the
+        command's own queue task, so nothing edits the document between
+        `media_entries` / `pending_media_entries` and this call). */
+        let fingerprint = self
+            .undo
+            .current()
+            .media
+            .get(&rel_id)
+            .map_or(0, |b| media_registry::fingerprint(&b.data));
+        self.image_cache.insert(
+            rel_id,
+            RegisteredImage {
+                bitmap,
+                fingerprint,
+            },
+        );
         /* Issue #497 — a page whose display list names this image paints
         differently now, though its scene is unchanged. */
         self.forget_painted_pages();
@@ -1685,6 +1759,13 @@ struct CommentOut {
     /// flat index for older consumers.
     start_path: BridgeBlockPath,
     end_path: BridgeBlockPath,
+}
+
+/// Issue #506 - a decoded picture and the fingerprint of the blob bytes it
+/// was decoded from.
+struct RegisteredImage {
+    bitmap: web_sys::ImageBitmap,
+    fingerprint: u64,
 }
 
 /// Serialization surface for [`Engine::media_entries`]. Mirrors
@@ -4562,12 +4643,37 @@ fn attach_block_paths(
 /// when the paragraph was explicitly LTR.
 ///
 /// Precedence:
-/// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`).
+/// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`, the
+///    reader folds the style chain and `<w:docDefaults>` into it).
 /// 2. `first_strong_direction(text)` — first-strong inference for
 ///    paragraphs with no explicit setting.
-/// 3. `cfg.base_direction` — document-wide default seeded at boot.
+/// 3. `cfg.base_direction` — the DOCUMENT default: a layout pass runs on
+///    [`RenderConfig::for_document`], so this is the document's
+///    `<w:docDefaults>` `<w:bidi>` when it declares one, else the boot
+///    base (LTR in the editor since issue #552). An empty or neutral-only
+///    paragraph therefore never falls to a hard-coded RTL.
 fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingDirection {
     paragraph_base_direction(p, cfg.base_direction)
+}
+
+/// Issue #552 — the direction a paragraph with no direction of its own
+/// and no strong character takes in `doc`: the document's declared
+/// default (`<w:docDefaults><w:pPrDefault><w:pPr><w:bidi>`,
+/// `DocumentTree::style_defaults.direction` — what Word gives every
+/// paragraph that names no other), else `base`, the layout config's
+/// boot direction. A paragraph read from `.docx` already carries the
+/// cascaded value in `props.direction`; this is what the paragraphs the
+/// ENGINE mints (a toolbar table's empty cells, its escape paragraph, a
+/// fresh document's paragraph) resolve to. There is no section-level
+/// paragraph direction to consult: `<w:sectPr><w:bidi>` orders a
+/// section's columns, it sets no paragraph's direction (and is not
+/// modelled).
+fn document_base_direction(doc: &DocumentTree, base: ShapingDirection) -> ShapingDirection {
+    match doc.style_defaults.direction {
+        Some(engine::TextDirection::Rtl) => ShapingDirection::Rtl,
+        Some(engine::TextDirection::Ltr) => ShapingDirection::Ltr,
+        None => base,
+    }
 }
 
 /// The precedence of [`resolve_base_direction`] against an explicit
@@ -6257,6 +6363,7 @@ fn collect_paragraph_line_geom(
             height: line.height,
             start_byte,
             end_byte,
+            rtl: para_box.direction == ShapingDirection::Rtl,
             slots,
             runs,
         });
@@ -6425,6 +6532,7 @@ fn collect_paragraph_image_rects(
                         a picture inside a text-box story. */
                         story: Vec::new(),
                         story_rid: String::new(),
+                        rtl: false,
                     });
                 }
                 pen += g.x_advance;
@@ -6492,6 +6600,7 @@ fn collect_text_box_image_rects(
             wrap: None,
             story: Vec::new(),
             story_rid: String::new(),
+            rtl: false,
         });
     }
     let story: Vec<bridge::TextBoxHop> = chain
@@ -6578,21 +6687,171 @@ fn collect_table_image_rects(
     }
 }
 
+/// One of a line's two LOGICAL ends (issue #553).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEdge {
+    /// The first character of the line in reading order.
+    Start,
+    /// The position after the last character of the line in reading order.
+    End,
+}
+
+/// Issue #553 — which logical end of `line` a pointer at `x` is beyond, or
+/// `None` when it is over the line's ink (`x` strictly between the
+/// outermost caret stops).
+///
+/// A click past the ink does not name the nearest caret slot: in a
+/// mixed-direction line the visually outermost slot is not an end of the
+/// line. An LTR paragraph that ends in an RTL run has the RTL run's
+/// logical START at its right edge, so "nearest slot to the right" put a
+/// click on the empty space after `Hello world مرحبا بالعالم` at the first
+/// Arabic word instead of after the last one. The side the pointer is on
+/// is a VISUAL fact; which end of the text it means follows from the
+/// paragraph's base direction alone (right of an LTR line / left of an
+/// RTL one = the end), the way Word and every browser resolve it.
+/// Single-direction lines are unchanged: there the outermost slot already
+/// is the matching end.
+fn line_edge_at(line: &LineGeom, x: f32) -> Option<LineEdge> {
+    let (lo, hi) = line
+        .slots
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s.x), hi.max(s.x))
+        });
+    if lo > hi {
+        return None; // no caret stop: an empty line
+    }
+    match (x <= lo, x >= hi) {
+        (false, false) => None,
+        /* One stop only: there is no direction to read the side from. */
+        (true, true) => Some(LineEdge::Start),
+        (false, true) => Some(if line.rtl {
+            LineEdge::Start
+        } else {
+            LineEdge::End
+        }),
+        (true, false) => Some(if line.rtl {
+            LineEdge::End
+        } else {
+            LineEdge::Start
+        }),
+    }
+}
+
+impl LineGeom {
+    /// Source byte of one of the line's logical ends.
+    fn edge_byte(&self, edge: LineEdge) -> u32 {
+        match edge {
+            LineEdge::Start => self.start_byte,
+            LineEdge::End => self.end_byte,
+        }
+    }
+}
+
 /// Map an absolute pixel to a logical position — nearest line by `y`, then
-/// nearest caret slot by `x`. The returned `path` is the line's owning
-/// paragraph path, descending into a cell when the hit lands inside one.
+/// nearest caret slot by `x`; a pointer past the line's ink resolves to the
+/// line's logical end on that side (issue #553, [`line_edge_at`]). The
+/// returned `path` is the line's owning paragraph path, descending into a
+/// cell when the hit lands inside one.
 fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
     let Some(line) = nearest_line(geom, x, y) else {
         return bpos_top(0, 0);
     };
-    let offset = line
-        .slots
-        .iter()
-        .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
-        .map_or(line.start_byte, |s| s.byte);
+    let offset = match line_edge_at(line, x) {
+        Some(edge) => line.edge_byte(edge),
+        None => line
+            .slots
+            .iter()
+            .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
+            .map_or(line.start_byte, |s| s.byte),
+    };
     BridgeLogicalPos {
         path: line.path.clone(),
         offset,
+    }
+}
+
+/// Issue #553 — what a double-click points at, in LOGICAL terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordTarget {
+    /// The character that starts at this byte is the one under the
+    /// pointer (a pointer before the line's first character names it).
+    Char(u32),
+    /// The pointer is past the line's last character: the target is the
+    /// last word of the line `[start, end)`, not the first character of
+    /// whatever comes next (the next line's first word, or — in a
+    /// mixed-direction line — the visually outermost run).
+    LineEnd { start: u32, end: u32 },
+}
+
+/// The byte of the first character, in `line`'s visual runs, whose cell
+/// contains `x` — `None` when `x` is over no run (the caller falls back
+/// to the nearest caret slot). A cell is the span between two ADJACENT
+/// caret stops of one run; its logical start is the smaller of the two
+/// stops' bytes whichever way the run reads, so no visual order enters
+/// the answer.
+fn char_start_under_x(line: &LineGeom, x: f32) -> Option<u32> {
+    for run in &line.runs {
+        let mut stops: Vec<(f32, u32)> = run.slots.iter().map(|s| (s.x, s.byte)).collect();
+        /* An RTL run lists its logical-end stop last, at its left edge. */
+        stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for pair in stops.windows(2) {
+            let ((x0, b0), (x1, b1)) = (pair[0], pair[1]);
+            if x >= x0 && x < x1 && b0 != b1 {
+                return Some(b0.min(b1));
+            }
+        }
+    }
+    None
+}
+
+/// Issue #553 — resolve a double-click at `(x, y)` to its paragraph and
+/// logical [`WordTarget`].
+///
+/// `hit_test_geom`'s nearest caret SLOT is the wrong probe for a word: a
+/// slot sits BETWEEN two characters, so the right half of a word's last
+/// letter and the left half of the space after it name the same offset
+/// and one of them selected the wrong thing (the space, or — past the end
+/// of a mixed-direction line — the first word of the trailing run). The
+/// word is chosen from the CHARACTER under the pointer, and from the
+/// line's logical last word when the pointer is past its end.
+fn word_target_geom(geom: &[LineGeom], x: f32, y: f32) -> (BridgeBlockPath, WordTarget) {
+    let Some(line) = nearest_line(geom, x, y) else {
+        return (bpos_top(0, 0).path, WordTarget::Char(0));
+    };
+    let target = match line_edge_at(line, x) {
+        Some(LineEdge::End) => WordTarget::LineEnd {
+            start: line.start_byte,
+            end: line.end_byte,
+        },
+        Some(LineEdge::Start) => WordTarget::Char(line.start_byte),
+        None => WordTarget::Char(char_start_under_x(line, x).unwrap_or_else(|| {
+            line.slots
+                .iter()
+                .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
+                .map_or(line.start_byte, |s| s.byte)
+        })),
+    };
+    (line.path.clone(), target)
+}
+
+/// The byte whose character `Paragraph::word_bounds` should classify for
+/// `target` in `text`. A line end probes the last NON-whitespace
+/// character of the line (its trailing space belongs to no word the user
+/// can be pointing at); an all-whitespace line probes its last character.
+fn word_probe_offset(text: &str, target: WordTarget) -> u32 {
+    match target {
+        WordTarget::Char(offset) => offset,
+        WordTarget::LineEnd { start, end } => {
+            let end = (end as usize).min(text.len());
+            let start = (start as usize).min(end);
+            let line = text.get(start..end).unwrap_or("");
+            line.char_indices()
+                .rev()
+                .find(|(_, c)| !c.is_whitespace())
+                .or_else(|| line.char_indices().next_back())
+                .map_or(start as u32, |(i, _)| (start + i) as u32)
+        }
     }
 }
 
@@ -6910,6 +7169,70 @@ struct RangeFlags {
     subscript: bool,
     caps: bool,
     small_caps: bool,
+}
+
+/// Issue #507 — Left / Right at a line's visual edge inside a table cell.
+/// `stepped` is the logical step the caret paragraph's direction chose
+/// (`visual_step_arrow`). While it stays inside the caret's innermost cell
+/// it stands (a line / paragraph wrap within the cell). When it LEAVES the
+/// cell, the TABLE's direction decides, not the paragraph's: the key that
+/// points at the table's reading direction (Right in a left-to-right
+/// table, Left in a `<w:bidiVisual>` one, whose first cell is the
+/// rightmost) moves to the START of the next cell in reading order — same
+/// row, then the next row, then the paragraph after the table — and the
+/// other key to the END of the previous one. An empty cell's paragraph, or
+/// one whose direction differs from its table's, can therefore no longer
+/// send Right to the previous cell (the old `going_right ^ para_rtl` flip
+/// did, for every empty cell while they resolved RTL — #552). Up / Down
+/// stay spatial and never come here.
+fn cell_exit_step(
+    doc: &DocumentTree,
+    caret: &BridgeLogicalPos,
+    stepped: BridgeLogicalPos,
+    going_right: bool,
+) -> BridgeLogicalPos {
+    let here = bridge_to_engine_path(caret.path.clone());
+    let Some(k) = here
+        .steps
+        .iter()
+        .rposition(|s| matches!(s, EnginePathStep::Cell { .. }))
+    else {
+        return stepped;
+    };
+    let cell = &here.steps[..=k];
+    let inside = |p: &EngineBlockPath| p.steps.starts_with(cell);
+    if inside(&bridge_to_engine_path(stepped.path.clone())) {
+        return stepped;
+    }
+    let table = EngineBlockPath {
+        steps: here.steps[..k].to_vec(),
+    };
+    let rtl_table = doc
+        .table_at_path(&table)
+        .is_some_and(|t| t.props.bidi_visual);
+    let paths = doc_paragraph_paths(doc);
+    let Some(at) = paths.iter().position(|p| *p == here) else {
+        return stepped;
+    };
+    let target = if going_right ^ rtl_table {
+        paths[at + 1..]
+            .iter()
+            .find(|p| !inside(p))
+            .map(|p| (p.clone(), 0))
+    } else {
+        paths[..at].iter().rev().find(|p| !inside(p)).map(|p| {
+            let len = doc.paragraph_at_path(p).map_or(0, |q| q.text.len() as u32);
+            (p.clone(), len)
+        })
+    };
+    match target {
+        Some((path, offset)) => BridgeLogicalPos {
+            path: engine_to_bridge_path(path),
+            offset,
+        },
+        /* The table is the first / last thing in the story: pin. */
+        None => caret.clone(),
+    }
 }
 
 /// Issues #423 / #420 — the formatting at a caret position before it is
@@ -10525,7 +10848,8 @@ impl Engine {
         with_composition: bool,
         note_markers: &HashMap<engine::NoteAnchor, String>,
     ) -> Vec<layout::LayoutDegradation> {
-        let Some(cfg) = self.layout_cfg.clone() else {
+        /* Issue #552 — the document's default direction, like the body. */
+        let Some(cfg) = self.layout_cfg.as_ref().map(|c| c.for_document(doc)) else {
             return Vec::new();
         };
         if !pages
@@ -10611,7 +10935,9 @@ impl Engine {
         ),
         Box<Event>,
     > {
-        let cfg = match self.layout_cfg.clone() {
+        /* Issue #552 — a paragraph with no direction and no strong
+        character takes the DOCUMENT's default (`for_document`). */
+        let cfg = match self.layout_cfg.as_ref().map(|c| c.for_document(&doc)) {
             Some(c) => c,
             None => {
                 return Err(Box::new(Event::error_kind(
@@ -11736,7 +12062,7 @@ impl Engine {
                 &page_scene,
                 &mut self.atlas,
                 |id| self.fonts.get(id).cloned(),
-                |rel| image_cache.get(rel).cloned(),
+                |rel| image_cache.get(rel).map(|r| r.bitmap.clone()),
                 clip_rect,
             ) {
                 return Err(Box::new(Event::error_kind(
@@ -13184,6 +13510,7 @@ impl Engine {
                     wrap: None,
                     story: Vec::new(),
                     story_rid: String::new(),
+                    rtl: false,
                 });
             }
             /* Issue #206 — pictures inside text-box stories (and inside a
@@ -13206,6 +13533,11 @@ impl Engine {
         resizes by `new_emu = emu × new_px / old_px`, so it needs the
         current EMU alongside the current px rect. */
         let doc = self.undo.current();
+        let fallback_dir = self
+            .layout_cfg
+            .as_ref()
+            .map(|c| c.base_direction)
+            .unwrap_or(ShapingDirection::Ltr);
         /* Issue #206 — a box picture's path is rooted in its story: resolve
         each story tree once (keyed by its rid). */
         let mut story_trees: HashMap<String, Option<DocumentTree>> = HashMap::new();
@@ -13226,9 +13558,13 @@ impl Engine {
                     })
                     .as_ref()
             };
-            let io = tree
-                .and_then(|t| t.paragraph_at_path(&epath))
-                .and_then(|p| p.inline_objects.iter().find(|io| io.at == im.at));
+            let para = tree.and_then(|t| t.paragraph_at_path(&epath));
+            /* Issue #554 — the paragraph's effective base direction. */
+            im.rtl = !im.floating
+                && para.is_some_and(|p| {
+                    paragraph_base_direction(p, fallback_dir) == ShapingDirection::Rtl
+                });
+            let io = para.and_then(|p| p.inline_objects.iter().find(|io| io.at == im.at));
             if let Some(io) = io
                 && let engine::InlineKind::Image {
                     width_emu,
@@ -13493,28 +13829,30 @@ impl Engine {
             Ok(g) => g,
             Err(e) => return *e,
         };
-        let hit = hit_test_geom(&geom, at.x, at.y);
-        let engine_path = bridge_to_engine_path(hit.path.clone());
+        /* Issue #553 — the word comes from the LOGICAL character the
+        pointer is on (or the line's logical last word past its end),
+        never from a visual slot: see `word_target_geom`. */
+        let (path, target) = word_target_geom(&geom, at.x, at.y);
+        let engine_path = bridge_to_engine_path(path.clone());
+        let unresolved = match target {
+            WordTarget::Char(at) | WordTarget::LineEnd { end: at, .. } => (at, at),
+        };
         let (lo, hi) = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path)
-                .map_or((hit.offset, hit.offset), |p| {
-                    /* Issue #77 — a word that reaches into a field takes
-                    the whole field (a double-click on "12" in "Page 12
-                    of 34" selects the PAGE field). */
-                    let (lo, hi) = p.word_bounds(hit.offset);
-                    p.expand_range_over_fields(lo, hi)
-                })
+            d.paragraph_at_path(&engine_path).map_or(unresolved, |p| {
+                /* Issue #77 — a word that reaches into a field takes
+                the whole field (a double-click on "12" in "Page 12
+                of 34" selects the PAGE field). */
+                let (lo, hi) = p.word_bounds(word_probe_offset(&p.text, target));
+                p.expand_range_over_fields(lo, hi)
+            })
         });
         self.pending_format = None;
         self.selection = Some(SelectionState {
             anchor: BridgeLogicalPos {
-                path: hit.path.clone(),
+                path: path.clone(),
                 offset: lo,
             },
-            caret: BridgeLogicalPos {
-                path: hit.path,
-                offset: hi,
-            },
+            caret: BridgeLogicalPos { path, offset: hi },
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
@@ -14052,9 +14390,10 @@ impl Engine {
                 }
             }
         };
-        let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
-            Some(ShapingDirection::Rtl) => Direction::Rtl,
-            _ => Direction::Ltr,
+        /* Issue #552 — the DOCUMENT's default direction. */
+        let direction = match self.document_direction() {
+            ShapingDirection::Rtl => Direction::Rtl,
+            ShapingDirection::Ltr => Direction::Ltr,
         };
         /* Issues #423 / #420 — one cascade walk feeds the flat read-back
         and the per-slot one. */
@@ -14527,14 +14866,19 @@ impl Engine {
         render). Fall back to the paragraph-direction–aware logical
         step which handles line + paragraph wrap. Visual-right in an
         LTR line is logical-forward; in an RTL line it is
-        logical-backward. */
+        logical-backward. Issue #507 — a step that leaves a table cell
+        follows the table's direction instead (`cell_exit_step`). The
+        step walks the tree the selection addresses (a header / footer /
+        note story while one is being edited), not always the body. */
         let para_rtl = self.paragraph_direction_at(&caret.path) == ShapingDirection::Rtl;
-        let doc = self.undo.current();
-        let stepped = if going_right ^ para_rtl {
-            step_right(doc, caret.clone())
-        } else {
-            step_left(doc, caret.clone())
-        };
+        let stepped = self.with_selection_doc(|doc| {
+            let stepped = if going_right ^ para_rtl {
+                step_right(doc, caret.clone())
+            } else {
+                step_left(doc, caret.clone())
+            };
+            cell_exit_step(doc, caret, stepped, going_right)
+        });
         (stepped, affinity)
     }
 
@@ -14544,22 +14888,34 @@ impl Engine {
     /// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`).
     /// 2. `first_strong_direction` over the paragraph text — the same
     ///    inference layout applies when `props.direction` is `None`.
-    /// 3. The engine's `layout_cfg.base_direction` (the document-wide
-    ///    default the TS shell seeds at boot).
+    /// 3. The document's default direction ([`Self::document_direction`]:
+    ///    `<w:docDefaults>` `<w:bidi>`, else the boot base the TS shell
+    ///    seeds — LTR since issue #552).
     /// 4. `Ltr` if no `layout_cfg` is set (defensive — engine should
     ///    always carry a config once `render_document` has run).
     fn paragraph_direction_at(&self, path: &BridgeBlockPath) -> ShapingDirection {
         let engine_path = bridge_to_engine_path(path.clone());
-        let fallback = self
-            .layout_cfg
-            .as_ref()
-            .map(|c| c.base_direction)
-            .unwrap_or(ShapingDirection::Ltr);
+        let fallback = self.document_direction();
         self.with_selection_doc(|d| {
             d.paragraph_at_path(&engine_path)
                 .map(|p| paragraph_base_direction(p, fallback))
         })
         .unwrap_or(fallback)
+    }
+
+    /// Issue #552 — the document's default paragraph direction
+    /// ([`document_base_direction`] of the body tree over the layout
+    /// config's boot base; `Ltr` before the first `RenderPage`). The
+    /// fallback of every direction read-back, exactly as
+    /// [`RenderConfig::for_document`] is the layout pass's. Document
+    /// defaults are document-wide, so a header / footer / note story
+    /// resolves against the same value.
+    fn document_direction(&self) -> ShapingDirection {
+        let base = self
+            .layout_cfg
+            .as_ref()
+            .map_or(ShapingDirection::Ltr, |c| c.base_direction);
+        document_base_direction(self.undo.current(), base)
     }
 
     /// Tri-state paragraph direction across the selection: `Some(dir)`
@@ -17033,9 +17389,10 @@ impl Engine {
     /// directly. Phase 5 PR 3b: nested tables inside cells stay flat — the
     /// recursive `nodes` slot is empty for nested tables until PR 4.
     fn build_a11y_nodes(&self) -> Vec<A11yNode> {
-        let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
-            Some(ShapingDirection::Rtl) => Direction::Rtl,
-            _ => Direction::Ltr,
+        /* Issue #552 — the DOCUMENT's default direction. */
+        let direction = match self.document_direction() {
+            ShapingDirection::Rtl => Direction::Rtl,
+            ShapingDirection::Ltr => Direction::Ltr,
         };
         let doc = self.undo.current();
         /* Issue #203 — the body walk carries the note context: reference
@@ -18478,9 +18835,10 @@ impl Engine {
     /// **Renderer note.** The blob lands in `DocumentTree.media`; the
     /// renderer paints a placeholder rect until the worker decodes
     /// the bytes via `createImageBitmap` and calls
-    /// `Engine::register_image(rel_id, bitmap)`. That worker-side
-    /// post-insert registration is filed alongside this handler as
-    /// a follow-up sprint deliverable.
+    /// `Engine::register_image(rel_id, bitmap)`. Issue #506 - the worker
+    /// does so right after this command's reply: it asks
+    /// [`Engine::pending_media_entries`] after every command that can
+    /// change the document, decodes the new blob and repaints.
     fn do_insert_image(
         &mut self,
         at: BridgeLogicalPos,
@@ -20194,6 +20552,7 @@ mod tests {
             height: 20.0,
             start_byte: 0,
             end_byte: 8,
+            rtl: false,
             slots: Vec::new(),
             runs: vec![ltr, rtl],
         };
@@ -20234,6 +20593,7 @@ mod tests {
             height: 20.0,
             start_byte: 0,
             end_byte: 4,
+            rtl: false,
             slots: Vec::new(),
             runs: vec![run],
         };
@@ -20269,6 +20629,7 @@ mod tests {
             height: 24.0,
             start_byte: 0,
             end_byte: 0,
+            rtl: false,
             slots: Vec::new(),
             runs: Vec::new(),
         };
@@ -21089,6 +21450,7 @@ mod tests {
             height: 20.0,
             start_byte: 0,
             end_byte: 8,
+            rtl: false,
             slots: vec![
                 CaretSlot { x: 20.0, byte: 4 },
                 CaretSlot { x: 80.0, byte: 4 },
@@ -30513,6 +30875,12 @@ mod border_guard_tests;
 #[cfg(test)]
 mod shell_default_tests;
 
+/// Issues #552 / #507 - an empty / neutral paragraph takes the document's
+/// declared direction (LTR by default), and Left / Right leaving a table
+/// cell follow the table's direction (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod empty_paragraph_direction_tests;
+
 /// Issue #503 (item 1) - the restore / replay door of the same bounds
 /// (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
@@ -30520,6 +30888,10 @@ mod bounds_repair_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;
+
+/// Issue #554 - `ImageRect.rtl` (the picture's paragraph direction).
+#[cfg(test)]
+mod image_rtl_tests;
 
 #[cfg(test)]
 mod para_style_edit_tests;
@@ -31719,3 +32091,8 @@ mod fuzz_finding_tests;
 /// Issue #497 — the table-heavy body-edit repaint timing harness.
 #[cfg(test)]
 mod table_repaint_perf_tests;
+
+/// Issue #553 — double-click word selection follows the LOGICAL offset in
+/// mixed-direction paragraphs.
+#[cfg(test)]
+mod word_select_tests;
