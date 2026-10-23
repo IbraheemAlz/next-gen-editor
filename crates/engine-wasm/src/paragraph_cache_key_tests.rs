@@ -8,7 +8,7 @@ use super::*;
 
 fn sctx() -> StyleContext<'static> {
     StyleContext {
-        styles: Box::leak(Box::default()),
+        cascade: engine::StyleCascade::new(Box::leak(Box::default())),
         run_defaults: Box::leak(Box::default()),
         note_markers: None,
         note_self_mark: None,
