@@ -153,7 +153,8 @@ impl RenderConfig {
 impl RenderConfig {
     /// Issue #552 — this config with `base_direction` resolved for `doc`
     /// ([`document_base_direction`]: the document's `<w:docDefaults>`
-    /// direction, else the boot base). Every layout pass and every
+    /// direction folded with its default paragraph style's (#556), else
+    /// the boot base). Every layout pass and every
     /// direction read-back (caret, toolbar, a11y mirror) runs on it, so a
     /// paragraph with no direction and no strong character resolves the
     /// same way everywhere — and, because the paragraph / table cache keys
@@ -3157,7 +3158,10 @@ fn text_box_note_anchors(
 /// layout call chain without borrow gymnastics.
 #[derive(Clone, Copy)]
 struct StyleContext<'a> {
-    styles: &'a std::collections::HashMap<String, engine::ParagraphStyle>,
+    /// Issue #556 — the document's paragraph-style cascade, its default
+    /// paragraph style looked up once per context (a paragraph naming no
+    /// style takes `Normal`'s `<w:rPr>`).
+    cascade: engine::StyleCascade<'a>,
     run_defaults: &'a engine::SpanStyle,
     /// Issue #80 — document-order display markers per referenced note
     /// (`DocumentTree::note_markers`). `None` (callers outside a paint)
@@ -3183,7 +3187,7 @@ impl<'a> StyleContext<'a> {
         let theme = doc.theme.as_deref();
         StyleContext {
             settings: Some(&doc.settings),
-            styles: &doc.styles,
+            cascade: doc.style_cascade(),
             run_defaults: &doc.style_run_defaults,
             note_markers: None,
             note_self_mark: None,
@@ -3239,7 +3243,7 @@ impl<'a> StyleContext<'a> {
     }
 
     fn run_base(&self, style_id: Option<&str>) -> engine::SpanStyle {
-        engine::resolve_run_cascade(self.styles, self.run_defaults, style_id)
+        self.cascade.run(self.run_defaults, style_id)
     }
 
     /// Issue #80 — thread the paint's resolved note markers.
@@ -4817,12 +4821,14 @@ fn attach_block_paths(
 ///
 /// Precedence:
 /// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`, the
-///    reader folds the style chain and `<w:docDefaults>` into it).
+///    reader folds the style chain — the default paragraph style's for a
+///    paragraph naming none, #556 — and `<w:docDefaults>` into it).
 /// 2. `first_strong_direction(text)` — first-strong inference for
 ///    paragraphs with no explicit setting.
 /// 3. `cfg.base_direction` — the DOCUMENT default: a layout pass runs on
-///    [`RenderConfig::for_document`], so this is the document's
-///    `<w:docDefaults>` `<w:bidi>` when it declares one, else the boot
+///    [`RenderConfig::for_document`], so this is the `<w:bidi>` the
+///    document's `<w:docDefaults>` + default paragraph style declare
+///    when they declare one, else the boot
 ///    base (LTR in the editor since issue #552). An empty or neutral-only
 ///    paragraph therefore never falls to a hard-coded RTL.
 fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingDirection {
@@ -4830,19 +4836,20 @@ fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingD
 }
 
 /// Issue #552 — the direction a paragraph with no direction of its own
-/// and no strong character takes in `doc`: the document's declared
-/// default (`<w:docDefaults><w:pPrDefault><w:pPr><w:bidi>`,
-/// `DocumentTree::style_defaults.direction` — what Word gives every
-/// paragraph that names no other), else `base`, the layout config's
-/// boot direction. A paragraph read from `.docx` already carries the
-/// cascaded value in `props.direction`; this is what the paragraphs the
-/// ENGINE mints (a toolbar table's empty cells, its escape paragraph, a
-/// fresh document's paragraph) resolve to. There is no section-level
-/// paragraph direction to consult: `<w:sectPr><w:bidi>` orders a
-/// section's columns, it sets no paragraph's direction (and is not
-/// modelled).
+/// and no strong character takes in `doc`: the direction the cascade
+/// gives a paragraph that names no style — `<w:docDefaults>` folded with
+/// the DEFAULT paragraph style (issue #556: a `<w:bidi/>` that lives only
+/// on `Normal` counts, as it does in Word) through the one
+/// `DocumentTree::resolve_style_cascade` — else `base`, the layout
+/// config's boot direction. A paragraph read from `.docx` already
+/// carries the cascaded value in `props.direction`; this is what the
+/// paragraphs the ENGINE mints (a toolbar table's empty cells, its
+/// escape paragraph, a fresh document's paragraph) resolve to. There is
+/// no section-level paragraph direction to consult: `<w:sectPr><w:bidi>`
+/// orders a section's columns, it sets no paragraph's direction (and is
+/// not modelled).
 fn document_base_direction(doc: &DocumentTree, base: ShapingDirection) -> ShapingDirection {
-    match doc.style_defaults.direction {
+    match doc.resolve_style_cascade(None).direction {
         Some(engine::TextDirection::Rtl) => ShapingDirection::Rtl,
         Some(engine::TextDirection::Ltr) => ShapingDirection::Ltr,
         None => base,
@@ -21937,7 +21944,7 @@ mod tests {
     /// the run cascade (leaked so the borrows are 'static).
     fn empty_sctx() -> StyleContext<'static> {
         StyleContext {
-            styles: Box::leak(Box::default()),
+            cascade: engine::StyleCascade::new(Box::leak(Box::default())),
             run_defaults: Box::leak(Box::default()),
             note_markers: None,
             note_self_mark: None,
@@ -21966,11 +21973,12 @@ mod tests {
                     font_size: Some(16.0),
                     ..Default::default()
                 },
+                is_default: false,
             },
         );
         let run_defaults = engine::SpanStyle::default();
         let sctx = StyleContext {
-            styles: &styles,
+            cascade: engine::StyleCascade::new(&styles),
             run_defaults: &run_defaults,
             note_markers: None,
             note_self_mark: None,
@@ -22036,7 +22044,7 @@ mod tests {
             .insert("Arab".into(), "Noto Naskh Arabic".into());
         let styles = std::collections::HashMap::new();
         let ctx = |theme: Option<&'static engine::DocumentTheme>, key| StyleContext {
-            styles: Box::leak(Box::new(styles.clone())),
+            cascade: engine::StyleCascade::new(Box::leak(Box::new(styles.clone()))),
             run_defaults: Box::leak(Box::new(run_defaults.clone())),
             note_markers: None,
             note_self_mark: None,
@@ -31366,6 +31374,10 @@ mod nested_table_hit_tests;
 #[cfg(test)]
 mod table_cache_tests;
 
+/// Issue #556 — the default paragraph style formats unstyled paragraphs
+/// (direction, document default, layout).
+#[cfg(test)]
+mod default_paragraph_style_tests;
 #[cfg(test)]
 mod part_media_tests;
 #[cfg(test)]
