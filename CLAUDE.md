@@ -503,6 +503,30 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
 - BiDi runs **per line**, not paragraph-wide. UAX #9 requires this. Don't flatten visual order across line breaks.
 - Line break opportunities come from `icu_segmenter::LineSegmenter::new_auto()`. Greedy fit is fine for PoC; Knuth-Plass is Phase 3.
 - **Text enters the model clean (issue #467).** XML 1.0 cannot carry C0 controls other than TAB / LF / CR, `U+FFFE` or `U+FFFF`, so ONE table (`engine::text_input`) decides what every text door accepts: C0 controls are dropped, `U+000B` becomes a line break (`U+2028`), `U+000C` stays the model's page break, `U+FFFE` / `U+FFFF` are refused with `Event::Error { kind: InvalidArgument }` (nothing applied). The dispatcher runs it over every text-bearing command argument (`engine-wasm/src/text_input_guard.rs`, right after the #407 finiteness guard). Issue #485 — the guard has NO field list of its own: every `command_meta!` entry ends in `; (field: class, ...)` (`()` for no text; `T::Body` / `T::Line` / `T::Nested` / `T::Exempt("why")`), which the macro turns into `CommandMeta::text` and an exhaustive `Command::visit_text_mut` (payload structs implement `bridge::TextSlots` with an exhaustive destructure). A new variant does not compile unclassified; a new `String` field on an existing variant fails `bridge`'s `every_command_string_field_is_classified` (it reads `command.rs` / `common.rs`); text the user cannot retype (a decoded HTML entity, a `.txt` / `.html` file) is repaired to `U+FFFD` instead of refused. A lone UTF-16 surrogate cannot reach Rust (the wasm string glue substitutes `U+FFFD`), so the worker refuses it first (`ts/src/engine/text-guard.ts`, unlogged). The writer is the last line: `push_escaped` / `push_escaped_attr` write any forbidden character as `U+FFFD` and the save report (`format_docx::save_docx_with_notes`) carries `WriteNote::ForbiddenCharactersReplaced`. **The save report reaches the user (issue #485).** `Engine::save_docx_bytes` answers `Event::DocumentSaved { notes }` (additive `Vec<bridge::SaveNote>`, skipped on the wire when empty; `engine-wasm/src/save_report.rs` lowers `WriteNote`s, one entry per kind, repeats summed — a new `WriteNote` variant does not compile until classified there); `@nge/core` `createEditorState().lastSaveNotes()` mirrors it (replaced by every save, cleared by an open / close / restored session) and `saveNotices()` words it; `@nge/ui` `RecoveryBanner` shows it dismissibly (`data-kinds="save-notes"`, one line per kind), the Dev HUD has a "Last save" row, and a repaired save samples telemetry `DOC_SAVE` (`size_bytes` + per-kind `save_notes` counts; clean saves emit nothing). The e2e (`save-notes.spec.ts`) produces a REAL note through the one door left open: a restored snapshot (`RECOVER` with a hand-patched `SNAPSHOT` whose text holds C0 bytes) — command doors drop them.
+- **A range command reaches every paragraph of the range (issue #509).** Character
+  and paragraph formatting over a logical range resolve the range ONCE, through
+  `DocumentTree::range_targets` (document order, any depth: cells row by row,
+  nested tables, a body -> table boundary; vMerge-continue cells skipped; the
+  first paragraph from the start offset, the last up to the end offset, the rest
+  whole; wire block indices clipped to what exists, #422) or, for a
+  `TABLE_CELLS` selection, `cell_rect_targets` (the RECTANGLE, never the
+  document-order range between the corners). `apply_style` / `tracked_format_change`
+  and the eleven paragraph-level range commands (alignment, direction, indent,
+  style, tab stops, line spacing, shading, borders, list toggle / level / clear) all
+  go through it and `mutate_paragraphs_in_top` (each top-level block cloned once, so
+  a 5 000-cell table is not 5 000 table clones); never grow a new
+  `same_parent` / first-paragraph-only fallback. engine-wasm owns the rectangle:
+  `Engine::format_targets_in` (character formatting, `attrs_mixed_over`, the
+  `ToggleFormatting` state `range_flags`: all on -> clear, else set) and
+  `format_pieces` / `fold_pieces` (a paragraph-level command folded over one range
+  per selected cell); a range that is not the live selection's stays linear. An
+  EMPTY paragraph the range covers (an empty cell of a selected rectangle) takes the
+  patch on its mark, so typing there continues it (`RangeTarget::mark`, #293).
+  List markers are stamped over the same deep walk (`visit_rendered_paragraphs` /
+  `rendered_paragraphs_mut`, also the `.docx` reader's `resolve_markers_blocks`):
+  a numId counts in document order through cells; a marker stamp is derived state
+  and never dirties a table. Stories: character formatting honours the rectangle,
+  paragraph commands in a story stay linear (`story_mutate`).
 
 ## `.docx` round-trip invariants
 

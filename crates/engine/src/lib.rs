@@ -9099,14 +9099,16 @@ impl DocumentTree {
     /// Bullet applied to a cell paragraph set `list_item` and never got a
     /// marker to paint.
     fn with_list_markers_refreshed(mut self) -> Self {
+        /* The hot path (Enter / paste / merge in a document with no list):
+        a non-allocating scan that stops at the first list paragraph. */
+        if !has_rendered_list_paragraph(self.blocks.iter(), 0) {
+            return self;
+        }
         let mut items: Vec<Option<ListItem>> = Vec::new();
         let mut steps = Vec::new();
         visit_rendered_paragraphs(self.blocks.iter(), &mut steps, 0, &mut |_, p| {
             items.push(p.list_item);
         });
-        if items.iter().all(Option::is_none) {
-            return self;
-        }
         /* Two passes so `im::Vector` structural sharing survives the hot
         edit path: compute the expected stamps immutably, then path-copy
         ONLY the paragraphs whose stamps actually changed. An Enter inside
@@ -12364,6 +12366,24 @@ fn visit_rendered_paragraphs<'a>(
         }
         steps.pop();
     }
+}
+
+/// Issue #509 — does any paragraph [`visit_rendered_paragraphs`] would
+/// visit carry a list binding? Stops at the first one.
+fn has_rendered_list_paragraph<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    depth: u32,
+) -> bool {
+    blocks.into_iter().any(|block| match block {
+        Block::Paragraph(p) => p.list_item.is_some(),
+        Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => t
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .filter(|cell| cell.props.v_merge != VMergeRole::Continue)
+            .any(|cell| has_rendered_list_paragraph(cell.blocks.iter(), depth + 1)),
+        Block::Table(_) => false,
+    })
 }
 
 /// Issue #509 — [`visit_rendered_paragraphs`]' enumeration as mutable

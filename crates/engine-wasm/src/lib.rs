@@ -12228,11 +12228,7 @@ impl Engine {
     /// narrower than the table skips the cells beside it), so a command
     /// acting on the selection must act on the rectangle. A range that
     /// is not the live selection's (an explicit override) stays linear.
-    fn cell_rect_for(
-        &self,
-        start: &BridgeLogicalPos,
-        end: &BridgeLogicalPos,
-    ) -> Option<CellRect> {
+    fn cell_rect_for(&self, start: &BridgeLogicalPos, end: &BridgeLogicalPos) -> Option<CellRect> {
         let sel = self.selection.as_ref()?;
         let SelectionKind::TableCells {
             table_path,
