@@ -102,6 +102,8 @@ mod paragraph_mark_tests;
 #[cfg(test)]
 mod paragraph_merge_tests;
 #[cfg(test)]
+mod range_target_tests;
+#[cfg(test)]
 mod revision_tests;
 mod revisions;
 #[cfg(test)]

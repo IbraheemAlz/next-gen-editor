@@ -263,6 +263,65 @@ mod tests {
         assert_eq!(paras[2].resolved_marker.as_deref(), Some("3."));
     }
 
+    /// Issue #509 - a list paragraph inside a table cell (a nested table's
+    /// too) is numbered in document order with the body's: the resolver
+    /// used to skip every `Block::Table`, so an opened `.docx`'s bulleted
+    /// cell painted no marker.
+    #[test]
+    fn cells_and_nested_tables_are_numbered_in_document_order() {
+        use engine::{Block, Table, TableCell, TableRow};
+        let d = defs_with(
+            vec![AbstractNum {
+                id: 0,
+                levels: vec![lvl(0, NumFmt::Decimal, "%1.", 1)],
+            }],
+            vec![NumInstance {
+                num_id: 1,
+                abstract_num_id: 0,
+                overrides: vec![],
+            }],
+        );
+        let item = || Paragraph {
+            list_item: Some(ListItem { num_id: 1, ilvl: 0 }),
+            ..Default::default()
+        };
+        let cell_of = |blocks: Vec<Block>| TableCell {
+            blocks,
+            ..Default::default()
+        };
+        let table_of = |cells: Vec<TableCell>| {
+            Block::Table(Table {
+                rows: vec![TableRow {
+                    cells,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let nested = table_of(vec![cell_of(vec![Block::Paragraph(item())])]);
+        let mut blocks = vec![
+            Block::Paragraph(item()),
+            table_of(vec![
+                cell_of(vec![Block::Paragraph(item()), nested]),
+                cell_of(vec![Block::Paragraph(item())]),
+            ]),
+            Block::Paragraph(item()),
+        ];
+        resolve_markers_blocks(&mut blocks, &d);
+        let got: Vec<Option<String>> = engine::rendered_paragraphs_mut(blocks.iter_mut())
+            .into_iter()
+            .map(|p| p.resolved_marker.clone())
+            .collect();
+        assert_eq!(
+            got,
+            ["1.", "2.", "3.", "4.", "5."]
+                .iter()
+                .map(|m| Some((*m).to_string()))
+                .collect::<Vec<_>>(),
+            "body, cell, nested cell, next cell, body"
+        );
+    }
+
     #[test]
     fn deeper_level_resets_when_parent_increments() {
         let d = defs_with(
