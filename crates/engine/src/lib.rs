@@ -108,6 +108,8 @@ mod revision_tests;
 mod revisions;
 #[cfg(test)]
 mod section_mark_tests;
+#[cfg(test)]
+mod style_cascade_tests;
 mod text_remap;
 mod tracked;
 #[cfg(test)]
@@ -460,6 +462,17 @@ pub struct ParagraphStyle {
     /// Skipped when `None`, so a pre-#277 snapshot encodes unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// Issue #556 — `w:default="1"`: this is the document's DEFAULT
+    /// paragraph style (`Normal`, `a`, `Standard`, …), the one every
+    /// paragraph that names no style — or one the document does not
+    /// define — is formatted with ([`StyleCascade::applied_style`]). The
+    /// reader flags at most one (the part's last claimant, ECMA-376
+    /// §17.7.4.17); should several carry it (a hand-made snapshot), the
+    /// smallest id wins, so the answer never depends on map order. Not
+    /// editable by `ModifyStyle`. Skipped when `false`, so a pre-#556
+    /// snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
 }
 
 /// Phase 8a — author + date + body for one entry of `word/comments.xml`.
@@ -8706,29 +8719,11 @@ impl DocumentTree {
     /// depth-capped at [`MAX_STYLE_CHAIN`] entries, matching ECMA-376
     /// §17.7.4.5 implementation guidance. Used both by
     /// [`Self::recompute_paragraph_props`] (on every style mutation)
-    /// and by the reader's first-pass cascade.
+    /// and by the reader's first-pass cascade. Issue #556 — a paragraph
+    /// naming no (defined) style resolves through the DEFAULT paragraph
+    /// style ([`StyleCascade::applied_style`]).
     pub fn resolve_style_cascade(&self, style_id: Option<&str>) -> ParaProperties {
-        let Some(leaf) = style_id else {
-            return ParaProperties::cascade([&self.style_defaults]);
-        };
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut chain: Vec<&ParagraphStyle> = Vec::new();
-        let mut current: Option<&str> = Some(leaf);
-        while let Some(id) = current {
-            if chain.len() >= MAX_STYLE_CHAIN || !visited.insert(id) {
-                break;
-            }
-            let Some(def) = self.styles.get(id) else {
-                break;
-            };
-            chain.push(def);
-            current = def.based_on.as_deref();
-        }
-        /* Issue #395 — through the direction-aware cascade, so a
-        style's logical border edges land by the chain's direction. */
-        ParaProperties::cascade(
-            std::iter::once(&self.style_defaults).chain(chain.iter().rev().map(|d| &d.para)),
-        )
+        StyleCascade::new(&self.styles).para(&self.style_defaults, style_id)
     }
 
     /// Issue #29 — the RUN half of the cascade: fold
@@ -8737,6 +8732,12 @@ impl DocumentTree {
     /// Same cycle / depth guards as [`Self::resolve_style_cascade`].
     pub fn resolve_style_run_cascade(&self, style_id: Option<&str>) -> SpanStyle {
         resolve_run_cascade(&self.styles, &self.style_run_defaults, style_id)
+    }
+
+    /// Issue #556 — this document's paragraph-style cascade
+    /// ([`StyleCascade`]), the default paragraph style looked up once.
+    pub fn style_cascade(&self) -> StyleCascade<'_> {
+        StyleCascade::new(&self.styles)
     }
 
     /// Sprint 12 (#11) — apply `style_id` to every paragraph the range
@@ -8753,11 +8754,10 @@ impl DocumentTree {
     ) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
-        let styles_for_apply = self.styles.clone();
-        let defaults_for_apply = self.style_defaults.clone();
+        let cascade = self.style_cascade();
         let apply = |para: &mut Paragraph| {
             para.style_id = style_id.clone();
-            recompute_paragraph_props(para, &styles_for_apply, &defaults_for_apply);
+            cascade.recompute(para, &self.style_defaults);
         };
         let paths = self.range_paragraph_paths(&start, &end);
         mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| apply(para));
@@ -8831,28 +8831,27 @@ impl DocumentTree {
         it re-cascades for free). Recomputing unstyled paragraphs too
         is a harmless idempotent fold — cheaper than chain-membership
         bookkeeping and immune to basedOn re-parenting edge cases. */
-        fn recompute_block(
-            b: &mut Block,
-            styles: &std::collections::HashMap<String, ParagraphStyle>,
-            defaults: &ParaProperties,
-        ) {
+        fn recompute_block(b: &mut Block, cascade: &StyleCascade<'_>, defaults: &ParaProperties) {
             match b {
-                Block::Paragraph(p) => recompute_paragraph_props(p, styles, defaults),
+                Block::Paragraph(p) => cascade.recompute(p, defaults),
                 Block::Table(t) => {
                     for row in &mut t.rows {
                         for cell in &mut row.cells {
                             for cb in &mut cell.blocks {
-                                recompute_block(cb, styles, defaults);
+                                recompute_block(cb, cascade, defaults);
                             }
                         }
                     }
                 }
             }
         }
+        /* Issue #556 — the default paragraph style looked up once for
+        the whole sweep (unstyled paragraphs re-cascade through it). */
+        let cascade = StyleCascade::new(&styles);
         let mut blocks = self.blocks.clone();
         for i in 0..blocks.len() {
             let mut b = blocks[i].clone();
-            recompute_block(&mut b, &styles, &self.style_defaults);
+            recompute_block(&mut b, &cascade, &self.style_defaults);
             blocks.set(i, b);
         }
         /* Design review B5 — header/footer paragraphs carry the SAME
@@ -8864,13 +8863,13 @@ impl DocumentTree {
         let mut headers = self.headers.clone();
         for part in headers.values_mut() {
             for b in part.iter_mut() {
-                recompute_block(b, &styles, &self.style_defaults);
+                recompute_block(b, &cascade, &self.style_defaults);
             }
         }
         let mut footers = self.footers.clone();
         for part in footers.values_mut() {
             for b in part.iter_mut() {
-                recompute_block(b, &styles, &self.style_defaults);
+                recompute_block(b, &cascade, &self.style_defaults);
             }
         }
         Self {
@@ -11549,75 +11548,129 @@ fn flatten_blocks_plain(blocks: &[Block]) -> String {
 /// almost certainly a malformed stylesheet; we silently clamp.
 pub const MAX_STYLE_CHAIN: usize = 10;
 
-/// Sprint 12 (#11) — recompute the resolved `props` view on a single
-/// paragraph from its `style_id` cascade ∪ `direct_overrides`.
-/// `style_defaults` is the document's `<w:docDefaults>` snapshot
-/// (sits at the bottom of every cascade).
-/// Issue #29 — free-fn form of [`DocumentTree::resolve_style_run_cascade`]
-/// for callers holding only the style table (span materialization in
-/// engine-wasm). Same cycle / depth guards as the para half.
-pub fn resolve_run_cascade(
-    styles: &std::collections::HashMap<String, ParagraphStyle>,
-    run_defaults: &SpanStyle,
-    style_id: Option<&str>,
-) -> SpanStyle {
-    let mut out = run_defaults.clone();
-    let Some(leaf) = style_id else {
-        return out;
-    };
-    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut chain: Vec<&ParagraphStyle> = Vec::new();
-    let mut current: Option<&str> = Some(leaf);
-    while let Some(id) = current {
-        if chain.len() >= MAX_STYLE_CHAIN || !visited.insert(id) {
-            break;
-        }
-        let Some(def) = styles.get(id) else {
-            break;
-        };
-        chain.push(def);
-        current = def.based_on.as_deref();
-    }
-    for def in chain.iter().rev() {
-        out = out.merged_with(def.run.clone());
-    }
-    out
+/// Issue #556 — the paragraph-style cascade of one document's style
+/// table: the ONE place that decides which style a paragraph is
+/// formatted with ([`Self::applied_style`]) and walks its `<w:basedOn>`
+/// chain ([`Self::chain`]). Every paragraph-property fold
+/// ([`DocumentTree::resolve_style_cascade`], [`recompute_paragraph_props`])
+/// and every run-property fold ([`resolve_run_cascade`], engine-wasm's
+/// span materialization) goes through it, so a paragraph that names no
+/// style takes the DEFAULT paragraph style (`Normal`) everywhere — the
+/// reader's `format_docx::StyleResolver` applies the same rule
+/// (`StyleTable::applied_paragraph_style`). The default style is looked
+/// up once per value (build one per sweep, not per paragraph).
+#[derive(Clone, Copy)]
+pub struct StyleCascade<'a> {
+    styles: &'a std::collections::HashMap<String, ParagraphStyle>,
+    default_style: Option<&'a ParagraphStyle>,
 }
 
-pub fn recompute_paragraph_props(
-    para: &mut Paragraph,
-    styles: &std::collections::HashMap<String, ParagraphStyle>,
-    style_defaults: &ParaProperties,
-) {
-    /* Walk the style chain leaf → root with the same cycle / depth
-    guard as `DocumentTree::resolve_style_cascade` (kept here as a
-    free fn so callers without a borrowed `DocumentTree` can still
-    invoke it — e.g. the reader's per-paragraph fold loop). */
-    if let Some(leaf) = para.style_id.as_deref() {
+impl<'a> StyleCascade<'a> {
+    pub fn new(styles: &'a std::collections::HashMap<String, ParagraphStyle>) -> Self {
+        /* At most one style is flagged by the reader; a snapshot holding
+        several resolves to the smallest id (map order never decides). */
+        let default_style = styles
+            .values()
+            .filter(|s| s.is_default)
+            .min_by(|a, b| a.id.cmp(&b.id));
+        Self {
+            styles,
+            default_style,
+        }
+    }
+
+    /// The document's default paragraph style (`w:default="1"`), if any.
+    pub fn default_style(&self) -> Option<&'a ParagraphStyle> {
+        self.default_style
+    }
+
+    /// The style a paragraph whose `style_id` is `style_id` is formatted
+    /// with: that style when the document defines it, else the default
+    /// paragraph style — a paragraph naming no style, or one the document
+    /// does not define, takes `Normal`, as in Word (ECMA-376 §17.7.4.17).
+    /// `None` when neither exists: the cascade is the docDefaults alone.
+    pub fn applied_style(&self, style_id: Option<&str>) -> Option<&'a ParagraphStyle> {
+        style_id
+            .and_then(|id| self.styles.get(id))
+            .or(self.default_style)
+    }
+
+    /// The applied style's `<w:basedOn>` chain, LEAF FIRST (callers fold
+    /// it reversed: the root first, the leaf last). Cycle-safe (visited
+    /// set) and depth-capped at [`MAX_STYLE_CHAIN`]; a dangling parent
+    /// ends the chain.
+    pub fn chain(&self, style_id: Option<&str>) -> Vec<&'a ParagraphStyle> {
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut chain: Vec<&ParagraphStyle> = Vec::new();
-        let mut current: Option<&str> = Some(leaf);
-        while let Some(id) = current {
-            if chain.len() >= MAX_STYLE_CHAIN || !visited.insert(id) {
+        let mut chain: Vec<&'a ParagraphStyle> = Vec::new();
+        let mut current = self.applied_style(style_id);
+        while let Some(def) = current {
+            if chain.len() >= MAX_STYLE_CHAIN || !visited.insert(def.id.as_str()) {
                 break;
             }
-            let Some(def) = styles.get(id) else {
-                break;
-            };
             chain.push(def);
-            current = def.based_on.as_deref();
+            current = def.based_on.as_deref().and_then(|id| self.styles.get(id));
         }
-        /* Issue #395 — defaults → chain → direct in ONE direction-
-        aware cascade: the logical border edges of every level land on
-        the side the paragraph's final direction names. */
+        chain
+    }
+
+    /// `style_defaults → applied style chain (root → leaf)`, folded
+    /// through the direction-aware cascade (issue #395).
+    pub fn para(&self, style_defaults: &ParaProperties, style_id: Option<&str>) -> ParaProperties {
+        let chain = self.chain(style_id);
+        ParaProperties::cascade(
+            std::iter::once(style_defaults).chain(chain.iter().rev().map(|d| &d.para)),
+        )
+    }
+
+    /// `run_defaults → applied style chain <w:rPr> (root → leaf)`: the
+    /// `SpanStyle` a run of a `style_id` paragraph inherits before its
+    /// own formatting (issue #29).
+    pub fn run(&self, run_defaults: &SpanStyle, style_id: Option<&str>) -> SpanStyle {
+        let mut out = run_defaults.clone();
+        for def in self.chain(style_id).iter().rev() {
+            out = out.merged_with(def.run.clone());
+        }
+        out
+    }
+
+    /// Recompute `para.props` from its style cascade ∪ its
+    /// `direct_overrides`: `style_defaults → chain → direct` in ONE
+    /// direction-aware cascade (issue #395 — the logical border edges of
+    /// every level land on the side the paragraph's final direction
+    /// names).
+    pub fn recompute(&self, para: &mut Paragraph, style_defaults: &ParaProperties) {
+        let chain = self.chain(para.style_id.as_deref());
         para.props = ParaProperties::cascade(
             std::iter::once(style_defaults)
                 .chain(chain.iter().rev().map(|d| &d.para))
                 .chain(std::iter::once(&para.direct_overrides)),
         );
-        return;
     }
-    para.props = ParaProperties::cascade([style_defaults, &para.direct_overrides]);
+}
+
+/// Issue #29 — free-fn form of [`DocumentTree::resolve_style_run_cascade`]
+/// for callers holding only the style table. Same rule as the para half
+/// ([`StyleCascade::run`]); a sweep over many paragraphs builds one
+/// [`StyleCascade`] instead.
+pub fn resolve_run_cascade(
+    styles: &std::collections::HashMap<String, ParagraphStyle>,
+    run_defaults: &SpanStyle,
+    style_id: Option<&str>,
+) -> SpanStyle {
+    StyleCascade::new(styles).run(run_defaults, style_id)
+}
+
+/// Sprint 12 (#11) — recompute the resolved `props` view on a single
+/// paragraph from its `style_id` cascade ∪ `direct_overrides`.
+/// `style_defaults` is the document's `<w:docDefaults>` snapshot
+/// (sits at the bottom of every cascade). Free-fn form of
+/// [`StyleCascade::recompute`]; a sweep builds one [`StyleCascade`].
+pub fn recompute_paragraph_props(
+    para: &mut Paragraph,
+    styles: &std::collections::HashMap<String, ParagraphStyle>,
+    style_defaults: &ParaProperties,
+) {
+    StyleCascade::new(styles).recompute(para, style_defaults);
 }
 
 /// Sprint 11 — UAX-#29 word count for one paragraph's text. Shares
@@ -13935,6 +13988,7 @@ mod tests {
                 },
                 run: SpanStyle::default(),
                 next: None,
+                is_default: false,
             },
         );
         d
@@ -14016,6 +14070,7 @@ mod tests {
                 },
                 run: SpanStyle::default(),
                 next: None,
+                is_default: false,
             },
         );
         d.styles.insert(
@@ -14031,6 +14086,7 @@ mod tests {
                 },
                 run: SpanStyle::default(),
                 next: None,
+                is_default: false,
             },
         );
         let p0 = LogicalPos {
@@ -14920,6 +14976,7 @@ mod tests {
                 },
                 run: SpanStyle::default(),
                 next: None,
+                is_default: false,
             },
         );
         let mut para = doc.nth_paragraph(0).unwrap().clone();
