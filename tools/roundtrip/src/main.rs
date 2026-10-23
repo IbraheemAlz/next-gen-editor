@@ -31,6 +31,7 @@
 
 mod comments;
 mod complex_script;
+mod default_style;
 mod inline_spans;
 mod malformed;
 mod note_containers;
@@ -392,6 +393,9 @@ fn run_default() -> Result<()> {
     tracked_nesting::run_nested_table_revisions_roundtrip()?;
     /* Step 63 — issue #442: structural edits recorded in review mode. */
     tracked_structure::run_tracked_structure_roundtrip()?;
+    /* Step 64 — issue #556: the default paragraph style formats unstyled
+    paragraphs; the writer never spells it as direct formatting. */
+    default_style::run_default_style_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -5356,6 +5360,21 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             bytes: format_docx::test_fixtures::cell_paragraph_decor_docx(),
             entry: page_decor_fixture_entry(
                 format_docx::test_fixtures::CELL_DECOR_TEXTS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            ),
+        },
+        /* Issue #556 — `Normal` (the default paragraph style) carries
+        `<w:bidi/>`, spacing and a run font: every unstyled paragraph —
+        the empty one included — reads RTL (the e2e
+        `default-paragraph-style.spec.ts` opens it; step 64 edits it).
+        Zero-edit drift 0. */
+        PrebuiltFixture {
+            name: "default_style_rtl.docx",
+            bytes: format_docx::test_fixtures::default_style_rtl_docx(),
+            entry: page_decor_fixture_entry(
+                format_docx::test_fixtures::DEFAULT_STYLE_TEXTS
                     .iter()
                     .map(|t| t.to_string())
                     .collect(),

@@ -433,11 +433,21 @@ pub enum Scenario {
     /// stall itself is reproduced by `lazy_nav`'s fuzz-native tests, which
     /// write the size into the model.
     NavExpansionStalled,
+    /// Issue #512 - 24 nightly findings (#493 .. #549): `InsertField` at a
+    /// block index at or beyond the end of the document (22, 7 364 864,
+    /// 3 909 091 511) with `offset: u32::MAX` panicked `attempt to add with
+    /// overflow` in `do_insert_field` (`at.offset + cached.len()` on the raw
+    /// wire value). The position now goes through `resolve_edit_pos`: a
+    /// missing block is refused `NotInParagraph`, a huge offset in a real
+    /// paragraph snaps to its end. The same sequence pins the siblings the
+    /// audit found: `InsertSectionBreak` bumping a `u32::MAX` block index,
+    /// and `InsertFootnote` adding to a `u32::MAX` offset.
+    InsertFieldOffsetMax,
 }
 
 impl Scenario {
     /// Every scenario, in the fixed order [`Scenario::index`] encodes.
-    pub const ALL: [Scenario; 15] = [
+    pub const ALL: [Scenario; 16] = [
         Scenario::NanZoom,
         Scenario::NanDeviceScale,
         Scenario::BadRenderDate,
@@ -457,6 +467,8 @@ impl Scenario {
         Scenario::TableMergeCrossesMerge,
         // Issue #499 - appended, same rule.
         Scenario::NavExpansionStalled,
+        // Issue #512 - appended, same rule.
+        Scenario::InsertFieldOffsetMax,
     ];
 
     /// The committed corpus file this scenario's seed lives at, relative
@@ -478,6 +490,7 @@ impl Scenario {
             Scenario::PatternedUnderlineGiantImage => "repro_422_patterned_underline_giant_image",
             Scenario::TableMergeCrossesMerge => "repro_471_merge_crosses_merge",
             Scenario::NavExpansionStalled => "repro_499_nav_expansion_stalled",
+            Scenario::InsertFieldOffsetMax => "repro_512_insert_field_offset_max",
         }
     }
 
@@ -868,6 +881,40 @@ impl Scenario {
                     extend: true,
                 },
             ],
+            Scenario::InsertFieldOffsetMax => {
+                let at = |block: u32, offset: u32| LogicalPos {
+                    path: BlockPath::top(block),
+                    offset,
+                };
+                let field = |block, offset, kind| Command::InsertField {
+                    at: at(block, offset),
+                    kind,
+                };
+                vec![
+                    Command::InsertText {
+                        at: None,
+                        text: "hello".to_string(),
+                    },
+                    // The findings' exact shape: a block index at / beyond the
+                    // end of the document, `offset: u32::MAX`.
+                    field(22, u32::MAX, FieldKind::Page),
+                    field(7_364_864, u32::MAX, FieldKind::Date),
+                    field(3_909_091_511, u32::MAX, FieldKind::Author),
+                    // The audit's sibling: the caret after a section break
+                    // bumped the raw block index.
+                    Command::InsertSectionBreak {
+                        at: at(u32::MAX, u32::MAX),
+                        kind: SectionBreakKind::NextPage,
+                    },
+                    // A REAL paragraph with a huge offset snaps to its end.
+                    field(0, u32::MAX, FieldKind::Page),
+                    // And the note's `offset + 3` caret (this one enters the
+                    // note's story, so it goes last).
+                    Command::InsertFootnote {
+                        at: at(0, u32::MAX),
+                    },
+                ]
+            }
         }
     }
 
@@ -1957,6 +2004,57 @@ mod tests {
             events[5]
         );
         assert!(engine.selection_is_valid());
+    }
+
+    /// Issue #512 (`repro_512_insert_field_offset_max`) - every command of
+    /// the sequence answers instead of overflowing: the missing blocks are
+    /// refused `NotInParagraph` (nothing applied), a real paragraph with a
+    /// `u32::MAX` offset takes the field / note at its end.
+    #[test]
+    fn insert_field_at_u32_max_is_refused_or_snapped_never_an_overflow() {
+        let (engine, events) = apply_scenario(Scenario::InsertFieldOffsetMax);
+        assert_eq!(events.len(), 7, "{events:?}");
+        assert!(
+            matches!(events[0], Event::SelectionChanged { .. }),
+            "{:?}",
+            events[0]
+        );
+        let refused = [
+            "INSERT_FIELD",
+            "INSERT_FIELD",
+            "INSERT_FIELD",
+            "INSERT_SECTION_BREAK",
+        ];
+        for (i, name) in refused.into_iter().enumerate().map(|(i, n)| (i + 1, n)) {
+            assert!(
+                matches!(
+                    &events[i],
+                    Event::Error {
+                        kind: Some(bridge::ErrorKind::NotInParagraph),
+                        command: Some(c),
+                        ..
+                    } if c == name
+                ),
+                "step {i} is refused: {:?}",
+                events[i]
+            );
+        }
+        assert!(
+            matches!(events[5], Event::SelectionChanged { .. }),
+            "the field in a real paragraph lands: {:?}",
+            events[5]
+        );
+        assert!(
+            matches!(events[6], Event::SelectionChanged { .. }),
+            "the footnote in a real paragraph lands: {:?}",
+            events[6]
+        );
+        assert!(engine.selection_is_valid());
+        assert_eq!(
+            engine.check_invariants_for_fuzzing(),
+            Ok(()),
+            "the session still holds the engine invariants"
+        );
     }
 
     /// Issue #117/#261 (`repro_117_1`) — `SetSelection` with a wildly

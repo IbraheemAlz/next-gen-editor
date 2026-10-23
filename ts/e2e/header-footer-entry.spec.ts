@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { bandBox, box, dblclickFooterAtBottom, pageCard, type Box } from './helpers/bands';
 import { boot, scrollViewportTo, settle, viewportScroll } from './helpers/editor';
 
 /* Issues #505 / #510 — entering a header / footer through the REAL UI.
@@ -21,22 +22,6 @@ import { boot, scrollViewportTo, settle, viewportScroll } from './helpers/editor
  * from the DOM overlays (`.caret`, `.story-band`), which are valid under
  * headless Chrome (only the canvas pixels are not composited there). */
 
-interface Box {
-    top: number;
-    bottom: number;
-    left: number;
-    right: number;
-}
-
-async function box(page: Page, selector: string): Promise<Box | null> {
-    return page.evaluate((sel) => {
-        const el = document.querySelector(sel);
-        if (!el) return null;
-        const r = el.getBoundingClientRect();
-        return { top: r.top, bottom: r.bottom, left: r.left, right: r.right };
-    }, selector);
-}
-
 async function caretBox(page: Page): Promise<Box> {
     const c = await box(page, '.caret');
     expect(c, 'a caret overlay is shown').not.toBeNull();
@@ -56,15 +41,6 @@ async function caretInPage(page: Page, idx: number): Promise<Box> {
         left: c.left - p.left,
         right: c.right - p.left,
     };
-}
-
-/** The anchor page's active band — waits for it to appear. */
-async function bandBox(page: Page, pageIdx: number, footer: boolean): Promise<Box> {
-    const sel =
-        `.editor-page[data-page-index="${pageIdx}"] .story-band` +
-        (footer ? '.story-band--footer' : ':not(.story-band--footer)');
-    await expect(page.locator(sel)).toHaveCount(1);
-    return (await box(page, sel))!;
 }
 
 /** The `.story-band` outline is drawn 2 px inside the band region on
@@ -100,9 +76,6 @@ async function openText(page: Page, text: string): Promise<void> {
     expect(type).toBe('DOCUMENT_LOADED');
     await settle(page);
 }
-
-const pageCard = (page: Page, idx: number) =>
-    box(page, `.editor-page[data-page-index="${idx}"]`).then((b) => b!);
 
 test.beforeEach(async ({ page }) => {
     await boot(page);
@@ -160,19 +133,6 @@ test('the Header button puts the caret inside the header band (#505)', async ({ 
     expect(Math.abs(typed.top - caret.top)).toBeLessThan(1);
     expectInside(await caretBox(page), await bandBox(page, 0, false), 'caret after typing');
 });
-
-/** Scroll to the bottom of the (one-page) document and double-click the
- *  footer zone of page 0: below the body, inside the bottom margin. */
-async function dblclickFooterAtBottom(page: Page): Promise<{ scrollTop: number }> {
-    const scroll = await viewportScroll(page);
-    const target = scroll.scrollHeight - scroll.clientHeight;
-    expect(target).toBeGreaterThan(200);
-    await scrollViewportTo(page, target);
-    const card = await pageCard(page, 0);
-    const scrolled = (await viewportScroll(page)).scrollTop;
-    await page.mouse.dblclick((card.left + card.right) / 2, card.bottom - 30);
-    return { scrollTop: scrolled };
-}
 
 test('a double-click in the footer band of a page scrolled to its bottom enters the footer (#510)', async ({
     page,
@@ -301,6 +261,10 @@ test('a single click in a band while editing the body is a body click on the nea
     await settle(page);
     await expect(page.locator('.story-band')).toHaveCount(0);
     const caret = await caretInPage(page, 0);
-    expect(Math.abs(caret.top - 96)).toBeLessThan(1);
+    /* The first body line's top is the 96 px margin; the caret hangs off
+       its baseline (issue #557), so its top sits the face's line gap
+       below the line top. */
+    expect(caret.top).toBeGreaterThanOrEqual(96 - 0.5);
+    expect(caret.top).toBeLessThan(96 + 4);
     expect(Math.abs(caret.left - localX)).toBeLessThan(20);
 });

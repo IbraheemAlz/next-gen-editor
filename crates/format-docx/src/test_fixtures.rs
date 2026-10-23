@@ -1524,3 +1524,8 @@ pub use page_decor::*;
 #[path = "test_fixtures_cell_decor.rs"]
 mod cell_decor;
 pub use cell_decor::*;
+
+/* Issue #556 — the default paragraph style formats unstyled paragraphs. */
+#[path = "test_fixtures_default_style.rs"]
+mod default_style;
+pub use default_style::*;

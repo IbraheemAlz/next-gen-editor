@@ -102,6 +102,16 @@ impl LineMetrics {
         )
     }
 
+    /// Issue #557 — `(ascent, descent)` in px at `px_size`: the text's own
+    /// extent around the baseline, WITHOUT the line gap. The caret is this
+    /// tall (Word / OnlyOffice draw it from the caret run's font, never the
+    /// line box, whose gap and line-spacing extra sit above the text).
+    pub fn caret_extents(&self, px_size: f32) -> (f32, f32) {
+        let upem = f32::from(self.units_per_em.max(1));
+        let k = px_size / upem;
+        (self.ascent as f32 * k, self.descent as f32 * k)
+    }
+
     /// The single-spaced line height in em (`(ascent + descent + gap) / upem`).
     pub fn line_height_em(&self) -> f32 {
         (self.ascent + self.descent + self.line_gap) as f32 / f32::from(self.units_per_em.max(1))
@@ -1415,5 +1425,9 @@ mod tests {
         /* `scaled` puts the gap above the baseline. */
         let (a, d) = liberation.scaled(2048.0);
         assert_eq!((a, d), (1921.0, 434.0));
+        /* Issue #557 — the caret's extent is the text's own, without the
+        gap: shorter than the line wherever the face has one. */
+        assert_eq!(liberation.caret_extents(2048.0), (1854.0, 434.0));
+        assert_eq!(amiri.caret_extents(2048.0), amiri.scaled(2048.0));
     }
 }

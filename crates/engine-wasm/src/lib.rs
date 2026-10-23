@@ -153,7 +153,8 @@ impl RenderConfig {
 impl RenderConfig {
     /// Issue #552 — this config with `base_direction` resolved for `doc`
     /// ([`document_base_direction`]: the document's `<w:docDefaults>`
-    /// direction, else the boot base). Every layout pass and every
+    /// direction folded with its default paragraph style's (#556), else
+    /// the boot base). Every layout pass and every
     /// direction read-back (caret, toolbar, a11y mirror) runs on it, so a
     /// paragraph with no direction and no strong character resolves the
     /// same way everywhere — and, because the paragraph / table cache keys
@@ -989,6 +990,11 @@ struct LineGeom {
     hit_width: f32,
     y_top: f32,
     height: f32,
+    /// Issue #557 — the line's baseline in absolute coords
+    /// (`y_top + LineBox::baseline`). The caret hangs off it: its top is
+    /// the baseline minus the caret run's ascent, never the line box's top
+    /// (see [`caret_rect_geom`]).
+    baseline: f32,
     start_byte: u32,
     end_byte: u32,
     /// Issue #553 — the paragraph's BASE direction is right-to-left. It
@@ -1012,6 +1018,36 @@ struct RunGeom {
     src_start: u32,
     src_end: u32,
     slots: Vec<CaretSlot>,
+    /// Issue #557 — the caret's vertical extent in this run, `(above,
+    /// below)` the line baseline: the run face's ascent and descent at its
+    /// size (Word's metrics, the face the line pitch measures —
+    /// [`VisualRun::metrics_font`], else its own), shifted by its
+    /// sub / superscript raise. No line gap and no line-spacing extra: the
+    /// caret is as tall as the text, not the line box. `None` when the
+    /// face is not loaded (the caret then spans the line box).
+    caret: Option<(f32, f32)>,
+}
+
+/// Issue #557 — the engine's loaded faces by id (`Engine::fonts`, the map
+/// every `FontStack` is built from): the geometry walk measures each run's
+/// caret extent against it ([`run_caret_extents`]).
+type FaceMap = HashMap<String, Arc<LoadedFont>>;
+
+/// Issue #557 — `(above, below)` the line baseline of a caret in `run`: the
+/// ascent and descent of the face the line pitch measures the run with
+/// (`metrics_font`, else `font` — `layout::font_line_extents`' choice) at
+/// the run's size, raised by its sub / superscript shift. `None` when that
+/// face is not in `faces`.
+fn run_caret_extents(run: &layout::VisualRun, faces: &FaceMap) -> Option<(f32, f32)> {
+    let face = run
+        .metrics_font
+        .as_deref()
+        .and_then(|id| faces.get(id))
+        .or_else(|| faces.get(&run.font))?;
+    let (ascent, descent) = face.line_metrics().caret_extents(run.attrs.px_size);
+    let shift = run.attrs.baseline_shift_px;
+    (ascent.is_finite() && descent.is_finite() && shift.is_finite())
+        .then_some((ascent + shift, descent - shift))
 }
 
 /// Issue #497 — one page `<canvas>` (its 2D context) and the display
@@ -1528,6 +1564,17 @@ impl Engine {
     /// after a pure zoom change.
     pub fn paint_geometry_seq(&self) -> f64 {
         self.paint_geometry_seq as f64
+    }
+
+    /// Issue #557 — the live selection as the `Event::SelectionChanged` a
+    /// selection command would answer (never a reveal). The worker
+    /// broadcasts it after a command that replaced the document without
+    /// answering one (`OpenDocument` answers `DocumentLoaded`): the shell's
+    /// caret / selection mirror would otherwise keep drawing the PREVIOUS
+    /// document's rects until the next selection move.
+    pub fn selection_event(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.selection_changed())
+            .map_err(|e| JsValue::from_str(&format!("encode selection: {e}")))
     }
 
     /// Sprint 10 — drain queued `aria-live` announcements as
@@ -3111,7 +3158,10 @@ fn text_box_note_anchors(
 /// layout call chain without borrow gymnastics.
 #[derive(Clone, Copy)]
 struct StyleContext<'a> {
-    styles: &'a std::collections::HashMap<String, engine::ParagraphStyle>,
+    /// Issue #556 — the document's paragraph-style cascade, its default
+    /// paragraph style looked up once per context (a paragraph naming no
+    /// style takes `Normal`'s `<w:rPr>`).
+    cascade: engine::StyleCascade<'a>,
     run_defaults: &'a engine::SpanStyle,
     /// Issue #80 — document-order display markers per referenced note
     /// (`DocumentTree::note_markers`). `None` (callers outside a paint)
@@ -3137,7 +3187,7 @@ impl<'a> StyleContext<'a> {
         let theme = doc.theme.as_deref();
         StyleContext {
             settings: Some(&doc.settings),
-            styles: &doc.styles,
+            cascade: doc.style_cascade(),
             run_defaults: &doc.style_run_defaults,
             note_markers: None,
             note_self_mark: None,
@@ -3193,7 +3243,7 @@ impl<'a> StyleContext<'a> {
     }
 
     fn run_base(&self, style_id: Option<&str>) -> engine::SpanStyle {
-        engine::resolve_run_cascade(self.styles, self.run_defaults, style_id)
+        self.cascade.run(self.run_defaults, style_id)
     }
 
     /// Issue #80 — thread the paint's resolved note markers.
@@ -3628,6 +3678,36 @@ fn mark_line_extents(
     fonts: &FontStack,
     base_direction: ShapingDirection,
 ) -> Option<(f32, f32)> {
+    mark_line_metrics(para, cfg, scale, sctx, fonts, base_direction).map(|(m, px)| m.scaled(px))
+}
+
+/// Issue #557 — the caret's `(ascent, descent)` in layout px on a line with
+/// no text run: the paragraph MARK's face at its size (memo §11 — an empty
+/// paragraph's caret uses the mark's font), the very face
+/// [`mark_line_extents`] sizes that line with, without the line gap.
+fn mark_caret_extents(
+    para: &engine::Paragraph,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    base_direction: ShapingDirection,
+) -> Option<(f32, f32)> {
+    mark_line_metrics(para, cfg, scale, sctx, fonts, base_direction)
+        .map(|(m, px)| m.caret_extents(px))
+}
+
+/// The paragraph mark's face metrics and its size in layout px — the ONE
+/// resolution behind [`mark_line_extents`] (the line pitch) and
+/// [`mark_caret_extents`] (the caret).
+fn mark_line_metrics(
+    para: &engine::Paragraph,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    base_direction: ShapingDirection,
+) -> Option<(text_pipeline::LineMetrics, f32)> {
     let mut style = sctx.run_base(para.style_id.as_deref());
     if let Some(mark) = para.mark_style.as_deref() {
         style = style.merged_with(mark.clone());
@@ -3658,10 +3738,7 @@ fn mark_line_extents(
         italic.unwrap_or(false),
     )?;
     let face = r.metrics_id.and_then(|id| fonts.face(id)).unwrap_or(r.face);
-    Some(
-        face.line_metrics()
-            .scaled(size.unwrap_or(cfg.px_size) * scale),
-    )
+    Some((face.line_metrics(), size.unwrap_or(cfg.px_size) * scale))
 }
 
 /// Issue #80 — lay out one note story's blocks at `content_width` into
@@ -4744,12 +4821,14 @@ fn attach_block_paths(
 ///
 /// Precedence:
 /// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`, the
-///    reader folds the style chain and `<w:docDefaults>` into it).
+///    reader folds the style chain — the default paragraph style's for a
+///    paragraph naming none, #556 — and `<w:docDefaults>` into it).
 /// 2. `first_strong_direction(text)` — first-strong inference for
 ///    paragraphs with no explicit setting.
 /// 3. `cfg.base_direction` — the DOCUMENT default: a layout pass runs on
-///    [`RenderConfig::for_document`], so this is the document's
-///    `<w:docDefaults>` `<w:bidi>` when it declares one, else the boot
+///    [`RenderConfig::for_document`], so this is the `<w:bidi>` the
+///    document's `<w:docDefaults>` + default paragraph style declare
+///    when they declare one, else the boot
 ///    base (LTR in the editor since issue #552). An empty or neutral-only
 ///    paragraph therefore never falls to a hard-coded RTL.
 fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingDirection {
@@ -4757,19 +4836,20 @@ fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingD
 }
 
 /// Issue #552 — the direction a paragraph with no direction of its own
-/// and no strong character takes in `doc`: the document's declared
-/// default (`<w:docDefaults><w:pPrDefault><w:pPr><w:bidi>`,
-/// `DocumentTree::style_defaults.direction` — what Word gives every
-/// paragraph that names no other), else `base`, the layout config's
-/// boot direction. A paragraph read from `.docx` already carries the
-/// cascaded value in `props.direction`; this is what the paragraphs the
-/// ENGINE mints (a toolbar table's empty cells, its escape paragraph, a
-/// fresh document's paragraph) resolve to. There is no section-level
-/// paragraph direction to consult: `<w:sectPr><w:bidi>` orders a
-/// section's columns, it sets no paragraph's direction (and is not
-/// modelled).
+/// and no strong character takes in `doc`: the direction the cascade
+/// gives a paragraph that names no style — `<w:docDefaults>` folded with
+/// the DEFAULT paragraph style (issue #556: a `<w:bidi/>` that lives only
+/// on `Normal` counts, as it does in Word) through the one
+/// `DocumentTree::resolve_style_cascade` — else `base`, the layout
+/// config's boot direction. A paragraph read from `.docx` already
+/// carries the cascaded value in `props.direction`; this is what the
+/// paragraphs the ENGINE mints (a toolbar table's empty cells, its
+/// escape paragraph, a fresh document's paragraph) resolve to. There is
+/// no section-level paragraph direction to consult: `<w:sectPr><w:bidi>`
+/// orders a section's columns, it sets no paragraph's direction (and is
+/// not modelled).
 fn document_base_direction(doc: &DocumentTree, base: ShapingDirection) -> ShapingDirection {
-    match doc.style_defaults.direction {
+    match doc.resolve_style_cascade(None).direction {
         Some(engine::TextDirection::Rtl) => ShapingDirection::Rtl,
         Some(engine::TextDirection::Ltr) => ShapingDirection::Ltr,
         None => base,
@@ -6296,7 +6376,7 @@ fn tp_align_disc(a: Alignment) -> u8 {
 /// absolute left edge. Mirrors the pen walk in
 /// `render::scene::build_page_scene` so hit-testing inverts exactly the
 /// geometry the renderer drew.
-fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
+fn build_line_run_geom(line: &LineBox, line_abs_x: f32, faces: &FaceMap) -> Vec<RunGeom> {
     let mut runs: Vec<RunGeom> = Vec::new();
     let mut pen = 0.0_f32;
     for run in &line.runs {
@@ -6358,6 +6438,7 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
             src_start: run.source_range.start,
             src_end: run.source_range.end,
             slots,
+            caret: run_caret_extents(run, faces),
         });
         pen += run_advance;
     }
@@ -6409,7 +6490,12 @@ fn nearest_line(geom: &[LineGeom], x: f32, y: f32) -> Option<&LineGeom> {
 /// containing cell's left edge + content width, or the page content
 /// area for top-level paragraphs. Without this rectangle, multiple
 /// cells in the same row share `y_top` and the first-emitted line
-/// always wins (clicks in column C land in column 0).
+/// always wins (clicks in column C land in column 0). Issue #557 —
+/// `faces` measures each run's caret extent.
+// The eighth argument is the face map (#557): the frame (origin + hit
+// rectangle), the path and the sink are each independent inputs every
+// caller passes, and bundling any two would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn collect_paragraph_line_geom(
     para_box: &ParagraphBox,
     parent_origin_x: f32,
@@ -6417,6 +6503,7 @@ fn collect_paragraph_line_geom(
     container_left: f32,
     container_width: f32,
     path: &BridgeBlockPath,
+    faces: &FaceMap,
     out: &mut Vec<LineGeom>,
 ) {
     let para_x = parent_origin_x + para_box.origin.x;
@@ -6442,7 +6529,7 @@ fn collect_paragraph_line_geom(
             .map(|r| r.source_range.end)
             .max()
             .unwrap_or(line.source_start);
-        let runs = build_line_run_geom(line, line_x);
+        let runs = build_line_run_geom(line, line_x, faces);
         let slots: Vec<CaretSlot> = runs.iter().flat_map(|r| r.slots.iter().copied()).collect();
         /* Issue #82 — a line composed into one segment of a band cut by a
         float hit-tests over ITS segment only: the band's sibling lines
@@ -6461,6 +6548,7 @@ fn collect_paragraph_line_geom(
             hit_width,
             y_top: line_y,
             height: line.height,
+            baseline: line_y + line.baseline,
             start_byte,
             end_byte,
             rtl: para_box.direction == ShapingDirection::Rtl,
@@ -6479,6 +6567,7 @@ fn collect_table_line_geom(
     table_block_idx: u32,
     table_origin_x: f32,
     table_origin_y: f32,
+    faces: &FaceMap,
     out: &mut Vec<LineGeom>,
 ) {
     collect_table_line_geom_at(
@@ -6489,6 +6578,7 @@ fn collect_table_line_geom(
         table_origin_x,
         table_origin_y,
         0,
+        faces,
         out,
     );
 }
@@ -6517,6 +6607,7 @@ fn collect_table_line_geom_at(
     table_origin_x: f32,
     table_origin_y: f32,
     level: u32,
+    faces: &FaceMap,
     out: &mut Vec<LineGeom>,
 ) {
     if level + 1 >= MAX_TABLE_LAYOUT_DEPTH {
@@ -6565,6 +6656,7 @@ fn collect_table_line_geom_at(
                         cell_x,
                         cell.size.width,
                         &BridgeBlockPath { steps },
+                        faces,
                         out,
                     ),
                     LayoutBlock::Table(inner) => collect_table_line_geom_at(
@@ -6573,6 +6665,7 @@ fn collect_table_line_geom_at(
                         content_x + inner.origin.x,
                         content_y + inner.origin.y,
                         level + 1,
+                        faces,
                         out,
                     ),
                 }
@@ -7671,25 +7764,49 @@ fn collect_paragraph_paths_vec(
 
 /// Caret rectangle for `pos`, `caret_w` device px wide. Falls back to
 /// `fallback` when the document has no geometry yet (empty document).
+///
+/// Issue #557 (clean-room memo §11) — the caret is as tall as the TEXT at
+/// it, not the line box: its top is the line's baseline minus the caret
+/// run's ascent (raised by its sub / superscript shift) and its height that
+/// run's ascent + descent ([`RunGeom::caret`]). The line gap and any
+/// line-spacing extra sit above the text and stay out of it, so the caret
+/// in an empty paragraph and in the same paragraph holding text of the
+/// mark's formatting are equally tall. A line with no run (an empty
+/// paragraph, a doubled soft break) takes the paragraph MARK's extent —
+/// `mark_extents(path)`, asked only then. Either one unknown (a face not
+/// loaded) spans the line box, the pre-#557 caret.
 fn caret_rect_geom(
     geom: &[LineGeom],
     pos: &BridgeLogicalPos,
     fallback: BridgeRect,
     caret_w: f32,
     affinity: CaretAffinity,
+    mark_extents: impl FnOnce(&BridgeBlockPath) -> Option<(f32, f32)>,
 ) -> BridgeRect {
     let line = geom
         .iter()
         .find(|l| l.path == pos.path && pos.offset >= l.start_byte && pos.offset <= l.end_byte)
         .or_else(|| geom.first());
-    match line {
-        Some(line) => BridgeRect {
-            x: slot_x_for_byte_with_affinity(line, pos.offset, affinity),
-            y: line.y_top,
-            w: caret_w,
-            h: line.height,
-        },
-        None => fallback,
+    let Some(line) = line else {
+        return fallback;
+    };
+    let (x, run) = caret_slot(line, pos.offset, affinity);
+    let extents = match run {
+        Some(run) => run.caret,
+        None if line.runs.is_empty() => mark_extents(&line.path),
+        None => None,
+    };
+    let (above, below) = extents
+        .filter(|(a, b)| a.is_finite() && b.is_finite() && a + b > 0.0)
+        .unwrap_or((
+            line.baseline - line.y_top,
+            line.y_top + line.height - line.baseline,
+        ));
+    BridgeRect {
+        x,
+        y: line.baseline - above,
+        w: caret_w,
+        h: above + below,
     }
 }
 
@@ -7720,6 +7837,47 @@ fn slot_x_for_byte_with_affinity(line: &LineGeom, byte: u32, affinity: CaretAffi
             .max_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal)),
     };
     pick.map_or(line.start_x, |s| s.x)
+}
+
+/// Issue #557 — [`slot_x_for_byte_with_affinity`]'s x plus the run the
+/// caret drawn there belongs to (its font sizes the caret): the run owning
+/// the slot the affinity picked. Where two runs meet at that x (a style
+/// change inside one direction), the run holding the character BEFORE the
+/// caret wins — formatting is inherited from the left (memo §1), as typing
+/// there does — unless nothing precedes it on the line. A byte no slot
+/// carries (a cluster interior) takes the run whose span holds it.
+fn caret_slot(line: &LineGeom, byte: u32, affinity: CaretAffinity) -> (f32, Option<&RunGeom>) {
+    let x = slot_x_for_byte_with_affinity(line, byte, affinity);
+    let owns = |r: &&RunGeom| {
+        r.slots
+            .iter()
+            .any(|s| s.byte == byte && (s.x - x).abs() < 0.5)
+    };
+    let owners: Vec<&RunGeom> = line.runs.iter().filter(owns).collect();
+    let run = if owners.is_empty() {
+        run_inheriting_at(line.runs.iter(), byte)
+    } else {
+        run_inheriting_at(owners.into_iter(), byte)
+    };
+    (x, run)
+}
+
+/// Issue #557 — among `runs`, the one whose text a caret at `byte` takes
+/// its formatting from: the run holding the character before `byte`, else
+/// one starting there; an empty run only when nothing else spans `byte`.
+fn run_inheriting_at<'a>(
+    runs: impl Iterator<Item = &'a RunGeom>,
+    byte: u32,
+) -> Option<&'a RunGeom> {
+    let spans: Vec<&RunGeom> = runs
+        .filter(|r| r.src_start <= byte && byte <= r.src_end)
+        .collect();
+    spans
+        .iter()
+        .find(|r| r.src_start < byte && r.src_start < r.src_end)
+        .or_else(|| spans.iter().find(|r| r.src_start < r.src_end))
+        .or_else(|| spans.first())
+        .copied()
 }
 
 /// Per-`VisualRun` selection rectangles for `[start, end]` — the discontinuous
@@ -7920,6 +8078,14 @@ fn paragraph_is_empty(doc: &DocumentTree, at: &BridgeLogicalPos) -> bool {
 
 /// Issue #276 — apply [`replaced_text_style`]'s result to the `len` bytes
 /// just inserted at `start`.
+///
+/// Issue #512 audit: `start.offset + len` is not formed from a raw wire
+/// offset. Every caller passes a position that already went through
+/// `clamp_pos` (the interactive `InsertText`, its story twin) or
+/// `resolve_edit_pos` (`ReplaceRange`) - or the live selection, which every
+/// store clamps (`Engine::selection_is_valid`) - so `start.offset` is at
+/// most the paragraph's byte length and the sum is bounded by memory that
+/// exists.
 fn restyle_replacement(
     doc: DocumentTree,
     style: Option<SpanStyle>,
@@ -13369,6 +13535,7 @@ impl Engine {
                         &BridgeBlockPath {
                             steps: vec![BridgePathStep::Block { idx: i as u32 }],
                         },
+                        &self.fonts,
                         &mut geom,
                     );
                 }
@@ -13382,6 +13549,7 @@ impl Engine {
                         i as u32,
                         content_x + table_box.origin.x,
                         band_top + table_box.origin.y,
+                        &self.fonts,
                         &mut geom,
                     );
                 }
@@ -13566,6 +13734,7 @@ impl Engine {
                             content_x,
                             content_w,
                             &engine_to_bridge_path(path.clone()),
+                            &self.fonts,
                             &mut geom,
                         );
                     }
@@ -13576,6 +13745,7 @@ impl Engine {
                             table_block_idx,
                             content_x + table_box.origin.x,
                             content_y + table_box.origin.y,
+                            &self.fonts,
                             &mut geom,
                         );
                     }
@@ -14633,6 +14803,7 @@ impl Engine {
                 fallback,
                 CARET_WIDTH * scale,
                 self.caret_affinity,
+                |path| self.caret_mark_extents(path),
             ),
             direction,
             rects,
@@ -15200,6 +15371,29 @@ impl Engine {
     /// into one [`TextAttrs`] (the collapsed / range rules of
     /// [`Self::attrs_at`]). Computed once per `SelectionChanged` and read
     /// by both the flat read-back and the per-slot one.
+    /// Issue #557 — the caret's `(ascent, descent)` on a laid-out line with
+    /// no text run in the paragraph at `path` (selection-doc coordinates):
+    /// the paragraph mark's face, resolved exactly as layout sized that line
+    /// ([`mark_caret_extents`]: the body's style table and theme, the same
+    /// document config, scale and font stack). `None` before the first
+    /// paint or when no face is loaded.
+    fn caret_mark_extents(&self, path: &BridgeBlockPath) -> Option<(f32, f32)> {
+        let real = self.undo.current();
+        let cfg = self.layout_cfg.as_ref()?.for_document(real);
+        if self.fonts.is_empty() {
+            return None;
+        }
+        let fonts = self.font_stack(&cfg.font_id);
+        let sctx = StyleContext::of(real);
+        let scale = self.scale();
+        let engine_path = bridge_to_engine_path(path.clone());
+        self.with_selection_doc(|doc| {
+            let para = doc.paragraph_at_path(&engine_path)?;
+            let direction = resolve_base_direction(para, &cfg);
+            mark_caret_extents(para, &cfg, scale, sctx, &fonts, direction)
+        })
+    }
+
     fn caret_style(&self, pos: &BridgeLogicalPos, collapsed: bool) -> CaretStyle {
         let engine_path = bridge_to_engine_path(pos.path.clone());
         /* Issue #29 — fold the paragraph's style-chain run base UNDER
@@ -15546,6 +15740,9 @@ impl Engine {
         let was_empty = paragraph_is_empty(&base, &start);
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
         let mut new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        /* Issue #512 audit: `start` is the live selection's start or
+        `do_insert_text_interactive`'s `clamp_pos`'d `at`, never a raw wire
+        offset, so the add cannot wrap. */
         let inserted_end = start.offset + text.len() as u32;
         if let Some(pending) = self.pending_format.clone() {
             new_doc = new_doc.apply_style(
@@ -15808,6 +16005,7 @@ impl Engine {
                                 &BridgeBlockPath {
                                     steps: vec![BridgePathStep::Block { idx }],
                                 },
+                                &self.fonts,
                                 &mut geom,
                             ),
                             LayoutBlock::Table(table_box) => collect_table_line_geom(
@@ -15815,6 +16013,7 @@ impl Engine {
                                 idx,
                                 entry_x + table_box.origin.x,
                                 entry_top + table_box.origin.y,
+                                &self.fonts,
                                 &mut geom,
                             ),
                         }
@@ -15995,19 +16194,22 @@ impl Engine {
                 format!("Insert {what}: notes inside table cells aren't supported yet"),
             );
         }
-        let pos = to_engine_pos(at.clone());
+        /* Issue #512 - the position is validated AND snapped by the shared
+        boundary (`resolve_edit_pos`, issue #115) before the caret is
+        derived from it: `at.offset + 3` on a raw wire `u32::MAX` wrapped
+        (a panic with overflow checks on) and, mid-scalar, put the caret one
+        byte past the reference. */
         let doc = self.undo.current();
-        if doc.paragraph_at_path(&pos.path).is_none() {
-            return Event::error_kind(
-                bridge::ErrorKind::NotInParagraph,
-                format!("Insert {what}: the caret does not address a paragraph"),
-            );
-        }
-        let (new_doc, id) = doc.insert_note_at(pos, kind);
+        let at = match Self::resolve_edit_pos_in(doc, &format!("Insert {what}"), at) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
+        let (new_doc, id) = doc.insert_note_at(to_engine_pos(at.clone()), kind);
         self.undo.push(new_doc);
         self.invalidate_layout_snapshot();
         /* The body caret lands right after the new reference so exiting
-        the note returns there. */
+        the note returns there. `at.offset` is snapped (<= the paragraph's
+        byte length), so the add cannot wrap. */
         let caret = BridgeLogicalPos {
             path: at.path.clone(),
             offset: at.offset + '\u{FFFC}'.len_utf8() as u32,
@@ -16116,6 +16318,7 @@ impl Engine {
                             &BridgeBlockPath {
                                 steps: vec![BridgePathStep::Block { idx }],
                             },
+                            &self.fonts,
                             &mut geom,
                         ),
                         LayoutBlock::Table(table_box) => collect_table_line_geom(
@@ -16123,6 +16326,7 @@ impl Engine {
                             idx,
                             cx + table_box.origin.x,
                             cy + table_box.origin.y,
+                            &self.fonts,
                             &mut geom,
                         ),
                     }
@@ -16919,6 +17123,31 @@ impl Engine {
                 "InsertField: fields inside table cells aren't supported yet",
             );
         }
+        /* Issue #512 - the wire position goes through the engine's ONE
+        validated boundary for an explicit position (`resolve_edit_pos`,
+        issue #115), against the tree the field is inserted into (the story
+        tree in a header / footer / note, else the body): a block that is
+        not there is refused `NotInParagraph` before anything is built (it
+        used to push an undo entry for an unchanged tree), and the offset
+        is snapped - capped at the paragraph's length, floored to a char
+        boundary - so the caret below, `at.offset + cached.len()`, is never
+        formed from a raw `u32::MAX` (the 24 `rpc_command` overflows). */
+        let story = if self.story_active() {
+            match self.story_doc() {
+                Some(t) => Some(t),
+                None => return self.story_vanished(),
+            }
+        } else {
+            None
+        };
+        let at = match Self::resolve_edit_pos_in(
+            story.as_ref().unwrap_or_else(|| self.undo.current()),
+            "InsertField",
+            at,
+        ) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
         let (instruction, cached) = match kind {
             bridge::FieldKind::Page => ("PAGE".to_string(), "1".to_string()),
             bridge::FieldKind::NumPages => ("NUMPAGES".to_string(), "1".to_string()),
@@ -16958,10 +17187,10 @@ impl Engine {
                     .unwrap_or_else(|| self.review_author.clone()),
             ),
         };
-        if self.story_active() {
-            let Some(temp) = self.story_doc() else {
-                return self.story_vanished();
-            };
+        /* `at.offset` is the snapped offset (<= the paragraph's byte
+        length), so the sums below are bounded by memory that exists and
+        cannot wrap. */
+        if let Some(temp) = story {
             let new_doc = temp.insert_field_at(to_engine_pos(at.clone()), &instruction, &cached);
             let caret = BridgeLogicalPos {
                 path: at.path,
@@ -17057,9 +17286,13 @@ impl Engine {
     /// Issue #115 — the single validated boundary for an EXPLICIT wire
     /// position on an edit command (`DeleteRange`, `ReplaceRange`,
     /// `ApplyFormatting { range: Some(_) }`, `SplitParagraph` with no
-    /// selection, `InsertComment`). The path must address a paragraph
-    /// in the document the selection addresses (body or active story)
-    /// — an API caller naming a block that is not there is rejected
+    /// selection, `InsertComment`, and since issue #512 `InsertField` /
+    /// `InsertFootnote` / `InsertEndnote` / `InsertSectionBreak`, whose caret
+    /// is derived from `at.offset + <inserted length>` (or the block index
+    /// bumped by one) and so must start from the validated, SNAPPED position:
+    /// the raw wire `u32::MAX` overflowed that add). The path must address
+    /// a paragraph in the document the selection addresses (body or active
+    /// story); an API caller naming a block that is not there is rejected
     /// with a typed `Event::Error`, never silently redirected to some
     /// other paragraph (an edit that lands on the wrong text is worse
     /// than one that fails loudly). The offset then follows the
@@ -17071,11 +17304,24 @@ impl Engine {
         cmd: &str,
         pos: BridgeLogicalPos,
     ) -> Result<BridgeLogicalPos, Box<Event>> {
+        self.with_selection_doc(|d| Self::resolve_edit_pos_in(d, cmd, pos))
+    }
+
+    /// [`Self::resolve_edit_pos`] against an explicit tree, for a handler
+    /// that already holds the document it edits (issue #512: `InsertField`,
+    /// `InsertFootnote` / `InsertEndnote` and `InsertSectionBreak` resolve
+    /// against the very tree they hand to the pure `DocumentTree` mutation,
+    /// so the position they build the caret from is the one the mutation
+    /// used).
+    fn resolve_edit_pos_in(
+        doc: &DocumentTree,
+        cmd: &str,
+        pos: BridgeLogicalPos,
+    ) -> Result<BridgeLogicalPos, Box<Event>> {
         let epath = bridge_to_engine_path(pos.path.clone());
-        let snapped = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&epath)
-                .map(|p| p.snap_offset(pos.offset))
-        });
+        let snapped = doc
+            .paragraph_at_path(&epath)
+            .map(|p| p.snap_offset(pos.offset));
         match snapped {
             Some(offset) => Ok(BridgeLogicalPos {
                 path: pos.path,
@@ -17150,6 +17396,9 @@ impl Engine {
         } else {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
+        /* Issue #512 audit: `start` is the live selection's start (every
+        selection store is clamped) or the `clamp_pos`'d `at` above - never a
+        raw wire offset - so the add cannot wrap. */
         let inserted_end = start.offset + text.len() as u32;
         new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         /* Sticky formatting (Backlog #11): overlay any armed pending style
@@ -17213,6 +17462,8 @@ impl Engine {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
         let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        /* Issue #512 audit: `start` came out of `resolve_edit_range`, i.e.
+        its offset is snapped to the paragraph (<= its byte length). */
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,
@@ -19472,6 +19723,16 @@ impl Engine {
                 "InsertSectionBreak: section breaks inside table cells are not supported",
             );
         }
+        /* Issue #512 (found by the position audit) - the same shape as
+        `InsertField`: `insert_section_break_at` returns the tree unchanged
+        for a block that is not there, and the caret below bumps the RAW
+        wire block index (`u32::MAX + 1` wrapped). The position goes through
+        the shared boundary first: a missing block is refused
+        `NotInParagraph` with nothing applied, the offset is snapped. */
+        let at = match Self::resolve_edit_pos_in(self.undo.current(), "InsertSectionBreak", at) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
         let engine_kind = match kind {
             SectionBreakKind::NextPage => engine::SectionType::NextPage,
             SectionBreakKind::Continuous => engine::SectionType::Continuous,
@@ -20820,6 +21081,7 @@ mod tests {
                 CaretSlot { x: 30.0, byte: 3 },
                 CaretSlot { x: 40.0, byte: 4 },
             ],
+            caret: None,
         };
         /* RTL run: byte order is the reverse of x order. */
         let rtl = RunGeom {
@@ -20832,6 +21094,7 @@ mod tests {
                 CaretSlot { x: 60.0, byte: 7 },
                 CaretSlot { x: 50.0, byte: 8 },
             ],
+            caret: None,
         };
         let line = LineGeom {
             path: BridgeBlockPath::top(0),
@@ -20840,6 +21103,7 @@ mod tests {
             hit_width: 100.0,
             y_top: 5.0,
             height: 20.0,
+            baseline: 21.0,
             start_byte: 0,
             end_byte: 8,
             rtl: false,
@@ -20873,6 +21137,7 @@ mod tests {
                 CaretSlot { x: 30.0, byte: 3 },
                 CaretSlot { x: 40.0, byte: 4 },
             ],
+            caret: None,
         };
         let line = LineGeom {
             path: BridgeBlockPath::top(0),
@@ -20881,6 +21146,7 @@ mod tests {
             hit_width: 100.0,
             y_top: 5.0,
             height: 20.0,
+            baseline: 21.0,
             start_byte: 0,
             end_byte: 4,
             rtl: false,
@@ -20917,6 +21183,7 @@ mod tests {
             hit_width,
             y_top: 100.0,
             height: 24.0,
+            baseline: 119.2,
             start_byte: 0,
             end_byte: 0,
             rtl: false,
@@ -21102,7 +21369,7 @@ mod tests {
             segment: 0,
             hyphen: layout::LineHyphen::None,
         };
-        let geom = build_line_run_geom(&line, 0.0);
+        let geom = build_line_run_geom(&line, 0.0, &FaceMap::new());
         assert_eq!(geom.len(), 1);
         let slots = &geom[0].slots;
         let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
@@ -21738,6 +22005,7 @@ mod tests {
             hit_width: 100.0,
             y_top: 0.0,
             height: 20.0,
+            baseline: 16.0,
             start_byte: 0,
             end_byte: 8,
             rtl: false,
@@ -21823,7 +22091,7 @@ mod tests {
     /// the run cascade (leaked so the borrows are 'static).
     fn empty_sctx() -> StyleContext<'static> {
         StyleContext {
-            styles: Box::leak(Box::default()),
+            cascade: engine::StyleCascade::new(Box::leak(Box::default())),
             run_defaults: Box::leak(Box::default()),
             note_markers: None,
             note_self_mark: None,
@@ -21852,11 +22120,12 @@ mod tests {
                     font_size: Some(16.0),
                     ..Default::default()
                 },
+                is_default: false,
             },
         );
         let run_defaults = engine::SpanStyle::default();
         let sctx = StyleContext {
-            styles: &styles,
+            cascade: engine::StyleCascade::new(&styles),
             run_defaults: &run_defaults,
             note_markers: None,
             note_self_mark: None,
@@ -21922,7 +22191,7 @@ mod tests {
             .insert("Arab".into(), "Noto Naskh Arabic".into());
         let styles = std::collections::HashMap::new();
         let ctx = |theme: Option<&'static engine::DocumentTheme>, key| StyleContext {
-            styles: Box::leak(Box::new(styles.clone())),
+            cascade: engine::StyleCascade::new(Box::leak(Box::new(styles.clone()))),
             run_defaults: Box::leak(Box::new(run_defaults.clone())),
             note_markers: None,
             note_self_mark: None,
@@ -28269,7 +28538,7 @@ mod tests {
                 fragments += 1;
                 assert!(tb.rows[0].header, "every fragment opens with the header");
                 let mut out = Vec::new();
-                collect_table_line_geom(tb, 1, 0.0, 0.0, &mut out);
+                collect_table_line_geom(tb, 1, 0.0, 0.0, &FaceMap::new(), &mut out);
                 for g in &out {
                     match g.path.steps.get(1) {
                         Some(BridgePathStep::Cell { row, .. }) => rows_seen.push(*row),
@@ -31177,6 +31446,13 @@ mod empty_paragraph_direction_tests;
 #[cfg(all(test, feature = "fuzz-native"))]
 mod bounds_repair_tests;
 
+/// Issue #512 - `InsertField` / `InsertFootnote` / `InsertEndnote` resolve
+/// their position through `resolve_edit_pos` (no `offset + len` on a raw
+/// wire `u32::MAX`), and the audit of every other position-taking command
+/// (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod insert_position_tests;
+
 #[cfg(test)]
 mod a11y_direction_tests;
 
@@ -31252,6 +31528,10 @@ mod nested_table_hit_tests;
 #[cfg(test)]
 mod table_cache_tests;
 
+/// Issue #556 — the default paragraph style formats unstyled paragraphs
+/// (direction, document default, layout).
+#[cfg(test)]
+mod default_paragraph_style_tests;
 #[cfg(test)]
 mod part_media_tests;
 #[cfg(test)]
@@ -31314,6 +31594,12 @@ mod story_tab_tests;
 /// the band of the entered page (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod hf_entry_caret_tests;
+
+/// Issue #557 — the caret is the caret run's ascent + descent (an empty
+/// paragraph: the mark's), hung off the baseline, not the line box
+/// (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod caret_extent_tests;
 
 /// Issue #355 — theme fonts / colours through read → layout.
 #[cfg(test)]

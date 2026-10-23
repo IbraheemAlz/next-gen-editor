@@ -188,6 +188,11 @@ impl Engine {
                         to_engine_pos(target.start.clone()),
                         to_engine_pos(target.end.clone()),
                     );
+                    /* Issue #512 audit: `target.start` comes out of
+                    `text_intent`, which only builds it from the live
+                    selection (every store clamped), `clamp_pos` or
+                    `resolve_edit_range` / `resolve_edit_pos` - never a raw
+                    wire offset - so the add cannot wrap. */
                     let caret = BridgeLogicalPos {
                         path: target.start.path.clone(),
                         offset: target.start.offset + target.text.len() as u32,
