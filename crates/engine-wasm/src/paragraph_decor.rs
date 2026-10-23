@@ -4,9 +4,13 @@
 //! paragraph LRU key (`paragraph_layout_key`) leaves them out and the
 //! cached box carries none; every consumer that puts a paragraph on a
 //! page stamps them from the model through [`stamp_paragraph_decor`] —
-//! the body loop, the note / header / footer / text-box story loop and
-//! the table-cell loop (before #455 the cell loop had no copy, so a cell
-//! paragraph rendered bare). A new decoration copies here, nowhere else.
+//! the body loop, the note / text-box story loop, the header / footer
+//! band loop, the table-cell loop (before #455 the cell loop had no copy,
+//! so a cell paragraph rendered bare; before #504 neither had the band
+//! loop) and the post-pagination field reshape's swap
+//! (`transplant_reshaped_paragraph`, issue #504: a PAGE paragraph lost its
+//! rule and fill once its page number changed). A new decoration copies
+//! here, nowhere else.
 //!
 //! The content-keyed table cache (issue #379) stores the STAMPED cell
 //! paragraph boxes, so its key must see the decorations

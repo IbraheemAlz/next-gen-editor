@@ -4433,14 +4433,54 @@ fn reshape_resolved_fields(
             if new_box.lines.len() == pb.lines.len()
                 && (new_box.size.height - pb.size.height).abs() < 0.5
             {
-                let origin = pb.origin;
-                let src_id = pb.source_paragraph_id;
-                *pb = new_box;
-                pb.origin = origin;
-                pb.source_paragraph_id = src_id;
+                transplant_reshaped_paragraph(pb, new_box, source);
             }
         }
     }
+}
+
+/// Issue #504 — swap a shape-stable re-lay (`fresh`, the paragraph with
+/// its resolved field text spliced in) into the box the paginator placed.
+/// Only what the re-shape changed moves over: the shaped lines and the
+/// size / direction / list marker the layout derives with them. What the
+/// body loop and the paginator stamped on the placed box stays — origin,
+/// source id, the field overlays with their per-page values, the
+/// page-break lines, the keep / widow / page-break-before flags and the
+/// spacing (a keep-with-next the paginator released stays released) —
+/// and the paint-only decorations are stamped from the model by the ONE
+/// helper every paragraph path shares (issue #455). The swap used to
+/// take the whole fresh box, a bare one out of the paragraph LRU: a
+/// bordered / shaded PAGE paragraph lost its rule and fill once its page
+/// number changed. The destructure is exhaustive (no `..`): a new
+/// `ParagraphBox` field does not compile here until it is classified.
+fn transplant_reshaped_paragraph(
+    placed: &mut ParagraphBox,
+    fresh: ParagraphBox,
+    source: &engine::Paragraph,
+) {
+    let ParagraphBox {
+        /* The re-shaped content. */
+        size,
+        lines,
+        direction,
+        marker,
+        /* Placement: stamped by the body loop and the paginator. */
+        origin: _,
+        source_paragraph_id: _,
+        fields: _,
+        page_break_after_line: _,
+        keep_next: _,
+        flow: _,
+        /* Paint-only decorations: stamped from the model below. */
+        borders: _,
+        shading: _,
+        review_mark: _,
+    } = fresh;
+    placed.size = size;
+    placed.lines = lines;
+    placed.direction = direction;
+    placed.marker = marker;
+    paragraph_decor::stamp_paragraph_decor(placed, source);
 }
 
 /// Splice every resolved field's text into a clone of `source`,
@@ -4637,6 +4677,12 @@ fn lay_out_header_footer_box(
                         })
                         .collect();
                 }
+                /* Issues #455 / #504 — `<w:pBdr>`, `<w:shd>` and the
+                tracked-mark pilcrow through the ONE helper. The band
+                loop never stamped them, so a bordered / shaded header or
+                footer paragraph painted bare; the #43 field reshape
+                re-lays a band through here, so its restamp is covered. */
+                paragraph_decor::stamp_paragraph_decor(&mut p, para);
                 LayoutBlock::Paragraph(p)
             }
             /* Issue #72 — `<w:tbl>` inside a part rides the SAME table
@@ -31326,6 +31372,10 @@ mod pbdr_style_cascade_tests;
 /// Issue #455 — decorations on paragraphs inside table cells.
 #[cfg(test)]
 mod cell_paragraph_decor_tests;
+
+/// Issue #504 — the field reshape keeps a paragraph's decorations.
+#[cfg(test)]
+mod field_reshape_decor_tests;
 
 /// Issue #370 — an empty paragraph's line is sized by its mark.
 #[cfg(test)]
