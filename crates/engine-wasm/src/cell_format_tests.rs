@@ -202,8 +202,14 @@ fn bold_across_two_cells_formats_both_paragraphs() {
     toggle(&mut e, FormattingToggle::Bold);
     assert!(all_bytes(cell(&e, 0, 0), is_bold), "A1");
     assert!(all_bytes(cell(&e, 0, 1), is_bold), "A2");
-    assert!(no_bytes(cell(&e, 1, 0), is_bold), "B1 is outside the rectangle");
-    assert!(no_bytes(cell(&e, 1, 1), is_bold), "B2 is outside the rectangle");
+    assert!(
+        no_bytes(cell(&e, 1, 0), is_bold),
+        "B1 is outside the rectangle"
+    );
+    assert!(
+        no_bytes(cell(&e, 1, 1), is_bold),
+        "B2 is outside the rectangle"
+    );
     assert!(no_bytes(body(&e, 0), is_bold) && no_bytes(body(&e, 2), is_bold));
 
     /* Every character already bold -> the toggle clears it (Word). */
@@ -222,7 +228,10 @@ fn toggle_over_a_mixed_range_sets_then_clears_everything() {
     select(&mut e, cell_pos(0, 0, 0), cell_pos(0, 1, 2));
     toggle(&mut e, FormattingToggle::Bold);
     assert!(all_bytes(cell(&e, 0, 0), is_bold), "stays bold");
-    assert!(all_bytes(cell(&e, 0, 1), is_bold), "mixed range turns it ON");
+    assert!(
+        all_bytes(cell(&e, 0, 1), is_bold),
+        "mixed range turns it ON"
+    );
     toggle(&mut e, FormattingToggle::Bold);
     assert!(no_bytes(cell(&e, 0, 0), is_bold));
     assert!(no_bytes(cell(&e, 0, 1), is_bold));
@@ -276,7 +285,10 @@ fn table_cells_selection_is_the_rectangle_not_the_document_order_range() {
                 "cell ({r},{c}) bold == inside the rectangle"
             );
             if !inside {
-                assert!(no_bytes(cell(&e, r, c), is_bold), "cell ({r},{c}) untouched");
+                assert!(
+                    no_bytes(cell(&e, r, c), is_bold),
+                    "cell ({r},{c}) untouched"
+                );
             }
         }
     }
@@ -415,9 +427,9 @@ fn toggle_every_flag_over_cells_sets_then_clears() {
             FormattingToggle::Bold => s.bold == Some(true),
             FormattingToggle::Italic => s.italic == Some(true),
             FormattingToggle::Strike => s.strike == Some(true),
-            FormattingToggle::Underline => {
-                s.underline.is_some_and(|u| u != engine::UnderlineStyle::None)
-            }
+            FormattingToggle::Underline => s
+                .underline
+                .is_some_and(|u| u != engine::UnderlineStyle::None),
             FormattingToggle::Superscript => s.vert_align == Some(engine::VertAlign::Superscript),
             FormattingToggle::Subscript => s.vert_align == Some(engine::VertAlign::Subscript),
             FormattingToggle::Caps => s.caps == Some(true),
@@ -448,9 +460,18 @@ fn an_explicit_range_across_cells_is_document_order_with_partial_ends() {
         bold_patch(),
     );
     assert!(no_bytes(cell(&e, 0, 0), is_bold), "A1 precedes the range");
-    assert!(!is_bold(&cell(&e, 0, 1).style_at(0)), "A2 byte 0 precedes it");
-    assert!(is_bold(&cell(&e, 0, 1).style_at(1)), "A2 byte 1 is the start");
-    assert!(all_bytes(cell(&e, 1, 0), is_bold), "B1 is a whole middle paragraph");
+    assert!(
+        !is_bold(&cell(&e, 0, 1).style_at(0)),
+        "A2 byte 0 precedes it"
+    );
+    assert!(
+        is_bold(&cell(&e, 0, 1).style_at(1)),
+        "A2 byte 1 is the start"
+    );
+    assert!(
+        all_bytes(cell(&e, 1, 0), is_bold),
+        "B1 is a whole middle paragraph"
+    );
     assert!(is_bold(&cell(&e, 1, 1).style_at(0)), "B2 byte 0 is inside");
     assert!(!is_bold(&cell(&e, 1, 1).style_at(1)), "B2 ends at byte 1");
     assert!(no_bytes(body(&e, 2), is_bold), "tail follows the range");
@@ -483,8 +504,18 @@ fn a_range_around_the_table_formats_the_whole_table() {
         Some(range(bpos_top(0, 0), bpos_top(2, 4))),
         bold_patch(),
     );
-    assert!(all_bytes(body(&e, 0), is_bold), "head: {:?} {:?}", body(&e, 0).text, body(&e, 0).spans);
-    assert!(all_bytes(body(&e, 2), is_bold), "tail: {:?} {:?}", body(&e, 2).text, body(&e, 2).spans);
+    assert!(
+        all_bytes(body(&e, 0), is_bold),
+        "head: {:?} {:?}",
+        body(&e, 0).text,
+        body(&e, 0).spans
+    );
+    assert!(
+        all_bytes(body(&e, 2), is_bold),
+        "tail: {:?} {:?}",
+        body(&e, 2).text,
+        body(&e, 2).spans
+    );
     for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
         assert!(all_bytes(cell(&e, r, c), is_bold), "cell ({r},{c})");
     }
@@ -611,7 +642,11 @@ fn formatting_is_one_undo_step_and_leaves_untouched_blocks_shared() {
     let depth = e.undo.depth();
     select(&mut e, cell_pos(0, 0, 0), cell_pos(1, 1, 2));
     toggle(&mut e, FormattingToggle::Bold);
-    assert_eq!(e.undo.depth(), depth + 1, "one undo step for the whole range");
+    assert_eq!(
+        e.undo.depth(),
+        depth + 1,
+        "one undo step for the whole range"
+    );
     ok(&mut e, Command::Undo);
     for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
         assert!(no_bytes(cell(&e, r, c), is_bold), "undone: ({r},{c})");
@@ -662,8 +697,15 @@ fn a_bullet_on_a_cell_paragraph_gets_a_marker_that_paints_inside_the_cell() {
     );
     let a2 = cell(&e, 0, 1);
     assert!(a2.list_item.is_some(), "the paragraph joined a list");
-    assert_eq!(bullet_marker(a2), Some("\u{2022}"), "...and was given a marker");
-    assert!(a2.resolved_list_indent.is_some(), "...and the level's indent");
+    assert_eq!(
+        bullet_marker(a2),
+        Some("\u{2022}"),
+        "...and was given a marker"
+    );
+    assert!(
+        a2.resolved_list_indent.is_some(),
+        "...and the level's indent"
+    );
     assert!(
         cell(&e, 0, 0).list_item.is_none() && cell(&e, 1, 1).list_item.is_none(),
         "the neighbours are not in the list"

@@ -7846,10 +7846,7 @@ impl DocumentTree {
     /// even marked dirty); an empty paragraph whose mark is covered takes
     /// the patch on `Paragraph::mark_style`, so typing there continues it.
     pub fn apply_style_targets(&self, targets: &[RangeTarget], patch: SpanStyle) -> Self {
-        let live: Vec<&RangeTarget> = targets
-            .iter()
-            .filter(|t| t.lo < t.hi || t.mark)
-            .collect();
+        let live: Vec<&RangeTarget> = targets.iter().filter(|t| t.lo < t.hi || t.mark).collect();
         if live.is_empty() {
             return self.clone();
         }
@@ -7890,11 +7887,11 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let paths = self.range_paragraph_paths(&start, &end);
         mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| {
-                    para.props.alignment = Some(align);
-                    /* Sprint 12 (#11) — shadow direct_overrides so a
-                    subsequent ApplyStyle preserves this user edit. */
-                    para.direct_overrides.alignment = Some(align);
-                });
+            para.props.alignment = Some(align);
+            /* Sprint 12 (#11) — shadow direct_overrides so a
+            subsequent ApplyStyle preserves this user edit. */
+            para.direct_overrides.alignment = Some(align);
+        });
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -7944,9 +7941,9 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let paths = self.range_paragraph_paths(&start, &end);
         mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| {
-                    para.props.direction = Some(direction);
-                    para.direct_overrides.direction = Some(direction);
-                });
+            para.props.direction = Some(direction);
+            para.direct_overrides.direction = Some(direction);
+        });
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -9290,10 +9287,10 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let paths = self.range_paragraph_paths(&start, &end);
         mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| {
-                    para.list_item = None;
-                    para.resolved_marker = None;
-                    para.resolved_list_indent = None;
-                });
+            para.list_item = None;
+            para.resolved_marker = None;
+            para.resolved_list_indent = None;
+        });
         Self {
             blocks,
             body_section: self.body_section.clone(),
@@ -9799,8 +9796,8 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let paths = self.range_paragraph_paths(&start, &end);
         mutate_paragraphs_in_top(&mut blocks, &paths, |_, para| {
-                    para.props.borders = borders.clone();
-                });
+            para.props.borders = borders.clone();
+        });
         Self {
             blocks,
             body_section: self.body_section.clone(),

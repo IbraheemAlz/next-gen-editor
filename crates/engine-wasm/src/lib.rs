@@ -6889,6 +6889,14 @@ fn doc_paragraph_neighbor(
     Some((candidate, para))
 }
 
+/// Issue #509 — a `TABLE_CELLS` selection's rectangle: the table and the
+/// inclusive row / column cell-index bounds ([`Engine::cell_rect_for`]).
+struct CellRect {
+    table: BridgeBlockPath,
+    rows: (u32, u32),
+    cols: (u32, u32),
+}
+
 /// Issue #509 — per toggle flag: set on EVERY character of a range
 /// ([`Engine::range_flags`]). `ToggleFormatting` clears a flag only when
 /// all of the range has it.
@@ -9379,10 +9387,11 @@ impl Engine {
                 });
             }
             T::Superscript => {
-                let all_on = flags.as_ref().map_or(
-                    matches!(current.script, VerticalScript::Superscript),
-                    |f| f.superscript,
-                );
+                let all_on = flags
+                    .as_ref()
+                    .map_or(matches!(current.script, VerticalScript::Superscript), |f| {
+                        f.superscript
+                    });
                 patch.script = Some(if all_on {
                     VerticalScript::Normal
                 } else {
@@ -9390,10 +9399,11 @@ impl Engine {
                 });
             }
             T::Subscript => {
-                let all_on = flags.as_ref().map_or(
-                    matches!(current.script, VerticalScript::Subscript),
-                    |f| f.subscript,
-                );
+                let all_on = flags
+                    .as_ref()
+                    .map_or(matches!(current.script, VerticalScript::Subscript), |f| {
+                        f.subscript
+                    });
                 patch.script = Some(if all_on {
                     VerticalScript::Normal
                 } else {
@@ -12222,7 +12232,7 @@ impl Engine {
         &self,
         start: &BridgeLogicalPos,
         end: &BridgeLogicalPos,
-    ) -> Option<(BridgeBlockPath, (u32, u32), (u32, u32))> {
+    ) -> Option<CellRect> {
         let sel = self.selection.as_ref()?;
         let SelectionKind::TableCells {
             table_path,
@@ -12235,12 +12245,10 @@ impl Engine {
             return None;
         };
         let (s, e) = ordered(sel.anchor.clone(), sel.caret.clone());
-        (s == *start && e == *end).then(|| {
-            (
-                table_path.clone(),
-                (*from_row, *to_row),
-                (*from_col, *to_col),
-            )
+        (s == *start && e == *end).then(|| CellRect {
+            table: table_path.clone(),
+            rows: (*from_row, *to_row),
+            cols: (*from_col, *to_col),
         })
     }
 
@@ -12256,7 +12264,7 @@ impl Engine {
         start: &BridgeLogicalPos,
         end: &BridgeLogicalPos,
     ) -> Vec<engine::RangeTarget> {
-        if let Some((table, rows, cols)) = self.cell_rect_for(start, end) {
+        if let Some(CellRect { table, rows, cols }) = self.cell_rect_for(start, end) {
             let targets = doc.cell_rect_targets(&bridge_to_engine_path(table), rows, cols);
             if !targets.is_empty() {
                 return targets;
@@ -12277,7 +12285,7 @@ impl Engine {
         end: &BridgeLogicalPos,
     ) -> Vec<(EnginePos, EnginePos)> {
         let linear = || vec![(to_engine_pos(start.clone()), to_engine_pos(end.clone()))];
-        let Some((table, rows, cols)) = self.cell_rect_for(start, end) else {
+        let Some(CellRect { table, rows, cols }) = self.cell_rect_for(start, end) else {
             return linear();
         };
         let targets = self.undo.current().cell_rect_targets(
@@ -17868,7 +17876,8 @@ impl Engine {
             );
         }
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self.fold_pieces(&start, &end, |d, s, e| d.set_line_spacing(s, e, multiplier));
+        let new_doc =
+            self.fold_pieces(&start, &end, |d, s, e| d.set_line_spacing(s, e, multiplier));
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));

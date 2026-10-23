@@ -138,7 +138,11 @@ fn wire_indices_are_clipped_not_iterated() {
     let d = doc(1, 1);
     let far = at(BlockPath::top(u32::MAX), 7);
     let t = d.range_targets(&at(BlockPath::top(0), 0), &far);
-    assert_eq!(t.len(), 3, "head, the cell, tail - nothing for the billions of absent blocks");
+    assert_eq!(
+        t.len(),
+        3,
+        "head, the cell, tail - nothing for the billions of absent blocks"
+    );
     assert!(d.range_targets(&far, &far).is_empty());
 }
 
@@ -152,7 +156,10 @@ fn a_cell_rectangle_is_whole_paragraphs_with_marks_covered() {
         vec![cell(1, 0, 0), cell(1, 1, 0), cell(2, 0, 0), cell(2, 1, 0)]
     );
     assert!(t.iter().all(|x| x.lo == 0 && x.hi == 2));
-    assert!(d.cell_rect_targets(&BlockPath::top(0), (0, 9), (0, 9)).is_empty());
+    assert!(
+        d.cell_rect_targets(&BlockPath::top(0), (0, 9), (0, 9))
+            .is_empty()
+    );
 }
 
 #[test]
@@ -167,7 +174,13 @@ fn apply_style_reaches_every_paragraph_and_shares_the_rest() {
         let p = out.paragraph_at_path(&cell(r, c, 0)).unwrap();
         assert_eq!(p.style_at(0).bold, Some(true), "({r},{c})");
     }
-    assert_eq!(out.paragraph_at_path(&BlockPath::top(0)).unwrap().spans.len(), 0);
+    assert_eq!(
+        out.paragraph_at_path(&BlockPath::top(0))
+            .unwrap()
+            .spans
+            .len(),
+        0
+    );
     /* An empty range changes nothing and dirties nothing. */
     let same = d.apply_style(at(cell(0, 0, 0), 1), at(cell(0, 0, 0), 1), bold);
     let before = d.paragraph_at_path(&cell(0, 0, 0)).unwrap();
@@ -186,5 +199,10 @@ fn a_list_toggle_stamps_a_cell_marker() {
     );
     let p = out.paragraph_at_path(&cell(0, 1, 0)).unwrap();
     assert_eq!(p.resolved_marker.as_deref(), Some("\u{2022}"));
-    assert!(out.paragraph_at_path(&cell(0, 0, 0)).unwrap().list_item.is_none());
+    assert!(
+        out.paragraph_at_path(&cell(0, 0, 0))
+            .unwrap()
+            .list_item
+            .is_none()
+    );
 }
