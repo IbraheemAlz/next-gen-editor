@@ -233,12 +233,21 @@ hard failure so CI catches a new loop instead of a silent recovery.
   LRU holds an undecorated box; every path that puts a paragraph on a
   page copies them from the model through
   `paragraph_decor::stamp_paragraph_decor` (the body loop, the note /
-  header / footer / text-box story loop, the table-cell loop incl. its
-  nesting-cap flatten branch) — never a fourth hand copy. The #379 table
-  cache stores the STAMPED cell boxes, so `paragraph_content_key` mixes
-  `paragraph_decor::decor_key` into every cell paragraph's key and the
-  verified hit checks `decor_matches`; a new decoration goes into all
-  three functions.
+  text-box story loop, the header / footer band loop
+  `lay_out_header_footer_box`, the table-cell loop incl. its nesting-cap
+  flatten branch, and the #43 field reshape's body swap) — never a hand
+  copy. Issue #504: the reshape swaps a re-laid PAGE / NUMPAGES paragraph
+  in through `transplant_reshaped_paragraph`, which takes only the
+  re-shaped lines / size / direction / marker from the fresh (bare, LRU)
+  box, keeps every placement stamp of the placed box (fields, page-break
+  lines, keep / widow / page-break-before, spacing, origin, source id)
+  and re-stamps the decorations; its destructure is exhaustive, so a new
+  `ParagraphBox` field must be classified there. The band reshape re-lays
+  the whole band through the band loop, so it needs nothing extra. The
+  #379 table cache stores the STAMPED cell boxes, so
+  `paragraph_content_key` mixes `paragraph_decor::decor_key` into every
+  cell paragraph's key and the verified hit checks `decor_matches`; a new
+  decoration goes into all three functions.
 - **The caches are observable in production (issue #500).** Both caches
   keep always-on counters (paragraph `ParagraphCacheStats`, table-box
   `TableCacheStats`: a table hit is a verified served box, a miss is
