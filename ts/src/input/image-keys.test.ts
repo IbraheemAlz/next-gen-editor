@@ -4,8 +4,10 @@ import type { Command, Event } from '../engine/types';
 import {
     caretAtEdge,
     isModifierOnly,
+    pictureSelection,
     planImageKey,
     runImageKey,
+    selectsPicture,
     storyMatches,
     type ImageKeyClient,
     type KeyedImage,
@@ -148,6 +150,24 @@ describe('planImageKey (#554)', () => {
         });
     });
 
+    it('Ctrl/Cmd+C and Ctrl/Cmd+X act on the picture itself (#506)', () => {
+        expect(planImageKey({ ...key('c', { ctrlKey: true }), code: 'KeyC' }, LTR)).toEqual({
+            kind: 'clipboard',
+        });
+        expect(planImageKey({ ...key('x', { metaKey: true }), code: 'KeyX' }, RTL)).toEqual({
+            kind: 'clipboard',
+        });
+        /* Layout-independent: an Arabic layout reports another `key` at the
+           C position. */
+        expect(planImageKey({ ...key('ؤ', { ctrlKey: true }), code: 'KeyC' }, LTR)).toEqual({
+            kind: 'clipboard',
+        });
+        /* Ctrl+Shift+C is not copy. */
+        expect(
+            planImageKey({ ...key('C', { ctrlKey: true, shiftKey: true }), code: 'KeyC' }, LTR),
+        ).toEqual({ kind: 'keep' });
+    });
+
     it('other chords and function keys are not the picture\'s: the selection just drops', () => {
         expect(planImageKey({ ...key('z', { ctrlKey: true }), code: 'KeyZ' }, LTR)).toEqual({ kind: 'keep' });
         expect(planImageKey(key('b', { metaKey: true }), LTR)).toEqual({ kind: 'keep' });
@@ -191,6 +211,32 @@ describe('caretAtEdge', () => {
     });
 });
 
+describe('pictureSelection / selectsPicture (#506)', () => {
+    const start = { path: body().path, offset: 5 };
+    const end = { path: body().path, offset: 8 };
+
+    it('selects exactly the sentinel, caret after it', () => {
+        expect(pictureSelection(body())).toEqual({ type: 'SET_SELECTION', range: { start, end }, caret: end });
+    });
+
+    const reply = (s: number, e: number, story?: { area: string; rid: string }): Event =>
+        ({
+            type: 'SELECTION_CHANGED',
+            ...(story ? { editing_story: story } : {}),
+            range: { start: { ...start, offset: s }, end: { ...end, offset: e } },
+        }) as unknown as Event;
+
+    it('accepts only the engine selecting that very picture, in its own story', () => {
+        expect(selectsPicture(reply(5, 8), body())).toBe(true);
+        expect(selectsPicture(reply(5, 5), body()), 'clamped elsewhere').toBe(false);
+        expect(selectsPicture(reply(5, 8, { area: 'TextBox', rid: '1@0' }), body()), 'in a box').toBe(false);
+        expect(selectsPicture(reply(5, 8, { area: 'TextBox', rid: '1@0' }), boxed)).toBe(true);
+        expect(selectsPicture(reply(5, 8, { area: 'TextBox', rid: '2@0' }), boxed)).toBe(false);
+        expect(selectsPicture(reply(5, 8), boxed), 'still in the body').toBe(false);
+        expect(selectsPicture({ type: 'PONG' } as Event, body())).toBe(false);
+    });
+});
+
 describe('storyMatches', () => {
     it('a body picture needs the body, a box picture needs ITS box', () => {
         expect(storyMatches(body(), undefined)).toBe(true);
@@ -217,7 +263,11 @@ describe('runImageKey (#554)', () => {
     it('Delete on a body picture is ONE DELETE_RANGE over its sentinel, and the key is consumed', () => {
         const c = fakeClient();
         const plan = planImageKey(key('Delete'), LTR);
-        expect(runImageKey(plan, body(), c, undefined)).toBe('consumed');
+        const res = runImageKey(plan, body(), c, undefined);
+        expect(res.outcome).toBe('consumed');
+        expect(res.keepObject).toBe(false);
+        /* The caret stays hidden until the delete's reply placed it. */
+        expect(res.settled).toBeInstanceOf(Promise);
         expect(c.sent).toEqual([
             {
                 type: 'DELETE_RANGE',
@@ -231,63 +281,104 @@ describe('runImageKey (#554)', () => {
 
     it('Left posts only the caret placement; Up posts the placement THEN the motion', () => {
         const left = fakeClient();
-        expect(runImageKey(planImageKey(key('ArrowLeft'), LTR), body(), left, undefined)).toBe('consumed');
+        expect(runImageKey(planImageKey(key('ArrowLeft'), LTR), body(), left, undefined).outcome).toBe(
+            'consumed',
+        );
         expect(left.sent.map((c) => c.type)).toEqual(['SET_SELECTION']);
 
         const up = fakeClient();
-        expect(runImageKey(planImageKey(key('ArrowUp'), LTR), body(), up, undefined)).toBe('consumed');
+        expect(runImageKey(planImageKey(key('ArrowUp'), LTR), body(), up, undefined).outcome).toBe(
+            'consumed',
+        );
         expect(up.sent.map((c) => c.type)).toEqual(['SET_SELECTION', 'MOVE_CARET']);
         expect(up.sent[1]).toEqual({ type: 'MOVE_CARET', direction: 'Up', extend: false });
     });
 
+    it('the caret hold waits for the LAST command the key posted (#506)', async () => {
+        let release!: (e: Event) => void;
+        const order: string[] = [];
+        const c: ImageKeyClient = {
+            dispatch: (cmd: Command) => {
+                order.push(cmd.type);
+                return cmd.type === 'MOVE_CARET'
+                    ? new Promise<Event>((r) => (release = r))
+                    : Promise.resolve({ type: 'PONG' } as Event);
+            },
+        };
+        const res = runImageKey(planImageKey(key('ArrowDown'), LTR), body(), c, undefined);
+        let settled = false;
+        void res.settled!.then(() => (settled = true));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(order).toEqual(['SET_SELECTION', 'MOVE_CARET']);
+        expect(settled, 'not before the motion answered').toBe(false);
+        release({ type: 'PONG' } as Event);
+        await vi.waitFor(() => expect(settled).toBe(true));
+    });
+
     it('typing places the caret before the picture and lets the key go on', () => {
         const c = fakeClient();
-        expect(runImageKey(planImageKey(key('x'), LTR), body(), c, undefined)).toBe('continue');
+        const res = runImageKey(planImageKey(key('x'), LTR), body(), c, undefined);
+        expect(res.outcome).toBe('continue');
+        expect(res.keepObject).toBe(false);
         expect(c.sent).toEqual([caretAtEdge(body(), 'before')]);
     });
 
-    it('a chord the picture does not own posts nothing', () => {
+    it('a chord the picture does not own posts nothing and holds no caret', () => {
         const c = fakeClient();
         const plan = planImageKey({ ...key('z', { ctrlKey: true }), code: 'KeyZ' }, LTR);
-        expect(runImageKey(plan, body(), c, undefined)).toBe('continue');
+        expect(runImageKey(plan, body(), c, undefined)).toEqual({ outcome: 'continue', keepObject: false });
         expect(c.sent).toEqual([]);
+    });
+
+    it('Ctrl+C / Ctrl+X keep the object selection and let the copy / cut event run; the handler posts the selection (#506)', () => {
+        for (const code of ['KeyC', 'KeyX']) {
+            const c = fakeClient();
+            const plan = planImageKey({ ...key(code.slice(3).toLowerCase(), { ctrlKey: true }), code }, LTR);
+            expect(runImageKey(plan, body(), c, undefined)).toEqual({ outcome: 'continue', keepObject: true });
+            expect(c.sent).toEqual([]);
+        }
     });
 
     it('a box picture selected from outside its box cannot be addressed: Delete is swallowed, never continued', () => {
         const c = fakeClient();
-        expect(runImageKey(planImageKey(key('Delete'), LTR), boxed, c, undefined)).toBe('consumed');
+        expect(runImageKey(planImageKey(key('Delete'), LTR), boxed, c, undefined).outcome).toBe('consumed');
         expect(c.sent).toEqual([]);
     });
 
     it('a box picture\'s arrows fall through when its box is not the active story', () => {
         const c = fakeClient();
-        expect(runImageKey(planImageKey(key('ArrowLeft'), LTR), boxed, c, undefined)).toBe('continue');
+        expect(runImageKey(planImageKey(key('ArrowLeft'), LTR), boxed, c, undefined).outcome).toBe(
+            'continue',
+        );
         expect(c.sent).toEqual([]);
     });
 
-    it('Delete on a box picture selects the sentinel in its story, then deletes the selection', async () => {
-        const sel = {
+    const boxSel = (offsets: [number, number], rid = '1@0'): Event =>
+        ({
             type: 'SELECTION_CHANGED',
+            editing_story: { area: 'TextBox', rid },
             range: {
-                start: { path: boxed.path, offset: 5 },
-                end: { path: boxed.path, offset: 8 },
+                start: { path: boxed.path, offset: offsets[0] },
+                end: { path: boxed.path, offset: offsets[1] },
             },
-        } as unknown as Event;
-        const c = fakeClient([sel]);
+        }) as unknown as Event;
+
+    it('Delete on a box picture selects the sentinel in its story, then deletes the selection', async () => {
+        const c = fakeClient([boxSel([5, 8])]);
         const active = { area: 'TextBox', rid: '1@0' };
-        expect(runImageKey(planImageKey(key('Delete'), LTR), boxed, c, active)).toBe('consumed');
+        expect(runImageKey(planImageKey(key('Delete'), LTR), boxed, c, active).outcome).toBe('consumed');
         await vi.waitFor(() => expect(c.sent.map((x) => x.type)).toEqual(['SET_SELECTION', 'DELETE_AT_CARET']));
     });
 
+    it('nothing is deleted when the engine selected the offsets in ANOTHER story (#506: a click that did not enter the box)', async () => {
+        const c = fakeClient([boxSel([5, 8], '2@0')]);
+        const res = runImageKey(planImageKey(key('Delete'), LTR), boxed, c, { area: 'TextBox', rid: '1@0' });
+        await res.settled;
+        expect(c.sent.map((x) => x.type)).toEqual(['SET_SELECTION']);
+    });
+
     it('never deletes at a stale caret: if the engine did not select exactly the picture, nothing is deleted', async () => {
-        const wrong = {
-            type: 'SELECTION_CHANGED',
-            range: {
-                start: { path: boxed.path, offset: 0 },
-                end: { path: boxed.path, offset: 0 },
-            },
-        } as unknown as Event;
-        const c = fakeClient([wrong]);
+        const c = fakeClient([boxSel([0, 0])]);
         runImageKey(planImageKey(key('Backspace'), LTR), boxed, c, { area: 'TextBox', rid: '1@0' });
         await new Promise((r) => setTimeout(r, 10));
         expect(c.sent.map((x) => x.type)).toEqual(['SET_SELECTION']);

@@ -12,14 +12,18 @@ import type { Point } from '../engine/types';
 import {
     PAGE_GAP_PT,
     PAGE_H_PT,
+    activeStoryForKeys,
     deviceRatio,
     paintScale,
     editingStoryForPointer,
     enginePageTopDevice,
     headerFooterZoneAt,
+    noteStoryEntry,
     selectImageByPoint,
     selectionViewForPointer,
+    storyOfImage,
 } from '../state/engine-store';
+import { storyMatches } from './image-keys';
 
 /** Issue #80 — footnote / endnote stories ride the header/footer story
  *  protocol (`editing_story`) but live in the body's page flow. Issue
@@ -214,14 +218,38 @@ export function attachPointer(
            / note story mode — body images are unreachable behind the dim.
            Issue #206 — while a text box is being edited, a press on a
            picture INSIDE a text box still selects it (the engine accepts
-           picture edits in text-box mode); a press elsewhere falls
-           through to the story's own routing. */
+           picture edits in text-box mode).
+           Issue #506 — a picture is only selected IN its own story
+           (clean-room memo §2: drawings are hit-tested in the active
+           story's layer; §9: leaving the object selection activates the
+           story that owns it): a picture of another story — a text-box
+           picture from the body or another box, a body picture from inside
+           a box (#220) — is entered and selected by the same click. The
+           press also goes to PLACE_CARET_AT_POINT, which routes a press
+           inside a box into that box's story (innermost box first) and a
+           press outside every box back to the body (#83), so the picture's
+           keys can address it (positions are story-rooted). Posted
+           synchronously, so a key fired right after the click is queued
+           behind the entry; `noteStoryEntry` lets the key path count the
+           entry as done meanwhile. */
         const imageStory = editingStoryForPointer();
         if (!imageStory || imageStory.area === 'TextBox') {
             const dpr = deviceRatio();
             const gCss = toGlobal(e);
-            if (selectImageByPoint(gCss.x / dpr, gCss.y / dpr, imageStory !== undefined)) {
+            const hit = selectImageByPoint(gCss.x / dpr, gCss.y / dpr);
+            if (hit) {
                 gesture += 1;
+                if (!storyMatches(hit, activeStoryForKeys())) {
+                    const entering = client.dispatch({
+                        type: 'PLACE_CARET_AT_POINT',
+                        page: pageIdx,
+                        at: toLocal(e),
+                    });
+                    noteStoryEntry(storyOfImage(hit), entering);
+                    entering.catch((err: unknown) => {
+                        console.error('enter the picture\'s story failed', err);
+                    });
+                }
                 return;
             }
         }

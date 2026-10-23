@@ -21,6 +21,11 @@ export function PageSelectionOverlay(props: { store: EngineStore; pageIdx: numbe
     const pageBottomCss = () => pageTopCss() + props.store.pageHeightCss(props.pageIdx);
 
     const visibleRects = () => {
+        /* Issue #506 — object selection replaces the text selection too
+           (clean-room memo §2 / §9): while a picture shows its handles, the
+           engine's text range (the stale one the click left behind, or the
+           picture's own sentinel after Ctrl+C) is not highlighted. */
+        if (props.store.selectedImage()) return [];
         const top = pageTopCss();
         const bottom = pageBottomCss();
         return props.store
