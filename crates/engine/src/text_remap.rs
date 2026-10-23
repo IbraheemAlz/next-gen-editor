@@ -568,6 +568,51 @@ impl DocumentTree {
             r.end = map(&r.end);
         }
     }
+
+    /// Epic #555 row 28 — [`DocumentTree::join_paragraph_into_next_table`]:
+    /// the paragraph at `para` left its container and now heads the table
+    /// paragraph at `joined` (a POST-mutation path inside the table, which
+    /// moved up into `para`'s slot); that paragraph's own text shifted right
+    /// by `shift`. Must run on the POST-mutation tree. Anchors in the moved
+    /// paragraph keep their offsets on `joined`, anchors in the old first
+    /// cell paragraph shift by `shift`, and every later block of the
+    /// container (the table included) moves up one.
+    pub fn remap_paragraph_into_table(&mut self, para: &BlockPath, joined: &BlockPath, shift: u32) {
+        let Some((PathStep::Block(idx), container)) = para.steps.split_last() else {
+            return;
+        };
+        if self.comment_ranges.is_empty() {
+            return;
+        }
+        let (idx, d) = (*idx, container.len());
+        let map = |pos: &LogicalPos| -> LogicalPos {
+            if pos.path == *para {
+                return LogicalPos {
+                    path: joined.clone(),
+                    offset: pos.offset,
+                };
+            }
+            if pos.path.steps.len() <= d || pos.path.steps[..d] != *container {
+                return pos.clone();
+            }
+            let PathStep::Block(i) = pos.path.steps[d] else {
+                return pos.clone();
+            };
+            if i <= idx {
+                return pos.clone();
+            }
+            let mut out = pos.clone();
+            out.path.steps[d] = PathStep::Block(i - 1);
+            if out.path == *joined {
+                out.offset = out.offset.saturating_add(shift);
+            }
+            out
+        };
+        for r in &mut self.comment_ranges {
+            r.start = map(&r.start);
+            r.end = map(&r.end);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1097,5 +1142,76 @@ mod tests {
         bad.blocks = blocks;
         let mut undo = UndoStack::new(d, 10);
         undo.push(bad);
+    }
+
+    /* ---- epic #555 row 28: a paragraph joins the next table's first cell ---- */
+
+    fn cell(table: u32, row: u32, col: u32, offset: u32) -> LogicalPos {
+        LogicalPos::new(
+            BlockPath::top(table)
+                .push(PathStep::Cell { row, col })
+                .push(PathStep::Block(0)),
+            offset,
+        )
+    }
+
+    /// `Intro` / a 2 x 2 table (`a1 b1 / a2 b2`) / `Outro`, every paragraph
+    /// with source markup (the #250 push assertion checks it).
+    fn intro_table_outro() -> DocumentTree {
+        let mut d = DocumentTree::from_paragraphs(["Intro".into(), "Outro".into()]).insert_table(
+            BlockPath::top(1),
+            2,
+            2,
+        );
+        for (r, c, t) in [(0, 0, "a1"), (0, 1, "b1"), (1, 0, "a2"), (1, 1, "b2")] {
+            d = d.insert_text(cell(1, r, c, 0), t);
+        }
+        with_markup(d)
+    }
+
+    #[test]
+    fn joining_a_paragraph_into_the_next_table_moves_its_anchors_with_it() {
+        let d = intro_table_outro();
+        /* "tro" of Intro, "a1" of the first cell, "Out" of Outro. */
+        let d = commented(d, pos(0, 2), pos(0, 5));
+        let d = commented(d, cell(1, 0, 0, 0), cell(1, 0, 0, 2));
+        let d = commented(d, pos(2, 0), pos(2, 3));
+        let (j, caret) = d
+            .join_paragraph_into_next_table(&BlockPath::top(0))
+            .expect("Intro precedes the table");
+        assert_eq!(caret, cell(0, 0, 0, 5));
+        assert!(matches!(j.blocks.front(), Some(Block::Table(_))));
+        let first = j.paragraph_at_path(&caret.path).expect("first cell");
+        assert_eq!(first.text, "Introa1");
+        assert!(
+            in_step(first),
+            "the joined paragraph's markup stays in step"
+        );
+        let texts: Vec<String> = j
+            .comment_ranges
+            .iter()
+            .map(|r| j.text_range(r.start.clone(), r.end.clone()))
+            .collect();
+        assert_eq!(texts, ["tro", "a1", "Out"]);
+        assert_eq!(j.comment_ranges[0].start, cell(0, 0, 0, 2));
+        assert_eq!(j.comment_ranges[1].start, cell(0, 0, 0, 5));
+        assert_eq!(j.comment_ranges[2].start, pos(1, 0));
+        /* The edit is a legal undo step. */
+        let mut undo = UndoStack::new(d, 10);
+        undo.push(j);
+    }
+
+    #[test]
+    fn only_a_paragraph_right_before_a_table_joins_it() {
+        let d = intro_table_outro();
+        /* Outro follows the table; a cell paragraph has no next sibling. */
+        assert!(
+            d.join_paragraph_into_next_table(&BlockPath::top(2))
+                .is_none()
+        );
+        assert!(
+            d.join_paragraph_into_next_table(&cell(1, 0, 0, 0).path)
+                .is_none()
+        );
     }
 }

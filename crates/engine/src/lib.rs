@@ -10035,6 +10035,51 @@ impl DocumentTree {
         merged_doc.with_list_markers_refreshed()
     }
 
+    /// Epic #555 row 28 (clean-room cursor memo §7) — Delete at the END of
+    /// the paragraph at `para` whose next sibling block is a table: the
+    /// paragraph leaves its container and joins the table's FIRST paragraph
+    /// (the first cell's first paragraph in document order) as its head,
+    /// through the one paragraph-merge rule, [`Paragraph::concat`] (the
+    /// head's paragraph formatting wins unless it is empty). The table
+    /// moves up into the paragraph's slot.
+    ///
+    /// Returns the new tree and the caret at the join, or `None` when the
+    /// block after `para` is not a table, the table holds no paragraph, or
+    /// the paragraph's mark ends a section (joining would drop the section
+    /// break) — the caller then deletes nothing.
+    pub fn join_paragraph_into_next_table(&self, para: &BlockPath) -> Option<(Self, LogicalPos)> {
+        let head = self.paragraph_at_path(para)?;
+        if head.section_end.is_some() {
+            return None;
+        }
+        let (PathStep::Block(idx), container) = para.steps.split_last()? else {
+            return None;
+        };
+        let table_path = BlockPath {
+            steps: container.to_vec(),
+        }
+        .push(PathStep::Block(idx.checked_add(1)?));
+        let Block::Table(table) = self.block_at(&table_path)? else {
+            return None;
+        };
+        let target = first_cell_paragraph_path(table, table_path)?;
+        let tail = self.paragraph_at_path(&target)?;
+        let shift = head.text.len() as u32;
+        let merged = head.concat(tail);
+        let mut blocks = self.blocks.clone();
+        replace_block_in_top(&mut blocks, &target, Block::Paragraph(merged))?;
+        delete_block_at_path(&mut blocks, para)?;
+        /* The table now sits at the paragraph's index. */
+        let mut joined = target;
+        joined.steps[container.len()] = PathStep::Block(*idx);
+        let mut out = self.with_blocks(blocks);
+        out.remap_paragraph_into_table(para, &joined, shift);
+        Some((
+            out.with_list_markers_refreshed(),
+            LogicalPos::new(joined, shift),
+        ))
+    }
+
     /// Split the paragraph at `at`, the break falling between the two halves.
     pub fn split_paragraph(&self, at: LogicalPos) -> Self {
         let count = self.paragraph_count();
