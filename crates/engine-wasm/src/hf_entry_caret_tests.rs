@@ -82,11 +82,18 @@ fn enter(e: &mut Engine, page: u32, area: HeaderFooterArea) -> (BridgeRect, bool
                 panic!("{area:?} on page {page}: the story has no laid-out line")
             });
             assert_eq!(first.path, BridgeBlockPath::top(0));
+            /* Issue #557 — the caret is the mark's text height hung off
+            the line's baseline, inside the line box (not the box). */
             assert!(
-                (caret.y - first.y_top).abs() < 0.01 && (caret.h - first.height).abs() < 0.01,
-                "caret {caret:?} is not on the story's first line (y {}, h {})",
+                caret.h > 0.0
+                    && caret.y >= first.y_top - 0.01
+                    && caret.y + caret.h <= first.y_top + first.height + 0.01
+                    && caret.y < first.baseline
+                    && first.baseline <= caret.y + caret.h,
+                "caret {caret:?} is not on the story's first line (y {}, h {}, baseline {})",
                 first.y_top,
-                first.height
+                first.height,
+                first.baseline
             );
             (caret, reveal_caret)
         }

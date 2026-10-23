@@ -23,9 +23,12 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   `span.px_size` / `span.bold` / `span.font_family` directly for a piece.
 - **Paragraph direction has ONE resolution (issues #195 / #552).**
   `paragraph_base_direction`: the paragraph's own `props.direction` (the
-  reader folds style chain + `<w:docDefaults>` into it), else first-strong,
-  else the DOCUMENT default — `document_base_direction`:
-  `DocumentTree::style_defaults.direction`, else the config's boot base,
+  reader folds style chain + `<w:docDefaults>` into it — for a paragraph
+  naming no style, or an undefined one, the chain of the DEFAULT
+  paragraph style, `Normal`, issue #556), else first-strong, else the
+  DOCUMENT default — `document_base_direction`:
+  `resolve_style_cascade(None).direction` (docDefaults + the default
+  paragraph style), else the config's boot base,
   which the shell sends LTR (`App.tsx`, `RenderConfig::shell_default`).
   Layout runs on `RenderConfig::for_document(doc)`; the caret / toolbar /
   a11y read-backs on `Engine::document_direction()`. Never hard-code a

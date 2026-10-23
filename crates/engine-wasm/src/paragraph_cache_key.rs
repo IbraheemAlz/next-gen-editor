@@ -356,7 +356,7 @@ pub(crate) fn paragraph_layout_key(
     /* Issue #355 — the theme decides what a font binding names. */
     let StyleContext {
         // Reached through `run_base` / the marker texts hashed below.
-        styles: _,
+        cascade: _,
         run_defaults: _,
         note_markers: _,
         theme: _,

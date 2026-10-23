@@ -658,6 +658,22 @@ pub struct DocResult {
     pub layout_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paragraph_count: Option<u32>,
+    /// Issue #556 — the top-level paragraphs (the [`Self::paragraph_count`]
+    /// population) that name no style the document defines: the ones
+    /// formatted with the DEFAULT paragraph style when the document has
+    /// one ([`Self::default_paragraph_style`]) — whose layout #556 changed
+    /// when that style carries formatting ([`Self::default_style_formats`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unstyled_paragraphs: Option<u32>,
+    /// Issue #556 — the default paragraph style's id (`Normal`, `a`,
+    /// `Standard`, …); absent when the document defines none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_paragraph_style: Option<String>,
+    /// Issue #556 — the default paragraph style carries paragraph or run
+    /// formatting (so its unstyled paragraphs lay out differently since
+    /// #556); absent when the document defines no default style.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_style_formats: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_count_before: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1003,6 +1019,9 @@ impl DocResult {
             elapsed_ms: 0,
             layout_ms: None,
             paragraph_count: None,
+            unstyled_paragraphs: None,
+            default_paragraph_style: None,
+            default_style_formats: None,
             page_count_before: None,
             page_count_after: None,
             page_count_stable: None,
@@ -1094,6 +1113,34 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}...<truncated>", &s[..end])
+}
+
+/// Issue #556 — the effect size of the default paragraph style: which
+/// style it is, whether it formats anything, and how many top-level
+/// paragraphs take it because they name no style the document defines
+/// (the engine's own rule, `StyleCascade::applied_style`).
+fn default_style_census(doc: &engine::DocumentTree, rec: &mut DocResult) {
+    if let Some(default) = doc.style_cascade().default_style() {
+        rec.default_paragraph_style = Some(default.id.clone());
+        rec.default_style_formats = Some(
+            default.para != engine::ParaProperties::default()
+                || default.run != engine::SpanStyle::default(),
+        );
+    }
+    let unstyled = doc
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            engine::Block::Paragraph(p) => Some(p),
+            engine::Block::Table(_) => None,
+        })
+        .filter(|p| {
+            p.style_id
+                .as_deref()
+                .is_none_or(|id| !doc.styles.contains_key(id))
+        })
+        .count();
+    rec.unstyled_paragraphs = Some(unstyled as u32);
 }
 
 fn extract_doc_xml(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -1204,6 +1251,7 @@ pub fn run_one(
     let archive_a: DocxArchive = stage!("read_docx_1", format_docx::read_docx(bytes));
     read_doc = Some(archive_a.document.clone());
     rec.paragraph_count = Some(archive_a.document.paragraph_count());
+    default_style_census(&archive_a.document, &mut rec);
     rec.theme_fonts = Some(ThemeFontCensus::of(&archive_a.document));
     rec.font_substitutions = Some(SubstitutionCensus::of(
         &archive_a.document,

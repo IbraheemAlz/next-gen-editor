@@ -81,6 +81,43 @@ export function revealScroll(
     return { top, left };
 }
 
+/**
+ * Issue #557 — where a `SELECTION_CHANGED` left the caret, as far as the
+ * reveal is concerned: its rect (device px), the story it is in, and the
+ * document revision it was laid out against.
+ */
+export interface CaretPlacement {
+    x: number;
+    y: number;
+    h: number;
+    /** A stable key of `editing_story` (`''` for the body). */
+    story: string;
+    /** `document_revision`; `undefined` from an engine that predates it. */
+    revision: number | undefined;
+}
+
+/**
+ * Issue #557 (clean-room memo §11) — the caret is scrolled into view only
+ * when it MOVED: a reveal-bearing reply that leaves the caret exactly where
+ * the previous one did (an arrow press at the end of the document, a
+ * programmatic move onto the caret itself) keeps the view, so a user who
+ * scrolled away is not yanked back. Moved = another rect or story, or an
+ * edit since the last reply (the document changed under the caret and its
+ * line was laid out again — Word brings the caret back on every edit). The
+ * first placement always counts as a move.
+ */
+export function caretMoved(prev: CaretPlacement | undefined, next: CaretPlacement): boolean {
+    if (!prev) return true;
+    const same = (a: number, b: number): boolean => Math.abs(a - b) < 0.5;
+    return (
+        !same(prev.x, next.x) ||
+        !same(prev.y, next.y) ||
+        !same(prev.h, next.h) ||
+        prev.story !== next.story ||
+        prev.revision !== next.revision
+    );
+}
+
 /** Scroll `viewport` (minimally) so `box` is visible; `true` when it
  *  scrolled. */
 export function keepBoxVisible(

@@ -10,7 +10,10 @@
 //! 1. `<w:docDefaults>/<w:pPrDefault>` / `<w:rPrDefault>`.
 //! 2. The paragraph style chain — walked from the most-distant ancestor
 //!    toward the leaf via repeated `<w:basedOn>` hops, then folded
-//!    leaf-last so the child overrides the parent.
+//!    leaf-last so the child overrides the parent. The leaf is the
+//!    paragraph's `<w:pStyle>`, or — issue #556 — the DEFAULT paragraph
+//!    style (`w:default="1"`, usually `Normal`) when it names none or
+//!    one the part does not define ([`StyleTable::applied_paragraph_style`]).
 //! 3. (Runs only) The character style chain, applied on top of the
 //!    paragraph style's run formatting.
 //! 4. Direct `<w:pPr>` (paragraph) / `<w:rPr>` (run).
@@ -59,7 +62,12 @@ impl<'a> StyleResolver<'a> {
         direct_ppr: ParaProperties,
     ) -> (ParaProperties, SpanStyle) {
         let mut run = self.table.defaults.run.clone();
-        let chain = p_style
+        /* Issue #556 — a paragraph naming no (defined) paragraph style is
+        formatted with the DEFAULT paragraph style: it is the chain's leaf
+        exactly like an explicit `pStyle`, never a second fold. */
+        let chain = self
+            .table
+            .applied_paragraph_style(p_style)
             .map(|id| self.collect_chain(id, StyleKind::Paragraph))
             .unwrap_or_default();
         /* Chain is leaf-first; reverse so the most distant ancestor
@@ -85,6 +93,8 @@ impl<'a> StyleResolver<'a> {
     /// `baseline` is the second tuple value from
     /// [`Self::resolve_paragraph`]. `r_style` is the optional `<w:rStyle>`
     /// reference; `direct_rpr` is the `<w:rPr>` directly on this run.
+    /// A run with no `rStyle` takes no character style: the DEFAULT
+    /// character style is not applied yet (issue #558).
     pub fn resolve_run(
         &self,
         baseline: SpanStyle,
@@ -435,5 +445,61 @@ mod tests {
         let (inherited, _) = r.resolve_paragraph(Some("Heading"), ParaProperties::default());
         assert!(inherited.keep_next_on());
         assert!(inherited.keep_lines_on());
+    }
+
+    /// Issue #556 — the DEFAULT paragraph style is the leaf of a
+    /// paragraph that names no style (or one the part does not define):
+    /// its pPr and rPr reach the paragraph and its run baseline, under
+    /// the direct pPr; a style not based on it never sees it.
+    #[test]
+    fn the_default_paragraph_style_formats_unstyled_paragraphs() {
+        let normal = StyleDef {
+            para: ParaProperties {
+                direction: Some(engine::TextDirection::Rtl),
+                spacing: engine::Spacing {
+                    before_twips: 120,
+                    after_twips: 240,
+                },
+                ..Default::default()
+            },
+            ..pstyle(
+                "Normal",
+                None,
+                SpanStyle {
+                    font_size: Some(14.0),
+                    ..Default::default()
+                },
+            )
+        };
+        let plain = pstyle("Plain", None, SpanStyle::default());
+        let mut defaults = DocDefaults::default();
+        defaults.para.spacing.after_twips = 160;
+        let mut t = table_with(vec![normal, plain], defaults);
+        t.default_paragraph = Some("Normal".into());
+        let r = StyleResolver::new(&t);
+
+        for p_style in [None, Some("Missing")] {
+            let (p, run) = r.resolve_paragraph(p_style, ParaProperties::default());
+            assert_eq!(p.direction, Some(engine::TextDirection::Rtl), "{p_style:?}");
+            assert_eq!(p.spacing.after_twips, 240, "Normal over docDefaults");
+            assert_eq!(run.font_size, Some(14.0), "the run baseline");
+        }
+        let direct_ltr = ParaProperties {
+            direction: Some(engine::TextDirection::Ltr),
+            ..Default::default()
+        };
+        let (p, _) = r.resolve_paragraph(None, direct_ltr);
+        assert_eq!(p.direction, Some(engine::TextDirection::Ltr), "direct wins");
+        assert_eq!(p.spacing.after_twips, 240);
+
+        let (p, run) = r.resolve_paragraph(Some("Plain"), ParaProperties::default());
+        assert_eq!(p.direction, None, "no Normal under a style not based on it");
+        assert_eq!(p.spacing.after_twips, 160);
+        assert_eq!(run.font_size, None);
+
+        /* Issue #558 — the default CHARACTER style is not applied (yet):
+        a run without rStyle folds only its baseline and direct rPr. */
+        let resolved = r.resolve_run(SpanStyle::default(), None, SpanStyle::default());
+        assert_eq!(resolved, SpanStyle::default());
     }
 }

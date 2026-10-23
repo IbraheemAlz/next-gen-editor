@@ -1661,6 +1661,14 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
                 broadcastCommentHighlights();
             }
         }
+        /* Issue #557 — a command that replaced the document without
+           answering a SELECTION_CHANGED (OPEN_DOCUMENT answers
+           DOCUMENT_LOADED) left the shell's caret / selection mirror on
+           the PREVIOUS document's rects: broadcast the new document's
+           selection (never a reveal), after its page geometry above. */
+        if (startsNewDocument(msg.cmd) && evt.type !== 'ERROR' && evt.type !== 'SELECTION_CHANGED') {
+            broadcastSelection();
+        }
         /* Sprint 10 — drain queued aria-live announcements (queued by
            the engine's mutation handlers via `Engine::announce`). Each
            one rides the subscribe path (no `id`) so the
@@ -1749,6 +1757,18 @@ function broadcastPaintDims(): void {
  * then, except one empty list right after the last comment went, so the
  * overlay clears.
  */
+/** Issue #557 — post the engine's live selection as an id-less
+ *  `SELECTION_CHANGED` (see the call site in `handleClientCommand`). */
+function broadcastSelection(): void {
+    if (!engine) return;
+    try {
+        const evt = engine.selection_event() as Event;
+        if (evt.type === 'SELECTION_CHANGED') self.postMessage({ evt });
+    } catch (e) {
+        console.warn('[worker] selection_event failed', e);
+    }
+}
+
 function broadcastCommentHighlights(): void {
     if (!engine) return;
     try {

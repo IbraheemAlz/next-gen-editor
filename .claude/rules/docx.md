@@ -248,6 +248,26 @@ paths:
   paragraph's FINAL direction (`oriented_borders`) before folding, so a
   style's `<w:start>` lands where the paragraph's (cascaded) `<w:bidi>`
   says. Never fold paragraph properties with a bare `merged_with` loop.
+- **The default paragraph style (issue #556).** `<w:style w:type=
+  "paragraph" w:default="1">` (`Normal`, `a`, `Standard`, … — the LAST
+  claimant in the part, §17.7.4.17; a self-closing `<w:style/>` is a
+  style too) formats every paragraph that names no style or one the part
+  does not define as a paragraph style — never one under a style that is
+  not `basedOn` it. It is the chain's LEAF in the one walk, not a second
+  fold: `StyleTable::applied_paragraph_style` in the reader's
+  `StyleResolver`, `ParagraphStyle::is_default` +
+  `engine::StyleCascade::applied_style` for every engine cascade (para
+  and run halves, `recompute_paragraph_props`, `ModifyStyle`, the span
+  materialization's `StyleContext`). `style_id` stays `None` /
+  the dangling id (never rewritten to `Normal`). The writer stays
+  byte-neutral: a regenerated `<w:pPr>` with no source to splice leaves
+  out every field only the default style gives
+  (`writer::without_default_style`, the #431 rule for this link; inside
+  `write_docx` only) and `build_styles_xml` keeps `w:default="1"`. The
+  default CHARACTER style is recorded (`StyleTable::default_character`)
+  but not applied (issue #558). Harness: `tools/roundtrip` step 64
+  (`default_style_rtl.docx`); `tools/corpus-native`'s
+  `unstyled_paragraphs` / `default_paragraph_style` columns.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:
