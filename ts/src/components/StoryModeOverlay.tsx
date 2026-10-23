@@ -11,10 +11,14 @@
  * double-click on the dimmed body must still reach the canvas, because
  * that double-click IS the exit gesture.
  *
- * Band placement derives from the engine-reported per-page margins
- * (`Painted.page_margin_tops/bottoms`), the same numbers the pointer
- * gate uses — the zone you can double-click and the zone that lights up
- * are one and the same by construction.
+ * Band placement derives from the engine-reported per-page EFFECTIVE
+ * body extents (`Painted.page_content_tops/bottoms`, issue #71: the
+ * margins pushed inward by a band that overflows them; raw margins
+ * before a paint carries them), the same numbers the pointer gate uses —
+ * the zone you can double-click and the zone that lights up are one and
+ * the same by construction. Issue #505 — they also enclose the entry
+ * caret: the band being edited is laid out even when its part is empty,
+ * and its line can be taller than the margin.
  */
 import { Show } from 'solid-js';
 import type { EngineStore } from '../state/engine-store';
@@ -29,15 +33,21 @@ export function StoryModeOverlay(props: { store: EngineStore; pageIdx: number })
         const s = props.store.editingStory();
         return s && (s.area === 'Header' || s.area === 'Footer') ? s : undefined;
     };
+    const pageHeight = () => props.store.pageHeightCss(props.pageIdx);
+    /* CSS-px page-local body top: the header band is above it. */
     const marginTopCss = () => {
-        const t = props.store.marginGeometry()?.tops[props.pageIdx];
+        const t =
+            props.store.contentGeometry()?.tops[props.pageIdx] ??
+            props.store.marginGeometry()?.tops[props.pageIdx];
         return t !== undefined ? t / dpr() : undefined;
     };
+    /* CSS-px height of the footer band (page bottom − body bottom). */
     const marginBottomCss = () => {
+        const bodyBottom = props.store.contentGeometry()?.bottoms[props.pageIdx];
+        if (bodyBottom !== undefined) return Math.max(0, pageHeight() - bodyBottom / dpr());
         const b = props.store.marginGeometry()?.bottoms[props.pageIdx];
         return b !== undefined ? b / dpr() : undefined;
     };
-    const pageHeight = () => props.store.pageHeightCss(props.pageIdx);
     const isAnchor = () => story()?.page === props.pageIdx;
 
     return (

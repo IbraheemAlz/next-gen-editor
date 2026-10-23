@@ -6,9 +6,13 @@
 //! An empty part paints no band, so the story geometry used to have no
 //! lines and `selection_changed` fell back to the BODY margin of page 0:
 //! the caret overlay sat on the first body line, outside the band, until
-//! the first keystroke built one (live repro, 2026-10-23). The entry also
-//! reveals the caret now, so the toolbar's Footer button scrolls an
-//! off-screen footer into view.
+//! the first keystroke built one (live repro, 2026-10-23). The screen
+//! layout now lays the ACTIVE part out even when it is empty
+//! (`BandScope::Editing`: one empty line at the header / footer distance,
+//! the body making room for it like for any band), the saved views (PDF,
+//! field restamp) keep the empty part band-less, and the caret fallback
+//! is story-aware. The entry also reveals the caret, so the toolbar's
+//! Footer button scrolls an off-screen footer into view.
 //!
 //! Gated on `fuzz-native` like the other bridge-level tests that drive real
 //! `Command`s through `Engine::apply_sync`.
@@ -16,9 +20,21 @@
 use super::*;
 use bridge::HeaderFooterArea;
 
-/// Page `idx`'s absolute top, height and top / bottom margins (device px)
-/// from the layout the caret geometry walked.
-fn page_frame(e: &Engine, idx: usize) -> (f32, f32, f32, f32) {
+/// Page `idx`'s frame in absolute device px, from the layout the caret
+/// geometry walked: its top and height, and the EFFECTIVE body edges —
+/// the margins pushed inward by a band that overflows them (what
+/// `Painted.page_content_tops / bottoms` report and the shell's band gate
+/// tests against). Above `body_top` is the header band, below
+/// `body_bottom` the footer band.
+#[derive(Clone, Copy, Debug)]
+struct Frame {
+    top: f32,
+    height: f32,
+    body_top: f32,
+    body_bottom: f32,
+}
+
+fn page_frame(e: &Engine, idx: usize) -> Frame {
     let snap = e.layout_snapshot.borrow();
     let pages = &snap.as_ref().expect("a laid-out snapshot").pages;
     assert!(
@@ -29,7 +45,21 @@ fn page_frame(e: &Engine, idx: usize) -> (f32, f32, f32, f32) {
     let gap = render::scene::PAGE_GAP_PT * e.scale();
     let top: f32 = pages[..idx].iter().map(|p| p.size.height + gap).sum();
     let p = &pages[idx];
-    (top, p.size.height, p.margins.top, p.margins.bottom)
+    let header_h = p
+        .header
+        .as_ref()
+        .map_or(0.0, layout::HeaderFooterBox::content_height);
+    let footer_h = p
+        .footer
+        .as_ref()
+        .map_or(0.0, layout::HeaderFooterBox::content_height);
+    Frame {
+        top,
+        height: p.size.height,
+        body_top: top + p.margins.top.max(p.header_offset + header_h),
+        body_bottom: top
+            + (p.size.height - p.margins.bottom).min(p.size.height - p.footer_offset - footer_h),
+    }
 }
 
 /// The `SelectionChanged` an entry answers: its caret rect and whether it
@@ -64,33 +94,41 @@ fn enter(e: &mut Engine, page: u32, area: HeaderFooterArea) -> (BridgeRect, bool
     }
 }
 
-/// `caret` lies inside the header band (page top .. body top) of the page
-/// whose frame is `frame`.
-fn assert_in_header_band(caret: &BridgeRect, frame: (f32, f32, f32, f32)) {
-    let (top, _h, margin_top, _mb) = frame;
+/// `caret` lies inside the header band (page top .. body top).
+fn assert_in_header_band(caret: &BridgeRect, f: Frame) {
     assert!(caret.h > 0.0, "a caret with a height: {caret:?}");
     assert!(
-        caret.y >= top && caret.y + caret.h <= top + margin_top,
-        "caret {caret:?} is not inside the header band {top}..{}",
-        top + margin_top
+        caret.y >= f.top && caret.y + caret.h <= f.body_top + 0.01,
+        "caret {caret:?} is not inside the header band {}..{}",
+        f.top,
+        f.body_top
     );
 }
 
 /// `caret` lies inside the footer band (body bottom .. page bottom).
-fn assert_in_footer_band(caret: &BridgeRect, frame: (f32, f32, f32, f32)) {
-    let (top, h, _mt, margin_bottom) = frame;
+fn assert_in_footer_band(caret: &BridgeRect, f: Frame) {
     assert!(caret.h > 0.0, "a caret with a height: {caret:?}");
     assert!(
-        caret.y >= top + h - margin_bottom && caret.y + caret.h <= top + h,
+        caret.y >= f.body_bottom - 0.01 && caret.y + caret.h <= f.top + f.height,
         "caret {caret:?} is not inside the footer band {}..{}",
-        top + h - margin_bottom,
-        top + h
+        f.body_bottom,
+        f.top + f.height
     );
 }
 
 /// Two pages (a page break between them), no header or footer part.
 fn two_page_engine() -> Engine {
     Engine::new_headless(DocumentTree::from_text("page one\u{c}page two"))
+}
+
+/// The first body line's top on page `idx` (absolute device px).
+fn first_body_line_top(e: &mut Engine, idx: usize) -> f32 {
+    let frame = page_frame(e, idx);
+    let geom = e.body_geometry_display().expect("body geometry");
+    geom.iter()
+        .map(|l| l.y_top)
+        .filter(|y| *y >= frame.top && *y < frame.top + frame.height)
+        .fold(f32::INFINITY, f32::min)
 }
 
 #[test]
@@ -106,6 +144,13 @@ fn entering_an_absent_header_puts_the_caret_inside_the_entered_pages_band() {
         let sel = e.selection.clone().expect("a selection");
         assert_eq!(sel.caret, bpos_top(0, 0));
         assert_eq!(e.undo.current().headers.len(), 1);
+        /* The body makes room for the band: its first line starts at or
+        below the caret's line bottom. */
+        let body = first_body_line_top(&mut e, page as usize);
+        assert!(
+            body >= caret.y + caret.h - 0.01,
+            "body line at {body} overlaps the header caret {caret:?}"
+        );
     }
 }
 
@@ -121,7 +166,7 @@ fn entering_an_absent_footer_puts_the_caret_inside_the_entered_pages_band() {
 }
 
 /// The second entry finds the part the first one materialised: it exists
-/// but is still empty, so no entry path builds a band for it.
+/// but is still empty, so the paint path alone would lay no band for it.
 #[test]
 fn re_entering_an_existing_empty_part_keeps_the_caret_in_the_band() {
     let mut e = two_page_engine();
@@ -147,8 +192,7 @@ fn re_entering_an_existing_empty_part_keeps_the_caret_in_the_band() {
 }
 
 /// The empty part's caret is where its first typed character lands: the
-/// line laid out for the empty part and the painted band agree (same
-/// builder, same bottom anchoring for the footer).
+/// band laid out for the empty part and the band of the typed part agree.
 #[test]
 fn the_empty_parts_caret_line_is_the_line_the_first_character_paints_on() {
     for area in [HeaderFooterArea::Header, HeaderFooterArea::Footer] {
@@ -180,6 +224,38 @@ fn the_empty_parts_caret_line_is_the_line_the_first_character_paints_on() {
     }
 }
 
+/// The empty band exists only while its part is edited on screen: the
+/// saved views (PDF export, field restamp) keep an empty part band-less,
+/// and leaving the story drops the screen band again (the layout memo
+/// misses on the story change, though the undo revision did not move).
+#[test]
+fn the_empty_band_is_a_screen_editing_band_only() {
+    let mut e = two_page_engine();
+    enter(&mut e, 0, HeaderFooterArea::Header);
+    let screen_has_band = |e: &Engine| {
+        let snap = e.layout_snapshot.borrow();
+        snap.as_ref().expect("laid out").pages[0].header.is_some()
+    };
+    assert!(screen_has_band(&e), "the edited empty header has a band");
+    let (saved, ..) = e
+        .build_pages_of(
+            e.undo.current().clone(),
+            e.scale(),
+            false,
+            None,
+            FieldMode::Resolved,
+            BandScope::Saved,
+        )
+        .expect("saved layout");
+    assert!(saved[0].header.is_none(), "an exported empty header has no band");
+    let revision = e.undo.revision();
+    e.apply_sync(Command::ExitHeaderFooter);
+    assert_eq!(e.undo.revision(), revision);
+    e.ensure_layout_snapshot(e.scale(), false, None)
+        .expect("layout");
+    assert!(!screen_has_band(&e), "the body view drops the empty band");
+}
+
 /// Second line of defence: with no laid-out line at all for the story
 /// (the part vanished), the fallback rect is still in the band of the
 /// story's page, never the body margin of page 0.
@@ -191,8 +267,15 @@ fn the_story_caret_fallback_is_the_band_of_the_anchor_page() {
         let frame = page_frame(&e, 1);
         let fallback = e.caret_fallback_rect();
         match area {
-            HeaderFooterArea::Header => assert_in_header_band(&fallback, frame),
-            _ => assert_in_footer_band(&fallback, frame),
+            HeaderFooterArea::Header => assert!(
+                fallback.y >= frame.top && fallback.y < frame.body_top,
+                "{fallback:?} vs {frame:?}"
+            ),
+            _ => assert!(
+                fallback.y + fallback.h <= frame.top + frame.height
+                    && fallback.y + fallback.h > frame.body_bottom,
+                "{fallback:?} vs {frame:?}"
+            ),
         }
     }
 }
