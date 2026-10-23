@@ -61,6 +61,24 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "default_style_rtl.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 6,
+        "paragraph_texts": [
+          "مرحبا بالعالم",
+          "",
+          "Latin first, then العربية",
+          "Dangling style id",
+          "Own style, not based on Normal",
+          "Direct LTR override"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "drawing_objects_preserved.docx": {
       "generator": "handcrafted",
       "phase_introduced": 12,
