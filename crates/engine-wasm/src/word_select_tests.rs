@@ -66,11 +66,12 @@ fn doc_with_bold(text: &str, bold: &[(u32, u32)]) -> DocumentTree {
         .collect();
     let mut doc = DocumentTree::new();
     doc.blocks.clear();
-    doc.blocks.push_back(engine::Block::Paragraph(engine::Paragraph {
-        text: text.to_string(),
-        spans,
-        ..Default::default()
-    }));
+    doc.blocks
+        .push_back(engine::Block::Paragraph(engine::Paragraph {
+            text: text.to_string(),
+            spans,
+            ..Default::default()
+        }));
     doc
 }
 
@@ -180,7 +181,10 @@ fn double_click_below_the_last_line_selects_the_logical_last_word() {
     let at = below(line, right_of_ink(line));
     assert_eq!(hit_offset(&mut e, at), len, "the hit is the paragraph end");
     let (word, lo, hi) = select_word(&mut e, at);
-    assert_eq!(word, "بالعالم", "the logical last word, not the visual last");
+    assert_eq!(
+        word, "بالعالم",
+        "the logical last word, not the visual last"
+    );
     assert_eq!(hi, len);
     assert_eq!(lo, "Hello world مرحبا ".len() as u32);
 
@@ -242,12 +246,36 @@ fn the_right_half_of_a_words_last_letter_selects_the_word() {
         let (xa, xb) = (stop_x(line, a), stop_x(line, b));
         on(line, xa + (xb - xa) * t)
     };
-    assert_eq!(word_at(&mut e, between(4, 5, 0.75)), "Hello", "right half of `o`");
-    assert_eq!(word_at(&mut e, between(4, 5, 0.25)), "Hello", "left half of `o`");
-    assert_eq!(word_at(&mut e, between(5, 6, 0.25)), " ", "left half of the space");
-    assert_eq!(word_at(&mut e, between(5, 6, 0.75)), " ", "right half of the space");
-    assert_eq!(word_at(&mut e, between(6, 7, 0.25)), "world", "left half of `w`");
-    assert_eq!(word_at(&mut e, between(10, 11, 0.75)), "world", "right half of `d`");
+    assert_eq!(
+        word_at(&mut e, between(4, 5, 0.75)),
+        "Hello",
+        "right half of `o`"
+    );
+    assert_eq!(
+        word_at(&mut e, between(4, 5, 0.25)),
+        "Hello",
+        "left half of `o`"
+    );
+    assert_eq!(
+        word_at(&mut e, between(5, 6, 0.25)),
+        " ",
+        "left half of the space"
+    );
+    assert_eq!(
+        word_at(&mut e, between(5, 6, 0.75)),
+        " ",
+        "right half of the space"
+    );
+    assert_eq!(
+        word_at(&mut e, between(6, 7, 0.25)),
+        "world",
+        "left half of `w`"
+    );
+    assert_eq!(
+        word_at(&mut e, between(10, 11, 0.75)),
+        "world",
+        "right half of `d`"
+    );
     /* Past the ends: the logical first / last word. */
     assert_eq!(word_at(&mut e, on(line, right_of_ink(line))), "world");
     assert_eq!(word_at(&mut e, below(line, right_of_ink(line))), "world");
@@ -321,7 +349,10 @@ fn an_rtl_paragraph_with_a_trailing_latin_phrase_selects_the_logical_last_word()
 /// the two pieces selects the whole word, not half of it.
 #[test]
 fn a_style_run_boundary_inside_the_arabic_run_does_not_move_the_word() {
-    let first_piece = ("Hello world مرحبا ".len() as u32, "Hello world مرحبا بال".len() as u32);
+    let first_piece = (
+        "Hello world مرحبا ".len() as u32,
+        "Hello world مرحبا بال".len() as u32,
+    );
     let mut e = engine_with(doc_with_bold(MIXED, &[first_piece]));
     let geom = lines(&e);
     let line = &geom[0];
@@ -344,7 +375,10 @@ fn a_style_run_boundary_inside_the_arabic_run_does_not_move_the_word() {
     assert_eq!(word_at(&mut e, at), "بالعالم", "on the style seam");
     /* The seam between two words of the Arabic run (the bold piece ends
     at the end of `مرحبا `). */
-    let mut e = engine_with(doc_with_bold(MIXED, &[(0, "Hello world مرحبا ".len() as u32)]));
+    let mut e = engine_with(doc_with_bold(
+        MIXED,
+        &[(0, "Hello world مرحبا ".len() as u32)],
+    ));
     let geom = lines(&e);
     let line = &geom[0];
     assert_eq!(word_at(&mut e, below(line, right_of_ink(line))), "بالعالم");
@@ -355,7 +389,10 @@ fn a_style_run_boundary_inside_the_arabic_run_does_not_move_the_word() {
 /// line's start) and not the trailing space.
 #[test]
 fn double_click_past_a_wrapped_lines_end_selects_that_lines_last_word() {
-    for unit in ["alpha beta gamma delta epsilon ", "Hello world مرحبا بالعالم "] {
+    for unit in [
+        "alpha beta gamma delta epsilon ",
+        "Hello world مرحبا بالعالم ",
+    ] {
         let text = unit.repeat(8);
         let mut e = engine_for(&text);
         let geom = lines(&e);
@@ -537,7 +574,11 @@ fn line_edge_at_follows_the_paragraph_direction() {
     assert_eq!(line_edge_at(&synthetic_line(false, &[]), 50.0), None);
     let one = synthetic_line(true, &[(30.0, 0)]);
     assert_eq!(line_edge_at(&one, 30.0), Some(LineEdge::Start));
-    assert_eq!(line_edge_at(&one, 99.0), Some(LineEdge::Start), "right of RTL");
+    assert_eq!(
+        line_edge_at(&one, 99.0),
+        Some(LineEdge::Start),
+        "right of RTL"
+    );
     assert_eq!(line_edge_at(&one, 1.0), Some(LineEdge::End), "left of RTL");
 }
 
