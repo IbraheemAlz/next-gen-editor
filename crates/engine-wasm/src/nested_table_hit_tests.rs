@@ -104,6 +104,22 @@ fn line_for<'g>(geom: &'g [LineGeom], path: &BridgeBlockPath) -> &'g LineGeom {
         .unwrap_or_else(|| panic!("no geometry line for {path:?}"))
 }
 
+/// The caret sits on `line`: inside its box, through its baseline (issue
+/// #557 — the caret is the text's height, not the line box's).
+fn assert_on_line(caret: &BridgeRect, line: &LineGeom, what: &str) {
+    assert!(
+        caret.h > 0.0
+            && caret.y >= line.y_top - 1e-3
+            && caret.y + caret.h <= line.y_top + line.height + 1e-3
+            && caret.y < line.baseline
+            && line.baseline <= caret.y + caret.h,
+        "{what}: caret {caret:?} is not on the line (top {}, height {}, baseline {})",
+        line.y_top,
+        line.height,
+        line.baseline
+    );
+}
+
 /// A point inside the line's text: halfway along its caret slots, at
 /// half height.
 fn inside(line: &LineGeom) -> BridgePoint {
@@ -228,7 +244,7 @@ fn click_type_select_word_and_drag_inside_a_nested_cell() {
         Event::SelectionChanged { range, caret, .. } => {
             assert_eq!(range.start.path, inner_path());
             assert_eq!(range.start, range.end);
-            assert_eq!(caret.y, inner.y_top, "the caret sits on the inner line");
+            assert_on_line(&caret, inner, "the caret sits on the inner line");
             assert!(caret.x >= inner.hit_left && caret.x <= inner.hit_left + inner.hit_width);
         }
         other => panic!("PlaceCaretAtPoint: {other:?}"),
@@ -349,7 +365,7 @@ fn caret_and_selection_rects_of_a_nested_position_sit_on_its_line() {
         },
     ) {
         Event::SelectionChanged { caret, rects, .. } => {
-            assert_eq!(caret.y, inner.y_top);
+            assert_on_line(&caret, inner, "caret after `inner`");
             assert!(caret.x > inner.start_x, "caret after `inner`");
             assert_eq!(rects.len(), 1, "{rects:?}");
             assert_eq!(rects[0].y, inner.y_top);

@@ -989,6 +989,11 @@ struct LineGeom {
     hit_width: f32,
     y_top: f32,
     height: f32,
+    /// Issue #557 — the line's baseline in absolute coords
+    /// (`y_top + LineBox::baseline`). The caret hangs off it: its top is
+    /// the baseline minus the caret run's ascent, never the line box's top
+    /// (see [`caret_rect_geom`]).
+    baseline: f32,
     start_byte: u32,
     end_byte: u32,
     /// Issue #553 — the paragraph's BASE direction is right-to-left. It
@@ -1012,6 +1017,36 @@ struct RunGeom {
     src_start: u32,
     src_end: u32,
     slots: Vec<CaretSlot>,
+    /// Issue #557 — the caret's vertical extent in this run, `(above,
+    /// below)` the line baseline: the run face's ascent and descent at its
+    /// size (Word's metrics, the face the line pitch measures —
+    /// [`VisualRun::metrics_font`], else its own), shifted by its
+    /// sub / superscript raise. No line gap and no line-spacing extra: the
+    /// caret is as tall as the text, not the line box. `None` when the
+    /// face is not loaded (the caret then spans the line box).
+    caret: Option<(f32, f32)>,
+}
+
+/// Issue #557 — the engine's loaded faces by id (`Engine::fonts`, the map
+/// every `FontStack` is built from): the geometry walk measures each run's
+/// caret extent against it ([`run_caret_extents`]).
+type FaceMap = HashMap<String, Arc<LoadedFont>>;
+
+/// Issue #557 — `(above, below)` the line baseline of a caret in `run`: the
+/// ascent and descent of the face the line pitch measures the run with
+/// (`metrics_font`, else `font` — `layout::font_line_extents`' choice) at
+/// the run's size, raised by its sub / superscript shift. `None` when that
+/// face is not in `faces`.
+fn run_caret_extents(run: &layout::VisualRun, faces: &FaceMap) -> Option<(f32, f32)> {
+    let face = run
+        .metrics_font
+        .as_deref()
+        .and_then(|id| faces.get(id))
+        .or_else(|| faces.get(&run.font))?;
+    let (ascent, descent) = face.line_metrics().caret_extents(run.attrs.px_size);
+    let shift = run.attrs.baseline_shift_px;
+    (ascent.is_finite() && descent.is_finite() && shift.is_finite())
+        .then_some((ascent + shift, descent - shift))
 }
 
 /// Issue #497 — one page `<canvas>` (its 2D context) and the display
@@ -1528,6 +1563,17 @@ impl Engine {
     /// after a pure zoom change.
     pub fn paint_geometry_seq(&self) -> f64 {
         self.paint_geometry_seq as f64
+    }
+
+    /// Issue #557 — the live selection as the `Event::SelectionChanged` a
+    /// selection command would answer (never a reveal). The worker
+    /// broadcasts it after a command that replaced the document without
+    /// answering one (`OpenDocument` answers `DocumentLoaded`): the shell's
+    /// caret / selection mirror would otherwise keep drawing the PREVIOUS
+    /// document's rects until the next selection move.
+    pub fn selection_event(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.selection_changed())
+            .map_err(|e| JsValue::from_str(&format!("encode selection: {e}")))
     }
 
     /// Sprint 10 — drain queued `aria-live` announcements as
@@ -3628,6 +3674,36 @@ fn mark_line_extents(
     fonts: &FontStack,
     base_direction: ShapingDirection,
 ) -> Option<(f32, f32)> {
+    mark_line_metrics(para, cfg, scale, sctx, fonts, base_direction).map(|(m, px)| m.scaled(px))
+}
+
+/// Issue #557 — the caret's `(ascent, descent)` in layout px on a line with
+/// no text run: the paragraph MARK's face at its size (memo §11 — an empty
+/// paragraph's caret uses the mark's font), the very face
+/// [`mark_line_extents`] sizes that line with, without the line gap.
+fn mark_caret_extents(
+    para: &engine::Paragraph,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    base_direction: ShapingDirection,
+) -> Option<(f32, f32)> {
+    mark_line_metrics(para, cfg, scale, sctx, fonts, base_direction)
+        .map(|(m, px)| m.caret_extents(px))
+}
+
+/// The paragraph mark's face metrics and its size in layout px — the ONE
+/// resolution behind [`mark_line_extents`] (the line pitch) and
+/// [`mark_caret_extents`] (the caret).
+fn mark_line_metrics(
+    para: &engine::Paragraph,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    fonts: &FontStack,
+    base_direction: ShapingDirection,
+) -> Option<(text_pipeline::LineMetrics, f32)> {
     let mut style = sctx.run_base(para.style_id.as_deref());
     if let Some(mark) = para.mark_style.as_deref() {
         style = style.merged_with(mark.clone());
@@ -3658,10 +3734,7 @@ fn mark_line_extents(
         italic.unwrap_or(false),
     )?;
     let face = r.metrics_id.and_then(|id| fonts.face(id)).unwrap_or(r.face);
-    Some(
-        face.line_metrics()
-            .scaled(size.unwrap_or(cfg.px_size) * scale),
-    )
+    Some((face.line_metrics(), size.unwrap_or(cfg.px_size) * scale))
 }
 
 /// Issue #80 — lay out one note story's blocks at `content_width` into
@@ -6296,7 +6369,7 @@ fn tp_align_disc(a: Alignment) -> u8 {
 /// absolute left edge. Mirrors the pen walk in
 /// `render::scene::build_page_scene` so hit-testing inverts exactly the
 /// geometry the renderer drew.
-fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
+fn build_line_run_geom(line: &LineBox, line_abs_x: f32, faces: &FaceMap) -> Vec<RunGeom> {
     let mut runs: Vec<RunGeom> = Vec::new();
     let mut pen = 0.0_f32;
     for run in &line.runs {
@@ -6358,6 +6431,7 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
             src_start: run.source_range.start,
             src_end: run.source_range.end,
             slots,
+            caret: run_caret_extents(run, faces),
         });
         pen += run_advance;
     }
@@ -6409,7 +6483,12 @@ fn nearest_line(geom: &[LineGeom], x: f32, y: f32) -> Option<&LineGeom> {
 /// containing cell's left edge + content width, or the page content
 /// area for top-level paragraphs. Without this rectangle, multiple
 /// cells in the same row share `y_top` and the first-emitted line
-/// always wins (clicks in column C land in column 0).
+/// always wins (clicks in column C land in column 0). Issue #557 —
+/// `faces` measures each run's caret extent.
+// The eighth argument is the face map (#557): the frame (origin + hit
+// rectangle), the path and the sink are each independent inputs every
+// caller passes, and bundling any two would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn collect_paragraph_line_geom(
     para_box: &ParagraphBox,
     parent_origin_x: f32,
@@ -6417,6 +6496,7 @@ fn collect_paragraph_line_geom(
     container_left: f32,
     container_width: f32,
     path: &BridgeBlockPath,
+    faces: &FaceMap,
     out: &mut Vec<LineGeom>,
 ) {
     let para_x = parent_origin_x + para_box.origin.x;
@@ -6442,7 +6522,7 @@ fn collect_paragraph_line_geom(
             .map(|r| r.source_range.end)
             .max()
             .unwrap_or(line.source_start);
-        let runs = build_line_run_geom(line, line_x);
+        let runs = build_line_run_geom(line, line_x, faces);
         let slots: Vec<CaretSlot> = runs.iter().flat_map(|r| r.slots.iter().copied()).collect();
         /* Issue #82 — a line composed into one segment of a band cut by a
         float hit-tests over ITS segment only: the band's sibling lines
@@ -6461,6 +6541,7 @@ fn collect_paragraph_line_geom(
             hit_width,
             y_top: line_y,
             height: line.height,
+            baseline: line_y + line.baseline,
             start_byte,
             end_byte,
             rtl: para_box.direction == ShapingDirection::Rtl,
@@ -6479,6 +6560,7 @@ fn collect_table_line_geom(
     table_block_idx: u32,
     table_origin_x: f32,
     table_origin_y: f32,
+    faces: &FaceMap,
     out: &mut Vec<LineGeom>,
 ) {
     collect_table_line_geom_at(
@@ -6489,6 +6571,7 @@ fn collect_table_line_geom(
         table_origin_x,
         table_origin_y,
         0,
+        faces,
         out,
     );
 }
@@ -6517,6 +6600,7 @@ fn collect_table_line_geom_at(
     table_origin_x: f32,
     table_origin_y: f32,
     level: u32,
+    faces: &FaceMap,
     out: &mut Vec<LineGeom>,
 ) {
     if level + 1 >= MAX_TABLE_LAYOUT_DEPTH {
@@ -6565,6 +6649,7 @@ fn collect_table_line_geom_at(
                         cell_x,
                         cell.size.width,
                         &BridgeBlockPath { steps },
+                        faces,
                         out,
                     ),
                     LayoutBlock::Table(inner) => collect_table_line_geom_at(
@@ -6573,6 +6658,7 @@ fn collect_table_line_geom_at(
                         content_x + inner.origin.x,
                         content_y + inner.origin.y,
                         level + 1,
+                        faces,
                         out,
                     ),
                 }
@@ -7671,25 +7757,49 @@ fn collect_paragraph_paths_vec(
 
 /// Caret rectangle for `pos`, `caret_w` device px wide. Falls back to
 /// `fallback` when the document has no geometry yet (empty document).
+///
+/// Issue #557 (clean-room memo §11) — the caret is as tall as the TEXT at
+/// it, not the line box: its top is the line's baseline minus the caret
+/// run's ascent (raised by its sub / superscript shift) and its height that
+/// run's ascent + descent ([`RunGeom::caret`]). The line gap and any
+/// line-spacing extra sit above the text and stay out of it, so the caret
+/// in an empty paragraph and in the same paragraph holding text of the
+/// mark's formatting are equally tall. A line with no run (an empty
+/// paragraph, a doubled soft break) takes the paragraph MARK's extent —
+/// `mark_extents(path)`, asked only then. Either one unknown (a face not
+/// loaded) spans the line box, the pre-#557 caret.
 fn caret_rect_geom(
     geom: &[LineGeom],
     pos: &BridgeLogicalPos,
     fallback: BridgeRect,
     caret_w: f32,
     affinity: CaretAffinity,
+    mark_extents: impl FnOnce(&BridgeBlockPath) -> Option<(f32, f32)>,
 ) -> BridgeRect {
     let line = geom
         .iter()
         .find(|l| l.path == pos.path && pos.offset >= l.start_byte && pos.offset <= l.end_byte)
         .or_else(|| geom.first());
-    match line {
-        Some(line) => BridgeRect {
-            x: slot_x_for_byte_with_affinity(line, pos.offset, affinity),
-            y: line.y_top,
-            w: caret_w,
-            h: line.height,
-        },
-        None => fallback,
+    let Some(line) = line else {
+        return fallback;
+    };
+    let (x, run) = caret_slot(line, pos.offset, affinity);
+    let extents = match run {
+        Some(run) => run.caret,
+        None if line.runs.is_empty() => mark_extents(&line.path),
+        None => None,
+    };
+    let (above, below) = extents
+        .filter(|(a, b)| a.is_finite() && b.is_finite() && a + b > 0.0)
+        .unwrap_or((
+            line.baseline - line.y_top,
+            line.y_top + line.height - line.baseline,
+        ));
+    BridgeRect {
+        x,
+        y: line.baseline - above,
+        w: caret_w,
+        h: above + below,
     }
 }
 
@@ -7720,6 +7830,47 @@ fn slot_x_for_byte_with_affinity(line: &LineGeom, byte: u32, affinity: CaretAffi
             .max_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal)),
     };
     pick.map_or(line.start_x, |s| s.x)
+}
+
+/// Issue #557 — [`slot_x_for_byte_with_affinity`]'s x plus the run the
+/// caret drawn there belongs to (its font sizes the caret): the run owning
+/// the slot the affinity picked. Where two runs meet at that x (a style
+/// change inside one direction), the run holding the character BEFORE the
+/// caret wins — formatting is inherited from the left (memo §1), as typing
+/// there does — unless nothing precedes it on the line. A byte no slot
+/// carries (a cluster interior) takes the run whose span holds it.
+fn caret_slot(line: &LineGeom, byte: u32, affinity: CaretAffinity) -> (f32, Option<&RunGeom>) {
+    let x = slot_x_for_byte_with_affinity(line, byte, affinity);
+    let owns = |r: &&RunGeom| {
+        r.slots
+            .iter()
+            .any(|s| s.byte == byte && (s.x - x).abs() < 0.5)
+    };
+    let owners: Vec<&RunGeom> = line.runs.iter().filter(owns).collect();
+    let run = if owners.is_empty() {
+        run_inheriting_at(line.runs.iter(), byte)
+    } else {
+        run_inheriting_at(owners.into_iter(), byte)
+    };
+    (x, run)
+}
+
+/// Issue #557 — among `runs`, the one whose text a caret at `byte` takes
+/// its formatting from: the run holding the character before `byte`, else
+/// one starting there; an empty run only when nothing else spans `byte`.
+fn run_inheriting_at<'a>(
+    runs: impl Iterator<Item = &'a RunGeom>,
+    byte: u32,
+) -> Option<&'a RunGeom> {
+    let spans: Vec<&RunGeom> = runs
+        .filter(|r| r.src_start <= byte && byte <= r.src_end)
+        .collect();
+    spans
+        .iter()
+        .find(|r| r.src_start < byte && r.src_start < r.src_end)
+        .or_else(|| spans.iter().find(|r| r.src_start < r.src_end))
+        .or_else(|| spans.first())
+        .copied()
 }
 
 /// Per-`VisualRun` selection rectangles for `[start, end]` — the discontinuous
@@ -13361,6 +13512,7 @@ impl Engine {
                         &BridgeBlockPath {
                             steps: vec![BridgePathStep::Block { idx: i as u32 }],
                         },
+                        &self.fonts,
                         &mut geom,
                     );
                 }
@@ -13374,6 +13526,7 @@ impl Engine {
                         i as u32,
                         content_x + table_box.origin.x,
                         band_top + table_box.origin.y,
+                        &self.fonts,
                         &mut geom,
                     );
                 }
@@ -13558,6 +13711,7 @@ impl Engine {
                             content_x,
                             content_w,
                             &engine_to_bridge_path(path.clone()),
+                            &self.fonts,
                             &mut geom,
                         );
                     }
@@ -13568,6 +13722,7 @@ impl Engine {
                             table_block_idx,
                             content_x + table_box.origin.x,
                             content_y + table_box.origin.y,
+                            &self.fonts,
                             &mut geom,
                         );
                     }
@@ -14625,6 +14780,7 @@ impl Engine {
                 fallback,
                 CARET_WIDTH * scale,
                 self.caret_affinity,
+                |path| self.caret_mark_extents(path),
             ),
             direction,
             rects,
@@ -15192,6 +15348,29 @@ impl Engine {
     /// into one [`TextAttrs`] (the collapsed / range rules of
     /// [`Self::attrs_at`]). Computed once per `SelectionChanged` and read
     /// by both the flat read-back and the per-slot one.
+    /// Issue #557 — the caret's `(ascent, descent)` on a laid-out line with
+    /// no text run in the paragraph at `path` (selection-doc coordinates):
+    /// the paragraph mark's face, resolved exactly as layout sized that line
+    /// ([`mark_caret_extents`]: the body's style table and theme, the same
+    /// document config, scale and font stack). `None` before the first
+    /// paint or when no face is loaded.
+    fn caret_mark_extents(&self, path: &BridgeBlockPath) -> Option<(f32, f32)> {
+        let real = self.undo.current();
+        let cfg = self.layout_cfg.as_ref()?.for_document(real);
+        if self.fonts.is_empty() {
+            return None;
+        }
+        let fonts = self.font_stack(&cfg.font_id);
+        let sctx = StyleContext::of(real);
+        let scale = self.scale();
+        let engine_path = bridge_to_engine_path(path.clone());
+        self.with_selection_doc(|doc| {
+            let para = doc.paragraph_at_path(&engine_path)?;
+            let direction = resolve_base_direction(para, &cfg);
+            mark_caret_extents(para, &cfg, scale, sctx, &fonts, direction)
+        })
+    }
+
     fn caret_style(&self, pos: &BridgeLogicalPos, collapsed: bool) -> CaretStyle {
         let engine_path = bridge_to_engine_path(pos.path.clone());
         /* Issue #29 — fold the paragraph's style-chain run base UNDER
@@ -15803,6 +15982,7 @@ impl Engine {
                                 &BridgeBlockPath {
                                     steps: vec![BridgePathStep::Block { idx }],
                                 },
+                                &self.fonts,
                                 &mut geom,
                             ),
                             LayoutBlock::Table(table_box) => collect_table_line_geom(
@@ -15810,6 +15990,7 @@ impl Engine {
                                 idx,
                                 entry_x + table_box.origin.x,
                                 entry_top + table_box.origin.y,
+                                &self.fonts,
                                 &mut geom,
                             ),
                         }
@@ -16114,6 +16295,7 @@ impl Engine {
                             &BridgeBlockPath {
                                 steps: vec![BridgePathStep::Block { idx }],
                             },
+                            &self.fonts,
                             &mut geom,
                         ),
                         LayoutBlock::Table(table_box) => collect_table_line_geom(
@@ -16121,6 +16303,7 @@ impl Engine {
                             idx,
                             cx + table_box.origin.x,
                             cy + table_box.origin.y,
+                            &self.fonts,
                             &mut geom,
                         ),
                     }
@@ -20815,6 +20998,7 @@ mod tests {
                 CaretSlot { x: 30.0, byte: 3 },
                 CaretSlot { x: 40.0, byte: 4 },
             ],
+            caret: None,
         };
         /* RTL run: byte order is the reverse of x order. */
         let rtl = RunGeom {
@@ -20827,6 +21011,7 @@ mod tests {
                 CaretSlot { x: 60.0, byte: 7 },
                 CaretSlot { x: 50.0, byte: 8 },
             ],
+            caret: None,
         };
         let line = LineGeom {
             path: BridgeBlockPath::top(0),
@@ -20835,6 +21020,7 @@ mod tests {
             hit_width: 100.0,
             y_top: 5.0,
             height: 20.0,
+            baseline: 21.0,
             start_byte: 0,
             end_byte: 8,
             rtl: false,
@@ -20868,6 +21054,7 @@ mod tests {
                 CaretSlot { x: 30.0, byte: 3 },
                 CaretSlot { x: 40.0, byte: 4 },
             ],
+            caret: None,
         };
         let line = LineGeom {
             path: BridgeBlockPath::top(0),
@@ -20876,6 +21063,7 @@ mod tests {
             hit_width: 100.0,
             y_top: 5.0,
             height: 20.0,
+            baseline: 21.0,
             start_byte: 0,
             end_byte: 4,
             rtl: false,
@@ -20912,6 +21100,7 @@ mod tests {
             hit_width,
             y_top: 100.0,
             height: 24.0,
+            baseline: 119.2,
             start_byte: 0,
             end_byte: 0,
             rtl: false,
@@ -21097,7 +21286,7 @@ mod tests {
             segment: 0,
             hyphen: layout::LineHyphen::None,
         };
-        let geom = build_line_run_geom(&line, 0.0);
+        let geom = build_line_run_geom(&line, 0.0, &FaceMap::new());
         assert_eq!(geom.len(), 1);
         let slots = &geom[0].slots;
         let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
@@ -21733,6 +21922,7 @@ mod tests {
             hit_width: 100.0,
             y_top: 0.0,
             height: 20.0,
+            baseline: 16.0,
             start_byte: 0,
             end_byte: 8,
             rtl: false,
@@ -28264,7 +28454,7 @@ mod tests {
                 fragments += 1;
                 assert!(tb.rows[0].header, "every fragment opens with the header");
                 let mut out = Vec::new();
-                collect_table_line_geom(tb, 1, 0.0, 0.0, &mut out);
+                collect_table_line_geom(tb, 1, 0.0, 0.0, &FaceMap::new(), &mut out);
                 for g in &out {
                     match g.path.steps.get(1) {
                         Some(BridgePathStep::Cell { row, .. }) => rows_seen.push(*row),
@@ -31316,6 +31506,12 @@ mod story_tab_tests;
 /// the band of the entered page (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod hf_entry_caret_tests;
+
+/// Issue #557 — the caret is the caret run's ascent + descent (an empty
+/// paragraph: the mark's), hung off the baseline, not the line box
+/// (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod caret_extent_tests;
 
 /// Issue #355 — theme fonts / colours through read → layout.
 #[cfg(test)]

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { deviceRatioFor, revealScroll, type ScrollView } from './caretReveal';
+import {
+    caretMoved,
+    deviceRatioFor,
+    revealScroll,
+    type CaretPlacement,
+    type ScrollView,
+} from './caretReveal';
 
 const view = (scrollTop = 0, scrollLeft = 0): ScrollView => ({
     scrollTop,
@@ -64,5 +70,38 @@ describe('deviceRatioFor (issue #387, mirrors the engine paint-scale cap)', () =
     it('drops once the zoomed scale passes MAX_PAINT_SCALE', () => {
         /* dpr 2 × 4/3 × 3 = 8 device px per pt > 4: capped. */
         expect(deviceRatioFor(3, 2)).toBeCloseTo(4 / ((96 / 72) * 3));
+    });
+});
+
+describe('caretMoved (issue #557: reveal only a caret that moved)', () => {
+    const at = (over: Partial<CaretPlacement> = {}): CaretPlacement => ({
+        x: 120,
+        y: 400,
+        h: 36,
+        story: '',
+        revision: 7,
+        ...over,
+    });
+
+    it('counts the first placement as a move', () => {
+        expect(caretMoved(undefined, at())).toBe(true);
+    });
+
+    it('keeps the view for a reply that left the caret where it was', () => {
+        expect(caretMoved(at(), at())).toBe(false);
+        /* Sub-pixel jitter is not a move. */
+        expect(caretMoved(at(), at({ x: 120.2, y: 400.1 }))).toBe(false);
+    });
+
+    it('moves on another rect, another story or an edit', () => {
+        expect(caretMoved(at(), at({ x: 140 }))).toBe(true);
+        expect(caretMoved(at(), at({ y: 436 }))).toBe(true);
+        expect(caretMoved(at(), at({ h: 48 }))).toBe(true);
+        expect(caretMoved(at(), at({ story: '{"area":"Footer","page":0}' }))).toBe(true);
+        expect(caretMoved(at(), at({ revision: 8 }))).toBe(true);
+    });
+
+    it('compares rects alone when the engine reports no revision', () => {
+        expect(caretMoved(at({ revision: undefined }), at({ revision: undefined }))).toBe(false);
     });
 });
