@@ -6483,7 +6483,12 @@ fn nearest_line(geom: &[LineGeom], x: f32, y: f32) -> Option<&LineGeom> {
 /// containing cell's left edge + content width, or the page content
 /// area for top-level paragraphs. Without this rectangle, multiple
 /// cells in the same row share `y_top` and the first-emitted line
-/// always wins (clicks in column C land in column 0).
+/// always wins (clicks in column C land in column 0). Issue #557 —
+/// `faces` measures each run's caret extent.
+// The eighth argument is the face map (#557): the frame (origin + hit
+// rectangle), the path and the sink are each independent inputs every
+// caller passes, and bundling any two would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn collect_paragraph_line_geom(
     para_box: &ParagraphBox,
     parent_origin_x: f32,
