@@ -675,6 +675,11 @@ fn read_docx_scoped(
                 para: def.para.clone(),
                 run: def.run.clone(),
                 next: def.next.clone(),
+                /* Issue #556 — the ONE style the part's last
+                `w:default="1"` paragraph style names; the engine's
+                cascade (`StyleCascade`) gives it to every paragraph
+                naming no style, as the reader's resolver did above. */
+                is_default: style_table.default_paragraph.as_deref() == Some(id.as_str()),
             },
         );
     }

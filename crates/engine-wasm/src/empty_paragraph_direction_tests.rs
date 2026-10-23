@@ -436,3 +436,56 @@ fn doc_defaults_bidi_makes_engine_minted_paragraphs_rtl() {
     };
     assert_eq!(direction, Direction::Rtl, "the document direction");
 }
+
+/// Issue #556 — a document whose `<w:bidi/>` lives only on its DEFAULT
+/// paragraph style (`Normal`) is an RTL document too: its empty unstyled
+/// paragraph resolves RTL, Enter at its end opens another RTL paragraph,
+/// typing Latin into it keeps it RTL, and a toolbar table's cells (minted
+/// by the engine, no style) follow the document default.
+#[test]
+fn a_normal_style_bidi_makes_the_document_rtl() {
+    let mut e = open(format_docx::test_fixtures::default_style_rtl_docx());
+    assert_eq!(e.paragraph_direction_at(&top(1)), ShapingDirection::Rtl);
+    place(&mut e, pos(top(1), 0));
+    let evt = e.apply_sync(Command::SplitParagraph { at: None });
+    assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+    assert_eq!(e.selection.as_ref().unwrap().caret, pos(top(2), 0));
+    assert_eq!(e.paragraph_direction_at(&top(2)), ShapingDirection::Rtl);
+    let evt = e.apply_sync(Command::InsertText {
+        at: None,
+        text: "Latin".into(),
+    });
+    let Event::SelectionChanged { direction, .. } = evt else {
+        panic!("InsertText: {evt:?}");
+    };
+    assert_eq!(
+        direction,
+        Direction::Rtl,
+        "Latin text in a Normal-RTL paragraph"
+    );
+    let dirs = a11y_dirs(&e);
+    assert_eq!(
+        dirs,
+        [
+            Direction::Rtl,
+            Direction::Rtl,
+            Direction::Rtl,
+            Direction::Rtl,
+            Direction::Rtl,
+            Direction::Ltr,
+            Direction::Ltr,
+        ],
+        "the inserted paragraph mirrors RTL; Plain and the direct LTR stay LTR"
+    );
+    let evt = e.apply_sync(Command::InsertTable {
+        at: top(3),
+        rows: 1,
+        cols: 2,
+    });
+    assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+    assert_eq!(
+        e.paragraph_direction_at(&cell(3, 0, 1)),
+        ShapingDirection::Rtl,
+        "an engine-minted cell takes the document default (docDefaults + Normal)"
+    );
+}

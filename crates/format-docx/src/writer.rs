@@ -712,7 +712,13 @@ fn emit_doc_defaults(doc: &engine::DocumentTree, out: &mut String) {
 
 /// One `<w:style w:type="paragraph">` from the model.
 fn emit_paragraph_style(id: &str, def: &engine::ParagraphStyle, out: &mut String) {
-    out.push_str("<w:style w:type=\"paragraph\" w:styleId=\"");
+    out.push_str("<w:style w:type=\"paragraph\"");
+    /* Issue #556 — the default paragraph style keeps its claim (Word's
+    attribute order: type, default, styleId). */
+    if def.is_default {
+        out.push_str(" w:default=\"1\"");
+    }
+    out.push_str(" w:styleId=\"");
     push_escaped_attr(id, out);
     out.push_str("\">");
     /* Issue #297 — the display name as read (`heading 1`), not the
@@ -1129,8 +1135,15 @@ fn serialize_paragraph_body(
         `<w:spacing>`). */
         Some(sp) if source_ppr_is_current(sp, para) => push_utf8(&sp.xml, out),
         Some(_) if spliced.is_some() => out.push_str(spliced.as_deref().unwrap_or_default()),
+        /* Issue #556 — regenerated with nothing to splice into: what
+        only the DEFAULT paragraph style gives a paragraph naming no
+        style stays on `styles.xml`. (A splice needs no such step: the
+        recorded side was cascaded through the same style, so those
+        children compare equal and keep the source's absence.) */
         sp => emit_ppr(
-            &props,
+            without_default_style(para, &props)
+                .as_ref()
+                .unwrap_or(&props),
             para.style_id.as_deref(),
             para.list_item,
             para.section_end.as_deref(),
@@ -1238,8 +1251,23 @@ fn toc_bookmark_carried(para: &Paragraph, name: &str, end: bool) -> bool {
 /// table (`serialize_paragraph` has no document in hand — the
 /// [`WRITE_DEFAULT_GEOMETRY`] pattern).
 struct InheritedDirections {
+    /// The direction of a paragraph naming no (defined) style: the
+    /// docDefaults folded with the default paragraph style (#556).
     defaults: Option<TextDirection>,
     by_style: HashMap<String, Option<TextDirection>>,
+    /// Issue #556 — the cascade WITH and WITHOUT the default paragraph
+    /// style, `None` when the document has none
+    /// ([`without_default_style`]).
+    default_style: Option<DefaultStyleLink>,
+}
+
+/// Issue #556 — what the default paragraph style adds to the cascade of
+/// a paragraph that names no style.
+struct DefaultStyleLink {
+    /// `docDefaults → default style chain` (`resolve_style_cascade(None)`).
+    with: ParaProperties,
+    /// `docDefaults` alone.
+    without: ParaProperties,
 }
 
 thread_local! {
@@ -1266,13 +1294,24 @@ fn publish_inherited_directions(
     doc: &DocumentTree,
     styles_travel: bool,
 ) -> InheritedDirectionsScope {
-    let table = styles_travel.then(|| InheritedDirections {
-        defaults: doc.style_defaults.direction,
-        by_style: doc
-            .styles
-            .keys()
-            .map(|id| (id.clone(), doc.resolve_style_cascade(Some(id)).direction))
-            .collect(),
+    let table = styles_travel.then(|| {
+        /* Issue #556 — a paragraph naming no style (or one the table
+        lacks) is formatted with the default paragraph style. */
+        let unstyled = doc.resolve_style_cascade(None);
+        InheritedDirections {
+            defaults: unstyled.direction,
+            by_style: doc
+                .styles
+                .keys()
+                .map(|id| (id.clone(), doc.resolve_style_cascade(Some(id)).direction))
+                .collect(),
+            default_style: doc.style_cascade().default_style().is_some().then(|| {
+                DefaultStyleLink {
+                    with: unstyled,
+                    without: ParaProperties::cascade([&doc.style_defaults]),
+                }
+            }),
+        }
     });
     WRITE_INHERITED_DIRECTIONS.with(|c| *c.borrow_mut() = table);
     InheritedDirectionsScope
@@ -1322,13 +1361,73 @@ fn direction_is_inherited(para: &Paragraph) -> bool {
     WRITE_INHERITED_DIRECTIONS.with(|c| {
         c.borrow().as_ref().is_some_and(|t| {
             let inherited = match para.style_id.as_deref() {
-                /* An id missing from the table breaks the chain at once:
-                the cascade is the defaults alone. */
+                /* An id missing from the table is formatted like no id
+                at all (issue #556: the default paragraph style). */
                 Some(id) => t.by_style.get(id).copied().unwrap_or(t.defaults),
                 None => t.defaults,
             };
             inherited == para.props.direction
         })
+    })
+}
+
+/// Issue #556 — `props` (a paragraph's resolved properties, about to be
+/// written as a regenerated `<w:pPr>` with no source element to splice
+/// into) without what ONLY the default paragraph style gives it: the
+/// #431 "inherited, so omit" rule for the default-style link. A
+/// paragraph that names no style — or one the document does not define
+/// — is formatted with `Normal`, and the reader folds `Normal` into its
+/// `props`; writing those values as direct formatting would pin them
+/// against a later edit of `Normal` (in Word or here) and grow every new
+/// paragraph's `<w:pPr>`. Lossless by construction: a field is left out
+/// only when the default style's chain changes it (`with != without`),
+/// the live value is exactly the inherited one and the paragraph did not
+/// set it directly (`direct_overrides`) — the re-read resolves the same
+/// value from `styles.xml`. Every field the default style does not touch
+/// is written exactly as before; borders and shading go as a whole (a
+/// paragraph mixing direct edges with the style's keeps them all), and
+/// the direction rides [`direction_is_inherited`]. The list binding is
+/// not covered (a `numPr` on the default style; the reader does not keep
+/// a direct `numPr` apart from an inherited one). `None` when nothing
+/// changes — inside [`write_docx`] only, whose output carries the style
+/// table.
+fn without_default_style(para: &Paragraph, props: &ParaProperties) -> Option<ParaProperties> {
+    WRITE_INHERITED_DIRECTIONS.with(|c| {
+        let table = c.borrow();
+        let link = table.as_ref()?.default_style.as_ref()?;
+        let names_defined_style = para
+            .style_id
+            .as_deref()
+            .is_some_and(|id| table.as_ref().is_some_and(|t| t.by_style.contains_key(id)));
+        if names_defined_style {
+            return None;
+        }
+        let direct = &para.direct_overrides;
+        let (with, without) = (&link.with, &link.without);
+        let mut p = props.clone();
+        /* Clear `$field` (to "not written") when the default style set
+        it, `p` holds exactly its value and nothing direct set it. */
+        macro_rules! omit {
+            ($($field:ident),+ ; $direct_unset:expr) => {
+                if ($(&with.$field,)+) != ($(&without.$field,)+)
+                    && ($(&p.$field,)+) == ($(&with.$field,)+)
+                    && $direct_unset
+                {
+                    $(p.$field = Default::default();)+
+                }
+            };
+        }
+        omit!(alignment; direct.alignment.is_none());
+        omit!(indent; direct.indent == engine::Indent::default());
+        omit!(spacing; direct.spacing == engine::Spacing::default());
+        omit!(line_height; direct.line_height.is_none());
+        omit!(keep_next; direct.keep_next.is_none());
+        omit!(keep_lines; direct.keep_lines.is_none());
+        omit!(page_break_before; !direct.page_break_before);
+        omit!(tab_stops; direct.tab_stops.is_empty());
+        omit!(shading, shading_pattern; direct.shading.is_none() && direct.shading_pattern.is_none());
+        omit!(borders, border_spelling; direct.borders.is_none());
+        (p != *props).then_some(p)
     })
 }
 
@@ -11929,3 +12028,9 @@ mod run_content_tests;
 #[cfg(test)]
 #[path = "writer_forbidden_chars_tests.rs"]
 mod forbidden_chars_tests;
+
+/// Issue #556 — the default paragraph style: read into every unstyled
+/// paragraph, never written back as direct formatting.
+#[cfg(test)]
+#[path = "writer_default_style_tests.rs"]
+mod default_style_tests;

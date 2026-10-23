@@ -118,7 +118,7 @@ fn the_drawn_hyphen_is_not_a_caret_stop() {
     let run = line.runs.last().expect("run");
     let hyphen = run.glyphs.last().expect("glyph");
     assert!(hyphen.synthetic);
-    let geom = build_line_run_geom(line, 0.0);
+    let geom = build_line_run_geom(line, 0.0, &FaceMap::new());
     let last = geom.last().expect("run geometry");
     let end_slot = last.slots.last().expect("end slot");
     let pen: f32 = line
