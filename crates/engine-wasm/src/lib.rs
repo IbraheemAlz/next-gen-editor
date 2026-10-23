@@ -1371,8 +1371,13 @@ impl Engine {
             .media
             .get(&rel_id)
             .map_or(0, |b| media_registry::fingerprint(&b.data));
-        self.image_cache
-            .insert(rel_id, RegisteredImage { bitmap, fingerprint });
+        self.image_cache.insert(
+            rel_id,
+            RegisteredImage {
+                bitmap,
+                fingerprint,
+            },
+        );
         /* Issue #497 — a page whose display list names this image paints
         differently now, though its scene is unchanged. */
         self.forget_painted_pages();
@@ -13096,7 +13101,9 @@ impl Engine {
             let para = tree.and_then(|t| t.paragraph_at_path(&epath));
             /* Issue #554 — the paragraph's effective base direction. */
             im.rtl = !im.floating
-                && para.is_some_and(|p| paragraph_base_direction(p, fallback_dir) == ShapingDirection::Rtl);
+                && para.is_some_and(|p| {
+                    paragraph_base_direction(p, fallback_dir) == ShapingDirection::Rtl
+                });
             let io = para.and_then(|p| p.inline_objects.iter().find(|io| io.at == im.at));
             if let Some(io) = io
                 && let engine::InlineKind::Image {
@@ -18341,9 +18348,10 @@ impl Engine {
     /// **Renderer note.** The blob lands in `DocumentTree.media`; the
     /// renderer paints a placeholder rect until the worker decodes
     /// the bytes via `createImageBitmap` and calls
-    /// `Engine::register_image(rel_id, bitmap)`. That worker-side
-    /// post-insert registration is filed alongside this handler as
-    /// a follow-up sprint deliverable.
+    /// `Engine::register_image(rel_id, bitmap)`. Issue #506 - the worker
+    /// does so right after this command's reply: it asks
+    /// [`Engine::pending_media_entries`] after every command that can
+    /// change the document, decodes the new blob and repaints.
     fn do_insert_image(
         &mut self,
         at: BridgeLogicalPos,

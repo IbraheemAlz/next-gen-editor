@@ -32,7 +32,10 @@ fn para(text: &str, explicit: Option<engine::TextDirection>) -> engine::Block {
 }
 
 /// Two paragraphs, a picture at the start of each.
-fn two_pictures(first: Option<engine::TextDirection>, second: Option<engine::TextDirection>) -> DocumentTree {
+fn two_pictures(
+    first: Option<engine::TextDirection>,
+    second: Option<engine::TextDirection>,
+) -> DocumentTree {
     let mut doc = DocumentTree::new();
     doc.blocks = vec![para("12345", first), para("67890", second)].into();
     for idx in 0..2 {
