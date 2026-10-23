@@ -4355,11 +4355,12 @@ fn build_header_footer_box(
 
 /// [`build_header_footer_box`] without its "nothing to paint" gate: lays
 /// out every block of a part, an all-empty part included (one empty line
-/// per empty paragraph, sized by its mark — issue #370). The paint path
+/// per empty paragraph, sized by its mark — issue #370). Every other part
 /// keeps the gate (an empty part paints no band and reserves no space);
-/// issue #505 — the ACTIVE story's geometry lays out an empty part
-/// through here so the caret of a freshly entered header / footer sits
-/// on the part's own first line inside the band, never on the body.
+/// issue #505 — the screen layout (`BandScope::Editing`) lays the part
+/// being EDITED out through here, so the caret of a freshly entered empty
+/// header / footer sits on the part's own first line inside the band
+/// (never on the body) and the body makes room for that line.
 #[allow(clippy::too_many_arguments)]
 fn lay_out_header_footer_box(
     blocks: &[engine::Block],
@@ -12726,16 +12727,14 @@ impl Engine {
         doc: &DocumentTree,
     ) -> Vec<((u8, String), EngineBlockPath, usize, String)> {
         let mut out: Vec<((u8, String), EngineBlockPath, usize, String)> = Vec::new();
-        let Ok((pages, _fonts, page_paths, _info)) =
-            self.build_pages_of(
-                doc.clone(),
-                self.scale(),
-                false,
-                None,
-                FieldMode::Probe,
-                BandScope::Saved,
-            )
-        else {
+        let Ok((pages, _fonts, page_paths, _info)) = self.build_pages_of(
+            doc.clone(),
+            self.scale(),
+            false,
+            None,
+            FieldMode::Probe,
+            BandScope::Saved,
+        ) else {
             return out;
         };
         let mut push = |story: (u8, String),
@@ -12983,7 +12982,11 @@ impl Engine {
                 return None;
             }
         };
-        let table = if is_header { &doc.headers } else { &doc.footers };
+        let table = if is_header {
+            &doc.headers
+        } else {
+            &doc.footers
+        };
         let empty = table.get(rid)?.iter().all(|b| match b {
             engine::Block::Paragraph(p) => p.text.is_empty(),
             engine::Block::Table(_) => false,

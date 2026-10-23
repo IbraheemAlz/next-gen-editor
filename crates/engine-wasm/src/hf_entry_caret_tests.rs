@@ -247,7 +247,10 @@ fn the_empty_band_is_a_screen_editing_band_only() {
             BandScope::Saved,
         )
         .expect("saved layout");
-    assert!(saved[0].header.is_none(), "an exported empty header has no band");
+    assert!(
+        saved[0].header.is_none(),
+        "an exported empty header has no band"
+    );
     let revision = e.undo.revision();
     e.apply_sync(Command::ExitHeaderFooter);
     assert_eq!(e.undo.revision(), revision);
