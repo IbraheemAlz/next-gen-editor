@@ -7116,34 +7116,40 @@ impl DocumentTree {
     /// never park the caret on a bare `Block(table)` path (no text
     /// consumer can resolve it).
     pub fn path_to_first_paragraph_deep(&self) -> Option<BlockPath> {
-        for (i, b) in self.blocks.iter().enumerate() {
-            match b {
-                Block::Paragraph(_) => return Some(BlockPath::top(i as u32)),
-                Block::Table(t) => {
-                    if let Some(path) = first_cell_paragraph_path(t, BlockPath::top(i as u32)) {
-                        return Some(path);
-                    }
-                }
-            }
-        }
-        None
+        first_paragraph_in_blocks(&self.blocks, &BlockPath::root())
     }
 
     /// Issue #72 (design review B6) — block-tree-aware LAST caret
     /// home; [`Self::path_to_first_paragraph_deep`]'s tail twin, used
     /// by clamp fallbacks after structural edits.
     pub fn path_to_last_paragraph_deep(&self) -> Option<BlockPath> {
-        for (i, b) in self.blocks.iter().enumerate().rev() {
-            match b {
-                Block::Paragraph(_) => return Some(BlockPath::top(i as u32)),
-                Block::Table(t) => {
-                    if let Some(path) = last_cell_paragraph_path(t, BlockPath::top(i as u32)) {
-                        return Some(path);
-                    }
-                }
-            }
-        }
-        None
+        last_paragraph_in_blocks(&self.blocks, &BlockPath::root())
+    }
+
+    /// Issue #551 — the first and the last paragraph, in document order,
+    /// inside the table cell `cell` addresses (a path ending in a `Cell`
+    /// step), through the same descent as
+    /// [`Self::path_to_first_paragraph_deep`] /
+    /// [`Self::path_to_last_paragraph_deep`]: a cell that starts (or ends)
+    /// with a nested table resolves into that table's first (last) cell,
+    /// so a cell whose only content is a nested table spans that table's
+    /// content. `None` when `cell` addresses no cell or the cell holds no
+    /// paragraph at any depth — never a `Block` path that ends at a table.
+    pub fn cell_paragraph_bounds(&self, cell: &BlockPath) -> Option<(BlockPath, BlockPath)> {
+        let PathStep::Cell { row, col } = *cell.steps.last()? else {
+            return None;
+        };
+        let table = self.table_at_path(&cell.parent())?;
+        let blocks = &table
+            .rows
+            .get(row as usize)?
+            .cells
+            .get(col as usize)?
+            .blocks;
+        Some((
+            first_paragraph_in_blocks(blocks, cell)?,
+            last_paragraph_in_blocks(blocks, cell)?,
+        ))
     }
 
     /* ============================================================
@@ -11701,27 +11707,23 @@ fn block_at_descend<'a>(block: &'a Block, steps: &[PathStep]) -> Option<&'a Bloc
     block_at_descend(next, &steps[2..])
 }
 
-/// Issue #72 (design review B6) — first cell paragraph inside `t`,
-/// path rooted at `base` (the table's own path). One nesting level:
-/// a nested table's cells are searched too, depth-first.
-fn first_cell_paragraph_path(t: &Table, base: BlockPath) -> Option<BlockPath> {
-    for (ri, row) in t.rows.iter().enumerate() {
-        for (ci, cell) in row.cells.iter().enumerate() {
-            for (bi, b) in cell.blocks.iter().enumerate() {
-                let child = base
-                    .clone()
-                    .push(PathStep::Cell {
-                        row: ri as u32,
-                        col: ci as u32,
-                    })
-                    .push(PathStep::Block(bi as u32));
-                match b {
-                    Block::Paragraph(_) => return Some(child),
-                    Block::Table(nested) => {
-                        if let Some(p) = first_cell_paragraph_path(nested, child) {
-                            return Some(p);
-                        }
-                    }
+/// Issue #72 (design review B6) / #551 — the first paragraph, in
+/// document order, among `blocks` (the container `base` addresses: the
+/// root for a body or story, a `Cell`-terminated path for a cell),
+/// descending into a table's cells row by row, depth-first. The ONE
+/// "first caret home" descent: the document's, a story's and a cell's
+/// (`DocumentTree::cell_paragraph_bounds`) all go through it.
+fn first_paragraph_in_blocks<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    base: &BlockPath,
+) -> Option<BlockPath> {
+    for (bi, b) in blocks.into_iter().enumerate() {
+        let child = base.clone().push(PathStep::Block(bi as u32));
+        match b {
+            Block::Paragraph(_) => return Some(child),
+            Block::Table(t) => {
+                if let Some(p) = first_cell_paragraph_path(t, &child) {
+                    return Some(p);
                 }
             }
         }
@@ -11729,26 +11731,53 @@ fn first_cell_paragraph_path(t: &Table, base: BlockPath) -> Option<BlockPath> {
     None
 }
 
+/// Tail twin of [`first_paragraph_in_blocks`].
+fn last_paragraph_in_blocks<'a, I>(blocks: I, base: &BlockPath) -> Option<BlockPath>
+where
+    I: IntoIterator<Item = &'a Block>,
+    I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
+{
+    for (bi, b) in blocks.into_iter().enumerate().rev() {
+        let child = base.clone().push(PathStep::Block(bi as u32));
+        match b {
+            Block::Paragraph(_) => return Some(child),
+            Block::Table(t) => {
+                if let Some(p) = last_cell_paragraph_path(t, &child) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// First cell paragraph inside `t` (path rooted at `base`, the table's
+/// own path): each cell through [`first_paragraph_in_blocks`].
+fn first_cell_paragraph_path(t: &Table, base: &BlockPath) -> Option<BlockPath> {
+    for (ri, row) in t.rows.iter().enumerate() {
+        for (ci, cell) in row.cells.iter().enumerate() {
+            let cell_base = base.clone().push(PathStep::Cell {
+                row: ri as u32,
+                col: ci as u32,
+            });
+            if let Some(p) = first_paragraph_in_blocks(&cell.blocks, &cell_base) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 /// Tail twin of [`first_cell_paragraph_path`].
-fn last_cell_paragraph_path(t: &Table, base: BlockPath) -> Option<BlockPath> {
+fn last_cell_paragraph_path(t: &Table, base: &BlockPath) -> Option<BlockPath> {
     for (ri, row) in t.rows.iter().enumerate().rev() {
         for (ci, cell) in row.cells.iter().enumerate().rev() {
-            for (bi, b) in cell.blocks.iter().enumerate().rev() {
-                let child = base
-                    .clone()
-                    .push(PathStep::Cell {
-                        row: ri as u32,
-                        col: ci as u32,
-                    })
-                    .push(PathStep::Block(bi as u32));
-                match b {
-                    Block::Paragraph(_) => return Some(child),
-                    Block::Table(nested) => {
-                        if let Some(p) = last_cell_paragraph_path(nested, child) {
-                            return Some(p);
-                        }
-                    }
-                }
+            let cell_base = base.clone().push(PathStep::Cell {
+                row: ri as u32,
+                col: ci as u32,
+            });
+            if let Some(p) = last_paragraph_in_blocks(&cell.blocks, &cell_base) {
+                return Some(p);
             }
         }
     }
