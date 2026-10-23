@@ -13,14 +13,29 @@
 //! | `WrongPassword`                                       | `WrongPassword`       |
 //! | `MalformedXml`, `Xml`, `XmlAttr`, `Utf8`              | `DocumentUnreadable`  |
 //! | `Zip`, `MissingEntry`, `UnsafePartName`               | `DocumentUnreadable`  |
-//! | `CompoundFile` (a legacy `.doc`), `Io`                | `InvalidDocument`     |
+//! | `CompoundFile`, `Io`                                  | `InvalidDocument`     |
+//!
+//! Issue #567 — a legacy Word 97-2003 `.doc` no longer reaches the
+//! `CompoundFile` row (the engine routes every non-encrypted compound file
+//! to `format-doc` before the `.docx` reader sees it); its failures are
+//! classified by [`doc_open_error_event`]:
+//!
+//! | `format_doc::DocError`                                | `ErrorKind`           |
+//! |-------------------------------------------------------|-----------------------|
+//! | `Encrypted` (`FibBase.fEncrypted`)                    | `EncryptedDocument`   |
+//! | `Container`, `Malformed`                              | `DocumentUnreadable`  |
+//! | `TooLarge`                                            | `PackageTooLarge`     |
+//! | `NotWordDocument` (`.xls`, `.ppt`, …), `UnsupportedVersion` (Word 6/95) | `InvalidDocument` |
 //!
 //! A `DocumentUnreadable` message is `<origin>: <part>: <detail>` and is
 //! SCRUBBED: it names the part and an offset, never document bytes (a tag
 //! name, a namespace prefix or URI, a quick-xml cause that quotes them) —
 //! the shell shows it verbatim in the File menu banner and the Dev HUD.
+//! `format-doc`'s messages are built that way (a stream / structure name,
+//! a fixed phrase, numbers) and are bounded here like the others.
 
 use bridge::{ErrorKind, Event};
+use format_doc::DocError;
 use format_docx::DocxError;
 
 /// Longest scrubbed detail kept (the shell shows it in a banner).
@@ -63,6 +78,30 @@ pub(crate) fn open_error_event(origin: &str, e: &DocxError) -> Event {
         ),
         DocxError::CompoundFile | DocxError::Io(_) => (ErrorKind::InvalidDocument, e.to_string()),
     };
+    Event::Error {
+        message: format!("{origin}: {message}"),
+        kind: Some(kind),
+        command: None,
+    }
+}
+
+/// Issue #567 — the `Event::Error` a `.doc` open that failed with `e`
+/// answers (the second table in the module docs).
+pub(crate) fn doc_open_error_event(origin: &str, e: &DocError) -> Event {
+    let kind = match e {
+        DocError::Encrypted => ErrorKind::EncryptedDocument,
+        DocError::Container { .. } | DocError::Malformed { .. } => ErrorKind::DocumentUnreadable,
+        DocError::TooLarge { .. } => ErrorKind::PackageTooLarge,
+        DocError::NotWordDocument | DocError::UnsupportedVersion { .. } => {
+            ErrorKind::InvalidDocument
+        }
+    };
+    let message: String = e
+        .to_string()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_DETAIL_CHARS)
+        .collect();
     Event::Error {
         message: format!("{origin}: {message}"),
         kind: Some(kind),
@@ -228,6 +267,53 @@ mod tests {
             part: Some("word/document.xml".into()),
         });
         assert_eq!(k, Some(ErrorKind::PackageTooLarge));
+    }
+
+    /// Issue #567 — every `.doc` failure class has its kind; a damaged one
+    /// names the stream and structure.
+    #[test]
+    fn doc_failures_are_classified_by_the_second_table() {
+        let k = |e: &DocError| match doc_open_error_event("OpenDocument", e) {
+            Event::Error { kind, message, .. } => (kind, message),
+            other => panic!("expected an Error, got {other:?}"),
+        };
+        assert_eq!(
+            k(&DocError::Encrypted).0,
+            Some(ErrorKind::EncryptedDocument)
+        );
+        let (kind, message) = k(&DocError::Malformed {
+            part: "1Table: Clx".into(),
+            detail: "the piece CPs are not in ascending order".into(),
+        });
+        assert_eq!(kind, Some(ErrorKind::DocumentUnreadable));
+        assert_eq!(
+            message,
+            "OpenDocument: 1Table: Clx: the piece CPs are not in ascending order"
+        );
+        let (kind, message) = k(&DocError::Container {
+            stream: Some("WordDocument"),
+            detail: "sector chain loops",
+        });
+        assert_eq!(kind, Some(ErrorKind::DocumentUnreadable));
+        assert!(message.contains("WordDocument"), "{message}");
+        assert_eq!(
+            k(&DocError::TooLarge {
+                what: "the number of paragraphs",
+                max: 1
+            })
+            .0,
+            Some(ErrorKind::PackageTooLarge)
+        );
+        assert_eq!(
+            k(&DocError::NotWordDocument).0,
+            Some(ErrorKind::InvalidDocument)
+        );
+        let (kind, message) = k(&DocError::UnsupportedVersion {
+            w_ident: 0xA5DC,
+            n_fib: 0x65,
+        });
+        assert_eq!(kind, Some(ErrorKind::InvalidDocument));
+        assert!(message.contains("Word 6.0/95"), "{message}");
     }
 
     #[test]

@@ -73,6 +73,11 @@ export function docFormatForFileName(name: string | undefined): DocFormat {
         case 'htm':
         case 'xhtml':
             return 'html';
+        /* Issue #567 — a legacy Word 97-2003 `.doc` / `.dot` travels as
+         * `docx` too: the engine tells the formats apart by their bytes
+         * (a compound file vs a ZIP), never by the name. */
+        case 'doc':
+        case 'dot':
         default:
             return 'docx';
     }

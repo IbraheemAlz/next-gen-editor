@@ -7,7 +7,9 @@
  *   - **Open** → hidden file input → `Command::OpenDocument`. Issue #339 —
  *     `.docx`, `.txt` and `.html` / `.htm` are all engine-real; the format
  *     comes from the file name (`docFormatForFileName`), so no entry here
- *     needs an "Engine pending" badge.
+ *     needs an "Engine pending" badge. Issue #567 — so is a legacy `.doc`
+ *     (a read-only import; what it does not carry over is listed by the
+ *     open-warnings banner, and the save names the download `.docx`).
  *   - **Save** → `Command::SaveDocument { format: Docx }`. Bound to
  *     `Ctrl/Cmd+S` globally.
  *   - **Export PDF** → `Command::ExportPdf { conformance }`. All four
@@ -53,10 +55,15 @@ import { openErrorMessage } from './openErrorCopy';
 import './FileMenu.css';
 
 /** Issue #339 — every format `OpenDocument` implements (see
- *  `docFormatForFileName` in @nge/core for the extension mapping). */
+ *  `docFormatForFileName` in @nge/core for the extension mapping). Issue
+ *  #567 — a legacy Word 97-2003 `.doc` is engine-real too (read-only
+ *  import; the engine routes it by its compound-file signature, a save
+ *  writes `.docx`). */
 const OPEN_ACCEPT = [
     '.docx',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.doc',
+    'application/msword',
     '.txt',
     'text/plain',
     '.html',
@@ -311,7 +318,7 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                 onClick={() => fileInput?.click()}
                             >
                                 <span>Open…</span>
-                                <span class="nge-fm__shortcut">.docx · .txt · .html</span>
+                                <span class="nge-fm__shortcut">.docx · .doc · .txt · .html</span>
                             </button>
                         </li>
                         <li role="none">

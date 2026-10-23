@@ -10,6 +10,10 @@
  * and lists them under "Details" (`createEditorState().openWarnings()`,
  * worded by `@nge/core`'s `describeReadWarning()`).
  *
+ * Issue #567 — a document imported from a legacy Word 97-2003 `.doc` says
+ * so in the summary (`openWarningSummary`) and lists each class of content
+ * the importer does not model yet (`LegacyContentNotImported`).
+ *
  * A clean open shows nothing. Dismissing hides the banner for THIS open's
  * report; the next open with warnings shows it again. `role="status"`:
  * informational, not an alert — the document is open and editable.
@@ -19,6 +23,7 @@ import {
     createEditorState,
     describeReadWarning,
     openWarningCount,
+    openWarningSummary,
     type ReadWarning,
 } from '@nge/core';
 import './OpenWarningsBanner.css';
@@ -47,10 +52,7 @@ export const OpenWarningsBanner: Component = () => {
                     <strong class="nge-open-warnings__title">
                         Opened with {count()} {count() === 1 ? 'issue' : 'issues'}
                     </strong>
-                    <p class="nge-open-warnings__summary">
-                        Some values in this file could not be read as written and were
-                        corrected or ignored.
-                    </p>
+                    <p class="nge-open-warnings__summary">{openWarningSummary(warnings())}</p>
                     <details class="nge-open-warnings__details">
                         <summary class="nge-open-warnings__toggle">Details</summary>
                         <ul class="nge-open-warnings__list">

@@ -89,4 +89,20 @@ fn main() {
         "regen-seeds: done — {} snapshot_decode seed(s) rewritten",
         seeds.len()
     );
+    /* Issue #567 — the `doc_reader` seeds, pinned by
+    `tests::doc_seeds_are_committed`. */
+    let doc_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/doc_reader");
+    std::fs::create_dir_all(&doc_dir)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", doc_dir.display()));
+    let doc_seeds = engine_fuzz::doc_gen::doc_seeds();
+    for (name, bytes) in &doc_seeds {
+        let path = doc_dir.join(name);
+        std::fs::write(&path, bytes)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        println!("wrote {} ({} bytes)", path.display(), bytes.len());
+    }
+    println!(
+        "regen-seeds: done — {} doc_reader seed(s) rewritten",
+        doc_seeds.len()
+    );
 }

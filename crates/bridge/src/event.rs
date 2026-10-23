@@ -959,6 +959,13 @@ pub enum ReadWarningKind {
     /// regenerate-only on save — else read as it is (the detail says
     /// which).
     MalformedPart,
+    /// Issue #567 — the document was imported from the legacy Word
+    /// 97-2003 binary format (`.doc`, `format-doc`) and a class of its
+    /// content is not imported yet (tables read as plain paragraphs, list
+    /// markers, pictures, fields kept as their last result, headers /
+    /// footers, notes, comments, text boxes, styles and fonts); the detail
+    /// names the class, the count how many. A save writes a `.docx`.
+    LegacyContentNotImported,
 }
 
 /// Issue #485 - one coalesced write decision on
