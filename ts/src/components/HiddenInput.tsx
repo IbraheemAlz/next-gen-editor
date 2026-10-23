@@ -66,7 +66,17 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         }
     });
 
-    const focus = (): void => ref?.focus();
+    /* Issue #510 — `preventScroll`: the textarea sits at the CARET, so a
+       plain `focus()` scrolled `.editor-viewport` back to the caret on
+       every refocus. A double-click in the footer band of a page scrolled
+       to its bottom lost its second half that way: the first press was
+       swallowed by the band gate, its pointerup re-grabbed focus and
+       jumped the view to the caret at the top of the page, and the second
+       press + `dblclick` landed on the body under the pointer (a word
+       selection instead of entering the footer). Keeping the caret in
+       view is the caret reveal's job (`CaretReveal`, issue #387), which
+       knows when the user asked for it. */
+    const focus = (): void => ref?.focus({ preventScroll: true });
 
     /* Focus stewardship (issues #35/#49). A canvas click blurs focus to
        <body> via the mousedown default, so the textarea re-grabs it on

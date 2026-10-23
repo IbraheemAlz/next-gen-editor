@@ -46,7 +46,8 @@ function refocusHiddenInput(): void {
     if (!input) return;
     const a = document.activeElement;
     if (a && a !== document.body && a !== input) return;
-    input.focus();
+    /* Issue #510 — the textarea sits at the caret; never scroll to it. */
+    input.focus({ preventScroll: true });
 }
 
 /** Write the selection to the clipboard as `text/plain` + `text/html`.

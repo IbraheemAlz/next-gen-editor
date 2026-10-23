@@ -433,6 +433,16 @@ export function createEngineStore(client: EngineClient) {
         tops: number[];
         bottoms: number[];
     } | null>(null);
+    /* Issue #505 — reactive twin of `latestContentExtents` (page-local
+       device px of each page's EFFECTIVE body top / bottom edge: the
+       margins pushed inward by a band that overflows them). The story
+       overlay outlines the band the zone gate tests against, so the
+       band you double-click, the band that lights up and the band the
+       entry caret sits in are one region. */
+    const [contentGeometry, setContentGeometry] = createSignal<{
+        tops: number[];
+        bottoms: number[];
+    } | null>(null);
     let nodes: A11yNode[] = [];
     let announced = false;
 
@@ -550,6 +560,7 @@ export function createEngineStore(client: EngineClient) {
                     tops: ev.page_content_tops,
                     bottoms: ev.page_content_bottoms,
                 };
+                setContentGeometry(latestContentExtents);
             }
             /* Issue #44 — refresh inline-image geometry after a paint so
                the resize-handle overlay tracks images through edits,
@@ -640,6 +651,9 @@ export function createEngineStore(client: EngineClient) {
         /* Issue #77 — Alt+F9 field-code view flag. */
         fieldCodeView: fieldCodeViewSig,
         marginGeometry,
+        /** Issue #505 — effective body extents per page (device px,
+         *  page-local), `null` before a paginated paint. */
+        contentGeometry,
         /** Issue #280 — the engine's user zoom (reactive). */
         zoom: engineZoomSig,
         /** Issue #280 — device px per CSS px at the last paint (the

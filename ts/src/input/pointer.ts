@@ -153,11 +153,14 @@ export function attachPointer(
             return;
         }
         /* Phase 3 (#39) — header/footer zone gate, BEFORE any caret
-           placement (mirrors the image-hit early-return below): a press
-           in a vertical margin band must not clobber the body caret the
-           engine is about to stash on EnterHeaderFooter (the dblclick's
-           two constituent single-clicks land here first). Rules:
-           - body mode + press in a band → swallow (dblclick enters);
+           placement (mirrors the image-hit early-return below). Rules:
+           - body mode + press in a band → an ordinary body press
+             (issue #510, Word / the OnlyOffice methods memo §2: a single
+             click in a margin band resolves to the nearest body line;
+             the dblclick that follows enters the band, and Esc later
+             restores that caret). It used to be swallowed so the body
+             caret survived for the entry stash — which also left the
+             press without any visible effect;
            - story mode + press in the ACTIVE story's own band on its
              anchor page → fall through (caret placement inside the
              band; the engine clamps to the story);
@@ -170,8 +173,8 @@ export function attachPointer(
            - story mode + press on the dimmed body → swallow (dblclick
              exits — Word semantics);
            - issue #80 NOTE story mode (footnote / endnote) → a press in
-             a margin band is swallowed like in body mode (dblclick
-             enters the band); any other press falls through to
+             a margin band is swallowed (dblclick enters the band); any
+             other press falls through to
              PLACE_CARET_AT_POINT, which the engine routes itself
              (inside a note band → that note, elsewhere → back to the
              body at the point). */
@@ -198,9 +201,6 @@ export function attachPointer(
                     }
                     return;
                 }
-            } else if (zone !== null) {
-                gesture += 1;
-                return;
             }
         }
         /* Issue #44 — a primary press on an inline image body selects
@@ -256,8 +256,13 @@ export function attachPointer(
         gesture += 1;
         /* Phase 3 (#39) — double-click routing (the Word affordance):
            - a band while NOT already editing that exact band+page →
-             ENTER_HEADER_FOOTER for this page's section;
-           - the body content area while a story is active → exit;
+             ENTER_HEADER_FOOTER for this page's section (the engine
+             materialises an absent part, like the toolbar button);
+           - the body content area while a story is active → exit AND
+             place the body caret at the click (issue #510, Word / the
+             OnlyOffice methods memo §2) — both posted synchronously, so
+             the worker queue applies them in order and a keystroke
+             queued behind them types at the clicked spot;
            - the ACTIVE band → fall through to word selection (the
              critic-flagged hijack: in-band dblclick must keep its
              editing affordance). */
@@ -280,6 +285,7 @@ export function attachPointer(
             void client.dispatch({ type: 'EXIT_HEADER_FOOTER' }).catch((err: unknown) => {
                 console.error('exitHeaderFooter failed', err);
             });
+            placeCaret(toLocal(e));
             return;
         }
         void client.dispatch({ type: 'SELECT_WORD_AT', at: toGlobal(e) });

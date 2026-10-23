@@ -491,9 +491,18 @@ command_meta! {
     SetColumns { .. } => M::FORMAT.body_only() ; (),
     InsertPageBreak { .. } => M::EDIT.body_only() ; (),
     InsertSectionBreak { .. } => M::EDIT.body_only() ; (),
-    // Issue #387 — entered by a double-click on the band.
-    EnterHeaderFooter { .. } => M::SELECT.no_reveal() ; (),
-    ExitHeaderFooter => M::SELECT ; (),
+    // Issue #505 — reveals: the toolbar's Header / Footer buttons enter
+    // a band that may be off screen (a footer below the viewport), and
+    // Word scrolls the entry caret into view. A double-click entry parks
+    // the caret on the band under the pointer, so its reveal at most
+    // nudges the view by the reveal margin.
+    EnterHeaderFooter { .. } => M::SELECT ; (),
+    // Issue #510 — leaving a band never scrolls: the shell's body
+    // double-click exit places the caret under the pointer right behind
+    // it (`PlaceCaretAtPoint`), and revealing the restored body selection
+    // first would scroll the view away from where the user clicked (Esc /
+    // Close keep the view too; the next keystroke reveals the caret).
+    ExitHeaderFooter => M::SELECT.no_reveal() ; (),
     SetHeaderFooterLink { .. } => M::FORMAT ; (),
     SetTitlePage { .. } => M::FORMAT ; (),
     SetEvenOddHeaders { .. } => M::FORMAT ; (),
@@ -809,6 +818,7 @@ mod tests {
             K::Redo,
             K::EndComposition,
             K::SetSelection,
+            K::EnterHeaderFooter,
         ] {
             assert!(k.meta().reveals_caret, "{k:?} reveals the caret");
         }
@@ -818,7 +828,7 @@ mod tests {
             K::SelectWordAt,
             K::SelectParagraphAt,
             K::SelectCellAt,
-            K::EnterHeaderFooter,
+            K::ExitHeaderFooter,
             K::SelectAll,
             K::SetZoom,
             K::SetDeviceScale,

@@ -756,9 +756,30 @@ struct LayoutSnapshot {
     /// Issue #77 — the Alt+F9 view lays out a DIFFERENT document (the
     /// field-code derivation) at the same undo revision.
     code_view: bool,
+    /// Issue #505 — the EMPTY header / footer part being edited (laid
+    /// out as a band while it is the active story, see
+    /// [`Engine::active_empty_part`]); entering or leaving it changes no
+    /// undo revision.
+    active_empty_part: Option<(String, bool)>,
     pages: Vec<PageBox>,
     page_paths: Vec<Vec<EngineBlockPath>>,
     info: LazyLayoutInfo,
+}
+
+/// Issue #505 — which header / footer parts [`Engine::build_pages_of`]
+/// lays out as bands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BandScope {
+    /// The document as saved: a part with nothing to paint (no table,
+    /// no text) gets no band and reserves no space (PDF export, the
+    /// field restamp) — whatever the screen is editing.
+    Saved,
+    /// The screen: as `Saved`, plus the active header / footer story's
+    /// part even when it is empty — one empty line per paragraph at the
+    /// header / footer distance (Word's empty header paragraph), so the
+    /// entry caret sits on the part's own line inside the band and the
+    /// body makes room for it.
+    Editing,
 }
 
 /// Issue #77 — how [`Engine::build_pages_of`] treats fields.
@@ -4394,6 +4415,39 @@ fn build_header_footer_box(
     if !has_content {
         return None;
     }
+    Some(lay_out_header_footer_box(
+        blocks,
+        content_width,
+        fonts,
+        cfg,
+        scale,
+        sctx,
+        cache,
+        source_rid,
+        composition,
+    ))
+}
+
+/// [`build_header_footer_box`] without its "nothing to paint" gate: lays
+/// out every block of a part, an all-empty part included (one empty line
+/// per empty paragraph, sized by its mark — issue #370). Every other part
+/// keeps the gate (an empty part paints no band and reserves no space);
+/// issue #505 — the screen layout (`BandScope::Editing`) lays the part
+/// being EDITED out through here, so the caret of a freshly entered empty
+/// header / footer sits on the part's own first line inside the band
+/// (never on the body) and the body makes room for that line.
+#[allow(clippy::too_many_arguments)]
+fn lay_out_header_footer_box(
+    blocks: &[engine::Block],
+    content_width: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LayoutCache,
+    source_rid: Option<&str>,
+    composition: Option<&CompositionState>,
+) -> layout::HeaderFooterBox {
     let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
     for (block_idx, block) in blocks.iter().enumerate() {
@@ -4530,10 +4584,10 @@ fn build_header_footer_box(
         y += lb.size().height;
         out.push(lb);
     }
-    Some(layout::HeaderFooterBox {
+    layout::HeaderFooterBox {
         blocks: out,
         source_rid: source_rid.map(str::to_string),
-    })
+    }
 }
 
 /// Phase 6 — walk a freshly laid-out `TableBox` and stamp every nested
@@ -10457,11 +10511,13 @@ impl Engine {
         /* The inputs the LAYOUT depends on; the cull target and the
         viewport height only decide how deep the band goes. */
         let code_view = self.field_code_view;
+        let active_empty_part = self.active_empty_part();
         let same_layout_inputs = |s: &LayoutSnapshot| {
             s.doc_revision == doc_revision
                 && s.scale_bits == scale_bits
                 && s.composition_active == composition_active
                 && s.code_view == code_view
+                && s.active_empty_part == active_empty_part
         };
         {
             let snap = self.layout_snapshot.borrow();
@@ -10522,6 +10578,7 @@ impl Engine {
             viewport_h_bits,
             composition_active,
             code_view,
+            active_empty_part,
             pages,
             page_paths,
             info,
@@ -10577,7 +10634,14 @@ impl Engine {
         } else {
             FieldMode::Resolved
         };
-        self.build_pages_of(self.layout_doc(), scale, with_composition, target_y, mode)
+        self.build_pages_of(
+            self.layout_doc(),
+            scale,
+            with_composition,
+            target_y,
+            mode,
+            BandScope::Editing,
+        )
     }
 
     /// [`Self::build_pages`] over an explicit document and
@@ -10599,7 +10663,7 @@ impl Engine {
     /// object's per-object forward-move cap, its watchdog churn ladder
     /// and a hard pass cap; every escape is a reported
     /// `LayoutDegradeReason` on the final pass's notes.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn build_pages_of(
         &self,
         doc: DocumentTree,
@@ -10607,6 +10671,7 @@ impl Engine {
         with_composition: bool,
         target_y: Option<f32>,
         mode: FieldMode,
+        bands: BandScope,
     ) -> Result<
         (
             Vec<PageBox>,
@@ -10626,6 +10691,7 @@ impl Engine {
                 with_composition,
                 target_y,
                 mode,
+                bands,
                 &plan,
                 markers,
             )?;
@@ -10645,6 +10711,7 @@ impl Engine {
                             with_composition,
                             target_y,
                             mode,
+                            bands,
                             &plan,
                             markers,
                         )?;
@@ -10844,6 +10911,7 @@ impl Engine {
         with_composition: bool,
         target_y: Option<f32>,
         mode: FieldMode,
+        bands: BandScope,
         plan: &layout::WrapPlan,
         markers: Option<&HashMap<engine::NoteAnchor, String>>,
     ) -> Result<
@@ -11108,13 +11176,26 @@ impl Engine {
                                 is_header: bool|
              -> Option<layout::HeaderFooterBox> {
                 let rid = slot?;
-                let comp = story_comp
-                    .filter(|(story_rid, story_is_header)| {
-                        *story_rid == rid && *story_is_header == is_header
-                    })
-                    .and(composition);
+                let active = story_comp.is_some_and(|(story_rid, story_is_header)| {
+                    story_rid == rid && story_is_header == is_header
+                });
+                let comp = composition.filter(|_| active);
+                let blocks = table.get(rid)?;
+                if active && bands == BandScope::Editing {
+                    return Some(lay_out_header_footer_box(
+                        blocks,
+                        content_w,
+                        &font_stack,
+                        &cfg,
+                        scale,
+                        sctx,
+                        &mut cache,
+                        Some(rid),
+                        comp,
+                    ));
+                }
                 build_header_footer_box(
-                    table.get(rid)?,
+                    blocks,
                     content_w,
                     &font_stack,
                     &cfg,
@@ -12036,6 +12117,7 @@ impl Engine {
             false,
             None,
             FieldMode::Resolved,
+            BandScope::Saved,
         ) {
             Ok(v) => v,
             Err(e) => return *e,
@@ -12814,9 +12896,14 @@ impl Engine {
         doc: &DocumentTree,
     ) -> Vec<((u8, String), EngineBlockPath, usize, String)> {
         let mut out: Vec<((u8, String), EngineBlockPath, usize, String)> = Vec::new();
-        let Ok((pages, _fonts, page_paths, _info)) =
-            self.build_pages_of(doc.clone(), self.scale(), false, None, FieldMode::Probe)
-        else {
+        let Ok((pages, _fonts, page_paths, _info)) = self.build_pages_of(
+            doc.clone(),
+            self.scale(),
+            false,
+            None,
+            FieldMode::Probe,
+            BandScope::Saved,
+        ) else {
             return out;
         };
         let mut push = |story: (u8, String),
@@ -13000,6 +13087,9 @@ impl Engine {
         let Some(page) = pages.get(idx) else {
             return Ok(geom);
         };
+        /* Issue #505 — the active part has a band on its pages even when
+        it is empty (`build_pages_pass` lays it out for the screen), so
+        an entered empty header / footer has its line here. */
         let band = if header { &page.header } else { &page.footer };
         let Some(band) = band else {
             return Ok(geom);
@@ -13043,6 +13133,34 @@ impl Engine {
             }
         }
         Ok(geom)
+    }
+
+    /// Issue #505 — `(rid, is_header)` of the active header / footer
+    /// story when its part is EMPTY (no table, every paragraph without
+    /// text: [`build_header_footer_box`]'s "nothing to paint" gate).
+    /// The screen layout lays such a part out anyway while it is being
+    /// edited (one empty line per paragraph at the header / footer
+    /// distance), so the layout memo must miss when it changes; a part
+    /// with content lays out the same in or out of the story.
+    fn active_empty_part(&self) -> Option<(String, bool)> {
+        let doc = self.undo.current();
+        let (rid, is_header) = match &self.active_story {
+            StoryTarget::Header { rid, .. } => (rid, true),
+            StoryTarget::Footer { rid, .. } => (rid, false),
+            StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => {
+                return None;
+            }
+        };
+        let table = if is_header {
+            &doc.headers
+        } else {
+            &doc.footers
+        };
+        let empty = table.get(rid)?.iter().all(|b| match b {
+            engine::Block::Paragraph(p) => p.text.is_empty(),
+            engine::Block::Table(_) => false,
+        });
+        empty.then(|| (rid.clone(), is_header))
     }
 
     /// Flatten the current document into per-line hit-test geometry. PR 4:
@@ -14161,6 +14279,55 @@ impl Engine {
     }
 
     /// Assemble a `SelectionChanged` event from the current selection.
+    /// The caret rectangle `selection_changed` reports when the active
+    /// document has no laid-out line at all (an empty body before the
+    /// first paint, a story whose band could not be laid out). Issue
+    /// #505 — story-aware: a header / footer story falls back to a line
+    /// at the header distance from the top / footer distance from the
+    /// bottom of its anchor page, never to the body margin of page 0
+    /// (the overlay then sat on the body, outside the band being edited).
+    fn caret_fallback_rect(&self) -> BridgeRect {
+        let scale = self.scale();
+        let w = CARET_WIDTH * scale;
+        let h = self.layout_cfg.as_ref().map_or(16.0, |c| c.line_height) * scale;
+        let band = match &self.active_story {
+            StoryTarget::Header { page, .. } => Some((*page, true)),
+            StoryTarget::Footer { page, .. } => Some((*page, false)),
+            StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => None,
+        };
+        if let Some((page_idx, header)) = band {
+            let snap_cell = self.layout_snapshot.borrow();
+            if let Some(pages) = snap_cell.as_ref().map(|s| &s.pages)
+                && let Some(last) = pages.len().checked_sub(1)
+            {
+                let gap = render::scene::PAGE_GAP_PT * scale;
+                let idx = (page_idx as usize).min(last);
+                let page_top: f32 = pages[..idx].iter().map(|p| p.size.height + gap).sum();
+                let page = &pages[idx];
+                /* `footer_band_top` of a one-line band (`h`) — the band
+                bottom-anchors at the footer distance. */
+                let y = if header {
+                    page.header_band_top()
+                } else {
+                    page.size.height - page.footer_offset - h
+                };
+                return BridgeRect {
+                    x: page.margins.left,
+                    y: page_top + y,
+                    w,
+                    h,
+                };
+            }
+        }
+        let page = A4Page::a4().scaled(scale);
+        BridgeRect {
+            x: page.margin.left,
+            y: page.margin.top,
+            w,
+            h,
+        }
+    }
+
     fn selection_changed(&self) -> Event {
         let Some(sel) = self.selection.clone() else {
             return Event::error_kind(
@@ -14174,13 +14341,7 @@ impl Engine {
         };
         let (start, end) = ordered(sel.anchor.clone(), sel.caret.clone());
         let scale = self.scale();
-        let page = A4Page::a4().scaled(scale);
-        let fallback = BridgeRect {
-            x: page.margin.left,
-            y: page.margin.top,
-            w: CARET_WIDTH * scale,
-            h: self.layout_cfg.as_ref().map_or(16.0, |c| c.line_height) * scale,
-        };
+        let fallback = self.caret_fallback_rect();
         let rects = match &sel.kind {
             SelectionKind::TableCells {
                 table_path,
@@ -16369,7 +16530,14 @@ impl Engine {
         };
         let measure = |d: &DocumentTree| -> Refs {
             let (pages, _fonts, page_paths, _info) = self
-                .build_pages_of(d.clone(), self.scale(), false, None, FieldMode::Probe)
+                .build_pages_of(
+                    d.clone(),
+                    self.scale(),
+                    false,
+                    None,
+                    FieldMode::Probe,
+                    BandScope::Saved,
+                )
                 .ok()?;
             let mut first_page: HashMap<u32, usize> = HashMap::new();
             for (pi, paths) in page_paths.iter().enumerate() {
@@ -26952,6 +27120,7 @@ mod tests {
                 false,
                 None,
                 FieldMode::Resolved,
+                BandScope::Saved,
             )
             .expect("export layout");
         let f0 = pages[0].footer.as_ref().expect("footer");
@@ -30813,6 +30982,11 @@ mod revision_address_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
+
+/// Issue #505 — the entry caret of an (empty) header / footer sits inside
+/// the band of the entered page (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod hf_entry_caret_tests;
 
 /// Issue #355 — theme fonts / colours through read → layout.
 #[cfg(test)]
