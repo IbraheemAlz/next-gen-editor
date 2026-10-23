@@ -107,10 +107,11 @@ struct RenderConfig {
 /// Issue #498 - the editor shell's boot layout config, the values
 /// `ts/src/App.tsx` sends in its boot `RENDER_PAGE`: 24 px text on 36 px
 /// lines (logical; the line pitch itself is the font-derived one since
-/// #475, this is the nominal fallback), start alignment, an RTL document
-/// base (the seed paragraph is Arabic + Latin; it is the direction a
-/// paragraph with no strong character falls back to, and it routes an
-/// empty paragraph's mark through the complex-script size).
+/// #475, this is the nominal fallback), start alignment, an LTR document
+/// base (issue #552: Word's default - the direction a paragraph with no
+/// direction of its own, no strong character and no `<w:docDefaults>`
+/// `<w:bidi>` falls back to; it was RTL, which laid every empty paragraph
+/// and table cell out right to left in a Latin document).
 #[cfg(any(test, feature = "fuzz-native"))]
 const SHELL_PX_SIZE: f32 = 24.0;
 #[cfg(any(test, feature = "fuzz-native"))]
@@ -138,13 +139,30 @@ impl RenderConfig {
     fn shell_default() -> Self {
         Self {
             font_id: SHELL_SEED_FONT_ID.to_string(),
-            base_direction: ShapingDirection::Rtl,
+            base_direction: ShapingDirection::Ltr,
             px_size: SHELL_PX_SIZE,
             line_height: SHELL_LINE_HEIGHT,
             alignment: Alignment::Start,
             scale: SHELL_BASE_SCALE,
             base_scale: SHELL_BASE_SCALE,
             zoom: 1.0,
+        }
+    }
+}
+
+impl RenderConfig {
+    /// Issue #552 — this config with `base_direction` resolved for `doc`
+    /// ([`document_base_direction`]: the document's `<w:docDefaults>`
+    /// direction, else the boot base). Every layout pass and every
+    /// direction read-back (caret, toolbar, a11y mirror) runs on it, so a
+    /// paragraph with no direction and no strong character resolves the
+    /// same way everywhere — and, because the paragraph / table cache keys
+    /// hash the config they are handed, an entry laid out under one
+    /// document default never serves another.
+    fn for_document(&self, doc: &DocumentTree) -> RenderConfig {
+        RenderConfig {
+            base_direction: document_base_direction(doc, self.base_direction),
+            ..self.clone()
         }
     }
 }
@@ -4625,12 +4643,37 @@ fn attach_block_paths(
 /// when the paragraph was explicitly LTR.
 ///
 /// Precedence:
-/// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`).
+/// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`, the
+///    reader folds the style chain and `<w:docDefaults>` into it).
 /// 2. `first_strong_direction(text)` — first-strong inference for
 ///    paragraphs with no explicit setting.
-/// 3. `cfg.base_direction` — document-wide default seeded at boot.
+/// 3. `cfg.base_direction` — the DOCUMENT default: a layout pass runs on
+///    [`RenderConfig::for_document`], so this is the document's
+///    `<w:docDefaults>` `<w:bidi>` when it declares one, else the boot
+///    base (LTR in the editor since issue #552). An empty or neutral-only
+///    paragraph therefore never falls to a hard-coded RTL.
 fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingDirection {
     paragraph_base_direction(p, cfg.base_direction)
+}
+
+/// Issue #552 — the direction a paragraph with no direction of its own
+/// and no strong character takes in `doc`: the document's declared
+/// default (`<w:docDefaults><w:pPrDefault><w:pPr><w:bidi>`,
+/// `DocumentTree::style_defaults.direction` — what Word gives every
+/// paragraph that names no other), else `base`, the layout config's
+/// boot direction. A paragraph read from `.docx` already carries the
+/// cascaded value in `props.direction`; this is what the paragraphs the
+/// ENGINE mints (a toolbar table's empty cells, its escape paragraph, a
+/// fresh document's paragraph) resolve to. There is no section-level
+/// paragraph direction to consult: `<w:sectPr><w:bidi>` orders a
+/// section's columns, it sets no paragraph's direction (and is not
+/// modelled).
+fn document_base_direction(doc: &DocumentTree, base: ShapingDirection) -> ShapingDirection {
+    match doc.style_defaults.direction {
+        Some(engine::TextDirection::Rtl) => ShapingDirection::Rtl,
+        Some(engine::TextDirection::Ltr) => ShapingDirection::Ltr,
+        None => base,
+    }
 }
 
 /// The precedence of [`resolve_base_direction`] against an explicit
@@ -7103,6 +7146,70 @@ fn doc_paragraph_neighbor(
     let candidate = paths.get(target)?.clone();
     let para = doc.paragraph_at_path(&candidate)?.clone();
     Some((candidate, para))
+}
+
+/// Issue #507 — Left / Right at a line's visual edge inside a table cell.
+/// `stepped` is the logical step the caret paragraph's direction chose
+/// (`visual_step_arrow`). While it stays inside the caret's innermost cell
+/// it stands (a line / paragraph wrap within the cell). When it LEAVES the
+/// cell, the TABLE's direction decides, not the paragraph's: the key that
+/// points at the table's reading direction (Right in a left-to-right
+/// table, Left in a `<w:bidiVisual>` one, whose first cell is the
+/// rightmost) moves to the START of the next cell in reading order — same
+/// row, then the next row, then the paragraph after the table — and the
+/// other key to the END of the previous one. An empty cell's paragraph, or
+/// one whose direction differs from its table's, can therefore no longer
+/// send Right to the previous cell (the old `going_right ^ para_rtl` flip
+/// did, for every empty cell while they resolved RTL — #552). Up / Down
+/// stay spatial and never come here.
+fn cell_exit_step(
+    doc: &DocumentTree,
+    caret: &BridgeLogicalPos,
+    stepped: BridgeLogicalPos,
+    going_right: bool,
+) -> BridgeLogicalPos {
+    let here = bridge_to_engine_path(caret.path.clone());
+    let Some(k) = here
+        .steps
+        .iter()
+        .rposition(|s| matches!(s, EnginePathStep::Cell { .. }))
+    else {
+        return stepped;
+    };
+    let cell = &here.steps[..=k];
+    let inside = |p: &EngineBlockPath| p.steps.starts_with(cell);
+    if inside(&bridge_to_engine_path(stepped.path.clone())) {
+        return stepped;
+    }
+    let table = EngineBlockPath {
+        steps: here.steps[..k].to_vec(),
+    };
+    let rtl_table = doc
+        .table_at_path(&table)
+        .is_some_and(|t| t.props.bidi_visual);
+    let paths = doc_paragraph_paths(doc);
+    let Some(at) = paths.iter().position(|p| *p == here) else {
+        return stepped;
+    };
+    let target = if going_right ^ rtl_table {
+        paths[at + 1..]
+            .iter()
+            .find(|p| !inside(p))
+            .map(|p| (p.clone(), 0))
+    } else {
+        paths[..at].iter().rev().find(|p| !inside(p)).map(|p| {
+            let len = doc.paragraph_at_path(p).map_or(0, |q| q.text.len() as u32);
+            (p.clone(), len)
+        })
+    };
+    match target {
+        Some((path, offset)) => BridgeLogicalPos {
+            path: engine_to_bridge_path(path),
+            offset,
+        },
+        /* The table is the first / last thing in the story: pin. */
+        None => caret.clone(),
+    }
 }
 
 /// Issues #423 / #420 — the formatting at a caret position before it is
@@ -10661,7 +10768,8 @@ impl Engine {
         with_composition: bool,
         note_markers: &HashMap<engine::NoteAnchor, String>,
     ) -> Vec<layout::LayoutDegradation> {
-        let Some(cfg) = self.layout_cfg.clone() else {
+        /* Issue #552 — the document's default direction, like the body. */
+        let Some(cfg) = self.layout_cfg.as_ref().map(|c| c.for_document(doc)) else {
             return Vec::new();
         };
         if !pages
@@ -10747,7 +10855,9 @@ impl Engine {
         ),
         Box<Event>,
     > {
-        let cfg = match self.layout_cfg.clone() {
+        /* Issue #552 — a paragraph with no direction and no strong
+        character takes the DOCUMENT's default (`for_document`). */
+        let cfg = match self.layout_cfg.as_ref().map(|c| c.for_document(&doc)) {
             Some(c) => c,
             None => {
                 return Err(Box::new(Event::error_kind(
@@ -14087,9 +14197,10 @@ impl Engine {
                 }
             }
         };
-        let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
-            Some(ShapingDirection::Rtl) => Direction::Rtl,
-            _ => Direction::Ltr,
+        /* Issue #552 — the DOCUMENT's default direction. */
+        let direction = match self.document_direction() {
+            ShapingDirection::Rtl => Direction::Rtl,
+            ShapingDirection::Ltr => Direction::Ltr,
         };
         /* Issues #423 / #420 — one cascade walk feeds the flat read-back
         and the per-slot one. */
@@ -14532,14 +14643,19 @@ impl Engine {
         render). Fall back to the paragraph-direction–aware logical
         step which handles line + paragraph wrap. Visual-right in an
         LTR line is logical-forward; in an RTL line it is
-        logical-backward. */
+        logical-backward. Issue #507 — a step that leaves a table cell
+        follows the table's direction instead (`cell_exit_step`). The
+        step walks the tree the selection addresses (a header / footer /
+        note story while one is being edited), not always the body. */
         let para_rtl = self.paragraph_direction_at(&caret.path) == ShapingDirection::Rtl;
-        let doc = self.undo.current();
-        let stepped = if going_right ^ para_rtl {
-            step_right(doc, caret.clone())
-        } else {
-            step_left(doc, caret.clone())
-        };
+        let stepped = self.with_selection_doc(|doc| {
+            let stepped = if going_right ^ para_rtl {
+                step_right(doc, caret.clone())
+            } else {
+                step_left(doc, caret.clone())
+            };
+            cell_exit_step(doc, caret, stepped, going_right)
+        });
         (stepped, affinity)
     }
 
@@ -14549,22 +14665,34 @@ impl Engine {
     /// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`).
     /// 2. `first_strong_direction` over the paragraph text — the same
     ///    inference layout applies when `props.direction` is `None`.
-    /// 3. The engine's `layout_cfg.base_direction` (the document-wide
-    ///    default the TS shell seeds at boot).
+    /// 3. The document's default direction ([`Self::document_direction`]:
+    ///    `<w:docDefaults>` `<w:bidi>`, else the boot base the TS shell
+    ///    seeds — LTR since issue #552).
     /// 4. `Ltr` if no `layout_cfg` is set (defensive — engine should
     ///    always carry a config once `render_document` has run).
     fn paragraph_direction_at(&self, path: &BridgeBlockPath) -> ShapingDirection {
         let engine_path = bridge_to_engine_path(path.clone());
-        let fallback = self
-            .layout_cfg
-            .as_ref()
-            .map(|c| c.base_direction)
-            .unwrap_or(ShapingDirection::Ltr);
+        let fallback = self.document_direction();
         self.with_selection_doc(|d| {
             d.paragraph_at_path(&engine_path)
                 .map(|p| paragraph_base_direction(p, fallback))
         })
         .unwrap_or(fallback)
+    }
+
+    /// Issue #552 — the document's default paragraph direction
+    /// ([`document_base_direction`] of the body tree over the layout
+    /// config's boot base; `Ltr` before the first `RenderPage`). The
+    /// fallback of every direction read-back, exactly as
+    /// [`RenderConfig::for_document`] is the layout pass's. Document
+    /// defaults are document-wide, so a header / footer / note story
+    /// resolves against the same value.
+    fn document_direction(&self) -> ShapingDirection {
+        let base = self
+            .layout_cfg
+            .as_ref()
+            .map_or(ShapingDirection::Ltr, |c| c.base_direction);
+        document_base_direction(self.undo.current(), base)
     }
 
     /// Tri-state paragraph direction across the selection: `Some(dir)`
@@ -17034,9 +17162,10 @@ impl Engine {
     /// directly. Phase 5 PR 3b: nested tables inside cells stay flat — the
     /// recursive `nodes` slot is empty for nested tables until PR 4.
     fn build_a11y_nodes(&self) -> Vec<A11yNode> {
-        let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
-            Some(ShapingDirection::Rtl) => Direction::Rtl,
-            _ => Direction::Ltr,
+        /* Issue #552 — the DOCUMENT's default direction. */
+        let direction = match self.document_direction() {
+            ShapingDirection::Rtl => Direction::Rtl,
+            ShapingDirection::Ltr => Direction::Ltr,
         };
         let doc = self.undo.current();
         /* Issue #203 — the body walk carries the note context: reference
@@ -30544,6 +30673,12 @@ mod border_guard_tests;
 /// (the headless-engine tests need `fuzz-native`).
 #[cfg(test)]
 mod shell_default_tests;
+
+/// Issues #552 / #507 - an empty / neutral paragraph takes the document's
+/// declared direction (LTR by default), and Left / Right leaving a table
+/// cell follow the table's direction (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod empty_paragraph_direction_tests;
 
 /// Issue #503 (item 1) - the restore / replay door of the same bounds
 /// (`fuzz-native`).

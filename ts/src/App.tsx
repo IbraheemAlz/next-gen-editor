@@ -91,7 +91,12 @@ async function setupEngine(
            BiDi text to hit-test against. */
         text: 'Hello world مرحبا بالعالم',
         font_id: seedFont,
-        base_direction: 'RTL',
+        /* Issue #552 — an LTR document, Word's default: the direction a
+           paragraph with no `w:bidi` of its own (an empty paragraph, a new
+           table cell, digits only) takes. RTL here laid every empty
+           paragraph and cell out right to left. An opened document keeps
+           what its own `w:bidi` / `w:docDefaults` say. */
+        base_direction: 'LTR',
         /* MIRRORED in `RenderConfig::shell_default` (crates/engine-wasm,
            issue #498): the canvas-less engine every native harness uses
            (`Engine::new_headless`) lays out with exactly these values, and

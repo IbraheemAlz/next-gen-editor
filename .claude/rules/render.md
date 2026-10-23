@@ -21,6 +21,18 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   (`segment_by_script_class`) and shape each piece with
   `StyleSpan::face_for(complex)` — keep the two in step, and never read
   `span.px_size` / `span.bold` / `span.font_family` directly for a piece.
+- **Paragraph direction has ONE resolution (issues #195 / #552).**
+  `paragraph_base_direction`: the paragraph's own `props.direction` (the
+  reader folds style chain + `<w:docDefaults>` into it), else first-strong,
+  else the DOCUMENT default — `document_base_direction`:
+  `DocumentTree::style_defaults.direction`, else the config's boot base,
+  which the shell sends LTR (`App.tsx`, `RenderConfig::shell_default`).
+  Layout runs on `RenderConfig::for_document(doc)`; the caret / toolbar /
+  a11y read-backs on `Engine::document_direction()`. Never hard-code a
+  fallback direction or read `layout_cfg.base_direction` raw for a
+  paragraph. Left / Right leaving a table cell follow the TABLE's
+  direction (`cell_exit_step`, `<w:bidiVisual>`), not the cell
+  paragraph's.
 
 ## Font substitution and line pitch (issue #329)
 
