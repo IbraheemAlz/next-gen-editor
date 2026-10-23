@@ -497,7 +497,12 @@ command_meta! {
     // the caret on the band under the pointer, so its reveal at most
     // nudges the view by the reveal margin.
     EnterHeaderFooter { .. } => M::SELECT ; (),
-    ExitHeaderFooter => M::SELECT ; (),
+    // Issue #510 — leaving a band never scrolls: the shell's body
+    // double-click exit places the caret under the pointer right behind
+    // it (`PlaceCaretAtPoint`), and revealing the restored body selection
+    // first would scroll the view away from where the user clicked (Esc /
+    // Close keep the view too; the next keystroke reveals the caret).
+    ExitHeaderFooter => M::SELECT.no_reveal() ; (),
     SetHeaderFooterLink { .. } => M::FORMAT ; (),
     SetTitlePage { .. } => M::FORMAT ; (),
     SetEvenOddHeaders { .. } => M::FORMAT ; (),
@@ -814,7 +819,6 @@ mod tests {
             K::EndComposition,
             K::SetSelection,
             K::EnterHeaderFooter,
-            K::ExitHeaderFooter,
         ] {
             assert!(k.meta().reveals_caret, "{k:?} reveals the caret");
         }
@@ -824,6 +828,7 @@ mod tests {
             K::SelectWordAt,
             K::SelectParagraphAt,
             K::SelectCellAt,
+            K::ExitHeaderFooter,
             K::SelectAll,
             K::SetZoom,
             K::SetDeviceScale,

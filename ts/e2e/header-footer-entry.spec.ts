@@ -218,6 +218,49 @@ test('a double-click in the header band of a later page enters THAT page (#510)'
     const band = await bandBox(page, 1, false);
     await expect(page.locator('.editor-page[data-page-index="0"] .story-band')).toHaveCount(0);
     expectInside(await caretBox(page), band, 'entry caret vs page-1 header band');
+
+    /* A body double-click on page 1 exits and puts the caret THERE, with
+       the view kept where it is. */
+    const scrolled = (await viewportScroll(page)).scrollTop;
+    const card1 = await pageCard(page, 1);
+    const localX = 96 + 120;
+    const localY = 96 + 60;
+    await page.mouse.dblclick(card1.left + localX, card1.top + localY);
+    await expect(page.locator('.story-band')).toHaveCount(0);
+    await settle(page);
+    expect(Math.abs((await viewportScroll(page)).scrollTop - scrolled)).toBeLessThan(40);
+    const caret = await caretInPage(page, 1);
+    expect(caret.top).toBeLessThanOrEqual(localY);
+    expect(caret.bottom).toBeGreaterThanOrEqual(localY);
+    expect(Math.abs(caret.left - localX)).toBeLessThan(20);
+});
+
+test('leaving a band by double-clicking the body does not scroll to the stashed caret', async ({
+    page,
+}) => {
+    const lines = Array.from({ length: 60 }, (_, i) => `Line ${i + 1} of the long document`);
+    await openText(page, lines.join('\n'));
+    /* The body caret sits at the document start (page 0); the Footer
+       button enters page 0's footer; then the user scrolls to page 1 and
+       double-clicks its body. */
+    await page.getByRole('button', { name: 'Edit footer' }).click();
+    await bandBox(page, 0, true);
+    await expect(page.locator('.editor-page[data-page-index="1"]')).toHaveCount(1);
+    const p1 = await pageCard(page, 1);
+    const v = (await box(page, '.editor-viewport'))!;
+    const scroll = await viewportScroll(page);
+    await scrollViewportTo(page, scroll.scrollTop + p1.top - v.top + 100);
+    const scrolled = (await viewportScroll(page)).scrollTop;
+    const card1 = await pageCard(page, 1);
+    const localX = 96 + 120;
+    const localY = 96 + 60;
+    await page.mouse.dblclick(card1.left + localX, card1.top + localY);
+    await expect(page.locator('.story-band')).toHaveCount(0);
+    await settle(page);
+    expect(Math.abs((await viewportScroll(page)).scrollTop - scrolled)).toBeLessThan(40);
+    const caret = await caretInPage(page, 1);
+    expect(caret.top).toBeLessThanOrEqual(localY);
+    expect(caret.bottom).toBeGreaterThanOrEqual(localY);
 });
 
 test('a double-click in the body exits the story and places the caret at the click', async ({
