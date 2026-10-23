@@ -487,12 +487,21 @@ fn read_docx_scoped(
         _ => StyleTable::default(),
     };
     let resolver = StyleResolver::new(&style_table);
+    /* Issues #536 / #530 — a block the walk meets where no block may stand
+    (`parts::document::misplaced_block`) refuses the part; the detail names
+    it like every other `MalformedXml` producer. */
     let mut document = parse_document_xml_with_warnings(
         &xml,
         &resolver,
         &mut warnings,
         default_page_size.geometry(),
-    )?;
+    )
+    .map_err(|e| match e {
+        DocxError::MalformedXml(detail) => {
+            DocxError::MalformedXml(format!("{}: {detail}", part_names.main))
+        }
+        e => e,
+    })?;
     document.settings.default_page_size = default_page_size;
     document.settings.widow_control_default = widow_control_default;
 

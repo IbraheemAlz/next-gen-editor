@@ -23,6 +23,8 @@ pub mod opc;
 pub mod parts;
 pub mod reader;
 #[cfg(test)]
+mod reader_block_placement_tests;
+#[cfg(test)]
 mod reader_hardening_tests;
 #[cfg(test)]
 mod reader_well_formed_tests;
