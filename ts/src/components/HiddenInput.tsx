@@ -13,7 +13,9 @@ import {
     clearSelectedImage,
     editingStoryForPointer,
     fieldCodeViewForKeys,
+    selectedImageForKeys,
 } from '../state/engine-store';
+import { isModifierOnly, planImageKey, runImageKey } from '../input/image-keys';
 import { ClipboardWriteError, copy, cut, paste, writeSync } from '../input/clipboard';
 import { createClipboardPrefetch } from '../input/clipboard-cache';
 import { devHooksEnabled, installDevHook } from '../dev-hooks';
@@ -151,9 +153,32 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
            deletion) means the user is working with the text caret, so
            deselect any inline image whose resize handles are showing.
            Bare modifier presses (Shift/Ctrl/Alt/Meta) are skipped so a
-           Shift-in-preparation doesn't drop the selection. */
-        if (e.key !== 'Shift' && e.key !== 'Control' && e.key !== 'Alt' && e.key !== 'Meta') {
+           Shift-in-preparation doesn't drop the selection.
+
+           Issue #554 — object selection REPLACES the caret, so the key is
+           first resolved against the picture: Delete / Backspace remove it,
+           arrows collapse the selection to a caret at its edge (Up / Down
+           then walk from the picture's own line), Escape / typing / Enter
+           put the caret before it (see `input/image-keys.ts`). The commands
+           are posted synchronously, ahead of any `beforeinput` this key
+           causes, so the worker applies them in key order. */
+        if (!isModifierOnly(e.key)) {
+            const img = selectedImageForKeys();
+            const story = editingStoryForPointer();
+            const outcome = img
+                ? runImageKey(
+                      planImageKey(e, img),
+                      img,
+                      props.client,
+                      story && { area: story.area, rid: story.rid },
+                      (what, err) => console.error(`${what} failed`, err),
+                  )
+                : 'continue';
             clearSelectedImage();
+            if (outcome === 'consumed') {
+                e.preventDefault();
+                return;
+            }
         }
 
         /* Phase 3 (#39) — Esc leaves header/footer editing (Word

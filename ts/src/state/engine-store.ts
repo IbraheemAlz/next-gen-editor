@@ -233,6 +233,9 @@ export interface ImageRectCss {
     story: TextBoxHop[];
     /** Issue #206 — the owning story's `outer/inner` id (`''` for body). */
     storyRid: string;
+    /** Issue #554 — the picture's paragraph runs right-to-left, so its
+     *  visual left edge is the byte offset AFTER the sentinel. */
+    rtl: boolean;
 }
 export interface ImageAddr {
     path: BlockPath;
@@ -297,6 +300,15 @@ export function selectImageByPoint(
     }
     setSelectedImageSig(null);
     return false;
+}
+
+/** Issue #554 — the selected picture's current rect, for the non-reactive
+ *  key path (`undefined` when nothing is selected or the engine no longer
+ *  lists it). */
+export function selectedImageForKeys(): ImageRectCss | undefined {
+    const sel = selectedImageSig();
+    if (!sel) return undefined;
+    return imageRectsSig().find((r) => sameImageAddr(r, sel));
 }
 
 /** Clear any selected-image state (e.g. on a caret-placing click). */
@@ -462,6 +474,7 @@ export function createEngineStore(client: EngineClient) {
                 wrap: im.wrap,
                 story: im.story ?? [],
                 storyRid: im.story_rid ?? '',
+                rtl: im.rtl ?? false,
             }));
             setImageRectsSig(rects);
             const sel = selectedImageSig();

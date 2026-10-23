@@ -89,6 +89,8 @@ type WorkerReply = {
     revisions?: RevisionSnapshot[];
     /** Issue #96 — payload of the DEV-only `PROBE_PAGE_INK` reply. */
     ink?: Record<number, number>;
+    /** Issue #506 — payload of the DEV-only `PROBE_PAGE_PIXELS` reply. */
+    pixels?: Array<[number, number, number, number] | null>;
     /** Issue #502 — payload of the dev-only `FORCE_CONTEXT_LOSS` reply:
      *  how the worker hears context loss (`events` / `polling` / `none`). */
     mode?: string;
@@ -1275,6 +1277,21 @@ export class EngineClient {
         const r = await this.send({ type: 'PROBE_PAGE_INK' });
         if (!r.ok) throw new Error(r.error);
         return r.ink ?? {};
+    }
+
+    /**
+     * Issue #506 test hook (DEV builds only): the RGBA of single pixels of
+     * page `pageIndex`'s surface (page-local DEVICE px, `null` outside it),
+     * read back worker-side. Lets a spec tell a decoded bitmap from the grey
+     * placeholder the renderer paints for an image it has no bitmap for.
+     */
+    async probePagePixels(
+        pageIndex: number,
+        points: Array<{ x: number; y: number }>,
+    ): Promise<Array<[number, number, number, number] | null>> {
+        const r = await this.send({ type: 'PROBE_PAGE_PIXELS', page: pageIndex, points });
+        if (!r.ok) throw new Error(r.error);
+        return r.pixels ?? [];
     }
 
     /**
