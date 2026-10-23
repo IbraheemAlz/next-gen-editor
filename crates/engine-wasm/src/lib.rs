@@ -45,6 +45,9 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod error_reply;
+/// Issue #506 - which media blobs still need a decoded bitmap (content
+/// fingerprints, so a re-minted key is decoded again).
+mod media_registry;
 /// Issue #491 — open-time `DocxError` → typed `Event::Error` (one table).
 mod open_error;
 /// Issue #379 — the content-keyed table layout cache that survives
@@ -1081,8 +1084,11 @@ pub struct Engine {
     /// `ImageBitmap` after the document loads and installs the result
     /// here via the direct wasm method [`Engine::register_image`]. The
     /// Canvas2D backend looks each painted inline image up here; a miss
-    /// falls back to a placeholder.
-    image_cache: HashMap<String, web_sys::ImageBitmap>,
+    /// falls back to a placeholder. Issue #506 - each entry remembers the
+    /// fingerprint of the bytes it was decoded from
+    /// (`media_registry::fingerprint`), so [`Engine::pending_media_entries`]
+    /// can tell a stale bitmap (a re-minted key) from a current one.
+    image_cache: HashMap<String, RegisteredImage>,
     /// Last `render_document` output dimensions, cached so the worker
     /// can post a synthetic `Painted` side-channel after every mutating
     /// command without re-rendering. The TS shell drives the CSS
@@ -1292,6 +1298,34 @@ impl Engine {
             .map_err(|e| JsValue::from_str(&format!("encode media entries: {e}")))
     }
 
+    /// Issue #506 - the media blobs that still need a decoded bitmap:
+    /// nothing is cached under their key, or what is cached was decoded
+    /// from different bytes (a key the engine re-minted after an undone
+    /// insert). Same `{ rel_id, mime, bytes }` shape as
+    /// [`Engine::media_entries`] but only the pending ones, sorted by key -
+    /// an empty array on the common path, so the worker can ask after every
+    /// command that may have changed the document without copying a single
+    /// blob. The worker decodes each and hands it to
+    /// [`Engine::register_image`].
+    pub fn pending_media_entries(&self) -> Result<JsValue, JsValue> {
+        let doc = self.undo.current();
+        let pending = media_registry::pending_keys(&doc.media, |key| {
+            self.image_cache.get(key).map(|r| r.fingerprint)
+        });
+        let entries: Vec<MediaEntryOut> = pending
+            .into_iter()
+            .filter_map(|key| {
+                doc.media.get(key).map(|blob| MediaEntryOut {
+                    rel_id: key.to_string(),
+                    mime: blob.content_type.clone(),
+                    bytes: blob.data.clone(),
+                })
+            })
+            .collect();
+        serde_wasm_bindgen::to_value(&entries)
+            .map_err(|e| JsValue::from_str(&format!("encode pending media entries: {e}")))
+    }
+
     /// Issue #85 — `Engine::snapshot()`: serialize the session (document
     /// + styles + stories + undo window + selection + layout config) into
     /// the versioned `engine::snapshot` envelope. Same bytes as
@@ -1327,7 +1361,18 @@ impl Engine {
     /// registrations overwrite earlier ones (lets the worker re-decode on
     /// DPR change without leaking).
     pub fn register_image(&mut self, rel_id: String, bitmap: web_sys::ImageBitmap) {
-        self.image_cache.insert(rel_id, bitmap);
+        /* Issue #506 - the bitmap was decoded from the blob the document
+        holds under `rel_id` right now (the worker decodes inside the
+        command's own queue task, so nothing edits the document between
+        `media_entries` / `pending_media_entries` and this call). */
+        let fingerprint = self
+            .undo
+            .current()
+            .media
+            .get(&rel_id)
+            .map_or(0, |b| media_registry::fingerprint(&b.data));
+        self.image_cache
+            .insert(rel_id, RegisteredImage { bitmap, fingerprint });
         /* Issue #497 — a page whose display list names this image paints
         differently now, though its scene is unchanged. */
         self.forget_painted_pages();
@@ -1685,6 +1730,13 @@ struct CommentOut {
     /// flat index for older consumers.
     start_path: BridgeBlockPath,
     end_path: BridgeBlockPath,
+}
+
+/// Issue #506 - a decoded picture and the fingerprint of the blob bytes it
+/// was decoded from.
+struct RegisteredImage {
+    bitmap: web_sys::ImageBitmap,
+    fingerprint: u64,
 }
 
 /// Serialization surface for [`Engine::media_entries`]. Mirrors
@@ -6425,6 +6477,7 @@ fn collect_paragraph_image_rects(
                         a picture inside a text-box story. */
                         story: Vec::new(),
                         story_rid: String::new(),
+                        rtl: false,
                     });
                 }
                 pen += g.x_advance;
@@ -6492,6 +6545,7 @@ fn collect_text_box_image_rects(
             wrap: None,
             story: Vec::new(),
             story_rid: String::new(),
+            rtl: false,
         });
     }
     let story: Vec<bridge::TextBoxHop> = chain
@@ -11656,7 +11710,7 @@ impl Engine {
                 &page_scene,
                 &mut self.atlas,
                 |id| self.fonts.get(id).cloned(),
-                |rel| image_cache.get(rel).cloned(),
+                |rel| image_cache.get(rel).map(|r| r.bitmap.clone()),
                 clip_rect,
             ) {
                 return Err(Box::new(Event::error_kind(
@@ -12991,6 +13045,7 @@ impl Engine {
                     wrap: None,
                     story: Vec::new(),
                     story_rid: String::new(),
+                    rtl: false,
                 });
             }
             /* Issue #206 — pictures inside text-box stories (and inside a
@@ -13013,6 +13068,11 @@ impl Engine {
         resizes by `new_emu = emu × new_px / old_px`, so it needs the
         current EMU alongside the current px rect. */
         let doc = self.undo.current();
+        let fallback_dir = self
+            .layout_cfg
+            .as_ref()
+            .map(|c| c.base_direction)
+            .unwrap_or(ShapingDirection::Ltr);
         /* Issue #206 — a box picture's path is rooted in its story: resolve
         each story tree once (keyed by its rid). */
         let mut story_trees: HashMap<String, Option<DocumentTree>> = HashMap::new();
@@ -13033,9 +13093,11 @@ impl Engine {
                     })
                     .as_ref()
             };
-            let io = tree
-                .and_then(|t| t.paragraph_at_path(&epath))
-                .and_then(|p| p.inline_objects.iter().find(|io| io.at == im.at));
+            let para = tree.and_then(|t| t.paragraph_at_path(&epath));
+            /* Issue #554 — the paragraph's effective base direction. */
+            im.rtl = !im.floating
+                && para.is_some_and(|p| paragraph_base_direction(p, fallback_dir) == ShapingDirection::Rtl);
+            let io = para.and_then(|p| p.inline_objects.iter().find(|io| io.at == im.at));
             if let Some(io) = io
                 && let engine::InlineKind::Image {
                     width_emu,

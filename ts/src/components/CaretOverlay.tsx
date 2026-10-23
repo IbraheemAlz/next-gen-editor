@@ -16,6 +16,11 @@ export function CaretOverlay(props: { store: EngineStore; pageIdx?: number }) {
     const idx = () => props.pageIdx ?? 0;
     const pageTop = () => props.store.pageTopCss(idx());
     const visibleCaret = () => {
+        /* Issue #554 — object selection REPLACES the caret: while a picture
+           shows its resize handles there is no insertion point to draw (the
+           engine's caret is where the next key will land only AFTER the
+           selection is left; `input/image-keys.ts`). */
+        if (props.store.selectedImage()) return null;
         const c = props.store.caret();
         if (!c) return null;
         const top = pageTop();
