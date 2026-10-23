@@ -42,6 +42,8 @@ export const SENTINEL_LEN = 3;
 /** The slice of a key event the planner reads. */
 export interface KeyInfo {
     key: string;
+    /** `KeyboardEvent.code` (the physical key); only Ctrl/Cmd+V reads it. */
+    code?: string;
     shiftKey: boolean;
     ctrlKey: boolean;
     metaKey: boolean;
@@ -145,7 +147,11 @@ export function planImageKey(k: KeyInfo, img: Pick<KeyedImage, 'rtl'>): ImageKey
 
     if (k.key === 'Escape') return { kind: 'caret', edge: 'before', consume: true };
 
-    /* Ctrl/Cmd chords (copy, undo, bold, …) and function keys act on the
+    /* Paste inserts at the caret, so the caret goes before the picture
+       first (the native `paste` event follows this keydown). */
+    if (chord && k.code === 'KeyV') return { kind: 'caret', edge: 'before', consume: false };
+
+    /* Other Ctrl/Cmd chords (undo, bold, …) and function keys act on the
        document, not on the object. */
     if (chord || alt || /^F\d{1,2}$/.test(k.key)) return { kind: 'keep' };
 

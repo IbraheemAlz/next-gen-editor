@@ -30382,6 +30382,10 @@ mod bounds_repair_tests;
 #[cfg(test)]
 mod a11y_direction_tests;
 
+/// Issue #554 - `ImageRect.rtl` (the picture's paragraph direction).
+#[cfg(test)]
+mod image_rtl_tests;
+
 #[cfg(test)]
 mod para_style_edit_tests;
 

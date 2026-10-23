@@ -1,4 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { boot, burst, documentText, settle } from './helpers/editor';
 
 /* Issues #506 (items 1 and 3) and #554 — a picture inserted through the
@@ -318,5 +320,114 @@ test.describe('an inserted picture (#506, #554)', () => {
            bitmap under that key. */
         expect(second!.media_key).toBe(first!.media_key);
         await expectPainted(page, second!.rect, GREEN);
+    });
+    /* The recovered engine is a fresh one: its image cache starts empty and
+       its document comes back from the event log (the logged INSERT_IMAGE in
+       the replayed tail, or the snapshot that holds the picture's bytes). */
+    for (const withSnapshot of [false, true]) {
+        test(`a picture inserted before a worker trap paints after recovery (${
+            withSnapshot ? 'snapshot + tail' : 'tail only'
+        })`, async ({ page }) => {
+            test.setTimeout(60_000);
+            await insertPng(page, RED);
+            const [img] = await waitForImages(page, 1);
+            await expectPainted(page, img!.rect, RED);
+            /* The worker's idle snapshot fires 1.5 s after the last logged
+               command. */
+            if (withSnapshot) await page.waitForTimeout(2_500);
+            await page.evaluate(async () => {
+                const w = window as any;
+                w.__recovered = false;
+                await w.__engineClient.armTrap(1);
+                await w.__dispatch({ type: 'PING' }).catch(() => undefined);
+                for (let i = 0; i < 600 && w.__recovered !== true; i++) {
+                    await new Promise((r) => setTimeout(r, 50));
+                }
+            });
+            expect(await page.evaluate(() => (window as any).__recovered)).toBe(true);
+            const info = await page.evaluate(() => (window as any).__engineClient.lastRecovery);
+            expect(info.restored, 'base snapshot restored').toBe(withSnapshot);
+            const [again] = await waitForImages(page, 1);
+            await expectPainted(page, again!.rect, RED);
+        });
+    }
+});
+
+/* A picture inside a text box (#206) is addressed by a story-rooted path, and
+ * `DeleteRange` is body-only, so Delete on it goes through the story: select
+ * the sentinel there, then delete the selection - but only while the engine is
+ * EDITING that box. Selected from outside its box the key is swallowed (it
+ * must never fall through to a delete at the stale body caret). */
+test.describe('a picture inside a text box (#554)', () => {
+    const FIXTURE = fileURLToPath(
+        new URL('../../crates/format-docx/tests/fixtures/text_box_pictures.docx', import.meta.url),
+    );
+
+    test('Delete removes it while its box is being edited; from outside the box it is a no-op', async ({
+        page,
+    }) => {
+        test.setTimeout(90_000);
+        await boot(page);
+        const bytes = Array.from(readFileSync(FIXTURE));
+        const scale = await page.evaluate(async (arr: number[]) => {
+            const d = (cmd: unknown): Promise<any> => (window as any).__dispatch(cmd);
+            const top = { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 };
+            const loaded = await d({ type: 'LOAD_DOCX', bytes: new Uint8Array(arr) });
+            if (loaded.type === 'ERROR') throw new Error(loaded.message);
+            const sel = await d({ type: 'SET_SELECTION', range: { start: top, end: top }, caret: top });
+            return (sel.caret.x as number) / 72;
+        }, bytes);
+        const inch = 72 * scale;
+        type BoxImg = Img & { story_rid?: string };
+        const list = async (): Promise<Record<string, BoxImg>> => {
+            const out: Record<string, BoxImg> = {};
+            for (const im of (await images(page)) as BoxImg[]) out[im.story_rid ?? ''] = im;
+            return out;
+        };
+        const rids = async (): Promise<string[]> => Object.keys(await list()).sort();
+        expect(await rids()).toEqual(['1@0', '1@0/1@0']);
+
+        const canvas = page.locator('.editor-page[data-page-index="0"] canvas').first();
+        await canvas.scrollIntoViewIfNeeded();
+        const dpr = await page.evaluate(() => window.devicePixelRatio || 1);
+        const viewportAt = async (x: number, y: number) => {
+            const box = await canvas.boundingBox();
+            return { x: box!.x + x / dpr, y: box!.y + y / dpr };
+        };
+        const handles = page.locator('.image-handles');
+        const select = async (rid: string): Promise<void> => {
+            await expect(async () => {
+                const im = (await list())[rid]!;
+                const c = await viewportAt(im.rect.x + im.rect.w / 2, im.rect.y + im.rect.h / 2);
+                await page.mouse.click(c.x, c.y);
+                await expect(handles).toBeVisible({ timeout: 1_000 });
+            }).toPass({ timeout: 15_000 });
+        };
+        const editing = async (): Promise<string | null> => {
+            const evt = await dispatch(page, { type: 'SELECT_ALL' });
+            return (evt.editing_story?.rid as string | undefined) ?? null;
+        };
+
+        /* Outside the box (the engine is in the body): Delete does nothing -
+           and above all does not delete a body character at the old caret. */
+        const before = await documentText(page);
+        await dispatch(page, { type: 'MOVE_CARET', direction: 'DocHome', extend: false });
+        await select('1@0');
+        await page.keyboard.press('Delete');
+        await settle(page);
+        expect(await rids()).toEqual(['1@0', '1@0/1@0']);
+        expect(await documentText(page)).toBe(before);
+
+        /* Inside the outer box's story (a click on its text): Delete removes
+           the outer picture, nothing else. */
+        const inBox = await viewportAt(1.3 * inch, 4.85 * inch);
+        await page.mouse.click(inBox.x, inBox.y);
+        await expect.poll(editing).toBe('1@0');
+        await select('1@0');
+        await page.keyboard.press('Delete');
+        await expect.poll(rids).toEqual(['1@0/1@0']);
+        /* One undo brings it back. */
+        await page.keyboard.press('Control+z');
+        await expect.poll(rids).toEqual(['1@0', '1@0/1@0']);
     });
 });
