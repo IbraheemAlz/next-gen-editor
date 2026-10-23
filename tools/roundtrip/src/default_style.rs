@@ -42,8 +42,8 @@ fn expected() -> Vec<(Option<TextDirection>, Spacing)> {
 ///    the one naming an undefined style resolve RTL with `Normal`'s
 ///    spacing; `Plain` (not based on `Normal`) and a direct LTR do not.
 /// b. An untouched save is byte-identical (both save paths).
-/// c. Typing into an unstyled paragraph regenerates it as exactly source
-///    + insert (no `<w:bidi/>` / `<w:spacing>` from `Normal`).
+/// c. Typing into an unstyled paragraph regenerates it as exactly the
+///    source plus the insert (no `<w:bidi/>` / `<w:spacing>` from `Normal`).
 /// d. Enter at the end of the empty paragraph and typing into the new
 ///    one: nothing `Normal` gives is written as direct formatting, and
 ///    the re-read resolves the new paragraph RTL with `Normal`'s spacing.
