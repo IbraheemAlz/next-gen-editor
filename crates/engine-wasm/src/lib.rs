@@ -7920,6 +7920,14 @@ fn paragraph_is_empty(doc: &DocumentTree, at: &BridgeLogicalPos) -> bool {
 
 /// Issue #276 — apply [`replaced_text_style`]'s result to the `len` bytes
 /// just inserted at `start`.
+///
+/// Issue #512 audit: `start.offset + len` is not formed from a raw wire
+/// offset. Every caller passes a position that already went through
+/// `clamp_pos` (the interactive `InsertText`, its story twin) or
+/// `resolve_edit_pos` (`ReplaceRange`) - or the live selection, which every
+/// store clamps (`Engine::selection_is_valid`) - so `start.offset` is at
+/// most the paragraph's byte length and the sum is bounded by memory that
+/// exists.
 fn restyle_replacement(
     doc: DocumentTree,
     style: Option<SpanStyle>,
@@ -15530,6 +15538,9 @@ impl Engine {
         let was_empty = paragraph_is_empty(&base, &start);
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
         let mut new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        /* Issue #512 audit: `start` is the live selection's start or
+        `do_insert_text_interactive`'s `clamp_pos`'d `at`, never a raw wire
+        offset, so the add cannot wrap. */
         let inserted_end = start.offset + text.len() as u32;
         if let Some(pending) = self.pending_format.clone() {
             new_doc = new_doc.apply_style(
@@ -15979,19 +15990,22 @@ impl Engine {
                 format!("Insert {what}: notes inside table cells aren't supported yet"),
             );
         }
-        let pos = to_engine_pos(at.clone());
+        /* Issue #512 - the position is validated AND snapped by the shared
+        boundary (`resolve_edit_pos`, issue #115) before the caret is
+        derived from it: `at.offset + 3` on a raw wire `u32::MAX` wrapped
+        (a panic with overflow checks on) and, mid-scalar, put the caret one
+        byte past the reference. */
         let doc = self.undo.current();
-        if doc.paragraph_at_path(&pos.path).is_none() {
-            return Event::error_kind(
-                bridge::ErrorKind::NotInParagraph,
-                format!("Insert {what}: the caret does not address a paragraph"),
-            );
-        }
-        let (new_doc, id) = doc.insert_note_at(pos, kind);
+        let at = match Self::resolve_edit_pos_in(doc, &format!("Insert {what}"), at) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
+        let (new_doc, id) = doc.insert_note_at(to_engine_pos(at.clone()), kind);
         self.undo.push(new_doc);
         self.invalidate_layout_snapshot();
         /* The body caret lands right after the new reference so exiting
-        the note returns there. */
+        the note returns there. `at.offset` is snapped (<= the paragraph's
+        byte length), so the add cannot wrap. */
         let caret = BridgeLogicalPos {
             path: at.path.clone(),
             offset: at.offset + '\u{FFFC}'.len_utf8() as u32,
@@ -16903,6 +16917,31 @@ impl Engine {
                 "InsertField: fields inside table cells aren't supported yet",
             );
         }
+        /* Issue #512 - the wire position goes through the engine's ONE
+        validated boundary for an explicit position (`resolve_edit_pos`,
+        issue #115), against the tree the field is inserted into (the story
+        tree in a header / footer / note, else the body): a block that is
+        not there is refused `NotInParagraph` before anything is built (it
+        used to push an undo entry for an unchanged tree), and the offset
+        is snapped - capped at the paragraph's length, floored to a char
+        boundary - so the caret below, `at.offset + cached.len()`, is never
+        formed from a raw `u32::MAX` (the 24 `rpc_command` overflows). */
+        let story = if self.story_active() {
+            match self.story_doc() {
+                Some(t) => Some(t),
+                None => return self.story_vanished(),
+            }
+        } else {
+            None
+        };
+        let at = match Self::resolve_edit_pos_in(
+            story.as_ref().unwrap_or_else(|| self.undo.current()),
+            "InsertField",
+            at,
+        ) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
         let (instruction, cached) = match kind {
             bridge::FieldKind::Page => ("PAGE".to_string(), "1".to_string()),
             bridge::FieldKind::NumPages => ("NUMPAGES".to_string(), "1".to_string()),
@@ -16942,10 +16981,10 @@ impl Engine {
                     .unwrap_or_else(|| self.review_author.clone()),
             ),
         };
-        if self.story_active() {
-            let Some(temp) = self.story_doc() else {
-                return self.story_vanished();
-            };
+        /* `at.offset` is the snapped offset (<= the paragraph's byte
+        length), so the sums below are bounded by memory that exists and
+        cannot wrap. */
+        if let Some(temp) = story {
             let new_doc = temp.insert_field_at(to_engine_pos(at.clone()), &instruction, &cached);
             let caret = BridgeLogicalPos {
                 path: at.path,
@@ -17041,9 +17080,13 @@ impl Engine {
     /// Issue #115 — the single validated boundary for an EXPLICIT wire
     /// position on an edit command (`DeleteRange`, `ReplaceRange`,
     /// `ApplyFormatting { range: Some(_) }`, `SplitParagraph` with no
-    /// selection, `InsertComment`). The path must address a paragraph
-    /// in the document the selection addresses (body or active story)
-    /// — an API caller naming a block that is not there is rejected
+    /// selection, `InsertComment`, and since issue #512 `InsertField` /
+    /// `InsertFootnote` / `InsertEndnote` / `InsertSectionBreak`, whose caret
+    /// is derived from `at.offset + <inserted length>` (or the block index
+    /// bumped by one) and so must start from the validated, SNAPPED position:
+    /// the raw wire `u32::MAX` overflowed that add). The path must address
+    /// a paragraph in the document the selection addresses (body or active
+    /// story); an API caller naming a block that is not there is rejected
     /// with a typed `Event::Error`, never silently redirected to some
     /// other paragraph (an edit that lands on the wrong text is worse
     /// than one that fails loudly). The offset then follows the
@@ -17055,11 +17098,24 @@ impl Engine {
         cmd: &str,
         pos: BridgeLogicalPos,
     ) -> Result<BridgeLogicalPos, Box<Event>> {
+        self.with_selection_doc(|d| Self::resolve_edit_pos_in(d, cmd, pos))
+    }
+
+    /// [`Self::resolve_edit_pos`] against an explicit tree, for a handler
+    /// that already holds the document it edits (issue #512: `InsertField`,
+    /// `InsertFootnote` / `InsertEndnote` and `InsertSectionBreak` resolve
+    /// against the very tree they hand to the pure `DocumentTree` mutation,
+    /// so the position they build the caret from is the one the mutation
+    /// used).
+    fn resolve_edit_pos_in(
+        doc: &DocumentTree,
+        cmd: &str,
+        pos: BridgeLogicalPos,
+    ) -> Result<BridgeLogicalPos, Box<Event>> {
         let epath = bridge_to_engine_path(pos.path.clone());
-        let snapped = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&epath)
-                .map(|p| p.snap_offset(pos.offset))
-        });
+        let snapped = doc
+            .paragraph_at_path(&epath)
+            .map(|p| p.snap_offset(pos.offset));
         match snapped {
             Some(offset) => Ok(BridgeLogicalPos {
                 path: pos.path,
@@ -17134,6 +17190,9 @@ impl Engine {
         } else {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
+        /* Issue #512 audit: `start` is the live selection's start (every
+        selection store is clamped) or the `clamp_pos`'d `at` above - never a
+        raw wire offset - so the add cannot wrap. */
         let inserted_end = start.offset + text.len() as u32;
         new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         /* Sticky formatting (Backlog #11): overlay any armed pending style
@@ -17197,6 +17256,8 @@ impl Engine {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
         let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        /* Issue #512 audit: `start` came out of `resolve_edit_range`, i.e.
+        its offset is snapped to the paragraph (<= its byte length). */
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,
@@ -19396,6 +19457,16 @@ impl Engine {
                 "InsertSectionBreak: section breaks inside table cells are not supported",
             );
         }
+        /* Issue #512 (found by the position audit) - the same shape as
+        `InsertField`: `insert_section_break_at` returns the tree unchanged
+        for a block that is not there, and the caret below bumps the RAW
+        wire block index (`u32::MAX + 1` wrapped). The position goes through
+        the shared boundary first: a missing block is refused
+        `NotInParagraph` with nothing applied, the offset is snapped. */
+        let at = match Self::resolve_edit_pos_in(self.undo.current(), "InsertSectionBreak", at) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
         let engine_kind = match kind {
             SectionBreakKind::NextPage => engine::SectionType::NextPage,
             SectionBreakKind::Continuous => engine::SectionType::Continuous,
@@ -31100,6 +31171,13 @@ mod empty_paragraph_direction_tests;
 /// (`fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod bounds_repair_tests;
+
+/// Issue #512 - `InsertField` / `InsertFootnote` / `InsertEndnote` resolve
+/// their position through `resolve_edit_pos` (no `offset + len` on a raw
+/// wire `u32::MAX`), and the audit of every other position-taking command
+/// (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod insert_position_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;
