@@ -4313,6 +4313,38 @@ fn build_header_footer_box(
     if !has_content {
         return None;
     }
+    Some(lay_out_header_footer_box(
+        blocks,
+        content_width,
+        fonts,
+        cfg,
+        scale,
+        sctx,
+        cache,
+        source_rid,
+        composition,
+    ))
+}
+
+/// [`build_header_footer_box`] without its "nothing to paint" gate: lays
+/// out every block of a part, an all-empty part included (one empty line
+/// per empty paragraph, sized by its mark — issue #370). The paint path
+/// keeps the gate (an empty part paints no band and reserves no space);
+/// issue #505 — the ACTIVE story's geometry lays out an empty part
+/// through here so the caret of a freshly entered header / footer sits
+/// on the part's own first line inside the band, never on the body.
+#[allow(clippy::too_many_arguments)]
+fn lay_out_header_footer_box(
+    blocks: &[engine::Block],
+    content_width: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LayoutCache,
+    source_rid: Option<&str>,
+    composition: Option<&CompositionState>,
+) -> layout::HeaderFooterBox {
     let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
     for (block_idx, block) in blocks.iter().enumerate() {
@@ -4449,10 +4481,10 @@ fn build_header_footer_box(
         y += lb.size().height;
         out.push(lb);
     }
-    Some(layout::HeaderFooterBox {
+    layout::HeaderFooterBox {
         blocks: out,
         source_rid: source_rid.map(str::to_string),
-    })
+    }
 }
 
 /// Phase 6 — walk a freshly laid-out `TableBox` and stamp every nested
@@ -12674,9 +12706,24 @@ impl Engine {
         let Some(page) = pages.get(idx) else {
             return Ok(geom);
         };
-        let band = if header { &page.header } else { &page.footer };
-        let Some(band) = band else {
-            return Ok(geom);
+        /* Issue #505 — an EMPTY part paints no band (the paint path's
+        "nothing to paint" gate), so a freshly entered header / footer
+        had no lines here: `selection_changed` fell back to the body
+        margin of page 0 and the caret overlay sat on the body, outside
+        the band, until the first keystroke built one. Lay the active
+        part out on its own (one empty line per empty paragraph, at the
+        header / footer distance) so the entry caret always lands on
+        the part's first line inside the band of the entered page. */
+        let laid_out_empty;
+        let band = match if header { &page.header } else { &page.footer } {
+            Some(band) => band,
+            None => match self.active_empty_band(page) {
+                Some(band) => {
+                    laid_out_empty = band;
+                    &laid_out_empty
+                }
+                None => return Ok(geom),
+            },
         };
         let content_x = page.margins.left;
         let content_w = page.size.width - page.margins.left - page.margins.right;
@@ -12684,7 +12731,7 @@ impl Engine {
             + if header {
                 page.header_band_top()
             } else {
-                page.footer_band_top()
+                page.footer_band_top_for(Some(band))
             };
         for (i, band_block) in band.blocks.iter().enumerate() {
             match band_block {
@@ -12717,6 +12764,43 @@ impl Engine {
             }
         }
         Ok(geom)
+    }
+
+    /// Issue #505 — the ACTIVE header / footer part laid out for `page`
+    /// when the page paints no band for it (an all-empty part: the paint
+    /// path reserves nothing for it). Same builder, content width, fonts
+    /// and style context as the paint path's band, so the empty line's
+    /// height and the caret's x (alignment, direction, the mark's face)
+    /// are what the first typed character will paint with. `None` outside
+    /// a header / footer story, for a part that does not exist, or before
+    /// the layout config / fonts are ready.
+    fn active_empty_band(&self, page: &PageBox) -> Option<layout::HeaderFooterBox> {
+        let doc = self.undo.current();
+        let blocks = match &self.active_story {
+            StoryTarget::Header { rid, .. } => doc.headers.get(rid)?,
+            StoryTarget::Footer { rid, .. } => doc.footers.get(rid)?,
+            StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => {
+                return None;
+            }
+        };
+        let cfg = self.layout_cfg.as_ref()?;
+        if !self.fonts.contains_key(&cfg.font_id) {
+            return None;
+        }
+        let font_stack = self.font_stack(&cfg.font_id);
+        let mut cache = self.layout_cache.borrow_mut();
+        let content_w = page.size.width - page.margins.left - page.margins.right;
+        Some(lay_out_header_footer_box(
+            blocks,
+            content_w,
+            &font_stack,
+            cfg,
+            self.scale(),
+            StyleContext::of(doc),
+            &mut cache,
+            None,
+            None,
+        ))
     }
 
     /// Flatten the current document into per-line hit-test geometry. PR 4:
@@ -13823,6 +13907,53 @@ impl Engine {
     }
 
     /// Assemble a `SelectionChanged` event from the current selection.
+    /// The caret rectangle `selection_changed` reports when the active
+    /// document has no laid-out line at all (an empty body before the
+    /// first paint, a story whose band could not be laid out). Issue
+    /// #505 — story-aware: a header / footer story falls back to a line
+    /// at the header distance from the top / footer distance from the
+    /// bottom of its anchor page, never to the body margin of page 0
+    /// (the overlay then sat on the body, outside the band being edited).
+    fn caret_fallback_rect(&self) -> BridgeRect {
+        let scale = self.scale();
+        let w = CARET_WIDTH * scale;
+        let h = self.layout_cfg.as_ref().map_or(16.0, |c| c.line_height) * scale;
+        let band = match &self.active_story {
+            StoryTarget::Header { page, .. } => Some((*page, true)),
+            StoryTarget::Footer { page, .. } => Some((*page, false)),
+            StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => None,
+        };
+        if let Some((page_idx, header)) = band {
+            let snap_cell = self.layout_snapshot.borrow();
+            if let Some(pages) = snap_cell.as_ref().map(|s| &s.pages)
+                && let Some(last) = pages.len().checked_sub(1)
+            {
+                let gap = render::scene::PAGE_GAP_PT * scale;
+                let idx = (page_idx as usize).min(last);
+                let page_top: f32 = pages[..idx].iter().map(|p| p.size.height + gap).sum();
+                let page = &pages[idx];
+                let y = if header {
+                    page.header_band_top()
+                } else {
+                    page.footer_band_top_for(None) - h
+                };
+                return BridgeRect {
+                    x: page.margins.left,
+                    y: page_top + y,
+                    w,
+                    h,
+                };
+            }
+        }
+        let page = A4Page::a4().scaled(scale);
+        BridgeRect {
+            x: page.margin.left,
+            y: page.margin.top,
+            w,
+            h,
+        }
+    }
+
     fn selection_changed(&self) -> Event {
         let Some(sel) = self.selection.clone() else {
             return Event::error_kind(
@@ -13836,13 +13967,7 @@ impl Engine {
         };
         let (start, end) = ordered(sel.anchor.clone(), sel.caret.clone());
         let scale = self.scale();
-        let page = A4Page::a4().scaled(scale);
-        let fallback = BridgeRect {
-            x: page.margin.left,
-            y: page.margin.top,
-            w: CARET_WIDTH * scale,
-            h: self.layout_cfg.as_ref().map_or(16.0, |c| c.line_height) * scale,
-        };
+        let fallback = self.caret_fallback_rect();
         let rects = match &sel.kind {
             SelectionKind::TableCells {
                 table_path,
@@ -30441,6 +30566,11 @@ mod revision_address_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
+
+/// Issue #505 — the entry caret of an (empty) header / footer sits inside
+/// the band of the entered page (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod hf_entry_caret_tests;
 
 /// Issue #355 — theme fonts / colours through read → layout.
 #[cfg(test)]

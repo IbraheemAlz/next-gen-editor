@@ -1025,10 +1025,17 @@ impl PageBox {
     /// expansion for bands taller than the margin is out of scope —
     /// tracked as a follow-up.
     pub fn footer_band_top(&self) -> f32 {
-        let content_h = self
-            .footer
-            .as_ref()
-            .map_or(0.0, HeaderFooterBox::content_height);
+        self.footer_band_top_for(self.footer.as_ref())
+    }
+
+    /// Issue #505 — [`Self::footer_band_top`] for an explicit footer
+    /// band: the page's own (`self.footer`), or one laid out for the
+    /// active story when the page paints none (an empty part reserves no
+    /// band, yet its caret must still sit on the part's first line). The
+    /// same bottom anchoring, so the caret of an empty footer lands where
+    /// its first typed character will paint.
+    pub fn footer_band_top_for(&self, band: Option<&HeaderFooterBox>) -> f32 {
+        let content_h = band.map_or(0.0, HeaderFooterBox::content_height);
         self.size.height - self.footer_offset - content_h
     }
 }
