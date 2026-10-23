@@ -28,6 +28,18 @@ provenance:
       build time (FreeType-glue patch only), not vendored; the vendored ICU
       under the charset-conversion module contains an unused full UAX #9
       engine.
+  - repo: https://github.com/ONLYOFFICE/sdkjs.git
+    local: /data/code/reference/onlyoffice-sdkjs
+    commit: 75a9683e0f34472d646642f7a9b7f81dfb91aa23
+    branch: develop
+    commit_date: "2026-05-26"
+    studied: "2026-10-23"
+    license: AGPL-3.0
+    note: >
+      Caret / selection / hit-testing / story-switching study (same tree as the
+      2026-08-22 row). Output: plans/cleanroom/memos/onlyoffice-cursor-memo.md
+      (sanitized; review gate passed by the Reader). Code reading only; no
+      runtime observation.
 
 areas:
   - name: word document model + editing logic
@@ -76,6 +88,29 @@ areas:
     where: [{repo: core, path: MsBinaryFile}, {repo: core, path: RtfFile}, {repo: core, path: OdfFile}, {repo: core, path: HtmlFile2}, {repo: core, path: EpubFile}]
   - name: zip + encrypted-file handling
     where: [{repo: core, path: OfficeUtils/src}, {repo: core, path: OfficeCryptReader}]
+  # ---- caret / selection / navigation (added 2026-10-23, cursor memo) ----
+  - name: per-story controllers (body, header/footer, drawings, notes) receiving caret + selection calls
+    where: [{repo: sdkjs, path: word/Editor/DocumentControllerBase.js}, {repo: sdkjs, path: word/Editor/LogicDocumentController.js}, {repo: sdkjs, path: word/Editor/HeaderFooterController.js}, {repo: sdkjs, path: word/Editor/DrawingsController.js}]
+  - name: top-level mouse/key dispatch, story choice on click, body vertical-arrow probe, page keys, Esc
+    where: [{repo: sdkjs, path: word/Editor/Document.js}]
+  - name: structural caret navigation inside inner stories (cells, headers, text boxes) + boundary deletes
+    where: [{repo: sdkjs, path: word/Editor/DocumentContent.js}, {repo: sdkjs, path: word/Editor/DocumentContentBase.js}]
+  - name: paragraph point-to-position hit-test and caret geometry (bidi-replayed)
+    where: [{repo: sdkjs, path: word/Editor/Paragraph/search-position-by-coords.js}, {repo: sdkjs, path: word/Editor/Paragraph/position-calculator.js}, {repo: sdkjs, path: word/Editor/Paragraph.js}, {repo: sdkjs, path: word/Editor/Run.js}]
+  - name: header/footer activation, band test, per-page instance switching
+    where: [{repo: sdkjs, path: word/Editor/HeaderFooter.js}, {repo: sdkjs, path: word/Editor/Layout/PrintView.js}]
+  - name: table cell hit-test, cell navigation, Tab, cell-rectangle selection
+    where: [{repo: sdkjs, path: word/Editor/Table.js}]
+  - name: view-layer page pick, caret overlay element, blink, scroll-into-view
+    where: [{repo: sdkjs, path: word/Drawing/DrawingDocument.js}]
+  - name: object selection, layer-scoped drawing hit-test, nudge, return-to-text
+    where: [{repo: sdkjs, path: common/Drawings/CommonController.js}, {repo: sdkjs, path: word/Editor/GraphicObjects}, {repo: sdkjs, path: word/Editor/Paragraph/ParaDrawing.js}]
+  - name: IME composition lifecycle
+    where: [{repo: sdkjs, path: word/Editor/document-composite-input.js}]
+  - name: undo/redo selection-state snapshots
+    where: [{repo: sdkjs, path: word/Editor/History.js}]
+  - name: per-character font slot (ascii / hAnsi / eastAsia / cs) classification
+    where: [{repo: sdkjs, path: word/Editor/Paragraph/Run/FontClassification.js}]
 
 features:
   # ---- layout & pagination ----
