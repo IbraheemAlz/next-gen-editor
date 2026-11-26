@@ -12029,6 +12029,11 @@ mod run_content_tests;
 #[path = "writer_forbidden_chars_tests.rs"]
 mod forbidden_chars_tests;
 
+/// Issue #599 — U+00A0 NO-BREAK SPACE round-trips as the literal character.
+#[cfg(test)]
+#[path = "writer_nbsp_tests.rs"]
+mod nbsp_tests;
+
 /// Issue #556 — the default paragraph style: read into every unstyled
 /// paragraph, never written back as direct formatting.
 #[cfg(test)]

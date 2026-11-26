@@ -490,6 +490,9 @@ pub fn to_html_blocks(blocks: &[Block]) -> String {
 /* Parsing — HTML -> Paragraph                                             */
 /* ======================================================================= */
 
+/// U+00A0 NO-BREAK SPACE — what `&nbsp;` decodes to (issue #599).
+const NBSP: char = '\u{00A0}';
+
 fn decode_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -513,7 +516,12 @@ fn decode_entities(s: &str) -> String {
             "gt" => Some('>'),
             "quot" => Some('"'),
             "apos" | "#39" => Some('\''),
-            "nbsp" => Some(' '),
+            /* Issue #599 - the NO-BREAK SPACE, never an ASCII space:
+            `collapse_ws` (ASCII whitespace only) must leave it alone, so
+            Word's `&nbsp;` indentation runs and a browser's `a&nbsp;&nbsp;b`
+            keep every one, and layout will not break a line at it. The
+            numeric spellings (`&#160;`, `&#xA0;`) already decoded to it. */
+            "nbsp" => Some(NBSP),
             _ => ent
                 .strip_prefix("#x")
                 .or_else(|| ent.strip_prefix("#X"))
@@ -538,6 +546,8 @@ fn decode_entities(s: &str) -> String {
 
 /// Collapse every run of ASCII whitespace to a single space — the browser
 /// rule for non-`<pre>` content; keeps pasted HTML indentation out of the text.
+/// Only ASCII whitespace: U+00A0 (`&nbsp;`) and every other Unicode space
+/// are content, never collapsed (issue #599).
 fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_ws = false;
@@ -1154,7 +1164,13 @@ impl ParaBuilder {
 
     fn is_empty(&self) -> bool {
         self.events.iter().all(|e| match e {
-            BuilderEvent::Text(t, _) => t.trim().is_empty(),
+            /* Issue #599 - inter-tag formatting whitespace is ASCII; a
+            paragraph holding only `&nbsp;` is a blank line the author wrote
+            (Word's clipboard HTML spells every empty paragraph that way),
+            and `str::trim` would drop it as Unicode white space. */
+            BuilderEvent::Text(t, _) => {
+                t.trim_matches(|c: char| c.is_ascii_whitespace()).is_empty()
+            }
             BuilderEvent::Object(_) => false,
         })
     }
@@ -1695,6 +1711,116 @@ mod tests {
         assert_eq!(decode_entities("&&amp;&"), "&&&");
         assert_eq!(decode_entities("no entities"), "no entities");
         assert_eq!(decode_entities(""), "");
+    }
+
+    /// Issue #599 - `&nbsp;` is U+00A0 in every spelling (named, decimal,
+    /// hex), never an ASCII space: the named entity used to decode to U+0020
+    /// and `collapse_ws` then merged a run of them into one.
+    #[test]
+    fn nbsp_decodes_to_u00a0_in_every_spelling() {
+        assert_eq!(decode_entities("&nbsp;"), "\u{a0}");
+        assert_eq!(decode_entities("&#160;"), "\u{a0}");
+        assert_eq!(decode_entities("&#xA0;"), "\u{a0}");
+        assert_eq!(decode_entities("&#xa0;"), "\u{a0}");
+        assert_eq!(decode_entities("&#XA0;"), "\u{a0}");
+        assert_eq!(
+            decode_entities("a&nbsp;&nbsp;&nbsp;b"),
+            "a\u{a0}\u{a0}\u{a0}b"
+        );
+        /* HTML entity names are case-sensitive: `&NBSP;` is no entity here
+        (the unknown-entity rule keeps its `&`). */
+        assert_eq!(decode_entities("&NBSP;"), "&NBSP;");
+    }
+
+    /// Issue #599 - `collapse_ws` collapses ASCII whitespace only: a no-break
+    /// space (and any other Unicode space) is content.
+    #[test]
+    fn collapse_ws_leaves_no_break_spaces_alone() {
+        assert_eq!(collapse_ws("a \n\t b"), "a b");
+        assert_eq!(collapse_ws("a\u{a0}\u{a0}\u{a0}b"), "a\u{a0}\u{a0}\u{a0}b");
+        /* An ASCII space next to a no-break one stays two characters. */
+        assert_eq!(collapse_ws("a \u{a0} b"), "a \u{a0} b");
+        assert_eq!(collapse_ws("a\u{2003}\u{2003}b"), "a\u{2003}\u{2003}b");
+    }
+
+    fn only_text(p: &Paragraph) -> &str {
+        &p.text
+    }
+
+    /// Issue #599 - the shapes a browser / Word clipboard writes: an
+    /// indentation run, a gap between words, a trailing no-break space.
+    #[test]
+    fn from_html_keeps_every_no_break_space() {
+        let p = from_html("<p>a&nbsp;&nbsp;&nbsp;b</p>");
+        assert_eq!(p.len(), 1);
+        assert_eq!(only_text(&p[0]), "a\u{a0}\u{a0}\u{a0}b");
+
+        /* Word's indentation: a run in front of the text. */
+        let p = from_html("<p class=MsoNormal>&nbsp;&nbsp;&nbsp;&nbsp;indented</p>");
+        assert_eq!(only_text(&p[0]), "\u{a0}\u{a0}\u{a0}\u{a0}indented");
+
+        /* Source formatting whitespace around it still collapses; the
+        no-break space is kept apart from the ASCII spaces next to it. */
+        let p = from_html("<p>a\n    &nbsp;\n    b&nbsp;</p>");
+        assert_eq!(only_text(&p[0]), "a \u{a0} b\u{a0}");
+
+        /* The numeric spellings behave the same. */
+        let p = from_html("<p>a&#160;&#xA0;b</p>");
+        assert_eq!(only_text(&p[0]), "a\u{a0}\u{a0}b");
+
+        /* Inside an inline style, the styled run keeps it. */
+        let p = from_html("<p><b>x&nbsp;&nbsp;y</b></p>");
+        assert_eq!(only_text(&p[0]), "x\u{a0}\u{a0}y");
+        assert!(p[0].spans.iter().any(|s| s.style.bold == Some(true)));
+    }
+
+    /// Issue #599 - a paragraph (or cell) holding ONLY `&nbsp;` is a blank
+    /// line the author wrote - Word's clipboard HTML spells every empty
+    /// paragraph `<p><o:p>&nbsp;</o:p></p>` - not inter-tag whitespace, so it
+    /// is kept (as a browser keeps it); a paragraph of ASCII whitespace alone
+    /// is still dropped.
+    #[test]
+    fn a_paragraph_holding_only_nbsp_is_kept() {
+        let p = from_html("<p>one</p><p>&nbsp;</p><p>two</p>");
+        let texts: Vec<&str> = p.iter().map(only_text).collect();
+        assert_eq!(texts, ["one", "\u{a0}", "two"]);
+
+        let p = from_html("<p class=MsoNormal><o:p>&nbsp;</o:p></p>");
+        assert_eq!(p.len(), 1);
+        assert_eq!(only_text(&p[0]), "\u{a0}");
+
+        /* ASCII-whitespace-only paragraphs are formatting, not content. */
+        assert!(from_html("<p> </p><p>\n\t</p>").is_empty());
+        assert!(from_html("   \n  ").is_empty());
+
+        let blocks = from_html_blocks("<table><tr><td>&nbsp;</td><td> </td></tr></table>");
+        let Some(Block::Table(t)) = blocks.first() else {
+            panic!("a table: {blocks:?}");
+        };
+        let cell_text = |i: usize| match t.rows[0].cells[i].blocks.first() {
+            Some(Block::Paragraph(p)) => p.text.clone(),
+            other => panic!("a paragraph: {other:?}"),
+        };
+        assert_eq!(cell_text(0), "\u{a0}");
+        assert_eq!(cell_text(1), "");
+    }
+
+    /// Issue #599 - a `.html` file opened as a document keeps them too.
+    #[test]
+    fn from_html_document_keeps_no_break_spaces() {
+        let doc = from_html_document(
+            "<!DOCTYPE html><html><head><title>t&nbsp;t</title></head>\
+             <body><p>a&nbsp;&nbsp;b</p><p>&nbsp;</p></body></html>",
+        );
+        let texts: Vec<String> = doc
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph(p) => p.text.clone(),
+                Block::Table(_) => panic!("no table"),
+            })
+            .collect();
+        assert_eq!(texts, ["a\u{a0}\u{a0}b", "\u{a0}"]);
     }
 
     /// Issue #592 (audit sibling) - `parse_css_color` sliced a hex colour by

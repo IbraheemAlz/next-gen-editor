@@ -452,11 +452,20 @@ pub enum Scenario {
     /// and a bare `&` before Arabic text) and the audit's sibling
     /// (`parse_css_color` slicing a 3-byte hex colour holding an e-acute).
     PasteHtmlEntityBeforeMultibyte,
+    /// Issue #599 - `&nbsp;` in pasted HTML decoded to an ASCII space that
+    /// `collapse_ws` then merged, so a run of them (Word's indentation, a
+    /// browser's `a&nbsp;&nbsp;&nbsp;b`) became one space and a paragraph /
+    /// cell holding only `&nbsp;` was dropped or emptied. It is U+00A0 now,
+    /// kept by the collapse. The sequence pastes the shapes - a run, Word's
+    /// indented paragraph + blank `<o:p>&nbsp;</o:p>` line, an `&nbsp;`
+    /// table cell, the numeric spellings - and the test counts every
+    /// character that landed.
+    PasteHtmlNbsp,
 }
 
 impl Scenario {
     /// Every scenario, in the fixed order [`Scenario::index`] encodes.
-    pub const ALL: [Scenario; 17] = [
+    pub const ALL: [Scenario; 18] = [
         Scenario::NanZoom,
         Scenario::NanDeviceScale,
         Scenario::BadRenderDate,
@@ -480,6 +489,8 @@ impl Scenario {
         Scenario::InsertFieldOffsetMax,
         // Issue #592 - appended, same rule.
         Scenario::PasteHtmlEntityBeforeMultibyte,
+        // Issue #599 - appended, same rule.
+        Scenario::PasteHtmlNbsp,
     ];
 
     /// The committed corpus file this scenario's seed lives at, relative
@@ -503,6 +514,7 @@ impl Scenario {
             Scenario::NavExpansionStalled => "repro_499_nav_expansion_stalled",
             Scenario::InsertFieldOffsetMax => "repro_512_insert_field_offset_max",
             Scenario::PasteHtmlEntityBeforeMultibyte => "repro_592_paste_html_entity_multibyte",
+            Scenario::PasteHtmlNbsp => "repro_599_paste_html_nbsp",
         }
     }
 
@@ -946,6 +958,25 @@ impl Scenario {
                     // The audit's sibling: a 3-byte hex colour that holds a
                     // 2-byte scalar.
                     paste("<p><span style=\"color:#\u{e9}a\">x</span></p>"),
+                ]
+            }
+            Scenario::PasteHtmlNbsp => {
+                let paste = |html: &str| Command::PasteHtml {
+                    html: html.to_string(),
+                };
+                vec![
+                    // A run of three, between letters.
+                    paste("<p>a&nbsp;&nbsp;&nbsp;b</p>"),
+                    // Word's clipboard HTML: an indentation run of four,
+                    // then a blank line spelled `<o:p>&nbsp;</o:p>`.
+                    paste(
+                        "<p class=MsoNormal><o:p>&nbsp;&nbsp;&nbsp;&nbsp;</o:p>indented</p>\
+                         <p class=MsoNormal><o:p>&nbsp;</o:p></p>",
+                    ),
+                    // An empty-looking cell.
+                    paste("<table><tr><td>&nbsp;</td><td>x</td></tr></table>"),
+                    // The numeric spellings and the named one together.
+                    paste("<p>&#160;&#xA0;&nbsp; z</p>"),
                 ]
             }
         }
@@ -2119,6 +2150,41 @@ mod tests {
                 "step {i} pastes its text and leaves the caret at {caret}: {evt:?}"
             );
         }
+        assert!(engine.selection_is_valid());
+        assert_eq!(
+            engine.check_invariants_for_fuzzing(),
+            Ok(()),
+            "the session still holds the engine invariants"
+        );
+    }
+
+    /// Issue #599 (`repro_599_paste_html_nbsp`) - every `&nbsp;` of the
+    /// pasted shapes lands as its own U+00A0 (3 + 4 + the blank line's 1 +
+    /// the cell's 1 + the three spellings' 3 = 12), none collapsed into an
+    /// ASCII space and no `&nbsp;`-only paragraph / cell dropped.
+    #[test]
+    fn paste_html_nbsp_lands_every_no_break_space() {
+        let (mut engine, events) = apply_scenario(Scenario::PasteHtmlNbsp);
+        assert_eq!(events.len(), 4, "{events:?}");
+        for evt in &events {
+            assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        }
+        /* The saved `.docx` read back: its text covers the table cell too
+        (the clipboard's plain flavour of a selection leaves tables out). */
+        let Event::DocumentSaved { bytes, .. } = engine.apply_sync(Command::SaveDocx) else {
+            panic!("the document saves");
+        };
+        let plain = format_docx::read_docx(&bytes)
+            .expect("the save re-reads")
+            .document
+            .to_plain_text();
+        assert_eq!(plain.matches('\u{a0}').count(), 12, "{plain:?}");
+        assert!(plain.contains("a\u{a0}\u{a0}\u{a0}b"), "{plain:?}");
+        assert!(
+            plain.contains("\u{a0}\u{a0}\u{a0}\u{a0}indented"),
+            "{plain:?}"
+        );
+        assert!(plain.contains("\u{a0}\u{a0}\u{a0} z"), "{plain:?}");
         assert!(engine.selection_is_valid());
         assert_eq!(
             engine.check_invariants_for_fuzzing(),

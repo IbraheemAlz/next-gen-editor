@@ -13,7 +13,7 @@
 //! render can paint correctly, never for write-back at PR 2.
 
 use crate::error::{DocxError, DocxWarning};
-use crate::parts::document::{CommentEvent, is_block_level_marker};
+use crate::parts::document::{BlockPlace, CommentEvent, is_block_level_marker, misplaced_block};
 use crate::schema::block_envelope::{BlockEnvelopes, PassthroughSlot};
 use crate::schema::ct_ppr::parse_jc;
 use crate::schema::ct_rpr::{attr_val, parse_hex_color, toggle_on};
@@ -83,6 +83,7 @@ pub fn parse_table_bytes(
         resolver,
         ns,
         0,
+        0,
         &mut warnings,
         &mut CommentSink::default(),
     )?;
@@ -127,21 +128,33 @@ pub fn parse_table_bytes_with_warnings(
     ns: &NamespaceScope,
     warnings: &mut Vec<DocxWarning>,
 ) -> Result<ParsedTable, DocxError> {
-    parse_table_bytes_at(xml, resolver, ns, 0, warnings, &mut CommentSink::default())
+    parse_table_bytes_at(
+        xml,
+        resolver,
+        ns,
+        0,
+        0,
+        warnings,
+        &mut CommentSink::default(),
+    )
 }
 
 /// Issue #284 — [`parse_table_bytes_with_warnings`], appending every
 /// comment anchor piece inside the table (cell paragraphs, nested tables,
 /// markers between cell blocks) to `sink`, in document order, with its
 /// full path (`sink`'s prefix — the table's own path — first).
+///
+/// Issue #564 — `base` is where `xml` starts in the part (the walk's byte
+/// space), so the offset a block-placement refusal names is part-relative.
 pub(crate) fn parse_table_bytes_with_events(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
     ns: &NamespaceScope,
+    base: usize,
     warnings: &mut Vec<DocxWarning>,
     sink: &mut CommentSink,
 ) -> Result<ParsedTable, DocxError> {
-    parse_table_bytes_at(xml, resolver, ns, 0, warnings, sink)
+    parse_table_bytes_at(xml, resolver, ns, 0, base, warnings, sink)
 }
 
 /// Issue #284 — where a table walk records comment anchor pieces: the
@@ -282,11 +295,14 @@ fn parse_table_bytes_at(
     resolver: &crate::style_resolver::StyleResolver<'_>,
     ns: &NamespaceScope,
     depth: u32,
+    base: usize,
     warnings: &mut Vec<DocxWarning>,
     sink: &mut CommentSink,
 ) -> Result<ParsedTable, DocxError> {
     /* Issue #284 — this table's path prefix in `sink` (a nested walk
-    extends it; every use here truncates back to it first). */
+    extends it; every use here truncates back to it first). Issue #564 —
+    `base` is where `xml` starts in the part: every offset a refusal names
+    is `base` + a position in `xml`. */
     let sink_base = sink.prefix.len();
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
@@ -352,6 +368,26 @@ fn parse_table_bytes_at(
         match event {
             Event::Start(e) => {
                 let name = e.name().as_ref().to_owned();
+                /* Issue #564 — the ONE block-placement rule
+                (`parts::document::misplaced_block`, #536 / #530) for this
+                table's own blocks; a nested table is walked, and held to it,
+                by its own recursion. */
+                if nested_tbl_depth == 0 {
+                    let block = match name.as_slice() {
+                        b"w:p" => Some("paragraph"),
+                        b"w:tbl" if in_table => Some("table"),
+                        _ => None,
+                    };
+                    if let Some(block) = block {
+                        refuse_misplaced_block(
+                            block,
+                            base + prev_pos,
+                            cur_cell.is_some(),
+                            p_start_byte.is_some(),
+                            open_tc_pr.is_some(),
+                        )?;
+                    }
+                }
                 match name.as_slice() {
                     /* Issue #351 — inside a cell paragraph a drawing, an
                     `mc:AlternateContent` or a text-box story is the
@@ -561,6 +597,16 @@ fn parse_table_bytes_at(
             }
             Event::Empty(e) => {
                 let name = e.name().as_ref().to_owned();
+                /* Issue #564 — a self-closing paragraph obeys the same rule. */
+                if nested_tbl_depth == 0 && name.as_slice() == b"w:p" {
+                    refuse_misplaced_block(
+                        "paragraph",
+                        base + prev_pos,
+                        cur_cell.is_some(),
+                        p_start_byte.is_some(),
+                        open_tc_pr.is_some(),
+                    )?;
+                }
                 if at_cell_level && name.as_slice() == b"w:p" {
                     /* Issue #120 — a self-closing `<w:p …/>` cell paragraph
                     (Word writes one for every empty cell): one `Empty`
@@ -570,10 +616,12 @@ fn parse_table_bytes_at(
                     if let Some(raw) = slice_element(xml, prev_pos, end_pos, b"w:p")
                         && let Some(cell) = cur_cell.as_mut()
                     {
-                        let at = cell_block_at(&rows, &cur_row, Some(cell));
-                        let mut p = parse_cell_paragraph(&raw, resolver, ns, sink, sink_base, at);
-                        p.body_xml = cell_env.take_before();
-                        cell.blocks.push(Block::Paragraph(p));
+                        let place = CellParaPlace {
+                            sink_base,
+                            at: cell_block_at(&rows, &cur_row, Some(cell)),
+                            at_byte: base + prev_pos,
+                        };
+                        push_cell_paragraph(cell, &mut cell_env, &raw, resolver, ns, sink, place)?;
                         cell_env.note_block_end(end_pos);
                     }
                     prev_pos = end_pos;
@@ -699,21 +747,40 @@ fn parse_table_bytes_at(
                                         cell_env.take_before(),
                                     );
                                     cell_env.note_block_end(end_pos);
-                                } else if let Ok(parsed) = parse_table_bytes_at(
-                                    &raw,
-                                    resolver,
-                                    ns,
-                                    depth + 1,
-                                    warnings,
-                                    /* Issue #284 — its comment pieces land
-                                    under its path in this table. */
-                                    sink.enter(
-                                        sink_base,
-                                        cell_block_at(&rows, &cur_row, Some(cell)),
-                                    ),
-                                ) {
-                                    push_nested_table(cell, parsed, raw, cell_env.take_before());
-                                    cell_env.note_block_end(end_pos);
+                                } else {
+                                    match parse_table_bytes_at(
+                                        &raw,
+                                        resolver,
+                                        ns,
+                                        depth + 1,
+                                        base + start,
+                                        warnings,
+                                        /* Issue #284 — its comment pieces land
+                                        under its path in this table. */
+                                        sink.enter(
+                                            sink_base,
+                                            cell_block_at(&rows, &cur_row, Some(cell)),
+                                        ),
+                                    ) {
+                                        Ok(parsed) => {
+                                            push_nested_table(
+                                                cell,
+                                                parsed,
+                                                raw,
+                                                cell_env.take_before(),
+                                            );
+                                            cell_env.note_block_end(end_pos);
+                                        }
+                                        /* Issue #564 — a refusal inside the
+                                        nested table refuses the part; any
+                                        other failure keeps the nested bytes
+                                        opaque (`opaque_unless_refused`'s
+                                        rule, spelled as a `match`: a generic
+                                        wrapper's temporaries would sit on
+                                        this recursive frame). */
+                                        Err(e @ DocxError::MalformedXml(_)) => return Err(e),
+                                        Err(_) => {}
+                                    }
                                 }
                             }
                         }
@@ -841,11 +908,20 @@ fn parse_table_bytes_at(
                                 /* Issue #101 — cell paragraphs parse
                                 through the body run parser (runs, rPr
                                 grab bags, pictures, source bytes). */
-                                let at = cell_block_at(&rows, &cur_row, Some(cell));
-                                let mut p =
-                                    parse_cell_paragraph(&raw, resolver, ns, sink, sink_base, at);
-                                p.body_xml = cell_env.take_before();
-                                cell.blocks.push(Block::Paragraph(p));
+                                let place = CellParaPlace {
+                                    sink_base,
+                                    at: cell_block_at(&rows, &cur_row, Some(cell)),
+                                    at_byte: base + start,
+                                };
+                                push_cell_paragraph(
+                                    cell,
+                                    &mut cell_env,
+                                    &raw,
+                                    resolver,
+                                    ns,
+                                    sink,
+                                    place,
+                                )?;
                                 cell_env.note_block_end(end_pos);
                             }
                         }
@@ -900,6 +976,33 @@ fn parse_table_bytes_at(
     })
 }
 
+/// Issue #564 — the table walk's side of the ONE block-placement rule
+/// (`parts::document::misplaced_block`, issues #536 / #530). A `<w:p>` or a
+/// nested `<w:tbl>` of THIS table is a cell block only inside a `<w:tc>`,
+/// outside any open cell paragraph and outside the cell's `<w:tcPr>`;
+/// anywhere else (`block` at part-relative byte `at`) the table — and with it
+/// the part — is refused. Out of line: the walk's frame recurses once per
+/// nesting level.
+#[inline(never)]
+fn refuse_misplaced_block(
+    block: &str,
+    at: usize,
+    in_cell: bool,
+    in_paragraph: bool,
+    in_cell_props: bool,
+) -> Result<(), DocxError> {
+    let place = if in_paragraph {
+        BlockPlace::InParagraph
+    } else if !in_cell {
+        BlockPlace::OutsideCell
+    } else if in_cell_props {
+        BlockPlace::InCellProperties
+    } else {
+        return Ok(());
+    };
+    Err(misplaced_block(block, at, place))
+}
+
 /// Issue #103 — record a `<w:tr>`'s `<w:tblPrEx>` bytes (`frag`, which
 /// started at `start`) with the whitespace since `lead_from`.
 fn record_tbl_pr_ex(
@@ -920,6 +1023,35 @@ fn record_tbl_pr_ex(
             model: (),
         });
     }
+}
+
+/// Where a cell paragraph stands: its comment-sink prefix length, its path
+/// in the table being walked (issue #284) and its start in the part
+/// (issue #564).
+struct CellParaPlace {
+    sink_base: usize,
+    at: [engine::PathStep; 2],
+    at_byte: usize,
+}
+
+/// Parse the cell paragraph `raw` and append it to `cell` (out of line, like
+/// [`push_nested_table`]: the paragraph temporaries stay off the walk's
+/// recursive frame — one per nesting level, on a debug build's bounded test
+/// stack). A refusal (issue #564) goes up; the cell is left as it was.
+#[inline(never)]
+fn push_cell_paragraph(
+    cell: &mut TableCell,
+    cell_env: &mut BlockEnvelopes,
+    raw: &[u8],
+    resolver: &crate::style_resolver::StyleResolver<'_>,
+    ns: &NamespaceScope,
+    sink: &mut CommentSink,
+    place: CellParaPlace,
+) -> Result<(), DocxError> {
+    let mut p = parse_cell_paragraph(raw, resolver, ns, sink, place)?;
+    p.body_xml = cell_env.take_before();
+    cell.blocks.push(Block::Paragraph(p));
+    Ok(())
 }
 
 /// Cell paragraph parser (issue #101). A cell `<w:p>` is parsed by the
@@ -944,14 +1076,26 @@ fn record_tbl_pr_ex(
 /// document section (`section_end`). Issue #284 — its comment anchor
 /// pieces go to `sink` at `at` (the paragraph's `Cell` step and block
 /// index in the table being walked).
+///
+/// Issue #564 — the body walk's own placement refusal (`misplaced_block`) is
+/// no longer folded into an opaque paragraph: it refuses the table. The
+/// table walk asks the same rule first, so what reaches here is only what
+/// that walk skips whole to leave to this parse — a `<w:p>` inside a
+/// paragraph-level `mc:AlternateContent` branch. `place.at_byte` is where
+/// the paragraph starts in the part (the wrapped parse's own offsets are not
+/// part-relative, so the refusal names the paragraph, not the inner block).
 fn parse_cell_paragraph(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
     ns: &NamespaceScope,
     sink: &mut CommentSink,
-    sink_base: usize,
-    at: [engine::PathStep; 2],
-) -> engine::Paragraph {
+    place: CellParaPlace,
+) -> Result<engine::Paragraph, DocxError> {
+    let CellParaPlace {
+        sink_base,
+        at,
+        at_byte,
+    } = place;
     let mut wrapped: Vec<u8> = Vec::with_capacity(xml.len() + 256);
     wrapped.extend_from_slice(b"<w:document");
     if ns.uri("w").is_none() {
@@ -984,13 +1128,20 @@ fn parse_cell_paragraph(
         resolver,
         &mut warnings,
         engine::PageGeometry::default(),
-    )
-    .ok()
-    .and_then(|(tree, events)| match tree.blocks.front() {
-        Some(Block::Paragraph(p)) => Some((p.clone(), events)),
-        _ => None,
-    });
-    match parsed {
+    );
+    if matches!(parsed, Err(DocxError::MalformedXml(_))) {
+        return Err(DocxError::MalformedXml(format!(
+            "a block inside the paragraph at byte {at_byte} stands where no block may stand \
+             (no faithful repair)"
+        )));
+    }
+    let parsed = parsed
+        .ok()
+        .and_then(|(tree, events)| match tree.blocks.front() {
+            Some(Block::Paragraph(p)) => Some((p.clone(), events)),
+            _ => None,
+        });
+    Ok(match parsed {
         Some((mut p, found)) => {
             p.section_end = None;
             sink.paragraph(found, sink_base, at);
@@ -1003,7 +1154,7 @@ fn parse_cell_paragraph(
             source_xml: Some(xml.to_vec()),
             ..Default::default()
         },
-    }
+    })
 }
 
 /// Push a nested table onto `cell` (out of line, issue #284: the

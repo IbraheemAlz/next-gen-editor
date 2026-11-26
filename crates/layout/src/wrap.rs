@@ -341,8 +341,8 @@ pub const FOOTER_ANCHOR_ID: u32 = u32::MAX - 2;
 /// Resolve a float's [`FloatKey`] on its page.
 pub fn float_key(page: &PageBox, f: &FloatBox) -> Option<FloatKey> {
     let id = match f.anchor {
-        FloatAnchorRef::Header => HEADER_ANCHOR_ID,
-        FloatAnchorRef::Footer => FOOTER_ANCHOR_ID,
+        FloatAnchorRef::Header { .. } => HEADER_ANCHOR_ID,
+        FloatAnchorRef::Footer { .. } => FOOTER_ANCHOR_ID,
         FloatAnchorRef::Body { block, cell } => {
             let b = page.blocks.get(block)?;
             match (b, cell) {
@@ -1040,9 +1040,9 @@ mod tests {
         let mut f = float_at(0.0, 0.0, 1.0, 1.0, wrap(WrapKind::Square));
         let pg = page(vec![para(42, 0.0, 16.0, 1)], vec![]);
         assert_eq!(float_key(&pg, &f), Some((42, 1)));
-        f.anchor = FloatAnchorRef::Header;
+        f.anchor = FloatAnchorRef::Header { block: 0 };
         assert_eq!(float_key(&pg, &f), Some((HEADER_ANCHOR_ID, 1)));
-        f.anchor = FloatAnchorRef::Footer;
+        f.anchor = FloatAnchorRef::Footer { block: 0 };
         assert_eq!(float_key(&pg, &f), Some((FOOTER_ANCHOR_ID, 1)));
         f.anchor = FloatAnchorRef::Body {
             block: 5,

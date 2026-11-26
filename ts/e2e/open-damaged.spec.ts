@@ -82,8 +82,13 @@ test('a damaged .docx is refused with a visible typed message; the document stay
  * paragraph inside the first (#530). Such a package used to open and its
  * zero-edit save read back the body twice / lost the outer paragraph's
  * text; it is now refused through the real File -> Open flow with the
- * damaged-document banner, naming the part and the defect, never the text. */
+ * damaged-document banner, naming the part and the defect, never the text.
+ * Issue #564 extends it to a table cell's blocks. */
 const ROOT_OPEN = documentXml('').split('<w:body>')[0] ?? '';
+/** A closed, well-formed part whose body is one table holding `rows`. */
+const CELL = (rows: string): string =>
+    `${ROOT_OPEN}<w:body><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>` +
+    `${rows}</w:tbl></w:body></w:document>`;
 const MISPLACED = [
     {
         name: 'enclosing-body.docx',
@@ -94,6 +99,24 @@ const MISPLACED = [
         name: 'nested-paragraph.docx',
         xml: `${ROOT_OPEN}<w:body><w:p><w:r><w:t>zzoutersecret</w:t></w:r>${BODY('zzinnersecret')}`,
         defect: 'inside a paragraph',
+    },
+    /* Issue #564 - the same rule for a table CELL's blocks (the table walker
+     * used to read a `<w:p>` nested in a cell paragraph as the inner
+     * paragraph only, silently dropping `zzoutersecret`; a `<w:p>` directly
+     * in a `<w:tr>` was ignored). */
+    {
+        name: 'cell-nested-paragraph.docx',
+        xml: CELL(
+            `<w:tr><w:tc><w:p><w:r><w:t>zzoutersecret</w:t></w:r>` +
+                `<w:smartTag w:element="x">${BODY('zzinnersecret')}</w:smartTag>` +
+                `<w:r><w:t>tail</w:t></w:r></w:p></w:tc></w:tr>`,
+        ),
+        defect: 'inside a paragraph',
+    },
+    {
+        name: 'row-stray-paragraph.docx',
+        xml: CELL(`<w:tr>${BODY('zzstraysecret')}<w:tc>${BODY('cell')}</w:tc></w:tr>`),
+        defect: 'outside a table cell',
     },
 ];
 
