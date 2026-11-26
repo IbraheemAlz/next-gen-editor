@@ -12,7 +12,7 @@ use crate::page::A4Page;
 use crate::paginate::{HeaderBands, PageGeometry, Paginator};
 use crate::paragraph::{
     InlineObjectInfo, InlineObjectInfoKind, ParagraphConfig, layout_paragraph,
-    layout_paragraph_wrapped,
+    layout_paragraph_wrapped, layout_paragraph_wrapped_with_cap, wrap_band_cap,
 };
 use crate::watchdog::{DegradeReason, LayoutDegradation, geometry_fingerprint};
 use crate::wrap::{WrapConvergence, WrapPlan, WrapVerdict};
@@ -185,7 +185,13 @@ fn pass(d: &Doc, fonts: &FontStack, plan: &WrapPlan) -> Vec<PageBox> {
             hyphenation: None,
         };
         let cuts: &[WrapCutout] = plan.get(&(id as u32)).map_or(&[], |v| v.as_slice());
-        let mut p = layout_paragraph_wrapped(cfg, cuts);
+        let wrapped = layout_paragraph_wrapped(cfg, cuts);
+        /* Issue #347 — a nominal fixture never reaches the band cap. */
+        assert_eq!(
+            wrapped.degraded, None,
+            "paragraph {id} hit the wrap band cap"
+        );
+        let mut p = wrapped.paragraph;
         p.source_paragraph_id = id as u32;
         pag.push_block(LayoutBlock::Paragraph(p), 0.0, 6.0);
     }
@@ -425,7 +431,7 @@ fn empty_cutouts_are_the_unwrapped_composer_byte_for_byte() {
             hyphenation: None,
         };
         let a = layout_paragraph(cfg());
-        let b = layout_paragraph_wrapped(cfg(), &[]);
+        let b = layout_paragraph_wrapped(cfg(), &[]).paragraph;
         let page = |p: ParagraphBox| PageBox {
             size: crate::Size {
                 width: 600.0,
@@ -448,6 +454,140 @@ fn empty_cutouts_are_the_unwrapped_composer_byte_for_byte() {
             geometry_fingerprint(&[page(a)]),
             geometry_fingerprint(&[page(b)])
         );
+    }
+}
+
+/// Issue #347 — the paragraph composer's defensive band cap is an escape
+/// hatch like any other (`.claude/rules/render.md`, "Layout
+/// self-defense"): it paints the rest of the text with the cutouts
+/// ignored and reports `FloatWrapCapped`; the nominal path reports
+/// nothing. No finite plan reaches the real cap (every band consumes text
+/// or passes a cutout edge), so the explicit-cap seam forces it.
+#[test]
+fn the_band_cap_reports_float_wrap_capped_and_still_paints_all_text() {
+    let fonts = fonts();
+    for (text, dir) in [
+        (ltr_text(), ShapingDirection::Ltr),
+        (rtl_text(), ShapingDirection::Rtl),
+    ] {
+        let spans = [span(text.len())];
+        let cfg = || ParagraphConfig {
+            text: &text,
+            fonts: &fonts,
+            spans: &spans,
+            base_direction: dir,
+            max_width: 300.0,
+            line_height: LINE_H,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 12.0,
+            inline_objects: &[],
+            tab_stops_px: &[],
+            font_line: None,
+            hyphenation: None,
+        };
+        /* A square object in the middle of the column, ~7 bands tall. */
+        let cuts = [WrapCutout {
+            x0: 100.0,
+            x1: 200.0,
+            y0: 0.0,
+            y1: 7.0 * LINE_H,
+        }];
+        let covered = |p: &ParagraphBox| -> u32 {
+            p.lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .map(|r| r.source_range.end - r.source_range.start)
+                .sum()
+        };
+
+        /* Nominal: the cutout steers every band it touches, nothing noted. */
+        let nominal = layout_paragraph_wrapped(cfg(), &cuts);
+        assert_eq!(nominal.degraded, None, "{dir:?}: nominal path is silent");
+        let nominal_cut_bands = cut_lines_of(&nominal.paragraph)
+            .map(|l| l.origin.y.to_bits())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            nominal_cut_bands > 2,
+            "{dir:?}: the fixture must need more than two cut bands, got {nominal_cut_bands}"
+        );
+        let same =
+            layout_paragraph_wrapped_with_cap(cfg(), &cuts, wrap_band_cap(text.len(), cuts.len()));
+        assert_eq!(same.degraded, None);
+        assert_eq!(
+            geometry_fingerprint(&[one_page(same.paragraph)]),
+            geometry_fingerprint(&[one_page(nominal.paragraph.clone())]),
+            "{dir:?}: the production cap is the explicit cap"
+        );
+
+        /* Forced: two bands, then the cutouts are ignored. */
+        let capped = layout_paragraph_wrapped_with_cap(cfg(), &cuts, 2);
+        assert_eq!(
+            capped.degraded,
+            Some(DegradeReason::FloatWrapCapped),
+            "{dir:?}: the cap is reported"
+        );
+        assert_eq!(
+            covered(&capped.paragraph),
+            covered(&nominal.paragraph),
+            "{dir:?}: the capped layout still paints every byte of text"
+        );
+        let capped_cut_bands = cut_lines_of(&capped.paragraph)
+            .map(|l| l.origin.y.to_bits())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert_eq!(
+            capped_cut_bands, 2,
+            "{dir:?}: only the first two bands were cut"
+        );
+        assert!(
+            capped
+                .paragraph
+                .lines
+                .iter()
+                .any(|l| l.segments.is_empty() && l.origin.y < 7.0 * LINE_H && l.origin.y > 0.0),
+            "{dir:?}: a line below band two now runs through the ignored cutout's rows"
+        );
+
+        /* A cap of zero ignores the cutouts from the first band: one note,
+        a plain full-width layout of the whole paragraph. */
+        let zero = layout_paragraph_wrapped_with_cap(cfg(), &cuts, 0);
+        assert_eq!(zero.degraded, Some(DegradeReason::FloatWrapCapped));
+        assert_eq!(cut_lines_of(&zero.paragraph).count(), 0);
+        assert_eq!(covered(&zero.paragraph), covered(&nominal.paragraph));
+    }
+}
+
+/// The lines a cutout steered (they carry their band's segment list).
+fn cut_lines_of(p: &ParagraphBox) -> impl Iterator<Item = &crate::boxes::LineBox> {
+    p.lines.iter().filter(|l| !l.segments.is_empty())
+}
+
+/// A one-page wrapper for fingerprinting a bare paragraph box.
+fn one_page(p: ParagraphBox) -> PageBox {
+    PageBox {
+        size: crate::Size {
+            width: 600.0,
+            height: 800.0,
+        },
+        margins: crate::Margins::uniform(50.0),
+        blocks: vec![LayoutBlock::Paragraph(p)],
+        header: None,
+        footer: None,
+        header_offset: 20.0,
+        footer_offset: 20.0,
+        footnotes: crate::NoteBand::default(),
+        endnotes: crate::NoteBand::default(),
+        hf_role: crate::HeaderRole::Default,
+        page_number: 1,
+        floats: Vec::new(),
+        decor: Default::default(),
     }
 }
 
