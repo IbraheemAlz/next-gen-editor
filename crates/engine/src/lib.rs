@@ -12969,6 +12969,23 @@ pub struct UndoStack {
     /// A fresh stack restarts at 0, so callers that swap stacks must
     /// invalidate their caches explicitly.
     revision: u64,
+    /// Epic #555 row 35 — one id per entry of `snapshots` (same index):
+    /// the history STEP the entry is. `push` mints a fresh one,
+    /// `replace_current` keeps it (the same step, amended), overflow drops
+    /// it with its snapshot. Ids are unique across every stack of the
+    /// process ([`next_undo_step_id`]), so a consumer may key side data —
+    /// the engine's caret before / after each step — on them without
+    /// caring which stack minted them. Not persisted: a deserialized or
+    /// rebuilt stack gets fresh ids.
+    #[serde(skip)]
+    step_ids: Vec<u64>,
+}
+
+/// Epic #555 row 35 — a process-wide fresh [`UndoStack`] step id.
+fn next_undo_step_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl UndoStack {
@@ -12978,7 +12995,21 @@ impl UndoStack {
             cursor: 0,
             cap,
             revision: 0,
+            step_ids: vec![next_undo_step_id()],
         }
+    }
+
+    /// Epic #555 row 35 — the id of the history step `current()` is (see
+    /// the `step_ids` field). `None` only for a stack deserialized without
+    /// ids (it is never minted that way by the engine).
+    pub fn current_step(&self) -> Option<u64> {
+        self.step_ids.get(self.cursor).copied()
+    }
+
+    /// Epic #555 row 35 — whether `id` still names a step of this stack
+    /// (undo / redo can reach it), for pruning side data keyed on ids.
+    pub fn has_step(&self, id: u64) -> bool {
+        self.step_ids.contains(&id)
     }
 
     pub fn current(&self) -> &DocumentTree {
@@ -13005,11 +13036,17 @@ impl UndoStack {
         if self.cursor + 1 < self.snapshots.len() {
             self.snapshots.truncate(self.cursor + 1);
         }
+        /* Index-aligned with `snapshots` again: drops the redo branch's
+        ids, and gives a stack deserialized without ids fresh ones. */
+        self.step_ids
+            .resize_with(self.snapshots.len(), next_undo_step_id);
         self.snapshots.push(doc);
+        self.step_ids.push(next_undo_step_id());
         self.cursor = self.snapshots.len() - 1;
         /* Cap from the bottom. */
         while self.snapshots.len() > self.cap {
             self.snapshots.remove(0);
+            self.step_ids.remove(0);
             self.cursor = self.cursor.saturating_sub(1);
         }
         self.revision += 1;
@@ -13079,11 +13116,13 @@ impl UndoStack {
             snapshots.drain(..drop);
             cursor = cursor.saturating_sub(drop);
         }
+        let step_ids = snapshots.iter().map(|_| next_undo_step_id()).collect();
         Self {
             snapshots,
             cursor,
             cap,
             revision: 0,
+            step_ids,
         }
     }
 }
@@ -17766,6 +17805,39 @@ mod undo_history_tests {
 
     fn text(d: &DocumentTree) -> &str {
         d.paragraph_text(0).unwrap()
+    }
+
+    /// Epic #555 row 35 — every history step has an id: `push` mints a
+    /// fresh one, `replace_current` keeps it, undo / redo walk back to the
+    /// same ids, a new push after an undo drops the redo branch's ids, and
+    /// overflow drops the oldest with its snapshot.
+    #[test]
+    fn step_ids_follow_push_replace_undo_redo_and_overflow() {
+        let mut s = stack_with(2, 3); /* "0" "1" "2" */
+        let two = s.current_step().unwrap();
+        s.replace_current(DocumentTree::from_text("2b"));
+        assert_eq!(s.current_step(), Some(two), "an amended step keeps its id");
+        assert!(s.undo());
+        let one = s.current_step().unwrap();
+        assert_ne!(one, two);
+        assert!(s.redo());
+        assert_eq!(s.current_step(), Some(two));
+        assert!(s.undo());
+        s.push(DocumentTree::from_text("x"));
+        let x = s.current_step().unwrap();
+        assert!(![one, two].contains(&x), "a push mints a fresh id");
+        assert!(!s.has_step(two), "the dropped redo branch's id is gone");
+        assert!(s.has_step(one));
+        s.push(DocumentTree::from_text("y")); /* cap 3: "0" falls out */
+        assert_eq!(s.depth(), 3);
+        assert!(s.has_step(one) && s.has_step(x));
+        let rebuilt = UndoStack::from_history(vec![DocumentTree::from_text("r")], 0, 3);
+        assert!(rebuilt.current_step().is_some());
+        assert_ne!(
+            rebuilt.current_step(),
+            s.current_step(),
+            "ids are process-unique"
+        );
     }
 
     #[test]
