@@ -186,6 +186,7 @@ mod tests {
                 .iter()
                 .map(|&(x, byte)| CaretSlot { x, byte })
                 .collect(),
+            caret: None,
         }
     }
 
