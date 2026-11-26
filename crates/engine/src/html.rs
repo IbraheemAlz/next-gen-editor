@@ -87,6 +87,13 @@ fn parse_css_color(v: &str) -> Option<[u8; 4]> {
     let v = v.trim();
     if let Some(hex) = v.strip_prefix('#') {
         let h = hex.trim();
+        /* Issue #592 (audit sibling) - `h.len()` counts BYTES and the digits
+        below are sliced by byte index, so a multi-byte character would put
+        a slice inside a scalar (`#` + e-acute + `a` is three bytes). A hex
+        colour is ASCII; anything else is not a colour. */
+        if !h.is_ascii() {
+            return None;
+        }
         if h.len() == 3 {
             let d = |i: usize| u8::from_str_radix(&h[i..i + 1], 16).ok();
             let (r, g, b) = (d(0)?, d(1)?, d(2)?);
@@ -489,7 +496,12 @@ fn decode_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         rest = &rest[amp..];
-        let Some(semi) = rest[..rest.len().min(12)].find(';') else {
+        /* Issue #592 - the entity's `;` must sit within the first 12 BYTES.
+        Search the bytes, never `rest[..12]`: a byte index is not a char
+        boundary when a multi-byte letter straddles it (`R&amp;` followed by
+        Arabic text), and slicing there panics. `;` is ASCII, so `semi`
+        itself is on a boundary and so is `&rest[1..semi]` below. */
+        let Some(semi) = rest.bytes().take(12).position(|b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -1572,6 +1584,144 @@ mod tests {
     fn from_html_decodes_entities() {
         let parsed = from_html("<p>a &amp; b &lt;c&gt; &#65;</p>");
         assert_eq!(parsed[0].text, "a & b <c> A");
+    }
+
+    /// Issue #592 - the entity scan looks for its `;` in the first 12 BYTES
+    /// after the `&`. It used to slice `rest[..12]`, which panics when byte
+    /// 12 falls inside a multi-byte character (`end byte index 12 is not a
+    /// char boundary`) - an engine trap in the shipped wasm
+    /// (`panic = "abort"`), reachable from any pasted HTML with an `&`
+    /// before non-ASCII text.
+    #[test]
+    fn decode_entities_reproducer_from_issue_592_does_not_panic() {
+        /* The 33-byte nightly input (`tlZId3eJ04hodHRwJi9aWlpaWnNlYUHEk7p3bHd8d3e6`)
+        decodes to a `PasteHtml` of this string: from the `&`, byte index 12 is the
+        second byte of `U+0113` (bytes 11..13), so `rest[..12]` split it. */
+        let pasted = "\u{4c8}http&/ZZZZZseaA\u{113}";
+        let amp = pasted.find('&').unwrap();
+        assert_eq!(pasted.len() - amp, 13);
+        assert!(!pasted.is_char_boundary(amp + 12));
+        assert_eq!(decode_entities(pasted), pasted);
+        let parsed = from_html(pasted);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].text, pasted);
+    }
+
+    /// Issue #592 - realistic input: a legal entity followed by Arabic text
+    /// whose 12th byte lands mid-letter. Whether it panicked depended on
+    /// byte alignment alone, so to a user it looked random.
+    #[test]
+    fn decode_entities_before_arabic_text_decodes_and_keeps_the_text() {
+        let arabic = "\u{634}\u{631}\u{643}\u{629} \u{627}\u{644}\u{639}\u{631}\u{628}";
+        assert_eq!(
+            decode_entities(&format!("R&amp;{arabic}")),
+            format!("R&{arabic}")
+        );
+        /* A bare `&` (no entity) in front of the same text. */
+        assert_eq!(
+            decode_entities(&format!("AT&T{arabic}")),
+            format!("AT&T{arabic}")
+        );
+        assert_eq!(
+            from_html(&format!("<p>R&amp;{arabic}</p>"))[0].text,
+            format!("R&{arabic}")
+        );
+        assert_eq!(
+            from_html(&format!("<p>AT&T{arabic}</p>"))[0].text,
+            format!("AT&T{arabic}")
+        );
+        /* The survivor from the triage: here byte 12 is a boundary. */
+        assert_eq!(
+            from_html(&format!("<p>Tom &amp; {arabic}</p>"))[0].text,
+            format!("Tom & {arabic}")
+        );
+    }
+
+    /// Issue #592 - an entity cut by the 12-byte window inside Arabic: the
+    /// `;` sits beyond byte 12 (so it is NOT this `&`'s terminator, exactly
+    /// as before) and the window ends mid-letter. Nothing decodes, nothing
+    /// is lost, whatever the byte alignment of the `&`.
+    #[test]
+    fn decode_entities_window_ending_inside_a_letter_decodes_nothing() {
+        let tail = "\u{634}".repeat(8); /* 16 bytes, no `;` in the window */
+        for pad in 0..=14 {
+            let plain = format!("&{}{tail};", "a".repeat(pad));
+            assert_eq!(decode_entities(&plain), plain, "pad {pad}");
+            let lead = format!("{}&{}{tail}", "\u{634}".repeat(2), "a".repeat(pad));
+            assert_eq!(decode_entities(&lead), lead, "lead, pad {pad}");
+        }
+        /* Every alignment of the window against 2-, 3- and 4-byte scalars. */
+        for ch in ['\u{634}', '\u{20ac}', '\u{1f600}'] {
+            for pad in 0..=12 {
+                let s = format!("&{}{}", "x".repeat(pad), ch.to_string().repeat(6));
+                assert_eq!(decode_entities(&s), s, "{ch:?} pad {pad}");
+            }
+        }
+        /* The `;` is accepted at byte 11 of the window and refused at 12 -
+        the same 12-byte contract the char-slice had. */
+        assert_eq!(decode_entities("&#x00000041;"), "A");
+        assert_eq!(decode_entities("&#x000000041;"), "&#x000000041;");
+    }
+
+    /// Issue #592 - an entity with no `;` at the end of the text, with and
+    /// without non-ASCII text in front, is left as written.
+    #[test]
+    fn decode_entities_unterminated_entity_at_the_end_is_kept() {
+        assert_eq!(decode_entities("a &amp"), "a &amp");
+        assert_eq!(decode_entities("&"), "&");
+        assert_eq!(decode_entities("x &#65"), "x &#65");
+        assert_eq!(
+            decode_entities("\u{634}\u{631} &amp"),
+            "\u{634}\u{631} &amp"
+        );
+        assert_eq!(
+            decode_entities("\u{634}\u{631}\u{643}\u{629} &#x"),
+            "\u{634}\u{631}\u{643}\u{629} &#x"
+        );
+        /* An unknown / out-of-range entity stays literal, `&` first. */
+        assert_eq!(
+            decode_entities("&bogus; &#xD800; &#;"),
+            "&bogus; &#xD800; &#;"
+        );
+    }
+
+    /// Issue #592 - plain ASCII entities decode exactly as they always did.
+    #[test]
+    fn decode_entities_ascii_behaviour_is_unchanged() {
+        assert_eq!(
+            decode_entities("a &amp; b &lt;c&gt; &#65; &#x42; &quot;q&quot; &apos; &#39;"),
+            "a & b <c> A B \"q\" ' '"
+        );
+        assert_eq!(decode_entities("&&amp;&"), "&&&");
+        assert_eq!(decode_entities("no entities"), "no entities");
+        assert_eq!(decode_entities(""), "");
+    }
+
+    /// Issue #592 (audit sibling) - `parse_css_color` sliced a hex colour by
+    /// byte index after checking its BYTE length, so a multi-byte character
+    /// in a `#...` colour of 3 or 6 bytes (`#` + e-acute + `a`) put a slice
+    /// inside a scalar and panicked the same way. A pasted `style="color:..."`
+    /// or `<font color>` reaches it.
+    #[test]
+    fn parse_css_color_non_ascii_hex_is_no_colour_not_a_panic() {
+        for v in [
+            "#\u{e9}a",
+            "#a\u{e9}",
+            "#\u{e9}\u{e9}\u{e9}",
+            "#a\u{e9}a\u{e9}a",
+            "#\u{634}\u{631}\u{643}",
+            "#\u{1f600}\u{1f600}",
+            "#ab\u{e9}",
+        ] {
+            assert_eq!(parse_css_color(v), None, "{v:?}");
+        }
+        assert_eq!(parse_css_color("#abc"), Some([170, 187, 204, 255]));
+        assert_eq!(parse_css_color("#ff0000"), Some([255, 0, 0, 255]));
+        let parsed = from_html(
+            "<p><span style=\"color:#\u{e9}a\">x</span><font color=\"#\u{e9}a\">y</font></p>",
+        );
+        assert_eq!(parsed[0].text, "xy");
+        assert_eq!(parsed[0].style_at(0).color, None);
     }
 
     #[test]
