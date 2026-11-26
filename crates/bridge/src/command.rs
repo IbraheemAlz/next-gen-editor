@@ -562,6 +562,11 @@ pub enum Command {
     // Phase 5b). Every command flips `Table.dirty = true` so the writer
     // regenerates the table on save.
     // ===================================================================
+    /// Insert an empty `rows × cols` table at the block position `at`:
+    /// `at`'s last `Block` step indexes the body (a one-step path) or,
+    /// issue #563, the table cell its earlier steps address at any depth
+    /// (a caret in a cell nests the table there). The block at that index
+    /// slides down; a paragraph follows the table in its container.
     InsertTable {
         at: BlockPath,
         rows: u32,
