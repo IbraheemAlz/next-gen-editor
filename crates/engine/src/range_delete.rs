@@ -473,43 +473,72 @@ impl DocumentTree {
     /// Issue #561 — clear every cell of the rectangle
     /// `rows.0..=rows.1` x `cols.0..=cols.1` of the table at `table` (a
     /// `TABLE_CELLS` selection's Delete): each cell keeps one empty
-    /// paragraph, the cells and rows stay (memo §7 — deletion never
-    /// crosses a cell boundary). Returns the tree and the start of the
-    /// rectangle's first cell, or `None` when the rectangle holds no cell.
+    /// paragraph (its last paragraph's mark), the cells and rows stay (memo
+    /// §7 — deletion never crosses a cell boundary). Each cell's content is
+    /// cleared by the one cross-container routine ([`Self::delete_between`]
+    /// over the cell's whole span, run on the cell's blocks alone), the
+    /// table is cloned ONCE — a rectangle over a 5 000-cell table is not
+    /// 5 000 table clones (the #509 rule) — and a comment anchor inside a
+    /// cleared cell collapses onto its start. Returns the tree and the
+    /// start of the rectangle's first cell, or `None` when the rectangle
+    /// holds no cell.
     pub fn clear_cell_rect(
         &self,
         table: &BlockPath,
         rows: (u32, u32),
         cols: (u32, u32),
     ) -> Option<(Self, LogicalPos)> {
-        let t = self.table_at_path(table)?;
-        let mut cells = Vec::new();
-        for (ri, row) in t.rows.iter().enumerate() {
+        let mut t = self.table_at_path(table)?.clone();
+        let mut cleared: Vec<(u32, u32)> = Vec::new();
+        for (ri, row) in t.rows.iter_mut().enumerate() {
             let r = ri as u32;
             if r < rows.0 || r > rows.1 {
                 continue;
             }
-            for (ci, cell) in row.cells.iter().enumerate() {
+            for (ci, cell) in row.cells.iter_mut().enumerate() {
                 let c = ci as u32;
                 if c < cols.0 || c > cols.1 || cell.props.v_merge == VMergeRole::Continue {
                     continue;
                 }
-                cells.push(table.clone().push(PathStep::Cell { row: r, col: c }));
+                /* The cell's blocks as a tree of their own: the routine's
+                paths are then rooted at the cell. */
+                let alone = DocumentTree {
+                    blocks: cell.blocks.iter().cloned().collect(),
+                    ..DocumentTree::default()
+                };
+                let (Some(first), Some(last)) = (
+                    alone.path_to_first_paragraph_deep(),
+                    alone.path_to_last_paragraph_deep(),
+                ) else {
+                    continue;
+                };
+                let to = alone.end_position_of(&last);
+                let (out, _) = alone.delete_between(&[], &LogicalPos::new(first, 0), &to)?;
+                cell.blocks = out.blocks.into_iter().collect();
+                cleared.push((r, c));
             }
         }
-        let mut doc = self.clone();
-        let mut caret = None;
-        for cell in cells.iter().rev() {
-            let Some((first, last)) = doc.cell_paragraph_bounds(cell) else {
-                continue;
-            };
-            let to = doc.end_position_of(&last);
-            let (next, landed) =
-                doc.delete_between(&cell.steps, &LogicalPos::new(first, 0), &to)?;
-            doc = next;
-            caret = Some(landed);
-        }
-        Some((doc.with_list_markers_refreshed(), caret?))
+        let &(r0, c0) = cleared.first()?;
+        t.dirty = true;
+        t.source_xml = None;
+        let mut out = self.clone();
+        let mut blocks = out.blocks.clone();
+        replace_block_in_top(&mut blocks, table, Block::Table(t))?;
+        out.blocks = blocks;
+        out.remap_table_cells(table, |r, c| {
+            if cleared.contains(&(r, c)) {
+                CellMove::Collapse {
+                    row: r,
+                    col: c,
+                    at_end: false,
+                }
+            } else {
+                CellMove::Keep
+            }
+        });
+        let (home, _) =
+            out.cell_paragraph_bounds(&table.clone().push(PathStep::Cell { row: r0, col: c0 }))?;
+        Some((out.with_list_markers_refreshed(), LogicalPos::new(home, 0)))
     }
 
     /// Issue #561 — the plain text of a range's paragraphs, as the

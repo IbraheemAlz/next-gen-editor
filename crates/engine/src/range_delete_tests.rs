@@ -448,3 +448,30 @@ fn ends_that_address_no_paragraph_delete_nothing() {
     assert_eq!(shape(&out), shape(&d));
     assert_eq!(d.text_range(at(&[b(1)], 0), at(&[b(2)], 1)), "");
 }
+
+#[test]
+fn a_comment_in_a_cleared_cell_collapses_onto_its_start() {
+    let d = doc_of(vec![
+        para("intro"),
+        grid(&[&["a", "bbb"], &["c", "d"]]),
+        para("outro"),
+    ])
+    .insert_comment(
+        at(&[b(1), c(0, 1), b(0)], 1),
+        at(&[b(1), c(0, 1), b(0)], 3),
+        "on b".into(),
+        "A".into(),
+        "2026-01-01T00:00:00Z".into(),
+    )
+    .0;
+    let (out, _) = d
+        .clear_cell_rect(&path(&[b(1)]), (0, 1), (1, 1))
+        .expect("a rectangle");
+    assert_eq!(
+        shape(&out),
+        vec![p("intro"), t(&[&["a", ""], &["c", ""]]), p("outro")]
+    );
+    let r = &out.comment_ranges[0];
+    assert_eq!(r.start, at(&[b(1), c(0, 1), b(0)], 0));
+    assert_eq!(r.end, r.start);
+}
