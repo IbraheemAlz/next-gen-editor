@@ -443,11 +443,20 @@ pub enum Scenario {
     /// audit found: `InsertSectionBreak` bumping a `u32::MAX` block index,
     /// and `InsertFootnote` adding to a `u32::MAX` offset.
     InsertFieldOffsetMax,
+    /// Issue #592 - the nightly `rpc_command` finding (33 raw bytes,
+    /// `PasteHtml { html: "\u{4c8}http&/ZZZZZseaA\u{113}" }`): `decode_entities`
+    /// sliced the entity window `rest[..12]` by BYTE index, which panics
+    /// when byte 12 falls inside a multi-byte character - a trap in the
+    /// shipped wasm (`panic = "abort"`). The window is now searched
+    /// byte-wise. The same sequence pins the realistic shapes (`&amp;`
+    /// and a bare `&` before Arabic text) and the audit's sibling
+    /// (`parse_css_color` slicing a 3-byte hex colour holding an e-acute).
+    PasteHtmlEntityBeforeMultibyte,
 }
 
 impl Scenario {
     /// Every scenario, in the fixed order [`Scenario::index`] encodes.
-    pub const ALL: [Scenario; 16] = [
+    pub const ALL: [Scenario; 17] = [
         Scenario::NanZoom,
         Scenario::NanDeviceScale,
         Scenario::BadRenderDate,
@@ -469,6 +478,8 @@ impl Scenario {
         Scenario::NavExpansionStalled,
         // Issue #512 - appended, same rule.
         Scenario::InsertFieldOffsetMax,
+        // Issue #592 - appended, same rule.
+        Scenario::PasteHtmlEntityBeforeMultibyte,
     ];
 
     /// The committed corpus file this scenario's seed lives at, relative
@@ -491,6 +502,7 @@ impl Scenario {
             Scenario::TableMergeCrossesMerge => "repro_471_merge_crosses_merge",
             Scenario::NavExpansionStalled => "repro_499_nav_expansion_stalled",
             Scenario::InsertFieldOffsetMax => "repro_512_insert_field_offset_max",
+            Scenario::PasteHtmlEntityBeforeMultibyte => "repro_592_paste_html_entity_multibyte",
         }
     }
 
@@ -913,6 +925,27 @@ impl Scenario {
                     Command::InsertFootnote {
                         at: at(0, u32::MAX),
                     },
+                ]
+            }
+            Scenario::PasteHtmlEntityBeforeMultibyte => {
+                let paste = |html: &str| Command::PasteHtml {
+                    html: html.to_string(),
+                };
+                vec![
+                    // The finding's exact string: from the `&`, byte index 12
+                    // is the second byte of `U+0113`.
+                    paste("\u{4c8}http&/ZZZZZseaA\u{113}"),
+                    // The realistic shapes: a legal entity, and a bare `&`,
+                    // in front of Arabic text.
+                    paste(
+                        "<p>R&amp;\u{634}\u{631}\u{643}\u{629} \u{627}\u{644}\u{639}\u{631}\u{628}</p>",
+                    ),
+                    paste(
+                        "<p>AT&T\u{634}\u{631}\u{643}\u{629} \u{627}\u{644}\u{639}\u{631}\u{628}</p>",
+                    ),
+                    // The audit's sibling: a 3-byte hex colour that holds a
+                    // 2-byte scalar.
+                    paste("<p><span style=\"color:#\u{e9}a\">x</span></p>"),
                 ]
             }
         }
@@ -2049,6 +2082,43 @@ mod tests {
             "the footnote in a real paragraph lands: {:?}",
             events[6]
         );
+        assert!(engine.selection_is_valid());
+        assert_eq!(
+            engine.check_invariants_for_fuzzing(),
+            Ok(()),
+            "the session still holds the engine invariants"
+        );
+    }
+
+    /// Issue #592 (`repro_592_paste_html_entity_multibyte`) — `PasteHtml`
+    /// with an `&` in front of multi-byte text answers a normal edit
+    /// instead of slicing its 12-byte entity window inside a scalar (a
+    /// `str` slice panic, an engine trap in the shipped wasm). Every paste
+    /// lands as one inline paragraph at the caret, so the caret ends
+    /// after the sum of the pasted texts' bytes (`&amp;` decoded to `&`).
+    #[test]
+    fn paste_html_entity_before_multibyte_text_is_a_normal_edit() {
+        let (engine, events) = apply_scenario(Scenario::PasteHtmlEntityBeforeMultibyte);
+        assert_eq!(events.len(), 4, "{events:?}");
+        let arabic = "\u{634}\u{631}\u{643}\u{629} \u{627}\u{644}\u{639}\u{631}\u{628}";
+        let landed = [
+            "\u{4c8}http&/ZZZZZseaA\u{113}".len(),
+            format!("R&{arabic}").len(),
+            format!("AT&T{arabic}").len(),
+            "x".len(),
+        ];
+        let mut caret = 0;
+        for (i, (evt, len)) in events.iter().zip(landed).enumerate() {
+            caret += len as u32;
+            assert!(
+                matches!(
+                    evt,
+                    Event::SelectionChanged { range, .. }
+                        if range.start.offset == caret && range.end.offset == caret
+                ),
+                "step {i} pastes its text and leaves the caret at {caret}: {evt:?}"
+            );
+        }
         assert!(engine.selection_is_valid());
         assert_eq!(
             engine.check_invariants_for_fuzzing(),

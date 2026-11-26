@@ -31457,6 +31457,12 @@ mod bounds_repair_tests;
 #[cfg(all(test, feature = "fuzz-native"))]
 mod insert_position_tests;
 
+/// Issue #592 - `PasteHtml` / a `.html` open with an `&` in front of
+/// multi-byte text (`decode_entities` sliced its 12-byte window by byte
+/// index) is a document, not a trap (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod paste_html_tests;
+
 #[cfg(test)]
 mod a11y_direction_tests;
 
