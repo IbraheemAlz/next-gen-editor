@@ -346,6 +346,7 @@ dependencies = [
  "bridge",
  "engine",
  "engine-wasm",
+ "format-doc",
  "format-docx",
  "format-pdf",
  "layout",
@@ -363,6 +364,7 @@ dependencies = [
  "bridge",
  "console_error_panic_hook",
  "engine",
+ "format-doc",
  "format-docx",
  "format-html",
  "format-pdf",
@@ -449,6 +451,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e64eb721ca85a34323425f4041adc5d82704d3782d5f8f03793bc012419dce23"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "format-doc"
+version = "0.5.0-beta.3"
+dependencies = [
+ "engine",
+ "format-docx",
 ]
 
 [[package]]

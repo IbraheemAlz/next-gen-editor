@@ -141,7 +141,12 @@ export {
 export type { LayoutCacheFigures, LayoutCacheStats } from './layoutCaches';
 
 /* Issue #406 — the reader's warning report for the open document. */
-export { READ_WARNING_LABELS, openWarningCount, describeReadWarning } from './openWarnings';
+export {
+    READ_WARNING_LABELS,
+    openWarningCount,
+    openWarningSummary,
+    describeReadWarning,
+} from './openWarnings';
 
 export type {
     Command,

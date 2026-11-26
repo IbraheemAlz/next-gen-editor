@@ -20,6 +20,11 @@
 #   - snapshot_decode (issue #341): engine::snapshot envelopes, valid and
 #                       structure-aware mutated, through Engine::restore /
 #                       Command::Recover; Ok or a typed error, never a panic
+#   - doc_reader (issue #567): legacy Word 97-2003 `.doc` bytes -> format_doc::
+#                       read_doc — a committed seed / mutation read as-is,
+#                       every input also as a splice over a built image (NOT
+#                       structure-aware yet); an import holds the model's
+#                       bounds / text / span rules and saves as a clean .docx
 #   - format_pdf_image_decode (issue #227): raw bytes -> format_pdf::
 #                       prepare_image for every enabled decoder (PNG/JPEG/
 #                       GIF/WebP/BMP/TIFF, sniffing decides); asserts the
@@ -55,6 +60,8 @@ path = "src/lib.rs"
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 format-docx = { path = "../crates/format-docx" }
+# Issue #567 — the legacy Word 97-2003 `.doc` importer (`doc_reader`).
+format-doc = { path = "../crates/format-doc" }
 format-pdf = { path = "../crates/format-pdf" }
 bridge = { path = "../crates/bridge", features = ["arbitrary"] }
 engine = { path = "../crates/engine" }
@@ -104,6 +111,13 @@ bench = false
 [[bin]]
 name = "snapshot_decode"
 path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "doc_reader"
+path = "fuzz_targets/doc_reader.rs"
 test = false
 doc = false
 bench = false

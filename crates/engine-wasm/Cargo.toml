@@ -16,6 +16,8 @@ text-pipeline = { path = "../text-pipeline" }
 layout = { path = "../layout" }
 render = { path = "../render" }
 format-docx = { path = "../format-docx" }
+# Issue #567 — read-only import of legacy Word 97-2003 `.doc` files.
+format-doc = { path = "../format-doc" }
 format-html = { path = "../format-html" }
 format-pdf = { path = "../format-pdf" }
 kurbo = { workspace = true }

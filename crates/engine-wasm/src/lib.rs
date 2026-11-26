@@ -8271,6 +8271,22 @@ fn file_base_name(name: &str) -> String {
         .to_string()
 }
 
+/// Issue #567 — the name a document imported from a legacy binary file
+/// carries: a save writes `.docx`, so `report.doc` (or a `.dot` template)
+/// becomes `report.docx` (what FILENAME shows and what the shell's save
+/// names the download). Any other name is kept.
+fn docx_name_for_legacy(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty()
+                && (ext.eq_ignore_ascii_case("doc") || ext.eq_ignore_ascii_case("dot")) =>
+        {
+            format!("{stem}.docx")
+        }
+        _ => name.to_string(),
+    }
+}
+
 /// Issue #339 — decode a `.txt` / `.html` file's bytes: a UTF-8 BOM is
 /// dropped, a UTF-16 LE / BE BOM selects UTF-16, everything else is UTF-8
 /// with invalid sequences replaced by U+FFFD (no `encoding_rs` in the tree,
@@ -19096,15 +19112,32 @@ impl Engine {
     /// `DocumentLoaded`.
     fn open_synthesized_document(
         &mut self,
+        doc: DocumentTree,
+        defaults: Option<DocumentDefaults>,
+    ) -> Event {
+        self.open_built_document(doc, defaults, true, Vec::new())
+    }
+
+    /// [`Self::open_synthesized_document`]'s body. `host_page_setup`:
+    /// the host's default page size replaces the body section's geometry
+    /// (a `.txt` / `.html` file says nothing about pages); `false` keeps
+    /// the geometry the importer read (a `.doc` section's SEPX, issue
+    /// #567). `warnings` rides `DocumentLoaded` (issue #406).
+    fn open_built_document(
+        &mut self,
         mut doc: DocumentTree,
         defaults: Option<DocumentDefaults>,
+        host_page_setup: bool,
+        warnings: Vec<bridge::ReadWarning>,
     ) -> Event {
         let page_size = match defaults.as_ref().and_then(|d| d.page_size) {
             Some(BridgeDefaultPageSize::A4) => engine::DefaultPageSize::A4,
             Some(BridgeDefaultPageSize::Letter) => engine::DefaultPageSize::Letter,
             None => engine::DefaultPageSize::default(),
         };
-        doc.body_section.geometry = page_size.geometry();
+        if host_page_setup {
+            doc.body_section.geometry = page_size.geometry();
+        }
         doc.settings.default_page_size = page_size;
         doc.settings.widow_control_default = defaults.and_then(|d| d.widow_control).unwrap_or(true);
         stamp_auto_directions(&mut doc);
@@ -19117,8 +19150,41 @@ impl Engine {
         Event::DocumentLoaded {
             paragraph_count,
             substituted: self.font_substitutions(),
-            warnings: Vec::new(),
+            warnings,
         }
+    }
+
+    /// Issue #567 — open a legacy Word 97-2003 binary document (`.doc`)
+    /// through `format-doc`: a read-only import into a document with no
+    /// source package, so a save writes a fresh `.docx` (and the document
+    /// name says so: `x.doc` → `x.docx`). What the importer does not model
+    /// yet rides `DocumentLoaded.warnings` as `LegacyContentNotImported`;
+    /// a refusal goes through `open_error::doc_open_error_event` and
+    /// changes nothing (issue #341).
+    fn load_doc_bytes(
+        &mut self,
+        bytes: &[u8],
+        origin: &'static str,
+        defaults: Option<DocumentDefaults>,
+        limits: Option<bridge::PackageLimitsOverride>,
+        new_name: Option<Option<String>>,
+    ) -> Event {
+        /* A compound file is read in place (nothing inflates): the file
+        itself is bounded like one package part. */
+        if let Some(refused) = text_file_over_limits(bytes.len(), limits) {
+            return refused;
+        }
+        let import = match format_doc::read_doc(bytes) {
+            Ok(import) => import,
+            Err(e) => return open_error::doc_open_error_event(origin, &e),
+        };
+        /* Issue #341 — past the only refusals: commit. */
+        self.exit_story_to_body();
+        if let Some(n) = new_name {
+            self.document_name = n.map(|n| docx_name_for_legacy(&n));
+        }
+        let warnings = read_report::legacy_not_imported_warnings(&import.not_imported);
+        self.open_built_document(import.document, defaults, !import.has_page_setup, warnings)
     }
 
     /// Issue #338 — `Command::CloseDocument`: back to the seeded empty
@@ -19184,6 +19250,16 @@ impl Engine {
         new_name: Option<Option<String>>,
         password: Option<&str>,
     ) -> Event {
+        /* Issue #567 — dispatch by magic bytes: an OLE compound file
+        (`D0 CF 11 E0 A1 B1 1A E1`) that is not an MS-OFFCRYPTO encrypted
+        OOXML package is a legacy binary document — the `.doc` importer
+        reads it (and names an `.xls` / Word 95 file for what it is);
+        a ZIP (or anything else) goes to the `.docx` reader as before. A
+        password is ignored for a `.doc` (an encrypted one is refused as
+        `EncryptedDocument`: decryption is not implemented). */
+        if format_doc::is_legacy_compound_file(bytes) {
+            return self.load_doc_bytes(bytes, origin, defaults, limits, new_name);
+        }
         let default_page_size = match defaults.as_ref().and_then(|d| d.page_size) {
             Some(BridgeDefaultPageSize::A4) => engine::DefaultPageSize::A4,
             Some(BridgeDefaultPageSize::Letter) => engine::DefaultPageSize::Letter,
@@ -31689,6 +31765,12 @@ mod document_protection_tests;
 /// with the open document untouched (the dispatcher path needs `fuzz-native`).
 #[cfg(all(test, feature = "fuzz-native"))]
 mod open_unreadable_tests;
+
+/// Issue #567 — a legacy Word 97-2003 `.doc` opens through the dispatcher
+/// (text, bold run, RTL paragraph, page setup), saves as `.docx`, and its
+/// refusals are typed and change nothing.
+#[cfg(all(test, feature = "fuzz-native"))]
+mod doc_open_tests;
 
 /// Issue #345 — the document-protection firewall (`Engine::protection_gate`).
 mod protection_gate;

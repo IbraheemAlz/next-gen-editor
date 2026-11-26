@@ -173,20 +173,38 @@ fn an_encrypted_package_answers_the_typed_error() {
     }
 }
 
-/// Issue #345 — a compound file WITHOUT the encryption streams (a legacy
-/// binary `.doc`) is an honest refusal naming the format — typed
-/// `InvalidDocument` (issue #427), never `EncryptedDocument`.
+/// Issue #345 — a compound file WITHOUT the encryption streams is never
+/// reported as encrypted. Since issue #567 such a file goes to the legacy
+/// `.doc` importer (a real Word 97-2003 document opens — `doc_open_tests`):
+/// a Word 6/95 `WordDocument` stream is an honest refusal naming the
+/// format (typed `InvalidDocument`, issue #427), one that is no Word
+/// stream at all is damaged (`DocumentUnreadable`, naming the FIB).
 #[test]
 fn a_legacy_compound_file_is_not_reported_as_encrypted() {
-    let doc = format_docx::opc::cfb::test_writer::build(&[("WordDocument", &[1u8; 600])]);
-    let mut e = engine_with(DocumentTree::from_text("keep me"));
-    let evt = open_docx(&mut e, doc);
-    let Event::Error { message, kind, .. } = evt else {
-        panic!("a legacy compound file answers Error, got {evt:?}");
-    };
-    assert_eq!(kind, Some(bridge::ErrorKind::InvalidDocument), "{message}");
-    assert!(message.contains("97-2003"), "{message}");
-    assert_eq!(e.undo.current().to_plain_text(), "keep me");
+    let mut word95 = vec![1u8; 600];
+    word95[..2].copy_from_slice(&0xA5DCu16.to_le_bytes());
+    for (stream, want, says) in [
+        (
+            word95,
+            bridge::ErrorKind::InvalidDocument,
+            "only Word 97-2003 .doc files can be opened",
+        ),
+        (
+            vec![1u8; 600],
+            bridge::ErrorKind::DocumentUnreadable,
+            "WordDocument: FIB",
+        ),
+    ] {
+        let doc = format_docx::opc::cfb::test_writer::build(&[("WordDocument", &stream)]);
+        let mut e = engine_with(DocumentTree::from_text("keep me"));
+        let evt = open_docx(&mut e, doc);
+        let Event::Error { message, kind, .. } = evt else {
+            panic!("a non-Word-97 compound file answers Error, got {evt:?}");
+        };
+        assert_eq!(kind, Some(want), "{message}");
+        assert!(message.contains(says), "{message}");
+        assert_eq!(e.undo.current().to_plain_text(), "keep me");
+    }
 }
 
 fn selection_protection(e: &mut Engine) -> Option<bridge::ProtectionMode> {

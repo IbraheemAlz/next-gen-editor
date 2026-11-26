@@ -1,7 +1,8 @@
 name: fuzz-nightly
 
 # D5.5 scaled up (issue #90; the 5th target added by issue #227, the 6th —
-# `snapshot_decode` — by issue #341; the `.docx` legs fuzz with the
+# `snapshot_decode` — by issue #341, the 7th — `doc_reader`, raw `.doc` bytes
+# plus splices, not structure-aware yet — by issue #567; the `.docx` legs fuzz with the
 # `fuzz/dictionaries/docx.dict` libFuzzer dictionary since issue #358) — nightly
 # `cargo +nightly fuzz run` for each structure-aware target in `fuzz/`.
 # `ci.yml`'s `rust-native` job only compile-checks `fuzz/` on stable
@@ -88,6 +89,10 @@ jobs:
             corpus_dir: snapshot_decode
           - target: format_pdf_image_decode
             corpus_dir: image_decode
+          # Issue #567 — the legacy Word 97-2003 `.doc` importer
+          # (format-doc): generated seeds in fuzz/corpus/doc_reader/.
+          - target: doc_reader
+            corpus_dir: doc_reader
     steps:
       - uses: actions/checkout@v6
 

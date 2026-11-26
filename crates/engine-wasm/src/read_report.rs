@@ -62,9 +62,49 @@ pub(crate) fn bridge_read_warnings(warnings: &[DocxWarning]) -> Vec<ReadWarning>
     out
 }
 
+/// Issue #567 — a `.doc` import's report on the wire: one
+/// `LegacyContentNotImported` entry per class `format-doc` did not model
+/// (its `describe()` line as the detail, never document text; the
+/// occurrence count as `count`), in the importer's order. No part is
+/// named: a binary document has no package parts.
+pub(crate) fn legacy_not_imported_warnings(report: &[format_doc::NotImported]) -> Vec<ReadWarning> {
+    report
+        .iter()
+        .map(|n| ReadWarning {
+            kind: ReadWarningKind::LegacyContentNotImported,
+            part: None,
+            detail: n.content.describe().to_string(),
+            count: n.count.max(1),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_doc_import_report_becomes_one_warning_per_class() {
+        use format_doc::{LegacyContent, NotImported};
+        let out = legacy_not_imported_warnings(&[
+            NotImported {
+                content: LegacyContent::Tables,
+                count: 4,
+            },
+            NotImported {
+                content: LegacyContent::HeadersFooters,
+                count: 1,
+            },
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter()
+                .all(|w| w.kind == ReadWarningKind::LegacyContentNotImported && w.part.is_none())
+        );
+        assert_eq!(out[0].count, 4);
+        assert!(out[0].detail.starts_with("tables"), "{}", out[0].detail);
+        assert_eq!(out[1].detail, "headers and footers");
+    }
 
     #[test]
     fn identical_warnings_coalesce_in_first_occurrence_order() {

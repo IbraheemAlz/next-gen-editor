@@ -646,7 +646,7 @@ fn main() {
     if timeout_secs != 0 {
         println!("smoke: per-input timeout = {timeout_secs} s (SMOKE_TIMEOUT_SECS)");
     }
-    let targets: [(&str, &str, TargetFn); 6] = [
+    let targets: [(&str, &str, TargetFn); 7] = [
         ("docx_reader", "docx_reader", engine_fuzz::run_docx_reader),
         (
             "docx_roundtrip",
@@ -669,6 +669,8 @@ fn main() {
             "image_decode",
             engine_fuzz::run_format_pdf_image_decode,
         ),
+        /* Issue #567 — the legacy `.doc` importer. */
+        ("doc_reader", "doc_reader", engine_fuzz::run_doc_reader),
     ];
     if let Some(only) = &opts.only
         && !targets.iter().any(|(name, _, _)| name == only)
