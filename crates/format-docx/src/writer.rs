@@ -53,6 +53,10 @@ mod ppr_splice;
 #[path = "writer_styles_patch.rs"]
 mod styles_patch;
 
+/// Issue #354 — the settings toggles patched into the source part.
+#[path = "writer_settings_patch.rs"]
+mod settings_patch;
+
 /// Standard OOXML document namespace boilerplate (matches what Word emits).
 const DOC_XML_HEADER: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
@@ -4693,35 +4697,23 @@ fn write_docx_raw(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         on styles.xml, not as a direct `<w:bidi/>`. */
         let _inherited_directions =
             publish_inherited_directions(doc, styles_already_present || styles_bytes.is_some());
-        /* Issue #74 — `SetEvenOddHeaders` flips `settings_dirty`; patch
-        `word/settings.xml` IN PLACE (a full regenerate would drop every
-        unmodeled sibling — zoom, proofState, compat). Synthesize a
-        minimal part only when the archive never had one. */
-        let settings_already_present = archive
+        /* Issues #74 / #354 — the settings toggles the engine owns
+        (`evenAndOddHeaders`, `trackRevisions`, `mirrorMargins`) are
+        patched into `word/settings.xml` IN PLACE, and only those whose
+        live value differs from what the source part reads as (a full
+        regenerate would drop every unmodeled sibling — zoom, proofState,
+        compat; an unchanged flag keeps the part byte-identical). A
+        minimal part is synthesized only when the archive never had one
+        and a toggle is on. */
+        let existing_settings = archive
             .other_entries
             .iter()
-            .any(|(n, _)| n == names.settings.as_str());
-        let settings_bytes: Option<Vec<u8>> = if doc.settings_dirty {
-            let existing = archive
-                .other_entries
-                .iter()
-                .find(|(n, _)| n == names.settings.as_str())
-                .and_then(|(_, b)| std::str::from_utf8(b).ok());
-            match existing {
-                Some(xml) => Some(
-                    patch_settings_even_odd(xml, doc.settings.even_and_odd_headers).into_bytes(),
-                ),
-                None if doc.settings.even_and_odd_headers => Some(
-                    fam("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-                     <w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
-                     <w:evenAndOddHeaders/></w:settings>")
-                    .into_owned()
-                    .into_bytes(),
-                ),
-                None => None,
-            }
-        } else {
-            None
+            .find(|(n, _)| n == names.settings.as_str());
+        let settings_already_present = existing_settings.is_some();
+        let settings_bytes: Option<Vec<u8>> = match existing_settings {
+            Some((_, xml)) => settings_patch::patch_settings_xml(xml, &doc.settings),
+            None => settings_patch::build_settings_xml(&doc.settings)
+                .map(|xml| fam(&xml).into_owned().into_bytes()),
         };
         let synth_settings = !settings_already_present && settings_bytes.is_some();
         /* Issue #80 — regenerate a note part when the engine touched a
@@ -5809,76 +5801,6 @@ fn hf_part_rels_name(part_entry: &str) -> String {
         Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
         None => format!("_rels/{part_entry}.rels"),
     }
-}
-
-/// Issue #74 (design review M2) — toggle `<w:evenAndOddHeaders/>` in an
-/// EXISTING settings.xml by targeted string surgery, preserving every
-/// unmodeled sibling (zoom, proofState, compat — a full regenerate
-/// would silently drop them all):
-///
-/// - element present in ANY form (`<w:evenAndOddHeaders/>`,
-///   `w:val="…"` variants, paired tag) → replaced by the bare toggle
-///   when enabling, REMOVED entirely when disabling (a naive
-///   literal-match remove missed `w:val` variants and silently read
-///   back as ON);
-/// - element absent + enabling → inserted right after the
-///   `<w:settings …>` open tag. CT_Settings declares a child sequence,
-///   but Word and LibreOffice both read known settings positionally
-///   independent — accepted order-leniency, pinned by tests.
-fn patch_settings_even_odd(xml: &str, enabled: bool) -> String {
-    const NEEDLE: &str = "<w:evenAndOddHeaders";
-    let mut out = String::with_capacity(xml.len() + 32);
-    let mut rest = xml;
-    let mut found = false;
-    while let Some(at) = rest.find(NEEDLE) {
-        /* Guard against prefix collisions (no such sibling element
-        exists today, but stay exact): the needle must be followed by
-        whitespace, '/', or '>'. */
-        let after = &rest[at + NEEDLE.len()..];
-        let boundary = after
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>');
-        if !boundary {
-            out.push_str(&rest[..at + NEEDLE.len()]);
-            rest = after;
-            continue;
-        }
-        found = true;
-        out.push_str(&rest[..at]);
-        /* Consume the element: self-closing `…/>` or paired
-        `…>…</w:evenAndOddHeaders>`. */
-        let elem_end = after.find('>').map(|i| i + 1).unwrap_or(after.len());
-        let self_closing = after[..elem_end].trim_end_matches('>').ends_with('/');
-        let consumed = if self_closing {
-            elem_end
-        } else {
-            const CLOSE: &str = "</w:evenAndOddHeaders>";
-            after[elem_end..]
-                .find(CLOSE)
-                .map(|i| elem_end + i + CLOSE.len())
-                .unwrap_or(elem_end)
-        };
-        if enabled {
-            out.push_str("<w:evenAndOddHeaders/>");
-        }
-        rest = &after[consumed..];
-    }
-    out.push_str(rest);
-    if enabled && !found {
-        /* Insert right after the settings open tag. */
-        if let Some(open) = out.find("<w:settings")
-            && let Some(close) = out[open..].find('>')
-        {
-            let at = open + close + 1;
-            out.insert_str(at, "<w:evenAndOddHeaders/>");
-        } else {
-            /* Malformed part — append defensively; the reader's
-            toggle scan still finds it. */
-            out.push_str("<w:evenAndOddHeaders/>");
-        }
-    }
-    out
 }
 
 /// Phase 3 (#39) — serialize one header/footer story into a complete
@@ -10330,36 +10252,55 @@ mod tests {
 
     #[test]
     fn patch_settings_even_odd_covers_every_variant() {
+        /* Issue #354 — the patch is relative to what the SOURCE part
+        reads as: `None` = keep the bytes. */
+        let even_odd = |on: bool| engine::DocumentSettings {
+            even_and_odd_headers: on,
+            ..engine::DocumentSettings::default()
+        };
+        let patch = |xml: &str, on: bool| {
+            settings_patch::patch_settings_xml(xml.as_bytes(), &even_odd(on))
+                .map(|b| String::from_utf8(b).unwrap())
+        };
         /* Bare element removal. */
         let xml = r#"<w:settings xmlns:w="x"><w:zoom w:percent="130"/><w:evenAndOddHeaders/><w:proofState/></w:settings>"#;
-        let off = patch_settings_even_odd(xml, false);
-        assert!(!off.contains("evenAndOddHeaders"));
-        assert!(off.contains("w:zoom") && off.contains("w:proofState"));
+        let off = patch(xml, false).expect("removed");
+        assert_eq!(
+            off,
+            r#"<w:settings xmlns:w="x"><w:zoom w:percent="130"/><w:proofState/></w:settings>"#
+        );
+        assert_eq!(patch(xml, true), None, "unchanged: bytes kept");
 
         /* Design review M2 — the `w:val` variants a literal-match
         remove silently missed (reading back as ON). */
-        for variant in [
-            r#"<w:evenAndOddHeaders w:val="1"/>"#,
-            r#"<w:evenAndOddHeaders w:val="true"/>"#,
-            r#"<w:evenAndOddHeaders w:val="0"/>"#,
-            r#"<w:evenAndOddHeaders></w:evenAndOddHeaders>"#,
+        for (variant, reads_on) in [
+            (r#"<w:evenAndOddHeaders w:val="1"/>"#, true),
+            (r#"<w:evenAndOddHeaders w:val="true"/>"#, true),
+            (r#"<w:evenAndOddHeaders w:val="0"/>"#, false),
+            (r#"<w:evenAndOddHeaders></w:evenAndOddHeaders>"#, true),
         ] {
             let xml = format!(r#"<w:settings xmlns:w="x">{variant}<w:zoom/></w:settings>"#);
-            let off = patch_settings_even_odd(&xml, false);
-            assert!(!off.contains("evenAndOddHeaders"), "variant {variant}");
-            assert!(off.contains("w:zoom"));
-            /* Enabling normalizes any variant to the bare toggle. */
-            let on = patch_settings_even_odd(&xml, true);
-            assert_eq!(on.matches("evenAndOddHeaders").count(), 1);
-            assert!(on.contains("<w:evenAndOddHeaders/>"));
+            let flipped = patch(&xml, !reads_on).expect("changed");
+            if reads_on {
+                assert!(!flipped.contains("evenAndOddHeaders"), "variant {variant}");
+            } else {
+                /* Enabling an off spelling leaves the bare toggle only. */
+                assert_eq!(flipped.matches("evenAndOddHeaders").count(), 1);
+                assert!(flipped.contains("<w:evenAndOddHeaders/>"));
+            }
+            assert!(flipped.contains("w:zoom"));
+            assert_eq!(patch(&xml, reads_on), None, "variant {variant} unchanged");
         }
 
-        /* Absent + enabling → inserted after the open tag. */
+        /* Absent + enabling → inserted at its schema rank (after zoom). */
         let xml = r#"<w:settings xmlns:w="x"><w:zoom/></w:settings>"#;
-        let on = patch_settings_even_odd(xml, true);
-        assert!(on.starts_with(r#"<w:settings xmlns:w="x"><w:evenAndOddHeaders/>"#));
+        let on = patch(xml, true).expect("inserted");
+        assert_eq!(
+            on,
+            r#"<w:settings xmlns:w="x"><w:zoom/><w:evenAndOddHeaders/></w:settings>"#
+        );
         /* Absent + disabling → byte-identical no-op. */
-        assert_eq!(patch_settings_even_odd(xml, false), xml);
+        assert_eq!(patch(xml, false), None);
     }
 
     #[test]
