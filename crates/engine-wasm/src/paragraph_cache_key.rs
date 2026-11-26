@@ -353,9 +353,17 @@ pub(crate) fn paragraph_layout_key(
     materialization, so two style-table states must never collide on a
     key. `style_id` itself is covered by what it resolves to. */
     hash_span_style(&sctx.run_base(style_id.as_deref()), &mut h);
+    /* Issue #558 — the default character style sits between that base
+    and every run naming no character style. Mixed in only when there is
+    one, so every other document keeps its keys. */
+    if let Some(default_char) = sctx.cascade.default_character() {
+        0x55_u8.hash(&mut h);
+        hash_span_style(default_char, &mut h);
+    }
     /* Issue #355 — the theme decides what a font binding names. */
     let StyleContext {
-        // Reached through `run_base` / the marker texts hashed below.
+        // Reached through `run_base`, the default character style / the
+        // marker texts hashed below.
         cascade: _,
         run_defaults: _,
         note_markers: _,

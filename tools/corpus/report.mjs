@@ -343,6 +343,23 @@ function main() {
         }
     }
 
+    /* --- Issue #558 — the default CHARACTER style: the runs that name no
+    character style take it; the ones whose layout the fix changed are those
+    of documents where it carries formatting. --- */
+    const runCensused = records.filter((r) => typeof r.unstyled_runs === 'number');
+    const charFormatting = runCensused.filter((r) => r.default_char_style_formats);
+    const unstyledRunsTotal = sum(runCensused, (r) => r.unstyled_runs);
+    const unstyledRunsFormatted = sum(charFormatting, (r) => r.unstyled_runs);
+    if (runCensused.length > 0) {
+        console.log(
+            `\n=== Default character style (#558): ${unstyledRunsTotal} top-level runs name no character style; ` +
+                `${charFormatting.length}/${runCensused.length} documents' default character style carries formatting ` +
+                `(${unstyledRunsFormatted} runs take it) ===`,
+        );
+        const top = [...charFormatting].sort((a, b) => b.unstyled_runs - a.unstyled_runs);
+        for (const r of top.slice(0, TOP_N)) console.log(`    ${r.path} (${r.unstyled_runs} runs)`);
+    }
+
     /* --- Layout-time outliers. --- */
     const withLayoutTime = records.filter((r) => typeof r.layout_ms === 'number').sort((a, b) => b.layout_ms - a.layout_ms);
     console.log(`\n=== Layout-time outliers (top ${Math.min(10, withLayoutTime.length)}) ===`);
@@ -425,6 +442,13 @@ function main() {
             documents_where_it_formats: formatting.length,
             unstyled_paragraphs_formatted: affected,
             ids: Object.fromEntries(sortedDefaultIds),
+        },
+        /* Issue #558 — the default character style's reach. */
+        default_character_style: {
+            documents: runCensused.length,
+            unstyled_runs: unstyledRunsTotal,
+            documents_where_it_formats: charFormatting.length,
+            unstyled_runs_formatted: unstyledRunsFormatted,
         },
         layout: {
             budget_ms: LAYOUT_BUDGET_MS,

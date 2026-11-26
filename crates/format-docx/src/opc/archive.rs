@@ -668,6 +668,9 @@ fn read_docx_scoped(
     /* Issue #487 — the `LineNumber` character style the line-number
     gutter paints with (character styles are not mirrored above). */
     document.line_number_style = resolver.builtin_character_style("LineNumber", "line number");
+    /* Issue #558 — the default character style every run naming none
+    takes (folded at span-materialize time, never into spans). */
+    document.default_char_style = resolver.default_character_style();
     for (id, def) in &style_table.by_id {
         if !matches!(def.kind, crate::parts::styles::StyleKind::Paragraph) {
             continue;

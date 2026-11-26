@@ -95,6 +95,10 @@ pub use font_size_bounds::{
 pub mod fields;
 mod revision_refs;
 pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};
+/// Issues #560 / #558 — engine-minted paragraphs take the style cascade;
+/// the default character style formats runs naming none.
+#[cfg(test)]
+mod minted_paragraph_tests;
 #[cfg(test)]
 mod para_border_cascade_tests;
 #[cfg(test)]
@@ -438,6 +442,22 @@ pub struct DocumentTree {
     /// snapshot encodes unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_number_style: Option<SpanStyle>,
+    /// Issue #558 — the run formatting of the document's DEFAULT
+    /// CHARACTER style (`<w:style w:type="character" w:default="1">`,
+    /// Word's `DefaultParagraphFont`), its `basedOn` chain folded
+    /// root-first, WITHOUT the docDefaults: the character style of every
+    /// run that names none (ECMA-376 §17.7.4.17). Folded at
+    /// span-materialize time between the paragraph style chain's
+    /// `<w:rPr>` and the run's own formatting
+    /// ([`StyleCascade::text_style`]), never into a span, so the writer
+    /// never spells it as direct formatting. A run naming a character
+    /// style (`SpanStyle::char_style`) takes that style's chain instead.
+    /// Read-only (`styles.xml` rides the source package verbatim);
+    /// `None` when the document defines no default character style or it
+    /// formats nothing (Word's own is empty) — skipped when `None`, so a
+    /// pre-#558 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_char_style: Option<SpanStyle>,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -6215,6 +6235,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6271,6 +6292,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6329,6 +6351,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6367,6 +6390,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6405,6 +6429,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6496,6 +6521,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6892,10 +6918,23 @@ impl DocumentTree {
         if let Some(e) = edit {
             next.remap_text_edit_record(&target, e);
         }
+        /* Word styles note bodies `FootnoteText` / `EndnoteText`; adopt
+        the style when the document defines it so the body picks up the
+        smaller size the template intends. Issue #560 — through the
+        cascade: the body lays out with the style's paragraph properties
+        now, not only after save + reopen. */
+        let style_id = match kind {
+            NoteKind::Footnote => "FootnoteText",
+            NoteKind::Endnote => "EndnoteText",
+        };
         let mut body_para = Paragraph {
             text: format!("{}{}", '\u{FFFC}', ' '),
             dirty: true,
-            ..Default::default()
+            ..self.new_paragraph_in_style(
+                self.styles
+                    .contains_key(style_id)
+                    .then(|| style_id.to_string()),
+            )
         };
         body_para.inline_objects.push(InlineObject {
             at: 0,
@@ -6903,16 +6942,6 @@ impl DocumentTree {
             anchor: None,
             source_xml: None,
         });
-        /* Word styles note bodies `FootnoteText` / `EndnoteText`; adopt
-        the style when the document defines it so the body picks up the
-        smaller size the template intends. */
-        let style_id = match kind {
-            NoteKind::Footnote => "FootnoteText",
-            NoteKind::Endnote => "EndnoteText",
-        };
-        if self.styles.contains_key(style_id) {
-            body_para.style_id = Some(style_id.to_string());
-        }
         let next = next.with_updated_note_story(kind, id as i32, vec![Block::Paragraph(body_para)]);
         (next, id)
     }
@@ -7615,27 +7644,11 @@ impl DocumentTree {
         it or typing lands in a phantom trailing paragraph. */
         let count = self.paragraph_count();
         if count == 0 && self.path_to_first_paragraph_deep().is_none() {
+            /* Issue #560 — the minted paragraph takes the cascade. */
             blocks.push_back(Block::Paragraph(Paragraph {
                 text: text.to_owned(),
-                spans: Vec::new(),
-                props: ParaProperties::default(),
-                list_item: None,
-                resolved_marker: None,
-                resolved_list_indent: None,
                 dirty: true,
-                source_xml: None,
-                inline_objects: Vec::new(),
-                hyperlinks: Vec::new(),
-                revisions: Vec::new(),
-                fields: Vec::new(),
-                style_id: None,
-                direct_overrides: ParaProperties::default(),
-                section_end: None,
-                bookmarks: Vec::new(),
-                body_xml: None,
-                source_markup: None,
-                mark_revisions: Vec::new(),
-                mark_style: None,
+                ..self.new_paragraph()
             }));
             return Self {
                 blocks,
@@ -7656,6 +7669,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -7806,6 +7820,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -7946,6 +7961,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -7998,6 +8014,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8091,6 +8108,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8234,6 +8252,7 @@ impl DocumentTree {
             style_defaults: split.style_defaults.clone(),
             style_run_defaults: split.style_run_defaults.clone(),
             line_number_style: split.line_number_style.clone(),
+            default_char_style: split.default_char_style.clone(),
             styles_dirty: split.styles_dirty,
             numbering: split.numbering.clone(),
             hf_dirty: split.hf_dirty.clone(),
@@ -8345,6 +8364,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8442,6 +8462,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8520,6 +8541,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8596,6 +8618,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8635,6 +8658,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8714,6 +8738,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8757,9 +8782,41 @@ impl DocumentTree {
     }
 
     /// Issue #556 — this document's paragraph-style cascade
-    /// ([`StyleCascade`]), the default paragraph style looked up once.
+    /// ([`StyleCascade`]), the default paragraph style looked up once —
+    /// and, issue #558, its default character style.
     pub fn style_cascade(&self) -> StyleCascade<'_> {
-        StyleCascade::new(&self.styles)
+        StyleCascade::new(&self.styles).with_default_character(self.default_char_style.as_ref())
+    }
+
+    /// Issue #558 — the effective formatting of text whose own run
+    /// formatting is `own` (`None`: no span covers it) in a `style_id`
+    /// paragraph: `docDefaults → pStyle chain → the default character
+    /// style (when `own` names no character style) → own`
+    /// ([`StyleCascade::text_style`]).
+    pub fn resolve_text_style(&self, style_id: Option<&str>, own: Option<&SpanStyle>) -> SpanStyle {
+        let cascade = self.style_cascade();
+        cascade.text_style(&cascade.run(&self.style_run_defaults, style_id), own)
+    }
+
+    /// Issue #560 — a paragraph the engine mints, formatted with the
+    /// default paragraph style through the document's ONE cascade
+    /// ([`StyleCascade::new_paragraph`]). Every structural insert takes
+    /// its new paragraphs here, never from `Paragraph::default()`.
+    pub fn new_paragraph(&self) -> Paragraph {
+        self.new_paragraph_in_style(None)
+    }
+
+    /// Issue #560 — [`Self::new_paragraph`] formatted with `style_id`
+    /// (a note body's `FootnoteText`).
+    pub fn new_paragraph_in_style(&self, style_id: Option<String>) -> Paragraph {
+        self.style_cascade()
+            .new_paragraph(&self.style_defaults, style_id)
+    }
+
+    /// Issue #560 — a fresh table cell (Word's default borders) holding
+    /// one [`Self::new_paragraph`].
+    pub fn new_table_cell(&self) -> TableCell {
+        table_cell_holding(self.new_paragraph())
     }
 
     /// Sprint 12 (#11) — apply `style_id` to every paragraph the range
@@ -8802,6 +8859,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8913,6 +8971,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: true,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8988,6 +9047,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9039,6 +9099,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9093,6 +9154,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9231,6 +9293,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: next_numbering,
             hf_dirty: self.hf_dirty.clone(),
@@ -9293,6 +9356,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9333,6 +9397,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9455,6 +9520,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9520,6 +9586,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9713,6 +9780,8 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let mut placed_at = 0u32;
         let mut edit = None;
+        /* Issue #560 — the box's first paragraph takes the cascade. */
+        let seed = self.new_paragraph();
         let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
             let mut off = (pos.offset as usize).min(para.text.len());
             while !para.text.is_char_boundary(off) {
@@ -9726,6 +9795,7 @@ impl DocumentTree {
                     width_emu: width_emu.max(1),
                     height_emu: height_emu.max(1),
                     story: Box::new(TextBoxStory {
+                        body: vec![Block::Paragraph(seed)],
                         fill: Some([255, 255, 255, 255]),
                         outline: Some(ShapeOutline {
                             color: [0, 0, 0, 255],
@@ -9840,6 +9910,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9899,6 +9970,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -10037,6 +10109,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -10105,8 +10178,8 @@ impl DocumentTree {
         /* Design review B6 — see `insert_text`: a table-only tree has
         cell paragraphs the deep path reaches. */
         if count == 0 && self.path_to_first_paragraph_deep().is_none() {
-            blocks.push_back(Block::Paragraph(Paragraph::default()));
-            blocks.push_back(Block::Paragraph(Paragraph::default()));
+            blocks.push_back(Block::Paragraph(self.new_paragraph()));
+            blocks.push_back(Block::Paragraph(self.new_paragraph()));
             return Self {
                 blocks,
                 body_section: self.body_section.clone(),
@@ -10126,6 +10199,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -10178,6 +10252,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -10339,7 +10414,7 @@ impl DocumentTree {
         let paras: &[Paragraph] = &paras;
         let mut blocks = self.blocks.clone();
         if self.paragraph_count() == 0 {
-            blocks.push_back(Block::Paragraph(Paragraph::default()));
+            blocks.push_back(Block::Paragraph(self.new_paragraph()));
         }
         let target_path = if self.paragraph_at_path(&at.path).is_some() {
             at.path.clone()
@@ -10350,7 +10425,7 @@ impl DocumentTree {
         let Some(target_para) = self
             .paragraph_at_path(&target_path)
             .cloned()
-            .or_else(|| Some(Paragraph::default()))
+            .or_else(|| Some(self.new_paragraph()))
         else {
             return (self.clone(), at.clone());
         };
@@ -10385,6 +10460,7 @@ impl DocumentTree {
                     style_defaults: self.style_defaults.clone(),
                     style_run_defaults: self.style_run_defaults.clone(),
                     line_number_style: self.line_number_style.clone(),
+                    default_char_style: self.default_char_style.clone(),
                     styles_dirty: self.styles_dirty,
                     numbering: self.numbering.clone(),
                     hf_dirty: self.hf_dirty.clone(),
@@ -10440,6 +10516,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -10594,7 +10671,7 @@ impl DocumentTree {
         }
         let mut blocks = self.blocks.clone();
         if self.paragraph_count() == 0 {
-            blocks.push_back(Block::Paragraph(Paragraph::default()));
+            blocks.push_back(Block::Paragraph(self.new_paragraph()));
         }
         let target_path = if self.paragraph_at_path(&at.path).is_some() {
             at.path.clone()
@@ -10682,6 +10759,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -10795,11 +10873,16 @@ impl DocumentTree {
             Some(content) => vec![(content / cols as i32).max(1); cols],
             None => vec![(DEFAULT_A4_CONTENT_TWIPS / cols as i32).max(720); cols],
         };
+        /* Issue #560 — the cells and the escape paragraph take the
+        document's cascade (a nested table's too: a cell paragraph naming
+        no style reads back through `Normal` like a body one). */
+        let fresh_cell = self.new_table_cell();
+        let escape = self.new_paragraph();
         let mut row_vec: Vec<TableRow> = Vec::with_capacity(rows as usize);
         for _ in 0..rows {
             let mut cells = Vec::with_capacity(cols);
             for _ in 0..cols {
-                cells.push(default_table_cell());
+                cells.push(fresh_cell.clone());
             }
             row_vec.push(TableRow {
                 props: RowProperties::default(),
@@ -10838,7 +10921,7 @@ impl DocumentTree {
                 .block(insert_at + 1)
                 .is_none_or(|b| !matches!(b, Block::Paragraph(_)));
             if needs_trailing {
-                blocks.insert_block(insert_at + 1, Block::Paragraph(Paragraph::default()));
+                blocks.insert_block(insert_at + 1, Block::Paragraph(escape.clone()));
             }
             (insert_at, needs_trailing)
         };
@@ -10933,6 +11016,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -10979,6 +11063,8 @@ impl DocumentTree {
     }
 
     fn insert_row_unmapped(&self, table_path: BlockPath, at: usize) -> Self {
+        /* Issue #560 — the new cells take the document's cascade. */
+        let fresh_cell = self.new_table_cell();
         self.mutate_table(table_path, |t| {
             /* Prefer the grid width: a merged first row has FEWER cells
             than the table has logical columns, and a fresh row must
@@ -10990,7 +11076,7 @@ impl DocumentTree {
             };
             let new_row = TableRow {
                 props: RowProperties::default(),
-                cells: (0..cols).map(|_| default_table_cell()).collect(),
+                cells: (0..cols).map(|_| fresh_cell.clone()).collect(),
                 source_markup: None,
             };
             let insert_at = at.min(t.rows.len());
@@ -11076,6 +11162,8 @@ impl DocumentTree {
     }
 
     fn insert_column_unmapped(&self, table_path: BlockPath, at: usize) -> Self {
+        /* Issue #560 — the new cells take the document's cascade. */
+        let fresh_cell = self.new_table_cell();
         self.mutate_table(table_path, |t| {
             let insert_at = at.min(t.grid.len());
             /* Re-divide the A4 content width across the new column
@@ -11089,7 +11177,7 @@ impl DocumentTree {
             }
             for row in &mut t.rows {
                 let cell_at = insert_at.min(row.cells.len());
-                row.cells.insert(cell_at, default_table_cell());
+                row.cells.insert(cell_at, fresh_cell.clone());
             }
         })
     }
@@ -11263,6 +11351,9 @@ impl DocumentTree {
         g0: u32,
         g1: u32,
     ) -> Self {
+        /* Issue #560 — a continuation placeholder's paragraph takes the
+        document's cascade, as it reads back. */
+        let placeholder = self.new_paragraph();
         self.mutate_table(table_path, |t| {
             let plan = merge_plan(t, r0, r1, g0, g1);
             let Some(&(first_row, owner_col, _)) = plan.first() else {
@@ -11282,7 +11373,7 @@ impl DocumentTree {
                     let free = is_content_free_placeholder(&row.cells[lo]);
                     let own = std::mem::replace(
                         &mut row.cells[lo].blocks,
-                        vec![Block::Paragraph(Paragraph::default())],
+                        vec![Block::Paragraph(placeholder.clone())],
                     );
                     if !free {
                         appended.extend(own);
@@ -11316,13 +11407,15 @@ impl DocumentTree {
     /// starting *grid column* (cursor walk over per-row `grid_span`s), not
     /// by cell index — preceding cells in a row may themselves span.
     pub fn split_cell(&self, table_path: BlockPath, row: u32, col: u32) -> Self {
-        fn restore_row(row: &mut TableRow, idx: usize, span: usize) {
+        fn restore_row(row: &mut TableRow, idx: usize, span: usize, fresh: &TableCell) {
             row.cells[idx].props.grid_span = 1;
             row.cells[idx].props.v_merge = VMergeRole::None;
             for k in 0..span.saturating_sub(1) {
-                row.cells.insert(idx + 1 + k, default_table_cell());
+                row.cells.insert(idx + 1 + k, fresh.clone());
             }
         }
+        /* Issue #560 — the restored cells take the document's cascade. */
+        let fresh_cell = self.new_table_cell();
         /* Cell index in `row` whose starting grid column == `grid_col`. */
         fn cell_at_grid_col(row: &TableRow, grid_col: usize) -> Option<usize> {
             let mut cursor = 0usize;
@@ -11374,7 +11467,7 @@ impl DocumentTree {
                 .iter()
                 .map(|c| c.props.grid_span.max(1) as usize)
                 .sum();
-            restore_row(&mut t.rows[row as usize], col as usize, span);
+            restore_row(&mut t.rows[row as usize], col as usize, span, &fresh_cell);
             if was_restart {
                 for r in (row as usize + 1)..t.rows.len() {
                     let Some(i) = cell_at_grid_col(&t.rows[r], owner_grid_col) else {
@@ -11383,7 +11476,7 @@ impl DocumentTree {
                     if !matches!(t.rows[r].cells[i].props.v_merge, VMergeRole::Continue) {
                         break;
                     }
-                    restore_row(&mut t.rows[r], i, span);
+                    restore_row(&mut t.rows[r], i, span, &fresh_cell);
                 }
             }
         });
@@ -11621,6 +11714,10 @@ pub const MAX_STYLE_CHAIN: usize = 10;
 pub struct StyleCascade<'a> {
     styles: &'a std::collections::HashMap<String, ParagraphStyle>,
     default_style: Option<&'a ParagraphStyle>,
+    /// Issue #558 — the default CHARACTER style's folded run formatting
+    /// ([`DocumentTree::default_char_style`]); `None` from [`Self::new`],
+    /// set by [`DocumentTree::style_cascade`].
+    default_char: Option<&'a SpanStyle>,
 }
 
 impl<'a> StyleCascade<'a> {
@@ -11634,12 +11731,26 @@ impl<'a> StyleCascade<'a> {
         Self {
             styles,
             default_style,
+            default_char: None,
         }
+    }
+
+    /// Issue #558 — this cascade with the document's default character
+    /// style ([`DocumentTree::default_char_style`]).
+    pub fn with_default_character(mut self, style: Option<&'a SpanStyle>) -> Self {
+        self.default_char = style;
+        self
     }
 
     /// The document's default paragraph style (`w:default="1"`), if any.
     pub fn default_style(&self) -> Option<&'a ParagraphStyle> {
         self.default_style
+    }
+
+    /// Issue #558 — the folded run formatting of the document's default
+    /// character style, when it formats anything.
+    pub fn default_character(&self) -> Option<&'a SpanStyle> {
+        self.default_char
     }
 
     /// The style a paragraph whose `style_id` is `style_id` is formatted
@@ -11691,6 +11802,28 @@ impl<'a> StyleCascade<'a> {
         out
     }
 
+    /// Issue #558 — the formatting of TEXT whose own run formatting is
+    /// `own` (`None`: text no span covers) in a paragraph whose run
+    /// baseline is `base` ([`Self::run`]): `base → the default character
+    /// style → own`, the default character style only when `own` names
+    /// no character style (`SpanStyle::char_style`: a named style's chain
+    /// is folded into the span by the reader and replaces the default,
+    /// ECMA-376 §17.7.4.17). The ONE fold every consumer of a run's
+    /// effective formatting goes through — span materialization, the
+    /// paragraph mark, the caret / toolbar read-back.
+    pub fn text_style(&self, base: &SpanStyle, own: Option<&SpanStyle>) -> SpanStyle {
+        let mut out = base.clone();
+        if own.is_none_or(|s| s.char_style.is_none())
+            && let Some(default_char) = self.default_char
+        {
+            out = out.merged_with(default_char.clone());
+        }
+        match own {
+            Some(own) => out.merged_with(own.clone()),
+            None => out,
+        }
+    }
+
     /// Recompute `para.props` from its style cascade ∪ its
     /// `direct_overrides`: `style_defaults → chain → direct` in ONE
     /// direction-aware cascade (issue #395 — the logical border edges of
@@ -11703,6 +11836,29 @@ impl<'a> StyleCascade<'a> {
                 .chain(chain.iter().rev().map(|d| &d.para))
                 .chain(std::iter::once(&para.direct_overrides)),
         );
+    }
+
+    /// Issue #560 — a paragraph the ENGINE creates (a table's cells and
+    /// its escape paragraph, a new row / column / split cell, a header /
+    /// footer / text-box / note seed, the first paragraph of an empty
+    /// container) formatted with `style_id` exactly as the reader formats
+    /// a `<w:p>` with no `<w:pPr>` (or only that `<w:pStyle>`): `props` =
+    /// this cascade (`style_defaults → applied style chain`, the default
+    /// paragraph style for `None`), nothing direct. It lays out now as it
+    /// will after save + reopen, and the writer leaves every inherited
+    /// value out of its regenerated `<w:pPr>` (#431,
+    /// `format_docx::writer::without_inherited`).
+    pub fn new_paragraph(
+        &self,
+        style_defaults: &ParaProperties,
+        style_id: Option<String>,
+    ) -> Paragraph {
+        let mut para = Paragraph {
+            style_id,
+            ..Paragraph::default()
+        };
+        self.recompute(&mut para, style_defaults);
+        para
     }
 }
 
@@ -11781,13 +11937,22 @@ pub fn default_word_borders() -> CellBorders {
 /// borders on every edge. Without the placeholder paragraph cells
 /// collapse to zero height; without the borders the table is
 /// invisible until the user dresses it up.
+///
+/// Its paragraph skips every style cascade (a tree with no style table);
+/// engine code takes [`DocumentTree::new_table_cell`] (issue #560).
 pub fn default_table_cell() -> TableCell {
+    table_cell_holding(Paragraph::default())
+}
+
+/// A table cell with Word's default borders holding `para`
+/// ([`default_table_cell`], [`DocumentTree::new_table_cell`]).
+fn table_cell_holding(para: Paragraph) -> TableCell {
     TableCell {
         props: CellProperties {
             borders: Some(default_word_borders()),
             ..CellProperties::default()
         },
-        blocks: vec![Block::Paragraph(Paragraph::default())],
+        blocks: vec![Block::Paragraph(para)],
         source_markup: None,
     }
 }
@@ -17101,6 +17266,7 @@ mod tests {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),

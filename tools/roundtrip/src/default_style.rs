@@ -2,11 +2,12 @@
 //! `w:default="1"`) formats every paragraph that names no style (or an
 //! undefined one) on read, and the writer stays byte-neutral
 //! (`format_docx::test_fixtures::default_style_rtl_docx`, committed as
-//! `default_style_rtl.docx`).
+//! `default_style_rtl.docx`); 64e — issue #560: a table the engine inserts
+//! carries the same cascade in its minted paragraphs and writes none of it.
 
 use super::{assert_document_xml_well_formed, extract_doc_xml, read_docx};
 use anyhow::{Context, Result, bail};
-use engine::{BlockPath, DocumentTree, LogicalPos, Spacing, TextDirection};
+use engine::{BlockPath, DocumentTree, LogicalPos, PathStep, Spacing, TextDirection};
 use format_docx::test_fixtures::{DEFAULT_STYLE_TEXTS, default_style_rtl_docx};
 use format_docx::write_docx;
 
@@ -47,6 +48,9 @@ fn expected() -> Vec<(Option<TextDirection>, Spacing)> {
 /// d. Enter at the end of the empty paragraph and typing into the new
 ///    one: nothing `Normal` gives is written as direct formatting, and
 ///    the re-read resolves the new paragraph RTL with `Normal`'s spacing.
+/// e. Issue #560 — a table inserted at the end: its cells and escape
+///    paragraph carry docDefaults + `Normal` in the engine, write no
+///    `<w:pPr>` and re-read to the same properties.
 pub(super) fn run_default_style_roundtrip() -> Result<()> {
     let fixture = default_style_rtl_docx();
     let archive = read_docx(&fixture).context("read default-style fixture")?;
@@ -127,5 +131,50 @@ pub(super) fn run_default_style_roundtrip() -> Result<()> {
     println!(
         "[roundtrip] step 64d OK — Enter + typing write nothing Normal gives; the new paragraph re-reads RTL"
     );
+
+    /* e. Issue #560 — a table inserted at the end: its cells and escape
+    paragraph carry docDefaults + Normal in the engine (they lay out as
+    the package re-opens), the save writes no `<w:pPr>` for them (as
+    before #560) and the re-read gives them the same properties. */
+    let end = DEFAULT_STYLE_TEXTS.len() as u32;
+    let with_table = archive.document.insert_table(BlockPath::top(end), 2, 2);
+    let cell = |row: u32, col: u32| {
+        BlockPath::top(end)
+            .push(PathStep::Cell { row, col })
+            .push(PathStep::Block(0))
+    };
+    let unstyled = with_table.resolve_style_cascade(None);
+    let minted: Vec<BlockPath> = vec![cell(0, 0), cell(1, 1), BlockPath::top(end + 1)];
+    for path in &minted {
+        let props = with_table.paragraph_at_path(path).map(|p| &p.props);
+        if props != Some(&unstyled) {
+            bail!("minted paragraph {path:?} does not carry docDefaults + Normal: {props:?}");
+        }
+    }
+    let bytes = write_docx(&archive, &with_table).context("write with a table")?;
+    assert_document_xml_well_formed(&bytes).context("table default-style .docx")?;
+    let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 table")?;
+    let table = xml
+        .find("<w:tbl>")
+        .map(|at| &xml[at..])
+        .context("the inserted table")?;
+    if table.contains("<w:pPr>") {
+        bail!("a minted paragraph wrote inherited properties as direct formatting:\n{xml}");
+    }
+    if !xml.starts_with(source.split(DEFAULT_STYLE_LAST).next().unwrap_or_default()) {
+        bail!("the source paragraphs did not replay in front of the table:\n{xml}");
+    }
+    let back = read_docx(&bytes).context("re-read with a table")?.document;
+    for path in &minted {
+        if back.paragraph_at_path(path).map(|p| &p.props) != Some(&unstyled) {
+            bail!("minted paragraph {path:?} re-reads differently");
+        }
+    }
+    println!(
+        "[roundtrip] step 64e OK — an inserted table's minted paragraphs carry Normal, write no pPr, re-read the same"
+    );
     Ok(())
 }
+
+/// The last source paragraph's text: everything in front of it replays.
+const DEFAULT_STYLE_LAST: &str = "Direct LTR override";

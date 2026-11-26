@@ -207,10 +207,9 @@ fn mark_line_extents(
     fonts: &FontStack,
     rtl: bool,
 ) -> (f32, f32) {
-    let mut style = doc.resolve_style_run_cascade(p.style_id.as_deref());
-    if let Some(mark) = p.mark_style.as_deref() {
-        style = style.merged_with(mark.clone());
-    }
+    /* Issue #558 — the mark is a run naming no character style: the
+    default character style formats it (engine-wasm's one fold). */
+    let style = doc.resolve_text_style(p.style_id.as_deref(), p.mark_style.as_deref());
     let theme = doc.theme.as_deref();
     let complex = rtl || style.forces_complex_script();
     let (script, class, hint, size, bold, italic) = if complex {
@@ -305,7 +304,12 @@ fn span_from_style(
 /// (`engine-wasm`'s `build_style_spans` does this at layout time) — a plain
 /// per-span read would silently drop any inherited style.
 fn build_style_spans(p: &Paragraph, doc: &DocumentTree) -> Vec<StyleSpan> {
+    /* Issue #558 — text naming no character style takes the default one
+    over the paragraph baseline (`StyleCascade::text_style`, as in
+    engine-wasm). */
+    let styles = doc.style_cascade();
     let base = doc.resolve_style_run_cascade(p.style_id.as_deref());
+    let plain = styles.text_style(&base, None);
     let theme = doc.theme.as_deref();
     let text_len = p.text.len() as u32;
     let mut spans = p.spans.clone();
@@ -320,9 +324,9 @@ fn build_style_spans(p: &Paragraph, doc: &DocumentTree) -> Vec<StyleSpan> {
             continue;
         }
         if start > cursor {
-            out.push(span_from_style(&base, cursor, start, &p.text, theme));
+            out.push(span_from_style(&plain, cursor, start, &p.text, theme));
         }
-        let merged = base.clone().merged_with(run.style.clone());
+        let merged = styles.text_style(&base, Some(&run.style));
         out.push(span_from_style(&merged, start, end, &p.text, theme));
         cursor = end;
     }
@@ -331,11 +335,14 @@ fn build_style_spans(p: &Paragraph, doc: &DocumentTree) -> Vec<StyleSpan> {
         paragraph MARK (`<w:pPr><w:rPr>` over the style), which sizes its
         line (`layout::empty_line_extents`), as in engine-wasm. */
         let style = match p.mark_style.as_deref() {
-            Some(mark) if text_len == 0 => base.clone().merged_with(SpanStyle {
-                grab_bag: None,
-                ..mark.clone()
-            }),
-            _ => base.clone(),
+            Some(mark) if text_len == 0 => styles.text_style(
+                &base,
+                Some(&SpanStyle {
+                    grab_bag: None,
+                    ..mark.clone()
+                }),
+            ),
+            _ => plain.clone(),
         };
         out.push(span_from_style(&style, cursor, text_len, &p.text, theme));
     }

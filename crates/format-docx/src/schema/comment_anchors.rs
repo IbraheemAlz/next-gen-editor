@@ -44,7 +44,7 @@
 //!
 //! [`CommentPlan`] is computed once per `document.xml` write (from the tree)
 //! and published for the duration of the write, the
-//! `WRITE_INHERITED_DIRECTIONS` pattern — the paragraph serializer has no
+//! `WRITE_INHERITED_PROPS` pattern — the paragraph serializer has no
 //! document in hand.
 
 use engine::{
