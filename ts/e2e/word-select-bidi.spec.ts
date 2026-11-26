@@ -123,9 +123,12 @@ test('a click past the end of a mixed line puts the caret at the logical end; Ct
     await page.keyboard.type('!');
     await expect.poll(() => documentText(page)).toBe(`${SEED}!`);
 
-    /* Ctrl+Left from the logical end lands on the start of the last
-       LOGICAL word (never along the visual order). */
+    /* Ctrl+Left from the logical end walks LOGICAL word stops (never along
+       the visual order): the `!` is a stop of its own (punctuation is a
+       word class of its own — cursor memo §5, epic #555 row 20), then the
+       start of the last logical word. */
     await page.mouse.click(right.x, right.y);
+    await page.keyboard.press('Control+ArrowLeft');
     await page.keyboard.press('Control+ArrowLeft');
     await page.keyboard.type('|');
     await expect.poll(() => documentText(page)).toBe('Hello world مرحبا |بالعالم!');
