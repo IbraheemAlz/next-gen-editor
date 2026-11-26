@@ -1144,7 +1144,8 @@ mod tests {
         assert_eq!(engine.state_fingerprint_for_fuzzing(), before);
     }
 
-    /// Issues #536 / #530 (and the closed #491, #492, #511) — each nightly
+    /// Issues #536 / #530 (their duplicates #586 / #588 / #591 / #594 / #595
+    /// / #597, and the closed #491, #492, #511) — each nightly
     /// input builds a package with a block where no block may stand (a
     /// `<w:p>` before the body, unclosed so the EOF repair makes it enclose
     /// the body, or nested in another paragraph by the same repair). Its
@@ -1163,6 +1164,15 @@ mod tests {
             ("repro_511", "outside the document body"),
             ("repro_536", "outside the document body"),
             ("repro_530", "inside a paragraph"),
+            // Later nightly duplicates of the two root causes (a CLOSED stray
+            // `<w:p>` before the body; two unclosed ones; an unclosed
+            // paragraph the EOF repair nests the next one in).
+            ("repro_595", "outside the document body"),
+            ("repro_597", "outside the document body"),
+            ("repro_586", "outside the document body"),
+            ("repro_591", "outside the document body"),
+            ("repro_588", "inside a paragraph"),
+            ("repro_594", "inside a paragraph"),
         ] {
             let data = std::fs::read(dir.join(seed)).expect("the reproducer is committed");
             run_docx_roundtrip(&data);
