@@ -5,14 +5,17 @@
 //! reads raw bytes (a committed seed or a mutation of one) as the file
 //! itself, and every other input as a SPLICE — a small valid image built by
 //! `format_doc::test_builder` from the input's head (text, run / paragraph
-//! flags, an optional section and an out-of-order piece split), then the
+//! flags, an optional section, an out-of-order piece split, and — issue
+//! #576 — the paragraphs as the cells of one table row), then the
 //! rest of the input overwriting bytes of its two streams at input-chosen
 //! offsets before the compound file is assembled. That keeps the random
 //! sweep inside the FIB / piece table / FKP / SEPX parsers instead of
 //! failing on the container signature.
 
 use arbitrary::Unstructured;
-use format_doc::test_builder::{DocSpec, Encoding, Para, PieceSpec, build, run, sprm, streams};
+use format_doc::test_builder::{
+    DocSpec, Encoding, Para, PieceSpec, Tc, build, prc_data, run, sprm, streams,
+};
 
 /// The committed `corpus/doc_reader/` seeds: `(file name, .doc bytes)`.
 /// Written by `examples/regen-seeds`, pinned by
@@ -76,10 +79,69 @@ pub fn doc_seeds() -> Vec<(&'static str, Vec<u8>)> {
         fast_saved: true,
         ..DocSpec::new(vec![Para::plain("Hello café world")])
     };
+    /* Issue #576 — tables: a 2x2 table (TDefTable with TC80s, table
+    borders, a shading, a vertical merge) holding a nested 1x1 table, a
+    right-to-left table after it, and a row mark read through a Huge PAPX
+    in the Data stream. */
+    let nested = |text: &str, row_end: bool| {
+        let mut g = cat(&[sprm::in_table(true), sprm::itap(2), sprm::inner_cell(true)]);
+        if row_end {
+            g.extend(sprm::inner_row_end(true));
+            g.extend(sprm::def_table(&[0, 1440], &[]));
+        }
+        let runs = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![run(text, Vec::new())]
+        };
+        Para::new(runs, g)
+    };
+    let tc = Tc {
+        vert_merge: 3,
+        v_align: 1,
+        borders: [sprm::brc80(8, 0x01, 6); 4],
+        ..Tc::default()
+    };
+    let huge_row = cat(&[
+        sprm::in_table(true),
+        sprm::row_end(true),
+        sprm::def_table(&[0, 1500, 3000], &[Tc::default(); 2]),
+        sprm::table_rtl(true),
+    ]);
+    let mut tables = DocSpec::new(vec![
+        Para::plain("before"),
+        nested("inner", false),
+        nested("", true),
+        Para::cell("A1", Vec::new()),
+        Para::cell("B1", Vec::new()),
+        Para::row_end(cat(&[
+            sprm::def_table(&[-108, 2772, 5652], &[tc, Tc::default()]),
+            sprm::table_borders80(sprm::brc80(4, 0x01, 0)),
+            sprm::set_shd(1, 2, [0xFF, 0xEB, 0x78]),
+            sprm::row_height(400),
+        ])),
+        Para::cell("", Vec::new()),
+        Para::cell("B2", Vec::new()),
+        Para::row_end(cat(&[
+            sprm::def_table(&[-108, 2772, 5652], &[]),
+            sprm::vert_merge(0, 1),
+        ])),
+        Para::plain("between"),
+        Para::cell("ي", sprm::rtl_paragraph(true)),
+        Para::cell("ب", sprm::rtl_paragraph(true)),
+        Para {
+            runs: Vec::new(),
+            papx: sprm::huge_papx(8),
+            mark: '\u{7}',
+        },
+        Para::plain("after"),
+    ]);
+    tables.data = cat(&[vec![0; 8], prc_data(&huge_row)]);
     vec![
         ("seed_plain.doc", build(&plain)),
         ("seed_rtl_section.doc", build(&rtl)),
         ("seed_fast_saved.doc", build(&fast_saved)),
+        ("seed_tables.doc", build(&tables)),
     ]
 }
 
@@ -120,6 +182,23 @@ pub fn spliced(data: &[u8]) -> Option<Vec<u8>> {
             papx.extend(sprm::jc(u.int_in_range(0u8..=4).ok()?));
         }
         paras.push(Para::new(vec![run(&text, chpx)], papx));
+    }
+    /* Issue #576 — bit 7: the paragraphs are the cells of one table row,
+    closed by a row mark carrying a cell layout and table borders. */
+    if flags & 128 != 0 {
+        let cells = paras.len();
+        for p in &mut paras {
+            p.papx.extend(sprm::in_table(true));
+            p.mark = '\u{7}';
+        }
+        let edges: Vec<i16> = (0..=cells).map(|i| i as i16 * 1440 - 108).collect();
+        paras.push(Para::row_end(
+            [
+                sprm::def_table(&edges, &[]),
+                sprm::table_borders80(sprm::brc80(4, 0x01, 0)),
+            ]
+            .concat(),
+        ));
     }
     let mut spec = DocSpec::new(paras);
     let total = spec.ccp_text();

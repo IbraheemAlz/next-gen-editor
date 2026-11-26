@@ -8,11 +8,17 @@
  * `fWhichTblStm` -> 1Table; `csw` 14, `cslw` 22, `cbMac`, `ccpText`;
  * `cbRgFcLcb` 0x5D with the PlcBteChpx (12), PlcBtePapx (13) and Clx (33)
  * pairs), the text from byte 1024 (UTF-16LE, a `\r` mark per paragraph,
- * `\u0007` for a table cell), then the CHPX and PAPX FKP pages (512 bytes,
- * 512-aligned). 1Table stream: the Clx (one Pcdt with one Pcd), then the
- * two bin tables. Both streams are padded past 4096 bytes so the compound
- * file needs no mini stream; the container is a version-3 MS-CFB file
- * (512-byte sectors: directory, the two streams, the FAT). */
+ * `\u0007` for a table cell or row), then the CHPX and PAPX FKP pages (512
+ * bytes, 512-aligned). 1Table stream: the Clx (one Pcdt with one Pcd), then
+ * the two bin tables. Both streams are padded past 4096 bytes so the
+ * compound file needs no mini stream; the container is a version-3 MS-CFB
+ * file (512-byte sectors: directory, the two streams, the FAT).
+ *
+ * Tables (issue #576, [MS-DOC] 2.4.3): a cell's last paragraph is a `cell`
+ * paragraph (0x07 + `sprmPFInTable`); a row ends with a `rowEnd` paragraph
+ * — an empty 0x07 mark with `sprmPFInTable` + `sprmPFTtp`, the row's
+ * `sprmTDefTable` (its cell edges, no TC80s) and single 1/2 pt table borders
+ * (`sprmTTableBorders80`). */
 
 export interface DocRun {
     text: string;
@@ -29,6 +35,28 @@ export interface DocPara {
     center?: boolean;
     /** End the paragraph with a table-cell mark (`sprmPFInTable` set). */
     cell?: boolean;
+    /** A table row mark (TTP) whose `sprmTDefTable` places the row's cells
+     *  between these edges (twips from the left margin, one more than the
+     *  cells); `runs` should be empty. */
+    rowEnd?: number[];
+    /** `sprmPIlfo` 1: a list paragraph (its marker is not imported). */
+    list?: boolean;
+}
+
+/** `sprmTDefTable` (0xD608): `cb` (the rest + 1), the cell count, the
+ *  edges (signed 16-bit twips), no TC80s. */
+function defTable(edges: number[]): number[] {
+    const body = [edges.length - 1];
+    for (const e of edges) body.push(e & 0xff, (e >> 8) & 0xff);
+    const cb = body.length + 1;
+    return [0x08, 0xd6, cb & 0xff, cb >> 8, ...body];
+}
+
+/** `sprmTTableBorders80` (0xD605): six single 1/2 pt `Brc80`s. */
+function tableBorders80(): number[] {
+    const out = [0x05, 0xd6, 0x18];
+    for (let i = 0; i < 6; i++) out.push(4, 0x01, 0, 0);
+    return out;
 }
 
 const TEXT_AT = 1024;
@@ -128,13 +156,18 @@ function streams(paras: DocPara[]): { word: Uint8Array; table: Uint8Array } {
             if (word.length > start) chpx.push([start, word.length, g]);
         }
         const markAt = word.length;
-        word.u16(p.cell ? 0x0007 : 0x000d);
+        word.u16(p.cell || p.rowEnd ? 0x0007 : 0x000d);
         cps += 1;
         chpx.push([markAt, word.length, []]);
         const g: number[] = [];
         if (p.rtl) g.push(0x41, 0x24, 0x01); // sprmPFBiDi
         if (p.center) g.push(0x61, 0x24, 0x01); // sprmPJc
-        if (p.cell) g.push(0x16, 0x24, 0x01); // sprmPFInTable
+        if (p.cell || p.rowEnd) g.push(0x16, 0x24, 0x01); // sprmPFInTable
+        if (p.list) g.push(0x0b, 0x46, 0x01, 0x00); // sprmPIlfo 1
+        if (p.rowEnd) {
+            g.push(0x17, 0x24, 0x01); // sprmPFTtp
+            g.push(...defTable(p.rowEnd), ...tableBorders80());
+        }
         papx.push([paraStart, word.length, g]);
     }
     const textEnd = word.length;

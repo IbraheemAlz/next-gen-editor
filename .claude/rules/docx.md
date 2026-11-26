@@ -939,12 +939,31 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   `TooLarge` -> `PackageTooLarge`, a non-Word OLE file or a Word 6/95 FIB
   -> `InvalidDocument`. A new `DocError` variant does not compile there
   until classified.
-- **Honest UX.** What the importer does not model (tables as plain
-  paragraphs, list markers, pictures, fields kept as their result,
-  subdocuments, styles / fonts) is COUNTED during the walk and rides
-  `DocumentLoaded.warnings` as `ReadWarningKind::LegacyContentNotImported`
+- **Honest UX.** What the importer does not model (list markers,
+  pictures, fields kept as their result, subdocuments, styles / fonts,
+  tables nested deeper than the model nests) is COUNTED during the walk and
+  rides `DocumentLoaded.warnings` as `ReadWarningKind::LegacyContentNotImported`
   (one entry per class); a newly modelled class drops its counter, a newly
   skipped one adds one — never drop content silently.
+- **Tables (issue #576, [MS-DOC] 2.4.3 / 2.6.3).** Every paragraph mark
+  records its table depth (`sprmPFInTable` / `sprmPItap` / `sprmPDtap`) and
+  what it ends (`table::Membership::mark`: 0x07 = a cell mark, + `sprmPFTtp`
+  the row mark; deeper, a 0x0D with `sprmPFInnerTableCell` /
+  `sprmPFInnerTtp`); a row mark carries its row's table sprms (`tap::Tap`,
+  read through `sprmPHugePapx` from the Data stream when they did not fit the
+  FKP page). `table::assemble` builds `engine::Table`s in ONE pass with an
+  explicit stack (no recursion), depth bounded by `format_docx`'s
+  `MAX_TABLE_NESTING_DEPTH` (deeper paragraphs stay plain paragraphs of the
+  deepest cell, counted as `LegacyContent::Tables`). Rows of different
+  direction / table style are different tables. The grid is the UNION of
+  every row's `rgdxaCenter` edges (cells span the columns between their
+  edges — Word 2000+ horizontal merges; the Word 97 `horzMerge` flags /
+  `sprmTMerge` fold merged cells into their first one; vertical merges from
+  `TCGRF.vertMerge` / `sprmTVertMerge`), at most 255 columns (`grid_span` is a
+  `u8`, else one even column per cell + autofit); the indent is the leading
+  edge, `fAutofit` off = `TableLayout::Fixed`. A body or cell that would end
+  in a table gets an empty paragraph after it. Tests build tables with
+  `test_builder::{Para::cell, Para::row_end, sprm::def_table, Tc}`.
 - **Borrowed code.** Parts of `format-doc` are modified from WordCraft
   (MIT OR Apache-2.0): every such file carries the "Modified from
   WordCraft ... at commit ..." header and a row in `THIRD-PARTY-NOTICES.md`.
