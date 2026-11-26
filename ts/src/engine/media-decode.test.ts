@@ -2,14 +2,14 @@
  * decode loop. */
 import { describe, expect, it } from 'vitest';
 import { commandMeta } from '@nge/core/command-meta';
-import { MediaDecoder, mediaDecodePlan, type MediaEntry } from './media-decode';
+import { MediaDecoder, mediaDecodePlan, runMediaPass, type MediaEntry } from './media-decode';
 
 const plan = (cmd: Parameters<typeof commandMeta>[0], reply = 'SELECTION_CHANGED') =>
     mediaDecodePlan(commandMeta(cmd), reply);
 
 describe('mediaDecodePlan (#506)', () => {
-    it('decodes and repaints after INSERT_IMAGE - the picture the engine minted itself', () => {
-        expect(plan('INSERT_IMAGE')).toEqual({ decode: true, repaint: true });
+    it('decodes after INSERT_IMAGE - the picture the engine minted itself', () => {
+        expect(plan('INSERT_IMAGE')).toEqual({ decode: true, reset: false });
     });
 
     it('decodes after an undo / redo / paste, which can bring a picture blob back', () => {
@@ -18,24 +18,25 @@ describe('mediaDecodePlan (#506)', () => {
         }
     });
 
-    it('decodes after OPEN_DOCUMENT but leaves the paint to the page canvases', () => {
-        expect(plan('OPEN_DOCUMENT', 'DOCUMENT_OPENED')).toEqual({ decode: true, repaint: false });
+    it('decodes after OPEN_DOCUMENT and forgets the previous document\'s failures', () => {
+        expect(plan('OPEN_DOCUMENT', 'DOCUMENT_LOADED')).toEqual({ decode: true, reset: true });
+        expect(plan('CLOSE_DOCUMENT', 'DOCUMENT_LOADED')).toEqual({ decode: true, reset: true });
     });
 
     it('does nothing for read-only commands (HIT_TEST fires on every pointermove)', () => {
         for (const type of ['HIT_TEST', 'GET_IMAGE_RECTS', 'REQUEST_PAINT', 'PING'] as const) {
-            expect(plan(type), type).toEqual({ decode: false, repaint: false });
+            expect(plan(type), type).toEqual({ decode: false, reset: false });
         }
     });
 
     it('does nothing when the engine refused the command', () => {
-        expect(plan('INSERT_IMAGE', 'ERROR')).toEqual({ decode: false, repaint: false });
-        expect(plan('OPEN_DOCUMENT', 'ERROR')).toEqual({ decode: false, repaint: false });
+        expect(plan('INSERT_IMAGE', 'ERROR')).toEqual({ decode: false, reset: false });
+        expect(plan('OPEN_DOCUMENT', 'ERROR')).toEqual({ decode: false, reset: false });
     });
 
     it('every command that mutates the document gets a decode pass (the rule has no list of its own)', () => {
         const meta = { mutates_doc: true, new_document: false };
-        expect(mediaDecodePlan(meta, 'X')).toEqual({ decode: true, repaint: true });
+        expect(mediaDecodePlan(meta, 'X')).toEqual({ decode: true, reset: false });
         expect(mediaDecodePlan({ mutates_doc: false, new_document: false }, 'X').decode).toBe(false);
     });
 });
@@ -104,5 +105,71 @@ describe('MediaDecoder (#506)', () => {
         expect(await d.run([entry('k', 13)])).toBe(0);
         expect(await d.run([entry('k', 4)])).toBe(1);
         expect(registered).toEqual(['k']);
+    });
+});
+
+/* Issue #574 - an opened document's pictures stayed grey until the next
+ * edit: the open's decode pass registered the bitmaps but never repainted
+ * (its page canvases were supposed to paint them, and are re-registered only
+ * when the page count changes). */
+describe('runMediaPass (#506 / #574)', () => {
+    function pass(pending: MediaEntry[], opts: { failing?: Set<string> } = {}) {
+        const { d, registered, warnings } = decoder(opts);
+        const log: string[] = [];
+        const io = {
+            pending: () => {
+                log.push('pending');
+                return pending;
+            },
+            repaint: async () => {
+                log.push(`repaint after ${registered.length}`);
+            },
+        };
+        return { d, io, log, registered, warnings };
+    }
+
+    it('an OPEN_DOCUMENT with pictures repaints ONCE, after every bitmap is registered', async () => {
+        const { d, io, log, registered } = pass([entry('rId5'), entry('rId6')]);
+        expect(await runMediaPass(plan('OPEN_DOCUMENT', 'DOCUMENT_LOADED'), d, io)).toBe(2);
+        expect(registered).toEqual(['rId5', 'rId6']);
+        expect(log).toEqual(['pending', 'repaint after 2']);
+    });
+
+    it('every decoding command repaints the same way (INSERT_IMAGE, UNDO)', async () => {
+        for (const type of ['INSERT_IMAGE', 'UNDO'] as const) {
+            const { d, io, log } = pass([entry('nge_img_1')]);
+            await runMediaPass(plan(type), d, io);
+            expect(log, type).toEqual(['pending', 'repaint after 1']);
+        }
+    });
+
+    it('nothing pending, nothing registered: no repaint (the common path)', async () => {
+        const { d, io, log } = pass([]);
+        expect(await runMediaPass(plan('OPEN_DOCUMENT', 'DOCUMENT_LOADED'), d, io)).toBe(0);
+        expect(log).toEqual(['pending']);
+    });
+
+    it('a pass whose every blob fails to decode does not repaint', async () => {
+        const { d, io, log, warnings } = pass([entry('bad', 13)], { failing: new Set(['bad']) });
+        expect(await runMediaPass(plan('OPEN_DOCUMENT', 'DOCUMENT_LOADED'), d, io)).toBe(0);
+        expect(log).toEqual(['pending']);
+        expect(warnings).toHaveLength(1);
+    });
+
+    it('a command that cannot add a picture never asks the engine', async () => {
+        const { d, io, log } = pass([entry('rId5')]);
+        expect(await runMediaPass(plan('HIT_TEST'), d, io)).toBe(0);
+        expect(await runMediaPass(plan('OPEN_DOCUMENT', 'ERROR'), d, io)).toBe(0);
+        expect(log).toEqual([]);
+    });
+
+    it('a new document forgets the failures of the previous one; an edit does not', async () => {
+        const bad = entry('bad', 13);
+        const { d, io, warnings } = pass([bad], { failing: new Set(['bad']) });
+        await runMediaPass(plan('INSERT_IMAGE'), d, io);
+        await runMediaPass(plan('INSERT_IMAGE'), d, io);
+        expect(warnings).toHaveLength(1);
+        await runMediaPass(plan('OPEN_DOCUMENT', 'DOCUMENT_LOADED'), d, io);
+        expect(warnings).toHaveLength(2);
     });
 });
