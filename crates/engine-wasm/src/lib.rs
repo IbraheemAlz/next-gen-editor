@@ -687,10 +687,66 @@ fn drain_layout_notes() -> Vec<LayoutDegraded> {
     LAYOUT_NOTES.with(|n| std::mem::take(&mut *n.borrow_mut()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Issue #347 — see [`ForcedWrapBandCap`].
+    static WRAP_BAND_CAP_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Issue #347 — test-only: while alive, the paragraph float-wrap
+/// composer's defensive band cap on this thread is `cap` instead of
+/// `layout::wrap_band_cap` (which no finite wrap plan can reach), so the
+/// escape hatch and its `FloatWrapCapped` note can be exercised through
+/// the real engine path - the counterpart of `CULL_CLAMP_OFF` for #501.
+#[cfg(test)]
+struct ForcedWrapBandCap(Option<usize>);
+
+#[cfg(test)]
+impl ForcedWrapBandCap {
+    fn to(cap: usize) -> Self {
+        Self(WRAP_BAND_CAP_OVERRIDE.with(|c| c.replace(Some(cap))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedWrapBandCap {
+    fn drop(&mut self) {
+        WRAP_BAND_CAP_OVERRIDE.with(|c| c.set(self.0));
+    }
+}
+
+/// Issue #347 — the ONE door to the paragraph float-wrap composer
+/// (`layout::layout_paragraph_wrapped`): a capped composition painted the
+/// rest of the paragraph with its cutouts ignored, and that escape hatch
+/// is reported as a `FloatWrapCapped` note like every other
+/// (`.claude/rules/render.md`, "Layout self-defense"). Never call the
+/// layout function directly from the engine.
+fn lay_out_wrapped(cfg: ParagraphConfig<'_>, cuts: &[layout::WrapCutout]) -> ParagraphBox {
+    let band_cap = layout::wrap_band_cap(cfg.text.len(), cuts.len());
+    #[cfg(test)]
+    let band_cap = WRAP_BAND_CAP_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(band_cap);
+    let wrapped = layout::layout_paragraph_wrapped_with_cap(cfg, cuts, band_cap);
+    if let Some(reason) = wrapped.degraded {
+        note_layout_degradation(bridge_reason(reason));
+    }
+    wrapped.paragraph
+}
+
 /// Issue #87 — a paginator note in its wire shape.
 fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
+    LayoutDegraded {
+        reason: bridge_reason(d.reason),
+        page: Some(d.page),
+    }
+}
+
+/// The wire spelling of a layout degradation reason (one-to-one).
+fn bridge_reason(reason: layout::DegradeReason) -> LayoutDegradeReason {
     use layout::DegradeReason as R;
-    let reason = match d.reason {
+    match reason {
         R::OversizeLine => LayoutDegradeReason::OversizeLine,
         R::KeepChainDropped => LayoutDegradeReason::KeepChainDropped,
         R::KeepLinesDropped => LayoutDegradeReason::KeepLinesDropped,
@@ -710,10 +766,7 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::FloatClampedByNotes => LayoutDegradeReason::FloatClampedByNotes,
         R::NestingCapped => LayoutDegradeReason::NestingCapped,
         R::TableCacheMismatch => LayoutDegradeReason::TableCacheMismatch,
-    };
-    LayoutDegraded {
-        reason,
-        page: Some(d.page),
+        R::FloatWrapCapped => LayoutDegradeReason::FloatWrapCapped,
     }
 }
 
@@ -6289,7 +6342,7 @@ fn layout_paragraph_wrapped_uncached(
         font_line,
         hyphenation: hyphenation.as_ref(),
     };
-    layout::layout_paragraph_wrapped(para_cfg, cuts)
+    lay_out_wrapped(para_cfg, cuts)
 }
 
 /// Issue #326 — the byte ranges of `para` automatic hyphenation may break
@@ -11954,7 +12007,7 @@ impl Engine {
                                 &font_stack,
                                 base_direction,
                             );
-                            layout::layout_paragraph_wrapped(
+                            lay_out_wrapped(
                                 ParagraphConfig {
                                     text: &text,
                                     fonts: &font_stack,
@@ -32822,6 +32875,11 @@ mod wire_validation_tests {
 /// Issue #456 — the paragraph layout cache key sees every layout input.
 #[cfg(test)]
 mod paragraph_cache_key_tests;
+
+/// Issue #347 — the float-wrap composer's band cap is reported
+/// (`FloatWrapCapped`) and a hard failure under the strict note sink.
+#[cfg(test)]
+mod float_wrap_cap_tests;
 
 /// Issue #457 — the paragraph layout cache is weighted in bytes.
 #[cfg(test)]
