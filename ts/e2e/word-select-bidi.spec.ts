@@ -87,10 +87,10 @@ test('a double-click below the last line of a mixed paragraph selects its logica
     await expect.poll(() => selectedText(page)).toBe('بالعالم');
 
     /* Left of the ink (the page margin): the logical start -> the first
-       word. */
+       word, with its trailing space (issue #598, cursor memo §6). */
     const left = below(t, 0.05);
     await page.mouse.dblclick(left.x, left.y);
-    await expect.poll(() => selectedText(page)).toBe('Hello');
+    await expect.poll(() => selectedText(page)).toBe('Hello ');
 
     /* On the line's own band, right of the ink: the same last word. */
     const onLine = { x: right.x, y: right.y - 24 - 6 };

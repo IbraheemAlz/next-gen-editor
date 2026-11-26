@@ -14,9 +14,13 @@ use bridge::{
     LayoutDegradeReason, LayoutDegraded, LogicalPos as BridgeLogicalPos,
     LogicalRange as BridgeLogicalRange, MoveDirection, PageOrientation as BridgePageOrientation,
     PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
-    SectionBreakKind, SelectionKind, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
+    SectionBreakKind, SelectionKind, SelectionUnit, TextAttrs, TextAttrsPatch, UnderlineStyle,
+    VerticalScript,
 };
 use engine::snapshot::SnapshotError;
+/* Issue #598 — the ONE word model (Ctrl+arrows, Ctrl+Backspace / Delete;
+double-click and the drag by words read it through `Paragraph::word_bounds`). */
+use engine::words::{word_stop_backward, word_stop_forward};
 use engine::{
     Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
     FontFamily as EngineFontFamily, LogicalPos as EnginePos, PathStep as EnginePathStep, SpanStyle,
@@ -7301,85 +7305,6 @@ fn line_end(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalPo
     })
 }
 
-/// Epic #555 row 20 — the class of a Ctrl+Left / Ctrl+Right word unit
-/// (the clean-room cursor memo §5): text, punctuation (a class of its
-/// own), separators (space, tab, no-break space — any white space), and a
-/// non-text element (an inline object's `U+FFFC` sentinel), which is a
-/// word by itself. There are no script-specific rules: an Arabic word
-/// with a tatweel or harakat is text like any other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WordClass {
-    Text,
-    Punctuation,
-    Separator,
-    Object,
-}
-
-/// The word units of `text`: UAX #29 word segments (`split_word_bounds`,
-/// so a contraction `isn't`, a number `3.14`, an ideograph and a letter
-/// with its combining marks stay whole) classified by [`WordClass`], with
-/// adjacent punctuation and adjacent separators merged into one unit each
-/// (a run of one class). `(start, end, class)`, in logical order, covering
-/// `text`.
-fn word_units(text: &str) -> Vec<(usize, usize, WordClass)> {
-    use unicode_segmentation::UnicodeSegmentation;
-    let mut units: Vec<(usize, usize, WordClass)> = Vec::new();
-    for (i, seg) in text.split_word_bound_indices() {
-        let class = if seg == "\u{FFFC}" {
-            WordClass::Object
-        } else if seg.chars().all(char::is_whitespace) {
-            WordClass::Separator
-        } else if seg.chars().any(char::is_alphanumeric) {
-            WordClass::Text
-        } else {
-            WordClass::Punctuation
-        };
-        let end = i + seg.len();
-        match units.last_mut() {
-            Some(last)
-                if last.2 == class
-                    && matches!(class, WordClass::Punctuation | WordClass::Separator) =>
-            {
-                last.1 = end;
-            }
-            _ => units.push((i, end, class)),
-        }
-    }
-    units
-}
-
-/// Where Ctrl+Right (logical forward) stops from byte `off` of `text`:
-/// past the run of one class `off` sits in, then past the separators after
-/// it — the start of the next word, punctuation run or object, else the
-/// paragraph end. Also the far end of a Ctrl+Delete.
-fn word_stop_forward(text: &str, off: usize) -> usize {
-    let units = word_units(text);
-    let Some(i) = units.iter().position(|u| off >= u.0 && off < u.1) else {
-        return text.len();
-    };
-    match units.get(i + 1) {
-        Some(next) if next.2 == WordClass::Separator && units[i].2 != WordClass::Separator => {
-            next.1
-        }
-        Some(next) => next.0,
-        None => text.len(),
-    }
-}
-
-/// Where Ctrl+Left (logical backward) stops from byte `off` of `text`:
-/// back over the separators before it, then over a run of one class — its
-/// start. Also the near end of a Ctrl+Backspace.
-fn word_stop_backward(text: &str, off: usize) -> usize {
-    let units = word_units(text);
-    let Some(mut i) = units.iter().position(|u| off > u.0 && off <= u.1) else {
-        return 0;
-    };
-    if units[i].2 == WordClass::Separator && i > 0 {
-        i -= 1;
-    }
-    units[i].0
-}
-
 /// Jump one word backward in logical byte order — the engine half of
 /// Ctrl/Cmd + ArrowLeft in an LTR paragraph (an RTL paragraph flips the
 /// visual mapping; see `do_move_caret`). Lands where
@@ -8249,6 +8174,35 @@ fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, Bridg
         Ordering::Equal => a.offset > b.offset,
     };
     if swap { (b, a) } else { (a, b) }
+}
+
+/// Issue #598 — where text typed over the selection `[start, end)` stops
+/// replacing: a selection that ends in the separators after a word, right
+/// before the next word (a double-clicked word), keeps them, so the typed
+/// text does not glue onto the next word (`engine::words::typing_replace_end`).
+/// Only inside one paragraph; any other range is replaced whole.
+fn typing_replace_end(
+    doc: &DocumentTree,
+    start: &BridgeLogicalPos,
+    end: BridgeLogicalPos,
+    typed: &str,
+) -> BridgeLogicalPos {
+    if start.path != end.path {
+        return end;
+    }
+    let Some(para) = doc.paragraph_at_path(&bridge_to_engine_path(end.path.clone())) else {
+        return end;
+    };
+    let kept = engine::words::typing_replace_end(
+        &para.text,
+        start.offset as usize,
+        end.offset as usize,
+        typed,
+    );
+    BridgeLogicalPos {
+        path: end.path,
+        offset: kept as u32,
+    }
 }
 
 /// Issue #77 — owned key for a `FieldStory` (body / header rid / footer
@@ -9568,6 +9522,12 @@ impl Engine {
             Command::GetImageRects => self.do_get_image_rects(),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
             Command::SelectParagraphAt { at } => self.do_select_paragraph_at(at),
+            Command::SelectUnitsInPage {
+                page,
+                from,
+                to,
+                unit,
+            } => self.do_select_units_in_page(page, from, to, unit),
             Command::SelectCellAt { at } => self.do_select_cell_at(at),
             Command::DeleteAtCaret { forward, by_word } => {
                 self.do_delete_at_caret(forward, by_word)
@@ -14116,6 +14076,29 @@ impl Engine {
     /// pointer events from N independent `<canvas>` elements without
     /// any TS-side offset math.
     fn do_hit_test_in_page(&mut self, page_idx: u32, at: BridgePoint) -> Event {
+        let at = match self.page_point_to_document(page_idx, at) {
+            Ok(at) => at,
+            Err(e) => return *e,
+        };
+        match self.document_geometry() {
+            Ok(geom) => Event::HitResult {
+                pos: hit_test_geom(&geom, at.x, at.y),
+            },
+            Err(e) => *e,
+        }
+    }
+
+    /// A point in page `page_idx`'s LOCAL device pixels → document-absolute
+    /// device pixels: the page's accumulated top offset is added (growing
+    /// the lazy band to the page first). The ONE conversion every
+    /// page-local pointer command (`HitTestInPage` and through it
+    /// `PlaceCaretAtPoint` / `ExtendSelectionToPoint`, issue #598's
+    /// `SelectUnitsInPage`) goes through.
+    fn page_point_to_document(
+        &mut self,
+        page_idx: u32,
+        at: BridgePoint,
+    ) -> Result<BridgePoint, Box<Event>> {
         let scale = self.scale();
         let gap = render::scene::PAGE_GAP_PT * scale;
         /* Issue #34/#51 — this used to request a FULL document layout
@@ -14140,12 +14123,9 @@ impl Engine {
         synchronously, estimating the missing pages from the sections'
         real page size and looping until the page is laid (no A4
         guess, no first-miss clamp). */
-        let grew = match self.lazy_nav_reach_page(page_idx) {
-            Ok(g) => g,
-            Err(e) => return *e,
-        };
-        if grew && let Err(e) = self.maybe_repaint_result() {
-            return *e;
+        let grew = self.lazy_nav_reach_page(page_idx)?;
+        if grew {
+            self.maybe_repaint_result()?;
         }
         let page_top = {
             let snap_cell = self.layout_snapshot.borrow();
@@ -14162,13 +14142,10 @@ impl Engine {
                 top
             })
         };
-        let global_y = at.y + page_top;
-        match self.document_geometry() {
-            Ok(geom) => Event::HitResult {
-                pos: hit_test_geom(&geom, at.x, global_y),
-            },
-            Err(e) => *e,
-        }
+        Ok(BridgePoint {
+            x: at.x,
+            y: at.y + page_top,
+        })
     }
 
     /// Issue #53 — where an interactive `InsertText { at: None }`
@@ -14315,72 +14292,130 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::SelectWordAt` — hit-test, then select the whole word
-    /// (double-click).
+    /// `Command::SelectWordAt` — select the word under a document point
+    /// (double-click). Issue #598: a word with its trailing spaces, see
+    /// [`Self::unit_range_at`].
     fn do_select_word_at(&mut self, at: BridgePoint) -> Event {
         self.lazy_layout_bump_for_y(at.y);
         let geom = match self.document_geometry() {
             Ok(g) => g,
             Err(e) => return *e,
         };
-        /* Issue #553 — the word comes from the LOGICAL character the
-        pointer is on (or the line's logical last word past its end),
-        never from a visual slot: see `word_target_geom`. */
-        let (path, target) = word_target_geom(&geom, at.x, at.y);
-        let engine_path = bridge_to_engine_path(path.clone());
-        let unresolved = match target {
-            WordTarget::Char(at) | WordTarget::LineEnd { end: at, .. } => (at, at),
-        };
-        let (lo, hi) = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path).map_or(unresolved, |p| {
-                /* Issue #77 — a word that reaches into a field takes
-                the whole field (a double-click on "12" in "Page 12
-                of 34" selects the PAGE field). */
-                let (lo, hi) = p.word_bounds(word_probe_offset(&p.text, target));
-                p.expand_range_over_fields(lo, hi)
-            })
-        });
-        self.pending_format = None;
-        self.selection = Some(SelectionState {
-            anchor: BridgeLogicalPos {
-                path: path.clone(),
-                offset: lo,
-            },
-            caret: BridgeLogicalPos { path, offset: hi },
-            ideal_x: None,
-            kind: SelectionKind::Linear,
-        });
-        self.selection_changed()
+        let (lo, hi) = self.unit_range_at(&geom, at, SelectionUnit::Word);
+        self.select_unit_range(lo, hi)
     }
 
-    /// `Command::SelectParagraphAt` — hit-test then select the whole
-    /// paragraph (triple-click).
+    /// `Command::SelectParagraphAt` — select the whole paragraph under a
+    /// document point (triple-click).
     fn do_select_paragraph_at(&mut self, at: BridgePoint) -> Event {
         self.lazy_layout_bump_for_y(at.y);
         let geom = match self.document_geometry() {
             Ok(g) => g,
             Err(e) => return *e,
         };
-        let hit = hit_test_geom(&geom, at.x, at.y);
-        let engine_path = bridge_to_engine_path(hit.path.clone());
-        let len = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path)
-                .map_or(0, |p| p.text.len() as u32)
-        });
-        self.pending_format = None;
-        self.selection = Some(SelectionState {
-            anchor: BridgeLogicalPos {
-                path: hit.path.clone(),
-                offset: 0,
+        let (lo, hi) = self.unit_range_at(&geom, at, SelectionUnit::Paragraph);
+        self.select_unit_range(lo, hi)
+    }
+
+    /// Epic #555 row 22, issue #598 — `Command::SelectUnitsInPage`: the
+    /// double / triple press (`from == to`) and the drag after it, which
+    /// grows by WHOLE units (clean-room cursor memo §6). Both points are
+    /// page-local; both units are resolved through
+    /// [`Self::unit_range_at`], the one resolution `SelectWordAt` /
+    /// `SelectParagraphAt` use. Pointer at or after the first unit: anchor
+    /// at its start, caret at the far end of the unit under `to` (never
+    /// short of the first unit's end). Pointer before it: anchor at its
+    /// END, caret at the start of the unit under `to` — the first unit
+    /// stays selected whichever way the drag goes.
+    fn do_select_units_in_page(
+        &mut self,
+        page_idx: u32,
+        from: BridgePoint,
+        to: BridgePoint,
+        unit: SelectionUnit,
+    ) -> Event {
+        let from = match self.page_point_to_document(page_idx, from) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
+        let to = match self.page_point_to_document(page_idx, to) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
+        let geom = match self.document_geometry() {
+            Ok(g) => g,
+            Err(e) => return *e,
+        };
+        let (first_lo, first_hi) = self.unit_range_at(&geom, from, unit);
+        let (lo, hi) = self.unit_range_at(&geom, to, unit);
+        let before_first = lo != first_lo && ordered(lo.clone(), first_lo.clone()).0 == lo;
+        if before_first {
+            self.select_unit_range(first_hi, lo)
+        } else {
+            let far = ordered(first_hi, hi).1;
+            self.select_unit_range(first_lo, far)
+        }
+    }
+
+    /// Issue #598 — the ONE resolution of "the unit under this document
+    /// point" (`SelectWordAt`, `SelectParagraphAt`, `SelectUnitsInPage`),
+    /// as `(start, end)` positions in the selection's document.
+    ///
+    /// A word is chosen from the LOGICAL character under the pointer, or
+    /// the line's logical last word past its end (issue #553,
+    /// [`word_target_geom`] — never a visual slot), and is
+    /// `Paragraph::word_bounds`: the `engine::words` unit with the
+    /// separators after it. A word that reaches into a field takes the
+    /// whole field (issue #77: a double-click on "12" in "Page 12 of 34"
+    /// selects the PAGE field). A paragraph is the hit paragraph, whole.
+    fn unit_range_at(
+        &self,
+        geom: &[LineGeom],
+        at: BridgePoint,
+        unit: SelectionUnit,
+    ) -> (BridgeLogicalPos, BridgeLogicalPos) {
+        let (path, (lo, hi)) = match unit {
+            SelectionUnit::Word => {
+                let (path, target) = word_target_geom(geom, at.x, at.y);
+                let engine_path = bridge_to_engine_path(path.clone());
+                let unresolved = match target {
+                    WordTarget::Char(at) | WordTarget::LineEnd { end: at, .. } => (at, at),
+                };
+                let range = self.with_selection_doc(|d| {
+                    d.paragraph_at_path(&engine_path).map_or(unresolved, |p| {
+                        let (lo, hi) = p.word_bounds(word_probe_offset(&p.text, target));
+                        p.expand_range_over_fields(lo, hi)
+                    })
+                });
+                (path, range)
+            }
+            SelectionUnit::Paragraph => {
+                let path = hit_test_geom(geom, at.x, at.y).path;
+                let engine_path = bridge_to_engine_path(path.clone());
+                let len = self.with_selection_doc(|d| {
+                    d.paragraph_at_path(&engine_path)
+                        .map_or(0, |p| p.text.len() as u32)
+                });
+                (path, (0, len))
+            }
+        };
+        (
+            BridgeLogicalPos {
+                path: path.clone(),
+                offset: lo,
             },
-            caret: BridgeLogicalPos {
-                path: hit.path,
-                offset: len,
-            },
-            ideal_x: None,
-            kind: SelectionKind::Linear,
-        });
-        self.selection_changed()
+            BridgeLogicalPos { path, offset: hi },
+        )
+    }
+
+    /// Select from `anchor` to `caret` for a unit gesture — the live
+    /// selection the `SetSelection` way (clamped into the selection's
+    /// document, widened over fields, sticky style and caret affinity
+    /// dropped, the kind derived — a drag into another cell is a
+    /// `TABLE_CELLS` selection).
+    fn select_unit_range(&mut self, anchor: BridgeLogicalPos, caret: BridgeLogicalPos) -> Event {
+        let (start, end) = ordered(anchor, caret.clone());
+        self.do_set_selection(BridgeLogicalRange { start, end }, caret)
     }
 
     /// `Command::SelectCellAt` — hit-test, then select every byte of
@@ -15845,6 +15880,7 @@ impl Engine {
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
         };
+        let end = typing_replace_end(&temp, &start, end, &text);
         let replaced = replaced_text_style(&temp, &start, &end);
         let base = if start == end {
             temp
@@ -17480,6 +17516,7 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
+        let end = typing_replace_end(self.undo.current(), &start, end, &text);
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();

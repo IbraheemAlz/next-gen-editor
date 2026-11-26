@@ -539,6 +539,8 @@ command_meta! {
     // Issue #472 - font setup, classified like LoadFont (replay needs it;
     // the shell also re-sends it after every boot / recovery).
     SetFontPriority { .. } => M::VIEW ; (priorities: T::Exempt("font registry ids, looked up and never stored")),
+    // Epic #555 row 22 - the double / triple press and the drag after it.
+    SelectUnitsInPage { .. } => M::SELECT.no_reveal() ; (),
 }
 
 impl CommandKind {
@@ -780,7 +782,7 @@ mod tests {
     /// match has no wildcard, so `CommandKind::ALL` is the full variant
     /// list; update this when `Command` gains or loses a variant (and
     /// classify the new variant above).
-    const EXPECTED_VARIANT_COUNT: usize = 108;
+    const EXPECTED_VARIANT_COUNT: usize = 109;
 
     #[test]
     fn command_meta_is_exhaustive() {
@@ -827,6 +829,7 @@ mod tests {
             K::ExtendSelectionToPoint,
             K::SelectWordAt,
             K::SelectParagraphAt,
+            K::SelectUnitsInPage,
             K::SelectCellAt,
             K::ExitHeaderFooter,
             K::SelectAll,

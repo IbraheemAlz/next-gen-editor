@@ -7,7 +7,7 @@
 //!   and Left / Right step one cluster per press, ligatures included
 //!   (`grapheme_slots`).
 //! * Row 20 (memo §5) — Ctrl+Left / Ctrl+Right stop at three classes:
-//!   text, punctuation, separators (`word_units`).
+//!   text, punctuation, separators (`engine::words`, issue #598).
 //! * Row 37 (memo §10) — an empty IME commit leaves the document and the
 //!   selection as they were.
 
