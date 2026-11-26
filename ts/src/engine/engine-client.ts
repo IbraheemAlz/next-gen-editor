@@ -383,6 +383,12 @@ export class EngineClient {
     private nextId = 1;
     private pending = new Map<number, Resolver>();
     private subscribers = new Set<(e: Event) => void>();
+    /** Issue #506 - observers of (command, reply) pairs, run before the
+     *  reply fans out to `subscribers` (see `onCommandReply`). */
+    private replyObservers = new Set<(cmd: Command, evt: Event) => void>();
+    /** Issue #506 - the command each in-flight `dispatch` id carries, so
+     *  `handle` can hand the pair to `replyObservers`. */
+    private inflightCommands = new Map<number, Command>();
     private pendingWrites = 0;
     /** Issue #260 — request ids of in-flight write commands (`isWrite`). */
     private writeIds = new Set<number>();
@@ -1360,6 +1366,7 @@ export class EngineClient {
 
     private abandonWrites(): void {
         this.writeIds.clear();
+        this.inflightCommands.clear();
         this.writeEpochCounter += 1;
     }
 
@@ -1440,6 +1447,23 @@ export class EngineClient {
     }
 
     /**
+     * Issue #506 - observe every answered `dispatch` as its (command, reply)
+     * pair, whoever dispatched it (the shell, an `@nge/ui` control through
+     * `@nge/core`, a dev hook). Observers run synchronously in the same
+     * task as the reply, BEFORE it fans out to `subscribe()` listeners, so
+     * state an observer derives from the pair (the object selection an
+     * `INSERT_IMAGE` leaves behind) lands in the same flush as the caret
+     * the reply moves - no frame shows one without the other. Returns the
+     * unsubscribe.
+     */
+    onCommandReply(fn: (cmd: Command, evt: Event) => void): () => void {
+        this.replyObservers.add(fn);
+        return () => {
+            this.replyObservers.delete(fn);
+        };
+    }
+
+    /**
      * Test hook (ts/e2e/crash-recovery.spec.ts): simulate a worker crash by
      * terminating the worker and running the trap-recovery path.
      */
@@ -1463,6 +1487,7 @@ export class EngineClient {
                 const id = this.nextId++;
                 this.pending.set(id, resolve);
                 if (write) this.writeIds.add(id);
+                if (payload.cmd !== undefined) this.inflightCommands.set(id, payload.cmd);
                 this.worker.postMessage({ id, ...payload }, transfer);
             },
         );
@@ -1481,6 +1506,12 @@ export class EngineClient {
         if (cb) {
             this.pending.delete(msg.id);
             cb(msg);
+        }
+        /* Issue #506 - (command, reply) observers first, then the fan-out. */
+        const cmd = msg.id === undefined ? undefined : this.inflightCommands.get(msg.id);
+        if (cmd !== undefined) {
+            this.inflightCommands.delete(msg.id);
+            if (msg.evt) this.replyObservers.forEach((o) => o(cmd, msg.evt));
         }
         if (msg.evt) this.subscribers.forEach((s) => s(msg.evt));
         if (msg.trap) {

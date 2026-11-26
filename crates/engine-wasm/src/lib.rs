@@ -31504,6 +31504,12 @@ mod a11y_direction_tests;
 #[cfg(test)]
 mod image_rtl_tests;
 
+/// Issue #506 - the engine facts the shell's picture object selection
+/// rests on (insert address, copy / cut / paste of the sentinel, a press
+/// on a text-box picture entering its box).
+#[cfg(test)]
+mod image_object_selection_tests;
+
 #[cfg(test)]
 mod para_style_edit_tests;
 

@@ -18,8 +18,17 @@
  *     starts in the picture's own line. Shift extends from there.
  *   - Escape, Enter, Tab, Home / End and every typing key leave the object
  *     selection: the caret goes just BEFORE the picture's anchor (in the
- *     story that owns it) and the key then does its normal job.
- *   - Chords the picture does not own (Ctrl+C, Ctrl+Z, F-keys, Alt+…) just
+ *     story that owns it) and the key then does its normal job. Typing
+ *     therefore inserts before the picture, it does not replace it (memo
+ *     §9 "leaving object selection (Esc, Delete, typing) puts the caret
+ *     just before the object's anchor").
+ *   - Issue #506 — Ctrl/Cmd+C and Ctrl/Cmd+X keep the object selection
+ *     and let the native copy / cut event run; its handler puts the
+ *     picture's sentinel in the engine's selection first
+ *     (`pictureSelection`), so the clipboard gets the picture, never the
+ *     stale text selection (a cut drops the object selection once the
+ *     picture is gone).
+ *   - Chords the picture does not own (Ctrl+Z, Ctrl+B, F-keys, Alt+…) just
  *     drop the selection, as before.
  *
  * Pure planning lives here (`planImageKey`, unit-tested without a DOM); the
@@ -79,6 +88,9 @@ export type ImageKeyPlan =
     | { kind: 'keep' }
     /** Remove the picture. */
     | { kind: 'delete' }
+    /** Issue #506 — keep the object selection; the native `copy` / `cut`
+     *  event that follows acts on the picture. */
+    | { kind: 'clipboard' }
     /** Put the caret at `edge` of the picture, optionally apply a motion,
      *  and either consume the key (`consume`) or let it go on. */
     | {
@@ -151,6 +163,12 @@ export function planImageKey(k: KeyInfo, img: Pick<KeyedImage, 'rtl'>): ImageKey
        first (the native `paste` event follows this keydown). */
     if (chord && k.code === 'KeyV') return { kind: 'caret', edge: 'before', consume: false };
 
+    /* Issue #506 — copy / cut the picture itself (Ctrl+Shift+C / X are
+       other commands in Word: copy formatting, ...). */
+    if (chord && !k.shiftKey && (k.code === 'KeyC' || k.code === 'KeyX')) {
+        return { kind: 'clipboard' };
+    }
+
     /* Other Ctrl/Cmd chords (undo, bold, …) and function keys act on the
        document, not on the object. */
     if (chord || alt || /^F\d{1,2}$/.test(k.key)) return { kind: 'keep' };
@@ -182,6 +200,20 @@ export function storyMatches(img: Pick<KeyedImage, 'story' | 'storyRid'>, active
 /** What the caller does with the key event. */
 export type ImageKeyOutcome = 'consumed' | 'continue';
 
+/** `runImageKey`'s answer. */
+export interface ImageKeyResult {
+    /** `'consumed'`: `preventDefault` and stop; `'continue'`: the key goes
+     *  on. */
+    outcome: ImageKeyOutcome;
+    /** Issue #506 — the object selection stays (copy / cut); otherwise the
+     *  caller leaves it. */
+    keepObject: boolean;
+    /** Issue #506 — settles once the engine answered the last command the
+     *  key posted (the caret it places): the caller keeps the caret overlay
+     *  hidden until then. Absent when the key posted nothing. */
+    settled?: Promise<unknown>;
+}
+
 /** The slice of `EngineClient` the runner needs. */
 export interface ImageKeyClient {
     dispatch(cmd: Command): Promise<Event>;
@@ -189,75 +221,103 @@ export interface ImageKeyClient {
 
 /** Carry out `planImageKey`'s plan. Synchronous up to the commands it
  *  posts (they enter the worker queue in key order, ahead of any later
- *  `beforeinput`); resolves `'consumed'` when the caller should
- *  `preventDefault` and stop, `'continue'` when the key goes on. The
- *  caller clears the object selection either way. */
+ *  `beforeinput` or `copy` / `cut` event); `outcome` says whether the
+ *  caller should `preventDefault` and stop or let the key go on, and
+ *  `keepObject` whether the object selection survives the key. */
 export function runImageKey(
     plan: ImageKeyPlan,
     img: KeyedImage,
     client: ImageKeyClient,
     active: ActiveStory | undefined,
     onError: (what: string, e: unknown) => void = () => {},
-): ImageKeyOutcome {
+): ImageKeyResult {
     const fail = (what: string) => (e: unknown) => onError(what, e);
+    const leave = (outcome: ImageKeyOutcome, settled?: Promise<unknown>): ImageKeyResult =>
+        settled ? { outcome, keepObject: false, settled } : { outcome, keepObject: false };
     switch (plan.kind) {
         case 'ignore':
+            return { outcome: 'continue', keepObject: true };
         case 'keep':
-            return 'continue';
+            return leave('continue');
+        case 'clipboard':
+            /* The copy / cut handler selects the sentinel (it also runs for
+               a copy that did not come from the keyboard). */
+            return { outcome: 'continue', keepObject: true };
         case 'delete': {
             /* A text-box picture selected from outside its box cannot be
                addressed (positions are story-rooted). The key is swallowed
                rather than continued: a continued Delete / Backspace would
                delete a character at the engine's stale caret. */
-            if (!storyMatches(img, active)) return 'consumed';
+            if (!storyMatches(img, active)) return leave('consumed');
             if (img.story.length === 0) {
                 /* ONE command: one undo entry, caret left at the anchor. */
-                client
-                    .dispatch({
-                        type: 'DELETE_RANGE',
-                        range: {
-                            start: { path: img.path, offset: img.at },
-                            end: { path: img.path, offset: img.at + SENTINEL_LEN },
-                        },
-                    })
-                    .catch(fail('delete image'));
-                return 'consumed';
+                const settled = client.dispatch({
+                    type: 'DELETE_RANGE',
+                    range: {
+                        start: { path: img.path, offset: img.at },
+                        end: { path: img.path, offset: img.at + SENTINEL_LEN },
+                    },
+                });
+                settled.catch(fail('delete image'));
+                return leave('consumed', settled);
             }
             /* `DeleteRange` is body-only: select the sentinel in the story
                and delete the selection, but only once the engine confirms it
-               selected exactly the picture (a stale address must never turn
-               into a delete at the old caret). */
-            void (async () => {
-                const sel = await client.dispatch(selectPicture(img));
-                if (
-                    sel.type === 'SELECTION_CHANGED' &&
-                    sel.range.start.offset === img.at &&
-                    sel.range.end.offset === img.at + SENTINEL_LEN
-                ) {
+               selected exactly the picture IN ITS BOX (a stale address, or a
+               press that did not enter the box, must never turn into a
+               delete at the old caret). */
+            const settled = (async () => {
+                const sel = await client.dispatch(pictureSelection(img));
+                if (selectsPicture(sel, img)) {
                     await client.dispatch({ type: 'DELETE_AT_CARET', forward: false, by_word: false });
                 }
-            })().catch(fail('delete story image'));
-            return 'consumed';
+            })();
+            settled.catch(fail('delete story image'));
+            return leave('consumed', settled);
         }
         case 'caret': {
-            if (!storyMatches(img, active)) return 'continue';
-            client.dispatch(caretAtEdge(img, plan.edge)).catch(fail('place caret at image'));
+            if (!storyMatches(img, active)) return leave('continue');
+            let settled = client.dispatch(caretAtEdge(img, plan.edge));
+            settled.catch(fail('place caret at image'));
             if (plan.motion) {
-                client
-                    .dispatch({
-                        type: 'MOVE_CARET',
-                        direction: plan.motion.direction,
-                        extend: plan.motion.extend,
-                    })
-                    .catch(fail('move caret from image'));
+                settled = client.dispatch({
+                    type: 'MOVE_CARET',
+                    direction: plan.motion.direction,
+                    extend: plan.motion.extend,
+                });
+                settled.catch(fail('move caret from image'));
             }
-            return plan.consume ? 'consumed' : 'continue';
+            return leave(plan.consume ? 'consumed' : 'continue', settled);
         }
     }
 }
 
-function selectPicture(img: Pick<KeyedImage, 'path' | 'at'>): Command {
+/** The `SET_SELECTION` that selects exactly the picture's sentinel (in the
+ *  story its path is rooted in, which must be the active one). Issue #506 —
+ *  also what copy / cut of an object-selected picture put on the clipboard. */
+export function pictureSelection(img: Pick<KeyedImage, 'path' | 'at'>): Command {
     const start: LogicalPos = { path: img.path, offset: img.at };
     const end: LogicalPos = { path: img.path, offset: img.at + SENTINEL_LEN };
     return { type: 'SET_SELECTION', range: { start, end }, caret: end };
+}
+
+/** Whether the engine's reply to `pictureSelection(img)` selected exactly
+ *  that picture, in its own story — the gate before anything deletes the
+ *  selection (a stale address, or a click that did not enter the picture's
+ *  box, must never turn into a delete of whatever got selected instead). */
+export function selectsPicture(
+    evt: Event,
+    img: Pick<KeyedImage, 'at' | 'story' | 'storyRid'>,
+): boolean {
+    if (evt.type !== 'SELECTION_CHANGED') return false;
+    const story = evt.editing_story;
+    const inStory =
+        img.story.length === 0
+            ? story === undefined
+            : story?.area === 'TextBox' && story.rid === img.storyRid;
+    return (
+        inStory &&
+        evt.range.start.offset === img.at &&
+        evt.range.end.offset === img.at + SENTINEL_LEN
+    );
 }

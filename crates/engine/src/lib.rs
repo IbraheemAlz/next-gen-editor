@@ -4876,7 +4876,12 @@ impl Paragraph {
                 resolved_list_indent: self.resolved_list_indent,
                 dirty: true,
                 source_xml: None,
-                inline_objects: Vec::new(),
+                /* Issue #506 — the right half's objects (computed above)
+                used to be dropped here: Enter, a paste or a cross-paragraph
+                delete left of a picture lost it (an orphan U+FFFC stayed in
+                the text), and a clipboard slice starting at a picture
+                carried no `<img>`. */
+                inline_objects: objects_right,
                 hyperlinks: self.hyperlinks.clone(),
                 revisions: self.revisions.clone(),
                 fields: fields_right,
@@ -14549,6 +14554,55 @@ mod tests {
         let (left, right) = p.split_at(1);
         assert!(left.section_end.is_none(), "left half gets a fresh mark");
         assert!(right.section_end.is_some(), "original mark ends the right");
+    }
+
+    /// Issue #506 — an inline object travels with the half that holds its
+    /// sentinel, the right half's re-based to it. The right half used to
+    /// drop every object: Enter left of a picture lost it (an orphan
+    /// U+FFFC stayed in the text) and a clipboard slice starting at a
+    /// picture carried no picture.
+    #[test]
+    fn split_at_keeps_each_inline_object_with_its_sentinel() {
+        let img = |rel: &str| ImageBlob {
+            content_type: "image/png".into(),
+            data: rel.as_bytes().to_vec(),
+        };
+        let at = |off: u32| LogicalPos::new(BlockPath::top(0), off);
+        let d = DocumentTree::from_text("abcd")
+            .insert_inline_image_at(at(3), img("r"), 9525, 9525)
+            .insert_inline_image_at(at(1), img("l"), 9525, 9525);
+        let p = d
+            .paragraph_at_path(&BlockPath::top(0))
+            .expect("paragraph")
+            .clone();
+        assert_eq!(p.text, "a\u{FFFC}bc\u{FFFC}d");
+        let objects = |q: &Paragraph| q.inline_objects.iter().map(|o| o.at).collect::<Vec<_>>();
+        assert_eq!(objects(&p), vec![1, 6]);
+        for cut in [0_u32, 1, 4, 5, 6, 9, 10] {
+            let (left, right) = p.split_at(cut);
+            for (half, side) in [(&left, "left"), (&right, "right")] {
+                let sentinels: Vec<u32> = half
+                    .text
+                    .match_indices('\u{FFFC}')
+                    .map(|(i, _)| i as u32)
+                    .collect();
+                assert_eq!(
+                    objects(half),
+                    sentinels,
+                    "cut {cut}: {side} half objects sit on its sentinels"
+                );
+            }
+        }
+        /* Enter left of the picture: the picture moves to the new paragraph. */
+        let entered = d.split_paragraph(at(0));
+        let second = entered
+            .paragraph_at_path(&BlockPath::top(1))
+            .expect("second");
+        assert_eq!(
+            objects(second),
+            vec![1, 6],
+            "both pictures survive the Enter"
+        );
     }
 
     #[test]

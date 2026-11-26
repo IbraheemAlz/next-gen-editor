@@ -2,6 +2,20 @@ import { test, expect, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { boot, burst, documentText, settle } from './helpers/editor';
+import {
+    GREEN,
+    RED,
+    caretBox,
+    clickRect,
+    clientPoint,
+    dispatch,
+    expectPainted,
+    images,
+    insertPng,
+    pixels,
+    waitForImages,
+    type Img,
+} from './helpers/images';
 
 /* Issues #506 (items 1 and 3) and #554 — a picture inserted through the
  * toolbar's file input, the way a user does it:
@@ -22,28 +36,11 @@ import { boot, burst, documentText, settle } from './helpers/editor';
  * composites the interactive canvas (CLAUDE.md), so a screenshot would be
  * blank. The click and key presses go through the REAL shell: `pointer.ts`
  * -> `selectImageByPoint` -> `ImageHandlesOverlay`, and the hidden
- * textarea's `onKeyDown`. */
+ * textarea's `onKeyDown`. The flows around the selection (selected after
+ * insert, copy / cut, the caret flash, entering a text box) are
+ * `image-selection-flows.spec.ts`. */
 
 test.use({ viewport: { width: 1280, height: 1400 } });
-
-/** The decoded-bitmap colours the in-page PNGs are filled with. */
-const RED = '#d02020';
-const GREEN = '#20b040';
-
-interface Img {
-    at: number;
-    rect: { x: number; y: number; w: number; h: number };
-    media_key: string;
-}
-
-const dispatch = (page: Page, cmd: unknown): Promise<any> =>
-    page.evaluate((c) => (window as any).__dispatch(c), cmd);
-
-async function images(page: Page): Promise<Img[]> {
-    const evt = await dispatch(page, { type: 'GET_IMAGE_RECTS' });
-    if (evt.type !== 'IMAGE_RECTS') throw new Error(`GET_IMAGE_RECTS -> ${evt.type}`);
-    return evt.images as Img[];
-}
 
 /** `above`, a 2 x 3 table, and an empty paragraph with the caret in it. */
 async function seed(page: Page): Promise<void> {
@@ -68,80 +65,6 @@ async function seed(page: Page): Promise<void> {
     });
 }
 
-/** Feed a PNG filled with `color` through the toolbar's real file input: a
- *  `File` built from a canvas `toBlob`, put on the input with a
- *  `DataTransfer`, then the `change` event `InsertImageButton` listens for. */
-async function insertPng(page: Page, color: string): Promise<void> {
-    await page.evaluate(async (fill) => {
-        const canvas = document.createElement('canvas');
-        canvas.width = 160;
-        canvas.height = 100;
-        const g = canvas.getContext('2d')!;
-        g.fillStyle = fill;
-        g.fillRect(0, 0, 160, 100);
-        const blob: Blob = await new Promise((resolve, reject) =>
-            canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob'))), 'image/png'),
-        );
-        const input = document.querySelector<HTMLInputElement>(
-            'input[type=file][accept*="image/png"]',
-        );
-        if (!input) throw new Error('Insert image file input missing');
-        const dt = new DataTransfer();
-        dt.items.add(new File([blob], 'picture.png', { type: 'image/png' }));
-        input.files = dt.files;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-    }, color);
-}
-
-/** Wait until exactly `n` pictures are listed and return them. */
-async function waitForImages(page: Page, n: number): Promise<Img[]> {
-    await expect.poll(async () => (await images(page)).length, { timeout: 15_000 }).toBe(n);
-    return images(page);
-}
-
-/** RGBA at page-0-local device px (the worker reads its surface back). */
-async function pixels(
-    page: Page,
-    points: Array<{ x: number; y: number }>,
-): Promise<Array<[number, number, number, number] | null>> {
-    return page.evaluate(
-        (p) => (window as any).__engineClient.probePagePixels(0, p),
-        points,
-    );
-}
-
-const near = (px: [number, number, number, number] | null, hex: string): boolean => {
-    if (!px) return false;
-    const want = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
-    return px[3] === 255 && want.every((c, i) => Math.abs((px[i] as number) - c) <= 12);
-};
-
-/** Sample points well inside the picture. */
-const inside = (r: Img['rect']): Array<{ x: number; y: number }> => [
-    { x: r.x + r.w * 0.2, y: r.y + r.h * 0.2 },
-    { x: r.x + r.w * 0.5, y: r.y + r.h * 0.5 },
-    { x: r.x + r.w * 0.8, y: r.y + r.h * 0.8 },
-];
-
-/** The picture shows `hex` everywhere we sample (and so is not the flat grey
- *  placeholder). */
-async function expectPainted(page: Page, r: Img['rect'], hex: string): Promise<void> {
-    await expect
-        .poll(async () => (await pixels(page, inside(r))).every((p) => near(p, hex)), {
-            message: `the picture's pixels are ${hex}`,
-            timeout: 15_000,
-        })
-        .toBe(true);
-}
-
-/** Client coordinates of a page-0 device-px point (the real mouse's space). */
-async function clientPoint(page: Page, x: number, y: number): Promise<{ x: number; y: number }> {
-    const box = await page.locator('.editor-page[data-page-index="0"] canvas').boundingBox();
-    if (!box) throw new Error('page 0 canvas has no box');
-    const dpr = await page.evaluate(() => window.devicePixelRatio || 1);
-    return { x: box.x + x / dpr, y: box.y + y / dpr };
-}
-
 /** Park the engine's caret at the very top of the document, far from the
  *  picture. Object selection is shell-side: the engine's caret stays where
  *  it was, and a key that fell through to it (the pre-#554 behaviour) acted
@@ -155,23 +78,8 @@ async function parkCaretAtTop(page: Page): Promise<void> {
 /** A real click on the picture's centre (caret parked at the top first). */
 async function clickPicture(page: Page, r: Img['rect']): Promise<void> {
     await parkCaretAtTop(page);
-    const p = await clientPoint(page, r.x + r.w / 2, r.y + r.h / 2);
-    await page.mouse.click(p.x, p.y);
+    await clickRect(page, r);
     await expect(page.locator('.image-handles')).toHaveCount(1);
-}
-
-/** The caret overlay's box in page-0 CSS px (`null` when it is not drawn). */
-async function caretBox(page: Page): Promise<{ x: number; y: number; h: number } | null> {
-    await settle(page);
-    return page.evaluate(() => {
-        const el = document.querySelector<HTMLElement>('.editor-page[data-page-index="0"] .caret');
-        if (!el) return null;
-        return {
-            x: parseFloat(el.style.left),
-            y: parseFloat(el.style.top),
-            h: parseFloat(el.style.height),
-        };
-    });
 }
 
 /** The engine's last reported caret address. */
@@ -355,15 +263,16 @@ test.describe('an inserted picture (#506, #554)', () => {
 
 /* A picture inside a text box (#206) is addressed by a story-rooted path, and
  * `DeleteRange` is body-only, so Delete on it goes through the story: select
- * the sentinel there, then delete the selection - but only while the engine is
- * EDITING that box. Selected from outside its box the key is swallowed (it
- * must never fall through to a delete at the stale body caret). */
-test.describe('a picture inside a text box (#554)', () => {
+ * the sentinel there, then delete the selection - only while the engine is
+ * EDITING that box (#554). Issue #506: a click on the picture from OUTSIDE its
+ * box enters the box and selects the picture in one go, so Delete works from
+ * there too (the race and nested cases are in `image-selection-flows.spec.ts`). */
+test.describe('a picture inside a text box (#554, #506)', () => {
     const FIXTURE = fileURLToPath(
         new URL('../../crates/format-docx/tests/fixtures/text_box_pictures.docx', import.meta.url),
     );
 
-    test('Delete removes it while its box is being edited; from outside the box it is a no-op', async ({
+    test('Delete removes it, whether its box was being edited or entered by the click itself', async ({
         page,
     }) => {
         test.setTimeout(90_000);
@@ -375,13 +284,19 @@ test.describe('a picture inside a text box (#554)', () => {
             const loaded = await d({ type: 'LOAD_DOCX', bytes: new Uint8Array(arr) });
             if (loaded.type === 'ERROR') throw new Error(loaded.message);
             const sel = await d({ type: 'SET_SELECTION', range: { start: top, end: top }, caret: top });
+            /* The editing story of every SELECTION_CHANGED (no SELECT_ALL
+               probe, which would move the selection). */
+            const w = window as any;
+            w.__editing = null;
+            w.__engineClient.subscribe((e: any) => {
+                if (e.type === 'SELECTION_CHANGED') w.__editing = e.editing_story?.rid ?? null;
+            });
             return (sel.caret.x as number) / 72;
         }, bytes);
         const inch = 72 * scale;
-        type BoxImg = Img & { story_rid?: string };
-        const list = async (): Promise<Record<string, BoxImg>> => {
-            const out: Record<string, BoxImg> = {};
-            for (const im of (await images(page)) as BoxImg[]) out[im.story_rid ?? ''] = im;
+        const list = async (): Promise<Record<string, Img>> => {
+            const out: Record<string, Img> = {};
+            for (const im of await images(page)) out[im.story_rid ?? ''] = im;
             return out;
         };
         const rids = async (): Promise<string[]> => Object.keys(await list()).sort();
@@ -389,38 +304,37 @@ test.describe('a picture inside a text box (#554)', () => {
 
         const canvas = page.locator('.editor-page[data-page-index="0"] canvas').first();
         await canvas.scrollIntoViewIfNeeded();
-        const dpr = await page.evaluate(() => window.devicePixelRatio || 1);
-        const viewportAt = async (x: number, y: number) => {
-            const box = await canvas.boundingBox();
-            return { x: box!.x + x / dpr, y: box!.y + y / dpr };
-        };
         const handles = page.locator('.image-handles');
         const select = async (rid: string): Promise<void> => {
             await expect(async () => {
                 const im = (await list())[rid]!;
-                const c = await viewportAt(im.rect.x + im.rect.w / 2, im.rect.y + im.rect.h / 2);
-                await page.mouse.click(c.x, c.y);
+                await clickRect(page, im.rect);
                 await expect(handles).toBeVisible({ timeout: 1_000 });
             }).toPass({ timeout: 15_000 });
         };
-        const editing = async (): Promise<string | null> => {
-            const evt = await dispatch(page, { type: 'SELECT_ALL' });
-            return (evt.editing_story?.rid as string | undefined) ?? null;
-        };
+        const editing = (): Promise<string | null> =>
+            settle(page).then(() => page.evaluate(() => (window as any).__editing as string | null));
 
-        /* Outside the box (the engine is in the body): Delete does nothing -
-           and above all does not delete a body character at the old caret. */
+        /* From the body: ONE click on the outer picture enters its box and
+           selects it; Delete removes it, and no body character at the old
+           caret. */
         const before = await documentText(page);
         await dispatch(page, { type: 'MOVE_CARET', direction: 'DocHome', extend: false });
+        expect(await editing()).toBeNull();
         await select('1@0');
+        expect(await editing(), 'the click entered the picture\'s box').toBe('1@0');
         await page.keyboard.press('Delete');
-        await settle(page);
-        expect(await rids()).toEqual(['1@0', '1@0/1@0']);
+        await expect.poll(rids).toEqual(['1@0/1@0']);
+        await page.keyboard.press('Control+z');
+        await expect.poll(rids).toEqual(['1@0', '1@0/1@0']);
+        /* Back in the body, its text is what it was. */
+        await page.keyboard.press('Escape');
+        await expect.poll(editing).toBeNull();
         expect(await documentText(page)).toBe(before);
 
         /* Inside the outer box's story (a click on its text): Delete removes
            the outer picture, nothing else. */
-        const inBox = await viewportAt(1.3 * inch, 4.85 * inch);
+        const inBox = await clientPoint(page, 1.3 * inch, 4.85 * inch);
         await page.mouse.click(inBox.x, inBox.y);
         await expect.poll(editing).toBe('1@0');
         await select('1@0');
