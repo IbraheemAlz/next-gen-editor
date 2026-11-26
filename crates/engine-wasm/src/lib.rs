@@ -12029,24 +12029,30 @@ impl Engine {
                 if (incoming % 2 == 0) != want_even {
                     let filler_geom = emitted_pages
                         .last()
-                        .map(|p| (p.size, p.margins, p.header_offset, p.footer_offset))
+                        .map(|p| (p.size, p.header_offset, p.footer_offset))
                         .unwrap_or((
                             Size {
                                 width: geom.width,
                                 height: geom.height,
                             },
-                            geom.margins,
                             geom.header_offset,
                             geom.footer_offset,
                         ));
+                    /* Issue #354 — the filler is the previous section's
+                    page: its nominal margins at the filler's OWN number,
+                    through the one per-page helper (the last page's
+                    margins are mirrored for that page's parity). */
+                    let nominal = sections.get(sect_idx - 1).map_or(geom.margins, |s| {
+                        scaled_paginator_geometry(s.geometry, scale).margins
+                    });
                     emitted_pages.push(PageBox {
                         size: filler_geom.0,
-                        margins: filler_geom.1,
+                        margins: nominal.for_page(incoming, doc.settings.mirror_margins),
                         blocks: Vec::new(),
                         header: None,
                         footer: None,
-                        header_offset: filler_geom.2,
-                        footer_offset: filler_geom.3,
+                        header_offset: filler_geom.1,
+                        footer_offset: filler_geom.2,
                         footnotes: layout::NoteBand::default(),
                         endnotes: layout::NoteBand::default(),
                         hf_role: layout::HeaderRole::Default,
@@ -12185,6 +12191,9 @@ impl Engine {
                     section.title_pg,
                     doc.settings.even_and_odd_headers,
                 )
+                /* Issue #354 — even-numbered pages swap the inside /
+                outside margins under `<w:mirrorMargins/>`. */
+                .with_mirror_margins(doc.settings.mirror_margins)
                 /* Issue #278 — a header / footer note an earlier
                 section's pages already carry is not placed again. */
                 .with_placed_band_notes(emitted_pages.iter().flat_map(|p| {
@@ -19464,15 +19473,14 @@ impl Engine {
     /// `a11y_cache` would diff against the old tree. (`do_recover` resets
     /// the same set for the same reason.)
     fn install_new_document(&mut self, doc: DocumentTree) -> Result<(), Box<Event>> {
-        /* Issue #345 — a document protected for tracked changes opens
-        with review mode on (and `protection_gate` keeps it on); leaving
-        one releases the review mode it forced. */
-        let tracked = Some(engine::ProtectionEdit::TrackedChanges);
-        if doc.protection_mode() == tracked {
-            self.tracking_changes = true;
-        } else if self.protection_mode() == tracked {
-            self.tracking_changes = false;
-        }
+        /* Issue #354 — review mode is the new document's own: on when it
+        was saved with `<w:trackRevisions/>` (Word's Track Changes), off
+        otherwise — a new / plain-text / HTML document and a `.docx`
+        without the setting open with it off, whatever the previous
+        document had. Issue #345 — a document protected for tracked
+        changes opens with it on too (and `protection_gate` keeps it on). */
+        self.tracking_changes = doc.settings.track_revisions
+            || doc.protection_mode() == Some(engine::ProtectionEdit::TrackedChanges);
         self.install_undo_stack(UndoStack::new(doc, UNDO_CAP));
         self.selection = Some(SelectionState {
             anchor: bpos_top(0, 0),
@@ -19714,6 +19722,19 @@ impl Engine {
         }
     }
 
+    /// Issue #354 — the `<w:trackRevisions/>` a save writes: the review
+    /// toggle. While `trackedChanges` protection forces review mode on,
+    /// the mode is the restriction's, not the user's toggle (which
+    /// `protection_gate` locks), so the document's own setting is kept as
+    /// it was read.
+    fn saved_track_revisions(&self, doc: &DocumentTree) -> bool {
+        if doc.protection_mode() == Some(engine::ProtectionEdit::TrackedChanges) {
+            doc.settings.track_revisions
+        } else {
+            self.tracking_changes
+        }
+    }
+
     /// Sprint 3 (UI Edition) — shared body for the legacy `SaveDocx`
     /// and the new `SaveDocument { format: Docx }` commands.
     fn save_docx_bytes(&self, origin: &'static str) -> Event {
@@ -19722,7 +19743,12 @@ impl Engine {
         reader that never evaluates fields still shows current text.
         The in-memory document is untouched — F9 is the user's explicit
         update; this is the file's. */
-        let (doc, _changed) = self.restamped_document(false);
+        let (mut doc, _changed) = self.restamped_document(false);
+        /* Issue #354 — review mode is engine state (no undo step); the
+        file's Track Changes setting is stamped from it here, and the
+        writer patches `settings.xml` only when it differs from the
+        source part. */
+        doc.settings.track_revisions = self.saved_track_revisions(&doc);
         /* Issue #134 — a document opened from `.docx` saves against its
         retained source package (`write_docx`: every sibling part
         byte-identical); an engine-authored one through the minimal-package
@@ -32101,6 +32127,10 @@ mod pbdr_start_end_tests;
 /// Issue #395 — paragraph borders defined on styles, on canvas.
 #[cfg(test)]
 mod pbdr_style_cascade_tests;
+/// Issue #354 — `settings.xml` trackRevisions (review mode) and
+/// mirrorMargins (per-page margins), end to end.
+#[cfg(test)]
+mod settings_toggle_tests;
 
 /// Issue #455 — decorations on paragraphs inside table cells.
 #[cfg(test)]
