@@ -36,6 +36,16 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   paragraph. Left / Right leaving a table cell follow the TABLE's
   direction (`cell_exit_step`, `<w:bidiVisual>`), not the cell
   paragraph's.
+- **A page's margins have ONE per-page resolution (issue #354).**
+  `layout::Margins::for_page(page_number, mirror)`: under
+  `<w:mirrorMargins/>` (`DocumentSettings::mirror_margins`,
+  `Paginator::with_mirror_margins`) an even-NUMBERED page (the
+  formatted number, `pgNumType` restart included — the even / odd band
+  parity) swaps its section's left / right margins. It is applied where
+  a `PageBox` is minted (the paginator's flush, the Even/Odd-page filler)
+  and nowhere else: body, bands, note bands, columns, floats, page
+  decor, paint, PDF and hit-testing read `PageBox::margins`. Never swap
+  on a call site; flag off is geometry-identical.
 
 ## Font substitution and line pitch (issue #329)
 
