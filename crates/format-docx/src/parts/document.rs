@@ -758,12 +758,52 @@ pub(crate) fn is_block_level_marker(qname: &[u8]) -> bool {
     )
 }
 
-/// Issues #536 / #530 — the ONE placement rule for a block. A `<w:p>`
-/// (start tag or self-closing) or a `<w:tbl>` the walk meets is a block
-/// only where a block may stand: directly in a block container (`<w:body>`,
-/// a header / footer root, a note, a comment; a cell's blocks are the table
-/// walker's, `parts::table`, which does not apply this rule yet — #564) or
-/// in a block-level wrapper inside one (a `<w:sdtContent>`, a
+/// Where a block the walk met stands (issues #536 / #530 / #564): the
+/// class half of [`misplaced_block`]'s message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockPlace {
+    /// Inside an open paragraph (body or cell).
+    InParagraph,
+    /// Inside the body's `<w:sectPr>`.
+    InSectPr,
+    /// Before / after / around `<w:body>`.
+    OutsideBody,
+    /// A table walk's block that is in no `<w:tc>`: in the `<w:tbl>` or a
+    /// `<w:tr>` itself (issue #564).
+    OutsideCell,
+    /// Inside a cell's `<w:tcPr>` (issue #564).
+    InCellProperties,
+}
+
+impl BlockPlace {
+    /// The body walk's place for a block that is not at block level.
+    pub(crate) fn in_body_walk(in_paragraph: bool, in_sect_pr: bool) -> Self {
+        if in_paragraph {
+            Self::InParagraph
+        } else if in_sect_pr {
+            Self::InSectPr
+        } else {
+            Self::OutsideBody
+        }
+    }
+
+    fn phrase(self) -> &'static str {
+        match self {
+            Self::InParagraph => "inside a paragraph",
+            Self::InSectPr => "inside section properties",
+            Self::OutsideBody => "outside the document body",
+            Self::OutsideCell => "outside a table cell",
+            Self::InCellProperties => "inside cell properties",
+        }
+    }
+}
+
+/// Issues #536 / #530 / #564 — the ONE placement rule for a block. A
+/// `<w:p>` (start tag or self-closing) or a `<w:tbl>` a walk meets is a
+/// block only where a block may stand: directly in a block container
+/// (`<w:body>`, a header / footer root, a note, a comment, a table cell —
+/// the table walker, `parts::table`, asks this same rule for its cell
+/// blocks) or in a block-level wrapper inside one (a `<w:sdtContent>`, a
 /// `<w:customXml>`, the selected `mc:AlternateContent` branch). Story
 /// containers (`<w:txbxContent>`, `<w:pict>`, a run's drawing) are skipped
 /// whole before this rule is asked.
@@ -771,30 +811,20 @@ pub(crate) fn is_block_level_marker(qname: &[u8]) -> bool {
 /// Anywhere else — before `<w:body>` or around it (the EOF repair of an
 /// unclosed `<w:p>` makes it ENCLOSE the body), inside another paragraph
 /// (the same repair nests the paragraphs that follow an unclosed one),
-/// inside section properties — the walk used to take the element for a
-/// block anyway while its bytes also rode the envelope or the enclosing
-/// paragraph's verbatim capture, so a zero-edit save wrote its content
-/// twice, or wrote the inner paragraph's bytes for the outer paragraph's
-/// text. There is no faithful repair (where did the producer mean the
-/// unclosed paragraph to end?), so — like every other structural defect
-/// (`opc::well_formed`) — the part is refused with
-/// `DocxError::MalformedXml` (the typed `DocumentUnreadable` for the main
-/// part; a header / footer / note part reads as absent, a text-box story
-/// stays an opaque object). The message names an offset and the defect
-/// class only, never document bytes.
-pub(crate) fn misplaced_block(
-    block: &str,
-    at: usize,
-    in_paragraph: bool,
-    in_sect_pr: bool,
-) -> DocxError {
-    let place = if in_paragraph {
-        "inside a paragraph"
-    } else if in_sect_pr {
-        "inside section properties"
-    } else {
-        "outside the document body"
-    };
+/// inside section properties, in a table outside every cell or inside a
+/// cell's properties — the walk used to take the element for a block anyway
+/// while its bytes also rode the envelope or the enclosing paragraph's
+/// verbatim capture, so a zero-edit save wrote its content twice, or wrote
+/// the inner paragraph's bytes for the outer paragraph's text. There is no
+/// faithful repair (where did the producer mean the unclosed paragraph to
+/// end?), so — like every other structural defect (`opc::well_formed`) —
+/// the part is refused with `DocxError::MalformedXml` (the typed
+/// `DocumentUnreadable` for the main part; a header / footer / note part
+/// reads as absent, a text-box story stays an opaque object). The message
+/// names an offset (part-relative, in the byte space the walk reads — the
+/// BOM-stripped part) and the defect class only, never document bytes.
+pub(crate) fn misplaced_block(block: &str, at: usize, place: BlockPlace) -> DocxError {
+    let place = place.phrase();
     DocxError::MalformedXml(format!(
         "a {block} at byte {at} stands {place}, where no block may stand (no faithful repair)"
     ))
@@ -1725,8 +1755,7 @@ pub(crate) fn parse_document_xml_with_events(
                             return Err(misplaced_block(
                                 "table",
                                 prev_pos,
-                                p_start_byte.is_some(),
-                                in_sect_pr,
+                                BlockPlace::in_body_walk(p_start_byte.is_some(), in_sect_pr),
                             ));
                         }
                         tbl_start_byte = Some(prev_pos);
@@ -2061,8 +2090,7 @@ pub(crate) fn parse_document_xml_with_events(
                             return Err(misplaced_block(
                                 "paragraph",
                                 prev_pos,
-                                p_start_byte.is_some(),
-                                in_sect_pr,
+                                BlockPlace::in_body_walk(p_start_byte.is_some(), in_sect_pr),
                             ));
                         }
                         /* Capture the byte offset of the `<w:p` opening
@@ -2416,8 +2444,7 @@ pub(crate) fn parse_document_xml_with_events(
                     return Err(misplaced_block(
                         "paragraph",
                         prev_pos,
-                        p_start_byte.is_some(),
-                        in_sect_pr,
+                        BlockPlace::in_body_walk(p_start_byte.is_some(), in_sect_pr),
                     ));
                 }
                 if in_run && is_modeled_empty_run_child(name.as_ref()) {
@@ -3140,8 +3167,8 @@ pub(crate) fn parse_document_xml_with_events(
                         in_tbl -= 1;
                         if in_tbl == 0 {
                             let tbl_end_byte = reader.buffer_position() as usize;
-                            let source_xml = tbl_start_byte
-                                .take()
+                            let tbl_start = tbl_start_byte.take();
+                            let source_xml = tbl_start
                                 .and_then(|s| slice_element(xml, s, tbl_end_byte, b"w:tbl"));
                             /* Phase 5 PR 2 — full row/cell parse via
                             `parts::table::parse_table_bytes`. Source bytes
@@ -3158,16 +3185,20 @@ pub(crate) fn parse_document_xml_with_events(
                             let mut sink = crate::parts::table::CommentSink::rooted(vec![
                                 engine::PathStep::Block(out_blocks.len() as u32),
                             ]);
-                            let parsed = source_xml
-                                .as_deref()
-                                .and_then(|b| {
+                            /* Issue #564 — a block the table walk meets where
+                            no block may stand refuses the part like the body
+                            walk's own (`opaque_unless_refused`: every other table
+                            walk error keeps the table opaque). */
+                            let parsed = match (source_xml.as_deref(), tbl_start) {
+                                (Some(b), Some(at)) => crate::error::opaque_unless_refused(
                                     parse_table_bytes_with_events(
-                                        b, resolver, &ns, warnings, &mut sink,
-                                    )
-                                    .ok()
-                                })
+                                        b, resolver, &ns, at, warnings, &mut sink,
+                                    ),
+                                )?
                                 .inspect(|_| comment_events.append(&mut sink.events))
-                                .unwrap_or_default();
+                                .unwrap_or_default(),
+                                _ => Default::default(),
+                            };
                             out_blocks.push(Block::Table(
                                 parsed.into_table(source_xml, envelopes.take_before()),
                             ));

@@ -73,6 +73,21 @@ fn main() {
         "regen-seeds: done — {} well-formedness docx seed(s) rewritten",
         wf.len()
     );
+    /* Issue #564 — the raw-package `docx_roundtrip` seeds for a cell's
+    blocks where no block may stand, pinned by
+    `tests::cell_placement_seeds_are_committed`. */
+    let rt_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_roundtrip");
+    let placement = engine_fuzz::cell_placement_docx_seeds();
+    for (name, bytes, _) in &placement {
+        let path = rt_dir.join(name);
+        std::fs::write(&path, bytes)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        println!("wrote {} ({} bytes)", path.display(), bytes.len());
+    }
+    println!(
+        "regen-seeds: done — {} cell-placement docx_roundtrip seed(s) rewritten",
+        placement.len()
+    );
     /* Issue #341 — the `snapshot_decode` seeds: engine snapshots in the
     v1 (`pkg-<len>-<fnv>`) and v2 (`sha256-`) package-key formats plus the
     hostile envelopes, pinned by `tests::snapshot_seeds_are_committed`. */

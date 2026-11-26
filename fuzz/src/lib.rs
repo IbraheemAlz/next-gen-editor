@@ -1032,9 +1032,121 @@ pub fn well_formed_docx_seeds() -> Vec<(&'static str, Vec<u8>, WfOutcome)> {
     ]
 }
 
+/// Issue #564 — the raw-package `docx_roundtrip` seeds
+/// `corpus/docx_roundtrip/repro_564_*.docx`: `(file name, package bytes, the
+/// defect class the refusal names)`, one per place a TABLE CELL's blocks may
+/// not stand (the cell walker used to read a `<w:p>` nested in a cell
+/// paragraph as the inner paragraph only, dropping the outer text — a
+/// zero-edit save kept that text, so the invariant never saw it). The
+/// generator cannot spell them (`docx_gen` closes every element it opens),
+/// so they are packages built from `format_docx::test_fixtures`, written by
+/// `examples/regen-seeds`, pinned by `tests::cell_placement_seeds_are_committed`.
+pub fn cell_placement_docx_seeds() -> Vec<(&'static str, Vec<u8>, &'static str)> {
+    use format_docx::test_fixtures::package_with_document_xml_bytes as package;
+    let root: Vec<u8> = [
+        &wf_root()[..wf_root().len() - 1],
+        b" xmlns:x=\"urn:example:unmodeled\">",
+    ]
+    .concat();
+    let table = |inner: &str| -> Vec<u8> {
+        [
+            wf_prolog(),
+            root.as_slice(),
+            b"<w:body><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid>",
+            inner.as_bytes(),
+            b"</w:tbl><w:sectPr/></w:body></w:document>",
+        ]
+        .concat()
+    };
+    let cell = |inner: &str| table(&format!("<w:tr><w:tc>{inner}</w:tc></w:tr>"));
+    vec![
+        (
+            "repro_564_cell_nested_paragraph.docx",
+            package(
+                &cell(
+                    "<w:p><w:r><w:t>outer</w:t></w:r><x:junk><w:p><w:r><w:t>inner</w:t></w:r></w:p>\
+                     </x:junk><w:r><w:t>tail</w:t></w:r></w:p>",
+                ),
+                &[],
+            ),
+            "inside a paragraph",
+        ),
+        (
+            "repro_564_cell_table_in_paragraph.docx",
+            package(
+                &cell(
+                    "<w:p><w:r><w:t>outer</w:t></w:r><w:tbl><w:tblPr/><w:tblGrid>\
+                     <w:gridCol w:w=\"1000\"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>inner</w:t>\
+                     </w:r></w:p></w:tc></w:tr></w:tbl></w:p>",
+                ),
+                &[],
+            ),
+            "inside a paragraph",
+        ),
+        (
+            "repro_564_row_stray_paragraph.docx",
+            package(
+                &table(
+                    "<w:tr><w:p><w:r><w:t>stray</w:t></w:r></w:p><w:tc><w:p><w:r><w:t>cell</w:t>\
+                     </w:r></w:p></w:tc></w:tr>",
+                ),
+                &[],
+            ),
+            "outside a table cell",
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #564 — the committed cell-placement seeds are exactly what
+    /// [`cell_placement_docx_seeds`] builds (re-run `examples/regen-seeds`);
+    /// each holds the `docx_roundtrip` invariants, is refused by the reader
+    /// (`MalformedXml` naming the class — no text drift is possible because
+    /// there is no save) and, opened through the real dispatcher, answers
+    /// the typed `DocumentUnreadable` with the open document untouched.
+    #[test]
+    fn cell_placement_seeds_are_committed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_roundtrip");
+        for (name, bytes, class) in cell_placement_docx_seeds() {
+            let committed = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("{name}: {e} — run examples/regen-seeds"));
+            assert!(
+                committed == bytes,
+                "{name} is stale — run examples/regen-seeds"
+            );
+            run_docx_roundtrip(&bytes);
+            let err = format_docx::read_docx(&bytes).expect_err("refused, not opened");
+            assert!(
+                matches!(&err, format_docx::DocxError::MalformedXml(d) if d.contains(class)),
+                "{name}: {err:?}"
+            );
+            let mut engine =
+                engine_wasm::Engine::new_headless(engine::DocumentTree::from_text("keep me"));
+            let before = engine.state_fingerprint_for_fuzzing();
+            let evt = engine.apply_sync(bridge::Command::OpenDocument {
+                bytes,
+                format: bridge::DocFormat::Docx,
+                name: Some(name.to_string()),
+                defaults: None,
+                limits: None,
+                password: None,
+            });
+            let bridge::Event::Error { kind, message, .. } = evt else {
+                panic!("{name}: a damaged package answers Error, got {evt:?}");
+            };
+            assert_eq!(
+                kind,
+                Some(bridge::ErrorKind::DocumentUnreadable),
+                "{name}: {message}"
+            );
+            assert!(message.contains(class), "{name}: {message}");
+            assert!(!message.contains("outer") && !message.contains("inner"));
+            assert_eq!(engine.state_fingerprint_for_fuzzing(), before, "{name}");
+        }
+    }
 
     /// Issue #567 — the splice mode is not vacuous: a fair share of
     /// pseudo-random inputs still reach a successful import (the walk, the
