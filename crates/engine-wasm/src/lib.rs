@@ -45,6 +45,8 @@ use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
 mod error_reply;
+/// Epic #555 row 2 — caret stops on grapheme cluster boundaries only.
+mod grapheme_slots;
 /// Issue #506 - which media blobs still need a decoded bitmap (content
 /// fingerprints, so a re-minted key is decoded again).
 mod media_registry;
@@ -7269,30 +7271,91 @@ fn line_end(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalPo
     })
 }
 
-/// UAX #29 word-like segment starts (byte offsets) in `text`. A segment
-/// is "word-like" iff `unicode-segmentation` classifies it via
-/// `unicode_word_indices` — Letters, Numbers, and a small set of
-/// connector chars (`'` inside contractions, `.` / `,` between digits in
-/// `3.14` and `1,000`). Whitespace and stand-alone punctuation are NOT
-/// word-like — they're the gaps the word-jump motions skip.
-fn word_starts(text: &str) -> Vec<usize> {
-    use unicode_segmentation::UnicodeSegmentation;
-    text.unicode_word_indices().map(|(i, _)| i).collect()
+/// Epic #555 row 20 — the class of a Ctrl+Left / Ctrl+Right word unit
+/// (the clean-room cursor memo §5): text, punctuation (a class of its
+/// own), separators (space, tab, no-break space — any white space), and a
+/// non-text element (an inline object's `U+FFFC` sentinel), which is a
+/// word by itself. There are no script-specific rules: an Arabic word
+/// with a tatweel or harakat is text like any other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordClass {
+    Text,
+    Punctuation,
+    Separator,
+    Object,
 }
 
-/// Jump one UAX #29 word backward in logical byte order — the engine
-/// half of Ctrl/Cmd + ArrowLeft in an LTR paragraph (an RTL paragraph
-/// flips the visual mapping; see `do_move_caret`). Lands on the start
-/// of the previous word-like segment relative to `pos.offset`. At
-/// paragraph start the caret hops to the end of the previous paragraph
-/// in the doc-flat walk (descending into cells); at document start it
-/// pins.
-///
-/// Word-like classification handles the cases the previous whitespace-
-/// only scanner missed: `"isn't"` is ONE word (apostrophe is a Word
-/// connector under WB6/WB7), `"3.14"` is ONE word (period between
-/// digits is MidNumLet/MidNum under WB11/WB12), and CJK ideographs
-/// segment per-ideograph.
+/// The word units of `text`: UAX #29 word segments (`split_word_bounds`,
+/// so a contraction `isn't`, a number `3.14`, an ideograph and a letter
+/// with its combining marks stay whole) classified by [`WordClass`], with
+/// adjacent punctuation and adjacent separators merged into one unit each
+/// (a run of one class). `(start, end, class)`, in logical order, covering
+/// `text`.
+fn word_units(text: &str) -> Vec<(usize, usize, WordClass)> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut units: Vec<(usize, usize, WordClass)> = Vec::new();
+    for (i, seg) in text.split_word_bound_indices() {
+        let class = if seg == "\u{FFFC}" {
+            WordClass::Object
+        } else if seg.chars().all(char::is_whitespace) {
+            WordClass::Separator
+        } else if seg.chars().any(char::is_alphanumeric) {
+            WordClass::Text
+        } else {
+            WordClass::Punctuation
+        };
+        let end = i + seg.len();
+        match units.last_mut() {
+            Some(last)
+                if last.2 == class
+                    && matches!(class, WordClass::Punctuation | WordClass::Separator) =>
+            {
+                last.1 = end;
+            }
+            _ => units.push((i, end, class)),
+        }
+    }
+    units
+}
+
+/// Where Ctrl+Right (logical forward) stops from byte `off` of `text`:
+/// past the run of one class `off` sits in, then past the separators after
+/// it — the start of the next word, punctuation run or object, else the
+/// paragraph end. Also the far end of a Ctrl+Delete.
+fn word_stop_forward(text: &str, off: usize) -> usize {
+    let units = word_units(text);
+    let Some(i) = units.iter().position(|u| off >= u.0 && off < u.1) else {
+        return text.len();
+    };
+    match units.get(i + 1) {
+        Some(next) if next.2 == WordClass::Separator && units[i].2 != WordClass::Separator => {
+            next.1
+        }
+        Some(next) => next.0,
+        None => text.len(),
+    }
+}
+
+/// Where Ctrl+Left (logical backward) stops from byte `off` of `text`:
+/// back over the separators before it, then over a run of one class — its
+/// start. Also the near end of a Ctrl+Backspace.
+fn word_stop_backward(text: &str, off: usize) -> usize {
+    let units = word_units(text);
+    let Some(mut i) = units.iter().position(|u| off > u.0 && off <= u.1) else {
+        return 0;
+    };
+    if units[i].2 == WordClass::Separator && i > 0 {
+        i -= 1;
+    }
+    units[i].0
+}
+
+/// Jump one word backward in logical byte order — the engine half of
+/// Ctrl/Cmd + ArrowLeft in an LTR paragraph (an RTL paragraph flips the
+/// visual mapping; see `do_move_caret`). Lands where
+/// [`word_stop_backward`] says. At paragraph start the caret hops to the
+/// end of the previous paragraph in the doc-flat walk (descending into
+/// cells); at document start it pins.
 fn step_word_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     let engine_path = bridge_to_engine_path(pos.path.clone());
     let Some(para) = doc.paragraph_at_path(&engine_path) else {
@@ -7309,28 +7372,17 @@ fn step_word_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos
         }
         return pos;
     }
-    /* Last word-start strictly before the caret. `unicode_word_indices`
-    is monotonic ascending; the last one < off wins. If the caret sits
-    at offset 0 of the first word, `word_starts` may still emit 0 →
-    falling through to "no candidate" lands the caret at 0 (pinned at
-    paragraph start). */
-    let target = word_starts(text)
-        .into_iter()
-        .take_while(|&i| i < off)
-        .last()
-        .unwrap_or(0);
     BridgeLogicalPos {
         path: pos.path,
-        offset: target as u32,
+        offset: word_stop_backward(text, off) as u32,
     }
 }
 
-/// Jump one UAX #29 word forward in logical byte order — the engine
-/// half of Ctrl/Cmd + ArrowRight in an LTR paragraph. Lands on the
-/// **start** of the next word-like segment after `pos.offset` (Word /
-/// Google Docs convention — not the end of the current word). At
-/// paragraph end the caret hops to offset 0 of the next paragraph; at
-/// document end it pins.
+/// Jump one word forward in logical byte order — the engine half of
+/// Ctrl/Cmd + ArrowRight in an LTR paragraph. Lands on the **start** of
+/// the next word ([`word_stop_forward`]; Word's convention — not the end
+/// of the current word). At paragraph end the caret hops to offset 0 of
+/// the next paragraph; at document end it pins.
 fn step_word_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     let engine_path = bridge_to_engine_path(pos.path.clone());
     let Some(para) = doc.paragraph_at_path(&engine_path) else {
@@ -7347,16 +7399,9 @@ fn step_word_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPo
         }
         return pos;
     }
-    /* First word-start strictly greater than the caret. If no further
-    word exists (caret in trailing whitespace/punctuation), pin at
-    paragraph end so a follow-up WordRight hops to the next paragraph. */
-    let target = word_starts(text)
-        .into_iter()
-        .find(|&i| i > off)
-        .unwrap_or(text.len());
     BridgeLogicalPos {
         path: pos.path,
-        offset: target as u32,
+        offset: word_stop_forward(text, off) as u32,
     }
 }
 
@@ -13637,7 +13682,14 @@ impl Engine {
     /// `BlockPath` ending at the cell's paragraph (`[Block(t), Cell{r,c},
     /// Block(p)]`).
     fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
-        let geom = self.document_geometry_display()?;
+        let mut geom = self.document_geometry_display()?;
+        /* Epic #555 row 2 — shaping stops become caret stops: one per
+        grapheme cluster, never inside one (display offsets, so a
+        code-view paragraph is skipped inside). */
+        let code_view = self.field_code_view;
+        self.with_selection_doc(|doc| {
+            grapheme_slots::snap_slots_to_graphemes(&mut geom, doc, code_view)
+        });
         Ok(self.geometry_to_source_offsets(geom))
     }
 
@@ -17733,15 +17785,9 @@ impl Engine {
         if forward {
             if caret.offset < para_len {
                 let to = if by_word {
-                    /* UAX #29 word boundary forward — delete from caret
-                    to the start of the next word-like segment. Matches
-                    Ctrl+Delete in Word / Google Docs. Falls back to
-                    paragraph end when no further word exists. */
-                    word_starts(&para.text)
-                        .into_iter()
-                        .find(|&i| i as u32 > caret.offset)
-                        .map(|i| i as u32)
-                        .unwrap_or(para_len)
+                    /* Ctrl+Delete — up to where Ctrl+Right stops (epic
+                    #555 row 20: the same word classes). */
+                    word_stop_forward(&para.text, caret.offset as usize) as u32
                 } else {
                     para.next_offset(caret.offset)
                 };
@@ -17763,15 +17809,9 @@ impl Engine {
             }
         } else if caret.offset > 0 {
             let from = if by_word {
-                /* UAX #29 word boundary backward — delete from the
-                start of the previous word-like segment up to the
-                caret. Matches Ctrl+Backspace in Word / Google Docs. */
-                word_starts(&para.text)
-                    .into_iter()
-                    .take_while(|&i| (i as u32) < caret.offset)
-                    .last()
-                    .map(|i| i as u32)
-                    .unwrap_or(0)
+                /* Ctrl+Backspace — back to where Ctrl+Left stops (epic
+                #555 row 20: the same word classes). */
+                word_stop_backward(&para.text, caret.offset as usize) as u32
             } else {
                 para.prev_offset(caret.offset)
             };
@@ -32691,3 +32731,8 @@ mod table_repaint_perf_tests;
 /// mixed-direction paragraphs.
 #[cfg(test)]
 mod word_select_tests;
+
+/// Epic #555 — the TEXT rows of the cursor matrix (grapheme caret stops,
+/// word-move classes, the empty IME commit).
+#[cfg(test)]
+mod text_cursor_tests;
