@@ -28,7 +28,7 @@ The caret is the engine's primary navigational state. Every motion command mutat
 | none | One **grapheme cluster** in logical order (UAX #29 grapheme break). At paragraph start, wrap to end of previous paragraph in the doc-flat walk. At paragraph end, wrap to start of next. At document boundary, pin. |
 | Shift | Same motion; anchor stays put. Selection becomes (anchor, new caret). |
 
-**Discount** — the current implementation steps by `char` (Unicode scalar), not by grapheme cluster. For combining marks (e.g., Arabic harakat, Devanagari conjuncts, emoji ZWJ sequences) this can land between visually-fused glyphs. `[TODO]`: switch to `unicode-segmentation::UnicodeSegmentation::grapheme_indices` or an `icu_segmenter::GraphemeClusterSegmenter` so the caret never visibly bisects a "user-perceived character".
+**Grapheme caret stops** `[DONE]` (epic #555 row 2, cursor memo §1 / §3) — the logical fallback steps (`step_left` / `step_right`) walk `grapheme_indices`, and the line geometry every spatial motion and hit-test reads (`Engine::document_geometry`) carries caret stops on grapheme boundaries only (`engine-wasm/src/grapheme_slots.rs`): a base and its marks are one stop, a ligature over several clusters (Amiri's `تب`, a Latin `fi`) is split evenly across its advance, and a run boundary inside a cluster (an emoji ZWJ sequence split across faces) offers no stop. A click can therefore never land inside a cluster either.
 
 **Cross-paragraph wrap** `[DONE]` — `step_left` / `step_right` already descend into table cells via `doc_paragraph_neighbor`. Cell-paragraph at offset 0 + Left → end of preceding cell-paragraph (or out of the cell to the body paragraph above, if at row 0 col 0). Symmetric for Right.
 
@@ -73,14 +73,11 @@ Walks the **line geometry** (`document_geometry()`'s flat `Vec<LineGeom>`), not 
 
 ## II. Word Boundaries (UAX #29)
 
-The target word boundary algorithm is UAX #29's `WB1`–`WB14`. The current implementation is a whitespace-only classifier — adequate for Latin and Arabic at the seeded text level, but it misses:
+The target word boundary algorithm is UAX #29's `WB1`–`WB14`.
 
-- ASCII punctuation as part of a word (URLs, "isn't" → currently treated as two segments)
-- Mid-word numbers (`3.14` → split at `.` currently)
-- CJK ideographs (no inter-character whitespace; each ideograph is its own word per UAX #29)
-- Emoji + ZWJ sequences (`👨‍👩‍👧` should be one word; current treats whitespace as the only break)
+**Word motion** `[DONE]` (epic #555 row 20, cursor memo §5) — `step_word_left` / `step_word_right` and `DELETE_AT_CARET { by_word: true }` share `word_units` (`engine-wasm/src/lib.rs`): UAX #29 word segments (`split_word_bounds`: `isn't`, `3.14`, one ideograph, a letter with its marks stay whole) classified as **text**, **punctuation** (a class of its own; adjacent punctuation is one unit), **separators** (white space; adjacent ones are one unit) and **objects** (an inline object's `U+FFFC`, a word by itself). Ctrl+Right skips a run of one class, then the separators after it; Ctrl+Left skips separators, then a run of one class. So Ctrl+Right over `word, next` stops at `,` then at `next`. No script-specific rule: a tatweel or harakat stays inside its Arabic word, the Arabic comma is punctuation.
 
-`[TODO]` — Migrate `step_word_left` / `step_word_right` to `icu_segmenter::WordSegmenter` (already a workspace dep). Keep the public motion API (`WordLeft` / `WordRight`) stable; swap only the inner classifier. Same for `SELECT_WORD_AT` and `DELETE_AT_CARET { by_word: true }`.
+`[PARTIAL]` — `SELECT_WORD_AT` (double-click, `Paragraph::word_bounds`) still uses the whitespace classifier.
 
 ### II.1 — Ctrl/Cmd + ArrowLeft / ArrowRight
 
@@ -104,16 +101,16 @@ The target word boundary algorithm is UAX #29's `WB1`–`WB14`. The current impl
 
 ### II.3 — Word segment classification
 
-Current rule: `char::is_whitespace` is the only segment boundary.
+Current rule: word motion follows the rule below (`word_units`, see §II); double-click word selection still treats `char::is_whitespace` as the only segment boundary.
 
 Target rule (UAX #29 with carve-outs for ergonomic Word/Google Docs behaviour):
 
 1. **Letter run** — any consecutive `Letter` or `Mark` chars (UAX #29 ALetter / Hebrew_Letter / Katakana / etc.).
 2. **Number run** — `Numeric` chars, with `MidNumLet` / `MidNum` (`.`, `,`) joining adjacent number runs (`3.14`, `1,000` are single words).
 3. **Whitespace run** — `White_Space`-property chars.
-4. **Other run** — punctuation, symbols, control chars (each emit-individual per WB14).
+4. **Other run** — punctuation, symbols, control chars; adjacent ones form ONE run (cursor memo §5).
 
-`WordLeft` / `WordRight` jump from the start of one Letter/Number run to the start of the next, skipping intermediate whitespace and treating "other" runs as their own one-char segments.
+`WordLeft` / `WordRight` jump from the start of one Letter/Number run to the start of the next, skipping intermediate whitespace and treating each "other" run as a word of its own.
 
 **Apostrophe inside words** — `"isn't"` is ONE word (WB6 / WB7). Don't break at the apostrophe.
 

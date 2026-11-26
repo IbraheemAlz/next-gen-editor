@@ -75,3 +75,53 @@ test('a damaged .docx is refused with a visible typed message; the document stay
     expect(intact.type).toBe('DOCUMENT_LOADED');
     expect(await documentText(page)).toContain('after the refusal');
 });
+
+/* Issues #536 / #530 - a paragraph where no block may stand. Both parts
+ * below stop early; the reader's EOF repair closes what is open, which
+ * makes the stray `<w:p>` ENCLOSE the body (#536) or nests the second
+ * paragraph inside the first (#530). Such a package used to open and its
+ * zero-edit save read back the body twice / lost the outer paragraph's
+ * text; it is now refused through the real File -> Open flow with the
+ * damaged-document banner, naming the part and the defect, never the text. */
+const ROOT_OPEN = documentXml('').split('<w:body>')[0] ?? '';
+const MISPLACED = [
+    {
+        name: 'enclosing-body.docx',
+        xml: `${ROOT_OPEN}<w:p><w:body>${BODY('zzinnersecret')}`,
+        defect: 'outside the document body',
+    },
+    {
+        name: 'nested-paragraph.docx',
+        xml: `${ROOT_OPEN}<w:body><w:p><w:r><w:t>zzoutersecret</w:t></w:r>${BODY('zzinnersecret')}`,
+        defect: 'inside a paragraph',
+    },
+];
+
+test('a paragraph where no block may stand is refused as damaged; the document stays', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await boot(page);
+    await page.evaluate(async () => {
+        const dispatch = (cmd: unknown): Promise<any> => (window as any).__dispatch(cmd);
+        await dispatch({ type: 'SELECT_ALL' });
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'previous document' });
+    });
+    const before = await documentText(page);
+    expect(before).toContain('previous document');
+
+    const banner = page.locator('.nge-fm__error');
+    for (const { name, xml, defect } of MISPLACED) {
+        await page.locator('.nge-fm input[type="file"]').setInputFiles({
+            name,
+            mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            buffer: Buffer.from(storedDocx(xml)),
+        });
+        await expect(banner).toContainText('This document is damaged and cannot be opened');
+        await expect(banner).toContainText('word/document.xml');
+        await expect(banner).toContainText(defect);
+        await expect(banner).not.toContainText('secret');
+        expect(await documentText(page)).toBe(before);
+    }
+    await expect(page.locator('.nge-trap')).toHaveCount(0);
+});
