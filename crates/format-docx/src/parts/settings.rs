@@ -1,9 +1,10 @@
-//! `word/settings.xml` — minimal read-only model (Phase 6).
+//! `word/settings.xml` — the typed read of the settings the engine uses.
 //!
-//! Phase 6 only needs to know the part exists for pass-through; the
-//! engine has no Settings consumer yet. The struct lands so later
-//! phases can grow typed fields (zoom, default tab stop, document
-//! direction) without touching the OPC reader.
+//! The part itself rides the package passthrough byte-identical; this is
+//! the ONE parse of it (the reader lifts these fields onto
+//! `DocumentSettings`, the theme reader and the writer's settings patch,
+//! `writer_settings_patch.rs`, re-use it). The writer changes the part
+//! only where a toggle it owns differs from what this parse read.
 
 use crate::error::DocxError;
 use quick_xml::events::Event;
@@ -18,6 +19,12 @@ pub struct SettingsPart {
     /// slot instead of the `Default`. The paginator consumes this
     /// alongside each section's per-role header table.
     pub even_and_odd_headers: bool,
+    /// Issue #354 — `<w:trackRevisions/>`: the document was saved with
+    /// Track Changes on (seeds the engine's review mode on open).
+    pub track_revisions: bool,
+    /// Issue #354 — `<w:mirrorMargins/>`: left / right margins are
+    /// inside / outside, swapped on even-numbered pages.
+    pub mirror_margins: bool,
     /// Issue #80 — document-level `<w:footnotePr>` (position, number
     /// format / start / restart). The `<w:footnote w:id>` separator
     /// references inside it are not modelled (the stories carry their
@@ -139,6 +146,13 @@ pub fn parse_settings_xml(xml: &[u8]) -> Result<SettingsPart, DocxError> {
             }
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:evenAndOddHeaders" => {
                 out.even_and_odd_headers = toggle_attr(e.attributes());
+            }
+            /* Issue #354 — the review toggle and mirrored margins. */
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:trackRevisions" => {
+                out.track_revisions = toggle_attr(e.attributes());
+            }
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:mirrorMargins" => {
+                out.mirror_margins = toggle_attr(e.attributes());
             }
             /* Issue #326 — the hyphenation settings. */
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:autoHyphenation" => {
@@ -279,6 +293,30 @@ mod tests {
         assert_eq!(s.clr_scheme_mapping.entries["t1"], "dark1");
         assert_eq!(s.clr_scheme_mapping.entries["hyperlink"], "hyperlink");
         assert_eq!(s.clr_scheme_mapping.entries.len(), 6);
+    }
+
+    /// Issue #354 — `<w:trackRevisions/>` / `<w:mirrorMargins/>`, every
+    /// toggle spelling.
+    #[test]
+    fn reads_track_revisions_and_mirror_margins() {
+        let wrap = |el: &str| {
+            parse_settings_xml(
+                format!(
+                    r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{el}</w:settings>"#
+                )
+                .as_bytes(),
+            )
+            .expect("parse")
+        };
+        let on = wrap("<w:mirrorMargins/><w:trackRevisions/>");
+        assert!(on.track_revisions && on.mirror_margins);
+        let on = wrap(r#"<w:mirrorMargins w:val="1"/><w:trackRevisions w:val="true"/>"#);
+        assert!(on.track_revisions && on.mirror_margins);
+        let off = wrap(r#"<w:mirrorMargins w:val="0"/><w:trackRevisions w:val="false"/>"#);
+        assert!(!off.track_revisions && !off.mirror_margins);
+        let absent = wrap("<w:evenAndOddHeaders/>");
+        assert!(!absent.track_revisions && !absent.mirror_margins);
+        assert!(absent.even_and_odd_headers);
     }
 
     /// Issue #326 — the hyphenation settings Word writes.

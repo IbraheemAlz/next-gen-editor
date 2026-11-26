@@ -539,7 +539,7 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
   emptied paragraph types with it (#293). Readers (`attrs_mixed_over`,
   `range_flags`) still sample a mark only for a paragraph with no text. Review
   mode patches the mark without recording a mark `<w:rPrChange>` (#372). The
-  writer adds the mark's `<w:rPr>` as a pure insertion (`tools/roundtrip` step 65).
+  writer adds the mark's `<w:rPr>` as a pure insertion (`tools/roundtrip` step 66).
   e2e: `mark-format.spec.ts` reads line heights off the selection overlay. List
   markers are stamped over the same deep walk (`visit_rendered_paragraphs` /
   `rendered_paragraphs_mut`, also the `.docx` reader's `resolve_markers_blocks`):

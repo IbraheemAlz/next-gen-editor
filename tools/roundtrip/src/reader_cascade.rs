@@ -175,7 +175,7 @@ fn eight_pt() -> engine::SpanStyle {
     .with_cs_twins()
 }
 
-/// Issue #489 — step 65.
+/// Issue #489 — step 66.
 ///
 /// a. Select All -> 8 pt over a Word package: every run AND every
 ///    paragraph mark is written at 8 pt, as pure insertions into the
@@ -233,7 +233,7 @@ pub(crate) fn run_mark_selection_roundtrip() -> Result<()> {
         bail!("the bold mark lost its bold: {:?}", third.mark_style);
     }
     println!(
-        "[roundtrip] step 65a OK — select all -> 8 pt writes every mark's size as pure insertions and re-reads it"
+        "[roundtrip] step 66a OK — select all -> 8 pt writes every mark's size as pure insertions and re-reads it"
     );
 
     let text_only = doc.apply_style(at(1, 0), at(1, 6), eight_pt());
@@ -258,7 +258,7 @@ pub(crate) fn run_mark_selection_roundtrip() -> Result<()> {
         bail!("the unselected mark gained formatting");
     }
     println!(
-        "[roundtrip] step 65b OK — a selection that stops at the last character leaves the mark's bytes"
+        "[roundtrip] step 66b OK — a selection that stops at the last character leaves the mark's bytes"
     );
     Ok(())
 }

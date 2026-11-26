@@ -1529,3 +1529,8 @@ pub use cell_decor::*;
 #[path = "test_fixtures_default_style.rs"]
 mod default_style;
 pub use default_style::*;
+
+/* Issue #354 — `settings.xml` trackRevisions / mirrorMargins. */
+#[path = "test_fixtures_settings.rs"]
+mod settings;
+pub use settings::*;
