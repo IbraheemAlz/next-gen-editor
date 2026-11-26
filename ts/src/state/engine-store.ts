@@ -5,7 +5,7 @@
  * invariant). Engine rects arrive in canvas device pixels; they are
  * converted to CSS pixels here so the DOM overlays land correctly on
  * high-DPI displays. */
-import { createSignal } from 'solid-js';
+import { batch, createSignal } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type {
     A11yNode,
@@ -25,6 +25,7 @@ import type {
     TextAttrs,
 } from '../engine/types';
 import { topPos } from '../engine/types';
+import { storyMatches, type ActiveStory } from '../input/image-keys';
 
 /* ——— Shared page-geometry constants ———
  * ONE source of truth for the pointer path, the per-page overlays, and
@@ -242,9 +243,22 @@ export interface ImageAddr {
     at: number;
     /** Issue #206 — the picture's text-box story chain (empty = body). */
     story: TextBoxHop[];
+    /** Issue #506 — set while the picture is selected but no
+     *  `GET_IMAGE_RECTS` reply has listed it yet (the object selection an
+     *  `INSERT_IMAGE` leaves behind, until the paint's rect query answers):
+     *  what the key path needs meanwhile. The first refresh that lists the
+     *  picture drops it; one that does not drops the selection. */
+    unlisted?: { rtl: boolean };
 }
 const [imageRectsSig, setImageRectsSig] = createSignal<ImageRectCss[]>([]);
 const [selectedImageSig, setSelectedImageSig] = createSignal<ImageAddr | null>(null);
+/* Issue #506 — the caret overlay stays hidden while this is set: a key that
+ * LEAVES the object selection posts the command that places the caret, and
+ * until its reply lands the engine's caret is still the stale one the
+ * object selection had replaced (the parked caret flashed there for a
+ * frame). Released in the same task as that reply's caret update. */
+const [caretHeldSig, setCaretHeldSig] = createSignal(false);
+let caretHoldToken = 0;
 
 /** Latest image rects (CSS px) for the non-reactive pointer path. */
 export function imageRectsForPointer(): ImageRectCss[] {
@@ -275,19 +289,15 @@ export const sameImageAddr = (a: ImageAddr, b: ImageAddr): boolean =>
     });
 
 /** Select the image under a document-absolute CSS point, if any. Returns
- *  true when an image was hit (and selected); false clears the selection.
- *  Called synchronously by the pointer path before it places a caret.
- *  Issue #206 — `textBoxOnly` limits the hit to pictures inside text-box
- *  stories (the pointer path while a text box is being edited). Nested
- *  pictures are listed after their box's, so the innermost hit wins. */
-export function selectImageByPoint(
-    cssX: number,
-    cssY: number,
-    textBoxOnly = false,
-): boolean {
+ *  the picture when one was hit (and selected); `undefined` clears the
+ *  selection. Called synchronously by the pointer path before it places a
+ *  caret. Nested pictures are listed after their box's, so the innermost
+ *  hit wins. Issue #506 — any story's picture can be hit (body or text
+ *  box); the pointer path enters the picture's story in the same click
+ *  when it is not the active one. */
+export function selectImageByPoint(cssX: number, cssY: number): ImageRectCss | undefined {
     const hits = imageRectsSig().filter(
         (im) =>
-            (!textBoxOnly || im.story.length > 0) &&
             cssX >= im.rect.x &&
             cssX <= im.rect.x + im.rect.w &&
             cssY >= im.rect.y &&
@@ -296,24 +306,103 @@ export function selectImageByPoint(
     const hit = hits[hits.length - 1];
     if (hit) {
         setSelectedImageSig({ path: hit.path, at: hit.at, story: hit.story });
-        return true;
+        return hit;
     }
     setSelectedImageSig(null);
-    return false;
+    return undefined;
 }
+
+/** What the key path needs of the selected picture (`input/image-keys.ts`
+ *  `KeyedImage`). */
+export type SelectedImageForKeys = Pick<ImageRectCss, 'path' | 'at' | 'story' | 'storyRid' | 'rtl'>;
 
 /** Issue #554 — the selected picture's current rect, for the non-reactive
  *  key path (`undefined` when nothing is selected or the engine no longer
- *  lists it). */
-export function selectedImageForKeys(): ImageRectCss | undefined {
+ *  lists it). Issue #506 — a picture selected by its own insert answers
+ *  from its address until the rect query lists it, so a key typed in that
+ *  window still resolves against the picture (a body picture: an insert
+ *  is body-only). */
+export function selectedImageForKeys(): SelectedImageForKeys | undefined {
     const sel = selectedImageSig();
     if (!sel) return undefined;
-    return imageRectsSig().find((r) => sameImageAddr(r, sel));
+    const listed = imageRectsSig().find((r) => sameImageAddr(r, sel));
+    if (listed) return listed;
+    if (sel.unlisted) {
+        return { path: sel.path, at: sel.at, story: sel.story, storyRid: '', rtl: sel.unlisted.rtl };
+    }
+    return undefined;
 }
 
 /** Clear any selected-image state (e.g. on a caret-placing click). */
 export function clearSelectedImage(): void {
     setSelectedImageSig(null);
+}
+
+/** Issue #506 — leave the object selection. With `settled` (the reply to
+ *  the command that places the caret, posted by the key that left it) the
+ *  caret overlay stays hidden until that reply lands, instead of flashing
+ *  the stale engine caret for a frame; the release runs in the same task
+ *  as the reply's caret update. Without it the caret shows at once (the
+ *  engine caret is where the next command acts). */
+export function leaveImageSelection(settled?: Promise<unknown>): void {
+    batch(() => {
+        if (settled) {
+            const token = ++caretHoldToken;
+            setCaretHeldSig(true);
+            const release = (): void => {
+                if (token === caretHoldToken) setCaretHeldSig(false);
+            };
+            settled.then(release, release);
+        }
+        setSelectedImageSig(null);
+    });
+}
+
+/* Issue #506 — a press on a picture of a story that is NOT the active one
+ * (a text-box picture from the body or from another box, a body picture
+ * from inside a box: #220) enters the picture's story and selects it in
+ * one click: the same press goes to `PLACE_CARET_AT_POINT`, which routes a
+ * press inside a box into its story and a press outside every box back to
+ * the body (#83). Until that reply lands the mirrored editing story is
+ * still the old one, so the key path answers with the story the engine
+ * WILL be in when the next command runs (the worker queue applies the
+ * entry first). */
+let pendingStoryEntry: { target: ActiveStory | undefined; token: number } | null = null;
+let storyEntryToken = 0;
+
+/** The story a picture's positions are rooted in, as `ActiveStory`. */
+export function storyOfImage(img: Pick<ImageRectCss, 'story' | 'storyRid'>): ActiveStory | undefined {
+    return img.story.length === 0 ? undefined : { area: 'TextBox', rid: img.storyRid };
+}
+
+/** Record that `settled` (a `PLACE_CARET_AT_POINT`) enters `target`. When
+ *  it lands in another story (the press was on a part of a box picture
+ *  outside the box's frame, or on a body picture under a box), the
+ *  selected picture of that story cannot stay selected: only the active
+ *  story's pictures are selectable. */
+export function noteStoryEntry(target: ActiveStory | undefined, settled: Promise<unknown>): void {
+    const token = ++storyEntryToken;
+    pendingStoryEntry = { target, token };
+    const done = (): void => {
+        if (pendingStoryEntry?.token !== token) return;
+        pendingStoryEntry = null;
+        const sel = selectedImageForKeys();
+        if (sel && !storyMatches(sel, editingStoryForKeys())) setSelectedImageSig(null);
+    };
+    settled.then(done, done);
+}
+
+/** The last broadcast editing story as `ActiveStory`. */
+function editingStoryForKeys(): ActiveStory | undefined {
+    const s = editingStorySig();
+    return s && { area: s.area, rid: s.rid };
+}
+
+/** Issue #506 — the story the engine's caret is in for the next command
+ *  (`input/image-keys.ts` `ActiveStory`): a pending story entry, else the
+ *  last broadcast editing story (`undefined` = the body). */
+export function activeStoryForKeys(): ActiveStory | undefined {
+    return pendingStoryEntry ? pendingStoryEntry.target : editingStoryForKeys();
 }
 
 /** The current selection: its logical range plus rendered rectangles. */
@@ -476,15 +565,38 @@ export function createEngineStore(client: EngineClient) {
                 storyRid: im.story_rid ?? '',
                 rtl: im.rtl ?? false,
             }));
-            setImageRectsSig(rects);
-            const sel = selectedImageSig();
-            if (sel && !rects.some((r) => sameImageAddr(r, sel))) {
-                setSelectedImageSig(null);
-            }
+            batch(() => {
+                setImageRectsSig(rects);
+                const sel = selectedImageSig();
+                if (sel && !rects.some((r) => sameImageAddr(r, sel))) {
+                    setSelectedImageSig(null);
+                } else if (sel?.unlisted) {
+                    /* Issue #506 — the inserted picture is listed now. */
+                    setSelectedImageSig({ path: sel.path, at: sel.at, story: sel.story });
+                }
+            });
         } catch (e) {
             console.error('refreshImageRects failed', e);
         }
     };
+
+    /* Issue #506 — after inserting a picture, the picture is object-selected
+       (clean-room memo `onlyoffice-cursor-memo.md` §9), exactly as if it had
+       been clicked: handles, no caret. The engine puts the sentinel at the
+       insert's `at` (the caret the toolbar sends) and answers with the
+       caret moved past it; an address that names no picture (the engine
+       fell back to another paragraph) is dropped by the first rect refresh
+       that does not list it. Runs before the reply fans out, so the caret
+       the reply moves is never drawn behind the new picture. */
+    client.onCommandReply((cmd, evt) => {
+        if (cmd.type !== 'INSERT_IMAGE' || evt.type !== 'SELECTION_CHANGED') return;
+        setSelectedImageSig({
+            path: cmd.at.path,
+            at: cmd.at.offset,
+            story: [],
+            unlisted: { rtl: evt.paragraph_direction === 'Rtl' },
+        });
+    });
 
     client.subscribe((ev: Event) => {
         if (ev.type === 'SELECTION_CHANGED') {
@@ -644,6 +756,9 @@ export function createEngineStore(client: EngineClient) {
            overlay. `imageRects` are CSS px, document-absolute. */
         imageRects: imageRectsSig,
         selectedImage: selectedImageSig,
+        /** Issue #506 — the caret overlay waits for the reply that places
+         *  the caret after a key left the object selection. */
+        caretHeld: caretHeldSig,
         setSelectedImage: setSelectedImageSig,
         refreshImageRects,
         /* Phase 3 (#39) — active story for overlays + control gating. */

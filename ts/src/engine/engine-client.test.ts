@@ -132,6 +132,46 @@ describe('lastSelectionMoveSentAt (#486)', () => {
     });
 });
 
+describe('command-reply observers (#506)', () => {
+    it('hand every answered dispatch over as its (command, reply) pair, BEFORE subscribers see the reply', async () => {
+        const order: string[] = [];
+        client.subscribe((e) => order.push(`sub:${e.type}`));
+        const off = client.onCommandReply((cmd, e) => order.push(`obs:${cmd.type}->${e.type}`));
+        const a = client.dispatch(insert);
+        const b = client.dispatch(select);
+        const [ma, mb] = worker().sent;
+        worker().reply(mb!.id, ev({ type: 'HIT_RESULT' }));
+        worker().reply(ma!.id, ev({ type: 'SELECTION_CHANGED' }));
+        await Promise.all([a, b]);
+        expect(order).toEqual([
+            'obs:HIT_TEST->HIT_RESULT',
+            'sub:HIT_RESULT',
+            'obs:INSERT_TEXT->SELECTION_CHANGED',
+            'sub:SELECTION_CHANGED',
+        ]);
+        off();
+        const c = client.dispatch(insert);
+        worker().reply(worker().last.id, painted);
+        await c;
+        expect(order.filter((o) => o.startsWith('obs:'))).toHaveLength(2);
+    });
+
+    it('never fire for an id-less event, a failed request, or a request a trap abandoned', async () => {
+        const seen = vi.fn();
+        client.onCommandReply(seen);
+        worker().push(ev({ type: 'A11Y_DELTA' }));
+        const failed = client.dispatch(insert);
+        worker().fail(worker().last.id, 'nope');
+        await expect(failed).rejects.toThrow();
+        const abandoned = client.dispatch(insert);
+        const id = worker().last.id;
+        worker().trap();
+        await expect(abandoned).rejects.toThrow();
+        worker().reply(id, painted);
+        expect(seen).not.toHaveBeenCalled();
+    });
+});
+
 describe('write epoch and writes in flight (#260 / #57)', () => {
     it('a write bumps the epoch when its reply lands, BEFORE subscribers see it', async () => {
         const epochs: number[] = [];

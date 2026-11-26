@@ -30,6 +30,10 @@ export function CaretOverlay(props: { store: EngineStore; pageIdx?: number }) {
            engine's caret is where the next key will land only AFTER the
            selection is left; `input/image-keys.ts`). */
         if (props.store.selectedImage()) return null;
+        /* Issue #506 — a key just left the object selection: the engine's
+           caret is still the stale one until the reply to the command that
+           places it lands, so it is not drawn meanwhile. */
+        if (props.store.caretHeld()) return null;
         const c = props.store.caret();
         if (!c) return null;
         const top = pageTop();
