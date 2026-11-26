@@ -8042,6 +8042,19 @@ fn step_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     pos
 }
 
+/// Issue #565 — the outcome of a collapsed Backspace / Delete
+/// ([`Engine::collapsed_delete_plan`]), decided once for the body and for
+/// every story tree.
+enum CollapsedDelete {
+    /// The caret is at an edge of the document or of its container.
+    Nothing,
+    /// Remove `[start, end)` — both ends share one parent container.
+    Range(BridgeLogicalPos, BridgeLogicalPos),
+    /// Delete at the end of the paragraph before a table: join the
+    /// paragraph at this path into the table's first cell.
+    JoinNextTable(EngineBlockPath),
+}
+
 /// Walk the document's paragraphs in linear order (depth-first into
 /// table cells) and return the neighbour of `path`. `forward` selects
 /// the next paragraph; otherwise the previous. `None` when at the
@@ -13935,12 +13948,26 @@ impl Engine {
     /// the field's end when `forward`, else its start. Positions at a
     /// boundary or outside every field pass through.
     fn snap_out_of_field(&self, pos: BridgeLogicalPos, forward: bool) -> BridgeLogicalPos {
+        self.with_selection_doc(|d| Self::snap_out_of_field_in(d, pos, forward))
+    }
+
+    /// [`Self::snap_out_of_field`] against an explicit tree (issue #565:
+    /// the collapsed-delete planner runs on the body or on the story tree
+    /// it was handed, never on whichever the selection happens to address).
+    fn snap_out_of_field_in(
+        doc: &DocumentTree,
+        pos: BridgeLogicalPos,
+        forward: bool,
+    ) -> BridgeLogicalPos {
         let off = pos.offset;
-        let snapped = self
-            .fields_at_path(&pos.path)
-            .iter()
-            .find(|f| f.is_local() && f.start < off && off < f.end)
-            .map(|f| if forward { f.end } else { f.start });
+        let snapped = doc
+            .paragraph_at_path(&bridge_to_engine_path(pos.path.clone()))
+            .and_then(|p| {
+                p.fields
+                    .iter()
+                    .find(|f| f.is_local() && f.start < off && off < f.end)
+                    .map(|f| if forward { f.end } else { f.start })
+            });
         match snapped {
             Some(offset) => BridgeLogicalPos {
                 path: pos.path,
@@ -13982,9 +14009,18 @@ impl Engine {
         start: BridgeLogicalPos,
         end: BridgeLogicalPos,
     ) -> (BridgeLogicalPos, BridgeLogicalPos) {
+        self.with_selection_doc(|d| Self::expand_over_fields_in(d, start, end))
+    }
+
+    /// [`Self::expand_over_fields`] against an explicit tree.
+    fn expand_over_fields_in(
+        doc: &DocumentTree,
+        start: BridgeLogicalPos,
+        end: BridgeLogicalPos,
+    ) -> (BridgeLogicalPos, BridgeLogicalPos) {
         (
-            self.snap_out_of_field(start, false),
-            self.snap_out_of_field(end, true),
+            Self::snap_out_of_field_in(doc, start, false),
+            Self::snap_out_of_field_in(doc, end, true),
         )
     }
 
@@ -16732,9 +16768,14 @@ impl Engine {
         self.commit_story_edit(&new_doc, caret)
     }
 
-    /// Story `DeleteAtCaret` — selection delete, or one grapheme/word
-    /// step; paragraph-edge deletes merge via `delete_range`'s
-    /// cross-paragraph semantics.
+    /// Story `DeleteAtCaret` — selection delete, or one grapheme / word
+    /// step. Issue #565 — the collapsed step is planned by the SAME
+    /// [`Engine::collapsed_delete_plan`] the body uses, over the story
+    /// tree: the caret's own (cell) paragraph, the document-order
+    /// neighbour walk, the #555 row 28 cell-boundary rule and the
+    /// word classes of row 20. (It used to address `top_idx` blocks of the
+    /// story, which for a caret in a header table cell is the TABLE: the
+    /// range straddled two containers and nothing was removed.)
     fn story_delete_at_caret(&mut self, forward: bool, by_word: bool) -> Event {
         let Some(sel) = self.selection.clone() else {
             return Event::error_kind(
@@ -16751,49 +16792,24 @@ impl Engine {
             let (new_doc, caret) = self.delete_range_in(&temp, &start, &end);
             return self.commit_story_edit(&new_doc, caret);
         }
-        let caret = sel.caret;
-        let epath = bridge_to_engine_path(caret.path.clone());
-        let Some(para) = temp.paragraph_at_path(&epath) else {
-            return self.selection_changed();
-        };
-        let top_idx = caret.path.steps.first().map_or(0, |s| match s {
-            BridgePathStep::Block { idx } => *idx,
-            BridgePathStep::Cell { .. } => 0,
-        });
-        let (del_start, del_end): (BridgeLogicalPos, BridgeLogicalPos) = if forward {
-            if caret.offset < para.text.len() as u32 {
-                let next = if by_word {
-                    para.word_bounds(caret.offset).1
-                } else {
-                    para.next_offset(caret.offset)
-                };
-                (caret.clone(), bpos_top(top_idx, next))
-            } else if (top_idx as usize + 1) < temp.blocks.len() {
-                /* Forward-delete at paragraph end: merge with the next. */
-                (caret.clone(), bpos_top(top_idx + 1, 0))
-            } else {
-                return self.selection_changed();
+        let plan =
+            Self::collapsed_delete_plan(&temp, sel.caret, forward, by_word, self.tracking_changes);
+        match plan {
+            CollapsedDelete::Nothing => self.selection_changed(),
+            CollapsedDelete::JoinNextTable(para) => {
+                match temp.join_paragraph_into_next_table(&para) {
+                    Some((new_doc, caret)) => {
+                        self.commit_story_edit(&new_doc, to_bridge_pos(caret))
+                    }
+                    None => self.selection_changed(),
+                }
             }
-        } else if caret.offset > 0 {
-            let prev = if by_word {
-                para.word_bounds(caret.offset.saturating_sub(1)).0
-            } else {
-                para.prev_offset(caret.offset)
-            };
-            (bpos_top(top_idx, prev), caret.clone())
-        } else if top_idx > 0 {
-            /* Backspace at paragraph start: merge with the previous. */
-            let prev_len = temp
-                .paragraph_at_path(&EngineBlockPath::top(top_idx - 1))
-                .map_or(0, |p| p.text.len() as u32);
-            (bpos_top(top_idx - 1, prev_len), caret.clone())
-        } else {
-            return self.selection_changed();
-        };
-        /* Issue #77 — atomic fields: the step widens to the whole field. */
-        let (del_start, del_end) = self.expand_over_fields(del_start, del_end);
-        let new_doc = temp.delete_range(to_engine_pos(del_start.clone()), to_engine_pos(del_end));
-        self.commit_story_edit(&new_doc, del_start)
+            CollapsedDelete::Range(del_start, del_end) => {
+                let new_doc =
+                    temp.delete_range(to_engine_pos(del_start.clone()), to_engine_pos(del_end));
+                self.commit_story_edit(&new_doc, del_start)
+            }
+        }
     }
 
     /// Story `ApplyFormatting` — span patch over the selection (or the
@@ -18544,33 +18560,29 @@ impl Engine {
                 Err(e) => *e,
             };
         }
-        let Some((del_start, del_end)) = self.delete_target(sel.caret, forward, by_word) else {
-            /* Caret at a document edge — nothing to delete. */
-            return self.selection_changed();
-        };
-        /* Epic #555 row 28 (clean-room cursor memo §7) — a collapsed
-        Backspace / Delete never crosses a cell boundary: when the step
-        leaves the caret's container (a cell edge, the table's edge, the
-        paragraph after a table) nothing is deleted and the caret stays.
-        The one exception is Delete at the end of the paragraph BEFORE a
-        table, which joins the table's first cell (untracked only: the
-        move has no tracked-change form, so review mode deletes nothing). */
-        let start_path = bridge_to_engine_path(del_start.path.clone());
-        if !engine::same_parent(&start_path, &bridge_to_engine_path(del_end.path.clone())) {
-            if forward
-                && !self.tracking_changes
-                && let Some((new_doc, caret)) = self
-                    .undo
-                    .current()
-                    .join_paragraph_into_next_table(&start_path)
-            {
-                return self.commit_edit(new_doc, to_bridge_pos(caret));
+        let plan = Self::collapsed_delete_plan(
+            self.undo.current(),
+            sel.caret,
+            forward,
+            by_word,
+            self.tracking_changes,
+        );
+        match plan {
+            /* Caret at a document edge, or a step that leaves its
+            container: nothing to delete. */
+            CollapsedDelete::Nothing => self.selection_changed(),
+            CollapsedDelete::JoinNextTable(para) => {
+                match self.undo.current().join_paragraph_into_next_table(&para) {
+                    Some((new_doc, caret)) => self.commit_edit(new_doc, to_bridge_pos(caret)),
+                    None => self.selection_changed(),
+                }
             }
-            return self.selection_changed();
-        }
-        match self.delete_or_mark(del_start, del_end, !forward) {
-            Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
-            Err(e) => *e,
+            CollapsedDelete::Range(del_start, del_end) => {
+                match self.delete_or_mark(del_start, del_end, !forward) {
+                    Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
+                    Err(e) => *e,
+                }
+            }
         }
     }
 
@@ -18663,8 +18675,7 @@ impl Engine {
         forward: bool,
         by_word: bool,
     ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
-        let (start, end) = self.delete_target_raw(caret, forward, by_word)?;
-        Some(self.expand_over_fields(start, end))
+        Self::delete_target_in(self.undo.current(), caret, forward, by_word)
     }
 
     fn delete_target_raw(
@@ -18673,7 +18684,58 @@ impl Engine {
         forward: bool,
         by_word: bool,
     ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
-        let doc = self.undo.current();
+        Self::delete_target_raw_in(self.undo.current(), caret, forward, by_word)
+    }
+
+    /// Issue #565 — [`Self::delete_target`] against an explicit tree, so
+    /// the body and the active story's synthetic tree share ONE rule (the
+    /// story twin used to rebuild it with top-level block arithmetic).
+    fn delete_target_in(
+        doc: &DocumentTree,
+        caret: BridgeLogicalPos,
+        forward: bool,
+        by_word: bool,
+    ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
+        let (start, end) = Self::delete_target_raw_in(doc, caret, forward, by_word)?;
+        Some(Self::expand_over_fields_in(doc, start, end))
+    }
+
+    /// What a COLLAPSED Backspace / Delete at `caret` does in `doc` — the
+    /// one decision both `do_delete_at_caret` (body) and
+    /// `story_delete_at_caret` (issue #565) apply to their own tree.
+    /// Epic #555 row 28 (clean-room cursor memo §7): a step that leaves
+    /// the caret's container (a cell edge, the table's edge, the
+    /// paragraph after a table) deletes nothing and the caret stays; the
+    /// one exception is Delete at the end of the paragraph BEFORE a
+    /// table, which joins the table's first cell — untracked only: the
+    /// move has no tracked-change form, so with `tracking` (review mode)
+    /// it deletes nothing.
+    fn collapsed_delete_plan(
+        doc: &DocumentTree,
+        caret: BridgeLogicalPos,
+        forward: bool,
+        by_word: bool,
+        tracking: bool,
+    ) -> CollapsedDelete {
+        let Some((start, end)) = Self::delete_target_in(doc, caret, forward, by_word) else {
+            return CollapsedDelete::Nothing;
+        };
+        let start_path = bridge_to_engine_path(start.path.clone());
+        if engine::same_parent(&start_path, &bridge_to_engine_path(end.path.clone())) {
+            CollapsedDelete::Range(start, end)
+        } else if forward && !tracking {
+            CollapsedDelete::JoinNextTable(start_path)
+        } else {
+            CollapsedDelete::Nothing
+        }
+    }
+
+    fn delete_target_raw_in(
+        doc: &DocumentTree,
+        caret: BridgeLogicalPos,
+        forward: bool,
+        by_word: bool,
+    ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
         let engine_path = bridge_to_engine_path(caret.path.clone());
         let para = doc.paragraph_at_path(&engine_path)?;
         let para_len = para.text.len() as u32;
@@ -32742,6 +32804,9 @@ mod tracked_structure_tests;
 #[cfg(test)]
 mod revision_address_tests;
 
+/// Issue #565 — Backspace / Delete inside a header table cell.
+#[cfg(test)]
+mod story_delete_tests;
 #[cfg(test)]
 mod story_tab_tests;
 

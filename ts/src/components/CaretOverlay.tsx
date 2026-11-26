@@ -16,7 +16,13 @@
  * it to page-local CSS px. It is drawn in the text colour at the caret
  * (`attrs_at_caret.color`), and every caret update — an arrow press,
  * typing, a click — restarts the blink in its visible phase, so a moving
- * caret never vanishes mid-move. */
+ * caret never vanishes mid-move.
+ *
+ * Issue #559 (memo §11) — the rect it draws is `store.overlayCaret`: the
+ * newest engine caret applied ONCE per animation frame (`caret-frame.ts`),
+ * except the reply to a vertical move (Up / Down / PageUp / PageDown),
+ * which is applied at once, so a key repeat is one style write per frame
+ * and a jump of lines never lags. */
 import { Show, createEffect, on } from 'solid-js';
 import type { EngineStore } from '../state/engine-store';
 import { caretColorCss, restartBlink } from './caret-style';
@@ -34,7 +40,7 @@ export function CaretOverlay(props: { store: EngineStore; pageIdx?: number }) {
            caret is still the stale one until the reply to the command that
            places it lands, so it is not drawn meanwhile. */
         if (props.store.caretHeld()) return null;
-        const c = props.store.caret();
+        const c = props.store.overlayCaret();
         if (!c) return null;
         const top = pageTop();
         const bottom = top + props.store.pageHeightCss(idx());
@@ -46,11 +52,13 @@ export function CaretOverlay(props: { store: EngineStore; pageIdx?: number }) {
         <Show when={visibleCaret()}>
             {(caret) => {
                 let el: HTMLDivElement | undefined;
-                /* Every SELECTION_CHANGED carries a fresh caret object, so
-                   this fires once per engine caret update (even one that
-                   leaves the caret where it was: an arrow press at the end
-                   of the document still restarts the blink). */
-                createEffect(on(props.store.caret, () => restartBlink(el), { defer: true }));
+                /* Every applied update carries a fresh caret object, so this
+                   fires once per APPLIED update (issue #559: the store's
+                   frame scheduler coalesces a burst of engine replies into
+                   one) - even one that leaves the caret where it was: an
+                   arrow press at the end of the document still restarts the
+                   blink. */
+                createEffect(on(props.store.overlayCaret, () => restartBlink(el), { defer: true }));
                 return (
                     <div
                         ref={el}

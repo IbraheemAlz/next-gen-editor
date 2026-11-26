@@ -16,11 +16,11 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-fn apply(e: &mut Engine, cmd: Command) -> Event {
+pub(super) fn apply(e: &mut Engine, cmd: Command) -> Event {
     block_on(e.apply(cmd))
 }
 
-fn engine_with(doc: DocumentTree) -> Engine {
+pub(super) fn engine_with(doc: DocumentTree) -> Engine {
     let mut e = assemble_engine(None, None);
     let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
     let font = LoadedFont::parse("test-latin".to_string(), bytes).expect("parse test font");
@@ -70,7 +70,7 @@ fn caret_cell(e: &Engine) -> (u32, u32) {
     }
 }
 
-fn header_rid(e: &Engine) -> String {
+pub(super) fn header_rid(e: &Engine) -> String {
     match &e.active_story {
         StoryTarget::Header { rid, .. } => rid.clone(),
         _ => panic!("expected a header story"),
@@ -88,7 +88,7 @@ fn header_table_rows(e: &Engine, rid: &str) -> usize {
 
 /// Body `"body text"`; enter the page-0 header and insert a 1×2 table
 /// there (the caret lands in its first cell).
-fn header_table_engine() -> (Engine, String) {
+pub(super) fn header_table_engine() -> (Engine, String) {
     let mut e = engine_with(DocumentTree::from_text("body text"));
     let evt = apply(
         &mut e,
