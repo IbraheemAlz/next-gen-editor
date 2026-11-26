@@ -2008,8 +2008,16 @@ fn enclosing_table_path(path: &BridgeBlockPath) -> Option<BridgeBlockPath> {
 /// #72 story adapter) so a story table's new row lands in its part.
 #[derive(Debug, Clone, PartialEq)]
 enum CellTabStep {
-    /// Pure caret move (also the no-op: the caret itself).
-    MoveTo(BridgeLogicalPos),
+    /// Outside a table, or Shift+Tab in the first cell: the caret stays.
+    Stay,
+    /// Move into the cell `cell` addresses (the table path + its `Cell`
+    /// step); `caret` is the start of its first paragraph in document
+    /// order (issue #551 — inside a leading nested table when the cell
+    /// starts with one).
+    MoveTo {
+        cell: BridgeBlockPath,
+        caret: BridgeLogicalPos,
+    },
     /// Tab in the table's last cell: append a row at `at_row` to the
     /// table at `table_path`, then land on `caret` (its first cell).
     AppendRowAndMoveTo {
@@ -2019,19 +2027,73 @@ enum CellTabStep {
     },
 }
 
-/// Tab / Shift+Tab cell navigation. Inside a table the caret jumps
-/// to the next (or previous) cell in row-major order, landing on the
-/// first paragraph at offset 0; at the table's last cell, Tab asks for
-/// a fresh row and lands at its first cell (Word default). Outside a
-/// table the caret stays put. `doc` is the tree the caret's path
-/// addresses (the selection doc).
-fn cell_tab_step(doc: &DocumentTree, caret: &BridgeLogicalPos, forward: bool) -> CellTabStep {
-    let stay = || CellTabStep::MoveTo(caret.clone());
-    let Some(table_path) = enclosing_table_path(&caret.path) else {
+/// Issue #551 — the cell a Tab / Shift+Tab steps FROM, given the
+/// selection `anchor .. caret`. A Tab- or `SelectCellAt`-selected cell
+/// whose content starts or ends with a nested table puts an endpoint
+/// INSIDE that nested table, and the caret's own innermost table is then
+/// the wrong one; so, in order:
+/// 1. the outermost cell holding both endpoints whose whole content
+///    ([`cell_span`]) IS the selection (a cell whose only content is a
+///    nested table: the selection covers that table, two of its cells);
+/// 2. the cell holding a range over several of its blocks (the
+///    endpoints' common path ends in that cell's `Cell` step);
+/// 3. otherwise — a caret, a range inside one paragraph, a cell
+///    rectangle — the caret's innermost cell, as before.
+fn tab_origin_cell(
+    doc: &DocumentTree,
+    anchor: &BridgeLogicalPos,
+    caret: &BridgeLogicalPos,
+) -> Option<BridgeBlockPath> {
+    if anchor == caret {
+        return innermost_cell_path(&caret.path);
+    }
+    let steps = &caret.path.steps;
+    let common = anchor
+        .path
+        .steps
+        .iter()
+        .zip(steps)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let selection = ordered(anchor.clone(), caret.clone());
+    let cell_at = |i: usize| BridgeBlockPath {
+        steps: steps[..=i].to_vec(),
+    };
+    for (i, step) in steps[..common].iter().enumerate() {
+        if matches!(step, BridgePathStep::Cell { .. })
+            && cell_span(doc, &cell_at(i)).is_some_and(|span| span == selection)
+        {
+            return Some(cell_at(i));
+        }
+    }
+    if common > 0 && matches!(steps[common - 1], BridgePathStep::Cell { .. }) {
+        return Some(cell_at(common - 1));
+    }
+    innermost_cell_path(&caret.path)
+}
+
+/// Tab / Shift+Tab cell navigation from the selection `anchor ..
+/// caret` ([`tab_origin_cell`]). Inside a table the caret jumps to the
+/// next (or previous) cell in row-major order, landing on the first
+/// paragraph of its content at offset 0; at the table's last cell, Tab
+/// asks for a fresh row and lands at its first cell (Word default).
+/// Outside a table the caret stays put. `doc` is the tree the
+/// selection's paths address (the selection doc).
+fn cell_tab_step(
+    doc: &DocumentTree,
+    anchor: &BridgeLogicalPos,
+    caret: &BridgeLogicalPos,
+    forward: bool,
+) -> CellTabStep {
+    let stay = || CellTabStep::Stay;
+    let Some(origin) = tab_origin_cell(doc, anchor, caret) else {
         return stay();
     };
-    let Some((r, c)) = cell_of(&caret.path, &table_path) else {
+    let Some(&BridgePathStep::Cell { row: r, col: c }) = origin.steps.last() else {
         return stay();
+    };
+    let table_path = BridgeBlockPath {
+        steps: origin.steps[..origin.steps.len() - 1].to_vec(),
     };
     let engine_table = bridge_to_engine_path(table_path.clone());
     let Some(table) = doc.table_at_path(&engine_table) else {
@@ -2058,15 +2120,18 @@ fn cell_tab_step(doc: &DocumentTree, caret: &BridgeLogicalPos, forward: bool) ->
             .and_then(|row| row.cells.get(cc as usize))
             .is_some_and(|cell| matches!(cell.props.v_merge, engine::VMergeRole::Continue))
     };
-    /* Address the first paragraph of a destination cell. */
-    let cell_start = |row: u32, col: u32| {
+    /* A destination cell's own path. */
+    let cell_path = |row: u32, col: u32| {
         let mut steps = table_path.steps.clone();
         steps.push(BridgePathStep::Cell { row, col });
-        steps.push(BridgePathStep::Block { idx: 0 });
-        BridgeLogicalPos {
-            path: BridgeBlockPath { steps },
-            offset: 0,
-        }
+        BridgeBlockPath { steps }
+    };
+    /* `Block(0)` of a cell: the start of a FRESH row's cell (one empty
+    paragraph each; the row does not exist yet when this is computed). */
+    let cell_start = |row: u32, col: u32| {
+        let mut path = cell_path(row, col);
+        path.steps.push(BridgePathStep::Block { idx: 0 });
+        BridgeLogicalPos { path, offset: 0 }
     };
     let (mut rr, mut cc) = (r, c);
     loop {
@@ -2095,7 +2160,12 @@ fn cell_tab_step(doc: &DocumentTree, caret: &BridgeLogicalPos, forward: bool) ->
             return stay();
         }
         if !is_continue(rr, cc) {
-            return CellTabStep::MoveTo(cell_start(rr, cc));
+            /* Issue #551 — the first paragraph in document order, not
+            `Block(0)`: a cell may start with a nested table. */
+            let cell = cell_path(rr, cc);
+            let caret =
+                cell_span(doc, &cell).map_or_else(|| cell_start(rr, cc), |(start, _)| start);
+            return CellTabStep::MoveTo { cell, caret };
         }
     }
 }
@@ -7657,66 +7727,58 @@ fn doc_paragraph_paths_between(
     all[si + 1..ei].to_vec()
 }
 
-/// Count of `Block` entries in the cell addressed by `cell_prefix`
-/// (a path with exactly `[Block(t), Cell{r,c}]`). `None` when the
-/// prefix doesn't resolve to a real cell. Used by `do_select_cell_at`
-/// to know which `Block(N)` step terminates the cell's last paragraph.
-fn cell_block_count(doc: &DocumentTree, cell_prefix: &EngineBlockPath) -> Option<usize> {
-    if cell_prefix.steps.len() < 2 {
+/// Issue #551 — the innermost table cell `path` lies in, as the cell's
+/// own path (the enclosing table's path + its `Cell` step). `None`
+/// outside every table. The innermost table handles cell selection, as
+/// it handles Tab (`onlyoffice-cursor-memo.md` §7).
+fn innermost_cell_path(path: &BridgeBlockPath) -> Option<BridgeBlockPath> {
+    let mut cell = enclosing_table_path(path)?;
+    let step = path.steps.get(cell.steps.len())?;
+    if !matches!(step, BridgePathStep::Cell { .. }) {
         return None;
     }
-    let EnginePathStep::Block(t_idx) = cell_prefix.steps[0] else {
-        return None;
-    };
-    let EnginePathStep::Cell { row, col } = cell_prefix.steps[1] else {
-        return None;
-    };
-    let block = doc.blocks.get(t_idx as usize)?;
-    let engine::Block::Table(t) = block else {
-        return None;
-    };
-    let cell = t.rows.get(row as usize)?.cells.get(col as usize)?;
-    Some(cell.blocks.len())
+    cell.steps.push(*step);
+    Some(cell)
 }
 
-/// `(start, end)` positions spanning the ENTIRE content of the cell the
-/// path descends into (first paragraph offset 0 → last paragraph byte
-/// length). `None` when the path is not inside a table cell. Shared by
-/// quadruple-click cell selection and Word's Tab-selects-cell semantics.
+/// Issue #551 — `(start, end)` positions spanning the ENTIRE content of
+/// the cell `cell` addresses (a path ending in its `Cell` step): offset 0
+/// of the first paragraph in document order inside it → the byte length
+/// of the last one, both resolved by the engine's one deep descent
+/// ([`DocumentTree::cell_paragraph_bounds`], shared with `SelectAll`'s
+/// `path_to_first_paragraph_deep`), so a cell that starts or ends with a
+/// nested table — or holds only one — never yields an endpoint on a
+/// table block. `None` when the cell does not exist or holds no
+/// paragraph at any depth.
+fn cell_span(
+    doc: &DocumentTree,
+    cell: &BridgeBlockPath,
+) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
+    let (first, last) = doc.cell_paragraph_bounds(&bridge_to_engine_path(cell.clone()))?;
+    let end_len = doc
+        .paragraph_at_path(&last)
+        .map_or(0, |p| p.text.len() as u32);
+    Some((
+        BridgeLogicalPos {
+            path: engine_to_bridge_path(first),
+            offset: 0,
+        },
+        BridgeLogicalPos {
+            path: engine_to_bridge_path(last),
+            offset: end_len,
+        },
+    ))
+}
+
+/// `(start, end)` positions spanning the ENTIRE content of the innermost
+/// cell `path` descends into ([`innermost_cell_path`] → [`cell_span`]).
+/// `None` when the path is not inside a table cell. Quadruple-click cell
+/// selection (`SelectCellAt`).
 fn cell_content_span(
     doc: &DocumentTree,
     path: &BridgeBlockPath,
 ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
-    if !matches!(path.steps.get(1), Some(BridgePathStep::Cell { .. })) {
-        return None;
-    }
-    let cell_prefix: Vec<BridgePathStep> = path.steps.iter().take(2).cloned().collect();
-    let engine_prefix = bridge_to_engine_path(BridgeBlockPath {
-        steps: cell_prefix.clone(),
-    });
-    let cell_blocks = cell_block_count(doc, &engine_prefix)?;
-    let last_block_idx = cell_blocks.saturating_sub(1) as u32;
-    let mut start_steps = cell_prefix.clone();
-    start_steps.push(BridgePathStep::Block { idx: 0 });
-    let mut end_steps = cell_prefix;
-    end_steps.push(BridgePathStep::Block {
-        idx: last_block_idx,
-    });
-    let end_path = BridgeBlockPath { steps: end_steps };
-    let end_engine = bridge_to_engine_path(end_path.clone());
-    let end_len = doc
-        .paragraph_at_path(&end_engine)
-        .map_or(0, |p| p.text.len() as u32);
-    Some((
-        BridgeLogicalPos {
-            path: BridgeBlockPath { steps: start_steps },
-            offset: 0,
-        },
-        BridgeLogicalPos {
-            path: end_path,
-            offset: end_len,
-        },
-    ))
+    cell_span(doc, &innermost_cell_path(path)?)
 }
 
 fn doc_paragraph_paths(doc: &DocumentTree) -> Vec<EngineBlockPath> {
@@ -8108,6 +8170,14 @@ fn paragraph_is_empty(doc: &DocumentTree, at: &BridgeLogicalPos) -> bool {
 
 /// Issue #276 — apply [`replaced_text_style`]'s result to the `len` bytes
 /// just inserted at `start`.
+///
+/// Issue #512 audit: `start.offset + len` is not formed from a raw wire
+/// offset. Every caller passes a position that already went through
+/// `clamp_pos` (the interactive `InsertText`, its story twin) or
+/// `resolve_edit_pos` (`ReplaceRange`) - or the live selection, which every
+/// store clamps (`Engine::selection_is_valid`) - so `start.offset` is at
+/// most the paragraph's byte length and the sum is bounded by memory that
+/// exists.
 fn restyle_replacement(
     doc: DocumentTree,
     style: Option<SpanStyle>,
@@ -14247,11 +14317,13 @@ impl Engine {
 
     /// `Command::SelectCellAt` — hit-test, then select every byte of
     /// the containing cell (quadruple-click inside a table).
-    /// `UX_BEHAVIOR_SPEC §I.3`. The hit's path tells us which cell —
-    /// path steps `[Block(t_idx), Cell{r,c}, Block(0)]` etc.
-    /// Anchor lands at offset 0 of the cell's first paragraph; caret
-    /// lands at `text.len()` of its last paragraph. Outside any cell
-    /// the command falls back to `SelectAll`.
+    /// `UX_BEHAVIOR_SPEC §I.3`. The hit's path tells us which cell — the
+    /// INNERMOST one it lies in (issue #551; a click inside a nested
+    /// table selects the nested cell). Anchor lands at offset 0 of the
+    /// cell's first paragraph in document order, caret at `text.len()`
+    /// of its last one, descending into a nested table that starts or
+    /// ends the cell. Outside any cell the command falls back to
+    /// `SelectAll`.
     fn do_select_cell_at(&mut self, at: BridgePoint) -> Event {
         self.lazy_layout_bump_for_y(at.y);
         let geom = match self.document_geometry() {
@@ -14259,25 +14331,19 @@ impl Engine {
             Err(e) => return *e,
         };
         let hit = hit_test_geom(&geom, at.x, at.y);
-        let in_cell = matches!(hit.path.steps.get(1), Some(BridgePathStep::Cell { .. }));
-        if !in_cell {
-            return self.do_select_all();
-        }
-        /* Cell address = first two steps of the hit's path
-        (`Block(t_idx)` + `Cell{r,c}`); `cell_content_span` builds the
-        first-paragraph → last-paragraph span. Issue #72 — read through
-        `selection_doc()` so a cell hit inside a story resolves against
-        the story tree, not the body. */
+        /* Issue #72 — read through `selection_doc()` so a cell hit
+        inside a story resolves against the story tree, not the body. */
         let doc = self.selection_doc();
         let Some((start, end)) = cell_content_span(&doc, &hit.path) else {
             return self.do_select_all();
         };
         self.pending_format = None;
+        let kind = derive_selection_kind(&start, &end);
         self.selection = Some(SelectionState {
             anchor: start,
             caret: end,
             ideal_x: None,
-            kind: SelectionKind::Linear,
+            kind,
         });
         self.selection_changed()
     }
@@ -14331,6 +14397,11 @@ impl Engine {
         regardless of the caret's current run direction). */
         let para_rtl = self.paragraph_direction_at(&sel.caret.path) == ShapingDirection::Rtl;
         let mut new_affinity = self.caret_affinity;
+        /* Issue #551 — the cell a Tab / Shift+Tab step enters; its
+        content is selected below. Named by the step itself, never
+        re-derived from the landing caret (which may sit in a nested
+        table inside that cell). */
+        let mut tab_cell: Option<BridgeBlockPath> = None;
         let (new_caret, new_ideal) = match direction {
             MoveDirection::Left => {
                 let (p, aff) = self.visual_step_arrow(&sel.caret, false);
@@ -14375,13 +14446,23 @@ impl Engine {
                 addresses (story tables included), then apply a row
                 append through the active mode's mutation path. */
                 let forward = direction == MoveDirection::NextCell;
-                match cell_tab_step(&doc, &sel.caret, forward) {
-                    CellTabStep::MoveTo(pos) => (pos, None),
+                match cell_tab_step(&doc, &sel.anchor, &sel.caret, forward) {
+                    CellTabStep::Stay => (sel.caret.clone(), None),
+                    CellTabStep::MoveTo { cell, caret } => {
+                        tab_cell = Some(cell);
+                        (caret, None)
+                    }
                     CellTabStep::AppendRowAndMoveTo {
                         table_path,
                         at_row,
                         caret,
                     } => {
+                        let mut fresh = table_path.clone();
+                        fresh.steps.push(BridgePathStep::Cell {
+                            row: at_row as u32,
+                            col: 0,
+                        });
+                        tab_cell = Some(fresh);
                         let epath = bridge_to_engine_path(table_path);
                         if self.story_active() {
                             /* One undo step, in the active part only;
@@ -14625,12 +14706,12 @@ impl Engine {
         (outside a table, Shift+Tab in the first cell) keep plain
         caret semantics. Read the doc fresh — a body Tab may have just
         appended a row. Issue #76 — through the selection doc, so a
-        story table's cell resolves against its part. */
-        if matches!(direction, MoveDirection::NextCell | MoveDirection::PrevCell)
-            && !extend
-            && new_caret != sel.caret
-            && let Some((start, end)) =
-                self.with_selection_doc(|d| cell_content_span(d, &new_caret.path))
+        story table's cell resolves against its part. Issue #551 — the
+        span of the cell the step ENTERED (`tab_cell`): first paragraph
+        in document order → end of the last, through nested tables. */
+        if !extend
+            && let Some(cell) = &tab_cell
+            && let Some((start, end)) = self.with_selection_doc(|d| cell_span(d, cell))
         {
             self.pending_format = None;
             self.caret_affinity = new_affinity;
@@ -15705,6 +15786,9 @@ impl Engine {
         let was_empty = paragraph_is_empty(&base, &start);
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
         let mut new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        /* Issue #512 audit: `start` is the live selection's start or
+        `do_insert_text_interactive`'s `clamp_pos`'d `at`, never a raw wire
+        offset, so the add cannot wrap. */
         let inserted_end = start.offset + text.len() as u32;
         if let Some(pending) = self.pending_format.clone() {
             new_doc = new_doc.apply_style(
@@ -16156,19 +16240,22 @@ impl Engine {
                 format!("Insert {what}: notes inside table cells aren't supported yet"),
             );
         }
-        let pos = to_engine_pos(at.clone());
+        /* Issue #512 - the position is validated AND snapped by the shared
+        boundary (`resolve_edit_pos`, issue #115) before the caret is
+        derived from it: `at.offset + 3` on a raw wire `u32::MAX` wrapped
+        (a panic with overflow checks on) and, mid-scalar, put the caret one
+        byte past the reference. */
         let doc = self.undo.current();
-        if doc.paragraph_at_path(&pos.path).is_none() {
-            return Event::error_kind(
-                bridge::ErrorKind::NotInParagraph,
-                format!("Insert {what}: the caret does not address a paragraph"),
-            );
-        }
-        let (new_doc, id) = doc.insert_note_at(pos, kind);
+        let at = match Self::resolve_edit_pos_in(doc, &format!("Insert {what}"), at) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
+        let (new_doc, id) = doc.insert_note_at(to_engine_pos(at.clone()), kind);
         self.undo.push(new_doc);
         self.invalidate_layout_snapshot();
         /* The body caret lands right after the new reference so exiting
-        the note returns there. */
+        the note returns there. `at.offset` is snapped (<= the paragraph's
+        byte length), so the add cannot wrap. */
         let caret = BridgeLogicalPos {
             path: at.path.clone(),
             offset: at.offset + '\u{FFFC}'.len_utf8() as u32,
@@ -17082,6 +17169,31 @@ impl Engine {
                 "InsertField: fields inside table cells aren't supported yet",
             );
         }
+        /* Issue #512 - the wire position goes through the engine's ONE
+        validated boundary for an explicit position (`resolve_edit_pos`,
+        issue #115), against the tree the field is inserted into (the story
+        tree in a header / footer / note, else the body): a block that is
+        not there is refused `NotInParagraph` before anything is built (it
+        used to push an undo entry for an unchanged tree), and the offset
+        is snapped - capped at the paragraph's length, floored to a char
+        boundary - so the caret below, `at.offset + cached.len()`, is never
+        formed from a raw `u32::MAX` (the 24 `rpc_command` overflows). */
+        let story = if self.story_active() {
+            match self.story_doc() {
+                Some(t) => Some(t),
+                None => return self.story_vanished(),
+            }
+        } else {
+            None
+        };
+        let at = match Self::resolve_edit_pos_in(
+            story.as_ref().unwrap_or_else(|| self.undo.current()),
+            "InsertField",
+            at,
+        ) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
         let (instruction, cached) = match kind {
             bridge::FieldKind::Page => ("PAGE".to_string(), "1".to_string()),
             bridge::FieldKind::NumPages => ("NUMPAGES".to_string(), "1".to_string()),
@@ -17121,10 +17233,10 @@ impl Engine {
                     .unwrap_or_else(|| self.review_author.clone()),
             ),
         };
-        if self.story_active() {
-            let Some(temp) = self.story_doc() else {
-                return self.story_vanished();
-            };
+        /* `at.offset` is the snapped offset (<= the paragraph's byte
+        length), so the sums below are bounded by memory that exists and
+        cannot wrap. */
+        if let Some(temp) = story {
             let new_doc = temp.insert_field_at(to_engine_pos(at.clone()), &instruction, &cached);
             let caret = BridgeLogicalPos {
                 path: at.path,
@@ -17220,9 +17332,13 @@ impl Engine {
     /// Issue #115 — the single validated boundary for an EXPLICIT wire
     /// position on an edit command (`DeleteRange`, `ReplaceRange`,
     /// `ApplyFormatting { range: Some(_) }`, `SplitParagraph` with no
-    /// selection, `InsertComment`). The path must address a paragraph
-    /// in the document the selection addresses (body or active story)
-    /// — an API caller naming a block that is not there is rejected
+    /// selection, `InsertComment`, and since issue #512 `InsertField` /
+    /// `InsertFootnote` / `InsertEndnote` / `InsertSectionBreak`, whose caret
+    /// is derived from `at.offset + <inserted length>` (or the block index
+    /// bumped by one) and so must start from the validated, SNAPPED position:
+    /// the raw wire `u32::MAX` overflowed that add). The path must address
+    /// a paragraph in the document the selection addresses (body or active
+    /// story); an API caller naming a block that is not there is rejected
     /// with a typed `Event::Error`, never silently redirected to some
     /// other paragraph (an edit that lands on the wrong text is worse
     /// than one that fails loudly). The offset then follows the
@@ -17234,11 +17350,24 @@ impl Engine {
         cmd: &str,
         pos: BridgeLogicalPos,
     ) -> Result<BridgeLogicalPos, Box<Event>> {
+        self.with_selection_doc(|d| Self::resolve_edit_pos_in(d, cmd, pos))
+    }
+
+    /// [`Self::resolve_edit_pos`] against an explicit tree, for a handler
+    /// that already holds the document it edits (issue #512: `InsertField`,
+    /// `InsertFootnote` / `InsertEndnote` and `InsertSectionBreak` resolve
+    /// against the very tree they hand to the pure `DocumentTree` mutation,
+    /// so the position they build the caret from is the one the mutation
+    /// used).
+    fn resolve_edit_pos_in(
+        doc: &DocumentTree,
+        cmd: &str,
+        pos: BridgeLogicalPos,
+    ) -> Result<BridgeLogicalPos, Box<Event>> {
         let epath = bridge_to_engine_path(pos.path.clone());
-        let snapped = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&epath)
-                .map(|p| p.snap_offset(pos.offset))
-        });
+        let snapped = doc
+            .paragraph_at_path(&epath)
+            .map(|p| p.snap_offset(pos.offset));
         match snapped {
             Some(offset) => Ok(BridgeLogicalPos {
                 path: pos.path,
@@ -17313,6 +17442,9 @@ impl Engine {
         } else {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
+        /* Issue #512 audit: `start` is the live selection's start (every
+        selection store is clamped) or the `clamp_pos`'d `at` above - never a
+        raw wire offset - so the add cannot wrap. */
         let inserted_end = start.offset + text.len() as u32;
         new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         /* Sticky formatting (Backlog #11): overlay any armed pending style
@@ -17376,6 +17508,8 @@ impl Engine {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
         let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        /* Issue #512 audit: `start` came out of `resolve_edit_range`, i.e.
+        its offset is snapped to the paragraph (<= its byte length). */
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,
@@ -19595,6 +19729,16 @@ impl Engine {
                 "InsertSectionBreak: section breaks inside table cells are not supported",
             );
         }
+        /* Issue #512 (found by the position audit) - the same shape as
+        `InsertField`: `insert_section_break_at` returns the tree unchanged
+        for a block that is not there, and the caret below bumps the RAW
+        wire block index (`u32::MAX + 1` wrapped). The position goes through
+        the shared boundary first: a missing block is refused
+        `NotInParagraph` with nothing applied, the offset is snapped. */
+        let at = match Self::resolve_edit_pos_in(self.undo.current(), "InsertSectionBreak", at) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
         let engine_kind = match kind {
             SectionBreakKind::NextPage => engine::SectionType::NextPage,
             SectionBreakKind::Continuous => engine::SectionType::Continuous,
@@ -21091,13 +21235,18 @@ mod tests {
             .merge_cells(EngineBlockPath::top(1), 0, 0, 1, 0);
         let mut undo = UndoStack::new(doc, 16);
         let moved = |step: CellTabStep| match step {
-            CellTabStep::MoveTo(p) => p,
+            CellTabStep::MoveTo { caret, .. } => caret,
             other => panic!("expected a pure move, got {other:?}"),
         };
-        let s1 = moved(cell_tab_step(undo.current(), &cell_pos(0, 0), true));
+        let s1 = moved(cell_tab_step(
+            undo.current(),
+            &cell_pos(0, 0),
+            &cell_pos(0, 0),
+            true,
+        ));
         assert_eq!(cell_of_pos(&s1), (0, 1));
         /* Forward wrap to row 1 — cell 0 is a Continue, skip to (1,1). */
-        let s2 = moved(cell_tab_step(undo.current(), &s1, true));
+        let s2 = moved(cell_tab_step(undo.current(), &s1, &s1, true));
         assert_eq!(cell_of_pos(&s2), (1, 1));
         /* Last cell + forward asks for a row append and lands on (2,0);
         the step itself never mutates. */
@@ -21105,7 +21254,7 @@ mod tests {
             table_path,
             at_row,
             caret: s3,
-        } = cell_tab_step(undo.current(), &s2, true)
+        } = cell_tab_step(undo.current(), &s2, &s2, true)
         else {
             panic!("expected a row append");
         };
@@ -21120,11 +21269,13 @@ mod tests {
         assert_eq!(t.rows.len(), 3, "Tab in the last cell appends a row");
         assert_eq!(t.rows[2].cells.len(), 2, "appended row is full grid width");
         /* Backward from (1,1) skips the Continue at (1,0) → (0,1). */
-        let b = moved(cell_tab_step(undo.current(), &s2, false));
+        let b = moved(cell_tab_step(undo.current(), &s2, &s2, false));
         assert_eq!(cell_of_pos(&b), (0, 1));
         /* Backward from the very first cell is a no-op. */
-        let stay = moved(cell_tab_step(undo.current(), &cell_pos(0, 0), false));
-        assert_eq!(cell_of_pos(&stay), (0, 0));
+        assert_eq!(
+            cell_tab_step(undo.current(), &cell_pos(0, 0), &cell_pos(0, 0), false),
+            CellTabStep::Stay
+        );
     }
 
     /// Tables epic — `cell_content_span` spans first → last paragraph
@@ -31308,6 +31459,13 @@ mod empty_paragraph_direction_tests;
 #[cfg(all(test, feature = "fuzz-native"))]
 mod bounds_repair_tests;
 
+/// Issue #512 - `InsertField` / `InsertFootnote` / `InsertEndnote` resolve
+/// their position through `resolve_edit_pos` (no `offset + len` on a raw
+/// wire `u32::MAX`), and the audit of every other position-taking command
+/// (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod insert_position_tests;
+
 #[cfg(test)]
 mod a11y_direction_tests;
 
@@ -31378,6 +31536,11 @@ mod nested_table_tests;
 /// drags inside tables nested in table cells.
 #[cfg(test)]
 mod nested_table_hit_tests;
+
+/// Issue #551 — cell selection (`SelectCellAt`, Tab / Shift+Tab) over a
+/// cell that starts with, ends with, or only holds a nested table.
+#[cfg(test)]
+mod cell_select_nested_tests;
 
 /// Issue #379 — the content-keyed table layout cache across repaints.
 #[cfg(test)]
