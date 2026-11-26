@@ -5,7 +5,7 @@
  * invariant). Engine rects arrive in canvas device pixels; they are
  * converted to CSS pixels here so the DOM overlays land correctly on
  * high-DPI displays. */
-import { batch, createSignal } from 'solid-js';
+import { batch, createSignal, getOwner, onCleanup } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type {
     A11yNode,
@@ -26,6 +26,11 @@ import type {
 } from '../engine/types';
 import { topPos } from '../engine/types';
 import { storyMatches, type ActiveStory } from '../input/image-keys';
+import {
+    applyCaretAtOnce,
+    createCaretFrameScheduler,
+    isVerticalMove,
+} from '../components/caret-frame';
 
 /* ——— Shared page-geometry constants ———
  * ONE source of truth for the pointer path, the per-page overlays, and
@@ -433,6 +438,18 @@ function toCssRect(r: Rect, dpr: number): Rect {
  */
 export function createEngineStore(client: EngineClient) {
     const [caret, setCaret] = createSignal<Rect | null>(null);
+    /* Issue #559 (memo §11) - the caret rect the OVERLAYS draw: the newest
+       engine caret applied once per animation frame (`caret-frame.ts`), or
+       at once for the reply to a vertical `MOVE_CARET`. ONE scheduler for
+       every page's overlay; `caret` above stays the engine's latest (IME
+       anchoring, the caret reveal and the toolbar read that one). */
+    const [overlayCaret, setOverlayCaret] = createSignal<Rect | null>(null);
+    const caretFrame = createCaretFrameScheduler<Rect>((rect) => setOverlayCaret(rect));
+    if (getOwner()) onCleanup(() => caretFrame.dispose());
+    /* Set by the reply observer for the `SELECTION_CHANGED` that answers a
+       vertical `MOVE_CARET`; consumed by the very next subscriber call (the
+       client runs the observers, then fans the same reply out). */
+    let verticalMoveReply = false;
     const [caretLogical, setCaretLogical] = createSignal<LogicalPos | null>(null);
     const [selection, setSelection] = createSignal<SelectionView>({
         range: EMPTY_RANGE,
@@ -598,6 +615,13 @@ export function createEngineStore(client: EngineClient) {
         });
     });
 
+    client.onCommandReply((cmd, evt) => {
+        verticalMoveReply =
+            cmd.type === 'MOVE_CARET' &&
+            evt.type === 'SELECTION_CHANGED' &&
+            isVerticalMove(cmd.direction);
+    });
+
     client.subscribe((ev: Event) => {
         if (ev.type === 'SELECTION_CHANGED') {
             /* Issue #280 — the zoom rides this very event; adopt it BEFORE
@@ -607,7 +631,22 @@ export function createEngineStore(client: EngineClient) {
             const dpr = deviceRatio();
             const cssRects = ev.rects.map((r) => toCssRect(r, dpr));
             latestSelectionView = { rects: cssRects, kind: ev.selection_kind };
-            setCaret(toCssRect(ev.caret, dpr));
+            const caretRect = toCssRect(ev.caret, dpr);
+            setCaret(caretRect);
+            const previousStory = editingStorySig();
+            const story = ev.editing_story;
+            caretFrame.push(
+                caretRect,
+                applyCaretAtOnce({
+                    vertical: verticalMoveReply,
+                    overlayHidden: caretHeldSig() || selectedImageSig() !== null,
+                    storyChanged:
+                        previousStory?.rid !== story?.rid ||
+                        previousStory?.area !== story?.area ||
+                        previousStory?.page !== story?.page,
+                }),
+            );
+            verticalMoveReply = false;
             setCaretLogical(ev.range.end);
             setSelection({
                 range: ev.range,
@@ -732,6 +771,9 @@ export function createEngineStore(client: EngineClient) {
 
     return {
         caret,
+        /** Issue #559 - the caret rect the overlays draw (coalesced to one
+         *  update per frame; vertical moves apply at once). */
+        overlayCaret,
         caretLogical,
         selection,
         attrsAtCaret,

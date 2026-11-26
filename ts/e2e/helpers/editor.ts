@@ -119,10 +119,21 @@ export async function documentText(page: Page): Promise<string> {
 
 /** Wait until every command already posted has been answered, WITHOUT
  *  touching the selection (a worker round-trip behind the queue). Unlike
- *  {@link documentText}, which SELECT_ALLs. */
+ *  {@link documentText}, which SELECT_ALLs.
+ *
+ *  Issue #559 - and until the DOM overlays have applied those answers: the
+ *  caret overlay draws the newest caret ONCE per animation frame (a vertical
+ *  move applies at once), so a spec that reads `.caret` right after `settle`
+ *  must wait one frame. The frame callback that applies a reply was queued
+ *  while the reply was handled - before this round-trip resolved - so one
+ *  more rAF callback runs after it; the second covers a reply handled in the
+ *  same task as this one. */
 export async function settle(page: Page): Promise<void> {
     await page.evaluate(async () => {
         await (window as any).__dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+        await new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        );
     });
 }
 
