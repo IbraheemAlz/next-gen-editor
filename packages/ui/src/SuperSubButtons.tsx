@@ -17,12 +17,15 @@
  */
 import { type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './SuperSubButtons.css';
 
 export const SuperSubButtons: Component = () => {
     const cmd = createEditorCommands();
     const state = createEditorState();
 
+    /* Issue #449 - formatting is refused by read-only / comments / forms. */
+    const gate = protectionGate(state, 'toggleFormatting');
     const isSuper = () => state.attrsAtCaret()?.script === 'Superscript';
     const isSub = () => state.attrsAtCaret()?.script === 'Subscript';
 
@@ -43,7 +46,8 @@ export const SuperSubButtons: Component = () => {
                 aria-label="Superscript"
                 aria-pressed={isSuper()}
                 data-active={isSuper()}
-                title="Superscript"
+                disabled={gate.locked()}
+                title={gate.title('Superscript')}
                 onClick={() => void toggleSuper()}
             >
                 X<sup>2</sup>
@@ -54,7 +58,8 @@ export const SuperSubButtons: Component = () => {
                 aria-label="Subscript"
                 aria-pressed={isSub()}
                 data-active={isSub()}
-                title="Subscript"
+                disabled={gate.locked()}
+                title={gate.title('Subscript')}
                 onClick={() => void toggleSub()}
             >
                 X<sub>2</sub>

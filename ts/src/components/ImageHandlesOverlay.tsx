@@ -36,6 +36,7 @@
  * command below hands that chain back, so selection, drag, resize and
  * the wrap picker work on them exactly as on body pictures. */
 import { For, Show, createSignal } from 'solid-js';
+import { createEditorState } from '@nge/core';
 import { ImageWrapPicker } from '@nge/ui';
 import type { EngineClient } from '../engine/engine-client';
 import { sameImageAddr, type EngineStore, type ImageRectCss } from '../state/engine-store';
@@ -70,6 +71,12 @@ export function ImageHandlesOverlay(props: {
     client: EngineClient;
     pageIdx: number;
 }) {
+    /* Issue #449 - a protected document refuses RESIZE_IMAGE / MOVE_IMAGE
+       (every mode): the handles stay as the selection's outline but stop
+       answering the pointer and say why, instead of ending a drag in a
+       refusal toast. */
+    const editorState = createEditorState();
+    const refusal = () => editorState.protectionRefusal('resizeImage', 'moveImage');
     /* Optimistic size during a drag, in CSS px — null when not dragging. */
     const [liveSize, setLiveSize] = createSignal<{ w: number; h: number } | null>(null);
     /* Issue #69 — optimistic translation during a body drag (CSS px). */
@@ -111,7 +118,7 @@ export function ImageHandlesOverlay(props: {
      *  `MOVE_IMAGE` on release (one undo entry, like the resize path). */
     const startMove = (e: PointerEvent): void => {
         const im = selected();
-        if (!im || !im.floating) return;
+        if (!im || !im.floating || refusal() !== undefined) return;
         e.preventDefault();
         e.stopPropagation();
         const addr = { path: im.path, at: im.at, story: im.story };
@@ -164,7 +171,7 @@ export function ImageHandlesOverlay(props: {
         e.preventDefault();
         e.stopPropagation();
         const im = selected();
-        if (!im) return;
+        if (!im || refusal() !== undefined) return;
         /* Capture the resize address up front — a mid-drag refresh must
            not repoint the commit at a different image. */
         const addr = { path: im.path, at: im.at, story: im.story };
@@ -246,6 +253,7 @@ export function ImageHandlesOverlay(props: {
             {(b) => (
                 <div
                     class="image-handles"
+                    data-locked={refusal() !== undefined ? 'true' : 'false'}
                     style={{
                         left: `${b().left}px`,
                         top: `${b().top}px`,
@@ -274,7 +282,9 @@ export function ImageHandlesOverlay(props: {
                     <Show when={selected()?.floating}>
                         <div
                             class="image-body-drag"
-                            title="Drag to reposition the floating image"
+                            title={
+                                refusal()?.title ?? 'Drag to reposition the floating image'
+                            }
                             onPointerDown={startMove}
                         />
                     </Show>
@@ -282,10 +292,11 @@ export function ImageHandlesOverlay(props: {
                         {(handle) => (
                             <div
                                 class={`image-handle image-handle--${handle.id}`}
+                                title={refusal()?.title}
                                 style={{
                                     left: `${handle.fx * 100}%`,
                                     top: `${handle.fy * 100}%`,
-                                    cursor: handle.cursor,
+                                    cursor: refusal() !== undefined ? 'not-allowed' : handle.cursor,
                                 }}
                                 onPointerDown={(e) => startDrag(handle, e)}
                             />

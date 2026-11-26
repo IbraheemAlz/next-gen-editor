@@ -49,6 +49,7 @@ import {
     type LogicalRange,
 } from '@nge/core';
 import { commentFocusFor } from './commentFocus';
+import { protectionGate } from './protectionGate';
 import { activeCommentId, comparePos } from './commentConnector';
 import './CommentsRail.css';
 
@@ -151,6 +152,12 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
     const engine = useEngine();
     const cmd = createEditorCommands();
     const editorState = createEditorState();
+    /* Issue #449 - replying, resolving and deleting are comment-class
+       commands: admitted by comments-only and tracked-changes protection,
+       refused by read-only and forms. */
+    const replyGate = protectionGate(editorState, 'replyToComment');
+    const resolveGate = protectionGate(editorState, 'resolveComment');
+    const deleteGate = protectionGate(editorState, 'deleteComment');
     const [comments, setComments] = createSignal<CommentSnapshot[]>([]);
     const [error, setError] = createSignal<string | null>(null);
     /* Issue #27 — one reply draft open at a time, keyed by the
@@ -368,7 +375,8 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                                         type="button"
                                         aria-label="Reply to comment"
                                         aria-expanded={replyFor() === t.root.id}
-                                        title="Reply"
+                                        disabled={replyGate.locked()}
+                                        title={replyGate.title('Reply')}
                                         onClick={() => toggleReplyDraft(t.root.id)}
                                     >
                                         ↩ Reply
@@ -377,7 +385,8 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                                         class="nge-btn nge-cm__action"
                                         type="button"
                                         aria-label={t.root.resolved ? 'Reopen comment' : 'Resolve comment'}
-                                        title={t.root.resolved ? 'Reopen' : 'Resolve'}
+                                        disabled={resolveGate.locked()}
+                                        title={resolveGate.title(t.root.resolved ? 'Reopen' : 'Resolve')}
                                         onClick={() => void toggleResolved(t.root)}
                                     >
                                         {t.root.resolved ? '↺ Reopen' : '✓ Resolve'}
@@ -386,7 +395,8 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                                         class="nge-btn nge-cm__action nge-cm__action--danger"
                                         type="button"
                                         aria-label="Delete comment"
-                                        title="Delete comment (removes its replies too)"
+                                        disabled={deleteGate.locked()}
+                                        title={deleteGate.title('Delete comment (removes its replies too)')}
                                         onClick={() => void remove(t.root.id)}
                                     >
                                         🗑 Delete
@@ -417,7 +427,7 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                                             <button
                                                 class="nge-btn nge-btn--primary nge-cm__action"
                                                 type="button"
-                                                disabled={replyText().trim() === ''}
+                                                disabled={replyText().trim() === '' || replyGate.locked()}
                                                 onClick={() => void submitReply(t.root.id)}
                                             >
                                                 Reply

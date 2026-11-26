@@ -42,6 +42,7 @@ import {
 import { focusEditorInput } from './focus';
 import { slotFromTheme, substituteMarker, substituteMarkerTitle } from './fontSourceMarkers';
 import { FontDialog } from './FontDialog';
+import { protectionGate } from './protectionGate';
 import './FontPickers.css';
 
 const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72];
@@ -55,6 +56,9 @@ export const FontPickers: Component = () => {
     const [dialogOpen, setDialogOpen] = createSignal(false);
 
     const ready = createMemo(() => state.selection() !== undefined);
+    /* Issue #449 - family / size / the Font dialog all send APPLY_FORMATTING,
+       which read-only, comments-only and forms protection refuse. */
+    const gate = protectionGate(state, 'setFontFamily', 'setFontSize', 'setSlotFormat');
     /* Issue #423 — the slot the caret's text reads, and its resolution. */
     const slotKey = () =>
         state.caretFontSlot() === 'ComplexScript' ? 'complex_script' : 'latin';
@@ -124,13 +128,14 @@ export const FontPickers: Component = () => {
                     class="nge-font__family"
                     aria-label="Font family"
                     aria-busy={pending()}
-                    disabled={!ready() || pending()}
+                    disabled={!ready() || pending() || gate.locked()}
                     title={
-                        substitute()
+                        gate.refusal()?.title ??
+                        (substitute()
                             ? `${resolvedName()} — ${fromTheme() ? 'from the document theme, ' : ''}not installed; laid out with ${substitute()}`
                             : fromTheme()
                               ? `${resolvedName()} — from the document theme`
-                              : 'Font family'
+                              : 'Font family')
                     }
                     data-nge-command="APPLY_FORMATTING"
                     onChange={(e) => void applyFamily(e.currentTarget.value)}
@@ -184,9 +189,9 @@ export const FontPickers: Component = () => {
                 max="400"
                 step="1"
                 aria-label="Font size (pt)"
-                disabled={!ready()}
+                disabled={!ready() || gate.locked()}
                 value={currentSize()}
-                title="Font size in points"
+                title={gate.title('Font size in points')}
                 onChange={(e) => void applySize(parseInt(e.currentTarget.value, 10))}
                 onKeyDown={(e) => {
                     /* Enter commits and returns focus to the document
@@ -208,8 +213,10 @@ export const FontPickers: Component = () => {
                 type="button"
                 aria-haspopup="dialog"
                 aria-label="Font dialog: format Latin and complex-script text separately"
-                title="Font… — family, size, bold and italic for Latin text and for complex scripts (Arabic, Hebrew, …) separately"
-                disabled={!ready()}
+                title={gate.title(
+                    'Font… — family, size, bold and italic for Latin text and for complex scripts (Arabic, Hebrew, …) separately',
+                )}
+                disabled={!ready() || gate.locked()}
                 data-nge-command="APPLY_FORMATTING"
                 onClick={() => setDialogOpen(true)}
             >

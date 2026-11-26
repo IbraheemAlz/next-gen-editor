@@ -58,6 +58,7 @@ import {
     type BridgeTabStop,
 } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { protectionGate } from './protectionGate';
 import './Ruler.css';
 
 const PT_PER_INCH = 72;
@@ -162,6 +163,10 @@ const A4_FALLBACK = {
 export const Ruler: Component<RulerProps> = (props) => {
     const cmd = createEditorCommands();
     const state = createEditorState();
+    /* Issue #449 - indents and tab stops are refused by every protection
+       mode: the strip and its handles stop answering the pointer (and
+       say why) instead of letting a drag end in a refusal toast. */
+    const gate = protectionGate(state, 'setParagraphIndent', 'setTabStops');
     const [drag, setDrag] = createSignal<DragState | null>(null);
     /* Local copy of tab stops the user is editing this gesture — bound
      * to the engine's authoritative list on every SELECTION_CHANGED
@@ -483,7 +488,7 @@ export const Ruler: Component<RulerProps> = (props) => {
     /* ---- click handlers -------------------------------------------- */
 
     const onStripPointerDown = (e: PointerEvent) => {
-        if (e.button !== 0) return;
+        if (e.button !== 0 || gate.locked()) return;
         const target = e.target as HTMLElement;
         /* Clicks on a handle / marker have their own onpointerdown. */
         if (target.closest('.nge-ruler__handle, .nge-ruler__tab')) return;
@@ -504,6 +509,7 @@ export const Ruler: Component<RulerProps> = (props) => {
     ) => {
         e.stopPropagation();
         e.preventDefault();
+        if (gate.locked()) return;
         /* Seed `livePt` at the marker's CURRENT content-pt (not 0) so the
          * handle does not snap to the leading edge on grab, and a plain
          * click with no drag commits the same value — no pixel drift. The
@@ -520,6 +526,7 @@ export const Ruler: Component<RulerProps> = (props) => {
     const onTabPointerDown = (e: PointerEvent, index: number, stop: BridgeTabStop) => {
         e.stopPropagation();
         e.preventDefault();
+        if (gate.locked()) return;
         /* Cache the current stops list as the "local" baseline so a
          * drag mutates this copy until release. A plain click (no
          * meaningful move) commits as a kind-cycle. */
@@ -630,8 +637,10 @@ export const Ruler: Component<RulerProps> = (props) => {
             ref={rulerEl}
             class="nge-ruler"
             data-rtl={isRtl() ? 'true' : 'false'}
+            data-locked={gate.locked() ? 'true' : 'false'}
             role="region"
             aria-label="Page ruler — drag to set indents and tab stops"
+            title={gate.refusal()?.title}
         >
             <div
                 ref={stripEl}
@@ -685,11 +694,14 @@ export const Ruler: Component<RulerProps> = (props) => {
                             data-kind={stop.kind}
                             data-leader={leaderName(stop.leader) !== null ? 'true' : 'false'}
                             style={{ left: `${contentPtToLeftPx(stop.position_pt)}px` }}
-                            title={`${tabKindName(stop.kind)} tab stop${
-                                leaderName(stop.leader) !== null
-                                    ? ` (${leaderName(stop.leader)})`
-                                    : ''
-                            } — click to cycle kind, drag off ruler to remove`}
+                            disabled={gate.locked()}
+                            title={gate.title(
+                                `${tabKindName(stop.kind)} tab stop${
+                                    leaderName(stop.leader) !== null
+                                        ? ` (${leaderName(stop.leader)})`
+                                        : ''
+                                } — click to cycle kind, drag off ruler to remove`,
+                            )}
                             onPointerDown={(e) => onTabPointerDown(e, i(), stop)}
                             onPointerUp={(e) => onTabPointerUp(e, i(), stop)}
                         >
@@ -712,7 +724,8 @@ export const Ruler: Component<RulerProps> = (props) => {
                     class="nge-ruler__handle nge-ruler__handle--first-line"
                     role="slider"
                     aria-label={firstLineLabel()}
-                    title={firstLineLabel()}
+                    title={gate.title(firstLineLabel())}
+                    aria-disabled={gate.locked()}
                     aria-valuenow={liveFirstLinePt()}
                     style={{ left: `${contentPtToLeftPx(liveFirstLinePt())}px` }}
                     onPointerDown={(e) => onHandlePointerDown(e, 'first-line')}
@@ -723,7 +736,8 @@ export const Ruler: Component<RulerProps> = (props) => {
                     class="nge-ruler__handle nge-ruler__handle--left-indent"
                     role="slider"
                     aria-label={startIndentLabel()}
-                    title={startIndentLabel()}
+                    title={gate.title(startIndentLabel())}
+                    aria-disabled={gate.locked()}
                     aria-valuenow={liveLeftIndentPt()}
                     style={{ left: `${contentPtToLeftPx(liveLeftIndentPt())}px` }}
                     onPointerDown={(e) => onHandlePointerDown(e, 'left-indent')}
@@ -739,7 +753,8 @@ export const Ruler: Component<RulerProps> = (props) => {
                     class="nge-ruler__handle nge-ruler__handle--end-indent"
                     role="slider"
                     aria-label={endIndentLabel()}
-                    title={endIndentLabel()}
+                    title={gate.title(endIndentLabel())}
+                    aria-disabled={gate.locked()}
                     aria-valuenow={liveEndIndentPt()}
                     style={{
                         left: `${contentPtToLeftPx(contentWidthPt() - liveEndIndentPt())}px`,

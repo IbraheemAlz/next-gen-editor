@@ -76,6 +76,23 @@ discipline.
     caret MOVED (`caretReveal.ts` `caretMoved`: another rect or story, or
     a new `document_revision`), so a key that leaves the caret in place
     never scrolls (`ts/e2e/caret-extent.spec.ts`).
+  - `src/createZoomAnchor.ts` + `src/zoomAnchor.ts` — issue #312: a zoom
+    keeps the caret (when its centre is in view, else the viewport centre)
+    where it is. ONE trigger: `createEditorCommands().setZoom` calls
+    `beginZoomAnchor(engine, scale)` before it dispatches, so every zoom
+    control, the Fit-width mode and a host's own widget anchor alike (a raw
+    `SET_ZOOM` dispatch is a test hook and does not). A host that scrolls
+    mounts `createZoomAnchor({ viewport, caretBox, pages })` once (the
+    shell's `ts/src/components/ZoomAnchor.tsx`; `caretBox` is the same
+    mapping the caret reveal uses, `pages` the MEASURED page cards in
+    scroll-content px). The anchor is a document position - page card +
+    distance below it at 100 % + viewport offset (`zoomAnchor.ts`, pure,
+    unit-tested) - and is put back after the zoom's repaint, told by the
+    page geometry on `PAINTED` (a zoom repaint keeps `PAINTED.version`), then
+    once more a frame later; a chain of requests shares one anchor until
+    the last zoom asked for has painted. `SET_ZOOM` is a `VIEW` command
+    (`reveals_caret: false`), so the #387 / #557 caret reveal never fires
+    for a zoom. e2e: `ts/e2e/zoom-anchor.spec.ts`.
   - `src/types.ts` — re-exports every bridge type from the wasm-pack
     output plus the `EngineClientLike` + `EngineClientSnapshots`
     interface contracts. **Single point of coupling** to
@@ -125,6 +142,27 @@ discipline.
   ```
 - **Disabled states** must not visually disappear — `disabled` + reduced
   opacity + accessible `title` tooltip explaining why.
+- **Document protection (issue #449).** A control that dispatches a command
+  the open document's enforced `w:documentProtection` would refuse renders
+  `disabled` with the reason as its `title`, never a live button that only
+  answers with a `Protected` toast. ONE query decides:
+  `createEditorState().protectionRefusal(...methods)` (`@nge/core`
+  `protection.ts`) names the FACADE members the control calls and answers
+  with the first refusal among the commands they dispatch
+  (`FACADE_METHOD_COMMANDS`), asked of the generated `protectionAdmits`
+  table (`bridge::ProtectionClass::admitted_by`) plus the one refinement a
+  control can see (every non-exempt command is refused while a header /
+  footer / note / text-box story is edited). Never restate the class table
+  in TS. In `@nge/ui` wrap it with `protectionGate(state, 'member', ...)`
+  (`packages/ui/src/protectionGate.ts`: `locked()` / `title(base)` /
+  `refusal()`). `ts/src/protection-coverage.test.ts` fails when a shelf
+  component calls a gated `cmd.<member>()` without naming it in a
+  `protectionGate(` / `protectionRefusal(` call (a dialog is covered by its
+  opener: `OPENED_BY` there). Keyboard paths (typing, shortcuts) still get
+  the engine's refusal toast - they have no control to disable. e2e:
+  `ts/e2e/protection-controls.spec.ts` (fixtures `readonly_protected.docx`,
+  `comments_protected.docx`, `tracked_protected.docx`, from
+  `format_docx::test_fixtures::protected_text_docx`).
 
 ## Honest UX — never ship Phantom UI
 

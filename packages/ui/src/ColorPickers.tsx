@@ -24,6 +24,7 @@ import {
 } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { protectionGate } from './protectionGate';
 import './ColorPickers.css';
 
 const TEXT_SWATCHES: string[] = [
@@ -133,6 +134,9 @@ export const ColorPickers: Component = () => {
     const state = createEditorState();
 
     const ready = createMemo(() => state.selection() !== undefined);
+    /* Issue #449 - colour is APPLY_FORMATTING: read-only / comments / forms
+       protection refuse it, so the triggers lock instead of toasting. */
+    const gate = protectionGate(state, 'setColor', 'setHighlight');
     const [openTextPicker, setOpenTextPicker] = createSignal(false);
     const [openHighlightPicker, setOpenHighlightPicker] = createSignal(false);
     const [lastHighlightHex, setLastHighlightHex] = createSignal('#ffff00');
@@ -187,8 +191,8 @@ export const ColorPickers: Component = () => {
                     aria-haspopup="dialog"
                     aria-expanded={openTextPicker()}
                     aria-label="Text colour"
-                    title="Text colour"
-                    disabled={!ready()}
+                    title={gate.title('Text colour')}
+                    disabled={!ready() || gate.locked()}
                     onClick={() => {
                         setOpenHighlightPicker(false);
                         setOpenTextPicker((v) => !v);
@@ -220,8 +224,8 @@ export const ColorPickers: Component = () => {
                     aria-haspopup="dialog"
                     aria-expanded={openHighlightPicker()}
                     aria-label="Highlight colour"
-                    title="Highlight colour"
-                    disabled={!ready()}
+                    title={gate.title('Highlight colour')}
+                    disabled={!ready() || gate.locked()}
                     onClick={() => {
                         setOpenTextPicker(false);
                         setOpenHighlightPicker((v) => !v);

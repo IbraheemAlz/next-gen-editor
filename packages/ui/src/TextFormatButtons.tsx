@@ -16,6 +16,7 @@
  */
 import { type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './TextFormatButtons.css';
 
 export const TextFormatButtons: Component = () => {
@@ -23,6 +24,8 @@ export const TextFormatButtons: Component = () => {
     const state = createEditorState();
 
     const ready = () => state.selection() !== undefined;
+    /* Issue #449 - formatting is refused by read-only / comments / forms. */
+    const gate = protectionGate(state, 'toggleFormatting');
     const isBold = () => state.attrsAtCaret()?.bold === true;
     const isItalic = () => state.attrsAtCaret()?.italic === true;
     const isStrike = () => state.attrsAtCaret()?.strike === true;
@@ -39,8 +42,8 @@ export const TextFormatButtons: Component = () => {
                 aria-pressed={isBold()}
                 data-active={isBold()}
                 data-mixed={mixedBold()}
-                disabled={!ready()}
-                title="Bold (Ctrl+B)"
+                disabled={!ready() || gate.locked()}
+                title={gate.title('Bold (Ctrl+B)')}
                 onClick={() => void cmd.toggleFormatting('Bold')}
             >
                 B
@@ -52,8 +55,8 @@ export const TextFormatButtons: Component = () => {
                 aria-pressed={isItalic()}
                 data-active={isItalic()}
                 data-mixed={mixedItalic()}
-                disabled={!ready()}
-                title="Italic (Ctrl+I)"
+                disabled={!ready() || gate.locked()}
+                title={gate.title('Italic (Ctrl+I)')}
                 onClick={() => void cmd.toggleFormatting('Italic')}
             >
                 I
@@ -65,8 +68,8 @@ export const TextFormatButtons: Component = () => {
                 aria-pressed={isStrike()}
                 data-active={isStrike()}
                 data-mixed={mixedStrike()}
-                disabled={!ready()}
-                title="Strikethrough"
+                disabled={!ready() || gate.locked()}
+                title={gate.title('Strikethrough')}
                 onClick={() => void cmd.toggleFormatting('Strike')}
             >
                 S

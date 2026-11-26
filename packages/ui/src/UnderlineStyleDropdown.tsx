@@ -14,6 +14,7 @@ import {
     createEditorState,
     type UnderlineStyle,
 } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './UnderlineStyleDropdown.css';
 
 const STYLES: { value: UnderlineStyle; label: string; preview: string }[] = [
@@ -36,6 +37,9 @@ export const UnderlineStyleDropdown: Component<UnderlineStyleDropdownProps> = (p
     const [lastStyle, setLastStyle] = createSignal<UnderlineStyle>(
         props.defaultStyle ?? 'Single',
     );
+
+    /* Issue #449 - formatting is refused by read-only / comments / forms. */
+    const gate = protectionGate(state, 'toggleFormatting', 'setUnderline');
 
     const isActive = () => {
         const attrs = state.attrsAtCaret();
@@ -67,7 +71,8 @@ export const UnderlineStyleDropdown: Component<UnderlineStyleDropdownProps> = (p
                 aria-label="Underline"
                 aria-pressed={isActive()}
                 data-active={isActive()}
-                title="Underline (Ctrl+U)"
+                disabled={gate.locked()}
+                title={gate.title('Underline (Ctrl+U)')}
                 onClick={() => void applyToggle()}
             >
                 <span class="nge-underline__glyph">U</span>
@@ -78,7 +83,8 @@ export const UnderlineStyleDropdown: Component<UnderlineStyleDropdownProps> = (p
                 aria-haspopup="menu"
                 aria-expanded={open()}
                 aria-label="Underline style"
-                title="Underline style"
+                disabled={gate.locked()}
+                title={gate.title('Underline style')}
                 onClick={() => setOpen((v) => !v)}
             >
                 ▾

@@ -51,6 +51,7 @@ import {
     type FieldKind,
 } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { protectionGate } from './protectionGate';
 import './FieldButtons.css';
 
 interface FieldEntry {
@@ -100,10 +101,21 @@ export const FieldButtons: Component = () => {
 
     const inCell = createMemo(() => state.cellProperties() !== undefined);
     const ready = createMemo(() => state.selection() !== undefined);
-    const canInsert = createMemo(() => ready() && !inCell());
+    /* Issue #449 - inserting, rebuilding and re-coding fields are refused
+       by every protection mode; toggling the CODE VIEW (a view switch) is
+       exempt and stays available. */
+    const insertGate = protectionGate(state, 'insertField');
+    const tocGate = protectionGate(state, 'insertToc');
+    const updateGate = protectionGate(state, 'updateFields');
+    const codeGate = protectionGate(state, 'setFieldInstruction');
+    const canInsert = createMemo(() => ready() && !inCell() && !insertGate.locked());
     /* Issue #81 — a TOC is body-only. */
     const canInsertToc = createMemo(
-        () => canInsert() && state.editingStory() === undefined,
+        () =>
+            ready() &&
+            !inCell() &&
+            !tocGate.locked() &&
+            state.editingStory() === undefined,
     );
     const inToc = () => field()?.keyword === 'TOC';
     const codes = () => state.fieldCodeView();
@@ -136,7 +148,7 @@ export const FieldButtons: Component = () => {
 
     const update = async () => {
         setOpen(false);
-        if (!ready()) return;
+        if (!ready() || updateGate.locked()) return;
         await cmd.updateFields();
         focusEditorInput();
     };
@@ -151,7 +163,7 @@ export const FieldButtons: Component = () => {
     const applyCode = async () => {
         const f = field();
         const code = draft().trim();
-        if (!f || code.length === 0) return;
+        if (!f || code.length === 0 || codeGate.locked()) return;
         setEditing(false);
         /* Address the field by its own end so the edit lands on THIS
            field whatever the selection did meanwhile. */
@@ -198,7 +210,10 @@ export const FieldButtons: Component = () => {
                             <button
                                 class="nge-fields__chip-btn"
                                 type="button"
-                                title="Rebuild the table of contents from the current headings and page numbers (F9)"
+                                disabled={updateGate.locked()}
+                                title={updateGate.title(
+                                    'Rebuild the table of contents from the current headings and page numbers (F9)',
+                                )}
                                 onClick={() => void update()}
                             >
                                 Update table
@@ -207,7 +222,8 @@ export const FieldButtons: Component = () => {
                         <button
                             class="nge-fields__chip-btn"
                             type="button"
-                            title="Edit this field’s code"
+                            disabled={codeGate.locked()}
+                            title={codeGate.title('Edit this field’s code')}
                             aria-expanded={editing()}
                             onClick={() => {
                                 setDraft(f().instruction);
@@ -234,9 +250,10 @@ export const FieldButtons: Component = () => {
                                 type="button"
                                 disabled={!canInsert()}
                                 title={
-                                    inCell()
+                                    insertGate.refusal()?.title ??
+                                    (inCell()
                                         ? 'Fields inside table cells aren’t supported yet'
-                                        : f.hint
+                                        : f.hint)
                                 }
                                 onClick={() => void insert(f.kind)}
                             >
@@ -252,9 +269,10 @@ export const FieldButtons: Component = () => {
                             type="button"
                             disabled={!canInsertToc()}
                             title={
-                                canInsertToc()
+                                tocGate.refusal()?.title ??
+                                (canInsertToc()
                                     ? 'Insert a table of contents built from the document’s headings (levels 1–3, linked, with page numbers)'
-                                    : 'A table of contents goes in the document body — not in a table, header, footer or note'
+                                    : 'A table of contents goes in the document body — not in a table, header, footer or note')
                             }
                             onClick={() => void insertToc()}
                         >
@@ -267,7 +285,8 @@ export const FieldButtons: Component = () => {
                             role="menuitem"
                             class="nge-fields__item"
                             type="button"
-                            title="Re-resolve every field in the document (F9)"
+                            disabled={updateGate.locked()}
+                            title={updateGate.title('Re-resolve every field in the document (F9)')}
                             onClick={() => void update()}
                         >
                             <span>Update fields</span>
@@ -320,8 +339,10 @@ export const FieldButtons: Component = () => {
                         <button
                             class="nge-btn nge-fields__editor-btn"
                             type="submit"
-                            disabled={draft().trim().length === 0}
-                            title="Replace the field code (the result updates on the next F9)"
+                            disabled={draft().trim().length === 0 || codeGate.locked()}
+                            title={codeGate.title(
+                                'Replace the field code (the result updates on the next F9)',
+                            )}
                         >
                             Apply
                         </button>

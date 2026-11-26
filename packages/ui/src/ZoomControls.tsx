@@ -29,6 +29,12 @@
  * step, Ctrl+0, a raw `SET_ZOOM`) leaves the mode. The mode is shared by
  * every widget on the same engine, like the zoom itself.
  *
+ * Issue #312 — every zoom this widget asks for goes through
+ * `cmd.setZoom`, which a scrolling host's `createZoomAnchor` hooks: the
+ * caret (or, with no caret in view, the viewport centre) stays where it
+ * is on screen instead of the view jumping with the resized pages. The
+ * widget itself does nothing for it.
+ *
  * Shortcuts:
  *   Ctrl+0 → 100%
  *   Ctrl+= → step up

@@ -22,13 +22,9 @@ import {
     Show,
     type Component,
 } from 'solid-js';
-import {
-    createEditorCommands,
-    createEditorState,
-    protectionAdmits,
-    useEngine,
-} from '@nge/core';
+import { createEditorCommands, createEditorState, useEngine } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { protectionGate } from './protectionGate';
 import './ReviewControls.css';
 
 export interface ReviewControlsProps {
@@ -71,18 +67,27 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
     /* Issue #345 — the open document's enforced protection: Track
      * Changes is locked by every mode (`trackedChanges` forces it on),
      * accepting / rejecting is refused by every mode, comments only by
-     * `readOnly` / `forms` (`protectionAdmits`, generated from
-     * `bridge::meta`). Disabled with a reason, never a silent refusal. */
-    const protectedTitle = (label: string, type: string, locked = false) => {
-        const mode = state.protection();
-        if (mode === undefined) return gatedTitle(label);
-        return locked || !protectionAdmits(mode, type)
-            ? 'Not available: this document is protected'
-            : gatedTitle(label);
-    };
+     * `readOnly` / `forms`. Issue #449 — the refusal comes from the one
+     * query (`state.protectionRefusal`: the generated class table +
+     * the facade map), the same one every other shelf control asks.
+     * Disabled with a reason, never a silent refusal. */
+    const trackGate = protectionGate(state, 'toggleTrackChanges');
+    const commentGate = protectionGate(state, 'insertComment');
+    const revisionsGate = protectionGate(state, 'acceptAllRevisions', 'rejectAllRevisions');
+    /* `trackedChanges` ADMITS the toggle class, yet the engine refuses to
+     * switch recording off (it is forced on): the one refinement that
+     * depends on the payload, so it is stated here. */
     const trackLocked = () => state.protection() !== undefined;
-    const commentLocked = () => !protectionAdmits(state.protection(), 'INSERT_COMMENT');
-    const revisionsLocked = () => !protectionAdmits(state.protection(), 'ACCEPT_ALL_REVISIONS');
+    const trackTitle = (label: string) => {
+        const refusal = trackGate.refusal();
+        if (refusal !== undefined) return refusal.title;
+        if (trackLocked()) return 'Track Changes is required by this document’s protection (tracked changes only)';
+        return gatedTitle(label);
+    };
+    const protectedTitle = (label: string, gate: { refusal: () => { title: string } | undefined }) =>
+        gate.refusal()?.title ?? gatedTitle(label);
+    const commentLocked = commentGate.locked;
+    const revisionsLocked = revisionsGate.locked;
 
     /* Propagate the author input to the engine review identity so
      * tracked revisions stop being stamped with the "You" default.
@@ -192,10 +197,8 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 aria-label="Track changes"
                 aria-pressed={tracking()}
                 data-active={tracking()}
-                title={protectedTitle(
+                title={trackTitle(
                     tracking() ? 'Track Changes — recording' : 'Track Changes — off',
-                    'TOGGLE_TRACK_CHANGES',
-                    trackLocked(),
                 )}
                 disabled={inStory() || trackLocked()}
                 onClick={() => void onToggleTracking()}
@@ -208,7 +211,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="New comment"
-                title={protectedTitle('New comment on selected range', 'INSERT_COMMENT')}
+                title={protectedTitle('New comment on selected range', commentGate)}
                 disabled={!ready() || inStory() || commentLocked()}
                 onClick={() => setCommentDraftOpen((v) => !v)}
             >
@@ -220,7 +223,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="Accept all revisions"
-                title={protectedTitle('Accept all tracked changes', 'ACCEPT_ALL_REVISIONS')}
+                title={protectedTitle('Accept all tracked changes', revisionsGate)}
                 disabled={inStory() || revisionsLocked()}
                 onClick={() => void acceptAll()}
             >
@@ -232,7 +235,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="Reject all revisions"
-                title={protectedTitle('Reject all tracked changes', 'REJECT_ALL_REVISIONS')}
+                title={protectedTitle('Reject all tracked changes', revisionsGate)}
                 disabled={inStory() || revisionsLocked()}
                 onClick={() => void rejectAll()}
             >

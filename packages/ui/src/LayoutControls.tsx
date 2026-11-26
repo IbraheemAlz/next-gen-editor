@@ -38,6 +38,7 @@ import {
 } from '@nge/core';
 import { PageSetupDialog } from './PageSetupDialog';
 import { ParagraphBordersDialog } from './ParagraphBordersDialog';
+import { protectionGate } from './protectionGate';
 import './LayoutControls.css';
 
 const DEFAULT_GUTTER_PT = 36;
@@ -81,6 +82,16 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
     const hasCaret = createMemo(() => state.selection() !== undefined);
     const inStory = createMemo(() => state.editingStory() !== undefined);
     const ready = createMemo(() => hasCaret() && !inStory());
+    /* Issue #449 - columns, breaks, borders and page setup are refused by
+     * every protection mode; grey them with the reason instead of a toast. */
+    const columnsGate = protectionGate(state, 'setColumnsAtCaret');
+    const breaksGate = protectionGate(state, 'insertPageBreak', 'insertSectionBreak');
+    const bordersGate = protectionGate(state, 'setParagraphBorders', 'clearParagraphBorders');
+    const pageSetupGate = protectionGate(
+        state,
+        'setPageMarginsAtCaret',
+        'setPageOrientationAtCaret',
+    );
 
     const setColumns = async (n: number) => {
         if (!ready()) return;
@@ -130,7 +141,8 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
                 <select
                     class="nge-layout__select"
                     aria-label="Section columns"
-                    disabled={!ready()}
+                    title={columnsGate.title('Section columns')}
+                    disabled={!ready() || columnsGate.locked()}
                     value={columnCount().toString()}
                     onChange={(e) =>
                         void setColumns(parseInt(e.currentTarget.value, 10))
@@ -149,8 +161,8 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
                     aria-haspopup="menu"
                     aria-expanded={breaksOpen()}
                     aria-label="Insert break"
-                    title="Insert a page or section break"
-                    disabled={!ready()}
+                    title={breaksGate.title('Insert a page or section break')}
+                    disabled={!ready() || breaksGate.locked()}
                     onClick={() => setBreaksOpen((v) => !v)}
                 >
                     <span class="nge-layout__icon" aria-hidden="true">↵</span>
@@ -255,8 +267,8 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
                 aria-label="Paragraph borders"
                 aria-pressed={hasBorders()}
                 data-active={hasBorders()}
-                title="Paragraph borders…"
-                disabled={!ready()}
+                title={bordersGate.title('Paragraph borders…')}
+                disabled={!ready() || bordersGate.locked()}
                 onClick={() => setBordersOpen(true)}
             >
                 <span class="nge-layout__borders-icon" aria-hidden="true">▢</span>
@@ -267,8 +279,8 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
                 class="nge-btn nge-layout__btn"
                 type="button"
                 aria-label="Page setup"
-                title="Page setup (margins + orientation)"
-                disabled={!ready()}
+                title={pageSetupGate.title('Page setup (margins + orientation)')}
+                disabled={!ready() || pageSetupGate.locked()}
                 onClick={() => setPageSetupOpen(true)}
             >
                 <span class="nge-layout__icon" aria-hidden="true">▤</span>

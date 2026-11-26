@@ -25,11 +25,13 @@
 import { For, Show, createMemo, type Component } from 'solid-js';
 import {
     createEditorCommands,
+    createEditorState,
     type BlockPath,
     type ImageWrapMode,
     type TextBoxHop,
 } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { protectionGate } from './protectionGate';
 import './ImageWrapPicker.css';
 
 /** The picture the picker acts on. */
@@ -71,6 +73,9 @@ const MODES: { mode: ImageWrapMode; label: string; glyph: string; hint: string }
 
 export const ImageWrapPicker: Component<ImageWrapPickerProps> = (props) => {
     const cmd = createEditorCommands();
+    /* Issue #449 - SET_IMAGE_WRAP is refused by every protection mode. */
+    const state = createEditorState();
+    const gate = protectionGate(state, 'setImageWrap');
     const target = createMemo(() => props.image());
     const floating = createMemo(() => target()?.floating === true);
 
@@ -101,11 +106,12 @@ export const ImageWrapPicker: Component<ImageWrapPickerProps> = (props) => {
                             aria-checked={target()?.wrap === m.mode}
                             aria-label={m.label}
                             title={
-                                floating()
+                                gate.refusal()?.title ??
+                                (floating()
                                     ? m.hint
-                                    : 'Wrap modes: engine pending for inline pictures (inline ↔ floating conversion)'
+                                    : 'Wrap modes: engine pending for inline pictures (inline ↔ floating conversion)')
                             }
-                            disabled={!floating()}
+                            disabled={!floating() || gate.locked()}
                             onClick={() => void choose(m.mode)}
                         >
                             <span class="nge-image-wrap__glyph" aria-hidden="true">

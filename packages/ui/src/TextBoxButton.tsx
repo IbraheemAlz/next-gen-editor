@@ -17,6 +17,7 @@
 import { Show, createMemo, type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { protectionGate } from './protectionGate';
 import './TextBoxButton.css';
 
 export const TextBoxButton: Component = () => {
@@ -27,9 +28,15 @@ export const TextBoxButton: Component = () => {
     const inCell = createMemo(() => state.cellProperties() !== undefined);
     const story = () => state.editingStory();
     const inTextBox = createMemo(() => story()?.area === 'TextBox');
-    const canInsert = createMemo(() => ready() && !inCell() && story() === undefined);
+    /* Issue #449 - INSERT_TEXT_BOX is refused by every protection mode. */
+    const gate = protectionGate(state, 'insertTextBox');
+    const canInsert = createMemo(
+        () => ready() && !inCell() && story() === undefined && !gate.locked(),
+    );
 
     const why = (): string | undefined => {
+        const refusal = gate.refusal();
+        if (refusal !== undefined) return refusal.title;
         if (story() !== undefined) return 'Return to the document body first';
         if (inCell()) return 'Text boxes inside table cells aren’t supported yet';
         return undefined;

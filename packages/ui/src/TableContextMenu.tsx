@@ -33,6 +33,7 @@ import {
     type PathStep,
 } from '@nge/core';
 import { CellPropertiesDialog } from './CellPropertiesDialog';
+import { protectionGate } from './protectionGate';
 import './TableContextMenu.css';
 
 interface TableContext {
@@ -109,6 +110,23 @@ export const TableContextMenu: Component<TableContextMenuProps> = (props) => {
         }
         return undefined;
     });
+
+    /* Issue #449 - every table edit is refused by every protection mode
+     * (tables are not tracked changes, forms or comments), so the whole
+     * menu locks with the reason instead of toasting per click. */
+    const gate = protectionGate(
+        state,
+        'insertRow',
+        'insertColumn',
+        'deleteRow',
+        'deleteColumn',
+        'mergeCells',
+        'splitCell',
+        'setTableBidiVisual',
+        'deleteTable',
+        'setCellShading',
+        'setCellBorders',
+    );
 
     const close = () => setOpen(false);
     const isInTable = () => ctx() !== undefined;
@@ -245,17 +263,17 @@ export const TableContextMenu: Component<TableContextMenuProps> = (props) => {
             >
                 <li role="presentation" class="nge-tcm__group">Rows</li>
                 <li role="none">
-                    <button class="nge-tcm__item" type="button" role="menuitem" onClick={() => void insertAbove()}>
+                    <button class="nge-tcm__item" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={() => void insertAbove()}>
                         Insert row above
                     </button>
                 </li>
                 <li role="none">
-                    <button class="nge-tcm__item" type="button" role="menuitem" onClick={() => void insertBelow()}>
+                    <button class="nge-tcm__item" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={() => void insertBelow()}>
                         Insert row below
                     </button>
                 </li>
                 <li role="none">
-                    <button class="nge-tcm__item nge-tcm__item--danger" type="button" role="menuitem" onClick={() => void deleteRowFn()}>
+                    <button class="nge-tcm__item nge-tcm__item--danger" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={() => void deleteRowFn()}>
                         Delete row
                     </button>
                 </li>
@@ -263,17 +281,17 @@ export const TableContextMenu: Component<TableContextMenuProps> = (props) => {
                 <li role="presentation" class="nge-tcm__separator" />
                 <li role="presentation" class="nge-tcm__group">Columns</li>
                 <li role="none">
-                    <button class="nge-tcm__item" type="button" role="menuitem" onClick={() => void insertLeft()}>
+                    <button class="nge-tcm__item" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={() => void insertLeft()}>
                         Insert column left
                     </button>
                 </li>
                 <li role="none">
-                    <button class="nge-tcm__item" type="button" role="menuitem" onClick={() => void insertRight()}>
+                    <button class="nge-tcm__item" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={() => void insertRight()}>
                         Insert column right
                     </button>
                 </li>
                 <li role="none">
-                    <button class="nge-tcm__item nge-tcm__item--danger" type="button" role="menuitem" onClick={() => void deleteColumnFn()}>
+                    <button class="nge-tcm__item nge-tcm__item--danger" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={() => void deleteColumnFn()}>
                         Delete column
                     </button>
                 </li>
@@ -285,22 +303,25 @@ export const TableContextMenu: Component<TableContextMenuProps> = (props) => {
                         class="nge-tcm__item"
                         type="button"
                         role="menuitem"
-                        disabled={!isMultiCell()}
-                        title={isMultiCell() ? 'Merge selected cells' : 'Select multiple cells to merge'}
+                        disabled={!isMultiCell() || gate.locked()}
+                        title={
+                            gate.refusal()?.title ??
+                            (isMultiCell() ? 'Merge selected cells' : 'Select multiple cells to merge')
+                        }
                         onClick={() => void mergeSelected()}
                     >
                         Merge cells
                     </button>
                 </li>
                 <li role="none">
-                    <button class="nge-tcm__item" type="button" role="menuitem" onClick={() => void splitCellFn()}>
+                    <button class="nge-tcm__item" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={() => void splitCellFn()}>
                         Split cell
                     </button>
                 </li>
 
                 <li role="presentation" class="nge-tcm__separator" />
                 <li role="none">
-                    <button class="nge-tcm__item" type="button" role="menuitem" onClick={openCellProperties}>
+                    <button class="nge-tcm__item" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={openCellProperties}>
                         Cell Properties…
                     </button>
                 </li>
@@ -313,7 +334,8 @@ export const TableContextMenu: Component<TableContextMenuProps> = (props) => {
                         type="button"
                         role="menuitemcheckbox"
                         aria-checked={isRtlTable()}
-                        title="Right-to-left table: the first column is shown on the right"
+                        disabled={gate.locked()}
+                        title={gate.title('Right-to-left table: the first column is shown on the right')}
                         onClick={() => void toggleRtlTable()}
                     >
                         <span class="nge-tcm__check" aria-hidden="true">
@@ -323,7 +345,7 @@ export const TableContextMenu: Component<TableContextMenuProps> = (props) => {
                     </button>
                 </li>
                 <li role="none">
-                    <button class="nge-tcm__item nge-tcm__item--danger" type="button" role="menuitem" onClick={() => void deleteTableFn()}>
+                    <button class="nge-tcm__item nge-tcm__item--danger" type="button" role="menuitem" disabled={gate.locked()} title={gate.refusal()?.title} onClick={() => void deleteTableFn()}>
                         Delete table
                     </button>
                 </li>
