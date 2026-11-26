@@ -38,6 +38,7 @@ impl Prl<'_> {
 pub(crate) const SGC_PARAGRAPH: u8 = 1;
 pub(crate) const SGC_CHARACTER: u8 = 2;
 pub(crate) const SGC_SECTION: u8 = 4;
+pub(crate) const SGC_TABLE: u8 = 5;
 
 /// The operand length of `op` given the bytes after it, `None` when the
 /// bytes cannot hold it.

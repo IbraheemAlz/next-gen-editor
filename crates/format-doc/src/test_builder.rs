@@ -22,8 +22,17 @@
 //!   one `LPStd` per [`StyleSheetSpec::styles`] slot) and the font table
 //!   (`SttbfFfn`: a 1-byte `cchData` and an `FFN` per [`DocSpec::fonts`]
 //!   name).
-//! - Both inside a version-3 compound file from `format-docx`'s
+//! - **`Data` stream**, only when [`DocSpec::data`] is not empty (what a
+//!   `sprmPHugePapx` points into).
+//! - All inside a version-3 compound file from `format-docx`'s
 //!   `opc::cfb::test_writer`.
+//!
+//! Tables (issue #576): a cell's last paragraph ends with
+//! [`Para::cell`] (0x07 + `sprmPFInTable`), a row with [`Para::row_end`]
+//! (0x07 + `sprmPFTtp` + the row's table sprms, [`sprm::def_table`] …); a
+//! nested table's paragraphs carry [`sprm::itap`] and end their cells /
+//! rows with [`sprm::inner_cell`] / [`sprm::inner_row_end`] on a `'\r'`
+//! mark.
 
 use crate::cp1252;
 
@@ -69,6 +78,52 @@ impl Para {
     pub fn plain(text: &str) -> Para {
         Para::new(vec![run(text, Vec::new())], Vec::new())
     }
+
+    /// The last paragraph of a depth-1 table cell: `text`, a 0x07 cell
+    /// mark, `sprmPFInTable` plus `papx`.
+    pub fn cell(text: &str, papx: Vec<u8>) -> Para {
+        let mut g = sprm::in_table(true);
+        g.extend(papx);
+        Para {
+            runs: vec![run(text, Vec::new())],
+            papx: g,
+            mark: '\u{7}',
+            ..Para::new(Vec::new(), Vec::new())
+        }
+    }
+
+    /// A depth-1 row mark (TTP): an empty 0x07 paragraph with
+    /// `sprmPFInTable`, `sprmPFTtp` and the row's table sprms `tap`.
+    pub fn row_end(tap: Vec<u8>) -> Para {
+        let mut g = sprm::in_table(true);
+        g.extend(sprm::row_end(true));
+        g.extend(tap);
+        Para {
+            runs: Vec::new(),
+            papx: g,
+            mark: '\u{7}',
+            ..Para::new(Vec::new(), Vec::new())
+        }
+    }
+}
+
+/// One `TC80` ([MS-DOC] 2.9.316) of [`sprm::def_table`]; the default is
+/// a plain, unmerged cell with no borders and no preferred width.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Tc {
+    /// `TCGRF.horzMerge`: 0 not merged, 1 merged into the cell before,
+    /// 2 first cell of a merged set.
+    pub horz_merge: u8,
+    /// `TCGRF.vertMerge`: 0 not merged, 1 continues the cell above,
+    /// 3 starts a vertical merge.
+    pub vert_merge: u8,
+    /// `TCGRF.vertAlign`: 0 top, 1 center, 2 bottom.
+    pub v_align: u8,
+    /// `TCGRF.ftsWidth` + `wWidth`: the preferred width (3 = twips).
+    pub fts_width: u8,
+    pub w_width: u16,
+    /// Top, left, bottom, right `Brc80MayBeNil`s, raw.
+    pub borders: [[u8; 4]; 4],
 }
 
 /// A run of `text` formatted by `chpx`.
@@ -113,6 +168,8 @@ pub struct DocSpec {
     pub prcs: Vec<Vec<u8>>,
     /// Sections: `(end_cp, sepx grpprl)`. Empty = no `PlcfSed`.
     pub sections: Vec<(u32, Vec<u8>)>,
+    /// The `Data` stream's bytes (written only when not empty).
+    pub data: Vec<u8>,
     /// `FibBase.fComplex`.
     pub fast_saved: bool,
     /// `FibBase.fEncrypted` (nothing is actually encrypted).
@@ -133,6 +190,7 @@ impl DocSpec {
             physical_order: Vec::new(),
             prcs: Vec::new(),
             sections: Vec::new(),
+            data: Vec::new(),
             fast_saved: false,
             encrypted: false,
             one_table: true,
@@ -420,6 +478,88 @@ pub mod sprm {
     pub fn row_end(on: bool) -> Vec<u8> {
         prl(0x2417, &[u8::from(on)])
     }
+    /// `sprmPItap`: the table depth.
+    pub fn itap(depth: i32) -> Vec<u8> {
+        prl(0x6649, &depth.to_le_bytes())
+    }
+    /// `sprmPFInnerTableCell`: this paragraph mark ends a nested cell.
+    pub fn inner_cell(on: bool) -> Vec<u8> {
+        prl(0x244B, &[u8::from(on)])
+    }
+    /// `sprmPFInnerTtp`: this paragraph mark ends a nested row.
+    pub fn inner_row_end(on: bool) -> Vec<u8> {
+        prl(0x244C, &[u8::from(on)])
+    }
+    /// `sprmPHugePapx`: the paragraph's properties are the `PrcData` at
+    /// `offset` of the Data stream (see [`super::prc_data`]).
+    pub fn huge_papx(offset: u32) -> Vec<u8> {
+        prl(0x6646, &offset.to_le_bytes())
+    }
+    /// `sprmTDefTable`: the cell edges (twips from the left margin, one
+    /// more than the cells) and one `TC80` per cell (missing ones are the
+    /// default).
+    pub fn def_table(edges: &[i16], tcs: &[super::Tc]) -> Vec<u8> {
+        let cells = edges.len().saturating_sub(1);
+        let mut body = vec![cells as u8];
+        for e in edges {
+            body.extend_from_slice(&e.to_le_bytes());
+        }
+        for tc in tcs {
+            let grf = u16::from(tc.horz_merge & 3)
+                | (u16::from(tc.vert_merge & 3) << 5)
+                | (u16::from(tc.v_align & 3) << 7)
+                | (u16::from(tc.fts_width & 7) << 9);
+            body.extend_from_slice(&grf.to_le_bytes());
+            body.extend_from_slice(&tc.w_width.to_le_bytes());
+            for b in tc.borders {
+                body.extend_from_slice(&b);
+            }
+        }
+        let mut operand = ((body.len() + 1) as u16).to_le_bytes().to_vec();
+        operand.extend(body);
+        prl(0xD608, &operand)
+    }
+    /// `sprmTTableBorders80`: the same `Brc80` on all six table edges.
+    pub fn table_borders80(brc: [u8; 4]) -> Vec<u8> {
+        let mut operand = vec![0x18];
+        for _ in 0..6 {
+            operand.extend_from_slice(&brc);
+        }
+        prl(0xD605, &operand)
+    }
+    /// A `Brc80`: width in eighths of a point, `BrcType`, `Ico`.
+    pub fn brc80(width: u8, brc_type: u8, ico: u8) -> [u8; 4] {
+        [width, brc_type, ico, 0]
+    }
+    /// `sprmTSetShd`: cells `first .. lim` shaded with a solid RGB fill.
+    pub fn set_shd(first: u8, lim: u8, rgb: [u8; 3]) -> Vec<u8> {
+        let mut operand = vec![12, first, lim];
+        operand.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 0]);
+        operand.extend_from_slice(&[0, 0, 0, 0xFF]);
+        operand.extend_from_slice(&1u16.to_le_bytes());
+        prl(0xD62D, &operand)
+    }
+    /// `sprmTVertMerge`: cell `itc` of the row — 1 continues the cell
+    /// above, 3 starts a merge.
+    pub fn vert_merge(itc: u8, flag: u8) -> Vec<u8> {
+        prl(0xD62B, &[2, itc, flag])
+    }
+    /// `sprmTJc` (logical): 0 leading edge, 1 centered, 2 trailing edge.
+    pub fn table_jc(jc: u16) -> Vec<u8> {
+        prl(0x548A, &jc.to_le_bytes())
+    }
+    /// `sprmTFBiDi`: a right-to-left table.
+    pub fn table_rtl(on: bool) -> Vec<u8> {
+        prl(0x560B, &u16::from(on).to_le_bytes())
+    }
+    /// `sprmTDyaRowHeight`: positive "at least", negative "exact" (twips).
+    pub fn row_height(dya: i16) -> Vec<u8> {
+        prl(0x9407, &dya.to_le_bytes())
+    }
+    /// `sprmTTableHeader`: a header row.
+    pub fn header_row(on: bool) -> Vec<u8> {
+        prl(0x3404, &[u8::from(on)])
+    }
     /// `sprmPIlfo`: list membership.
     pub fn list(ilfo: i16) -> Vec<u8> {
         prl(0x460B, &ilfo.to_le_bytes())
@@ -598,6 +738,14 @@ pub fn styled_sample() -> DocSpec {
             ),
         ])
     }
+}
+
+/// A `PrcData` (2.9.209): `cbGrpprl` then the grpprl — what a
+/// `sprmPHugePapx` points at in the Data stream.
+pub fn prc_data(grpprl: &[u8]) -> Vec<u8> {
+    let mut v = (grpprl.len() as u16).to_le_bytes().to_vec();
+    v.extend_from_slice(grpprl);
+    v
 }
 
 /// A `Prm0` (2.9.215): `isprm` with a one-byte operand.
@@ -960,5 +1108,9 @@ pub fn streams(spec: &DocSpec) -> (Vec<u8>, Vec<u8>) {
 pub fn build(spec: &DocSpec) -> Vec<u8> {
     let (word, table) = streams(spec);
     let table_name = if spec.one_table { "1Table" } else { "0Table" };
-    format_docx::opc::cfb::test_writer::build(&[("WordDocument", &word), (table_name, &table)])
+    let mut entries: Vec<(&str, &[u8])> = vec![("WordDocument", &word), (table_name, &table)];
+    if !spec.data.is_empty() {
+        entries.push(("Data", &spec.data));
+    }
+    format_docx::opc::cfb::test_writer::build(&entries)
 }

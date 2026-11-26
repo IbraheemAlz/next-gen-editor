@@ -939,32 +939,55 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   `TooLarge` -> `PackageTooLarge`, a non-Word OLE file or a Word 6/95 FIB
   -> `InvalidDocument`. A new `DocError` variant does not compile there
   until classified.
-- **Honest UX.** What the importer does not model (tables as plain
-  paragraphs, list markers, pictures, fields kept as their result,
-  subdocuments, a damaged style sheet / font table) is COUNTED during the
-  walk and rides `DocumentLoaded.warnings` as
+- **Honest UX.** What the importer does not model (list markers,
+  pictures, fields kept as their result, subdocuments, tables nested deeper
+  than the model nests, a damaged style sheet / font table) is COUNTED
+  during the walk and rides `DocumentLoaded.warnings` as
   `ReadWarningKind::LegacyContentNotImported` (one entry per class); a newly
   modelled class drops its counter, a newly skipped one adds one — never
   drop content silently.
+- **Tables (issue #576, [MS-DOC] 2.4.3 / 2.6.3).** Every paragraph mark
+  records its table depth (`sprmPFInTable` / `sprmPItap` / `sprmPDtap`) and
+  what it ends (`table::Membership::mark`: 0x07 = a cell mark, + `sprmPFTtp`
+  the row mark; deeper, a 0x0D with `sprmPFInnerTableCell` /
+  `sprmPFInnerTtp`); a row mark carries its row's table sprms (`tap::Tap`,
+  read through `sprmPHugePapx` from the Data stream when they did not fit the
+  FKP page). `table::assemble` builds `engine::Table`s in ONE pass with an
+  explicit stack (no recursion), depth bounded by `format_docx`'s
+  `MAX_TABLE_NESTING_DEPTH` (deeper paragraphs stay plain paragraphs of the
+  deepest cell, counted as `LegacyContent::Tables`). Rows of different
+  direction / table style are different tables. The grid is the UNION of
+  every row's `rgdxaCenter` edges (cells span the columns between their
+  edges — Word 2000+ horizontal merges; the Word 97 `horzMerge` flags /
+  `sprmTMerge` fold merged cells into their first one; vertical merges from
+  `TCGRF.vertMerge` / `sprmTVertMerge`), at most 255 columns (`grid_span` is a
+  `u8`, else one even column per cell + autofit); the indent is the leading
+  edge, `fAutofit` off = `TableLayout::Fixed`. A body or cell that would end
+  in a table gets an empty paragraph after it. Tests build tables with
+  `test_builder::{Para::cell, Para::row_end, sprm::def_table, Tc}`.
 - **Styles and fonts (issue #575) go through the ONE cascade.** The STSH
   (`stsh.rs`) and the `SttbfFfn` (`ffn.rs`) land in the structures the
   `.docx` reader fills (`styles.rs`): paragraph styles become
   `DocumentTree::styles` entries holding their OWN `UpxPapx` / `UpxChpx`
   (`based_on` / `next` by id; Normal, `istd` 0, is `is_default`); the
   default CHP (10 pt, `Stshif.ftcAsci` / `STSHI.ftcBi`) is
-  `style_run_defaults`; a paragraph keeps `style_id` (`None` for Normal, as
-  Word writes a `.docx`) and its direct PAPX as `direct_overrides`, and its
-  `props` come from `StyleCascade::recompute` — never a second fold in the
-  importer. A run's span is its character-style chain (`sprmCIstd`, id in
-  `char_style`) + direct CHPX; the paragraph style is folded at layout like
-  `.docx`. Toggle operands 0x80 / 0x81 resolve against the chain under the
-  level that carries them (`CharProps::resolve`); a physical `sprmPJc80`
-  against the style's direction. Font slots keep the font table's NAME
+  `style_run_defaults`; a paragraph — body or table cell alike, and the
+  empty paragraphs table assembly adds (`StyleSheet::empty_paragraph`) —
+  keeps `style_id` (`None` for Normal, as Word writes a `.docx`) and its
+  direct PAPX as `direct_overrides`, and its `props` come from
+  `StyleCascade::recompute` — never a second fold in the importer. A run's
+  span is its character-style chain (`sprmCIstd`, id in `char_style`) +
+  direct CHPX; the paragraph style is folded at layout like `.docx`. Toggle
+  operands 0x80 / 0x81 resolve against the chain under the level that
+  carries them (`CharProps::resolve`); a physical `sprmPJc80` against the
+  style's direction. Font slots keep the font table's NAME
   (`family_from_docx`), so layout substitutes it like a `<w:rFonts>` name.
   Ids: built-in `sti` -> Word's id (`Heading1`; always for Normal and the
-  headings), others from the name, unique. A damaged sheet / table never
-  refuses the document: what it holds is used and `LegacyContent::Styles`
-  reports the damage.
+  headings), others from the name, unique. TABLE styles (`stk` 3, a row's
+  `sprmTIstd`) are not imported: the engine has no table-style model, so a
+  table takes only its direct TAP. A damaged sheet / table never refuses the
+  document: what it holds is used and `LegacyContent::Styles` reports the
+  damage.
 - **Borrowed code.** Parts of `format-doc` are modified from WordCraft
   (MIT OR Apache-2.0): every such file carries the "Modified from
   WordCraft ... at commit ..." header and a row in `THIRD-PARTY-NOTICES.md`.

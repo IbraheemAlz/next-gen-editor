@@ -32,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 
 use engine::{
-    MAX_STYLE_CHAIN, ParaProperties, ParagraphStyle, SpanStyle, StyleCascade, TextDirection,
+    Block, MAX_STYLE_CHAIN, ParaProperties, ParagraphStyle, SpanStyle, StyleCascade, TextDirection,
 };
 
 use crate::ffn::FontTable;
@@ -295,6 +295,28 @@ impl StyleSheet {
     /// The engine's cascade over the paragraph styles (build one per walk).
     pub(crate) fn cascade(&self) -> StyleCascade<'_> {
         StyleCascade::new(&self.paragraph_styles)
+    }
+
+    /// Format every paragraph of `blocks` — table cells at any depth
+    /// included — through the engine's cascade: the empty paragraphs
+    /// table assembly adds (after a table, closing a cell) carry no
+    /// properties of their own. Idempotent for the walk's paragraphs, which
+    /// `recompute` already formatted. An explicit stack, no recursion.
+    pub(crate) fn recompute_all(&self, blocks: &mut [Block]) {
+        let cascade = self.cascade();
+        let mut stack: Vec<&mut Block> = blocks.iter_mut().collect();
+        while let Some(block) = stack.pop() {
+            match block {
+                Block::Paragraph(p) => cascade.recompute(p, &self.para_defaults),
+                Block::Table(t) => {
+                    for row in &mut t.rows {
+                        for cell in &mut row.cells {
+                            stack.extend(cell.blocks.iter_mut());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn slot(&self, istd: Option<u16>) -> &Slot {

@@ -75,11 +75,7 @@ const P_DYA_BEFORE: u16 = 0xA413;
 const P_DYA_AFTER: u16 = 0xA414;
 const P_DYA_LINE: u16 = 0x6412;
 const P_F_BIDI: u16 = 0x2441;
-/// Table / list membership — read only to report what is not imported.
-pub(crate) const P_F_IN_TABLE: u16 = 0x2416;
-pub(crate) const P_F_TTP: u16 = 0x2417;
-pub(crate) const P_F_INNER_TTP: u16 = 0x244C;
-pub(crate) const P_ITAP: u16 = 0x6649;
+/// List membership — read only to report what is not imported.
 pub(crate) const P_ILFO: u16 = 0x460B;
 
 // Section sprms (2.6.4).
@@ -114,9 +110,9 @@ const ICO: [[u8; 3]; 17] = [
     [192, 192, 192],
 ];
 
-/// An `Ico` (2.9.119) as an opaque colour; `None` for 0 ("automatic", or
-/// no highlight) and for an index past the palette.
-fn ico(i: u8) -> Option<[u8; 4]> {
+/// The colour of an `Ico` (2.9.119), `None` for "automatic" (0) — for
+/// `sprmCHighlight`, no highlight — and for a value outside the palette.
+pub(crate) fn ico_rgb(i: u8) -> Option<[u8; 4]> {
     match i {
         0 => None,
         i => ICO.get(usize::from(i)).map(|[r, g, b]| [*r, *g, *b, 255]),
@@ -249,7 +245,7 @@ impl CharProps {
                     _ => UnderlineStyle::Single,
                 });
             }
-            C_ICO => s.color = ico(p.operand.first().copied().unwrap_or(0)),
+            C_ICO => s.color = ico_rgb(p.operand.first().copied().unwrap_or(0)),
             /* COLORREF (2.9.43): red, green, blue, fAuto (0xFF = automatic). */
             C_CV => {
                 if let [r, g, b, auto, ..] = p.operand {
@@ -258,7 +254,7 @@ impl CharProps {
             }
             /* sprmCHighlight: an Ico, 0 = no highlight (the `.docx`
             reader's `<w:highlight>` lands on `bg_color` too). */
-            C_HIGHLIGHT => s.bg_color = ico(p.operand.first().copied().unwrap_or(0)),
+            C_HIGHLIGHT => s.bg_color = ico_rgb(p.operand.first().copied().unwrap_or(0)),
             /* sprmCIss: 0 normal, 1 superscript, 2 subscript. */
             C_ISS => {
                 s.vert_align = Some(match p.operand.first().copied() {
@@ -342,11 +338,12 @@ pub(crate) struct ParaProps {
     /// value depends on it, and it may come from a later sprm or from a
     /// style.
     jc: Option<(u8, bool)>,
-    /// Membership the importer does not model, reported instead.
-    pub(crate) in_table: bool,
-    pub(crate) row_end: bool,
-    /// `sprmPIlfo`: `Some(true)` a list paragraph, `Some(false)` an
-    /// explicit "no list" (it cancels a style's list), `None` unset.
+    /// Table membership: the paragraph's table depth and whether its
+    /// mark ends a cell or a row ([`crate::table`]).
+    pub(crate) table: crate::table::Membership,
+    /// `sprmPIlfo`: `Some(true)` a list paragraph (list numbering is not
+    /// imported: reported instead), `Some(false)` an explicit "no list" (it
+    /// cancels a style's list), `None` unset.
     pub(crate) list: Option<bool>,
 }
 
@@ -428,11 +425,10 @@ impl ParaProps {
                     Some(_) => TextDirection::Rtl,
                 });
             }
-            P_F_IN_TABLE => self.in_table = p.operand.first().is_some_and(|&v| v != 0),
-            P_ITAP => self.in_table |= crate::le::u32_at(p.operand, 0).is_some_and(|v| v != 0),
-            P_F_TTP | P_F_INNER_TTP => self.row_end = p.operand.first().is_some_and(|&v| v != 0),
             P_ILFO => self.list = i16_of(p).map(|v| v != 0 && v != -2047),
-            _ => {}
+            _ => {
+                self.table.apply(p);
+            }
         }
     }
 

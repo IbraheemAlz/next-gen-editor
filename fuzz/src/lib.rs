@@ -53,8 +53,10 @@ pub fn run_docx_reader(data: &[u8]) {
 /// input's head with the rest overwriting its streams). The importer must
 /// never panic; an `Err` is a correct answer to a hostile file. An import
 /// must hold the model's rules: Word's bounds, text XML can carry, spans
-/// inside their paragraph, and a `.docx` save whose parts carry no
-/// forbidden character.
+/// inside their paragraph (table cells included, issue #576), tables of
+/// the shape the engine reads (rows, cells, blocks ending in a paragraph,
+/// spans inside the grid, no deeper than the `.docx` model nests), and a
+/// `.docx` save whose parts carry no forbidden character.
 pub fn run_doc_reader(data: &[u8]) {
     if data.starts_with(&format_docx::opc::cfb::CFB_SIGNATURE) {
         check_doc_import(data);
@@ -100,10 +102,8 @@ pub fn check_doc_import(bytes: &[u8]) {
             );
         }
     }
-    for block in doc.blocks.iter() {
-        let engine::Block::Paragraph(p) = block else {
-            panic!("doc_reader: the importer made a table");
-        };
+    assert_doc_table_shapes(doc.blocks.iter(), 0);
+    engine::for_each_paragraph_nested(doc.blocks.iter(), &mut |_, p| {
         assert!(
             p.text
                 .chars()
@@ -131,7 +131,7 @@ pub fn check_doc_import(bytes: &[u8]) {
                 "doc_reader: a paragraph names a style the table does not hold"
             );
         }
-    }
+    });
     if let Ok(saved) = format_docx::save_docx(doc)
         && let Some((part, offset, ch)) = format_docx::first_forbidden_character(&saved)
     {
@@ -139,6 +139,40 @@ pub fn check_doc_import(bytes: &[u8]) {
             "doc_reader: the .docx save of an import holds U+{:04X} in {part} at {offset}",
             ch as u32
         );
+    }
+}
+
+/// Issue #576 — every table the `.doc` importer builds: rows, each with
+/// cells, each with blocks ending in a paragraph; a grid; every span
+/// inside it; nesting no deeper than the `.docx` model's
+/// (`MAX_TABLE_NESTING_DEPTH`, the outermost table at 0).
+fn assert_doc_table_shapes<'a>(blocks: impl Iterator<Item = &'a engine::Block>, depth: u32) {
+    for block in blocks {
+        let engine::Block::Table(t) = block else {
+            continue;
+        };
+        assert!(
+            depth < format_docx::parts::table::MAX_TABLE_NESTING_DEPTH,
+            "doc_reader: a table nested past the model's depth"
+        );
+        assert!(
+            !t.rows.is_empty() && !t.grid.is_empty(),
+            "doc_reader: a table without rows or grid"
+        );
+        for row in &t.rows {
+            assert!(!row.cells.is_empty(), "doc_reader: a row without cells");
+            for cell in &row.cells {
+                assert!(
+                    cell.props.grid_span >= 1 && usize::from(cell.props.grid_span) <= t.grid.len(),
+                    "doc_reader: a cell span outside the grid"
+                );
+                assert!(
+                    matches!(cell.blocks.last(), Some(engine::Block::Paragraph(_))),
+                    "doc_reader: a cell that does not end in a paragraph"
+                );
+                assert_doc_table_shapes(cell.blocks.iter(), depth + 1);
+            }
+        }
     }
 }
 

@@ -8,9 +8,10 @@
 // paragraph mark's properties too (2.4.6.2); fields keep their cached result
 // as plain text; special characters map onto this engine's model through the
 // `engine::text_input` rules (line break U+2028, page break U+000C, nothing
-// XML 1.0 cannot carry); inline objects, notes, tables and lists are counted
-// for the import report instead of modelled; bounded by a character budget
-// and a paragraph cap; each paragraph is formatted through its style
+// XML 1.0 cannot carry); inline objects, notes and lists are counted for the
+// import report instead of modelled; every paragraph mark records its table
+// structure (issue #576, `table.rs`); bounded by a character budget and a
+// paragraph cap; each paragraph is formatted through its style
 // (`PapxInFkp.istd`) and the engine's one style cascade, each run through its
 // character style (issue #575). See THIRD-PARTY-NOTICES.md at the
 // repository root.
@@ -30,10 +31,13 @@ use engine::{Paragraph, SpanStyle, StyleCascade, StyleRun, TextDirection};
 
 use crate::error::DocError;
 use crate::fkp::Bins;
+use crate::le::{u16_at, u32_at};
 use crate::piece::{Piece, PieceTable, PrmRef, char_in_piece};
 use crate::props::{CharProps, ParaProps};
-use crate::sprm::{Prl, SGC_CHARACTER, SGC_PARAGRAPH, prls, sprm_of_isprm};
+use crate::sprm::{Prl, SGC_CHARACTER, SGC_PARAGRAPH, SGC_TABLE, prls, sprm_of_isprm};
 use crate::styles::StyleSheet;
+use crate::table::{MarkKind, TableMark};
+use crate::tap::Tap;
 
 /// Most characters materialised from one document, whatever its stream
 /// claims: well above any real document (Word's own text limit for a .doc
@@ -44,6 +48,12 @@ pub const MAX_TEXT_CHARS: u64 = 32 << 20;
 pub const MAX_PARAGRAPHS: usize = 200_000;
 /// Fields nest at most this deep before the extra levels are only counted.
 const MAX_FIELD_DEPTH: usize = 64;
+/// `sprmPHugePapx` (2.6.2): the paragraph's properties live in the Data
+/// stream.
+const P_HUGE_PAPX: u16 = 0x6646;
+/// A chain of `sprmPHugePapx` is followed at most this many times (the
+/// specification requires it to end; a hostile file need not).
+const MAX_HUGE_PAPX_HOPS: usize = 4;
 
 /// Everything the walk reads.
 pub(crate) struct Walk<'a> {
@@ -51,6 +61,9 @@ pub(crate) struct Walk<'a> {
     pub(crate) pieces: &'a PieceTable,
     pub(crate) chpx: &'a Bins,
     pub(crate) papx: &'a Bins,
+    /// The `Data` stream (empty when the file has none): where a
+    /// `sprmPHugePapx` keeps a paragraph's properties.
+    pub(crate) data: &'a [u8],
     /// The CPs at which sections end, ascending: the section mark (0x0C)
     /// just before each is a paragraph mark, not a page break.
     pub(crate) sect_ends: &'a [u32],
@@ -61,7 +74,6 @@ pub(crate) struct Walk<'a> {
 /// What the walk could not model, counted for the import report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Skipped {
-    pub(crate) table_paragraphs: u32,
     pub(crate) list_paragraphs: u32,
     pub(crate) objects: u32,
     pub(crate) fields: u32,
@@ -71,6 +83,10 @@ pub(crate) struct Skipped {
 pub(crate) struct ParaOut {
     pub(crate) paragraph: Paragraph,
     pub(crate) end_cp: u32,
+    /// Its table depth and what its mark ends ([`crate::table`]).
+    pub(crate) mark: TableMark,
+    /// A row mark's table properties.
+    pub(crate) tap: Option<Box<Tap>>,
 }
 
 /// One paragraph being assembled.
@@ -144,7 +160,7 @@ impl ParaBuild {
 }
 
 /// Apply a piece's `Prm` sprms of group `sgc` through `f`.
-fn for_prm_sprms(prm: PrmRef<'_>, sgc: u8, mut f: impl FnMut(&Prl)) {
+pub(crate) fn for_prm_sprms(prm: PrmRef<'_>, sgc: u8, mut f: impl FnMut(&Prl)) {
     match prm {
         PrmRef::None => {}
         PrmRef::Short { isprm, val } => {
@@ -206,6 +222,39 @@ impl Walk<'_> {
         props
     }
 
+    /// The grpprl of a PapxInFkp. When its first Prl is
+    /// `sprmPHugePapx` (2.6.2), the paragraph's properties are the grpprl
+    /// of the `PrcData` (2.9.209: `cbGrpprl`, a signed size, then the
+    /// grpprl) at that offset of the Data stream — the rest of the
+    /// in-page grpprl is not processed; a Huge PAPX anywhere else is
+    /// ignored. A row mark of a wide table needs this: its cell
+    /// definitions do not fit an FKP page. What cannot be read leaves the
+    /// in-page grpprl.
+    pub(crate) fn papx_grpprl<'w>(&'w self, grpprl: &'w [u8]) -> &'w [u8] {
+        let mut g = grpprl;
+        for _ in 0..MAX_HUGE_PAPX_HOPS {
+            let Some(p) = prls(g).next() else { break };
+            if p.op != P_HUGE_PAPX {
+                break;
+            }
+            let Some(at) = u32_at(p.operand, 0).map(|v| v as usize) else {
+                break;
+            };
+            let Some(cb) = u16_at(self.data, at).and_then(|v| usize::try_from(v as i16).ok())
+            else {
+                break;
+            };
+            let Some(next) = at
+                .checked_add(2)
+                .and_then(|from| self.data.get(from..from.checked_add(cb)?))
+            else {
+                break;
+            };
+            g = next;
+        }
+        g
+    }
+
     /// The direct paragraph formatting of the paragraph whose mark is the
     /// byte at `fc_mark` in `piece`: the FKP's PapxInFkp (its style, then
     /// its sprms), then the piece's Prm (2.4.6.2). Not finished: the
@@ -214,12 +263,27 @@ impl Walk<'_> {
         let mut pp = ParaProps::default();
         if let Some(run) = self.papx.lookup(self.word, fc_mark) {
             pp.istd = run.istd;
-            for p in prls(run.grpprl).filter(|p| p.sgc() == SGC_PARAGRAPH) {
+            for p in prls(self.papx_grpprl(run.grpprl)).filter(|p| p.sgc() == SGC_PARAGRAPH) {
                 pp.apply(&p);
             }
         }
         for_prm_sprms(self.pieces.prm(piece), SGC_PARAGRAPH, |p| pp.apply(p));
         pp
+    }
+
+    /// The table properties a row mark at byte `fc_mark` of `piece`
+    /// carries: the table sprms of its PapxInFkp, then of the piece's
+    /// Prm (2.4.3: "the properties of each row mark MUST define the cells
+    /// for that table row").
+    fn tap(&self, piece: &Piece, fc_mark: u32) -> Tap {
+        let mut tap = Tap::default();
+        if let Some(run) = self.papx.lookup(self.word, fc_mark) {
+            for p in prls(self.papx_grpprl(run.grpprl)).filter(|p| p.sgc() == SGC_TABLE) {
+                tap.apply(&p);
+            }
+        }
+        for_prm_sprms(self.pieces.prm(piece), SGC_TABLE, |p| tap.apply(p));
+        tap
     }
 
     /// Walk CPs `[0, ccp_text)`.
@@ -260,15 +324,15 @@ impl Walk<'_> {
                 let section_mark =
                     c == '\u{C}' && self.sect_ends.binary_search(&cp.saturating_add(1)).is_ok();
                 if c == '\r' || c == '\u{7}' || section_mark {
-                    /* 0x0D ends a paragraph, 0x07 a table cell or row
-                    (tables are not modelled: the cell's text becomes a
-                    paragraph), a section mark the section's last
-                    paragraph. */
+                    /* 0x0D ends a paragraph, 0x07 a table cell or row, a
+                    section mark the section's last paragraph. Every mark
+                    records what it ends in the table structure; a row
+                    mark its row's table properties (`table.rs` assembles
+                    them). */
                     let pp = self.para_props(piece, fc);
-                    let is_row_end = pp.row_end && pb.text.is_empty();
-                    if !is_row_end && (pp.in_table || c == '\u{7}') {
-                        skipped.table_paragraphs = skipped.table_paragraphs.saturating_add(1);
-                    }
+                    let mark = pp.table.mark(c);
+                    let tap =
+                        (mark.kind == MarkKind::RowEnd).then(|| Box::new(self.tap(piece, fc)));
                     if pp.list.or(self.styles.paragraph_list(pp.istd)) == Some(true) {
                         skipped.list_paragraphs = skipped.list_paragraphs.saturating_add(1);
                     }
@@ -280,21 +344,22 @@ impl Walk<'_> {
                         overflow_depth = 0;
                     }
                     let built = std::mem::take(&mut pb);
-                    /* A table row's end mark holds no text: it is the row,
-                    not a paragraph. */
-                    if !is_row_end {
-                        if out.len() >= MAX_PARAGRAPHS {
-                            return Err(DocError::TooLarge {
-                                what: "the number of paragraphs",
-                                max: MAX_PARAGRAPHS as u64,
-                            });
-                        }
-                        let mark = self.char_props(&mut cache, pi, piece, fc);
-                        out.push(ParaOut {
-                            paragraph: built.finish(pp, &mark, self.styles, &cascade),
-                            end_cp: cp + 1,
+                    if out.len() >= MAX_PARAGRAPHS {
+                        return Err(DocError::TooLarge {
+                            what: "the number of paragraphs",
+                            max: MAX_PARAGRAPHS as u64,
                         });
                     }
+                    /* The mark's own character formatting (`mark_style`);
+                    a cell / row mark's paragraph goes through the same
+                    style cascade as a body paragraph. */
+                    let mark_chp = self.char_props(&mut cache, pi, piece, fc);
+                    out.push(ParaOut {
+                        paragraph: built.finish(pp, &mark_chp, self.styles, &cascade),
+                        end_cp: cp + 1,
+                        mark,
+                        tap,
+                    });
                     cp += units;
                     cp_reached = cp;
                     continue;
@@ -362,6 +427,8 @@ impl Walk<'_> {
                     &cascade,
                 ),
                 end_cp: cp_reached,
+                mark: TableMark::default(),
+                tap: None,
             });
         }
         Ok((out, skipped))
