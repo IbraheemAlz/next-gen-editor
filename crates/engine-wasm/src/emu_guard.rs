@@ -86,3 +86,113 @@ pub(crate) fn check_command(cmd: &Command) -> Result<(), Box<Event>> {
         ))),
     }
 }
+
+/* The guard itself needs no engine: these run in a plain `cargo test`
+(the engine-level twins in `emu_guard_tests.rs` are `fuzz-native`-gated and
+drive the same refusals through `Engine::apply_sync`). */
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bridge::BlockPath;
+
+    fn resize(w: i64, h: i64) -> Command {
+        Command::ResizeImage {
+            path: BlockPath::top(0),
+            at: 1,
+            width_emu: w,
+            height_emu: h,
+            story: Vec::new(),
+        }
+    }
+
+    fn move_to(h: i64, v: i64) -> Command {
+        Command::MoveImage {
+            path: BlockPath::top(0),
+            at: 1,
+            offset_h_emu: h,
+            offset_v_emu: v,
+            story: Vec::new(),
+        }
+    }
+
+    fn refusal(cmd: &Command) -> (Option<ErrorKind>, String) {
+        match check_command(cmd) {
+            Ok(()) => panic!("expected a refusal of {cmd:?}"),
+            Err(evt) => match *evt {
+                Event::Error { kind, message, .. } => (kind, message),
+                other => panic!("expected Event::Error, got {other:?}"),
+            },
+        }
+    }
+
+    /// The command path's bound IS the reader's: one shared constant, 22 in.
+    #[test]
+    fn the_bound_is_words_22_inches() {
+        assert_eq!(MAX_DRAWING_EMU, 22 * 914_400);
+        assert_eq!(MAX_DRAWING_EMU, 20_116_800);
+    }
+
+    #[test]
+    fn an_extent_must_lie_in_one_to_the_bound() {
+        for ok in [1, 914_400, MAX_DRAWING_EMU] {
+            assert!(check_command(&resize(ok, ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            0,
+            -1,
+            i64::MIN,
+            i64::MIN + 1,
+            MAX_DRAWING_EMU + 1,
+            i64::MAX - 1,
+            i64::MAX,
+        ] {
+            let (kind, message) = refusal(&resize(bad, 914_400));
+            assert_eq!(kind, Some(ErrorKind::OutOfRange), "{bad}");
+            assert!(message.contains("width_emu"), "{message}");
+            assert!(message.contains(&bad.to_string()), "{message}");
+            let (kind, message) = refusal(&resize(914_400, bad));
+            assert_eq!(kind, Some(ErrorKind::OutOfRange), "{bad}");
+            assert!(message.contains("height_emu"), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_offset_must_lie_within_plus_minus_the_bound() {
+        for ok in [0, -1, 1, MAX_DRAWING_EMU, -MAX_DRAWING_EMU] {
+            assert!(check_command(&move_to(ok, ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            MAX_DRAWING_EMU + 1,
+            -MAX_DRAWING_EMU - 1,
+            i64::MAX,
+            i64::MIN,
+            i64::MAX - 1,
+            i64::MIN + 1,
+        ] {
+            let (kind, message) = refusal(&move_to(bad, 0));
+            assert_eq!(kind, Some(ErrorKind::OutOfRange), "{bad}");
+            assert!(message.contains("offset_h_emu"), "{message}");
+            let (kind, message) = refusal(&move_to(0, bad));
+            assert_eq!(kind, Some(ErrorKind::OutOfRange), "{bad}");
+            assert!(message.contains("offset_v_emu"), "{message}");
+        }
+    }
+
+    /// The first offender is the one named, whichever axis it is on.
+    #[test]
+    fn the_first_offending_field_is_named() {
+        let (_, message) = refusal(&resize(i64::MAX, i64::MAX));
+        assert!(message.contains("width_emu"), "{message}");
+        let (_, message) = refusal(&move_to(i64::MAX, i64::MAX));
+        assert!(message.contains("offset_h_emu"), "{message}");
+    }
+
+    /// Only the drawing commands are inspected; every other command passes
+    /// through untouched (their own guards run elsewhere).
+    #[test]
+    fn other_commands_are_not_inspected() {
+        for cmd in [Command::Undo, Command::Redo, Command::SelectAll] {
+            assert!(check_command(&cmd).is_ok(), "{cmd:?}");
+        }
+    }
+}
