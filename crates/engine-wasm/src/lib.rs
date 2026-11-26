@@ -353,6 +353,13 @@ struct EngineSnapshotV1 {
         skip_serializing_if = "Option::is_none"
     )]
     theme: Option<Arc<engine::DocumentTheme>>,
+    /// Issue #489 — [`Engine::mark_selection`]: the persisted selection
+    /// includes its last paragraph's mark (Select All, a triple-click). A
+    /// replayed `ApplyFormatting` over that selection must reach the mark
+    /// exactly as the live one did. Absent when there is no such
+    /// selection (and in pre-#489 snapshots), so those bytes are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mark_selection: Option<(BridgeLogicalPos, BridgeLogicalPos)>,
 }
 
 /// Issue #212 — the cached detached package (see `Engine::detached_package`).
@@ -1337,10 +1344,12 @@ pub struct Engine {
     /// that selection patches the mark too
     /// ([`DocumentTree::range_targets_with_end_mark`]). Honoured only while
     /// the live selection is still exactly this range: `apply` drops it
-    /// after any command that leaves another selection. Not persisted (a
-    /// recovered session replays the command that set it). Stored on
-    /// `Engine`, like `caret_affinity`, so the many `SelectionState`
-    /// literals stay untouched.
+    /// after any command that leaves another selection. Persisted with the
+    /// selection in a crash-recovery snapshot
+    /// (`EngineSnapshotV1::mark_selection`), so a replayed format over it
+    /// reaches the mark as the live one did. Stored on `Engine`, like
+    /// `caret_affinity`, so the many `SelectionState` literals stay
+    /// untouched.
     mark_selection: Option<(BridgeLogicalPos, BridgeLogicalPos)>,
 }
 
@@ -11034,6 +11043,7 @@ impl Engine {
             document_name: self.document_name.clone(),
             package_hash: None,
             theme,
+            mark_selection: self.live_mark_selection().cloned(),
         }
     }
 
@@ -11222,6 +11232,7 @@ impl Engine {
         self.selection = s.selection;
         self.stashed_body_selection = s.stashed_body_selection;
         self.pending_format = s.pending_format;
+        self.mark_selection = s.mark_selection;
         self.caret_affinity = s.caret_affinity;
         self.tracking_changes = s.tracking_changes;
         self.review_author = s.review_author;
@@ -11255,6 +11266,11 @@ impl Engine {
                 ideal_x: sel.ideal_x,
                 kind: sel.kind,
             });
+        }
+        /* Issue #489 — the mark rides only the selection it was recorded
+        for (a clamp that moved the selection drops it). */
+        if self.live_mark_selection().is_none() {
+            self.mark_selection = None;
         }
         RestoreReport {
             package_lost,

@@ -289,6 +289,41 @@ fn the_mark_lapses_with_the_selection_that_included_it() {
     assert_eq!(mark_sizes(&e), vec![Some(SMALL), Some(SMALL), None]);
 }
 
+/// Crash recovery: a snapshot taken between Select All and the format
+/// (the worker's idle snapshot) carries "this selection includes its mark",
+/// so the replayed `ApplyFormatting` reaches the marks exactly as the live
+/// one did. A snapshot of any other selection carries nothing (its bytes
+/// are what they were before #489).
+#[test]
+fn a_recovery_replays_the_format_onto_the_marks() {
+    let mut live = tests::test_engine_with_doc(three());
+    apply(&mut live, Command::SelectAll);
+    let snapshot = live.snapshot_bytes().expect("snapshot");
+    let tail = Command::ApplyFormatting {
+        range: None,
+        attrs: size_patch(SMALL),
+    };
+    apply(&mut live, tail.clone());
+    assert_eq!(mark_sizes(&live), vec![Some(SMALL); 3]);
+
+    let mut recovered = tests::test_engine_with_doc(DocumentTree::from_text(""));
+    let evt = apply(
+        &mut recovered,
+        Command::Recover {
+            snapshot,
+            log_tail: vec![tail],
+            renderer_downgrade: None,
+            package: None,
+        },
+    );
+    assert!(matches!(evt, Event::Recovered { .. }), "{evt:?}");
+    assert_eq!(mark_sizes(&recovered), mark_sizes(&live));
+
+    let mut plain = tests::test_engine_with_doc(three());
+    select(&mut plain, bpos_top(0, 0), end_of(2));
+    assert!(plain.capture_snapshot().mark_selection.is_none());
+}
+
 /// Review mode resolves the same targets: the marks take the size (the
 /// lines shrink) and the text records its format change. (The mark's own
 /// `<w:rPrChange>` is issue #372.)
