@@ -416,6 +416,19 @@ struct SelectionState {
     kind: SelectionKind,
 }
 
+/// Epic #555 row 35 — the selection around one undo step
+/// (`Engine::undo_carets`).
+#[derive(Clone)]
+struct UndoCarets {
+    /// Before the command that pushed the step: what Undo restores.
+    before: SelectionState,
+    /// After it (or after the last command that amended it): what Redo
+    /// restores.
+    after: SelectionState,
+    /// The story both were expressed in.
+    story: StoryTarget,
+}
+
 /// An in-progress IME composition (PHASE_4_HEADLESS_UI.md §6). Tracked
 /// between `BeginComposition` and `EndComposition`; the latest `text` is
 /// committed on a committing end. The on-canvas inline preview shipped in
@@ -858,6 +871,38 @@ enum CaretAffinity {
     TrailingX,
 }
 
+/// Epic #555 (cursor memo §1) — the LINE HINT. A caret at a wrap point
+/// (the logical end of one line of a paragraph is the logical start of
+/// the next) lies on both lines; the hint says which one it is drawn on
+/// and walks from ([`caret_line`]). Only geometry sets it: a click or a
+/// drag ([`Engine::do_place_caret_at_point`]), Up / Down / PageUp /
+/// PageDown (the line they landed on) and Home / End. Every other
+/// selection move resets it to [`LineHint::Following`], so Right past a
+/// line's last character shows the caret at the start of the next line
+/// (no end-of-line stop) while End keeps it at the end of its own line.
+/// Display state only: not part of a snapshot (a restored caret starts
+/// at the default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum LineHint {
+    /// The start of the next line — the default.
+    #[default]
+    Following,
+    /// The end of the line the position closes.
+    Preceding,
+}
+
+impl LineHint {
+    /// The hint that keeps `offset` on `line`: `Preceding` when it is the
+    /// line's logical end (and not also its start), else `Following`.
+    fn for_line(line: &LineGeom, offset: u32) -> Self {
+        if offset == line.end_byte && offset != line.start_byte {
+            LineHint::Preceding
+        } else {
+            LineHint::Following
+        }
+    }
+}
+
 /// Phase 3 (#39) — which content story caret-relative commands address.
 /// While a header/footer story is active, `SelectionState` paths are
 /// STORY-relative (`Block(i)` = the story's i-th paragraph), the
@@ -1239,6 +1284,18 @@ pub struct Engine {
     /// `SelectionState` so the 13+ places that mint a `SelectionState`
     /// struct literal stay untouched.
     caret_affinity: CaretAffinity,
+    /// Epic #555 (cursor memo §1) — which line a caret at a wrap point is
+    /// on ([`LineHint`]). Like `caret_affinity`, an `Engine` field so the
+    /// many `SelectionState` literals stay untouched; `apply` resets it
+    /// for every selection-moving command except the ones that set it
+    /// from geometry.
+    caret_line_hint: LineHint,
+    /// Epic #555 row 35 (cursor memo §10) — the selection before and
+    /// after each undo step, keyed by [`UndoStack::current_step`]: Undo
+    /// restores the step's `before`, Redo its `after`. Recorded by
+    /// `apply` around the command that pushed the step; pruned to the
+    /// steps the stack still holds.
+    undo_carets: HashMap<u64, UndoCarets>,
     /// Sprint 10 — `aria-live` announcements queued by user-visible
     /// mutation handlers ("Aligned center", "Page break inserted", …).
     /// The worker drains this after each command via
@@ -1351,6 +1408,8 @@ fn assemble_engine(
         last_paint_dims: LastPaintDims::default(),
         lazy_layout: LazyLayoutState::default(),
         caret_affinity: CaretAffinity::default(),
+        caret_line_hint: LineHint::default(),
+        undo_carets: HashMap::new(),
         pending_announcements: Vec::new(),
         tracking_changes: false,
         review_author: "You".to_string(),
@@ -7250,8 +7309,16 @@ impl LineGeom {
 /// returned `path` is the line's owning paragraph path, descending into a
 /// cell when the hit lands inside one.
 fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
+    hit_test_geom_hinted(geom, x, y).0
+}
+
+/// [`hit_test_geom`] plus the [`LineHint`] that keeps the position on the
+/// line the point hit (epic #555, memo §1): a click right of a wrapped
+/// line's ink lands on its logical end, which is also the next line's
+/// start, and must stay drawn where the user clicked.
+fn hit_test_geom_hinted(geom: &[LineGeom], x: f32, y: f32) -> (BridgeLogicalPos, LineHint) {
     let Some(line) = nearest_line(geom, x, y) else {
-        return bpos_top(0, 0);
+        return (bpos_top(0, 0), LineHint::default());
     };
     let offset = match line_edge_at(line, x) {
         Some(edge) => line.edge_byte(edge),
@@ -7261,10 +7328,13 @@ fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
             .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
             .map_or(line.start_byte, |s| s.byte),
     };
-    BridgeLogicalPos {
-        path: line.path.clone(),
-        offset,
-    }
+    (
+        BridgeLogicalPos {
+            path: line.path.clone(),
+            offset,
+        },
+        LineHint::for_line(line, offset),
+    )
 }
 
 /// Issue #553 — what a double-click points at, in LOGICAL terms.
@@ -7395,6 +7465,187 @@ fn neighbor_slot_byte_by_x(slots: &[CaretSlot], current_x: f32, going_right: boo
     candidate.map(|s| s.byte)
 }
 
+/// Epic #555 (cursor memo §4) — which lines a vertical probe at `x` can
+/// land on. The probe re-runs the click hit-test at the sticky x, and
+/// inside a table that resolves the cell in the grid column under `x`
+/// (the nearest one when `x` is over none), never a neighbour that merely
+/// has a line at that height (a taller cell of the same row). So a line
+/// inside a table cell is reachable only when its cell is, among the
+/// cells of its row, the one nearest to `x` — at every nesting level;
+/// lines outside tables always are. A cell's extent is the union of its
+/// lines' hit rectangles (`hit_left .. hit_left + hit_width`).
+fn reachable_at_x(geom: &[LineGeom], x: f32) -> Vec<bool> {
+    type Key = Vec<(u8, u32, u32)>;
+    let key = |steps: &[BridgePathStep]| -> Key {
+        steps
+            .iter()
+            .map(|s| match *s {
+                BridgePathStep::Block { idx } => (0, idx, 0),
+                BridgePathStep::Cell { row, col } => (1, row, col),
+            })
+            .collect()
+    };
+    let is_cell = |s: &BridgePathStep| matches!(s, BridgePathStep::Cell { .. });
+    if !geom.iter().any(|l| l.path.steps.iter().any(is_cell)) {
+        return vec![true; geom.len()];
+    }
+    let dist = |(lo, hi): (f32, f32)| {
+        if x < lo {
+            lo - x
+        } else if x > hi {
+            x - hi
+        } else {
+            0.0
+        }
+    };
+    /* Every cell's x extent, keyed by its path through its Cell step. */
+    let mut cells: HashMap<Key, (f32, f32)> = HashMap::new();
+    for l in geom {
+        for (i, step) in l.path.steps.iter().enumerate() {
+            if is_cell(step) {
+                let e = cells
+                    .entry(key(&l.path.steps[..=i]))
+                    .or_insert((f32::INFINITY, f32::NEG_INFINITY));
+                e.0 = e.0.min(l.hit_left);
+                e.1 = e.1.max(l.hit_left + l.hit_width);
+            }
+        }
+    }
+    /* Per row (the table's path + the row index): the nearest cell. */
+    let mut rows: HashMap<(Key, u32), f32> = HashMap::new();
+    for (cell, extent) in &cells {
+        let Some(&(_, row, _)) = cell.last() else {
+            continue;
+        };
+        let near = rows
+            .entry((cell[..cell.len() - 1].to_vec(), row))
+            .or_insert(f32::INFINITY);
+        *near = near.min(dist(*extent));
+    }
+    geom.iter()
+        .map(|l| {
+            l.path.steps.iter().enumerate().all(|(i, step)| {
+                let BridgePathStep::Cell { row, .. } = *step else {
+                    return true;
+                };
+                let d = cells
+                    .get(&key(&l.path.steps[..=i]))
+                    .map_or(0.0, |e| dist(*e));
+                let near = rows
+                    .get(&(key(&l.path.steps[..i]), row))
+                    .copied()
+                    .unwrap_or(d);
+                d <= near + 0.5
+            })
+        })
+        .collect()
+}
+
+/// Epic #555 (cursor memo §4) — the line an Up (`going_up`) / Down press
+/// lands on from `cur` at the sticky x `ideal`: the geometrically next
+/// line above / below (by `y`, NOT by `geom` order — a table interleaves
+/// its cells in document order, so cell(0,1) follows cell(0,0) although
+/// it sits beside it) among the lines the probe can reach at `ideal`
+/// ([`reachable_at_x`]); same-height candidates (a band cut by a float)
+/// by distance to `ideal`. Falls back to the unrestricted scan when the
+/// caret's own line is not reachable at `ideal` (the reachability model
+/// does not describe this layout), and to [`table_exit_line`] when
+/// nothing is found from inside a cell.
+fn vertical_target<'a>(
+    geom: &'a [LineGeom],
+    cur_line: &LineGeom,
+    ideal: f32,
+    going_up: bool,
+) -> Option<&'a LineGeom> {
+    let reachable = reachable_at_x(geom, ideal);
+    let cur_reachable = geom
+        .iter()
+        .zip(&reachable)
+        .any(|(l, r)| *r && std::ptr::eq(l, cur_line));
+    let mut best: Option<&LineGeom> = None;
+    for (line, ok) in geom.iter().zip(&reachable) {
+        if std::ptr::eq(line, cur_line) || (cur_reachable && !*ok) {
+            continue;
+        }
+        let on_other_side = if going_up {
+            line.y_top + 0.5 < cur_line.y_top
+        } else {
+            line.y_top > cur_line.y_top + 0.5
+        };
+        if !on_other_side {
+            continue;
+        }
+        best = match best {
+            None => Some(line),
+            Some(b) => {
+                /* Prefer the candidate CLOSER in Y to the current line;
+                tie-break by X-overlap with `ideal` (same-height lines at
+                different X spans). */
+                let cur_dy = (line.y_top - cur_line.y_top).abs();
+                let b_dy = (b.y_top - cur_line.y_top).abs();
+                if cur_dy < b_dy - 0.5 {
+                    Some(line)
+                } else if (cur_dy - b_dy).abs() < 0.5 {
+                    if x_distance_to_line(line, ideal) < x_distance_to_line(b, ideal) {
+                        Some(line)
+                    } else {
+                        Some(b)
+                    }
+                } else {
+                    Some(b)
+                }
+            }
+        };
+    }
+    best.or_else(|| table_exit_line(geom, cur_line, going_up))
+}
+
+/// Boundary escape — when the vertical scan finds nothing AND the caret
+/// sits inside a table cell, hop out to the body paragraph adjacent to
+/// the table. Without this, pressing Up at the top row / Down at the
+/// bottom row with no body line on the correct side of the table TRAPS
+/// the caret inside the table (the scan needs a geom line to land on,
+/// and it filters lines by strict y-side relative to `cur_line` — if the
+/// only candidate is on the wrong y-side, it is rejected).
+/// `insert_table` appends a trailing paragraph so Down usually finds it
+/// through the scan; this fallback covers the residual cases (geometry
+/// rounding misattributing the trailing line's `y_top`, or a top-of-doc
+/// table whose only escape route is below).
+fn table_exit_line<'a>(
+    geom: &'a [LineGeom],
+    cur_line: &LineGeom,
+    going_up: bool,
+) -> Option<&'a LineGeom> {
+    let block_idx = |l: &LineGeom| match l.path.steps.first() {
+        Some(BridgePathStep::Block { idx }) => Some(*idx),
+        _ => None,
+    };
+    let in_cell = |l: &LineGeom| matches!(l.path.steps.get(1), Some(BridgePathStep::Cell { .. }));
+    let t_idx = block_idx(cur_line)?;
+    if !in_cell(cur_line) {
+        return None;
+    }
+    geom.iter()
+        .filter(|l| {
+            /* Body lines (no Cell step) whose top-level block index sits
+            on the correct side of the current table. */
+            !in_cell(l)
+                && match block_idx(l) {
+                    Some(i) if going_up => i < t_idx,
+                    Some(i) => i > t_idx,
+                    None => false,
+                }
+        })
+        .min_by(|a, b| {
+            /* Going up → the last line above the table (the GREATEST
+            y_top); going down → the first line below it (the SMALLEST). */
+            let key = |l: &&LineGeom| if going_up { -l.y_top } else { l.y_top };
+            key(a)
+                .partial_cmp(&key(b))
+                .unwrap_or(core::cmp::Ordering::Equal)
+        })
+}
+
 /// Caret slot whose `x` is closest to `target_x` (Backlog #14, ideal-x snap).
 /// `None` only when the line carries no slots — an empty paragraph.
 fn nearest_slot_by_x(slots: &[CaretSlot], target_x: f32) -> Option<&CaretSlot> {
@@ -7422,6 +7673,25 @@ fn x_distance_to_line(line: &LineGeom, target_x: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Epic #555 row 33 (cursor memo §10) — Enter in an EMPTY list item ends
+/// the list there instead of splitting the paragraph: a nested item moves
+/// up one level, a top-level item leaves the list (Word; the OnlyOffice
+/// model "loses or outdents its numbering"). `None` when the paragraph at
+/// `at` is not an empty list item, so Enter splits as usual.
+fn empty_list_item_exit(doc: &DocumentTree, at: &BridgeLogicalPos) -> Option<DocumentTree> {
+    let para = doc.paragraph_at_path(&bridge_to_engine_path(at.path.clone()))?;
+    let item = para.list_item?;
+    if !para.text.is_empty() {
+        return None;
+    }
+    let pos = to_engine_pos(at.clone());
+    Some(if item.ilvl > 0 {
+        doc.change_list_level_on_range(pos.clone(), pos, -1)
+    } else {
+        doc.clear_list_item_on_range(pos.clone(), pos)
+    })
 }
 
 /// The first (`at_end == false`) or last caret position of the story tree
@@ -7506,10 +7776,10 @@ fn line_home(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalP
     lands on the rightmost slot because the rightmost slot IS the
     logical start. No separate paragraph-direction check needed —
     line geometry already encodes the asymmetry. */
+    /* Epic #555 — the caret's line through the ONE resolution: Home at a
+    wrap point acts on the line the caret is drawn on. */
     let geom = engine.document_geometry().ok()?;
-    let line = geom.into_iter().find(|l| {
-        l.path == caret.path && caret.offset >= l.start_byte && caret.offset <= l.end_byte
-    })?;
+    let line = caret_line(&geom, caret, engine.caret_line_hint)?;
     Some(BridgeLogicalPos {
         path: caret.path.clone(),
         offset: line.start_byte,
@@ -7523,9 +7793,7 @@ fn line_home(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalP
 /// for LTR, visually leftmost for RTL.
 fn line_end(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalPos> {
     let geom = engine.document_geometry().ok()?;
-    let line = geom.into_iter().find(|l| {
-        l.path == caret.path && caret.offset >= l.start_byte && caret.offset <= l.end_byte
-    })?;
+    let line = caret_line(&geom, caret, engine.caret_line_hint)?;
     Some(BridgeLogicalPos {
         path: caret.path.clone(),
         offset: line.end_byte,
@@ -8130,8 +8398,36 @@ fn collect_paragraph_paths_vec(
     }
 }
 
+/// Epic #555 (cursor memo §1) — THE line a caret position is on: the
+/// one resolution every caret consumer shares (the caret rect, Up / Down,
+/// PageUp / PageDown, Home / End). A position strictly inside a line has
+/// one candidate; a WRAP point — the end of one line of the paragraph and
+/// the start of the next — has two, and the [`LineHint`] picks: the
+/// following line (default) or the preceding one. `None` when no laid-out
+/// line holds the position.
+fn caret_line<'a>(
+    geom: &'a [LineGeom],
+    pos: &BridgeLogicalPos,
+    hint: LineHint,
+) -> Option<&'a LineGeom> {
+    let holds = |l: &&LineGeom| {
+        l.path == pos.path && pos.offset >= l.start_byte && pos.offset <= l.end_byte
+    };
+    let mut lines = geom.iter().filter(holds);
+    let first = lines.next()?;
+    if hint == LineHint::Preceding || pos.offset != first.end_byte || pos.offset == first.start_byte
+    {
+        return Some(first);
+    }
+    /* The position closes `first`: the next line of the paragraph that
+    starts there (a wrap point) carries it by default. */
+    Some(lines.find(|l| l.start_byte == pos.offset).unwrap_or(first))
+}
+
 /// Caret rectangle for `pos`, `caret_w` device px wide. Falls back to
 /// `fallback` when the document has no geometry yet (empty document).
+/// The line is the one [`caret_line`] resolves with the caret's
+/// [`LineHint`] (epic #555).
 ///
 /// Issue #557 (clean-room memo §11) — the caret is as tall as the TEXT at
 /// it, not the line box: its top is the line's baseline minus the caret
@@ -8149,12 +8445,10 @@ fn caret_rect_geom(
     fallback: BridgeRect,
     caret_w: f32,
     affinity: CaretAffinity,
+    hint: LineHint,
     mark_extents: impl FnOnce(&BridgeBlockPath) -> Option<(f32, f32)>,
 ) -> BridgeRect {
-    let line = geom
-        .iter()
-        .find(|l| l.path == pos.path && pos.offset >= l.start_byte && pos.offset <= l.end_byte)
-        .or_else(|| geom.first());
+    let line = caret_line(geom, pos, hint).or_else(|| geom.first());
     let Some(line) = line else {
         return fallback;
     };
@@ -9443,10 +9737,32 @@ impl Engine {
         /* Issue #387 — classified once, in `bridge::meta`. */
         let reveals_caret = cmd.meta().reveals_caret;
         let cmd_kind = cmd.kind();
+        /* Epic #555 (memo §1) — a selection move drops the line hint;
+        `MoveCaret` resolves the caret's line with it and then sets it
+        itself, as do the pointer placements (from the line they hit). */
+        let hint_before = self.caret_line_hint;
+        if cmd.meta().moves_selection && cmd_kind != bridge::CommandKind::MoveCaret {
+            self.caret_line_hint = LineHint::default();
+        }
+        /* Epic #555 row 35 — the caret before the command, for the undo
+        step it may push. */
+        let step_before = self.undo.current_step();
+        let selection_before = self.selection.clone();
+        let story_before = self.active_story.clone();
         /* Issue #469 - the ONE place an error reply is attributed to the
         command it answers (finite guard, story / protection gates and
         every handler refusal all return through here). */
         let mut evt = error_reply::stamp(self.apply_command(cmd).await, cmd_kind);
+        if matches!(evt, Event::Error { .. }) {
+            /* A refused command leaves the caret where it was drawn. */
+            self.caret_line_hint = hint_before;
+        }
+        if !matches!(
+            cmd_kind,
+            bridge::CommandKind::Undo | bridge::CommandKind::Redo
+        ) {
+            self.record_undo_carets(step_before, selection_before, story_before, revision_before);
+        }
         if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
             self.mutation_seq += 1;
         }
@@ -9464,6 +9780,68 @@ impl Engine {
             *reveal_caret = reveals_caret;
         }
         evt
+    }
+
+    /// Epic #555 row 35 (cursor memo §10) — after a command: when it
+    /// pushed a new undo step, remember the selection before it (what
+    /// Undo restores) and after it (what Redo restores); when it amended
+    /// the current step in place (`replace_current`), refresh the step's
+    /// `after`. A step pushed in another story than the one the command
+    /// started in, or by a command that had no selection, records nothing
+    /// (Undo then clamps the live selection, the pre-#555 behaviour).
+    fn record_undo_carets(
+        &mut self,
+        step_before: Option<u64>,
+        selection_before: Option<SelectionState>,
+        story_before: StoryTarget,
+        revision_before: u64,
+    ) {
+        let Some(step) = self.undo.current_step() else {
+            return;
+        };
+        if Some(step) != step_before {
+            if let (Some(before), Some(after)) = (selection_before, self.selection.clone())
+                && story_before == self.active_story
+            {
+                self.undo_carets.insert(
+                    step,
+                    UndoCarets {
+                        before,
+                        after,
+                        story: story_before,
+                    },
+                );
+            }
+            let undo = &self.undo;
+            self.undo_carets.retain(|id, _| undo.has_step(*id));
+        } else if self.undo.revision() != revision_before
+            && let Some(entry) = self.undo_carets.get_mut(&step)
+            && entry.story == self.active_story
+            && let Some(after) = self.selection.clone()
+        {
+            entry.after = after;
+        }
+    }
+
+    /// Epic #555 row 35 — put back the selection an undo step recorded
+    /// (`before` for Undo, `after` for Redo) when the step was taken in
+    /// the story that is active now; `false` when there is none to put
+    /// back (the caller's clamp keeps the live selection).
+    fn restore_undo_caret(&mut self, step: Option<u64>, redo: bool) -> bool {
+        let Some(entry) = step.and_then(|id| self.undo_carets.get(&id)) else {
+            return false;
+        };
+        if entry.story != self.active_story {
+            return false;
+        }
+        let sel = if redo { &entry.after } else { &entry.before };
+        self.selection = Some(SelectionState {
+            ideal_x: None,
+            ..sel.clone()
+        });
+        self.pending_format = None;
+        self.caret_affinity = CaretAffinity::default();
+        true
     }
 
     /// Issue #194 — replace the whole undo stack (load / reset / restore).
@@ -10404,7 +10782,12 @@ impl Engine {
     }
 
     fn do_undo(&mut self) -> Event {
-        self.undo.undo();
+        /* Epic #555 row 35 — Undo restores the caret from before the
+        step it takes back. */
+        let step = self.undo.current_step();
+        if self.undo.undo() {
+            self.restore_undo_caret(step, false);
+        }
         self.story_validity_guard();
         /* Issue #117 — re-clamp BEFORE repainting: the tree has already
         been swapped, so a failing repaint (early return below) must not
@@ -11091,7 +11474,10 @@ impl Engine {
     }
 
     fn do_redo(&mut self) -> Event {
-        self.undo.redo();
+        /* Epic #555 row 35 — Redo restores the caret the step left. */
+        if self.undo.redo() {
+            self.restore_undo_caret(self.undo.current_step(), true);
+        }
         self.story_validity_guard();
         /* Issue #117 — re-clamp BEFORE repainting: the tree has already
         been swapped, so a failing repaint (early return below) must not
@@ -14365,6 +14751,20 @@ impl Engine {
     /// pointer events from N independent `<canvas>` elements without
     /// any TS-side offset math.
     fn do_hit_test_in_page(&mut self, page_idx: u32, at: BridgePoint) -> Event {
+        match self.hit_test_in_page_hinted(page_idx, at) {
+            Ok((pos, _)) => Event::HitResult { pos },
+            Err(e) => *e,
+        }
+    }
+
+    /// [`Self::do_hit_test_in_page`]'s walk, also answering the
+    /// [`LineHint`] of the line hit (epic #555) for the pointer
+    /// placements.
+    fn hit_test_in_page_hinted(
+        &mut self,
+        page_idx: u32,
+        at: BridgePoint,
+    ) -> Result<(BridgeLogicalPos, LineHint), Box<Event>> {
         let scale = self.scale();
         let gap = render::scene::PAGE_GAP_PT * scale;
         /* Issue #34/#51 — this used to request a FULL document layout
@@ -14389,12 +14789,9 @@ impl Engine {
         synchronously, estimating the missing pages from the sections'
         real page size and looping until the page is laid (no A4
         guess, no first-miss clamp). */
-        let grew = match self.lazy_nav_reach_page(page_idx) {
-            Ok(g) => g,
-            Err(e) => return *e,
-        };
-        if grew && let Err(e) = self.maybe_repaint_result() {
-            return *e;
+        let grew = self.lazy_nav_reach_page(page_idx)?;
+        if grew {
+            self.maybe_repaint_result()?;
         }
         let page_top = {
             let snap_cell = self.layout_snapshot.borrow();
@@ -14412,12 +14809,8 @@ impl Engine {
             })
         };
         let global_y = at.y + page_top;
-        match self.document_geometry() {
-            Ok(geom) => Event::HitResult {
-                pos: hit_test_geom(&geom, at.x, global_y),
-            },
-            Err(e) => *e,
-        }
+        let geom = self.document_geometry()?;
+        Ok(hit_test_geom_hinted(&geom, at.x, global_y))
     }
 
     /// Issue #53 — where an interactive `InsertText { at: None }`
@@ -14452,10 +14845,12 @@ impl Engine {
                 }
             }
         }
-        let pos = match self.do_hit_test_in_page(page_idx, at) {
-            Event::HitResult { pos } => pos,
-            other => return other,
+        let (pos, hint) = match self.hit_test_in_page_hinted(page_idx, at) {
+            Ok(hit) => hit,
+            Err(e) => return *e,
         };
+        /* Epic #555 — drawn on the line that was clicked. */
+        self.caret_line_hint = hint;
         self.do_set_selection(
             BridgeLogicalRange {
                 start: pos.clone(),
@@ -14473,10 +14868,11 @@ impl Engine {
     /// Extension never switches stories — the moving end stays in the
     /// document the anchor lives in (`do_extend_selection` clamps there).
     fn do_extend_selection_to_point(&mut self, page_idx: u32, at: BridgePoint) -> Event {
-        let pos = match self.do_hit_test_in_page(page_idx, at) {
-            Event::HitResult { pos } => pos,
-            other => return other,
+        let (pos, hint) = match self.hit_test_in_page_hinted(page_idx, at) {
+            Ok(hit) => hit,
+            Err(e) => return *e,
         };
+        self.caret_line_hint = hint;
         self.do_extend_selection(pos)
     }
 
@@ -14713,7 +15109,51 @@ impl Engine {
         paragraph-level, not run-level (jumps logical word boundaries
         regardless of the caret's current run direction). */
         let para_rtl = self.paragraph_direction_at(&sel.caret.path) == ShapingDirection::Rtl;
+        /* Epic #555 row 13 (cursor memo §3) — with a selection and no
+        Shift, Left / Right only COLLAPSE it: to its logical start when
+        the press is logically backward, its logical end when forward —
+        the key mapping flips in an RTL paragraph, so each arrow collapses
+        to the visual edge it points at. No further move. */
+        if !extend
+            && matches!(direction, MoveDirection::Left | MoveDirection::Right)
+            && sel.anchor != sel.caret
+        {
+            let forward = (direction == MoveDirection::Right) != para_rtl;
+            let (start, end) = ordered(sel.anchor.clone(), sel.caret.clone());
+            let to = if forward { end } else { start };
+            self.pending_format = None;
+            self.caret_affinity = if direction == MoveDirection::Right {
+                CaretAffinity::TrailingX
+            } else {
+                CaretAffinity::LeadingX
+            };
+            /* The later end of a selection is drawn on the line it
+            closes, the earlier one on the line it opens (memo §1). */
+            self.caret_line_hint = if forward {
+                LineHint::Preceding
+            } else {
+                LineHint::Following
+            };
+            self.selection = Some(SelectionState {
+                anchor: to.clone(),
+                caret: to,
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            });
+            return self.selection_changed();
+        }
         let mut new_affinity = self.caret_affinity;
+        /* Epic #555 (memo §1) — a logical move shows a wrap point at the
+        start of the next line; End keeps the caret at the end of its
+        own line; a vertical move stays on the line it landed on. */
+        let mut new_hint = match direction {
+            MoveDirection::LineEnd => LineHint::Preceding,
+            MoveDirection::Up
+            | MoveDirection::Down
+            | MoveDirection::PageUp
+            | MoveDirection::PageDown => self.caret_line_hint,
+            _ => LineHint::Following,
+        };
         /* Issue #551 — the cell a Tab / Shift+Tab step enters; its
         content is selected below. Named by the step itself, never
         re-derived from the landing caret (which may sit in a nested
@@ -14806,7 +15246,10 @@ impl Engine {
             /* Issue #462 — one viewport height, through the lazy band. */
             MoveDirection::PageDown | MoveDirection::PageUp => {
                 match self.page_step(&sel, direction == MoveDirection::PageDown) {
-                    Ok(target) => target,
+                    Ok((pos, ideal, hint)) => {
+                        new_hint = hint;
+                        (pos, ideal)
+                    }
                     Err(e) => return *e,
                 }
             }
@@ -14815,151 +15258,24 @@ impl Engine {
                     Ok(g) => g,
                     Err(e) => return *e,
                 };
-                let caret_path = sel.caret.path.clone();
-                let caret_offset = sel.caret.offset;
+                /* Epic #555 — the caret's line through the ONE resolution
+                (`caret_line`): a caret at a wrap point walks from the line
+                it is drawn on. */
+                let cur = caret_line(&geom, &sel.caret, self.caret_line_hint);
                 /* Re-use the carried column if a vertical walk is in progress;
                 otherwise lock in the caret's current x. */
                 let ideal = sel.ideal_x.unwrap_or_else(|| {
-                    geom.iter()
-                        .find(|l| {
-                            l.path == caret_path
-                                && caret_offset >= l.start_byte
-                                && caret_offset <= l.end_byte
-                        })
-                        .or_else(|| geom.first())
-                        .map_or(0.0, |line| slot_x_for_byte(line, caret_offset))
+                    cur.or_else(|| geom.first())
+                        .map_or(0.0, |line| slot_x_for_byte(line, sel.caret.offset))
                 });
-                /* Phase 6c — spatial vertical walk. Locate the caret's
-                line in `geom`, then look for the geometrically next
-                line above (Up) / below (Down) by Y position — NOT by
-                `geom` index order. Tables interleave cells in
-                document order that don't match the visual order:
-                cell(0,1) is to the *right* of cell(0,0) on the same
-                row, so a doc-order walk Up from cell(1,0) jumps to
-                cell(0,1) (the previous block) instead of cell(0,0).
-                Among lines at the target Y, prefer the one whose
-                horizontal span contains `ideal_x` (handles same-row
-                cells with different widths). */
-                let cur = geom.iter().find(|l| {
-                    l.path == caret_path
-                        && caret_offset >= l.start_byte
-                        && caret_offset <= l.end_byte
-                });
-                let target: Option<&LineGeom> = if let Some(cur_line) = cur {
-                    let going_up = direction == MoveDirection::Up;
-                    /* Find best candidate at the next y-level. */
-                    let mut best: Option<&LineGeom> = None;
-                    for line in &geom {
-                        if std::ptr::eq(line, cur_line) {
-                            continue;
-                        }
-                        let on_other_side = if going_up {
-                            line.y_top + 0.5 < cur_line.y_top
-                        } else {
-                            line.y_top > cur_line.y_top + 0.5
-                        };
-                        if !on_other_side {
-                            continue;
-                        }
-                        best = match best {
-                            None => Some(line),
-                            Some(b) => {
-                                /* Prefer the candidate CLOSER in Y to the
-                                current line; tie-break by X-overlap with
-                                `ideal` (cells at same row Y but different
-                                X spans). */
-                                let cur_dy = (line.y_top - cur_line.y_top).abs();
-                                let b_dy = (b.y_top - cur_line.y_top).abs();
-                                if cur_dy < b_dy - 0.5 {
-                                    Some(line)
-                                } else if (cur_dy - b_dy).abs() < 0.5 {
-                                    let line_x_dist = x_distance_to_line(line, ideal);
-                                    let b_x_dist = x_distance_to_line(b, ideal);
-                                    if line_x_dist < b_x_dist {
-                                        Some(line)
-                                    } else {
-                                        Some(b)
-                                    }
-                                } else {
-                                    Some(b)
-                                }
-                            }
-                        };
+                let target: Option<&LineGeom> = match cur {
+                    Some(cur_line) => {
+                        vertical_target(&geom, cur_line, ideal, direction == MoveDirection::Up)
                     }
-                    /* Boundary escape — when the spatial scan returns
-                    nothing AND the caret sits inside a table cell,
-                    explicitly hop out to the body paragraph adjacent
-                    to the table. Without this, pressing Up at the
-                    top row / Down at the bottom row with no body
-                    line on the correct side of the table TRAPS the
-                    caret inside the table (the spatial scan needs a
-                    geom line to land on, and the scan above filters
-                    lines by strict y-side relative to `cur_line` —
-                    if the only candidate is on the wrong y-side, it
-                    is rejected). `insert_table` now appends a
-                    trailing paragraph so Down usually finds it
-                    through the spatial scan; this fallback covers
-                    the residual cases (in particular when geometry
-                    rounding misattributes the trailing line's
-                    y_top, or when the caret is in a top-of-doc
-                    table and the only escape route is below). */
-                    if best.is_none() {
-                        let cur_table_idx = cur_line.path.steps.first().and_then(|s| match s {
-                            BridgePathStep::Block { idx } => Some(*idx),
-                            BridgePathStep::Cell { .. } => None,
-                        });
-                        let in_cell = matches!(
-                            cur_line.path.steps.get(1),
-                            Some(BridgePathStep::Cell { .. })
-                        );
-                        if let (Some(t_idx), true) = (cur_table_idx, in_cell) {
-                            best = geom
-                                .iter()
-                                .filter(|l| {
-                                    /* Body lines (no Cell step) whose top-level
-                                    block index sits on the correct side of the
-                                    current table. */
-                                    let outside_table = !matches!(
-                                        l.path.steps.get(1),
-                                        Some(BridgePathStep::Cell { .. })
-                                    );
-                                    let l_idx = l.path.steps.first().and_then(|s| match s {
-                                        BridgePathStep::Block { idx } => Some(*idx),
-                                        BridgePathStep::Cell { .. } => None,
-                                    });
-                                    outside_table
-                                        && match l_idx {
-                                            Some(i) if going_up => i < t_idx,
-                                            Some(i) => i > t_idx,
-                                            None => false,
-                                        }
-                                })
-                                .min_by(|a, b| {
-                                    /* Going up → the closest body line is
-                                    the one with the GREATEST y_top below
-                                    `cur_line` in document order (i.e.
-                                    last paragraph above the table).
-                                    Going down → the SMALLEST y_top
-                                    above `cur_line` (first paragraph
-                                    below the table). */
-                                    let key = |l: &&LineGeom| {
-                                        if going_up { -l.y_top } else { l.y_top }
-                                    };
-                                    key(a)
-                                        .partial_cmp(&key(b))
-                                        .unwrap_or(core::cmp::Ordering::Equal)
-                                });
-                        }
-                    }
-                    best
-                } else {
                     /* Fallback to first line when current isn't found
                     (defensive — caret should always sit on a geom line). */
-                    if direction == MoveDirection::Down {
-                        geom.first()
-                    } else {
-                        geom.last()
-                    }
+                    None if direction == MoveDirection::Down => geom.first(),
+                    None => geom.last(),
                 };
                 let new_caret = match target {
                     Some(line) => {
@@ -14976,6 +15292,10 @@ impl Engine {
                         let offset = nearest_slot_by_x(&line.slots, ideal)
                             .map(|s| s.byte)
                             .unwrap_or(line.start_byte);
+                        /* Epic #555 — stay drawn on the line landed on
+                        (the end of a short line that wraps is also the
+                        next line's start). */
+                        new_hint = LineHint::for_line(line, offset);
                         BridgeLogicalPos {
                             path: line.path.clone(),
                             offset,
@@ -15032,6 +15352,7 @@ impl Engine {
         {
             self.pending_format = None;
             self.caret_affinity = new_affinity;
+            self.caret_line_hint = LineHint::Following;
             let kind = derive_selection_kind(&start, &end);
             self.selection = Some(SelectionState {
                 anchor: start,
@@ -15049,6 +15370,7 @@ impl Engine {
         };
         let kind = derive_selection_kind(&anchor, &new_caret);
         self.caret_affinity = new_affinity;
+        self.caret_line_hint = new_hint;
         self.selection = Some(SelectionState {
             anchor,
             caret: new_caret,
@@ -15166,6 +15488,7 @@ impl Engine {
                 fallback,
                 CARET_WIDTH * scale,
                 self.caret_affinity,
+                self.caret_line_hint,
                 |path| self.caret_mark_extents(path),
             ),
             direction,
@@ -17892,6 +18215,21 @@ impl Engine {
                 );
             }
         };
+        /* Epic #555 row 33 (cursor memo §10) — Enter in an EMPTY list
+        item ends the list there instead of splitting. Not while review
+        mode records: a numbering change is no tracked revision the engine
+        can write, so the tracked split stays. */
+        let collapsed = self.selection.as_ref().is_none_or(|s| s.anchor == s.caret);
+        if collapsed
+            && !self.tracking_changes
+            && let Some(exited) = self.with_selection_doc(|d| empty_list_item_exit(d, &at))
+        {
+            self.layout_cache.get_mut().clear();
+            if self.story_active() {
+                return self.commit_story_edit(&exited, at);
+            }
+            return self.commit_edit(exited, at);
+        }
         if self.story_active() {
             return self.story_split_paragraph(at);
         }
@@ -21326,6 +21664,8 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            caret_line_hint: LineHint::default(),
+            undo_carets: HashMap::new(),
             pending_announcements: Vec::new(),
             tracking_changes: false,
             review_author: "You".to_string(),
@@ -22211,6 +22551,8 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            caret_line_hint: LineHint::default(),
+            undo_carets: HashMap::new(),
             pending_announcements: Vec::new(),
             tracking_changes: false,
             review_author: "You".to_string(),
@@ -22273,6 +22615,8 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            caret_line_hint: LineHint::default(),
+            undo_carets: HashMap::new(),
             pending_announcements: Vec::new(),
             tracking_changes: false,
             review_author: "You".to_string(),
@@ -22326,6 +22670,8 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            caret_line_hint: LineHint::default(),
+            undo_carets: HashMap::new(),
             pending_announcements: Vec::new(),
             tracking_changes: false,
             review_author: "You".to_string(),
@@ -22461,6 +22807,8 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            caret_line_hint: LineHint::default(),
+            undo_carets: HashMap::new(),
             pending_announcements: Vec::new(),
             tracking_changes: false,
             review_author: "You".to_string(),
@@ -23120,6 +23468,8 @@ mod tests {
                 last_paint_dims: LastPaintDims::default(),
                 lazy_layout: LazyLayoutState::default(),
                 caret_affinity: CaretAffinity::default(),
+                caret_line_hint: LineHint::default(),
+                undo_carets: HashMap::new(),
                 pending_announcements: Vec::new(),
                 tracking_changes: false,
                 review_author: "You".to_string(),
@@ -26865,6 +27215,8 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            caret_line_hint: LineHint::default(),
+            undo_carets: HashMap::new(),
             pending_announcements: Vec::new(),
             tracking_changes: false,
             review_author: "You".to_string(),
@@ -33110,6 +33462,12 @@ mod table_repaint_perf_tests;
 /// mixed-direction paragraphs.
 #[cfg(test)]
 mod word_select_tests;
+
+/// Epic #555 — the navigation rows of the cursor matrix: selection
+/// collapse, the wrap-point line hint, the column-true vertical probe,
+/// Enter in an empty list item, the undo caret.
+#[cfg(test)]
+mod nav_cursor_tests;
 
 /// Epic #555 — the TEXT rows of the cursor matrix (grapheme caret stops,
 /// word-move classes, the empty IME commit).
