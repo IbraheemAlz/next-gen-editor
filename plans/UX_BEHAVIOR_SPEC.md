@@ -227,6 +227,19 @@ Already supported via the existing `extend: e.shiftKey` pass-through plus the sp
 
 `[TODO]` — Bound to Home/End wiring (I.2).
 
+### IV.10 — Deleting / replacing a cross-container range
+
+A range whose ends sit in different containers of one story (body text into a table, a cell into the body, a Tab-selected cell whose content starts / ends with / is a nested table) is deleted over EVERY paragraph it reaches — the paragraphs `range_targets` resolves for formatting (#509) — by one routine, `DocumentTree::delete_range_at` (`crates/engine/src/range_delete.rs`, issue #561). Pinned from the clean-room memo:
+
+1. **Deletion never crosses a cell boundary** (memo §7). Paragraphs merge only inside one container; the body paragraph a range starts in keeps its head and is never merged into a cell (nor a cell's into the body, nor one cell's into another's).
+2. **A cell the range reaches stays**: it loses the covered text; a cell covered whole keeps one empty paragraph (its last paragraph's mark).
+3. **A row the range covers whole is removed** (memo §6: a selection that reaches outside a table contributes whole rows), and a table covered whole is removed with all its rows. A table that IS the whole range (a Tab-selected cell holding only a nested table) is replaced by an empty paragraph.
+4. **Typing over / pasting over** such a range = the delete, then the insert where the range's start landed (`delete_range_at` returns it).
+5. **A `TABLE_CELLS` rectangle** clears exactly its cells (Word's Delete over a cell selection): `DocumentTree::clear_cell_rect`; the typed text goes into its first cell.
+6. **Review mode** keeps the #365 rule: every row a range entering a table touches is marked deleted (`try_tracked_delete_range`).
+
+`[DONE]` (issue #561). Open: whether a partly covered row should go too (Word's selection snaps to whole rows — #615); review-mode Delete over a rectangle (#618).
+
 ---
 
 ## V. Clipboard Operations
@@ -236,7 +249,7 @@ Three flavours: plain text, rich text (HTML), and the engine's own internal form
 ### V.1 — Copy
 
 Output formats:
-1. **`text/plain`** — UTF-8 plain text. Paragraphs joined with `\n`. Table cells joined with `\t` within a row, rows joined with `\n`. `[DONE]`
+1. **`text/plain`** — UTF-8 plain text. Paragraphs joined with `\n`. Table cells joined with `\t` within a row, rows joined with `\n`. `[DONE]` — for the whole document (`DocumentTree::to_plain_text`) and, since issue #561, for any selection (`DocumentTree::targets_plain_text` over the paragraphs `range_targets` / `cell_rect_targets` reach: body ↔ cell, nested tables, a `TABLE_CELLS` rectangle by its rows; inside a crossed cell its own line breaks and tabs become spaces so one row stays one line). The `text/html` and `.docx` flavours of a cross-container selection still carry only the start paragraph's tail — #617.
 2. **`text/html`** — A minimal `<div>` containing `<p>`, `<table><tr><td>`, `<strong>`, `<em>`, `<u>`, `<a>` elements that round-trip into the engine on paste. Out-of-scope tags (script, style, headers/footers) stripped. `[PARTIAL]` — engine emits plain `<p>` runs; bold/italic/underline preserved; tables emitted but cell attributes not yet round-tripped.
 
 **Cut** = Copy + `DELETE_RANGE`. `[DONE]`

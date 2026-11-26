@@ -21,9 +21,11 @@ import { documentXml, readZipEntry, storedDocx } from './helpers/docx';
  * (the toolbar cannot author a nested table — Insert > Table in a cell
  * inserts a top-level table after the outer one, issue #563) and a
  * `SET_SELECTION` reads the click target's caret rect off the engine.
- * Typing over the span puts the character IN the cell; replacing the
- * WHOLE span (nested table included) is the cross-container delete of
- * issue #561, so the assertion is written to hold before and after it. */
+ *
+ * Issue #561 — typing over the span replaces the cell's WHOLE content,
+ * nested table included (the cross-container delete: before, only the
+ * span's first paragraph lost its tail and `inner2` / `after` stayed), and
+ * Ctrl+C copies all of it, the nested row's cells joined with a tab. */
 
 declare global {
     interface Window {
@@ -185,18 +187,49 @@ test('Tab into a cell that starts with a nested table selects its content; typin
 
     await page.keyboard.type('Z');
     await settle(page);
-    const after = await paragraphs(page);
-    /* The typed character replaced the start of the selected content, inside
-       cell (0,1): between `alpha` and `gamma`, and nothing outside the cell
-       moved (before #551 it went to `outro`). */
-    const z = after.findIndex((t) => t.startsWith('Z'));
-    expect(z, JSON.stringify(after)).toBeGreaterThan(after.indexOf('alpha'));
-    expect(z, JSON.stringify(after)).toBeLessThan(after.indexOf('gamma'));
-    expect(after).not.toContain('inner1');
-    const cell01 = new Set(['inner1', 'inner2', 'after']);
-    expect(after.filter((t) => !cell01.has(t) && !t.startsWith('Z'))).toEqual(
-        ORIGINAL.filter((t) => !cell01.has(t)),
-    );
+    /* The typed character REPLACED the whole selected content of cell (0,1)
+       — the nested table and `after` included (#561) — and nothing outside
+       the cell moved (before #551 it went to `outro`). */
+    expect(await paragraphs(page)).toEqual(['intro', 'alpha', 'Z', 'gamma', 'delta', 'deep1', 'deep2', 'outro']);
+});
+
+test('typing over a Tab-selected cell that ends with a nested table replaces all of it (#561)', async ({ page }) => {
+    await clickInto(page, GAMMA, 2);
+    await page.keyboard.press('Tab');
+    await expectCellSelected(page, DELTA, DEEP2, 'deep2'.length);
+    await page.keyboard.type('Z');
+    await settle(page);
+    expect(await paragraphs(page)).toEqual(['intro', 'alpha', 'inner1', 'inner2', 'after', 'gamma', 'Z', 'outro']);
+});
+
+test('Ctrl+C on a Tab-selected cell holding a nested table copies all of it (#561)', async ({ page, context }) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    await page.evaluate(() => navigator.clipboard.writeText('before'));
+    await clickInto(page, ALPHA, 2);
+    await page.keyboard.press('Tab');
+    await expectCellSelected(page, INNER1, AFTER, 'after'.length);
+    await page.keyboard.press('Control+c');
+    /* Before the fix: `inner1`, the span's first paragraph alone. */
+    await expect
+        .poll(
+            () =>
+                page.evaluate(async () => {
+                    /* A read racing the shell's write throws "Clipboard
+                       data has changed": poll again. */
+                    try {
+                        for (const item of await navigator.clipboard.read()) {
+                            if (item.types.includes('text/plain')) {
+                                return (await item.getType('text/plain')).text();
+                            }
+                        }
+                    } catch {
+                        /* fall through */
+                    }
+                    return '';
+                }),
+            { timeout: 10_000 },
+        )
+        .toBe('inner1\tinner2\nafter');
 });
 
 test('Shift+Tab back into the cell holding the nested table selects its content', async ({ page }) => {

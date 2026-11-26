@@ -21,6 +21,7 @@
 //! | `U+000B` VERTICAL TAB              | → `U+2028` (line break)  | → space       |
 //! | `U+000C` FORM FEED                 | kept (the model's page break) | → space  |
 //! | other C0 (`U+0000..=U+001F`)       | dropped                  | dropped       |
+//! | `U+FFFC` OBJECT REPLACEMENT        | dropped                  | dropped       |
 //! | `U+FFFE`, `U+FFFF`                 | refused / lossy: `U+FFFD` | same         |
 //!
 //! The model spells a manual line break as `U+2028` and a manual page break
@@ -28,7 +29,18 @@
 //! w:type="page"/>`), so mapping Word's paste behaviour (a vertical tab is
 //! a soft return, a form feed a page break) is a character-for-character
 //! translation. `U+007F` and the C1 range are legal XML characters and are
-//! kept. Lone surrogates cannot exist in a Rust `String`; the shell refuses
+//! kept.
+//!
+//! Issue #580 — `U+FFFC` is the model's inline-object SENTINEL: every one
+//! in `Paragraph::text` stands for the `InlineObject` (picture, note
+//! reference, text-box anchor) at its byte, and layout, the writers, the
+//! accessibility mirror and the clipboard all read it that way. Text that
+//! comes in through a door carries no object, so a bare `U+FFFC` (the
+//! plain-text flavour of a copied picture, pasted unformatted) would be an
+//! orphan sentinel. It is dropped — on every door, typed or repaired — like
+//! a control character: there is nothing to show for an object that is not
+//! there, and the replacement character would show a glyph the user never
+//! saw. Lone surrogates cannot exist in a Rust `String`; the shell refuses
 //! them before the command is sent (the wasm-bindgen string glue would
 //! otherwise turn them into `U+FFFD`).
 //!
@@ -48,6 +60,9 @@ pub const LINE_BREAK: char = '\u{2028}';
 pub const PAGE_BREAK: char = '\u{000C}';
 /// What a character XML cannot carry becomes when it is repaired.
 pub const REPLACEMENT: char = '\u{FFFD}';
+/// The model's inline-object sentinel (issue #580): never accepted from a
+/// text door.
+pub const OBJECT_SENTINEL: char = '\u{FFFC}';
 
 /// XML 1.0 `Char`: tab, LF, CR, and everything from `U+0020` except the
 /// surrogates (not representable as a `char`) and `U+FFFE` / `U+FFFF`.
@@ -104,6 +119,7 @@ enum Kind {
 fn action(c: char, kind: Kind) -> Action {
     match c {
         '\u{FFFE}' | '\u{FFFF}' => Action::Refuse,
+        OBJECT_SENTINEL => Action::Drop,
         '\t' | '\n' | '\r' | '\u{B}' | '\u{C}' if kind == Kind::Line => Action::Map(' '),
         '\t' | '\n' | '\r' | PAGE_BREAK => Action::Keep,
         '\u{B}' => Action::Map(LINE_BREAK),
@@ -206,6 +222,28 @@ mod tests {
         assert_eq!(
             sanitize_input_text("\u{7F}\u{85}\u{FEFF}").unwrap(),
             "\u{7F}\u{85}\u{FEFF}"
+        );
+    }
+
+    /// Issue #580 — a bare object sentinel never enters the model: dropped
+    /// from body text, one-line values and repaired (file / entity) text.
+    #[test]
+    fn the_object_sentinel_is_dropped_on_every_door() {
+        assert_eq!(sanitize_input_text("a\u{FFFC}b").unwrap(), "ab");
+        assert_eq!(sanitize_input_text("\u{FFFC}").unwrap(), "");
+        assert_eq!(sanitize_input_text("\u{FFFC}\u{1}x\u{FFFC}").unwrap(), "x");
+        assert_eq!(sanitize_input_line("Ann\u{FFFC}").unwrap(), "Ann");
+        assert_eq!(
+            sanitize_input_text_lossy("p\u{FFFC}\u{FFFE}q"),
+            "p\u{FFFD}q"
+        );
+        let mut s = String::from("\u{FFFC}pic");
+        sanitize_text_in_place(&mut s).unwrap();
+        assert_eq!(s, "pic");
+        /* Its neighbours are ordinary characters. */
+        assert_eq!(
+            sanitize_input_text("\u{FFFB}\u{FFFD}").unwrap(),
+            "\u{FFFB}\u{FFFD}"
         );
     }
 

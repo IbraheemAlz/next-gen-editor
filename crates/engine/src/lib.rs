@@ -101,6 +101,10 @@ mod para_border_cascade_tests;
 mod paragraph_mark_tests;
 #[cfg(test)]
 mod paragraph_merge_tests;
+/// Issue #561 — a range deleted / copied across containers.
+mod range_delete;
+#[cfg(test)]
+mod range_delete_tests;
 #[cfg(test)]
 mod range_target_tests;
 #[cfg(test)]
@@ -9842,9 +9846,12 @@ impl DocumentTree {
     }
 
     /// Delete the logical range `[start, end)`. A range spanning paragraphs
-    /// merges the partial first and last paragraphs and drops those between.
-    /// PR 4: same-parent cross-paragraph ranges work end-to-end; cross-
-    /// container ranges (cell ↔ body) clamp to the `start` paragraph.
+    /// of one container merges the partial first and last paragraphs and
+    /// drops the blocks between. Issue #561 — a range whose ends sit in
+    /// different containers (body ↔ cell, two cells, a cell ↔ a nested
+    /// table) deletes across them without ever merging two containers'
+    /// paragraphs (`range_delete.rs`); [`Self::delete_range_at`] also says
+    /// where the caret goes.
     pub fn delete_range(&self, start: LogicalPos, end: LogicalPos) -> Self {
         let (start, end) = order_positions(start, end);
         if self.paragraph_count() == 0 {
@@ -9901,16 +9908,10 @@ impl DocumentTree {
             return out;
         }
         if !same_parent(&start.path, &end.path) {
-            /* Cross-container delete clamps to the start endpoint —
-            full cross-container linear semantics land with Phase 5c. */
-            let end_in_start_container = LogicalPos {
-                path: start.path.clone(),
-                offset: self
-                    .paragraph_at_path(&start.path)
-                    .map(|p| p.text.len() as u32)
-                    .unwrap_or(start.offset),
-            };
-            return self.delete_range(start, end_in_start_container);
+            /* Issue #561 — the cross-container rule. */
+            return self
+                .delete_across_containers(&start, &end)
+                .map_or_else(|| self.clone(), |(doc, _)| doc);
         }
         let Some(sp_idx) = start.path.last_block_index() else {
             return self.clone();
@@ -10689,64 +10690,18 @@ impl DocumentTree {
         )
     }
 
-    /// Extract the text of the logical range `[start, end)`. Paragraphs the
-    /// range spans are joined by `\n`. Used for clipboard copy.
+    /// Extract the text of the logical range `[start, end)` — every
+    /// paragraph [`Self::range_targets`] reaches, tables and nested tables
+    /// included, serialised by [`Self::targets_plain_text`] (paragraphs
+    /// joined by `\n`, a row's cells by `\t`, issue #561). Used for
+    /// clipboard copy.
     pub fn text_range(&self, start: LogicalPos, end: LogicalPos) -> String {
-        let (start, end) = order_positions(start, end);
-        if self.paragraph_count() == 0 {
+        if self.paragraph_at_path(&start.path).is_none()
+            || self.paragraph_at_path(&end.path).is_none()
+        {
             return String::new();
         }
-        if start.path == end.path {
-            let Some(p) = self.paragraph_at_path(&start.path) else {
-                return String::new();
-            };
-            let lo = p.snap_offset(start.offset) as usize;
-            let hi = p.snap_offset(end.offset) as usize;
-            if lo >= hi {
-                return String::new();
-            }
-            return p.text[lo..hi].to_string();
-        }
-        if !same_parent(&start.path, &end.path) {
-            let Some(p) = self.paragraph_at_path(&start.path) else {
-                return String::new();
-            };
-            let lo = p.snap_offset(start.offset) as usize;
-            return p.text[lo..].to_string();
-        }
-        let Some(sp_idx) = start.path.last_block_index() else {
-            return String::new();
-        };
-        let Some(ep_idx) = end.path.last_block_index() else {
-            return String::new();
-        };
-        let Some(container) = parent_container_snapshot(self, &start.path) else {
-            return String::new();
-        };
-        let mut out = String::new();
-        for idx in sp_idx..=ep_idx {
-            let Some(para) = container.get(idx as usize).and_then(|b| b.as_paragraph()) else {
-                continue;
-            };
-            let len = para.text.len();
-            let lo = if idx == sp_idx {
-                para.snap_offset(start.offset) as usize
-            } else {
-                0
-            };
-            let hi = if idx == ep_idx {
-                para.snap_offset(end.offset) as usize
-            } else {
-                len
-            };
-            if idx > sp_idx {
-                out.push('\n');
-            }
-            if lo < hi {
-                out.push_str(&para.text[lo..hi]);
-            }
-        }
-        out
+        self.targets_plain_text(&self.range_targets(&start, &end))
     }
 
     /* ============================================================

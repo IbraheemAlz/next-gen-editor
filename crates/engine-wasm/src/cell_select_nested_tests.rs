@@ -153,9 +153,8 @@ fn tab(e: &mut Engine, forward: bool) {
 
 /// The texts of the paragraphs the live selection covers, in document
 /// order: every paragraph whose path lies between the (ordered)
-/// endpoints' paths. (`GetSelectionAsClipboard`'s plain text cannot
-/// serve here: `DocumentTree::text_range` reads only a same-container
-/// range, issue #561.)
+/// endpoints' paths. (Kept apart from `GetSelectionAsClipboard`, whose
+/// plain text since issue #561 joins a row's cells with tabs.)
 fn covered_texts(e: &Engine) -> Vec<String> {
     let sel = e.selection.as_ref().expect("a selection");
     let (start, end) = ordered(sel.anchor.clone(), sel.caret.clone());
@@ -339,10 +338,8 @@ fn select_cell_at_spans_a_leading_or_trailing_nested_table() {
 
     /* Typing over the (0,1) span lands IN that cell — before #551 the
     selection had escaped to the document's last paragraph, so the text
-    went there — and leaves every other cell and the body alone.
-    (Replacing the WHOLE span, nested table included, is the
-    cross-container delete of issue #561; today the delete stops at the
-    end of the span's first paragraph.) */
+    went there — replaces the WHOLE span, nested table included (issue
+    #561), and leaves every other cell and the body alone. */
     select_cell_at(&mut e, vec![b(1), c(0, 1), b(1)]);
     let _ = apply(
         &mut e,
@@ -362,18 +359,8 @@ fn select_cell_at_spans_a_leading_or_trailing_nested_table() {
         walk_block_texts_owned(&t.rows[r].cells[col].blocks, &mut out);
         out
     };
-    assert!(
-        texts(0, 1)
-            .first()
-            .is_some_and(|first| first.starts_with('Z')),
-        "{:?}",
-        texts(0, 1)
-    );
-    assert!(
-        !texts(0, 1).iter().any(|t| t.contains("N1")),
-        "{:?}",
-        texts(0, 1)
-    );
+    assert_eq!(texts(0, 1), vec!["Z".to_string()]);
+    assert_eq!(t.rows[0].cells[1].blocks.len(), 1, "the nested table went");
     assert_eq!(texts(0, 0), vec!["A".to_string()]);
     assert_eq!(texts(1, 0), vec!["before", "M1", "M2"]);
     assert_eq!(texts(1, 1), vec!["O1", "O2"]);
