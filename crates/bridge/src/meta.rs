@@ -77,10 +77,12 @@ pub enum StoryPolicy {
     /// Rejected with an `Event::Error` while any story is active — the UI
     /// disables the control in story mode; the gate is the backstop.
     BodyOnly,
-    /// Allowed only while the active story is a text box (picture edits
-    /// carry an explicit body-rooted address, issue #206); rejected in
-    /// header/footer and note stories.
-    TextBoxOnly,
+    /// Picture edits: allowed while the active story is a text box (they
+    /// carry an explicit body-rooted address, issue #206) or a header /
+    /// footer (issue #573 — an empty `story` then addresses a picture of
+    /// the part being edited, `path` rooted in it: only the active story's
+    /// drawings are objects); rejected in note stories.
+    PictureStories,
     /// Tears the story's ground away (a document load / close): the
     /// engine exits to the body first, then handles the command.
     ExitsStory,
@@ -255,9 +257,9 @@ impl CommandMeta {
         }
     }
 
-    const fn text_box_only(self) -> Self {
+    const fn picture_stories(self) -> Self {
         CommandMeta {
-            story: StoryPolicy::TextBoxOnly,
+            story: StoryPolicy::PictureStories,
             ..self
         }
     }
@@ -433,11 +435,11 @@ command_meta! {
     // across a boundary (`DeleteAtCaret`) is the interactive merge.
     MergeParagraph { .. } => M::EDIT.body_only().stub(396) ; (),
     InsertImage { .. } => M::EDIT.body_only() ; (image: T::Nested),
-    ResizeImage { .. } => M::FORMAT.text_box_only() ; (),
-    MoveImage { .. } => M::FORMAT.text_box_only() ; (),
+    ResizeImage { .. } => M::FORMAT.picture_stories() ; (),
+    MoveImage { .. } => M::FORMAT.picture_stories() ; (),
     // Issue #137 — an inline picture has no wrap mode until inline →
     // floating conversion ships (ImageWrapPicker's "Engine pending" badge).
-    SetImageWrap { .. } => M::FORMAT.text_box_only().partial(137) ; (),
+    SetImageWrap { .. } => M::FORMAT.picture_stories().partial(137) ; (),
     SetSelection { .. } => M::SELECT ; (),
     ExtendSelection { .. } => M::SELECT ; (),
     // Issue #387 — Word / Docs keep the view on Ctrl+A.
@@ -599,7 +601,7 @@ fn ts_story(story: StoryPolicy) -> &'static str {
     match story {
         StoryPolicy::Allowed => "allowed",
         StoryPolicy::BodyOnly => "body_only",
-        StoryPolicy::TextBoxOnly => "text_box_only",
+        StoryPolicy::PictureStories => "picture_stories",
         StoryPolicy::ExitsStory => "exits_story",
     }
 }
@@ -645,7 +647,7 @@ pub fn render_ts_module() -> String {
          \x20   | { readonly kind: 'stub'; readonly issue: number };\n\
          \n\
          /** Story-mode behaviour (`bridge::StoryPolicy`, `Engine::story_gate`). */\n\
-         export type StoryPolicy = 'allowed' | 'body_only' | 'text_box_only' | 'exits_story';\n\
+         export type StoryPolicy = 'allowed' | 'body_only' | 'picture_stories' | 'exits_story';\n\
          \n\
          /** What an enforced document protection lets through\n\
          \x20*  (`bridge::ProtectionClass`, issue #345). */\n\

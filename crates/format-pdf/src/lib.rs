@@ -1453,7 +1453,7 @@ fn anchor_paragraph(blocks: &[LayoutBlock], anchor: layout::FloatAnchorRef) -> O
             }
             LayoutBlock::Paragraph(_) => None,
         },
-        layout::FloatAnchorRef::Header | layout::FloatAnchorRef::Footer => None,
+        layout::FloatAnchorRef::Header { .. } | layout::FloatAnchorRef::Footer { .. } => None,
     }
 }
 
@@ -1486,8 +1486,8 @@ fn emit_float_group(
         /* Issue #360 — a float anchored in a header / footer band is part
         of that pagination artifact. */
         let band = match f.anchor {
-            layout::FloatAnchorRef::Header => Some(ArtifactKind::Header),
-            layout::FloatAnchorRef::Footer => Some(ArtifactKind::Footer),
+            layout::FloatAnchorRef::Header { .. } => Some(ArtifactKind::Header),
+            layout::FloatAnchorRef::Footer { .. } => Some(ArtifactKind::Footer),
             layout::FloatAnchorRef::Body { .. } => None,
         };
         if let Some(kind) = band {
