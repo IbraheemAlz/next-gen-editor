@@ -457,3 +457,172 @@ fn verified_hit_backstop_still_catches_a_bad_entry() {
     let healed = layout_paragraph_cached(&para, &fonts, &cfg, 1.0, 400.0, sctx, &mut cache);
     assert_eq!(healed.size.width.to_bits(), good.size.width.to_bits());
 }
+
+/* ---- Issue #346: the stale-undo scenario through the real engine ----
+`SetTabStops` clears the layout cache, `Undo` / `Redo` do not. That is
+sound exactly because the key is a CONTENT key (the exhaustive destructure
+above): undoing a left -> right tab change at the same position changes
+the hashed tab kind, so the entry laid under the OTHER state is a miss,
+never a stale hit - and the entry that IS the right content is served
+again. These tests pin that end to end, so nobody "fixes" undo with a
+blanket `clear` (which would only hide a key that forgot a field). */
+
+const TAB_PT: f32 = 144.0;
+
+fn tab_doc(kind: engine::TabKind) -> DocumentTree {
+    let mut doc = DocumentTree::from_text("a\tb");
+    if let Some(p) = doc.blocks[0].as_paragraph_mut() {
+        p.props.tab_stops = vec![engine::TabStop {
+            position_pt: TAB_PT,
+            kind,
+            leader: engine::TabLeader::None,
+        }];
+    }
+    doc
+}
+
+/// `Command::SetTabStops` over paragraph 0: the one stop, at `TAB_PT`.
+fn set_tab(e: &mut Engine, kind: bridge::BridgeTabKind, leader: Option<bridge::BridgeTabLeader>) {
+    let range = BridgeLogicalRange {
+        start: bpos_top(0, 0),
+        end: bpos_top(0, 0),
+    };
+    let stops = vec![bridge::BridgeTabStop {
+        position_pt: TAB_PT,
+        kind,
+        leader,
+    }];
+    let evt = e.do_set_tab_stops(range, stops);
+    assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+}
+
+/// What a layout paints: the geometry fingerprint plus the tab leaders,
+/// which are deliberately geometry-neutral (`PositionedGlyph::leader`, so
+/// the fingerprint never sees them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Painted {
+    geometry: u64,
+    leaders: Vec<Option<layout::TabLeaderKind>>,
+}
+
+/// The engine's current layout, through its own (warm) layout cache. Any
+/// degradation note - a `CacheMismatch` above all - fails the test: the
+/// verified-hit backstop must not be what saves a stale entry.
+fn warm_layout(e: &Engine) -> Painted {
+    let _strict = StrictLayoutNotes::on();
+    let (pages, _, _, info) = e.build_pages(2.0, false, None).expect("layout");
+    assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+    let leaders = pages
+        .iter()
+        .flat_map(|p| p.blocks.iter())
+        .filter_map(LayoutBlock::as_paragraph)
+        .flat_map(|p| p.lines.iter())
+        .flat_map(|l| l.runs.iter())
+        .flat_map(|r| r.glyphs.iter())
+        .map(|g| g.leader)
+        .collect();
+    Painted {
+        geometry: layout::geometry_fingerprint(&pages),
+        leaders,
+    }
+}
+
+/// The same document laid out by a brand-new engine: every cache cold.
+fn cold_layout(e: &Engine) -> Painted {
+    warm_layout(&tests::test_engine_with_doc(e.undo.current().clone()))
+}
+
+/// `(hits, misses)` of the paragraph layout cache since the engine began.
+fn paragraph_lookups(e: &Engine) -> (u64, u64) {
+    let seen = e.layout_cache.borrow().observed();
+    (seen.paragraph_hits, seen.paragraph_misses)
+}
+
+#[test]
+fn undo_and_redo_of_a_tab_kind_change_lay_out_like_a_cold_engine() {
+    let mut e = tests::test_engine_with_doc(tab_doc(engine::TabKind::Left));
+    let left = warm_layout(&e);
+    assert_eq!(left, cold_layout(&e));
+
+    /* Left -> right at the SAME position: `SetTabStops` clears the cache,
+    the right-aligned paragraph is laid out and cached. */
+    set_tab(&mut e, bridge::BridgeTabKind::Right, None);
+    let right = warm_layout(&e);
+    assert_ne!(
+        left.geometry, right.geometry,
+        "the fixture must discriminate: a right tab moves the text"
+    );
+    assert_eq!(right, cold_layout(&e));
+
+    /* Undo: the document is the left-aligned one again, the cache holds
+    only the RIGHT entry. A key blind to the tab kind would hit it (and
+    paint the right-tab box over a left-tab document). */
+    let (_, misses) = paragraph_lookups(&e);
+    e.do_undo();
+    assert_eq!(
+        warm_layout(&e),
+        left,
+        "undo must not serve the right-tab box"
+    );
+    assert_eq!(warm_layout(&e), cold_layout(&e));
+    assert_eq!(
+        paragraph_lookups(&e).1 - misses,
+        1,
+        "the left-tab paragraph was laid out (a miss), not hit on the other state's entry"
+    );
+
+    /* Redo: back to the right-aligned paragraph - and now BOTH entries
+    are cached, so redo is a legitimate HIT with the right geometry and
+    no new layout (no blanket clear is wanted: it would only cost this). */
+    let (hits, misses) = paragraph_lookups(&e);
+    e.do_redo();
+    assert_eq!(warm_layout(&e), right);
+    assert_eq!(warm_layout(&e), cold_layout(&e));
+    let (hits_after, misses_after) = paragraph_lookups(&e);
+    assert!(
+        hits_after > hits,
+        "redo reuses the right-tab entry still cached"
+    );
+    assert_eq!(misses_after, misses, "and lays nothing out again");
+
+    /* And once more the other way, still no invalidation anywhere. */
+    let (_, misses) = paragraph_lookups(&e);
+    e.do_undo();
+    assert_eq!(warm_layout(&e), left);
+    assert_eq!(warm_layout(&e), cold_layout(&e));
+    assert_eq!(
+        paragraph_lookups(&e).1,
+        misses,
+        "the left-tab entry is served"
+    );
+}
+
+/// The same scenario for the tab LEADER. A leader is geometry-neutral
+/// (`PositionedGlyph::leader` paints a pattern across the tab's own
+/// advance), so the fingerprint cannot see it - the glyph field is
+/// compared directly, which is exactly what a key blind to the leader
+/// would get wrong.
+#[test]
+fn undo_of_a_tab_leader_change_lays_out_like_a_cold_engine() {
+    let mut e = tests::test_engine_with_doc(tab_doc(engine::TabKind::Left));
+    let plain = warm_layout(&e);
+    assert!(plain.leaders.iter().all(Option::is_none));
+    set_tab(
+        &mut e,
+        bridge::BridgeTabKind::Left,
+        Some(bridge::BridgeTabLeader::Dot),
+    );
+    let dotted = warm_layout(&e);
+    assert!(
+        dotted.leaders.contains(&Some(layout::TabLeaderKind::Dot)),
+        "the fixture must discriminate: the tab glyph carries the dot leader"
+    );
+    assert_eq!(dotted, cold_layout(&e));
+
+    e.do_undo();
+    assert_eq!(warm_layout(&e), plain, "undo must not serve the dotted box");
+    assert_eq!(warm_layout(&e), cold_layout(&e));
+    e.do_redo();
+    assert_eq!(warm_layout(&e), dotted);
+    assert_eq!(warm_layout(&e), cold_layout(&e));
+}
