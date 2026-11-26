@@ -901,6 +901,40 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   (raw family per slot, both storage forms) and step 48 (each Font
   dialog section writes only its own slot).
 
+## Legacy `.doc` import (issue #567)
+
+- **One dispatch, by bytes.** `Engine::load_docx_bytes_with_limits` sends an OLE
+  compound file that is not an MS-OFFCRYPTO encrypted OOXML package
+  (`format_doc::is_legacy_compound_file`, over `format_docx::
+  sniff_compound_file`) to `crates/format-doc`; everything else goes to
+  the `.docx` reader. The file name never decides the format (`@nge/core`
+  `docFormatForFileName` maps `.doc` / `.dot` to `docx`). The import is
+  read-only: no source package, so a save writes a fresh `.docx` and the
+  document name `x.doc` becomes `x.docx` (`docx_name_for_legacy`).
+- **Refusals have ONE table**, the second one in `open_error.rs`
+  (`doc_open_error_event`): `Encrypted` -> `EncryptedDocument`,
+  `Container` / `Malformed` -> `DocumentUnreadable` (`<stream>:
+  <structure>: <fixed phrase + numbers>`, never document bytes),
+  `TooLarge` -> `PackageTooLarge`, a non-Word OLE file or a Word 6/95 FIB
+  -> `InvalidDocument`. A new `DocError` variant does not compile there
+  until classified.
+- **Honest UX.** What the importer does not model (tables as plain
+  paragraphs, list markers, pictures, fields kept as their result,
+  subdocuments, styles / fonts) is COUNTED during the walk and rides
+  `DocumentLoaded.warnings` as `ReadWarningKind::LegacyContentNotImported`
+  (one entry per class); a newly modelled class drops its counter, a newly
+  skipped one adds one — never drop content silently.
+- **Borrowed code.** Parts of `format-doc` are modified from WordCraft
+  (MIT OR Apache-2.0): every such file carries the "Modified from
+  WordCraft ... at commit ..." header and a row in `THIRD-PARTY-NOTICES.md`.
+  A further borrow adds both; the container stays our bounded
+  `format_docx::opc::cfb` reader (no `cfb` crate).
+- **Fixtures are built in code.** Unit tests, the fuzz-native open tests
+  and the e2e (`ts/e2e/helpers/doc.ts`) build their `.doc` images in
+  memory (`format_doc::test_builder`); the only committed `.doc` bytes are
+  the fuzz seeds, written by `fuzz/examples/regen-seeds` and pinned by a
+  fuzz-crate test.
+
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.
 - Phase 2+ will introduce `Run` model with bold/italic/font/size. Add corresponding XML emission only when the parser reads them too.
