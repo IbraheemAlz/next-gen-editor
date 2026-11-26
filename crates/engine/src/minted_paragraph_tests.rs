@@ -147,6 +147,27 @@ fn an_inserted_table_its_cells_and_escape_paragraph_take_the_cascade() {
     );
     let split = merged.split_cell(BlockPath::top(1), 0, 0);
     assert_minted(&split, cell_paragraph(&split, 1, 0, 1), None, "split cell");
+
+    /* Issue #563 — a table inserted INTO a cell: its cells and the escape
+    paragraph after it inside the outer cell take the cascade too. */
+    let cell = BlockPath::top(1).push(PathStep::Cell { row: 0, col: 0 });
+    let nested = d.insert_table(cell.clone().push(PathStep::Block(1)), 1, 2);
+    let inner = cell.clone().push(PathStep::Block(1));
+    for col in 0..2 {
+        let path = inner
+            .clone()
+            .push(PathStep::Cell { row: 0, col })
+            .push(PathStep::Block(0));
+        let p = nested
+            .paragraph_at_path(&path)
+            .unwrap_or_else(|| panic!("nested cell (0, {col})"));
+        assert_minted(&nested, p, None, "nested cell");
+    }
+    let escape = cell.push(PathStep::Block(2));
+    let p = nested
+        .paragraph_at_path(&escape)
+        .expect("the escape paragraph after the nested table");
+    assert_minted(&nested, p, None, "nested escape paragraph");
 }
 
 #[test]
