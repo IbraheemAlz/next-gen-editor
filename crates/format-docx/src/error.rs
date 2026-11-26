@@ -63,6 +63,22 @@ pub enum DocxError {
     UnsupportedEncryption(String),
 }
 
+/// Issue #564 — what a walk that keeps a subtree it cannot type as OPAQUE
+/// bytes (a table whose walk failed rides its source bytes whole) does with
+/// the failure: a structural refusal ([`DocxError::MalformedXml`] — a block
+/// where no block may stand, `parts::document::misplaced_block`) goes UP, so
+/// the part is refused like the same defect in the body walk; every other
+/// error stays what it was, `Ok(None)` (the caller keeps the subtree opaque).
+pub(crate) fn opaque_unless_refused<T>(
+    walked: Result<T, DocxError>,
+) -> Result<Option<T>, DocxError> {
+    match walked {
+        Ok(v) => Ok(Some(v)),
+        Err(e @ DocxError::MalformedXml(_)) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Non-fatal reader diagnostics. The document opened, but some subtree was
 /// degraded on the way into the typed model; its bytes still ride the
 /// passthrough so a resave loses nothing.

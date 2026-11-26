@@ -309,3 +309,259 @@ fn a_header_part_obeys_the_same_rule() {
         "{err:?}"
     );
 }
+
+/* ---- Issue #564: the table walker asks the same rule for a cell's blocks ---- */
+
+/// A table with one cell holding `cell` (the caller spells the cell's
+/// blocks), as the body's only block.
+fn table_in_body(cell: &str) -> String {
+    format!(
+        "<w:body><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid>\
+         <w:tr><w:tc>{cell}</w:tc></w:tr></w:tbl><w:sectPr/></w:body></w:document>"
+    )
+}
+
+/// `inner` is refused as a `block` standing `place`, and the offset the
+/// refusal names is where `needle` stands in the part (`ROOT` + `inner`),
+/// not a position in the table's own bytes.
+fn assert_refused_at(inner: &str, needle: &str, block: &str, place: &str) {
+    let part = format!("{ROOT}{inner}");
+    let at = part.find(needle).expect("the needle is in the part");
+    let Outcome::Refused(detail) = zero_edit_round_trip(&package(inner)) else {
+        panic!("expected a refusal for a {block} {place}: {inner}");
+    };
+    assert_eq!(
+        detail,
+        format!(
+            "word/document.xml: a {block} at byte {at} stands {place}, where no block may \
+             stand (no faithful repair)"
+        )
+    );
+    assert!(!detail.contains(SECRET), "{detail}");
+}
+
+/// #564 — a `<w:p>` nested in a CELL paragraph (through an element the reader
+/// does not model, or the EOF repair's nesting): the cell walker's start arm
+/// overwrote the paragraph's start offset, so the cell read as the INNER
+/// paragraph only and `outer` / `tail` were dropped, silently. The same shape
+/// in the body is refused (#530); the cell now is too.
+#[test]
+fn a_paragraph_inside_a_cell_paragraph_is_refused() {
+    let inner = table_in_body(&format!(
+        "<w:p><w:r><w:t>outer</w:t></w:r><x:junk>{}</x:junk><w:r><w:t>tail</w:t></w:r></w:p>",
+        para(SECRET)
+    ));
+    assert_refused_at(
+        &inner,
+        &format!("<w:p><w:r><w:t>{SECRET}"),
+        "paragraph",
+        "inside a paragraph",
+    );
+    /* A self-closing nested paragraph, and the EOF repair's nesting (an
+    unclosed cell paragraph followed by the next one). */
+    assert_refused_at(
+        &table_in_body("<w:p><w:r><w:t>outer</w:t></w:r><w:p/></w:p>"),
+        "<w:p/>",
+        "paragraph",
+        "inside a paragraph",
+    );
+    assert_refused_at(
+        &format!(
+            "<w:body><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid>\
+             <w:tr><w:tc><w:p><w:r><w:t>outer</w:t></w:r><w:p><w:r><w:t>{SECRET}</w:t></w:r>"
+        ),
+        &format!("<w:p><w:r><w:t>{SECRET}"),
+        "paragraph",
+        "inside a paragraph",
+    );
+    /* The same cell without the nested paragraph opens and keeps its text. */
+    assert_eq!(
+        zero_edit_round_trip(&package(&table_in_body(
+            "<w:p><w:r><w:t>outer</w:t></w:r><w:r><w:t>tail</w:t></w:r></w:p>"
+        ))),
+        Outcome::Kept("outertail".into())
+    );
+}
+
+/// #564 — a `<w:tbl>` in a cell paragraph was a cell block while its bytes
+/// ALSO rode the paragraph's capture.
+#[test]
+fn a_table_inside_a_cell_paragraph_is_refused() {
+    let inner = table_in_body(&format!("<w:p><w:r><w:t>{SECRET}</w:t></w:r>{TABLE}</w:p>"));
+    assert_refused_at(&inner, TABLE, "table", "inside a paragraph");
+}
+
+/// #564 — blocks of a table that stand in no cell (a `<w:p>` directly in the
+/// `<w:tbl>` or a `<w:tr>`, a `<w:tbl>` there) or in a cell's `<w:tcPr>`.
+#[test]
+fn a_block_in_a_table_outside_every_cell_is_refused() {
+    let grid = "<w:tblPr/><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid>";
+    let cell = "<w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc>";
+    let tail = "<w:sectPr/></w:body></w:document>";
+    let secret_p = format!("<w:p><w:r><w:t>{SECRET}");
+    /* (the table's inner xml, the needle the refusal names, block, place) */
+    let cases = [
+        (
+            format!("{grid}{}<w:tr>{cell}</w:tr>", para(SECRET)),
+            secret_p.clone(),
+            "paragraph",
+            "outside a table cell",
+        ),
+        (
+            format!("{grid}<w:tr>{}{cell}</w:tr>", para(SECRET)),
+            secret_p.clone(),
+            "paragraph",
+            "outside a table cell",
+        ),
+        (
+            format!("{grid}<w:tr><w:p/>{cell}</w:tr>"),
+            "<w:p/>".to_string(),
+            "paragraph",
+            "outside a table cell",
+        ),
+        (
+            format!("{grid}<w:tr><w:trPr>{}</w:trPr>{cell}</w:tr>", para(SECRET)),
+            secret_p.clone(),
+            "paragraph",
+            "outside a table cell",
+        ),
+        (
+            format!("{grid}<w:tr>{TABLE}{cell}</w:tr>"),
+            TABLE.to_string(),
+            "table",
+            "outside a table cell",
+        ),
+        (
+            format!(
+                "{grid}<w:tr><w:tc><w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\"/>{}</w:tcPr>\
+                 <w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr>",
+                para(SECRET)
+            ),
+            secret_p,
+            "paragraph",
+            "inside cell properties",
+        ),
+        (
+            format!("{grid}<w:tr><w:tc><w:tcPr><w:p/></w:tcPr><w:p/></w:tc></w:tr>"),
+            "<w:p/>".to_string(),
+            "paragraph",
+            "inside cell properties",
+        ),
+    ];
+    for (table, needle, block, place) in cases {
+        let inner = format!("<w:body><w:tbl>{table}</w:tbl>{tail}");
+        assert_refused_at(&inner, &needle, block, place);
+    }
+}
+
+/// #564 — a nested table is walked by its own recursion, and its refusal is
+/// the part's (the second swallow point), with the offset counted from the
+/// part's start through both tables' bases.
+#[test]
+fn a_misplaced_block_in_a_nested_table_is_refused_with_a_part_relative_offset() {
+    let nested = format!(
+        "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"1000\"/></w:tblGrid><w:tr><w:tc>\
+         <w:p><w:r><w:t>a</w:t></w:r><x:junk>{}</x:junk></w:p></w:tc></w:tr></w:tbl>",
+        para(SECRET)
+    );
+    let inner = table_in_body(&format!("<w:p><w:r><w:t>lead</w:t></w:r></w:p>{nested}"));
+    assert_refused_at(
+        &inner,
+        &format!("<w:p><w:r><w:t>{SECRET}"),
+        "paragraph",
+        "inside a paragraph",
+    );
+}
+
+/// #564 — the third swallow point: a paragraph-level `mc:AlternateContent`
+/// the table walk skips whole is parsed by the cell paragraph's own body
+/// walk, whose placement refusal used to fold into an opaque paragraph (the
+/// text kept in the table's bytes, the paragraph unread). It refuses the
+/// table now, naming the cell paragraph's part-relative offset.
+#[test]
+fn a_block_in_a_cell_paragraphs_alternate_content_is_refused() {
+    let cell_p = format!(
+        "<w:p><w:r><w:t>outer</w:t></w:r><mc:AlternateContent><mc:Choice Requires=\"w14\">{}\
+         </mc:Choice><mc:Fallback><w:r><w:t>fb</w:t></w:r></mc:Fallback></mc:AlternateContent></w:p>",
+        para(SECRET)
+    );
+    let inner = table_in_body(&cell_p);
+    let part = format!("{ROOT}{inner}");
+    let at = part
+        .find("<w:p><w:r><w:t>outer")
+        .expect("the cell paragraph");
+    let Outcome::Refused(detail) = zero_edit_round_trip(&package(&inner)) else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(
+        detail,
+        format!(
+            "word/document.xml: a block inside the paragraph at byte {at} stands where no \
+             block may stand (no faithful repair)"
+        )
+    );
+    assert!(!detail.contains(SECRET), "{detail}");
+}
+
+/// #564 — the same rule in a header part's table (the header then reads as
+/// absent, like any header that does not parse).
+#[test]
+fn a_header_tables_cell_obeys_the_same_rule() {
+    let table = crate::parts::styles::StyleTable::default();
+    let resolver = StyleResolver::new(&table);
+    let hdr = |inner: &str| {
+        format!(
+            "<w:hdr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{inner}</w:hdr>"
+        )
+    };
+    let cell = |c: &str| {
+        format!(
+            "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid><w:tr><w:tc>{c}</w:tc></w:tr></w:tbl>"
+        )
+    };
+    crate::parts::header::parse_header_xml(hdr(&cell(&para("head"))).as_bytes(), &resolver)
+        .expect("a well-placed header cell paragraph reads");
+    let nested = cell(&format!("<w:p><w:r><w:t>a</w:t></w:r>{}</w:p>", para("b")));
+    let err = crate::parts::header::parse_header_xml(hdr(&nested).as_bytes(), &resolver)
+        .expect_err("a nested cell paragraph in a header is refused");
+    assert!(
+        matches!(&err, DocxError::MalformedXml(d) if d.contains("inside a paragraph")),
+        "{err:?}"
+    );
+}
+
+/// #564 — the placement rule must not touch what Word writes: a cell's own
+/// blocks (paragraphs, a nested table, a content control around them, an
+/// `mc:AlternateContent` between them, a text box's own paragraphs inside a
+/// cell paragraph) and a `<w:tcPr>` before them.
+#[test]
+fn blocks_where_cell_blocks_stand_are_untouched() {
+    let tc_pr = "<w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\"/></w:tcPr>";
+    let cells = [
+        format!("{tc_pr}{}{}", para("one"), para("two")),
+        format!("{tc_pr}{TABLE}{}", para("after nested")),
+        format!(
+            "{tc_pr}<w:sdt><w:sdtPr/><w:sdtContent>{}{TABLE}</w:sdtContent></w:sdt>{}",
+            para("in sdt"),
+            para("end")
+        ),
+        format!(
+            "{tc_pr}<mc:AlternateContent><mc:Choice Requires=\"w14\">{}</mc:Choice>\
+             <mc:Fallback>{}</mc:Fallback></mc:AlternateContent>",
+            para("choice"),
+            para("fallback")
+        ),
+        format!(
+            "{tc_pr}<w:p><w:r><w:t>host</w:t></w:r><w:r>{}</w:r></w:p>",
+            alternate_content_text_box("wps")
+        ),
+        format!("{tc_pr}<w:p/><w:p w:rsidR=\"00A1\"/>"),
+    ];
+    for cell in &cells {
+        let inner = table_in_body(cell);
+        match zero_edit_round_trip(&package(&inner)) {
+            Outcome::Kept(text) => assert!(!text.is_empty() || cell.contains("<w:p/>"), "{cell}"),
+            Outcome::Refused(detail) => panic!("{cell}\nwas refused: {detail}"),
+        }
+    }
+}

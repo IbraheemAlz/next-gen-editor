@@ -131,9 +131,34 @@ paths:
   #434 structural-defect policy, not a repair. Tests
   `reader_block_placement_tests` (fixtures
   `crates/format-docx/tests/fixtures/malformed/`), seeds
-  `fuzz/corpus/docx_roundtrip/repro_{491,492,511,530,536}`. Cell blocks are
-  the table walker's (`parts::table`), which does not apply the rule yet
-  (#564).
+  `fuzz/corpus/docx_roundtrip/repro_{491,492,511,530,536}`.
+  **Cell blocks obey the same rule (issue #564).** The table walker
+  (`parts::table`) asks the SAME function for each of its own blocks
+  (`refuse_misplaced_block` -> `parts::document::misplaced_block`, place
+  `BlockPlace`): a `<w:p>` / nested `<w:tbl>` is a cell block only inside a
+  `<w:tc>`, outside an open cell paragraph and outside `<w:tcPr>`; a `<w:p>`
+  inside a cell paragraph (it used to overwrite the paragraph's start offset:
+  the cell read as the INNER paragraph only, the outer text dropped — a
+  zero-edit save kept the text, so `docx_roundtrip` never saw it), a
+  `<w:p>` / `<w:tbl>` straight in a `<w:tbl>` / `<w:tr>` / `<w:trPr>`, and a
+  `<w:p>` in a `<w:tcPr>` are refused (`MalformedXml`: "outside a table cell" /
+  "inside cell properties" / "inside a paragraph", offset part-relative —
+  `parse_table_bytes_at` takes the table's `base`, a nested table adds its
+  start). The three places that swallowed a table walk's error pass a
+  `MalformedXml` up and keep every other error opaque
+  (`error::opaque_unless_refused`): the body walker's table call (so header /
+  footer / note parts read as absent, a text-box story stays an object), the
+  nested-table recursion, and `parse_cell_paragraph` (the body walk of a cell
+  paragraph — reachable only through what the table walk skips whole, such as
+  a `<w:p>` in a paragraph-level `mc:AlternateContent` branch — now returns
+  `Result`; its refusal names the cell paragraph's offset, the re-rooted
+  parse's own offsets are not part-relative). Keep new per-level work out of
+  line (`push_cell_paragraph`, `refuse_misplaced_block`): the walk's frame
+  recurses once per nesting level and `sixty_nested_tables_still_read` runs
+  on a 2 MiB debug stack. Tests: `reader_block_placement_tests` (#564
+  section), seeds `fuzz/corpus/docx_roundtrip/repro_564_*.docx`
+  (`fuzz::cell_placement_docx_seeds`, written by `examples/regen-seeds`),
+  e2e `open-damaged.spec.ts`.
 - **Measures (issue #349).** Page geometry, `<w:ind>`, `<w:spacing>` and
   table widths go through `schema::measure` (`attr_measure*`): integer or
   decimal twips, ECMA universal-measure units (`in` / `cm` / `mm` / `pt` /
