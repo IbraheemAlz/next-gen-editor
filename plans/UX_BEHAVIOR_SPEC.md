@@ -64,8 +64,9 @@ Walks the **line geometry** (`document_geometry()`'s flat `Vec<LineGeom>`), not 
 | --- | --- |
 | Single click | Hit-test → place caret at nearest slot. Anchor + caret collapse to same position. Reset `ideal_x`. `[DONE]` |
 | Drag | `pointermove` during drag → extend selection (anchor pinned at down position, caret follows). Cross-page drags continue to resolve via document-absolute coords. `[DONE]` |
-| Double-click | `SELECT_WORD_AT` — UAX #29 word boundary expanding around the hit position. `[PARTIAL — current impl uses whitespace-classifier, not UAX #29 WordSegmenter]` |
-| Triple-click | `SELECT_PARAGRAPH_AT` — whole paragraph. `[DONE]` |
+| Double-click | Selects the WORD under the pointer — the word model of §II (the same one word motion uses): a text / punctuation / object unit **with the separators after it** (cursor memo §6), chosen from the logical character under the pointer, or the line's logical last word past its end (#553). A double-click on a space selects the word that space trails. Issue #598: the second PRESS selects (`SELECT_UNITS_IN_PAGE { unit: Word, from = to }`, so a key typed right after it replaces the word); the `dblclick` event only selects (`SELECT_WORD_AT`, same resolution) when no press did. Typing over the selection keeps its trailing separators when a word follows (`engine::words::typing_replace_end`): `one two three`, double-click `two`, type `X` → `one X three`. `[DONE]` |
+| Drag after a double / triple click | Grows by whole words / paragraphs (cursor memo §6): `SELECT_UNITS_IN_PAGE { from: the press, to: the pointer }` on every move. Forward, the anchor is the first unit's start and the caret the far end of the unit under the pointer; back past the first unit, the anchor is its END — the double-clicked word stays selected. `[DONE]` (#598) |
+| Triple-click | Whole paragraph (`SELECT_UNITS_IN_PAGE { unit: Paragraph }` at the third press, `SELECT_PARAGRAPH_AT` on the `click` without one). `[DONE]` |
 | Quadruple-click | `[TODO]` — Whole block (cell content if inside a cell; whole table if `SELECT_TABLE`; whole document on the body). |
 | Shift+click | Extend selection from anchor to hit position. `[TODO]` (currently a fresh click resets anchor). |
 
@@ -75,9 +76,9 @@ Walks the **line geometry** (`document_geometry()`'s flat `Vec<LineGeom>`), not 
 
 The target word boundary algorithm is UAX #29's `WB1`–`WB14`.
 
-**Word motion** `[DONE]` (epic #555 row 20, cursor memo §5) — `step_word_left` / `step_word_right` and `DELETE_AT_CARET { by_word: true }` share `word_units` (`engine-wasm/src/lib.rs`): UAX #29 word segments (`split_word_bounds`: `isn't`, `3.14`, one ideograph, a letter with its marks stay whole) classified as **text**, **punctuation** (a class of its own; adjacent punctuation is one unit), **separators** (white space; adjacent ones are one unit) and **objects** (an inline object's `U+FFFC`, a word by itself). Ctrl+Right skips a run of one class, then the separators after it; Ctrl+Left skips separators, then a run of one class. So Ctrl+Right over `word, next` stops at `,` then at `next`. No script-specific rule: a tatweel or harakat stays inside its Arabic word, the Arabic comma is punctuation.
+**Word motion** `[DONE]` (epic #555 row 20, cursor memo §5) — `step_word_left` / `step_word_right` and `DELETE_AT_CARET { by_word: true }` share `word_units` (`crates/engine/src/words.rs` since issue #598): UAX #29 word segments (`split_word_bounds`: `isn't`, `3.14`, one ideograph, a letter with its marks stay whole) classified as **text**, **punctuation** (a class of its own; adjacent punctuation is one unit), **separators** (horizontal white space — space, tab, no-break space; adjacent ones are one unit) and **objects** (an inline object's `U+FFFC`, and since #598 a line / page break — any UAX #29 newline — a word by itself). Ctrl+Right skips a run of one class, then the separators after it; Ctrl+Left skips separators, then a run of one class. So Ctrl+Right over `word, next` stops at `,` then at `next`. No script-specific rule: a tatweel or harakat stays inside its Arabic word, the Arabic comma is punctuation.
 
-`[PARTIAL]` — `SELECT_WORD_AT` (double-click, `Paragraph::word_bounds`) still uses the whitespace classifier.
+**Word selection** `[DONE]` (epic #555 row 22, issue #598) — the SAME model: `engine::words` owns the classifier, and a WORD is one unit plus the separators after it (separators at the start of a paragraph are a word of their own; a line / page break, like an inline object, is a word by itself). Double-click (`Paragraph::word_bounds`), the drag after it, Ctrl+Right (the end of the word = the start of the next), Ctrl+Left (the start of the word before the caret) and Ctrl+Backspace / Delete all read it — so `word, next` holds the words `word`, `, `, `next`.
 
 ### II.1 — Ctrl/Cmd + ArrowLeft / ArrowRight
 
@@ -101,7 +102,7 @@ The target word boundary algorithm is UAX #29's `WB1`–`WB14`.
 
 ### II.3 — Word segment classification
 
-Current rule: word motion follows the rule below (`word_units`, see §II); double-click word selection still treats `char::is_whitespace` as the only segment boundary.
+Current rule: word motion and word selection both follow the rule below (`engine::words`, see §II). The UAX #29 segmenter is `unicode-segmentation`'s `split_word_bound_indices`; the segments are then classified (text / punctuation / separator / object) and adjacent punctuation and separators merged.
 
 Target rule (UAX #29 with carve-outs for ergonomic Word/Google Docs behaviour):
 

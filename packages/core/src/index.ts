@@ -175,6 +175,7 @@ export type {
     ImageWrapMode,
     TextBoxHop,
     SelectionModifier,
+    SelectionUnit,
     MoveDirection,
     BridgeBorderStyle,
     BridgeCellBorders,

@@ -108,8 +108,8 @@ pub fn resolve_page_floats(page: &PageBox, columns: ColumnLayout) -> Vec<FloatBo
     }
     if let Some(hf) = &page.header {
         let band_top = page.header_band_top();
-        for block in &hf.blocks {
-            if let LayoutBlock::Paragraph(p) = block {
+        for (block, b) in hf.blocks.iter().enumerate() {
+            if let LayoutBlock::Paragraph(p) = b {
                 collect_paragraph_floats(
                     page,
                     p,
@@ -117,7 +117,7 @@ pub fn resolve_page_floats(page: &PageBox, columns: ColumnLayout) -> Vec<FloatBo
                     band_top,
                     content_x,
                     content_w,
-                    FloatAnchorRef::Header,
+                    FloatAnchorRef::Header { block },
                     &mut out,
                 );
             }
@@ -125,8 +125,8 @@ pub fn resolve_page_floats(page: &PageBox, columns: ColumnLayout) -> Vec<FloatBo
     }
     if let Some(hf) = &page.footer {
         let band_top = page.footer_band_top();
-        for block in &hf.blocks {
-            if let LayoutBlock::Paragraph(p) = block {
+        for (block, b) in hf.blocks.iter().enumerate() {
+            if let LayoutBlock::Paragraph(p) = b {
                 collect_paragraph_floats(
                     page,
                     p,
@@ -134,7 +134,7 @@ pub fn resolve_page_floats(page: &PageBox, columns: ColumnLayout) -> Vec<FloatBo
                     band_top,
                     content_x,
                     content_w,
-                    FloatAnchorRef::Footer,
+                    FloatAnchorRef::Footer { block },
                     &mut out,
                 );
             }
@@ -777,7 +777,7 @@ mod tests {
         let mut hidden = float_at(200.0, 700.0);
         hidden.hidden = true;
         let mut header = float_at(200.0, 700.0);
-        header.anchor = FloatAnchorRef::Header;
+        header.anchor = FloatAnchorRef::Header { block: 0 };
         let mut floats = vec![
             /* Above the limit. */
             float_at(200.0, 500.0),

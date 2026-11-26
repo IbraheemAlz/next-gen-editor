@@ -14,9 +14,13 @@ use bridge::{
     LayoutDegradeReason, LayoutDegraded, LogicalPos as BridgeLogicalPos,
     LogicalRange as BridgeLogicalRange, MoveDirection, PageOrientation as BridgePageOrientation,
     PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
-    SectionBreakKind, SelectionKind, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
+    SectionBreakKind, SelectionKind, SelectionUnit, TextAttrs, TextAttrsPatch, UnderlineStyle,
+    VerticalScript,
 };
 use engine::snapshot::SnapshotError;
+/* Issue #598 — the ONE word model (Ctrl+arrows, Ctrl+Backspace / Delete;
+double-click and the drag by words read it through `Paragraph::word_bounds`). */
+use engine::words::{word_stop_backward, word_stop_forward};
 use engine::{
     Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
     FontFamily as EngineFontFamily, LogicalPos as EnginePos, PathStep as EnginePathStep, SpanStyle,
@@ -3076,7 +3080,7 @@ fn float_host_path(paths: &[EngineBlockPath], f: &layout::FloatBox) -> Option<En
                 ),
             }
         }
-        layout::FloatAnchorRef::Header | layout::FloatAnchorRef::Footer => None,
+        layout::FloatAnchorRef::Header { .. } | layout::FloatAnchorRef::Footer { .. } => None,
     }
 }
 
@@ -6935,15 +6939,129 @@ fn collect_paragraph_image_rects(
                         frame_y: 0.0,
                         wrap: None,
                         /* Stamped by `collect_text_box_image_rects` for
-                        a picture inside a text-box story. */
+                        a picture inside a text-box story, by
+                        `collect_band_image_rects` for one of the header /
+                        footer being edited. */
                         story: Vec::new(),
                         story_rid: String::new(),
                         rtl: false,
+                        story_area: None,
                     });
                 }
                 pen += g.x_advance;
             }
         }
+    }
+}
+
+/// Issue #69 — the rect of the floating picture `f` addressed by `path`.
+/// `base` is the absolute device-px origin of the space `f.origin` is
+/// relative to (the page top-left for a page float, the parent's content
+/// rect for a float inside a text box). The EMU extent and the wrap mode
+/// are filled from the document model by `image_geometry`; the story
+/// fields by the caller that knows the story.
+fn float_image_rect(
+    f: &layout::FloatBox,
+    path: BridgeBlockPath,
+    base: (f32, f32),
+) -> bridge::ImageRect {
+    bridge::ImageRect {
+        path,
+        at: f.at,
+        rel_id: f.rel_id.clone(),
+        media_key: f.rel_id.clone(),
+        rect: BridgeRect {
+            x: base.0 + f.origin.x,
+            y: base.1 + f.origin.y,
+            w: f.size.width,
+            h: f.size.height,
+        },
+        width_emu: 0,
+        height_emu: 0,
+        floating: true,
+        frame_x: base.0 + f.frame_origin.x,
+        frame_y: base.1 + f.frame_origin.y,
+        wrap: None,
+        story: Vec::new(),
+        story_rid: String::new(),
+        rtl: false,
+        story_area: None,
+    }
+}
+
+/// Issue #573 — every picture of the header (`header`) or footer band of
+/// `page` — the part being edited, on the story's anchor page, `page_top`
+/// its absolute top: inline pictures through the band's paragraph and
+/// table boxes (placed exactly as `story_geometry` places the band's
+/// lines), floating ones from the page floats anchored in the band.
+/// Paths are story-rooted (`Block(i)` = the part's i-th block); every rect
+/// is tagged with the band area and the part's `rid`. Text boxes in a
+/// band are not addressable stories, so neither they nor their pictures
+/// are listed.
+fn collect_band_image_rects(
+    page: &layout::PageBox,
+    header: bool,
+    page_top: f32,
+    rid: &str,
+    out: &mut Vec<bridge::ImageRect>,
+) {
+    let band = if header { &page.header } else { &page.footer };
+    let Some(band) = band else {
+        return;
+    };
+    let start = out.len();
+    let content_x = page.margins.left;
+    let band_top = page_top
+        + if header {
+            page.header_band_top()
+        } else {
+            page.footer_band_top()
+        };
+    for (i, block) in band.blocks.iter().enumerate() {
+        match block {
+            LayoutBlock::Paragraph(p) => {
+                collect_paragraph_image_rects(
+                    p,
+                    content_x,
+                    band_top,
+                    &BridgeBlockPath::top(i as u32),
+                    out,
+                );
+            }
+            LayoutBlock::Table(t) => {
+                collect_table_image_rects(
+                    t,
+                    i as u32,
+                    content_x + t.origin.x,
+                    band_top + t.origin.y,
+                    out,
+                );
+            }
+        }
+    }
+    for f in &page.floats {
+        let block = match (f.anchor, header) {
+            (layout::FloatAnchorRef::Header { block }, true)
+            | (layout::FloatAnchorRef::Footer { block }, false) => block,
+            _ => continue,
+        };
+        if f.text_box.is_some() {
+            continue;
+        }
+        out.push(float_image_rect(
+            f,
+            BridgeBlockPath::top(block as u32),
+            (0.0, page_top),
+        ));
+    }
+    let area = if header {
+        bridge::HeaderFooterArea::Header
+    } else {
+        bridge::HeaderFooterArea::Footer
+    };
+    for im in &mut out[start..] {
+        im.story_area = Some(area);
+        im.story_rid = rid.to_string();
     }
 }
 
@@ -6987,27 +7105,7 @@ fn collect_text_box_image_rects(
         let Some(host) = float_host_path(&story_paths, nf) else {
             continue;
         };
-        out.push(bridge::ImageRect {
-            path: engine_to_bridge_path(host),
-            at: nf.at,
-            rel_id: nf.rel_id.clone(),
-            media_key: nf.rel_id.clone(),
-            rect: BridgeRect {
-                x: cx + nf.origin.x,
-                y: cy + nf.origin.y,
-                w: nf.size.width,
-                h: nf.size.height,
-            },
-            width_emu: 0,
-            height_emu: 0,
-            floating: true,
-            frame_x: cx + nf.frame_origin.x,
-            frame_y: cy + nf.frame_origin.y,
-            wrap: None,
-            story: Vec::new(),
-            story_rid: String::new(),
-            rtl: false,
-        });
+        out.push(float_image_rect(nf, engine_to_bridge_path(host), (cx, cy)));
     }
     let story: Vec<bridge::TextBoxHop> = chain
         .iter()
@@ -7024,6 +7122,7 @@ fn collect_text_box_image_rects(
     for im in &mut out[start..] {
         im.story = story.clone();
         im.story_rid = rid.clone();
+        im.story_area = Some(bridge::HeaderFooterArea::TextBox);
     }
     for nf in tb
         .floats
@@ -7649,85 +7748,6 @@ fn line_end(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalPo
         path: caret.path.clone(),
         offset: line.end_byte,
     })
-}
-
-/// Epic #555 row 20 — the class of a Ctrl+Left / Ctrl+Right word unit
-/// (the clean-room cursor memo §5): text, punctuation (a class of its
-/// own), separators (space, tab, no-break space — any white space), and a
-/// non-text element (an inline object's `U+FFFC` sentinel), which is a
-/// word by itself. There are no script-specific rules: an Arabic word
-/// with a tatweel or harakat is text like any other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WordClass {
-    Text,
-    Punctuation,
-    Separator,
-    Object,
-}
-
-/// The word units of `text`: UAX #29 word segments (`split_word_bounds`,
-/// so a contraction `isn't`, a number `3.14`, an ideograph and a letter
-/// with its combining marks stay whole) classified by [`WordClass`], with
-/// adjacent punctuation and adjacent separators merged into one unit each
-/// (a run of one class). `(start, end, class)`, in logical order, covering
-/// `text`.
-fn word_units(text: &str) -> Vec<(usize, usize, WordClass)> {
-    use unicode_segmentation::UnicodeSegmentation;
-    let mut units: Vec<(usize, usize, WordClass)> = Vec::new();
-    for (i, seg) in text.split_word_bound_indices() {
-        let class = if seg == "\u{FFFC}" {
-            WordClass::Object
-        } else if seg.chars().all(char::is_whitespace) {
-            WordClass::Separator
-        } else if seg.chars().any(char::is_alphanumeric) {
-            WordClass::Text
-        } else {
-            WordClass::Punctuation
-        };
-        let end = i + seg.len();
-        match units.last_mut() {
-            Some(last)
-                if last.2 == class
-                    && matches!(class, WordClass::Punctuation | WordClass::Separator) =>
-            {
-                last.1 = end;
-            }
-            _ => units.push((i, end, class)),
-        }
-    }
-    units
-}
-
-/// Where Ctrl+Right (logical forward) stops from byte `off` of `text`:
-/// past the run of one class `off` sits in, then past the separators after
-/// it — the start of the next word, punctuation run or object, else the
-/// paragraph end. Also the far end of a Ctrl+Delete.
-fn word_stop_forward(text: &str, off: usize) -> usize {
-    let units = word_units(text);
-    let Some(i) = units.iter().position(|u| off >= u.0 && off < u.1) else {
-        return text.len();
-    };
-    match units.get(i + 1) {
-        Some(next) if next.2 == WordClass::Separator && units[i].2 != WordClass::Separator => {
-            next.1
-        }
-        Some(next) => next.0,
-        None => text.len(),
-    }
-}
-
-/// Where Ctrl+Left (logical backward) stops from byte `off` of `text`:
-/// back over the separators before it, then over a run of one class — its
-/// start. Also the near end of a Ctrl+Backspace.
-fn word_stop_backward(text: &str, off: usize) -> usize {
-    let units = word_units(text);
-    let Some(mut i) = units.iter().position(|u| off > u.0 && off <= u.1) else {
-        return 0;
-    };
-    if units[i].2 == WordClass::Separator && i > 0 {
-        i -= 1;
-    }
-    units[i].0
 }
 
 /// Jump one word backward in logical byte order — the engine half of
@@ -8625,6 +8645,35 @@ fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, Bridg
         Ordering::Equal => a.offset > b.offset,
     };
     if swap { (b, a) } else { (a, b) }
+}
+
+/// Issue #598 — where text typed over the selection `[start, end)` stops
+/// replacing: a selection that ends in the separators after a word, right
+/// before the next word (a double-clicked word), keeps them, so the typed
+/// text does not glue onto the next word (`engine::words::typing_replace_end`).
+/// Only inside one paragraph; any other range is replaced whole.
+fn typing_replace_end(
+    doc: &DocumentTree,
+    start: &BridgeLogicalPos,
+    end: BridgeLogicalPos,
+    typed: &str,
+) -> BridgeLogicalPos {
+    if start.path != end.path {
+        return end;
+    }
+    let Some(para) = doc.paragraph_at_path(&bridge_to_engine_path(end.path.clone())) else {
+        return end;
+    };
+    let kept = engine::words::typing_replace_end(
+        &para.text,
+        start.offset as usize,
+        end.offset as usize,
+        typed,
+    );
+    BridgeLogicalPos {
+        path: end.path,
+        offset: kept as u32,
+    }
 }
 
 /// Issue #77 — owned key for a `FieldStory` (body / header rid / footer
@@ -9526,9 +9575,10 @@ impl Engine {
     ///   adapters (#72), and GLOBAL ones (paint, viewport, zoom, stats,
     ///   undo/redo, save/export, fonts, a11y, enter/exit, snapshot /
     ///   recover) — fall through unchanged.
-    /// - `TextBoxOnly` — picture edits carry an explicit, body-rooted
-    ///   address and never move a text byte, so they are allowed while a
-    ///   text box is open (#206), rejected in other stories.
+    /// - `PictureStories` — picture edits never move a text byte: allowed
+    ///   while a text box is open (an explicit, body-rooted address, #206)
+    ///   or a header / footer (#573 — an empty `story` addresses the part
+    ///   being edited), rejected in note stories.
     /// - `ExitsStory` — document loads / close tear the story's ground
     ///   away: the command exits to the body itself, at its commit point
     ///   (issue #341 — a refused load must leave the story open).
@@ -9545,8 +9595,13 @@ impl Engine {
         }
         match cmd.meta().story {
             bridge::StoryPolicy::Allowed => None,
-            bridge::StoryPolicy::TextBoxOnly
-                if matches!(self.active_story, StoryTarget::TextBox { .. }) =>
+            bridge::StoryPolicy::PictureStories
+                if matches!(
+                    self.active_story,
+                    StoryTarget::TextBox { .. }
+                        | StoryTarget::Header { .. }
+                        | StoryTarget::Footer { .. }
+                ) =>
             {
                 None
             }
@@ -9555,7 +9610,7 @@ impl Engine {
             so a REFUSED load leaves the open story, selection and
             document name alone ("`Event::Error` => no mutation"). */
             bridge::StoryPolicy::ExitsStory => None,
-            bridge::StoryPolicy::BodyOnly | bridge::StoryPolicy::TextBoxOnly => {
+            bridge::StoryPolicy::BodyOnly | bridge::StoryPolicy::PictureStories => {
                 Some(Event::error_kind(
                     bridge::ErrorKind::InStory,
                     match &self.active_story {
@@ -10033,6 +10088,12 @@ impl Engine {
             Command::GetImageRects => self.do_get_image_rects(),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
             Command::SelectParagraphAt { at } => self.do_select_paragraph_at(at),
+            Command::SelectUnitsInPage {
+                page,
+                from,
+                to,
+                unit,
+            } => self.do_select_units_in_page(page, from, to, unit),
             Command::SelectCellAt { at } => self.do_select_cell_at(at),
             Command::DeleteAtCaret { forward, by_word } => {
                 self.do_delete_at_caret(forward, by_word)
@@ -14428,6 +14489,10 @@ impl Engine {
     /// image rectangles (with resize addresses) for the shell's
     /// resize-handle overlay + image hit-testing. Reuses the cached
     /// layout snapshot like `document_geometry`, so it never re-lays-out.
+    /// Issue #573 — the pictures of a header / footer are listed only
+    /// while that part is the active story (clean-room cursor memo §2:
+    /// only the active story's drawings are hit-testable), on the story's
+    /// anchor page, tagged `story_area` + `story_rid`.
     fn image_geometry(&self) -> Result<Vec<bridge::ImageRect>, Box<Event>> {
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
         self.ensure_layout_snapshot(self.scale(), false, target_y)?;
@@ -14438,6 +14503,13 @@ impl Engine {
         let pages = &snap.pages;
         let page_paths = &snap.page_paths;
         let gap = render::scene::PAGE_GAP_PT * self.scale();
+        /* Issue #573 — `(is_header, rid, anchor page)` of the part being
+        edited. */
+        let band_story: Option<(bool, &str, usize)> = match &self.active_story {
+            StoryTarget::Header { rid, page, .. } => Some((true, rid, *page as usize)),
+            StoryTarget::Footer { rid, page, .. } => Some((false, rid, *page as usize)),
+            StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => None,
+        };
         let mut out: Vec<bridge::ImageRect> = Vec::new();
         let mut page_top: f32 = 0.0;
         for (pi, page) in pages.iter().enumerate() {
@@ -14473,9 +14545,8 @@ impl Engine {
             /* Issue #69 — floating images were positioned by the
             paginator (`PageBox::floats`, page-relative px). Map each
             anchor back to a body block path so the shell can select and
-            drag it. Header / footer floats are painted but not
-            addressable from the body story — skipped here, like the
-            band's inline images. */
+            drag it. Header / footer floats are objects only while their
+            part is edited (issue #573, below). */
             for f in &page.floats {
                 /* Issue #83 — text boxes are stories, not pictures: they
                 are entered by click (`route_text_box_click`), never
@@ -14506,30 +14577,10 @@ impl Engine {
                             },
                         }
                     }
-                    layout::FloatAnchorRef::Header | layout::FloatAnchorRef::Footer => continue,
+                    layout::FloatAnchorRef::Header { .. }
+                    | layout::FloatAnchorRef::Footer { .. } => continue,
                 };
-                out.push(bridge::ImageRect {
-                    path,
-                    at: f.at,
-                    rel_id: f.rel_id.clone(),
-                    media_key: f.rel_id.clone(),
-                    rect: BridgeRect {
-                        x: f.origin.x,
-                        y: page_top + f.origin.y,
-                        w: f.size.width,
-                        h: f.size.height,
-                    },
-                    width_emu: 0,
-                    height_emu: 0,
-                    floating: true,
-                    frame_x: f.frame_origin.x,
-                    frame_y: page_top + f.frame_origin.y,
-                    /* Filled from the document model below. */
-                    wrap: None,
-                    story: Vec::new(),
-                    story_rid: String::new(),
-                    rtl: false,
-                });
+                out.push(float_image_rect(f, path, (0.0, page_top)));
             }
             /* Issue #206 — pictures inside text-box stories (and inside a
             box nested in one): the box frames were laid out with the
@@ -14544,6 +14595,11 @@ impl Engine {
                 };
                 collect_text_box_image_rects(f, (0.0, page_top), &[(host, f.at)], &mut out);
             }
+            if let Some((header, rid, anchor)) = band_story
+                && anchor == pi
+            {
+                collect_band_image_rects(page, header, page_top, rid, &mut out);
+            }
             page_top += page.size.height + gap;
         }
         /* Enrich each rect with its EMU extent from the document model
@@ -14557,11 +14613,19 @@ impl Engine {
             .map(|c| c.base_direction)
             .unwrap_or(ShapingDirection::Ltr);
         /* Issue #206 — a box picture's path is rooted in its story: resolve
-        each story tree once (keyed by its rid). */
+        each story tree once (keyed by its rid). Issue #573 — a band
+        picture's in the part being edited. */
         let mut story_trees: HashMap<String, Option<DocumentTree>> = HashMap::new();
+        let band_tree = band_story.and_then(|_| self.story_doc());
         for im in &mut out {
             let epath = bridge_path_to_engine(&im.path);
-            let tree = if im.story.is_empty() {
+            let in_band = matches!(
+                im.story_area,
+                Some(bridge::HeaderFooterArea::Header | bridge::HeaderFooterArea::Footer)
+            );
+            let tree = if in_band {
+                band_tree.as_ref()
+            } else if im.story.is_empty() {
                 Some(doc)
             } else {
                 story_trees
@@ -14654,6 +14718,23 @@ impl Engine {
         page_idx: u32,
         at: BridgePoint,
     ) -> Result<(BridgeLogicalPos, LineHint), Box<Event>> {
+        let at = self.page_point_to_document(page_idx, at)?;
+        let geom = self.document_geometry()?;
+        Ok(hit_test_geom_hinted(&geom, at.x, at.y))
+    }
+
+    /// A point in page `page_idx`'s LOCAL device pixels → document-absolute
+    /// device pixels: the page's accumulated top offset is added (growing
+    /// the lazy band to the page first). The ONE conversion every
+    /// page-local pointer command goes through (`HitTestInPage`,
+    /// `PlaceCaretAtPoint` and `ExtendSelectionToPoint` via
+    /// [`Self::hit_test_in_page_hinted`], issue #598's
+    /// `SelectUnitsInPage`).
+    fn page_point_to_document(
+        &mut self,
+        page_idx: u32,
+        at: BridgePoint,
+    ) -> Result<BridgePoint, Box<Event>> {
         let scale = self.scale();
         let gap = render::scene::PAGE_GAP_PT * scale;
         /* Issue #34/#51 — this used to request a FULL document layout
@@ -14697,9 +14778,10 @@ impl Engine {
                 top
             })
         };
-        let global_y = at.y + page_top;
-        let geom = self.document_geometry()?;
-        Ok(hit_test_geom_hinted(&geom, at.x, global_y))
+        Ok(BridgePoint {
+            x: at.x,
+            y: at.y + page_top,
+        })
     }
 
     /// Issue #53 — where an interactive `InsertText { at: None }`
@@ -14849,74 +14931,143 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::SelectWordAt` — hit-test, then select the whole word
-    /// (double-click).
+    /// `Command::SelectWordAt` — select the word under a document point
+    /// (double-click). Issue #598: a word with its trailing spaces, see
+    /// [`Self::unit_range_at`].
     fn do_select_word_at(&mut self, at: BridgePoint) -> Event {
         self.lazy_layout_bump_for_y(at.y);
         let geom = match self.document_geometry() {
             Ok(g) => g,
             Err(e) => return *e,
         };
-        /* Issue #553 — the word comes from the LOGICAL character the
-        pointer is on (or the line's logical last word past its end),
-        never from a visual slot: see `word_target_geom`. */
-        let (path, target) = word_target_geom(&geom, at.x, at.y);
-        let engine_path = bridge_to_engine_path(path.clone());
-        let unresolved = match target {
-            WordTarget::Char(at) | WordTarget::LineEnd { end: at, .. } => (at, at),
-        };
-        let (lo, hi) = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path).map_or(unresolved, |p| {
-                /* Issue #77 — a word that reaches into a field takes
-                the whole field (a double-click on "12" in "Page 12
-                of 34" selects the PAGE field). */
-                let (lo, hi) = p.word_bounds(word_probe_offset(&p.text, target));
-                p.expand_range_over_fields(lo, hi)
-            })
-        });
-        self.pending_format = None;
-        self.selection = Some(SelectionState {
-            anchor: BridgeLogicalPos {
-                path: path.clone(),
-                offset: lo,
-            },
-            caret: BridgeLogicalPos { path, offset: hi },
-            ideal_x: None,
-            kind: SelectionKind::Linear,
-        });
-        self.selection_changed()
+        let (lo, hi) = self.unit_range_at(&geom, at, SelectionUnit::Word);
+        self.select_unit_range(lo, hi, SelectionUnit::Word)
     }
 
-    /// `Command::SelectParagraphAt` — hit-test then select the whole
-    /// paragraph (triple-click).
+    /// `Command::SelectParagraphAt` — select the whole paragraph under a
+    /// document point (triple-click).
     fn do_select_paragraph_at(&mut self, at: BridgePoint) -> Event {
         self.lazy_layout_bump_for_y(at.y);
         let geom = match self.document_geometry() {
             Ok(g) => g,
             Err(e) => return *e,
         };
-        let hit = hit_test_geom(&geom, at.x, at.y);
-        let engine_path = bridge_to_engine_path(hit.path.clone());
-        let len = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path)
-                .map_or(0, |p| p.text.len() as u32)
-        });
-        self.pending_format = None;
-        self.selection = Some(SelectionState {
-            anchor: BridgeLogicalPos {
-                path: hit.path.clone(),
-                offset: 0,
+        let (lo, hi) = self.unit_range_at(&geom, at, SelectionUnit::Paragraph);
+        self.select_unit_range(lo, hi, SelectionUnit::Paragraph)
+    }
+
+    /// Epic #555 row 22, issue #598 — `Command::SelectUnitsInPage`: the
+    /// double / triple press (`from == to`) and the drag after it, which
+    /// grows by WHOLE units (clean-room cursor memo §6). Both points are
+    /// page-local; both units are resolved through
+    /// [`Self::unit_range_at`], the one resolution `SelectWordAt` /
+    /// `SelectParagraphAt` use. Pointer at or after the first unit: anchor
+    /// at its start, caret at the far end of the unit under `to` (never
+    /// short of the first unit's end). Pointer before it: anchor at its
+    /// END, caret at the start of the unit under `to` — the first unit
+    /// stays selected whichever way the drag goes.
+    fn do_select_units_in_page(
+        &mut self,
+        page_idx: u32,
+        from: BridgePoint,
+        to: BridgePoint,
+        unit: SelectionUnit,
+    ) -> Event {
+        let from = match self.page_point_to_document(page_idx, from) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
+        let to = match self.page_point_to_document(page_idx, to) {
+            Ok(p) => p,
+            Err(e) => return *e,
+        };
+        let geom = match self.document_geometry() {
+            Ok(g) => g,
+            Err(e) => return *e,
+        };
+        let (first_lo, first_hi) = self.unit_range_at(&geom, from, unit);
+        let (lo, hi) = self.unit_range_at(&geom, to, unit);
+        let before_first = lo != first_lo && ordered(lo.clone(), first_lo.clone()).0 == lo;
+        if before_first {
+            self.select_unit_range(first_hi, lo, unit)
+        } else {
+            let far = ordered(first_hi, hi).1;
+            self.select_unit_range(first_lo, far, unit)
+        }
+    }
+
+    /// Issue #598 — the ONE resolution of "the unit under this document
+    /// point" (`SelectWordAt`, `SelectParagraphAt`, `SelectUnitsInPage`),
+    /// as `(start, end)` positions in the selection's document.
+    ///
+    /// A word is chosen from the LOGICAL character under the pointer, or
+    /// the line's logical last word past its end (issue #553,
+    /// [`word_target_geom`] — never a visual slot), and is
+    /// `Paragraph::word_bounds`: the `engine::words` unit with the
+    /// separators after it. A word that reaches into a field takes the
+    /// whole field (issue #77: a double-click on "12" in "Page 12 of 34"
+    /// selects the PAGE field). A paragraph is the hit paragraph, whole.
+    fn unit_range_at(
+        &self,
+        geom: &[LineGeom],
+        at: BridgePoint,
+        unit: SelectionUnit,
+    ) -> (BridgeLogicalPos, BridgeLogicalPos) {
+        let (path, (lo, hi)) = match unit {
+            SelectionUnit::Word => {
+                let (path, target) = word_target_geom(geom, at.x, at.y);
+                let engine_path = bridge_to_engine_path(path.clone());
+                let unresolved = match target {
+                    WordTarget::Char(at) | WordTarget::LineEnd { end: at, .. } => (at, at),
+                };
+                let range = self.with_selection_doc(|d| {
+                    d.paragraph_at_path(&engine_path).map_or(unresolved, |p| {
+                        let (lo, hi) = p.word_bounds(word_probe_offset(&p.text, target));
+                        p.expand_range_over_fields(lo, hi)
+                    })
+                });
+                (path, range)
+            }
+            SelectionUnit::Paragraph => {
+                let path = hit_test_geom(geom, at.x, at.y).path;
+                let engine_path = bridge_to_engine_path(path.clone());
+                let len = self.with_selection_doc(|d| {
+                    d.paragraph_at_path(&engine_path)
+                        .map_or(0, |p| p.text.len() as u32)
+                });
+                (path, (0, len))
+            }
+        };
+        (
+            BridgeLogicalPos {
+                path: path.clone(),
+                offset: lo,
             },
-            caret: BridgeLogicalPos {
-                path: hit.path,
-                offset: len,
-            },
-            ideal_x: None,
-            kind: SelectionKind::Linear,
-        });
-        /* Issue #489 — Word's triple-click selects the paragraph mark. */
-        self.note_selection_includes_its_mark();
-        self.selection_changed()
+            BridgeLogicalPos { path, offset: hi },
+        )
+    }
+
+    /// Select from `anchor` to `caret` for a gesture of `unit`s — the live
+    /// selection the `SetSelection` way (clamped into the selection's
+    /// document, widened over fields, sticky style and caret affinity
+    /// dropped, the kind derived — a drag into another cell is a
+    /// `TABLE_CELLS` selection). Issue #489 — a selection of whole
+    /// PARAGRAPHS (a triple-click, a drag by paragraphs) includes the mark
+    /// of its last one, as Word selects the pilcrow with them
+    /// ([`Engine::mark_selection`]).
+    fn select_unit_range(
+        &mut self,
+        anchor: BridgeLogicalPos,
+        caret: BridgeLogicalPos,
+        unit: SelectionUnit,
+    ) -> Event {
+        let (start, end) = ordered(anchor, caret.clone());
+        let evt = self.do_set_selection(BridgeLogicalRange { start, end }, caret);
+        if matches!(unit, SelectionUnit::Paragraph) && matches!(evt, Event::SelectionChanged { .. })
+        {
+            self.note_selection_includes_its_mark();
+        }
+        evt
     }
 
     /// `Command::SelectCellAt` — hit-test, then select every byte of
@@ -16320,6 +16471,7 @@ impl Engine {
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
         };
+        let end = typing_replace_end(&temp, &start, end, &text);
         let replaced = replaced_text_style(&temp, &start, &end);
         let base = if start == end {
             temp
@@ -17955,6 +18107,7 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
+        let end = typing_replace_end(self.undo.current(), &start, end, &text);
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
@@ -20096,11 +20249,25 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #573 — `true` while a header / footer part is the active
+    /// story: an image command's empty `story` then addresses a picture of
+    /// THAT part (`path` rooted in it), the only drawings that are objects
+    /// there (clean-room cursor memo §2).
+    fn editing_band_part(&self) -> bool {
+        matches!(
+            self.active_story,
+            StoryTarget::Header { .. } | StoryTarget::Footer { .. }
+        )
+    }
+
     /// Issue #206 — resolve an image command's `story` chain against the
     /// current tree: the engine hops plus a copy of the picture's inline
     /// object at `(path, at)` in that story (body when the chain is
     /// empty). `Err` is the honest reply for a chain past the nesting cap,
     /// a hop that names no text box, or an address holding no picture.
+    /// Issue #573 — while a header / footer is edited, the empty chain is
+    /// the part being edited (its text boxes are not addressable: a chain
+    /// is refused there).
     fn resolve_story_image(
         &self,
         origin: &str,
@@ -20108,6 +20275,33 @@ impl Engine {
         path: &EngineBlockPath,
         at: u32,
     ) -> Result<StoryImage, Box<Event>> {
+        let find = |d: &DocumentTree| {
+            d.paragraph_at_path(path).and_then(|p| {
+                p.inline_objects
+                    .iter()
+                    .find(|io| io.at == at && matches!(io.kind, engine::InlineKind::Image { .. }))
+                    .cloned()
+            })
+        };
+        if self.editing_band_part() {
+            if !story.is_empty() {
+                return Err(Box::new(Event::error_kind(
+                    bridge::ErrorKind::NoSuchTarget,
+                    format!(
+                        "{origin}: a header / footer addresses its own pictures with an empty \
+                         story; its text boxes are not addressable"
+                    ),
+                )));
+            }
+            let io = self.story_doc().and_then(|tree| find(&tree));
+            if io.is_none() {
+                return Err(Box::new(Event::error_kind(
+                    bridge::ErrorKind::NoSuchTarget,
+                    format!("{origin}: no picture at that address in the header / footer"),
+                )));
+            }
+            return Ok((Vec::new(), io));
+        }
         if story.len() > MAX_TEXT_BOX_LAYOUT_DEPTH as usize {
             return Err(Box::new(Event::error_kind(
                 bridge::ErrorKind::NestingTooDeep,
@@ -20119,14 +20313,6 @@ impl Engine {
             .map(|h| (bridge_path_to_engine(&h.path), h.at))
             .collect();
         let doc = self.undo.current();
-        let find = |d: &DocumentTree| {
-            d.paragraph_at_path(path).and_then(|p| {
-                p.inline_objects
-                    .iter()
-                    .find(|io| io.at == at && matches!(io.kind, engine::InlineKind::Image { .. }))
-                    .cloned()
-            })
-        };
         let io = if hops.is_empty() {
             find(doc)
         } else {
@@ -20145,11 +20331,23 @@ impl Engine {
     /// the body for none) as ONE undo step and re-lay-out: the paragraph
     /// layout LRU is cleared (the image spec rides the sentinel glyph; a
     /// story edit re-keys its box) and the pages re-paginate + repaint.
+    /// Issue #573 — while a header / footer is edited the edit runs in
+    /// that part (`resolve_story_image` gave no hops), through the story
+    /// transaction, keeping the selection.
     fn commit_image_edit(
         &mut self,
         hops: &[(EngineBlockPath, u32)],
         edit: impl FnOnce(&DocumentTree) -> DocumentTree,
     ) -> Event {
+        if self.editing_band_part() {
+            self.layout_cache.get_mut().clear();
+            self.invalidate_layout_snapshot();
+            let caret = self
+                .selection
+                .as_ref()
+                .map_or_else(|| bpos_top(0, 0), |s| s.caret.clone());
+            return self.story_mutate(edit, caret, true);
+        }
         let Some(new_doc) = self.undo.current().with_text_box_story_edit(hops, edit) else {
             return Event::error_kind(
                 bridge::ErrorKind::NoSuchTarget,
@@ -32149,6 +32347,12 @@ mod image_rtl_tests;
 /// on a text-box picture entering its box).
 #[cfg(test)]
 mod image_object_selection_tests;
+
+/// Issue #573 - the pictures of the header / footer being edited are
+/// objects: listed by `GetImageRects` only then, addressed by the image
+/// commands with an empty `story`, deleted through their sentinel.
+#[cfg(test)]
+mod band_picture_tests;
 
 #[cfg(test)]
 mod para_style_edit_tests;

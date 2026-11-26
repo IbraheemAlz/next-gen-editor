@@ -233,19 +233,25 @@ fn a_selection_that_stops_at_the_last_character_leaves_the_mark() {
     );
 }
 
+/// A point on body paragraph `block`'s (only) line, near its start, in
+/// document coordinates — page 0's local ones too.
+fn point_in(e: &Engine, block: u32) -> BridgePoint {
+    let geom = e.document_geometry().expect("geometry");
+    let line = geom
+        .iter()
+        .find(|l| l.path == bpos_top(block, 0).path)
+        .expect("the paragraph's line");
+    BridgePoint {
+        x: line.hit_left + 2.0,
+        y: line.y_top + line.height / 2.0,
+    }
+}
+
 /// A triple-click selects the paragraph WITH its mark.
 #[test]
 fn a_triple_click_paragraph_selection_formats_the_mark() {
     let mut e = tests::test_engine_with_doc(three());
-    let geom = e.document_geometry().expect("geometry");
-    let line = geom
-        .iter()
-        .find(|l| l.path == bpos_top(1, 0).path)
-        .expect("paragraph 1's line");
-    let at = BridgePoint {
-        x: line.hit_left + 2.0,
-        y: line.y_top + line.height / 2.0,
-    };
+    let at = point_in(&e, 1);
     match apply(&mut e, Command::SelectParagraphAt { at }) {
         Event::SelectionChanged { range, .. } => {
             assert_eq!((range.start, range.end), (bpos_top(1, 0), end_of(1)));
@@ -258,6 +264,61 @@ fn a_triple_click_paragraph_selection_formats_the_mark() {
         &line_heights(&e),
         &[single(DEFAULT), single(SMALL), single(DEFAULT)],
     );
+}
+
+/// Issue #598 — the shell's triple press and its drag by paragraphs post
+/// `SelectUnitsInPage { unit: Paragraph }`, which records the covered
+/// marks exactly like `SelectParagraphAt`: the press covers its
+/// paragraph's mark, a drag down every paragraph it reaches, a drag back
+/// up the paragraphs from the pointer's to the first one (the first stays
+/// selected). A WORD-unit gesture over a one-word paragraph selects the
+/// same text and no mark.
+#[test]
+fn a_paragraph_unit_gesture_formats_the_marks_it_covers() {
+    let units = |e: &mut Engine, from: u32, to: u32, unit: SelectionUnit| {
+        let (from, to) = (point_in(e, from), point_in(e, to));
+        match apply(
+            e,
+            Command::SelectUnitsInPage {
+                page: 0,
+                from,
+                to,
+                unit,
+            },
+        ) {
+            Event::SelectionChanged { range, .. } => (range.start, range.end),
+            other => panic!("SelectUnitsInPage: {other:?}"),
+        }
+    };
+    let cases = [
+        (
+            1,
+            1,
+            SelectionUnit::Paragraph,
+            (1, 1),
+            [None, Some(SMALL), None],
+        ),
+        (0, 2, SelectionUnit::Paragraph, (0, 2), [Some(SMALL); 3]),
+        (
+            2,
+            1,
+            SelectionUnit::Paragraph,
+            (1, 2),
+            [None, Some(SMALL), Some(SMALL)],
+        ),
+        (1, 1, SelectionUnit::Word, (1, 1), [None, None, None]),
+    ];
+    for (from, to, unit, (first, last), marks) in cases {
+        let mut e = tests::test_engine_with_doc(three());
+        let range = units(&mut e, from, to, unit);
+        assert_eq!(
+            range,
+            (bpos_top(first, 0), end_of(last)),
+            "{unit:?} {from} -> {to}"
+        );
+        format_selection(&mut e, size_patch(SMALL));
+        assert_eq!(mark_sizes(&e), marks.to_vec(), "{unit:?} {from} -> {to}");
+    }
 }
 
 /// "This selection includes its mark" lives exactly as long as the
