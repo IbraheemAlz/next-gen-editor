@@ -10227,6 +10227,12 @@ impl Engine {
 
     fn do_undo(&mut self) -> Event {
         self.undo.undo();
+        /* Issue #346 — no `layout_cache.clear()` here, on purpose: the
+        paragraph / table caches are keyed by CONTENT (every layout input,
+        exhaustively), so the restored document hits exactly the entries
+        laid out under the same content and misses the rest. Pinned by
+        `paragraph_cache_key_tests::undo_and_redo_of_a_tab_kind_change_…`;
+        a stale entry after undo means a field missing from the key. */
         self.story_validity_guard();
         /* Issue #117 — re-clamp BEFORE repainting: the tree has already
         been swapped, so a failing repaint (early return below) must not
@@ -10914,6 +10920,7 @@ impl Engine {
 
     fn do_redo(&mut self) -> Event {
         self.undo.redo();
+        /* Issue #346 — no cache clear: see `do_undo`. */
         self.story_validity_guard();
         /* Issue #117 — re-clamp BEFORE repainting: the tree has already
         been swapped, so a failing repaint (early return below) must not

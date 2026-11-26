@@ -242,6 +242,15 @@ hard failure so CI catches a new loop instead of a silent recovery.
   stored with the entry and replayed on a hit, so a cached paint reports
   what a fresh one would. `tools/corpus-native` re-lays every document
   warm (`engine_repaint_consistent`) to prove warm == cold.
+  **Undo / redo do not clear it (issue #346).** A content key makes the
+  restored document hit exactly the entries laid out under the same
+  content (redo of a tab-kind change is a real hit) and miss the rest;
+  `paragraph_cache_key_tests::undo_and_redo_of_a_tab_kind_change_…` /
+  `…_tab_leader_…` pin warm == cold through `SetTabStops` → `Undo` →
+  `Redo` (they fail the moment the tab kind / leader leaves the key —
+  the leader is geometry-neutral, so the test compares the glyph field).
+  A stale entry after undo is a field missing from a key, never a reason
+  for a blanket `clear` in `do_undo`.
 - **Paragraph decorations are stamped by ONE helper (issue #455).**
   `pBdr` borders, `shd` shading and the tracked-mark pilcrow colour are
   paint-only, so `paragraph_layout_key` leaves them out and the paragraph
