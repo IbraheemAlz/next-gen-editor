@@ -16,6 +16,7 @@ import type {
     BridgeStoryRef,
     Direction,
     Event,
+    HeaderFooterArea,
     ImageWrapMode,
     TextBoxHop,
     LogicalPos,
@@ -25,7 +26,12 @@ import type {
     TextAttrs,
 } from '../engine/types';
 import { topPos } from '../engine/types';
-import { storyMatches, type ActiveStory } from '../input/image-keys';
+import {
+    pictureHittable,
+    storyMatches,
+    storyOfImage,
+    type ActiveStory,
+} from '../input/image-keys';
 import {
     applyCaretAtOnce,
     createCaretFrameScheduler,
@@ -237,8 +243,14 @@ export interface ImageRectCss {
      *  for a body picture); `path` is rooted in that story. Handed back as
      *  the `story` of RESIZE_IMAGE / MOVE_IMAGE / SET_IMAGE_WRAP. */
     story: TextBoxHop[];
-    /** Issue #206 — the owning story's `outer/inner` id (`''` for body). */
+    /** Issue #206 — the owning story's `outer/inner` id (`''` for body);
+     *  issue #573 — the part's rid for a header / footer picture. */
     storyRid: string;
+    /** Issue #573 — `ImageRect.story_area`: `'Header'` / `'Footer'` for a
+     *  picture of the header / footer being edited (listed only then, its
+     *  `path` rooted in that part, `story` empty), `'TextBox'` for a
+     *  text-box picture, `undefined` for a body picture. */
+    storyArea: HeaderFooterArea | undefined;
     /** Issue #554 — the picture's paragraph runs right-to-left, so its
      *  visual left edge is the byte offset AFTER the sentinel. */
     rtl: boolean;
@@ -248,6 +260,10 @@ export interface ImageAddr {
     at: number;
     /** Issue #206 — the picture's text-box story chain (empty = body). */
     story: TextBoxHop[];
+    /** Issue #573 — a header / footer picture's part (its `path` is rooted
+     *  there, so `(path, at)` alone collides with a body picture). */
+    storyArea?: HeaderFooterArea | undefined;
+    storyRid?: string | undefined;
     /** Issue #506 — set while the picture is selected but no
      *  `GET_IMAGE_RECTS` reply has listed it yet (the object selection an
      *  `INSERT_IMAGE` leaves behind, until the paint's rect query answers):
@@ -281,36 +297,71 @@ const samePath = (a: BlockPath, b: BlockPath): boolean =>
         return false;
     });
 
+/** Issue #573 — the header / footer part a picture belongs to (`''` for a
+ *  body or text-box picture, whose story the chain names). */
+const bandKey = (a: ImageAddr): string =>
+    a.storyArea === 'Header' || a.storyArea === 'Footer' ? `${a.storyArea}:${a.storyRid ?? ''}` : '';
+
 /** `true` when two image addresses name the same picture — same story
  *  chain (issue #206: a box picture's path is story-rooted, so `(path,
- *  at)` alone can collide with a body picture), path and anchor byte. */
+ *  at)` alone can collide with a body picture), same header / footer part
+ *  (issue #573, likewise), path and anchor byte. */
 export const sameImageAddr = (a: ImageAddr, b: ImageAddr): boolean =>
     a.at === b.at &&
     samePath(a.path, b.path) &&
+    bandKey(a) === bandKey(b) &&
     a.story.length === b.story.length &&
     a.story.every((h, i) => {
         const o = b.story[i]!;
         return h.at === o.at && samePath(h.path, o.path);
     });
 
-/** Select the image under a document-absolute CSS point, if any. Returns
- *  the picture when one was hit (and selected); `undefined` clears the
- *  selection. Called synchronously by the pointer path before it places a
- *  caret. Nested pictures are listed after their box's, so the innermost
- *  hit wins. Issue #506 — any story's picture can be hit (body or text
- *  box); the pointer path enters the picture's story in the same click
- *  when it is not the active one. */
-export function selectImageByPoint(cssX: number, cssY: number): ImageRectCss | undefined {
+/** The picture under a document-absolute CSS point that a click may select
+ *  while the engine edits `active` (`pictureHittable`, issue #573: only
+ *  the active story's drawings when a header / footer is edited, never a
+ *  header / footer picture otherwise), if any. No side effect. Nested
+ *  pictures are listed after their box's, so the innermost hit wins. `only`
+ *  narrows the candidates further. */
+export function imageAtPoint(
+    cssX: number,
+    cssY: number,
+    active: ActiveStory | undefined,
+    only: (im: ImageRectCss) => boolean = () => true,
+): ImageRectCss | undefined {
     const hits = imageRectsSig().filter(
         (im) =>
             cssX >= im.rect.x &&
             cssX <= im.rect.x + im.rect.w &&
             cssY >= im.rect.y &&
-            cssY <= im.rect.y + im.rect.h,
+            cssY <= im.rect.y + im.rect.h &&
+            pictureHittable(im, active) &&
+            only(im),
     );
-    const hit = hits[hits.length - 1];
+    return hits[hits.length - 1];
+}
+
+/** Object-select `im` (resize handles, the caret hidden). */
+export function selectImage(im: ImageRectCss): void {
+    setSelectedImageSig({
+        path: im.path,
+        at: im.at,
+        story: im.story,
+        storyArea: im.storyArea,
+        storyRid: im.storyRid,
+    });
+}
+
+/** Select the image under a document-absolute CSS point, if any. Returns
+ *  the picture when one was hit (and selected); `undefined` clears the
+ *  selection. Called synchronously by the pointer path before it places a
+ *  caret. Issue #506 — a body or text-box picture can be hit from the body
+ *  or a text box; the pointer path enters the picture's story in the same
+ *  click when it is not the active one. Issue #573 — while a header /
+ *  footer is edited only its own pictures (`imageAtPoint`). */
+export function selectImageByPoint(cssX: number, cssY: number): ImageRectCss | undefined {
+    const hit = imageAtPoint(cssX, cssY, activeStoryForKeys());
     if (hit) {
-        setSelectedImageSig({ path: hit.path, at: hit.at, story: hit.story });
+        selectImage(hit);
         return hit;
     }
     setSelectedImageSig(null);
@@ -319,7 +370,10 @@ export function selectImageByPoint(cssX: number, cssY: number): ImageRectCss | u
 
 /** What the key path needs of the selected picture (`input/image-keys.ts`
  *  `KeyedImage`). */
-export type SelectedImageForKeys = Pick<ImageRectCss, 'path' | 'at' | 'story' | 'storyRid' | 'rtl'>;
+export type SelectedImageForKeys = Pick<
+    ImageRectCss,
+    'path' | 'at' | 'story' | 'storyRid' | 'storyArea' | 'rtl'
+>;
 
 /** Issue #554 — the selected picture's current rect, for the non-reactive
  *  key path (`undefined` when nothing is selected or the engine no longer
@@ -333,7 +387,14 @@ export function selectedImageForKeys(): SelectedImageForKeys | undefined {
     const listed = imageRectsSig().find((r) => sameImageAddr(r, sel));
     if (listed) return listed;
     if (sel.unlisted) {
-        return { path: sel.path, at: sel.at, story: sel.story, storyRid: '', rtl: sel.unlisted.rtl };
+        return {
+            path: sel.path,
+            at: sel.at,
+            story: sel.story,
+            storyRid: '',
+            storyArea: undefined,
+            rtl: sel.unlisted.rtl,
+        };
     }
     return undefined;
 }
@@ -375,10 +436,8 @@ export function leaveImageSelection(settled?: Promise<unknown>): void {
 let pendingStoryEntry: { target: ActiveStory | undefined; token: number } | null = null;
 let storyEntryToken = 0;
 
-/** The story a picture's positions are rooted in, as `ActiveStory`. */
-export function storyOfImage(img: Pick<ImageRectCss, 'story' | 'storyRid'>): ActiveStory | undefined {
-    return img.story.length === 0 ? undefined : { area: 'TextBox', rid: img.storyRid };
-}
+/** The story a picture's positions are rooted in (`input/image-keys.ts`). */
+export { storyOfImage };
 
 /** Record that `settled` (a `PLACE_CARET_AT_POINT`) enters `target`. When
  *  it lands in another story (the press was on a part of a box picture
@@ -580,6 +639,7 @@ export function createEngineStore(client: EngineClient) {
                 wrap: im.wrap,
                 story: im.story ?? [],
                 storyRid: im.story_rid ?? '',
+                storyArea: im.story_area,
                 rtl: im.rtl ?? false,
             }));
             batch(() => {

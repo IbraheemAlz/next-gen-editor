@@ -519,7 +519,7 @@ fn story_name(s: StoryPolicy) -> &'static str {
     match s {
         StoryPolicy::Allowed => "allowed",
         StoryPolicy::BodyOnly => "body only",
-        StoryPolicy::TextBoxOnly => "text box only",
+        StoryPolicy::PictureStories => "picture stories",
         StoryPolicy::ExitsStory => "exits story",
     }
 }

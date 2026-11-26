@@ -443,10 +443,13 @@ pub enum FloatAnchorRef {
         block: usize,
         cell: Option<CellAnchorRef>,
     },
-    /// A paragraph inside the page's header band.
-    Header,
-    /// A paragraph inside the page's footer band.
-    Footer,
+    /// A paragraph inside the page's header band: `band.blocks[block]`,
+    /// which is the header part's block `block` (issue #573 — the active
+    /// part's floating pictures are addressed story-rooted by it).
+    Header { block: usize },
+    /// A paragraph inside the page's footer band (`block` as for
+    /// [`Self::Header`]).
+    Footer { block: usize },
 }
 
 /// Issue #69 — table-cell coordinates of a float anchored inside a cell.

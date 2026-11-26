@@ -4,11 +4,13 @@ import type { Command, Event } from '../engine/types';
 import {
     caretAtEdge,
     isModifierOnly,
+    pictureHittable,
     pictureSelection,
     planImageKey,
     runImageKey,
     selectsPicture,
     storyMatches,
+    storyOfImage,
     type ImageKeyClient,
     type KeyedImage,
     type KeyInfo,
@@ -389,5 +391,99 @@ describe('runImageKey (#554)', () => {
         const c: ImageKeyClient = { dispatch: () => Promise.reject(new Error('boom')) };
         runImageKey(planImageKey(key('Delete'), LTR), body(), c, undefined, err);
         await vi.waitFor(() => expect(err).toHaveBeenCalledWith('delete image', expect.any(Error)));
+    });
+});
+
+/* Issue #573 - a picture of the header / footer being edited is an object
+ * of THAT story (clean-room memo §2: only the active story's drawing layer
+ * is hit-testable). Its path is rooted in the part, its `story` chain is
+ * empty, `storyArea` / `storyRid` name the part. */
+const inHeader = body({
+    path: { steps: [{ kind: 'BLOCK', idx: 0 }] },
+    at: 7,
+    storyRid: 'rId7',
+    storyArea: 'Header',
+});
+const HEADER = { area: 'Header', rid: 'rId7' };
+
+describe('header / footer pictures (#573)', () => {
+    it('belong to their part; body and box pictures keep their stories', () => {
+        expect(storyOfImage(inHeader)).toEqual(HEADER);
+        expect(storyOfImage(body({ storyArea: 'Footer', storyRid: 'rId8' }))).toEqual({
+            area: 'Footer',
+            rid: 'rId8',
+        });
+        expect(storyOfImage(body())).toBeUndefined();
+        expect(storyOfImage(boxed)).toEqual({ area: 'TextBox', rid: '1@0' });
+        expect(storyOfImage({ ...boxed, storyArea: 'TextBox' })).toEqual({ area: 'TextBox', rid: '1@0' });
+    });
+
+    it('are addressable only while their own part is edited', () => {
+        expect(storyMatches(inHeader, HEADER)).toBe(true);
+        expect(storyMatches(inHeader, undefined), 'the body').toBe(false);
+        expect(storyMatches(inHeader, { area: 'Header', rid: 'rId9' }), 'another part').toBe(false);
+        expect(storyMatches(inHeader, { area: 'Footer', rid: 'rId7' })).toBe(false);
+        expect(storyMatches(body(), HEADER), 'a body picture from the header').toBe(false);
+    });
+
+    it('a click hits only the active story\'s drawings when a part is edited, and a part\'s never from elsewhere', () => {
+        /* Editing the header: its pictures only. */
+        expect(pictureHittable(inHeader, HEADER)).toBe(true);
+        expect(pictureHittable(body(), HEADER)).toBe(false);
+        expect(pictureHittable(boxed, HEADER)).toBe(false);
+        expect(pictureHittable(inHeader, { area: 'Header', rid: 'rId9' })).toBe(false);
+        /* Editing the body or a box: never a header picture (a stale rect
+           list after the exit), body and box pictures as before (#506). */
+        expect(pictureHittable(inHeader, undefined)).toBe(false);
+        expect(pictureHittable(inHeader, { area: 'TextBox', rid: '1@0' })).toBe(false);
+        expect(pictureHittable(body(), undefined)).toBe(true);
+        expect(pictureHittable(boxed, undefined)).toBe(true);
+        expect(pictureHittable(body(), { area: 'TextBox', rid: '1@0' })).toBe(true);
+    });
+
+    it('selectsPicture accepts the sentinel only in the part', () => {
+        const sel = (story?: { area: string; rid: string }): Event =>
+            ({
+                type: 'SELECTION_CHANGED',
+                ...(story ? { editing_story: story } : {}),
+                range: {
+                    start: { path: inHeader.path, offset: 7 },
+                    end: { path: inHeader.path, offset: 10 },
+                },
+            }) as unknown as Event;
+        expect(selectsPicture(sel(HEADER), inHeader)).toBe(true);
+        expect(selectsPicture(sel(), inHeader), 'the body').toBe(false);
+        expect(selectsPicture(sel({ area: 'Header', rid: 'rId9' }), inHeader)).toBe(false);
+    });
+
+    it('Delete selects the sentinel IN the part, then deletes the selection - never a body DELETE_RANGE', async () => {
+        const reply = {
+            type: 'SELECTION_CHANGED',
+            editing_story: HEADER,
+            range: {
+                start: { path: inHeader.path, offset: 7 },
+                end: { path: inHeader.path, offset: 10 },
+            },
+        } as unknown as Event;
+        const c = fakeClient([reply]);
+        const res = runImageKey(planImageKey(key('Delete'), LTR), inHeader, c, HEADER);
+        expect(res.outcome).toBe('consumed');
+        await res.settled;
+        expect(c.sent.map((x) => x.type)).toEqual(['SET_SELECTION', 'DELETE_AT_CARET']);
+        expect(c.sent[0]).toEqual(pictureSelection(inHeader));
+    });
+
+    it('from outside its part (the body) Delete is swallowed and nothing is posted', () => {
+        const c = fakeClient();
+        expect(runImageKey(planImageKey(key('Delete'), LTR), inHeader, c, undefined).outcome).toBe('consumed');
+        expect(c.sent).toEqual([]);
+    });
+
+    it('the first Escape only drops the object selection: the caret goes before the picture IN the part', () => {
+        const c = fakeClient();
+        const res = runImageKey(planImageKey(key('Escape'), LTR), inHeader, c, HEADER);
+        expect(res.outcome, 'consumed: the header is not left').toBe('consumed');
+        expect(res.keepObject).toBe(false);
+        expect(c.sent).toEqual([caretAtEdge(inHeader, 'before')]);
     });
 });
