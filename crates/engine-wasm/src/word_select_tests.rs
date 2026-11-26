@@ -15,6 +15,14 @@
 //!    after it (it now probes the character UNDER the pointer, and the
 //!    line's last word past its end — `word_target_geom`).
 //!
+//! Issue #598 (epic #555 row 22) — the word itself is the ONE word model
+//! (`engine::words`, shared with Ctrl+arrows): text / punctuation /
+//! separator / object units, a word being a unit WITH the separators after
+//! it (clean-room cursor memo §5 / §6). So a double-click on `Hello` in
+//! `Hello world` selects `Hello ` (and a click on the space selects the
+//! word it trails), punctuation is a word of its own, and a drag after the
+//! double press grows by whole words (`SelectUnitsInPage`).
+//!
 //! The tests drive real `Command`s through `Engine::apply` over a layout
 //! with a Latin and an Arabic face loaded, and read what the selection
 //! covers off the paragraph TEXT, so none of them assumes a pixel.
@@ -188,10 +196,11 @@ fn double_click_below_the_last_line_selects_the_logical_last_word() {
     assert_eq!(hi, len);
     assert_eq!(lo, "Hello world مرحبا ".len() as u32);
 
-    /* The far side of the line is its logical START. */
+    /* The far side of the line is its logical START (issue #598: the
+    first word with its trailing space). */
     let at = below(line, left_of_ink(line));
     assert_eq!(hit_offset(&mut e, at), 0);
-    assert_eq!(word_at(&mut e, at), "Hello");
+    assert_eq!(word_at(&mut e, at), "Hello ");
 }
 
 /// The same past the ink but ON the line's own band (the empty space
@@ -211,31 +220,39 @@ fn double_click_right_of_the_ink_on_the_line_selects_the_logical_last_word() {
         assert_eq!(word_at(&mut e, at), "بالعالم", "x = {x}");
     }
     for x in [left_of_ink(line), line.hit_left - 50.0] {
-        assert_eq!(word_at(&mut e, on(line, x)), "Hello", "x = {x}");
+        assert_eq!(word_at(&mut e, on(line, x)), "Hello ", "x = {x}");
     }
 }
 
 /// Over the ink the pointer still decides: every word of the line is
 /// selected by a double-click on its own letters, whichever way the run
-/// reads (a stop strictly inside each word).
+/// reads (a stop strictly inside each word) — with its trailing space
+/// (issue #598).
 #[test]
 fn double_click_over_each_word_of_a_mixed_line_selects_that_word() {
     let mut e = engine_for(MIXED);
     let geom = lines(&e);
     let line = &geom[0];
-    for word in ["Hello", "world", "مرحبا", "بالعالم"] {
+    for (word, selected) in [
+        ("Hello", "Hello "),
+        ("world", "world "),
+        ("مرحبا", "مرحبا "),
+        ("بالعالم", "بالعالم"),
+    ] {
         let start = MIXED.find(word).expect("word") as u32;
         let first = word.chars().next().expect("char").len_utf8() as u32;
         let at = on(line, stop_x(line, start + first));
-        assert_eq!(word_at(&mut e, at), word, "on {word:?}");
+        assert_eq!(word_at(&mut e, at), selected, "on {word:?}");
     }
 }
 
 /// The word under the pointer is chosen from the CHARACTER under it: the
 /// right half of a word's last letter belongs to the word, the left half
-/// of the space after it to the space. (The nearest caret slot is the
-/// same one for both and used to pick the space for both.) All-Latin
-/// paragraph, so the LTR case agrees with the mixed one.
+/// of `w` to `world`. (The nearest caret slot is the same one for both
+/// halves of a slot and used to pick the wrong side.) Issue #598: the
+/// space after `Hello` belongs to `Hello` — a double-click on it selects
+/// the word it trails, with it. All-Latin paragraph, so the LTR case
+/// agrees with the mixed one.
 #[test]
 fn the_right_half_of_a_words_last_letter_selects_the_word() {
     let text = "Hello world";
@@ -248,22 +265,22 @@ fn the_right_half_of_a_words_last_letter_selects_the_word() {
     };
     assert_eq!(
         word_at(&mut e, between(4, 5, 0.75)),
-        "Hello",
+        "Hello ",
         "right half of `o`"
     );
     assert_eq!(
         word_at(&mut e, between(4, 5, 0.25)),
-        "Hello",
+        "Hello ",
         "left half of `o`"
     );
     assert_eq!(
         word_at(&mut e, between(5, 6, 0.25)),
-        " ",
+        "Hello ",
         "left half of the space"
     );
     assert_eq!(
         word_at(&mut e, between(5, 6, 0.75)),
-        " ",
+        "Hello ",
         "right half of the space"
     );
     assert_eq!(
@@ -279,7 +296,7 @@ fn the_right_half_of_a_words_last_letter_selects_the_word() {
     /* Past the ends: the logical first / last word. */
     assert_eq!(word_at(&mut e, on(line, right_of_ink(line))), "world");
     assert_eq!(word_at(&mut e, below(line, right_of_ink(line))), "world");
-    assert_eq!(word_at(&mut e, below(line, left_of_ink(line))), "Hello");
+    assert_eq!(word_at(&mut e, below(line, left_of_ink(line))), "Hello ");
     assert_eq!(hit_offset(&mut e, below(line, right_of_ink(line))), 11);
 }
 
@@ -298,7 +315,7 @@ fn an_rtl_paragraph_reads_its_edges_from_its_own_direction() {
         on(line, right_of_ink(line)),
     ] {
         assert_eq!(hit_offset(&mut e, at), 0);
-        assert_eq!(word_at(&mut e, at), "مرحبا");
+        assert_eq!(word_at(&mut e, at), "مرحبا ");
     }
     for at in [below(line, left_of_ink(line)), on(line, left_of_ink(line))] {
         assert_eq!(hit_offset(&mut e, at), end);
@@ -312,7 +329,7 @@ fn an_rtl_paragraph_reads_its_edges_from_its_own_direction() {
     };
     let sp = "مرحبا".len() as u32;
     let last = sp - 2;
-    assert_eq!(word_at(&mut e, between(last, sp, 0.5)), "مرحبا");
+    assert_eq!(word_at(&mut e, between(last, sp, 0.5)), "مرحبا ");
 }
 
 /// An RTL paragraph that ends in a Latin phrase: the visually leftmost
@@ -340,7 +357,7 @@ fn an_rtl_paragraph_with_a_trailing_latin_phrase_selects_the_logical_last_word()
     assert_eq!(word_at(&mut e, at), "world", "the logical last word");
     let at = below(line, right_of_ink(line));
     assert_eq!(hit_offset(&mut e, at), 0);
-    assert_eq!(word_at(&mut e, at), "مرحبا", "the logical first word");
+    assert_eq!(word_at(&mut e, at), "مرحبا ", "the logical first word");
 }
 
 /// A run boundary INSIDE the Arabic run (a style change between two
@@ -386,7 +403,7 @@ fn a_style_run_boundary_inside_the_arabic_run_does_not_move_the_word() {
 
 /// Past the end of a WRAPPED line, the target is that line's last word —
 /// not the first word of the next line (the line's end offset is the next
-/// line's start) and not the trailing space.
+/// line's start) — with the trailing space the line ends in (issue #598).
 #[test]
 fn double_click_past_a_wrapped_lines_end_selects_that_lines_last_word() {
     for unit in [
@@ -399,7 +416,17 @@ fn double_click_past_a_wrapped_lines_end_selects_that_lines_last_word() {
         assert!(geom.len() > 2, "precondition: the paragraph wraps");
         for (i, line) in geom.iter().enumerate() {
             let slice = &text[line.start_byte as usize..line.end_byte as usize];
-            let expected = slice.split_whitespace().next_back().expect("a word");
+            let trimmed = slice.trim_end();
+            let word_start = trimmed
+                .char_indices()
+                .rev()
+                .find(|(_, c)| c.is_whitespace())
+                .map_or(0, |(i, c)| i + c.len_utf8());
+            let expected = &slice[word_start..];
+            assert!(
+                expected.ends_with(' '),
+                "{expected:?}: a wrapped line ends in a space"
+            );
             let at = on(line, line.hit_left + line.hit_width + 10.0);
             assert_eq!(
                 word_at(&mut e, at),
@@ -655,4 +682,314 @@ fn headless_engine_selects_the_logical_last_word() {
         }
         other => panic!("SelectWordAt: {other:?}"),
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Issue #598 — the ONE word model under the pointer, and the drag     */
+/* by units after a double / triple press (epic #555 row 22).          */
+
+/// The middle of every caret CELL of a single-direction line — between
+/// two logically adjacent caret stops, which are visually adjacent in a
+/// run of one direction — with the byte the cell starts at. A cell is one
+/// grapheme cluster (`grapheme_slots`): a letter with its harakat, one
+/// tatweel.
+fn cells(line: &LineGeom) -> Vec<(u32, f32)> {
+    let mut bytes: Vec<u32> = line.slots.iter().map(|s| s.byte).collect();
+    bytes.sort_unstable();
+    bytes.dedup();
+    bytes
+        .windows(2)
+        .map(|w| (w[0], (stop_x(line, w[0]) + stop_x(line, w[1])) / 2.0))
+        .collect()
+}
+
+/// A double-click on every cell of `text` (one line) selects what
+/// `expected` says for the text from the cell's first byte on.
+fn assert_word_under_every_cell(e: &mut Engine, text: &str, expected: impl Fn(&str) -> String) {
+    let geom = lines(e);
+    assert_eq!(geom.len(), 1, "{text:?} lays out on one line");
+    let line = &geom[0];
+    let cells = cells(line);
+    {
+        use unicode_segmentation::UnicodeSegmentation;
+        assert_eq!(
+            cells.len(),
+            text.graphemes(true).count(),
+            "{text:?}: a cell per grapheme"
+        );
+    }
+    for (byte, x) in cells {
+        let rest = &text[byte as usize..];
+        assert_eq!(
+            word_at(e, on(line, x)),
+            expected(rest),
+            "{text:?}: the cell at byte {byte} ({rest:?})"
+        );
+    }
+}
+
+/// Memo §5 / §6: punctuation is a word of its own, a word takes its
+/// trailing spaces, a double-click on a space selects the word it trails.
+#[test]
+fn punctuation_is_its_own_word_and_a_word_takes_its_trailing_space() {
+    let text = "word, next one";
+    let mut e = engine_for(text);
+    assert_word_under_every_cell(&mut e, text, |rest| {
+        if rest.len() > ", next one".len() {
+            "word"
+        } else if rest.len() > "next one".len() {
+            ", "
+        } else if rest.len() > "one".len() {
+            "next "
+        } else {
+            "one"
+        }
+        .to_string()
+    });
+}
+
+/// No Arabic-specific rule: in an RTL paragraph a word with a tatweel and
+/// harakat is selected whole from ANY of its cells (every grapheme of it,
+/// the tatweels and the marked letters included), with its trailing
+/// space; the Arabic comma is punctuation, its own word.
+#[test]
+fn an_arabic_word_with_tatweel_and_harakat_is_selected_whole() {
+    const TATWEEL_WORD: &str = "كتـــاب";
+    const MARKED_WORD: &str = "جَدِيدٌ";
+    let text = format!("{TATWEEL_WORD} {MARKED_WORD}، نص");
+    let tail_of_marked = format!("{MARKED_WORD}، نص");
+    let mut e = engine_for(&text);
+    assert!(lines(&e)[0].rtl, "precondition: an RTL paragraph");
+    assert_word_under_every_cell(&mut e, &text, |rest| {
+        if rest.len() > tail_of_marked.len() {
+            format!("{TATWEEL_WORD} ")
+        } else if rest.len() > "، نص".len() {
+            MARKED_WORD.to_string()
+        } else if rest.len() > "نص".len() {
+            "، ".to_string()
+        } else {
+            "نص".to_string()
+        }
+    });
+}
+
+/// `SelectUnitsInPage { from, to, unit }` and what it selected, as
+/// `(selected text, anchor, caret)` (page 0: page-local = document px).
+fn select_units(
+    e: &mut Engine,
+    from: BridgePoint,
+    to: BridgePoint,
+    unit: SelectionUnit,
+) -> (String, u32, u32) {
+    match apply(
+        e,
+        Command::SelectUnitsInPage {
+            page: 0,
+            from,
+            to,
+            unit,
+        },
+    ) {
+        Event::SelectionChanged { range, .. } => {
+            let sel = e.selection.clone().expect("selection");
+            assert_eq!(
+                (range.start.offset, range.end.offset),
+                (
+                    sel.anchor.offset.min(sel.caret.offset),
+                    sel.anchor.offset.max(sel.caret.offset)
+                )
+            );
+            let text = text_of(e);
+            (
+                text[range.start.offset as usize..range.end.offset as usize].to_string(),
+                sel.anchor.offset,
+                sel.caret.offset,
+            )
+        }
+        other => panic!("SelectUnitsInPage: {other:?}"),
+    }
+}
+
+/// Memo §6: the double press selects the word under it, and a drag after
+/// it extends by WHOLE words — forward from the word's start, backward
+/// from its END, so the double-clicked word always stays selected.
+#[test]
+fn a_drag_after_a_double_click_extends_by_whole_words() {
+    let text = "one two three four five";
+    let mut e = engine_for(text);
+    let geom = lines(&e);
+    let line = &geom[0];
+    let start = |w: &str| text.find(w).expect("word") as u32;
+    /* The middle of the second character of `w`. */
+    let on_word = |w: &str| {
+        let s = start(w);
+        on(line, (stop_x(line, s + 1) + stop_x(line, s + 2)) / 2.0)
+    };
+    let press = on_word("three");
+    let word = SelectionUnit::Word;
+    /* The press itself (`from == to`): the word with its space. */
+    assert_eq!(
+        select_units(&mut e, press, press, word),
+        ("three ".into(), start("three"), start("four"))
+    );
+    /* Forward into the middle of `four`: whole words, anchor at `three`. */
+    assert_eq!(
+        select_units(&mut e, press, on_word("four"), word),
+        ("three four ".into(), start("three"), start("five"))
+    );
+    /* Back into `two`: the anchor flips to the END of `three `. */
+    assert_eq!(
+        select_units(&mut e, press, on_word("two"), word),
+        ("two three ".into(), start("four"), start("two"))
+    );
+    /* Back past the start of the line: the first word whole. */
+    assert_eq!(
+        select_units(&mut e, press, on(line, left_of_ink(line)), word),
+        ("one two three ".into(), start("four"), 0)
+    );
+    /* Past the end of the line: the line's last word. */
+    assert_eq!(
+        select_units(&mut e, press, on(line, right_of_ink(line)), word),
+        ("three four five".into(), start("three"), text.len() as u32)
+    );
+    /* The space after `three` belongs to `three`: still just it. */
+    let space = start("four") - 1;
+    let on_space = on(line, (stop_x(line, space) + stop_x(line, space + 1)) / 2.0);
+    assert_eq!(
+        select_units(&mut e, press, on_space, word),
+        ("three ".into(), start("three"), start("four"))
+    );
+}
+
+/// The press of a double-click and `SelectWordAt` (the `dblclick`
+/// fallback) resolve the same word: one resolution, two coordinate
+/// conventions (page-local on page 0 == document px). A mixed line, so
+/// the #553 logical rules hold for both.
+#[test]
+fn the_double_press_and_select_word_at_agree_everywhere() {
+    let text = "Hello world, مرحبا بالعالم 3.14 isn't";
+    let mut e = engine_for(text);
+    let geom = lines(&e);
+    let line = &geom[0];
+    let mut stops: Vec<f32> = line.slots.iter().map(|s| s.x).collect();
+    stops.sort_by(f32::total_cmp);
+    let mut xs: Vec<f32> = stops.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
+    xs.extend([left_of_ink(line), right_of_ink(line)]);
+    for x in xs {
+        let at = on(line, x);
+        let by_word_at = select_word(&mut e, at);
+        let by_press = select_units(&mut e, at, at, SelectionUnit::Word);
+        assert_eq!(by_press, by_word_at, "x = {x}");
+    }
+}
+
+/// One paragraph per string.
+fn doc_with_paragraphs(texts: &[&str]) -> DocumentTree {
+    let mut doc = DocumentTree::new();
+    doc.blocks.clear();
+    for text in texts {
+        doc.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: (*text).to_string(),
+                ..Default::default()
+            }));
+    }
+    doc
+}
+
+/// Memo §6: a triple press selects the paragraph, a drag after it extends
+/// by whole paragraphs, either way, keeping the first one.
+#[test]
+fn a_drag_after_a_triple_click_extends_by_whole_paragraphs() {
+    let texts = ["alpha beta", "gamma delta", "epsilon zeta"];
+    let mut e = engine_with(doc_with_paragraphs(&texts));
+    let geom = lines(&e);
+    assert_eq!(geom.len(), 3, "one line per paragraph");
+    let mid = |l: &LineGeom| on(l, (ink(l).0 + ink(l).1) / 2.0);
+    let sel = |e: &Engine| {
+        let s = e.selection.clone().expect("selection");
+        let idx = |p: &BridgeLogicalPos| match p.path.steps.first() {
+            Some(BridgePathStep::Block { idx }) => *idx,
+            other => panic!("{other:?}"),
+        };
+        (
+            (idx(&s.anchor), s.anchor.offset),
+            (idx(&s.caret), s.caret.offset),
+        )
+    };
+    let press = mid(&geom[1]);
+    let drag_to = |e: &mut Engine, to: BridgePoint| {
+        apply(
+            e,
+            Command::SelectUnitsInPage {
+                page: 0,
+                from: press,
+                to,
+                unit: SelectionUnit::Paragraph,
+            },
+        );
+        sel(e)
+    };
+    assert_eq!(drag_to(&mut e, press), ((1, 0), (1, 11)), "the press");
+    assert_eq!(
+        drag_to(&mut e, mid(&geom[2])),
+        ((1, 0), (2, 12)),
+        "down: whole paragraphs"
+    );
+    assert_eq!(
+        drag_to(&mut e, mid(&geom[0])),
+        ((1, 11), (0, 0)),
+        "up: anchored at the END of the first paragraph"
+    );
+}
+
+/// Typing over a double-clicked word replaces the word and keeps its
+/// trailing space (the space belongs to the selection, not to the typed
+/// text), so the replacement never glues onto the next word. Deleting a
+/// double-clicked word takes its space with it.
+#[test]
+fn typing_over_a_double_clicked_word_keeps_its_trailing_space() {
+    let text = "one two three";
+    let mut e = engine_for(text);
+    let geom = lines(&e);
+    let line = &geom[0];
+    let on_two = on(line, (stop_x(line, 5) + stop_x(line, 6)) / 2.0);
+    assert_eq!(word_at(&mut e, on_two), "two ");
+    apply(
+        &mut e,
+        Command::InsertText {
+            at: None,
+            text: "2".into(),
+        },
+    );
+    assert_eq!(text_of(&e), "one 2 three");
+    assert_eq!(caret_offset(&e), 5, "the caret after the typed text");
+    apply(&mut e, Command::Undo);
+    assert_eq!(text_of(&e), text, "one undo step");
+
+    /* Deleting it removes the word with its space. */
+    assert_eq!(word_at(&mut e, on_two), "two ");
+    apply(
+        &mut e,
+        Command::DeleteAtCaret {
+            forward: false,
+            by_word: false,
+        },
+    );
+    assert_eq!(text_of(&e), "one three");
+
+    /* A comma's word `, ` keeps its space too. */
+    let mut e = engine_for("word, next");
+    let geom = lines(&e);
+    let line = &geom[0];
+    let on_comma = on(line, (stop_x(line, 4) + stop_x(line, 5)) / 2.0);
+    assert_eq!(word_at(&mut e, on_comma), ", ");
+    apply(
+        &mut e,
+        Command::InsertText {
+            at: None,
+            text: ";".into(),
+        },
+    );
+    assert_eq!(text_of(&e), "word; next");
 }

@@ -1,14 +1,16 @@
 /* Phase 4 §7 — pointer input.
  *
  * The engine owns hit-testing; the UI only forwards device-pixel coordinates.
- * pointerdown places the caret, drag extends the selection, double-click
- * selects a word. Caret placement and extension are single-hop commands
+ * pointerdown places the caret, drag extends the selection, a double / triple
+ * press selects a word / paragraph and a drag after it grows by whole units
+ * (SELECT_UNITS_IN_PAGE — issue #598). Caret placement and extension are
+ * single-hop commands
  * (PLACE_CARET_AT_POINT / EXTEND_SELECTION_TO_POINT — issues #53/#64) that
  * hit-test and move the selection inside ONE serialized dispatch; the engine
  * answers with SELECTION_CHANGED, which engine-store fans out to the
  * overlays. */
 import type { EngineClient } from '../engine/engine-client';
-import type { Point } from '../engine/types';
+import type { Point, SelectionUnit } from '../engine/types';
 import {
     PAGE_GAP_PT,
     PAGE_H_PT,
@@ -64,6 +66,15 @@ export function attachPointer(
        hit-test can resolve out of order any more; the counter survives
        only as the gesture identity the zone / image gates bump. */
     let gesture = 0;
+    /* Issue #598 (epic #555 row 22, clean-room cursor memo §6) — a UNIT
+       gesture: the double press selects the WORD under it (with its
+       trailing spaces), the triple press the PARAGRAPH, at the press
+       itself, and a drag after it grows by whole units, anchored at the
+       press (`from`, this page's local device px). Cleared by every
+       pointerdown; set by the `mousedown` that carries the click count
+       (`PointerEvent.detail` is always 0). `undefined` = an ordinary
+       press, whose drag extends by characters. */
+    let unitGesture: { unit: SelectionUnit; from: Point } | undefined;
 
     /* Client coords → this page's LOCAL engine device pixels (origin at
        the page's top-left). `HIT_TEST_IN_PAGE` adds the page's real
@@ -128,7 +139,18 @@ export function attachPointer(
             });
     };
 
+    /* Issue #598 — select whole units from the one under `from` to the
+       one under `to`, single-hop and posted synchronously like extendTo. */
+    const selectUnits = (unit: SelectionUnit, from: Point, to: Point): void => {
+        void client
+            .dispatch({ type: 'SELECT_UNITS_IN_PAGE', page: pageIdx, from, to, unit })
+            .catch((e: unknown) => {
+                console.error('selectUnits failed', e);
+            });
+    };
+
     const onPointerDown = (e: PointerEvent): void => {
+        unitGesture = undefined;
         /* Non-primary buttons never start a drag (issue #36) — treating a
            right-click like a left-click collapsed the active TABLE_CELLS
            selection before TableContextMenu could read it, leaving "Merge
@@ -300,7 +322,60 @@ export function attachPointer(
 
     const onPointerMove = (e: PointerEvent): void => {
         if (!dragging) return;
+        if (unitGesture) {
+            selectUnits(unitGesture.unit, unitGesture.from, toLocal(e));
+            return;
+        }
         extendTo(toLocal(e));
+    };
+
+    /* Phase 3 (#39) — what a double-click does where it lands (the Word
+       affordance):
+       - a band while NOT already editing that exact band+page →
+         ENTER_HEADER_FOOTER for this page's section (the engine
+         materialises an absent part, like the toolbar button);
+       - the body content area while a story is active → exit AND place
+         the body caret at the click (issue #510, Word / the OnlyOffice
+         methods memo §2). Issue #573 — on a BODY picture the same exit
+         object-selects the picture (memo §2: objects beat text, a click
+         on an inline picture places no caret), its story being the body
+         the exit lands in;
+       - the ACTIVE band → word selection (the critic-flagged hijack:
+         in-band dblclick must keep its editing affordance). Issue #80 —
+         inside a note story a body double-click selects a word like
+         anywhere else (the note lives in the page flow; a single click
+         already routes story ↔ body engine-side). */
+    type DoubleClickRoute =
+        | { kind: 'enter-band'; zone: 'Header' | 'Footer' }
+        | { kind: 'exit-story' }
+        | { kind: 'word' };
+    const doubleClickRoute = (e: MouseEvent): DoubleClickRoute => {
+        const zone = headerFooterZoneAt(pageIdx, toLocal(e).y);
+        const story = editingStoryForPointer();
+        const inOwnBand =
+            story !== undefined && zone === story.area && pageIdx === story.page;
+        if (zone !== null && !inOwnBand) return { kind: 'enter-band', zone };
+        if (story && zone === null && !isNoteArea(story.area)) return { kind: 'exit-story' };
+        return { kind: 'word' };
+    };
+
+    /* Issue #598 — the double / triple PRESS selects its unit at once (the
+       `mousedown` carries the click count), so a drag before the release
+       grows by whole units and a key fired right after the press is
+       queued behind the selection. Only a live text press (one that
+       started a drag: not an image, not a swallowed band / dimmed-body
+       press, not Shift) — anything else keeps the `dblclick` / `click`
+       path below. A double press that would enter or leave a band is
+       left to `dblclick` too. */
+    const onMouseDown = (e: MouseEvent): void => {
+        if (e.button !== 0 || e.shiftKey || !dragging) return;
+        const unit: SelectionUnit | undefined =
+            e.detail === 2 ? 'Word' : e.detail === 3 ? 'Paragraph' : undefined;
+        if (unit === undefined) return;
+        if (unit === 'Word' && doubleClickRoute(e).kind !== 'word') return;
+        const from = toLocal(e);
+        unitGesture = { unit, from };
+        selectUnits(unit, from, from);
     };
 
     const onPointerUp = (e: PointerEvent): void => {
@@ -314,38 +389,19 @@ export function attachPointer(
         /* Bump past the two single-clicks' in-flight hit-tests so their
            SET_SELECTIONs are dropped and the word selection survives. */
         gesture += 1;
-        /* Phase 3 (#39) — double-click routing (the Word affordance):
-           - a band while NOT already editing that exact band+page →
-             ENTER_HEADER_FOOTER for this page's section (the engine
-             materialises an absent part, like the toolbar button);
-           - the body content area while a story is active → exit AND
-             place the body caret at the click (issue #510, Word / the
-             OnlyOffice methods memo §2) — both posted synchronously, so
-             the worker queue applies them in order and a keystroke
-             queued behind them types at the clicked spot. Issue #573 —
-             on a BODY picture the same exit object-selects the picture
-             (memo §2: objects beat text, a click on an inline picture
-             places no caret), its story being the body the exit lands
-             in;
-           - the ACTIVE band → fall through to word selection (the
-             critic-flagged hijack: in-band dblclick must keep its
-             editing affordance). */
-        const zone = headerFooterZoneAt(pageIdx, toLocal(e).y);
-        const story = editingStoryForPointer();
-        const inOwnBand =
-            story !== undefined && zone === story.area && pageIdx === story.page;
-        if (zone !== null && !inOwnBand) {
+        const route = doubleClickRoute(e);
+        if (route.kind === 'enter-band') {
             void client
-                .dispatch({ type: 'ENTER_HEADER_FOOTER', page: pageIdx, area: zone })
+                .dispatch({ type: 'ENTER_HEADER_FOOTER', page: pageIdx, area: route.zone })
                 .catch((err: unknown) => {
                     console.error('enterHeaderFooter failed', err);
                 });
             return;
         }
-        /* Issue #80 — inside a note story a body double-click selects a
-           word like anywhere else (the note lives in the page flow; a
-           single click already routes story ↔ body engine-side). */
-        if (story && zone === null && !isNoteArea(story.area)) {
+        /* Both posted synchronously, so the worker queue applies them in
+           order and a keystroke queued behind them types at the clicked
+           spot. */
+        if (route.kind === 'exit-story') {
             void client.dispatch({ type: 'EXIT_HEADER_FOOTER' }).catch((err: unknown) => {
                 console.error('exitHeaderFooter failed', err);
             });
@@ -373,6 +429,11 @@ export function attachPointer(
             }
             return;
         }
+        /* Issue #598 — the double press already selected the word (and a
+           drag may have grown it); re-selecting here would undo the drag.
+           Without one (a synthetic dblclick, a touch double-tap) the
+           dblclick selects the word itself, the same word. */
+        if (unitGesture?.unit === 'Word') return;
         void client.dispatch({ type: 'SELECT_WORD_AT', at: toGlobal(e) });
     };
 
@@ -387,6 +448,9 @@ export function attachPointer(
     const onClick = (e: MouseEvent): void => {
         if (e.detail === 3) {
             gesture += 1;
+            /* Issue #598 — the triple press already selected (and its drag
+               grew) the paragraph. */
+            if (unitGesture?.unit === 'Paragraph') return;
             void client.dispatch({ type: 'SELECT_PARAGRAPH_AT', at: toGlobal(e) });
         } else if (e.detail >= 4) {
             gesture += 1;
@@ -395,6 +459,7 @@ export function attachPointer(
     };
 
     canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('mousedown', onMouseDown);
     canvas.addEventListener('pointermove', onPointerMove);
     canvas.addEventListener('pointerup', onPointerUp);
     canvas.addEventListener('dblclick', onDblClick);
@@ -402,6 +467,7 @@ export function attachPointer(
 
     return () => {
         canvas.removeEventListener('pointerdown', onPointerDown);
+        canvas.removeEventListener('mousedown', onMouseDown);
         canvas.removeEventListener('pointermove', onPointerMove);
         canvas.removeEventListener('pointerup', onPointerUp);
         canvas.removeEventListener('dblclick', onDblClick);

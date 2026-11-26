@@ -154,6 +154,7 @@ export const COMMAND_FACADE: { readonly [K in CommandType]: FacadeTarget<K> } = 
     REPLY_TO_COMMENT: 'replyToComment',
     MODIFY_STYLE: 'modifyStyle',
     SET_FONT_PRIORITY: 'internal', // FontRegistry.applyScriptDefaults (issue #472)
+    SELECT_UNITS_IN_PAGE: 'internal', // pointer pipeline (double / triple press + drag, #598)
 };
 
 /** What a facade member dispatches: live command types, `'host'` (a host

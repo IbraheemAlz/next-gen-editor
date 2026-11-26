@@ -1819,6 +1819,7 @@ classify_variants! {
     ReplyToComment { .. } => false,
     ModifyStyle { .. } => true, // gen_measure_command (#503, paragraph patch)
     SetFontPriority { .. } => false,
+    SelectUnitsInPage { .. } => false,
 }
 
 thread_local! {
@@ -2578,7 +2579,7 @@ mod tests {
                 "duplicate variant name in ALL_VARIANT_NAMES: {name}"
             );
         }
-        const EXPECTED_VARIANT_COUNT: usize = 108;
+        const EXPECTED_VARIANT_COUNT: usize = 109;
         assert_eq!(
             ALL_VARIANT_NAMES.len(),
             EXPECTED_VARIANT_COUNT,

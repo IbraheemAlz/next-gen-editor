@@ -132,7 +132,9 @@ export async function settle(page: Page): Promise<void> {
  *  - `'ENTER'`: an `insertLineBreak` beforeinput (the Enter key)
  *  - `{ pointerdown }`: a primary-button `pointerdown` (optionally with
  *    Shift) on page `page`'s canvas at page-local DEVICE px `(x, y)`,
- *    through the shell's real `pointer.ts` listener
+ *    through the shell's real `pointer.ts` listener; with `clicks`, the
+ *    `mousedown` the browser fires right after it too, carrying that click
+ *    count (`2` = the press of a double-click — issue #598)
  *  - `{ pointerup }`: releases it
  *  - `{ key }`: a keydown of `key` (a `KeyboardEvent.key`, e.g.
  *    `'ArrowDown'`, `'End'`, `'PageDown'`) on the hidden textarea, with
@@ -144,7 +146,7 @@ export async function settle(page: Page): Promise<void> {
  *  - any other string: an `insertText` beforeinput carrying that text */
 export type BurstStep =
     | string
-    | { pointerdown: { x: number; y: number; page?: number; shift?: boolean } }
+    | { pointerdown: { x: number; y: number; page?: number; shift?: boolean; clicks?: number } }
     | { pointerup: true; page?: number }
     | { key: string; shift?: boolean; ctrl?: boolean }
     | { wheel: { dy: number } };
@@ -164,6 +166,7 @@ export async function burst(page: Page, steps: BurstStep[]): Promise<void> {
             x: number,
             y: number,
             shift: boolean,
+            clicks?: number,
         ): void => {
             const canvas = document.querySelector<HTMLCanvasElement>(
                 `.editor-page[data-page-index="${pageIdx}"] canvas`,
@@ -189,6 +192,20 @@ export async function burst(page: Page, steps: BurstStep[]): Promise<void> {
                     cancelable: true,
                 }),
             );
+            if (clicks !== undefined) {
+                canvas.dispatchEvent(
+                    new MouseEvent('mousedown', {
+                        clientX: r.left + x / dpr,
+                        clientY: r.top + y / dpr,
+                        button: 0,
+                        buttons: 1,
+                        detail: clicks,
+                        shiftKey: shift,
+                        bubbles: true,
+                        cancelable: true,
+                    }),
+                );
+            }
         };
         for (const s of steps) {
             if (typeof s !== 'string') {
@@ -217,7 +234,7 @@ export async function burst(page: Page, steps: BurstStep[]): Promise<void> {
                     );
                 } else if ('pointerdown' in s) {
                     const p = s.pointerdown;
-                    pointer('pointerdown', p.page ?? 0, p.x, p.y, p.shift === true);
+                    pointer('pointerdown', p.page ?? 0, p.x, p.y, p.shift === true, p.clicks);
                 } else {
                     pointer('pointerup', s.page ?? 0, 0, 0, false);
                 }

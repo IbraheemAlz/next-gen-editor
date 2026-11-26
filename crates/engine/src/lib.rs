@@ -142,6 +142,9 @@ pub mod text_input;
 pub mod theme;
 
 pub mod toc;
+/// Epic #555 rows 20 / 22, issue #598 — the ONE word model (double-click,
+/// drag by words, Ctrl+arrows, Ctrl+Backspace / Delete).
+pub mod words;
 pub use fields::{
     FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TocSwitches,
     TypedField, render_date_time_picture,
@@ -4562,40 +4565,15 @@ impl Paragraph {
         snap_offset(&self.text, offset)
     }
 
-    /// Byte range `[start, end)` of the word containing caret position
-    /// `offset` — a whitespace-delimited span (PHASE_4_HEADLESS_UI.md §7,
-    /// double-click select). When `offset` sits on whitespace, the run of
-    /// whitespace is returned. `offset` is clamped to a char boundary.
+    /// Byte range `[start, end)` of the word holding caret position
+    /// `offset` — issue #598, the ONE word model ([`words`]): a text,
+    /// punctuation or object unit plus the separators after it, so a
+    /// double-click on `word` in `word, next` selects `word`, on `,` the
+    /// `, `, and on a space the word that space trails. At the end of the
+    /// text, the last word. `offset` is clamped to a char boundary.
     pub fn word_bounds(&self, offset: u32) -> (u32, u32) {
-        let text = self.text.as_str();
-        let len = text.len();
-        if len == 0 {
-            return (0, 0);
-        }
         let off = self.snap_offset(offset) as usize;
-        /* Classify by the char to the right; at end-of-text, the char left. */
-        let ws = text[off..]
-            .chars()
-            .next()
-            .or_else(|| text[..off].chars().next_back())
-            .is_some_and(char::is_whitespace);
-
-        let mut start = off;
-        for (i, c) in text[..off].char_indices().rev() {
-            if c.is_whitespace() == ws {
-                start = i;
-            } else {
-                break;
-            }
-        }
-        let mut end = off;
-        for (i, c) in text[off..].char_indices() {
-            if c.is_whitespace() == ws {
-                end = off + i + c.len_utf8();
-            } else {
-                break;
-            }
-        }
+        let (start, end) = words::word_at(&self.text, off);
         (start as u32, end as u32)
     }
 
@@ -15561,9 +15539,10 @@ mod tests {
             mark_revisions: Vec::new(),
             mark_style: None,
         };
-        assert_eq!(p.word_bounds(2), (0, 5));
-        assert_eq!(p.word_bounds(0), (0, 5));
-        assert_eq!(p.word_bounds(5), (5, 6)); // on the space
+        /* Issue #598 — a word carries its trailing space (memo §6). */
+        assert_eq!(p.word_bounds(2), (0, 6));
+        assert_eq!(p.word_bounds(0), (0, 6));
+        assert_eq!(p.word_bounds(5), (0, 6)); // on the space: the word it trails
         assert_eq!(p.word_bounds(8), (6, 11));
         assert_eq!(p.word_bounds(11), (6, 11)); // end of text → last word
     }
@@ -15593,8 +15572,8 @@ mod tests {
             mark_revisions: Vec::new(),
             mark_style: None,
         };
-        assert_eq!(p.word_bounds(4), (0, 10));
-        assert_eq!(p.word_bounds(0), (0, 10));
+        assert_eq!(p.word_bounds(4), (0, 11));
+        assert_eq!(p.word_bounds(0), (0, 11));
         assert_eq!(p.word_bounds(12), (11, 25)); // mid-char offset clamps
     }
 

@@ -1015,6 +1015,25 @@ pub enum Command {
     SetFontPriority {
         priorities: Vec<FontPriority>,
     },
+
+    /// Epic #555 row 22, issue #598 — select whole UNITS (words or
+    /// paragraphs) from the one under `from` to the one under `to`, both in
+    /// page `page`'s LOCAL device pixels (like `ExtendSelectionToPoint`).
+    /// The shell posts it at the second (word) / third (paragraph) press
+    /// with `from == to` — exactly the unit under the pointer, a word with
+    /// its trailing spaces (clean-room cursor memo §6) — and on every drag
+    /// move after it with `from` kept at that press, so the drag grows by
+    /// whole units: forward the first unit's start is the anchor and the
+    /// caret the far end of the unit under `to`; back past the first unit
+    /// its END is the anchor, so the first unit always stays selected.
+    /// Stateless — both units are re-resolved from the points — so a
+    /// replayed log reproduces it exactly. Replies `SelectionChanged`.
+    SelectUnitsInPage {
+        page: u32,
+        from: Point,
+        to: Point,
+        unit: SelectionUnit,
+    },
 }
 
 /// Issue #79 — additive patch for [`Command::SetTableProperties`]. Each
@@ -1491,6 +1510,17 @@ pub enum SelectionModifier {
     Shift,
     Alt,
     ShiftAlt,
+}
+
+/// Epic #555 row 22 — the unit [`Command::SelectUnitsInPage`] selects and
+/// grows by: a double-click's word (a text, punctuation or object unit
+/// with the separators after it — `engine::words`) or a triple-click's
+/// paragraph. Tsify renders it as `"Word" | "Paragraph"`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum SelectionUnit {
+    Word,
+    Paragraph,
 }
 
 /// Cardinal direction for `Command::MoveCaret` (Backlog #14 — core nav).

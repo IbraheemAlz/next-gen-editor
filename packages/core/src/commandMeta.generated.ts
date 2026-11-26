@@ -159,6 +159,7 @@ export const COMMAND_META: { readonly [K in CommandType]: CommandMeta } = {
     REPLY_TO_COMMENT: { variant: 'ReplyToComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'comment' },
     MODIFY_STYLE: { variant: 'ModifyStyle', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
     SET_FONT_PRIORITY: { variant: 'SetFontPriority', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SELECT_UNITS_IN_PAGE: { variant: 'SelectUnitsInPage', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
 };
 
 /** Issue #345 — the protection classes each enforced mode admits
