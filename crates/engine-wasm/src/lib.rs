@@ -3314,8 +3314,24 @@ impl<'a> StyleContext<'a> {
         )
     }
 
+    /// The run baseline of a `style_id` paragraph (`docDefaults → pStyle
+    /// chain <w:rPr>`), before any character style. Text formatting goes
+    /// through [`Self::text_style`] over it.
     fn run_base(&self, style_id: Option<&str>) -> engine::SpanStyle {
         self.cascade.run(self.run_defaults, style_id)
+    }
+
+    /// Issue #558 — the effective formatting of text whose own run
+    /// formatting is `own` (`None`: text no span covers) over the
+    /// paragraph baseline `base` ([`Self::run_base`]): the default
+    /// character style sits between them for a run naming no character
+    /// style ([`engine::StyleCascade::text_style`]).
+    fn text_style(
+        &self,
+        base: &engine::SpanStyle,
+        own: Option<&engine::SpanStyle>,
+    ) -> engine::SpanStyle {
+        self.cascade.text_style(base, own)
     }
 
     /// Issue #80 — thread the paint's resolved note markers.
@@ -3413,8 +3429,11 @@ fn build_style_spans(
     formatting folds over it; gap (unstyled) text renders it as-is, so
     a Heading 1 with zero direct formatting picks up the style's bold /
     size. Unstyled paragraphs resolve to the doc-default rPr, which is
-    empty in fresh documents — byte-identical to the old flat gap. */
+    empty in fresh documents — byte-identical to the old flat gap.
+    Issue #558 — text naming no character style (the gaps, and spans
+    without `char_style`) takes the default character style over it. */
     let run_base = sctx.run_base(para.style_id.as_deref());
+    let plain = sctx.text_style(&run_base, None);
     let emit = |style: &engine::SpanStyle, start: u32, end: u32, out: &mut Vec<StyleSpan>| {
         let (template, base_px) = materialize_span(
             &para.text,
@@ -3430,14 +3449,14 @@ fn build_style_spans(
     };
     for run in &para.spans {
         if run.start > cursor {
-            emit(&run_base, cursor, run.start, &mut spans);
+            emit(&plain, cursor, run.start, &mut spans);
         }
-        let effective = run_base.clone().merged_with(run.style.clone());
+        let effective = sctx.text_style(&run_base, Some(&run.style));
         emit(&effective, run.start, run.end, &mut spans);
         cursor = run.end;
     }
     if cursor < len {
-        emit(&run_base, cursor, len, &mut spans);
+        emit(&plain, cursor, len, &mut spans);
     }
     spans
 }
@@ -3601,9 +3620,7 @@ fn composition_layout_spans(
     /* Issue #355 — the preview shapes in the face the committed text
     around it resolves to (cascade + theme). */
     let (font_family, font_family_cs) = sctx.run_font_ids(
-        &sctx
-            .run_base(para.style_id.as_deref())
-            .merged_with(st.clone()),
+        &sctx.text_style(&sctx.run_base(para.style_id.as_deref()), Some(&st)),
         /* The preview's own text is not in `para.text`. */
         "",
     );
@@ -3780,10 +3797,12 @@ fn mark_line_metrics(
     fonts: &FontStack,
     base_direction: ShapingDirection,
 ) -> Option<(text_pipeline::LineMetrics, f32)> {
-    let mut style = sctx.run_base(para.style_id.as_deref());
-    if let Some(mark) = para.mark_style.as_deref() {
-        style = style.merged_with(mark.clone());
-    }
+    /* Issue #558 — the mark is a run too: the default character style
+    formats it unless it names another. */
+    let style = sctx.text_style(
+        &sctx.run_base(para.style_id.as_deref()),
+        para.mark_style.as_deref(),
+    );
     let (latin, cs) = sctx.run_font_ids(&style, "");
     let complex = matches!(base_direction, ShapingDirection::Rtl) || style.forces_complex_script();
     let (script, family, size, bold, italic) = if complex {
@@ -6206,16 +6225,16 @@ fn empty_paragraph_mark(
     if !para.text.is_empty() {
         return None;
     }
+    /* Issue #558 — the mark and the document default are runs naming
+    no character style: the default character style formats both. */
     let run_base = sctx.run_base(para.style_id.as_deref());
-    let mark = match para.mark_style.as_deref() {
-        Some(m) => run_base.merged_with(SpanStyle {
-            grab_bag: None,
-            ..m.clone()
-        }),
-        None => run_base,
-    };
+    let own_mark = para.mark_style.as_deref().map(|m| SpanStyle {
+        grab_bag: None,
+        ..m.clone()
+    });
+    let mark = sctx.text_style(&run_base, own_mark.as_ref());
     let black = [0, 0, 0, 255];
-    let doc_default = sctx.run_base(None);
+    let doc_default = sctx.text_style(&sctx.run_base(None), None);
     let (base_span, _) = materialize_span("", &doc_default, 0, 0, sctx, default_size, black, scale);
     let (mark_span, _) = materialize_span("", &mark, 0, 0, sctx, default_size, black, scale);
     let rtl = matches!(base_direction, ShapingDirection::Rtl);
@@ -6314,6 +6333,8 @@ fn auto_hyphenation_ranges(
         return out;
     }
     let run_base = sctx.run_base(para.style_id.as_deref());
+    /* Issue #558 — text naming no character style. */
+    let plain = sctx.text_style(&run_base, None);
     let fallback = sctx.theme.and_then(|t| t.font_lang.latin.as_deref());
     let mut push = |style: &engine::SpanStyle, start: u32, end: u32| {
         if start >= end {
@@ -6335,12 +6356,12 @@ fn auto_hyphenation_ranges(
     let len = para.text.len() as u32;
     let mut cursor = 0_u32;
     for sr in &para.spans {
-        push(&run_base, cursor, sr.start.min(len));
-        let style = run_base.clone().merged_with(sr.style.clone());
+        push(&plain, cursor, sr.start.min(len));
+        let style = sctx.text_style(&run_base, Some(&sr.style));
         push(&style, sr.start.min(len), sr.end.min(len));
         cursor = sr.end.min(len);
     }
-    push(&run_base, cursor, len);
+    push(&plain, cursor, len);
     out
 }
 
@@ -12972,6 +12993,9 @@ impl Engine {
         tree.styles = real.styles.clone();
         tree.style_defaults = real.style_defaults.clone();
         tree.style_run_defaults = real.style_run_defaults.clone();
+        /* Issue #558 — the default character style is the run cascade's
+        too (the caret read-back of story text). */
+        tree.default_char_style = real.default_char_style.clone();
         tree.numbering = real.numbering.clone();
         Some(tree)
     }
@@ -15273,13 +15297,16 @@ impl Engine {
     fn range_flags(&self, start: &BridgeLogicalPos, end: &BridgeLogicalPos) -> Option<RangeFlags> {
         let doc = self.selection_doc();
         let mut samples: Vec<SpanStyle> = Vec::new();
+        /* Issue #558 — through the one text-style fold (the default
+        character style under a run that names none). */
+        let styles = doc.style_cascade();
         for t in self.format_targets_in(&doc, start, end) {
             let Some(p) = doc.paragraph_at_path(&t.path) else {
                 continue;
             };
-            let cascade = doc.resolve_style_run_cascade(p.style_id.as_deref());
+            let base = styles.run(&doc.style_run_defaults, p.style_id.as_deref());
             sample_paragraph_segments(p, t.lo, t.hi, &mut |raw, complex| {
-                let full = cascade.clone().merged_with(raw);
+                let full = styles.text_style(&base, Some(&raw));
                 samples.push(if complex {
                     full.complex_script_view()
                 } else {
@@ -15287,8 +15314,7 @@ impl Engine {
                 });
             });
             if t.mark && p.text.is_empty() {
-                let raw = p.mark_style.as_deref().cloned().unwrap_or_default();
-                samples.push(cascade.clone().merged_with(raw));
+                samples.push(styles.text_style(&base, p.mark_style.as_deref()));
             }
         }
         if samples.is_empty() {
@@ -15524,8 +15550,8 @@ impl Engine {
                         p.style_at(pos.offset)
                     };
                     (
-                        doc.resolve_style_run_cascade(p.style_id.as_deref())
-                            .merged_with(direct.clone()),
+                        /* Issue #558 — with the default character style. */
+                        doc.resolve_text_style(p.style_id.as_deref(), Some(&direct)),
                         direct,
                         reads_complex_script(p, pos.offset, collapsed),
                         caret_script_tag(p, pos.offset),
@@ -15809,7 +15835,7 @@ impl Engine {
         if blocks.is_empty() {
             /* The band always keeps one paragraph so the caret has a
             home and the part stays a valid `<w:hdr>/<w:ftr>`. */
-            blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
+            blocks.push(engine::Block::Paragraph(mutated.new_paragraph()));
         }
         let real = self.undo.current();
         /* `with_updated_*_part` strips any stray `section_end` marker —
@@ -16017,7 +16043,7 @@ impl Engine {
         };
         let mut blocks: Vec<engine::Block> = new_doc.blocks.iter().cloned().collect();
         if blocks.is_empty() {
-            blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
+            blocks.push(engine::Block::Paragraph(new_doc.new_paragraph()));
         }
         let real = self.undo.current();
         let new_real = target.write_blocks(real, blocks);
@@ -16828,7 +16854,7 @@ impl Engine {
                 /* Blank chain → materialize on the edited section. */
                 let doc = self.undo.current();
                 let new_rid = doc.fresh_hf_rid();
-                let seed = vec![engine::Block::Paragraph(engine::Paragraph::default())];
+                let seed = vec![engine::Block::Paragraph(doc.new_paragraph())];
                 let with_part = if is_header {
                     doc.with_updated_header_part(&new_rid, seed)
                 } else {
@@ -16957,7 +16983,7 @@ impl Engine {
             } else {
                 doc.footers.get(&cur_rid).cloned()
             }
-            .unwrap_or_else(|| vec![engine::Block::Paragraph(engine::Paragraph::default())]);
+            .unwrap_or_else(|| vec![engine::Block::Paragraph(doc.new_paragraph())]);
             let new_rid = doc.fresh_hf_rid();
             let with_part = if is_header {
                 doc.with_updated_header_part(&new_rid, seed)
@@ -17356,7 +17382,7 @@ impl Engine {
         let mutated = f(&temp);
         let mut blocks: Vec<engine::Block> = mutated.blocks.iter().cloned().collect();
         if blocks.is_empty() {
-            blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
+            blocks.push(engine::Block::Paragraph(mutated.new_paragraph()));
         }
         let real = self.undo.current();
         let mut new_real = target.write_blocks(real, blocks);
@@ -31674,10 +31700,18 @@ mod cell_select_nested_tests;
 #[cfg(test)]
 mod table_cache_tests;
 
+/// Issue #558 — the default character style formats runs naming none
+/// (spans, the paragraph mark, the caret read-back, layout).
+#[cfg(test)]
+mod default_char_style_tests;
 /// Issue #556 — the default paragraph style formats unstyled paragraphs
 /// (direction, document default, layout).
 #[cfg(test)]
 mod default_paragraph_style_tests;
+/// Issue #560 — engine-minted paragraphs lay out as the saved package
+/// re-opens (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod minted_paragraph_tests;
 #[cfg(test)]
 mod part_media_tests;
 #[cfg(test)]

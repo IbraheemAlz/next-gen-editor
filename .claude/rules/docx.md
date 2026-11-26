@@ -282,13 +282,47 @@ paths:
   materialization's `StyleContext`). `style_id` stays `None` /
   the dangling id (never rewritten to `Normal`). The writer stays
   byte-neutral: a regenerated `<w:pPr>` with no source to splice leaves
-  out every field only the default style gives
-  (`writer::without_default_style`, the #431 rule for this link; inside
-  `write_docx` only) and `build_styles_xml` keeps `w:default="1"`. The
-  default CHARACTER style is recorded (`StyleTable::default_character`)
-  but not applied (issue #558). Harness: `tools/roundtrip` step 64
-  (`default_style_rtl.docx`); `tools/corpus-native`'s
-  `unstyled_paragraphs` / `default_paragraph_style` columns.
+  out every field the paragraph only INHERITS — equal to its style
+  cascade (docDefaults → its applied style's chain) and not set in
+  `direct_overrides` (`writer::without_inherited`, issue #560: the #431
+  rule for every link of the cascade, the docDefaults included; inside
+  `write_docx` only) — and `build_styles_xml` keeps `w:default="1"`.
+  Harness: `tools/roundtrip` step 64 (`default_style_rtl.docx`);
+  `tools/corpus-native`'s `unstyled_paragraphs` /
+  `default_paragraph_style` columns.
+- **Engine-minted paragraphs take the cascade (issue #560).** A
+  paragraph the engine creates — a table's cells and escape paragraph,
+  new rows / columns, split / merged cell placeholders, header / footer /
+  text-box seeds, a note body (`FootnoteText`), the first paragraph of an
+  empty container — comes from `DocumentTree::new_paragraph` /
+  `new_paragraph_in_style` / `new_table_cell`
+  (`StyleCascade::new_paragraph`: `props` = the cascade, nothing
+  direct), exactly what the reader builds for a `<w:p>` with no
+  `<w:pPr>`, so it lays out now as it does after save + reopen. Never
+  mint an engine paragraph from `Paragraph::default()` (the bare
+  `default_table_cell()` is for trees without a style table); Enter keeps
+  `split_at`'s copy (+ `<w:next>`, #277). The writer leaves the inherited
+  values out (above), so a minted paragraph is written as before.
+  Harness: step 64e / 65e; engine-wasm `minted_paragraph_tests`
+  (fingerprint equal across `SaveDocx` + reopen); e2e
+  `minted-paragraph-cascade.spec.ts`.
+- **The default character style (issue #558).** `<w:style w:type=
+  "character" w:default="1">` (Word's `DefaultParagraphFont`, the last
+  claimant) formats every run that names no character style, between the
+  paragraph style chain's `<w:rPr>` and the run's own formatting; a run
+  naming another character style takes that style's chain instead (with
+  the default only when that chain is `basedOn` it); a dangling `rStyle`
+  keeps no character style. The reader folds its chain once
+  (`StyleResolver::default_character_style`, `None` when it formats
+  nothing — Word's own is empty) into `DocumentTree::default_char_style`;
+  it NEVER enters a span (spans bake only the character style they name),
+  so the run writer never spells it. Every consumer folds it through ONE
+  rule, `StyleCascade::text_style` (`DocumentTree::resolve_text_style`):
+  span materialization, the paragraph mark / empty line, the caret and
+  toolbar read-back, hyphenation, the IME preview, the paragraph cache
+  key. Harness: `tools/roundtrip` step 65 (`default_char_style.docx`);
+  `tools/corpus-native`'s `unstyled_runs` / `default_char_style_formats`
+  columns; e2e `default-character-style.spec.ts`.
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:

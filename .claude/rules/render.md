@@ -21,6 +21,15 @@ Phase 3 invariants for the box model, the Canvas2D backend, and PDF export.
   (`segment_by_script_class`) and shape each piece with
   `StyleSpan::face_for(complex)` — keep the two in step, and never read
   `span.px_size` / `span.bold` / `span.font_family` directly for a piece.
+- **A run's formatting has ONE fold (issue #558).** `docDefaults <w:rPr>
+  → pStyle chain <w:rPr>` (`StyleContext::run_base`) `→ the default
+  character style (only when the run names no character style) → the
+  run's own span`: `StyleContext::text_style` /
+  `engine::StyleCascade::text_style`. Span materialization, the paragraph
+  mark (an empty line's pitch, the mark on a last line), the IME preview,
+  hyphenation and the caret / toolbar read-back all go through it — never
+  `run_base.merged_with(span)` by hand. The paragraph cache key hashes the
+  default character style.
 - **Paragraph direction has ONE resolution (issues #195 / #552).**
   `paragraph_base_direction`: the paragraph's own `props.direction` (the
   reader folds style chain + `<w:docDefaults>` into it — for a paragraph

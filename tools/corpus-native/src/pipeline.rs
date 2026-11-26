@@ -674,6 +674,17 @@ pub struct DocResult {
     /// #556); absent when the document defines no default style.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_style_formats: Option<bool>,
+    /// Issue #558 — the runs of the top-level paragraphs that name no
+    /// character style (spans without `<w:rStyle>`, and the text no span
+    /// covers): the ones the DEFAULT character style formats — whose
+    /// layout #558 changed when that style carries formatting
+    /// ([`Self::default_char_style_formats`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unstyled_runs: Option<u32>,
+    /// Issue #558 — the document's default character style carries run
+    /// formatting (`DocumentTree::default_char_style` is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_char_style_formats: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_count_before: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -897,23 +908,27 @@ impl ThemeFontCensus {
         };
         let mut faces = std::collections::BTreeSet::new();
         let mut visit = |p: &engine::Paragraph| {
+            /* Issue #558 — through the engine's one text-style fold (the
+            default character style under a run naming none). */
+            let styles = doc.style_cascade();
             let base = doc.resolve_style_run_cascade(p.style_id.as_deref());
+            let plain = styles.text_style(&base, None);
             /* `(style, text)` per span plus every unstyled gap. */
             let mut runs: Vec<(engine::SpanStyle, &str)> = Vec::new();
             let mut cursor = 0usize;
             for r in &p.spans {
                 let (s, e) = (r.start as usize, r.end as usize);
                 if s > cursor {
-                    runs.push((base.clone(), p.text.get(cursor..s).unwrap_or("")));
+                    runs.push((plain.clone(), p.text.get(cursor..s).unwrap_or("")));
                 }
                 runs.push((
-                    base.clone().merged_with(r.style.clone()),
+                    styles.text_style(&base, Some(&r.style)),
                     p.text.get(s..e).unwrap_or(""),
                 ));
                 cursor = cursor.max(e);
             }
             if cursor < p.text.len() {
-                runs.push((base.clone(), p.text.get(cursor..).unwrap_or("")));
+                runs.push((plain.clone(), p.text.get(cursor..).unwrap_or("")));
             }
             let arabic = |ch: char| matches!(ch, '\u{0600}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}');
             for (style, text) in runs {
@@ -1022,6 +1037,8 @@ impl DocResult {
             unstyled_paragraphs: None,
             default_paragraph_style: None,
             default_style_formats: None,
+            unstyled_runs: None,
+            default_char_style_formats: None,
             page_count_before: None,
             page_count_after: None,
             page_count_stable: None,
@@ -1141,6 +1158,32 @@ fn default_style_census(doc: &engine::DocumentTree, rec: &mut DocResult) {
         })
         .count();
     rec.unstyled_paragraphs = Some(unstyled as u32);
+    /* Issue #558 — the default CHARACTER style: does it format anything,
+    and how many top-level runs name no character style (the ones it
+    formats — `StyleCascade::text_style`'s rule)? */
+    rec.default_char_style_formats = Some(doc.style_cascade().default_character().is_some());
+    rec.unstyled_runs = Some(
+        doc.blocks
+            .iter()
+            .filter_map(|b| match b {
+                engine::Block::Paragraph(p) => Some(unstyled_runs_of(p)),
+                engine::Block::Table(_) => None,
+            })
+            .sum::<usize>() as u32,
+    );
+}
+
+/// Issue #558 — the runs of `p` that name no character style: every span
+/// without one, plus every stretch of text no span covers.
+fn unstyled_runs_of(p: &engine::Paragraph) -> usize {
+    let mut runs = 0;
+    let mut cursor = 0u32;
+    for s in &p.spans {
+        runs += usize::from(s.start > cursor);
+        runs += usize::from(s.style.char_style.is_none());
+        cursor = cursor.max(s.end);
+    }
+    runs + usize::from((cursor as usize) < p.text.len())
 }
 
 fn extract_doc_xml(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {

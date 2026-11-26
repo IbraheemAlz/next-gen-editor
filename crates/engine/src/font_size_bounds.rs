@@ -62,6 +62,9 @@ pub fn first_font_size_beyond_bound(doc: &crate::DocumentTree) -> Option<String>
     if let Some(why) = doc.line_number_style.as_ref().and_then(scan_style) {
         return Some(format!("line number style: {why}"));
     }
+    if let Some(why) = doc.default_char_style.as_ref().and_then(scan_style) {
+        return Some(format!("default character style: {why}"));
+    }
     let mut style_ids: Vec<&String> = doc.styles.keys().collect();
     style_ids.sort();
     for id in style_ids {

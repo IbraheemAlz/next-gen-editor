@@ -1529,3 +1529,8 @@ pub use cell_decor::*;
 #[path = "test_fixtures_default_style.rs"]
 mod default_style;
 pub use default_style::*;
+
+/* Issue #558 — the default CHARACTER style formats runs naming none. */
+#[path = "test_fixtures_default_char_style.rs"]
+mod default_char_style;
+pub use default_char_style::*;
