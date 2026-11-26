@@ -303,7 +303,7 @@ paths:
   `default_table_cell()` is for trees without a style table); Enter keeps
   `split_at`'s copy (+ `<w:next>`, #277). The writer leaves the inherited
   values out (above), so a minted paragraph is written as before.
-  Harness: step 64e / 65e; engine-wasm `minted_paragraph_tests`
+  Harness: step 64e / 67e; engine-wasm `minted_paragraph_tests`
   (fingerprint equal across `SaveDocx` + reopen); e2e
   `minted-paragraph-cascade.spec.ts`.
 - **The default character style (issue #558).** `<w:style w:type=
@@ -320,7 +320,7 @@ paths:
   rule, `StyleCascade::text_style` (`DocumentTree::resolve_text_style`):
   span materialization, the paragraph mark / empty line, the caret and
   toolbar read-back, hyphenation, the IME preview, the paragraph cache
-  key. Harness: `tools/roundtrip` step 65 (`default_char_style.docx`);
+  key. Harness: `tools/roundtrip` step 67 (`default_char_style.docx`);
   `tools/corpus-native`'s `unstyled_runs` / `default_char_style_formats`
   columns; e2e `default-character-style.spec.ts`.
 
@@ -836,6 +836,23 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
     verbatim; a source paragraph with no text mints no empty run and stays
     self-closing when nothing is inside.
   Harness: `tools/roundtrip` step 56 (`regen_classes.docx`).
+
+## `settings.xml` toggles are patched only when they change (issue #354)
+
+`settings.xml` rides the passthrough; `parts::settings::parse_settings_xml`
+is its ONE parse. The writer owns three toggles (`writer_settings_patch.rs`:
+`evenAndOddHeaders`, `trackRevisions`, `mirrorMargins`) and compares each
+live value with what that parse reads from the SOURCE part — not
+`settings_dirty`: equal → bytes kept (any spelling); on → every
+occurrence removed and the bare element inserted at its CT_Settings rank
+(after the last ranked child before it); off → removed. A package without
+the part gets one (content-type override + relationship) only when a
+toggle is on. Review mode is engine state (`tracking_changes`, no undo
+step): `trackRevisions` seeds it on open and `Engine::save_docx_bytes`
+stamps it back (`saved_track_revisions`: under `trackedChanges` protection
+the document's own value is kept). A new owned toggle is one `TOGGLES` row.
+Harness: `tools/roundtrip` step 65 (`track_revisions.docx`,
+`mirror_margins.docx`).
 
 ## `styles.xml` is patched, not regenerated (issue #371)
 

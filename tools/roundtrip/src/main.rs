@@ -46,6 +46,7 @@ mod regen;
 mod revision_ids;
 mod revisions;
 mod run_content;
+mod settings_toggles;
 mod styles_patch;
 mod table_markup;
 mod table_merge;
@@ -397,8 +398,12 @@ fn run_default() -> Result<()> {
     /* Step 64 — issue #556: the default paragraph style formats unstyled
     paragraphs; the writer never spells it as direct formatting. */
     default_style::run_default_style_roundtrip()?;
-    /* Step 65 — issue #558: the default CHARACTER style formats runs
-    naming none; the writer never spells it as direct formatting. */
+    /* Step 65 — issue #354: the settings toggles (trackRevisions,
+    mirrorMargins) read, and written back only when they change. */
+    settings_toggles::run_settings_toggles_roundtrip()?;
+    /* Step 67 — issue #558: the default CHARACTER style formats runs
+    naming none; the writer never spells it as direct formatting (66 is
+    #489's). */
     default_char_style::run_default_char_style_roundtrip()?;
 
     println!("\nPASS");
@@ -5387,7 +5392,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         /* Issue #558 — `DefaultParagraphFont` (the default character
         style) carries a serif font, bold and 16 pt: every run naming no
         character style takes it (the e2e `default-character-style.spec.ts`
-        opens it; step 65 edits it). Zero-edit drift 0. */
+        opens it; step 67 edits it). Zero-edit drift 0. */
         PrebuiltFixture {
             name: "default_char_style.docx",
             bytes: format_docx::test_fixtures::default_char_style_docx(),
@@ -5420,6 +5425,31 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             name: "hyphenation_off.docx",
             bytes: format_docx::test_fixtures::hyphenation_docx(false),
             entry: hyphenation_fixture_entry(),
+        },
+        /* Issue #354 — `settings.xml` `<w:trackRevisions/>` (opens in
+        review mode) and `<w:mirrorMargins/>` (even pages swap the
+        inside / outside margins; the e2e `settings-toggles.spec.ts`
+        opens both). Zero-edit drift 0; the default harness's step 65
+        toggles review mode off and on. */
+        PrebuiltFixture {
+            name: "track_revisions.docx",
+            bytes: format_docx::test_fixtures::track_revisions_docx(),
+            entry: page_decor_fixture_entry(
+                format_docx::test_fixtures::TRACK_REVISIONS_TEXTS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            ),
+        },
+        PrebuiltFixture {
+            name: "mirror_margins.docx",
+            bytes: format_docx::test_fixtures::mirror_margins_docx(),
+            entry: page_decor_fixture_entry(
+                format_docx::test_fixtures::MIRROR_MARGINS_TEXTS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            ),
         },
     ]
 }

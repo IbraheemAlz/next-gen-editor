@@ -17,6 +17,30 @@ impl Margins {
             left: v,
         }
     }
+
+    /// Issue #354 — THE page-margins helper: the margins the page
+    /// numbered `page_number` lays out with, `self` being its section's
+    /// nominal margins. Under `<w:mirrorMargins/>` (`mirror`) a section's
+    /// left / right margins are its INSIDE / OUTSIDE margins: an odd page
+    /// (a recto, bound on its left) keeps them, an EVEN page (a verso,
+    /// bound on its right) swaps them. Parity is the page NUMBER's — the
+    /// formatted number a PAGE field shows (`PageBox::page_number`,
+    /// `<w:pgNumType w:start>` restart included), the parity the even /
+    /// odd header bands and inside / outside float alignment key on — not
+    /// the physical sheet index. Every page geometry goes through here
+    /// (the paginator's flush, a blank Even/Odd-page filler); downstream
+    /// code reads `PageBox::margins` and never swaps on its own.
+    pub fn for_page(self, page_number: u32, mirror: bool) -> Self {
+        if mirror && page_number % 2 == 0 {
+            Self {
+                left: self.right,
+                right: self.left,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

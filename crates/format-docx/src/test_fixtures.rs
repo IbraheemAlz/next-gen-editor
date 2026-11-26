@@ -1534,3 +1534,8 @@ pub use default_style::*;
 #[path = "test_fixtures_default_char_style.rs"]
 mod default_char_style;
 pub use default_char_style::*;
+
+/* Issue #354 — `settings.xml` trackRevisions / mirrorMargins. */
+#[path = "test_fixtures_settings.rs"]
+mod settings;
+pub use settings::*;

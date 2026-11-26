@@ -1,4 +1,4 @@
-//! Step 65 — issue #558: the DEFAULT CHARACTER style
+//! Step 67 — issue #558: the DEFAULT CHARACTER style
 //! (`DefaultParagraphFont`, `w:default="1"`) formats every run that names
 //! no character style, and the writer stays byte-neutral: it is mirrored
 //! into the engine (`DocumentTree::default_char_style`) and folded at
@@ -74,7 +74,7 @@ pub(super) fn run_default_char_style_roundtrip() -> Result<()> {
         bail!("the default character style was baked into a span");
     }
     println!(
-        "[roundtrip] step 65a OK — runs naming no character style take DefaultParagraphFont, no span bakes it"
+        "[roundtrip] step 67a OK — runs naming no character style take DefaultParagraphFont, no span bakes it"
     );
 
     let source = String::from_utf8(extract_doc_xml(&fixture)?).context("utf8 source")?;
@@ -86,7 +86,7 @@ pub(super) fn run_default_char_style_roundtrip() -> Result<()> {
     if extract_doc_xml(&ui)? != source.as_bytes() {
         bail!("untouched default-char-style document drifted on the UI save path");
     }
-    println!("[roundtrip] step 65b OK — untouched save byte-identical (write_docx + save_docx)");
+    println!("[roundtrip] step 67b OK — untouched save byte-identical (write_docx + save_docx)");
 
     let edited = doc.insert_text(
         LogicalPos {
@@ -107,7 +107,7 @@ pub(super) fn run_default_char_style_roundtrip() -> Result<()> {
     if shape(&read_docx(&bytes)?.document) != expected() {
         bail!("re-read of the edited document lost the default character style");
     }
-    println!("[roundtrip] step 65c OK — an edited plain run is source + insert");
+    println!("[roundtrip] step 67c OK — an edited plain run is source + insert");
 
     let split = doc.split_paragraph(LogicalPos {
         path: BlockPath::top(0),
@@ -140,7 +140,7 @@ pub(super) fn run_default_char_style_roundtrip() -> Result<()> {
         );
     }
     println!(
-        "[roundtrip] step 65d OK — Enter + typing write no run properties; the new run re-reads bold 16 pt"
+        "[roundtrip] step 67d OK — Enter + typing write no run properties; the new run re-reads bold 16 pt"
     );
 
     let end = DEFAULT_CHAR_TEXTS.len() as u32;
@@ -169,7 +169,7 @@ pub(super) fn run_default_char_style_roundtrip() -> Result<()> {
         bail!("the minted cell re-reads differently");
     }
     println!(
-        "[roundtrip] step 65e OK — minted cells carry the docDefaults' spacing, write no pPr, re-read the same"
+        "[roundtrip] step 67e OK — minted cells carry the docDefaults' spacing, write no pPr, re-read the same"
     );
     Ok(())
 }

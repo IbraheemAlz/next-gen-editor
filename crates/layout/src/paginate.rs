@@ -216,6 +216,9 @@ pub struct Paginator {
     title_pg: bool,
     /// `<w:evenAndOddHeaders/>` — even-numbered pages use `Even` slot.
     even_and_odd_headers: bool,
+    /// Issue #354 — `<w:mirrorMargins/>`: even-numbered pages swap the
+    /// section's left / right margins ([`Margins::for_page`]).
+    mirror_margins: bool,
     /// Set on `new` and after every `start_new_section`; cleared after
     /// the next page flushes. Drives the `First` slot selection when
     /// `title_pg` is on.
@@ -328,6 +331,7 @@ impl Paginator {
             footers,
             title_pg,
             even_and_odd_headers,
+            mirror_margins: false,
             section_first_page_pending: true,
             column_count: 1,
             column_gutter: 0.0,
@@ -359,6 +363,25 @@ impl Paginator {
         header band when the band is taller than the top margin. */
         p.cur_y = p.opening_cur_y();
         p
+    }
+
+    /// Issue #354 — the document-wide `<w:mirrorMargins/>` setting: every
+    /// even-numbered page this paginator emits swaps its section's left /
+    /// right margins ([`Margins::for_page`]). Off by default, so a
+    /// document without the setting lays out exactly as before.
+    pub fn with_mirror_margins(mut self, on: bool) -> Self {
+        self.mirror_margins = on;
+        self
+    }
+
+    /// Issue #354 — the margins of the page currently being filled: its
+    /// section's, through THE per-page helper [`Margins::for_page`] at the
+    /// number [`Self::current_formatted_page_no`] gives it (the number
+    /// its `PageBox::page_number` carries).
+    fn current_page_margins(&self) -> Margins {
+        self.geometry
+            .margins
+            .for_page(self.current_formatted_page_no(), self.mirror_margins)
     }
 
     /// Issue #87 — override the stage (c) page cap (tests, embedders
@@ -2531,7 +2554,10 @@ impl Paginator {
                 width: self.geometry.width,
                 height: self.geometry.height,
             },
-            margins: self.geometry.margins,
+            /* Issue #354 — mirrored on an even page under
+            `<w:mirrorMargins/>`; body, bands, notes, columns, floats,
+            decorations, paint, PDF and hit-testing all read THIS. */
+            margins: self.current_page_margins(),
             blocks,
             header,
             footer,
@@ -2570,8 +2596,9 @@ impl Paginator {
         like the endnote band and is not a page-bottom keep-out. */
         if !page.footnotes.is_empty() && self.footnote_position == NotePosition::PageBottom {
             let keep_out = crate::floats::NoteBandKeepOut {
-                x0: self.geometry.margins.left,
-                x1: self.geometry.width - self.geometry.margins.right,
+                /* Issue #354 — the band spans THIS page's text column. */
+                x0: page.margins.left,
+                x1: page.size.width - page.margins.right,
                 top: page.footnotes.y - FOOTNOTE_SEPARATOR_HEIGHT_PT,
                 bottom: page.footnotes.y + page.footnotes.content_height(),
                 floor: self.geometry.margins.top + self.header_intrusion(role),
@@ -4439,6 +4466,105 @@ mod tests {
         assert_eq!(header_tag(&pages[1]), 10, "displays 3 → default band");
         assert_eq!(pages[0].page_number, 2, "formatted number stamped");
         assert_eq!(pages[1].page_number, 3);
+    }
+
+    /// Issue #354 — `<w:mirrorMargins/>`: a section's left / right margins
+    /// are its inside / outside margins, so every even-numbered page lays
+    /// out with them swapped. Three pages, a 100 pt left (inside) and a
+    /// 30 pt right (outside) margin: each page's text x-origin (page
+    /// margin + block origin — what paint, PDF and hit-testing add up).
+    #[test]
+    fn mirror_margins_swap_left_and_right_on_even_pages() {
+        let mut geom = a4_geometry();
+        geom.margins.left = 100.0;
+        geom.margins.right = 30.0;
+        let lay = |mirror: bool, start: Option<u32>| {
+            let mut pag = Paginator::new(
+                geom,
+                HeaderBands::default(),
+                HeaderBands::default(),
+                false,
+                false,
+            )
+            .with_mirror_margins(mirror);
+            pag.set_page_numbering(
+                engine::PageNumType {
+                    start,
+                    ..Default::default()
+                },
+                0,
+            );
+            for i in 0..3 {
+                if i > 0 {
+                    pag.force_page_break();
+                }
+                pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+            }
+            let pages = pag.finish();
+            assert_eq!(pages.len(), 3);
+            pages
+        };
+        let text_x = |pages: &[PageBox]| -> Vec<f32> {
+            pages
+                .iter()
+                .map(|p| p.margins.left + p.blocks[0].origin().x)
+                .collect()
+        };
+        let right =
+            |pages: &[PageBox]| -> Vec<f32> { pages.iter().map(|p| p.margins.right).collect() };
+
+        let mirrored = lay(true, None);
+        assert_eq!(text_x(&mirrored), vec![100.0, 30.0, 100.0]);
+        assert_eq!(right(&mirrored), vec![30.0, 100.0, 30.0]);
+        /* The text column keeps its width; only its side moves. */
+        for p in &mirrored {
+            assert_eq!(
+                p.size.width - p.margins.left - p.margins.right,
+                geom.width - 130.0
+            );
+            assert_eq!(
+                (p.margins.top, p.margins.bottom),
+                (geom.margins.top, geom.margins.bottom)
+            );
+        }
+
+        /* Off (the default): every page keeps the section's margins. */
+        let plain = lay(false, None);
+        assert_eq!(text_x(&plain), vec![100.0, 100.0, 100.0]);
+        assert_eq!(
+            crate::watchdog::geometry_fingerprint(&plain),
+            crate::watchdog::geometry_fingerprint(&{
+                let mut pag = Paginator::new(
+                    geom,
+                    HeaderBands::default(),
+                    HeaderBands::default(),
+                    false,
+                    false,
+                );
+                for i in 0..3 {
+                    if i > 0 {
+                        pag.force_page_break();
+                    }
+                    pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+                }
+                pag.finish()
+            }),
+            "flag off = the paginator without the setting"
+        );
+        assert_ne!(
+            crate::watchdog::geometry_fingerprint(&mirrored),
+            crate::watchdog::geometry_fingerprint(&plain),
+            "page parity is part of the pinned geometry"
+        );
+
+        /* Parity is the page NUMBER's: a section restarting at 2 opens
+        on an even page, inside margin on the right. */
+        let restarted = lay(true, Some(2));
+        assert_eq!(
+            restarted.iter().map(|p| p.page_number).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(text_x(&restarted), vec![30.0, 100.0, 30.0]);
     }
 
     #[test]

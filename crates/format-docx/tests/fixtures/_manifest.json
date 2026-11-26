@@ -257,6 +257,21 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "mirror_margins.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 3,
+        "paragraph_texts": [
+          "Page one is odd: its inside margin is on the left.",
+          "Page two is even: its inside margin is on the right.",
+          "Page three is odd again."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "pPr_bidi_rtl.docx": {
       "generator": "handcrafted",
       "phase_introduced": 2,
@@ -686,6 +701,20 @@
           "",
           "Alpha",
           "Beta"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "track_revisions.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "Track Changes was on when this document was saved.",
+          "Typing here is recorded as an insertion."
         ]
       },
       "roundtrip": {
