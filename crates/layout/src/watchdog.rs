@@ -145,6 +145,13 @@ pub enum DegradeReason {
     /// Distinct from [`DegradeReason::CacheMismatch`] (the paragraph LRU)
     /// so telemetry tells the two cache tiers apart.
     TableCacheMismatch,
+    /// Issue #347 — the paragraph float-wrap composer hit its defensive
+    /// band cap (`layout_paragraph_wrapped`): the rest of the paragraph
+    /// was composed ignoring its float cutouts, so it may run under /
+    /// over an object it should have wrapped around. Unreachable for any
+    /// finite plan (every band consumes text or passes a cutout edge),
+    /// so a note means the termination argument broke.
+    FloatWrapCapped,
 }
 
 impl DegradeReason {
@@ -171,6 +178,7 @@ impl DegradeReason {
             DegradeReason::FloatClampedByNotes => "FLOAT_CLAMPED_BY_NOTES",
             DegradeReason::NestingCapped => "NESTING_CAPPED",
             DegradeReason::TableCacheMismatch => "TABLE_CACHE_MISMATCH",
+            DegradeReason::FloatWrapCapped => "FLOAT_WRAP_CAPPED",
         }
     }
 }

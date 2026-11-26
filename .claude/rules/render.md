@@ -161,6 +161,18 @@ hard failure so CI catches a new loop instead of a silent recovery.
 - Every degradation is reported: the paginator's notes ride
   `Event::Painted.layout_degraded` (and the synthetic side-channel).
   A degraded paint is telemetry, never a blocking error.
+- **A cap inside a layout FUNCTION reports through its return value
+  (issue #347).** `layout::layout_paragraph_wrapped`'s defensive band cap
+  (past it the remainder is composed ignoring the float cutouts) used to
+  drop the wrap silently; it now returns `WrappedParagraph { paragraph,
+  degraded: Some(DegradeReason::FloatWrapCapped) }` (`#[must_use]`), and
+  the engine reaches it ONLY through `lay_out_wrapped`, which notes the
+  reason into the sub-paginator sink (`note_layout_degradation`, so the
+  strict test sink panics on it). No finite plan reaches the real cap, so
+  tests force it through `layout_paragraph_wrapped_with_cap` /
+  `ForcedWrapBandCap` - a new cap in a layout function gets the same
+  treatment: a reason, a return channel the caller cannot ignore, and a
+  forced-cap test.
 - **Verified fast paths.** An incremental relayout (`LazyLayoutState` /
   `ExpandLayout` bands, the paragraph layout LRU, any future
   single-paragraph tier) is a *prediction*. Run the real layout, check
@@ -239,6 +251,15 @@ hard failure so CI catches a new loop instead of a silent recovery.
   stored with the entry and replayed on a hit, so a cached paint reports
   what a fresh one would. `tools/corpus-native` re-lays every document
   warm (`engine_repaint_consistent`) to prove warm == cold.
+  **Undo / redo do not clear it (issue #346).** A content key makes the
+  restored document hit exactly the entries laid out under the same
+  content (redo of a tab-kind change is a real hit) and miss the rest;
+  `paragraph_cache_key_tests::undo_and_redo_of_a_tab_kind_change_…` /
+  `…_tab_leader_…` pin warm == cold through `SetTabStops` → `Undo` →
+  `Redo` (they fail the moment the tab kind / leader leaves the key —
+  the leader is geometry-neutral, so the test compares the glyph field).
+  A stale entry after undo is a field missing from a key, never a reason
+  for a blanket `clear` in `do_undo`.
 - **Paragraph decorations are stamped by ONE helper (issue #455).**
   `pBdr` borders, `shd` shading and the tracked-mark pilcrow colour are
   paint-only, so `paragraph_layout_key` leaves them out and the paragraph
