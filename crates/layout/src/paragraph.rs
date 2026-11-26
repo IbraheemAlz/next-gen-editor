@@ -14,6 +14,7 @@ use crate::boxes::{
     SpanFace, StyleSpan, TabLeaderKind, TextAttrs, VisualRun,
 };
 use crate::hyphen::{append_break_hyphen, break_hyphen_advance, ends_at_soft_hyphen};
+use crate::watchdog::DegradeReason;
 use std::borrow::Cow;
 use std::mem::take;
 use text_pipeline::{
@@ -533,13 +534,52 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
 /// moves `y` strictly past the bottom of a cutout it intersected, and
 /// there are finitely many cutouts. A defensive band cap backs that up —
 /// past it the remainder is composed ignoring the cutouts (it paints,
-/// nothing is dropped).
+/// nothing is dropped) and the outcome carries
+/// [`DegradeReason::FloatWrapCapped`] (issue #347: an escape hatch is
+/// never silent, `.claude/rules/render.md` "Layout self-defense").
 pub fn layout_paragraph_wrapped(
     cfg: ParagraphConfig<'_>,
     cutouts: &[crate::wrap::WrapCutout],
-) -> ParagraphBox {
+) -> WrappedParagraph {
+    let band_cap = wrap_band_cap(cfg.text.len(), cutouts.len());
+    layout_paragraph_wrapped_with_cap(cfg, cutouts, band_cap)
+}
+
+/// Issue #347 — a wrapped paragraph and what its composer had to give up
+/// to finish it.
+#[derive(Debug, Clone)]
+#[must_use = "a capped wrap must be reported (DegradeReason::FloatWrapCapped)"]
+pub struct WrappedParagraph {
+    /// The laid-out paragraph. Always complete: a capped composer paints
+    /// the rest of the text, it never drops it.
+    pub paragraph: ParagraphBox,
+    /// `Some(FloatWrapCapped)` when the band cap was hit and the
+    /// remainder of the paragraph was composed ignoring its cutouts.
+    pub degraded: Option<DegradeReason>,
+}
+
+/// Issue #82 / #347 — the defensive cap on composed bands: generous,
+/// since every byte could be its own line and every cutout could force
+/// one skip per edge (so no finite plan reaches it — see
+/// [`layout_paragraph_wrapped`]).
+pub fn wrap_band_cap(text_len: usize, cutouts: usize) -> usize {
+    text_len + 2 * cutouts + 16
+}
+
+/// [`layout_paragraph_wrapped`] with an explicit band cap. Production
+/// passes [`wrap_band_cap`]; the seam exists because no finite plan can
+/// reach the real cap, so the escape hatch has to be forced to be tested
+/// (issue #347).
+pub fn layout_paragraph_wrapped_with_cap(
+    cfg: ParagraphConfig<'_>,
+    cutouts: &[crate::wrap::WrapCutout],
+    band_cap: usize,
+) -> WrappedParagraph {
     if cutouts.is_empty() || cfg.text.is_empty() {
-        return layout_paragraph(cfg);
+        return WrappedParagraph {
+            paragraph: layout_paragraph(cfg),
+            degraded: None,
+        };
     }
     use crate::wrap::{MIN_SEGMENT_LINE_HEIGHTS, next_band_edge, segments_for_band};
 
@@ -569,19 +609,19 @@ pub fn layout_paragraph_wrapped(
     let min_seg = MIN_SEGMENT_LINE_HEIGHTS * band_h;
     let breaks = break_opportunities(cfg.text);
     let soft = soft_break_segments(cfg.text);
-    let text_len = cfg.text.len();
 
     let mut lines: Vec<LineBox> = Vec::new();
     let mut y = 0.0_f32;
     let mut soft_idx = 0_usize;
     let mut start = soft[0].0;
-    /* Defensive cap (see the doc comment): generous — every byte could
-    be its own line and every cutout could force one skip. */
-    let band_cap = text_len + 2 * cutouts.len() + 16;
+    /* Defensive cap (see the doc comment): past it the cutouts are
+    ignored and the outcome reports `FloatWrapCapped`. */
     let mut bands = 0_usize;
+    let mut capped = false;
     while soft_idx < soft.len() {
         bands += 1;
         let ignore_cuts = bands > band_cap;
+        capped |= ignore_cuts;
         let cuts: &[crate::wrap::WrapCutout] = if ignore_cuts { &[] } else { cutouts };
         let fl = first_line_offset_px(lines.len(), cfg.first_line_indent_px, hanging_for_lines);
         let (cx0, cx1) = if rtl {
@@ -644,7 +684,7 @@ pub fn layout_paragraph_wrapped(
     }
 
     let marker = build_marker(&cfg, leading_off, lines.first());
-    ParagraphBox {
+    let paragraph = ParagraphBox {
         origin: Point::default(),
         size: Size {
             width: cfg.max_width,
@@ -661,6 +701,10 @@ pub fn layout_paragraph_wrapped(
         keep_next: false,
         flow: crate::boxes::ParaFlow::default(),
         review_mark: None,
+    };
+    WrappedParagraph {
+        paragraph,
+        degraded: capped.then_some(DegradeReason::FloatWrapCapped),
     }
 }
 
