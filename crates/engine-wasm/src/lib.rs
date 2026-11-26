@@ -7193,6 +7193,36 @@ fn x_distance_to_line(line: &LineGeom, target_x: f32) -> f32 {
     }
 }
 
+/// The first (`at_end == false`) or last caret position of the story tree
+/// `doc` (the body, or the header / footer / note / text-box story being
+/// edited): offset 0 of its first paragraph, or the end of its last
+/// top-level paragraph. Issue #117 — a table-led / table-ended story has no
+/// paragraph at `top(0)` / at its end, so the walk descends into the first /
+/// last cell. ONE resolution for Ctrl+Home / Ctrl+End, Select All and (epic
+/// #555 row 18) Shift+Up / Shift+Down past the story's edge.
+fn story_edge_pos(doc: &DocumentTree, at_end: bool) -> BridgeLogicalPos {
+    if !at_end {
+        return BridgeLogicalPos {
+            path: engine_to_bridge_path(
+                doc.path_to_first_paragraph_deep()
+                    .unwrap_or(EngineBlockPath::top(0)),
+            ),
+            offset: 0,
+        };
+    }
+    let last = doc
+        .path_to_last_top_paragraph()
+        .or_else(|| doc.path_to_last_paragraph_deep())
+        .unwrap_or(EngineBlockPath::top(0));
+    let offset = doc
+        .paragraph_at_path(&last)
+        .map_or(0, |p| p.text.len() as u32);
+    BridgeLogicalPos {
+        path: engine_to_bridge_path(last),
+        offset,
+    }
+}
+
 /// Step one grapheme cluster backward in logical byte order (UAX #29).
 /// `unicode-segmentation::UnicodeSegmentation::grapheme_indices` returns
 /// the byte index of every grapheme break; the caret lands on the LAST
@@ -14377,28 +14407,8 @@ impl Engine {
         addresses (the story tree in header/footer mode) and anchor on a
         real paragraph: a table-first document has no paragraph at
         `top(0)`, and a selection endpoint must always resolve. */
-        let (anchor, caret) = self.with_selection_doc(|doc| {
-            let first = doc
-                .path_to_first_paragraph_deep()
-                .unwrap_or(EngineBlockPath::top(0));
-            let last = doc
-                .path_to_last_top_paragraph()
-                .or_else(|| doc.path_to_last_paragraph_deep())
-                .unwrap_or(EngineBlockPath::top(0));
-            let last_len = doc
-                .paragraph_at_path(&last)
-                .map_or(0, |p| p.text.len() as u32);
-            (
-                BridgeLogicalPos {
-                    path: engine_to_bridge_path(first),
-                    offset: 0,
-                },
-                BridgeLogicalPos {
-                    path: engine_to_bridge_path(last),
-                    offset: last_len,
-                },
-            )
-        });
+        let (anchor, caret) =
+            self.with_selection_doc(|doc| (story_edge_pos(doc, false), story_edge_pos(doc, true)));
         self.pending_format = None;
         /* Audit gap B.M4 — SelectAll is a non-arrow motion; reset
         affinity. */
@@ -14481,33 +14491,8 @@ impl Engine {
                 line_end(self, &sel.caret).unwrap_or(sel.caret.clone()),
                 None,
             ),
-            MoveDirection::DocHome => (
-                /* Issue #117 — the first PARAGRAPH, not block 0: a table-first
-                document (or story) has no paragraph at `top(0)`. */
-                doc.path_to_first_paragraph_deep().map_or_else(
-                    || bpos_top(0, 0),
-                    |p| BridgeLogicalPos {
-                        path: engine_to_bridge_path(p),
-                        offset: 0,
-                    },
-                ),
-                None,
-            ),
-            MoveDirection::DocEnd => {
-                let last_path = doc
-                    .path_to_last_top_paragraph()
-                    .unwrap_or(EngineBlockPath::top(0));
-                let last_len = doc
-                    .paragraph_at_path(&last_path)
-                    .map_or(0, |p| p.text.len() as u32);
-                (
-                    BridgeLogicalPos {
-                        path: engine_to_bridge_path(last_path),
-                        offset: last_len,
-                    },
-                    None,
-                )
-            }
+            MoveDirection::DocHome => (story_edge_pos(&doc, false), None),
+            MoveDirection::DocEnd => (story_edge_pos(&doc, true), None),
             MoveDirection::NextCell | MoveDirection::PrevCell => {
                 /* Issue #76 — resolve against the tree the caret
                 addresses (story tables included), then apply a row
@@ -14731,6 +14716,10 @@ impl Engine {
                             offset,
                         }
                     }
+                    /* Epic #555 row 18 (clean-room cursor memo §4) — Shift
+                    past the story's first / last line extends to its
+                    start / end; a plain Up / Down there stays put. */
+                    None if extend => story_edge_pos(&doc, direction == MoveDirection::Down),
                     None => sel.caret.clone(),
                 };
                 (new_caret, Some(ideal))
@@ -17695,6 +17684,26 @@ impl Engine {
             /* Caret at a document edge — nothing to delete. */
             return self.selection_changed();
         };
+        /* Epic #555 row 28 (clean-room cursor memo §7) — a collapsed
+        Backspace / Delete never crosses a cell boundary: when the step
+        leaves the caret's container (a cell edge, the table's edge, the
+        paragraph after a table) nothing is deleted and the caret stays.
+        The one exception is Delete at the end of the paragraph BEFORE a
+        table, which joins the table's first cell (untracked only: the
+        move has no tracked-change form, so review mode deletes nothing). */
+        let start_path = bridge_to_engine_path(del_start.path.clone());
+        if !engine::same_parent(&start_path, &bridge_to_engine_path(del_end.path.clone())) {
+            if forward
+                && !self.tracking_changes
+                && let Some((new_doc, caret)) = self
+                    .undo
+                    .current()
+                    .join_paragraph_into_next_table(&start_path)
+            {
+                return self.commit_edit(new_doc, to_bridge_pos(caret));
+            }
+            return self.selection_changed();
+        }
         match self.delete_or_mark(del_start, del_end, !forward) {
             Ok((new_doc, caret)) => self.commit_edit(new_doc, caret),
             Err(e) => *e,
@@ -31644,6 +31653,11 @@ mod revision_address_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
+
+/// Epic #555 — the table rows of the cursor matrix (Shift past the
+/// document edge, Delete / Backspace at a table's and a cell's edges).
+#[cfg(test)]
+mod table_cursor_tests;
 
 /// Issue #505 — the entry caret of an (empty) header / footer sits inside
 /// the band of the entered page (`fuzz-native`).
