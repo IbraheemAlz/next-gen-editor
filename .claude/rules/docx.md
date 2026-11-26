@@ -113,6 +113,27 @@ paths:
   Internal }` with no bytes and the document untouched. Cost on the 12.6 MB
   corpus part: ~ the scan itself (≈ 17 % of save time, half of it quick-xml
   tokenization) — item 6 of #468 (fold it into `check_xml_part`) is the fix.
+- **Block placement (issues #536 / #530).** The body walk
+  (`parts::document`) takes a `<w:p>` (start or self-closing) or a
+  `<w:tbl>` for a block ONLY at block level — directly in a block container
+  (`<w:body>`, a header / footer root, a note, a comment) or a block-level
+  wrapper inside one; story containers are skipped whole before. Anywhere
+  else — before / after / around `<w:body>` (an unclosed `<w:p>` the EOF
+  repair closes after `</w:body>`), inside another paragraph (the same
+  repair nests the paragraphs after an unclosed one), inside a `<w:sectPr>` —
+  the walk fails with `parts::document::misplaced_block`
+  (`DocxError::MalformedXml`, offset + class only): the main part is refused
+  (`DocumentUnreadable`), a header / footer / note part reads as absent, a
+  text-box story stays an opaque object. Such an element used to be a block
+  while its bytes ALSO rode the envelope or the enclosing paragraph's
+  capture, so a zero-edit save duplicated or lost text. No faithful repair
+  exists (where did the producer mean the paragraph to end?), so this is the
+  #434 structural-defect policy, not a repair. Tests
+  `reader_block_placement_tests` (fixtures
+  `crates/format-docx/tests/fixtures/malformed/`), seeds
+  `fuzz/corpus/docx_roundtrip/repro_{491,492,511,530,536}`. Cell blocks are
+  the table walker's (`parts::table`), which does not apply the rule yet
+  (#564).
 - **Measures (issue #349).** Page geometry, `<w:ind>`, `<w:spacing>` and
   table widths go through `schema::measure` (`attr_measure*`): integer or
   decimal twips, ECMA universal-measure units (`in` / `cm` / `mm` / `pt` /

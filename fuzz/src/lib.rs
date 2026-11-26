@@ -1205,12 +1205,13 @@ mod tests {
         assert!(words.contains(b"<w:fldChar w:fldCharType=\"begin\"/>".as_slice()));
     }
 
-    /// Issues #439 / #434 (and #482 / #483) — every committed
-    /// `docx_roundtrip` reproducer (`corpus/docx_roundtrip/repro_*`, raw
-    /// fuzz inputs the generator turns into malformed packages) holds the
-    /// read => write => read invariant. The generator-independent
-    /// spellings of the same shapes are `format_docx`'s
-    /// `reader_well_formed_tests`.
+    /// Issues #439 / #434 (and #482 / #483, #491 / #492 / #511 / #530 /
+    /// #536) — every committed `docx_roundtrip` reproducer
+    /// (`corpus/docx_roundtrip/repro_*`, raw fuzz inputs the generator turns
+    /// into malformed packages) holds the read => write => read invariant.
+    /// The generator-independent spellings of the same shapes are
+    /// `format_docx`'s `reader_well_formed_tests` and
+    /// `reader_block_placement_tests`.
     #[test]
     fn committed_docx_roundtrip_reproducers_hold() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_roundtrip");
@@ -1268,6 +1269,59 @@ mod tests {
         );
         assert!(message.contains("word/document.xml"), "{message}");
         assert_eq!(engine.state_fingerprint_for_fuzzing(), before);
+    }
+
+    /// Issues #536 / #530 (and the closed #491, #492, #511) — each nightly
+    /// input builds a package with a block where no block may stand (a
+    /// `<w:p>` before the body, unclosed so the EOF repair makes it enclose
+    /// the body, or nested in another paragraph by the same repair). Its
+    /// zero-edit save used to read back duplicated or lost text; the read
+    /// now refuses it (`MalformedXml`, so `check_roundtrip` has no save to
+    /// compare) and the real dispatcher answers the typed
+    /// `DocumentUnreadable` with the open document untouched. The
+    /// generator-independent spellings are `format_docx`'s
+    /// `reader_block_placement_tests` (which also pin these packages).
+    #[test]
+    fn the_536_cluster_reproducers_open_as_document_unreadable() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/docx_roundtrip");
+        for (seed, class) in [
+            ("repro_491", "outside the document body"),
+            ("repro_492", "outside the document body"),
+            ("repro_511", "outside the document body"),
+            ("repro_536", "outside the document body"),
+            ("repro_530", "inside a paragraph"),
+        ] {
+            let data = std::fs::read(dir.join(seed)).expect("the reproducer is committed");
+            run_docx_roundtrip(&data);
+            let bytes = docx_gen::build_docx(&mut Unstructured::new(&data))
+                .expect("the generator builds a package");
+            let err = format_docx::read_docx(&bytes).expect_err("refused, not opened");
+            assert!(
+                matches!(&err, format_docx::DocxError::MalformedXml(d) if d.contains(class)),
+                "{seed}: {err:?}"
+            );
+            let mut engine =
+                engine_wasm::Engine::new_headless(engine::DocumentTree::from_text("keep me"));
+            let before = engine.state_fingerprint_for_fuzzing();
+            let evt = engine.apply_sync(bridge::Command::OpenDocument {
+                bytes,
+                format: bridge::DocFormat::Docx,
+                name: Some(format!("{seed}.docx")),
+                defaults: None,
+                limits: None,
+                password: None,
+            });
+            let bridge::Event::Error { kind, message, .. } = evt else {
+                panic!("{seed}: a damaged package answers Error, got {evt:?}");
+            };
+            assert_eq!(
+                kind,
+                Some(bridge::ErrorKind::DocumentUnreadable),
+                "{seed}: {message}"
+            );
+            assert!(message.contains(class), "{seed}: {message}");
+            assert_eq!(engine.state_fingerprint_for_fuzzing(), before, "{seed}");
+        }
     }
 
     /// Issues #477–#481 — every committed `snapshot_decode` reproducer
