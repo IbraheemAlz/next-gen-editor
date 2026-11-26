@@ -209,7 +209,21 @@ fn caret(e: &Engine) -> (BridgeLogicalPos, BridgeLogicalPos) {
 
 /// The fuzz targets' invariants hold after every step.
 fn assert_sound(e: &Engine, what: &str) {
-    assert!(e.selection_is_valid(), "{what}: the selection escaped");
+    /* `selection_is_valid` is native-only; its check, read straight: both
+    endpoints are fixed points of `clamp_pos`. */
+    let sel = e.selection.as_ref().expect("a selection");
+    e.with_selection_doc(|doc| {
+        assert_eq!(
+            clamp_pos(doc, sel.anchor.clone()),
+            sel.anchor,
+            "{what}: anchor escaped"
+        );
+        assert_eq!(
+            clamp_pos(doc, sel.caret.clone()),
+            sel.caret,
+            "{what}: caret escaped"
+        );
+    });
     #[cfg(feature = "fuzz-native")]
     e.check_invariants_for_fuzzing()
         .unwrap_or_else(|err| panic!("{what}: invariants: {err}"));
