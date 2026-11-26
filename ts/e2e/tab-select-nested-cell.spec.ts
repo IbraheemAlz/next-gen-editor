@@ -18,8 +18,9 @@ import { documentXml, readZipEntry, storedDocx } from './helpers/docx';
  * last one (inside a trailing nested table).
  *
  * Setup only goes through `__dispatch`: the fixture opens from a `.docx`
- * (the toolbar cannot author a nested table — Insert > Table in a cell
- * inserts a top-level table after the outer one, issue #563) and a
+ * (a cell that STARTS with a nested table cannot be typed: since #563 the
+ * toolbar's Insert > Table nests a table AFTER the caret's cell paragraph,
+ * `nested-table-flows.spec.ts`) and a
  * `SET_SELECTION` reads the click target's caret rect off the engine.
  * Typing over the span puts the character IN the cell; replacing the
  * WHOLE span (nested table included) is the cross-container delete of
