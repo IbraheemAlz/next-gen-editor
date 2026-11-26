@@ -43,8 +43,7 @@ const F_WHICH_TBL_STM: u16 = 0x0200;
 /// Indices of the `(fc, lcb)` pairs of `FibRgFcLcb97` (2.5.6) this
 /// importer reads.
 pub(crate) mod pair {
-    /// `fcStshf` / `lcbStshf` — the style sheet (only its presence is
-    /// read: styles are not imported yet).
+    /// `fcStshf` / `lcbStshf` — the style sheet (2.9.271 STSH).
     pub(crate) const STSHF: usize = 1;
     /// `fcPlcfSed` — the section descriptors.
     pub(crate) const PLCF_SED: usize = 6;
@@ -52,6 +51,8 @@ pub(crate) mod pair {
     pub(crate) const PLCF_BTE_CHPX: usize = 12;
     /// `fcPlcfBtePapx` — the paragraph-formatting bin table.
     pub(crate) const PLCF_BTE_PAPX: usize = 13;
+    /// `fcSttbfFfn` — the font table (2.9.293 SttbfFfn).
+    pub(crate) const STTBF_FFN: usize = 15;
     /// `fcClx` — the piece table.
     pub(crate) const CLX: usize = 33;
 }

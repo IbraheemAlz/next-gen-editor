@@ -31678,6 +31678,10 @@ mod table_cache_tests;
 /// (direction, document default, layout).
 #[cfg(test)]
 mod default_paragraph_style_tests;
+/// Issue #575 — a `.doc`'s style sheet and font table through the one
+/// cascade (direction, layout, font read-back, ModifyStyle, save).
+#[cfg(test)]
+mod doc_styles_tests;
 #[cfg(test)]
 mod part_media_tests;
 #[cfg(test)]

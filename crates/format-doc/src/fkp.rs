@@ -4,9 +4,10 @@
 // Licensed under the MIT License or the Apache License, Version 2.0, at your
 // option. Changes: a lookup also returns the end of the FC run it found (the
 // reader caches one run's formatting instead of re-searching per
-// character); a bin table that is not 4 + 8n bytes is a typed error; the
-// `crun` caps are the spec's (0x65 / 0x1D). See THIRD-PARTY-NOTICES.md at
-// the repository root.
+// character) and a PAPX entry's paragraph style (`istd`, issue #575); a
+// bin table that is not 4 + 8n bytes is a typed error; the `crun` caps are
+// the spec's (0x65 / 0x1D). See THIRD-PARTY-NOTICES.md at the repository
+// root.
 
 //! Direct formatting lookup ([MS-DOC] 2.4.6.1 Direct Character Formatting,
 //! 2.4.6.2 Direct Paragraph Formatting): a bin table in the table stream
@@ -49,10 +50,14 @@ pub(crate) struct Bins {
 }
 
 /// The formatting a lookup found: the grpprl (empty = no direct
-/// formatting) and the byte range of the run it applies to.
+/// formatting), the paragraph style of a `PapxInFkp` and the byte range
+/// of the run it applies to.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Run<'w> {
     pub(crate) grpprl: &'w [u8],
+    /// `GrpPrlAndIstd.istd` (2.9.112): the paragraph style (`None` for a
+    /// CHPX run, and for a PAPX entry with no properties at all).
+    pub(crate) istd: Option<u16>,
     /// The run covers bytes `[fc_start, fc_end)`.
     pub(crate) fc_start: u32,
     pub(crate) fc_end: u32,
@@ -134,6 +139,7 @@ impl Bins {
         let off = usize::from(*page.get(entry_at)?) * 2;
         let empty = Run {
             grpprl: &[],
+            istd: None,
             fc_start,
             fc_end,
         };
@@ -151,7 +157,7 @@ impl Bins {
                 /* PapxInFkp (2.9.179): cb; when nonzero the GrpPrlAndIstd is
                 2 × cb − 1 bytes, when zero the next byte cb' gives 2 × cb'
                 bytes. GrpPrlAndIstd (2.9.112): istd (u16, the paragraph
-                style, not imported yet) + grpprl. */
+                style) + grpprl. */
                 let cb = usize::from(*page.get(off)?);
                 let (data_at, len) = if cb != 0 {
                     (off + 1, 2 * cb - 1)
@@ -161,8 +167,13 @@ impl Bins {
                 if len < 2 {
                     return Some(empty);
                 }
+                let istd = crate::le::u16_at(page, data_at);
                 let grpprl = page.get(data_at + 2..data_at + len).unwrap_or(&[]);
-                Run { grpprl, ..empty }
+                Run {
+                    grpprl,
+                    istd,
+                    ..empty
+                }
             }
         };
         Some(run)

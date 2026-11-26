@@ -16,19 +16,28 @@
 //!   Windows-1252 and 16-bit UTF-16 pieces, in any physical order, so a
 //!   fast-saved document reads like a fully saved one;
 //! - paragraph boundaries and their direct formatting from the PAPX FKPs
-//!   (alignment, indents, spacing, line spacing, right-to-left);
+//!   (alignment, indents, spacing, line spacing, right-to-left, keep /
+//!   keep-with-next / page-break-before / widow control, outline level);
 //! - character runs and their direct formatting from the CHPX FKPs (bold,
-//!   italic, underline, strike, size, colour, the right-to-left flag and
-//!   the complex-script bold / italic / size twins), with the piece's
-//!   `Prm` applied on top;
-//! - page size, margins and section starts from every section's SEPX.
+//!   italic, underline, strike, caps, small caps, super / subscript,
+//!   highlight, size, colour, fonts, the right-to-left flag and the
+//!   complex-script bold / italic / size / font twins), with the piece's
+//!   `Prm` applied on top, and the paragraph mark's own formatting;
+//! - page size, margins and section starts from every section's SEPX;
+//! - the style sheet ([`styles`], issue #575): paragraph styles onto the
+//!   engine's style table (Normal as the default paragraph style), so a
+//!   paragraph keeps its style and its direct formatting apart and the
+//!   engine's one cascade resolves it; character styles folded into their
+//!   runs; the document defaults; the font table's face names on every
+//!   font slot (resolved at layout like a `.docx` `<w:rFonts>` name).
 //!
 //! What is not (yet) imported is COUNTED and reported
 //! ([`DocImport::not_imported`]): tables (their cell text becomes plain
 //! paragraphs), list numbering, pictures and drawings, fields (each kept
 //! as the text it last displayed), headers / footers, notes, comments,
-//! text boxes, styles and fonts. Honest UX: the engine turns the report
-//! into open warnings, so a partial import never looks like a clean one.
+//! text boxes — and a style sheet or font table too damaged to read.
+//! Honest UX: the engine turns the report into open warnings, so a partial
+//! import never looks like a clean one.
 //!
 //! The input is attacker-shaped and the wasm worker aborts on a panic: the
 //! container goes through `format-docx`'s bounded MS-CFB reader, every
@@ -40,6 +49,7 @@
 
 mod cp1252;
 mod error;
+mod ffn;
 mod fib;
 mod fkp;
 mod le;
@@ -48,6 +58,8 @@ mod props;
 mod reader;
 mod sections;
 mod sprm;
+mod stsh;
+mod styles;
 #[doc(hidden)]
 pub mod test_builder;
 #[cfg(test)]
@@ -81,8 +93,8 @@ pub enum LegacyContent {
     Comments,
     /// The text-box subdocuments.
     TextBoxes,
-    /// The style sheet and the font table: only direct formatting was
-    /// imported.
+    /// The style sheet or the font table is damaged: the styles (or the
+    /// font names) it could not read were not imported.
     Styles,
 }
 
@@ -102,7 +114,8 @@ impl LegacyContent {
             LegacyContent::Comments => "comments",
             LegacyContent::TextBoxes => "text boxes",
             LegacyContent::Styles => {
-                "paragraph and character styles and fonts: only direct formatting was imported"
+                "the style sheet or font table, which is damaged: what could not be read was \
+                 imported as direct formatting only"
             }
         }
     }
@@ -197,6 +210,14 @@ pub fn read_doc(bytes: &[u8]) -> Result<DocImport, DocError> {
     let sections =
         sections::parse(&word, &table, fc, lcb).map_err(|e| e.in_table_stream(table_name))?;
     let sect_ends: Vec<u32> = sections.iter().map(|s| s.end_cp).collect();
+    /* The font table and the style sheet (issue #575). Neither refuses
+    the document: what a damaged one still holds is used, and the damage
+    is reported. */
+    let (fc, lcb) = pair(fib::pair::STTBF_FFN);
+    let (fonts, fonts_damaged) = ffn::FontTable::parse(&table, fc, lcb);
+    let (fc, lcb) = pair(fib::pair::STSHF);
+    let (stsh, stsh_damaged) = stsh::Stsh::parse(&table, fc, lcb);
+    let styles = styles::StyleSheet::new(stsh.as_ref(), fonts);
 
     let walk = reader::Walk {
         word: &word,
@@ -204,6 +225,7 @@ pub fn read_doc(bytes: &[u8]) -> Result<DocImport, DocError> {
         chpx: &chpx,
         papx: &papx,
         sect_ends: &sect_ends,
+        styles: &styles,
     };
     let (mut paragraphs, skipped) = walk.run(fib.ccp.text)?;
 
@@ -236,6 +258,12 @@ pub fn read_doc(bytes: &[u8]) -> Result<DocImport, DocError> {
     if let Some(last) = sections.last() {
         document.body_section = section_props(last);
     }
+    /* The style table and the document defaults, exactly where the
+    `.docx` reader puts its `styles.xml` (set after the tree is built: the
+    constructors start with an empty table). */
+    document.styles = styles.paragraph_styles;
+    document.style_defaults = styles.para_defaults;
+    document.style_run_defaults = styles.run_defaults;
 
     let mut not_imported = Vec::new();
     let mut note = |content: LegacyContent, count: u32| {
@@ -258,7 +286,10 @@ pub fn read_doc(bytes: &[u8]) -> Result<DocImport, DocError> {
         LegacyContent::TextBoxes,
         present(fib.ccp.txbx.saturating_add(fib.ccp.hdr_txbx)),
     );
-    note(LegacyContent::Styles, present(pair(fib::pair::STSHF).1));
+    note(
+        LegacyContent::Styles,
+        u32::from(stsh_damaged || fonts_damaged),
+    );
 
     Ok(DocImport {
         document,

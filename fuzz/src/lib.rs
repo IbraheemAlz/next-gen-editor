@@ -85,6 +85,21 @@ pub fn check_doc_import(bytes: &[u8]) {
         doc.paragraph_count() as usize <= format_doc::MAX_PARAGRAPHS.max(1),
         "doc_reader: more paragraphs than the importer's cap"
     );
+    /* Issue #575 — the imported style table is one the engine's cascade
+    can use: every paragraph's style is in it, at most one style is the
+    default, and every `basedOn` / `next` names a style of the table. */
+    assert!(
+        doc.styles.values().filter(|s| s.is_default).count() <= 1,
+        "doc_reader: more than one default paragraph style"
+    );
+    for s in doc.styles.values() {
+        for link in [&s.based_on, &s.next].into_iter().flatten() {
+            assert!(
+                doc.styles.contains_key(link),
+                "doc_reader: a style links to a style the table does not hold"
+            );
+        }
+    }
     for block in doc.blocks.iter() {
         let engine::Block::Paragraph(p) = block else {
             panic!("doc_reader: the importer made a table");
@@ -109,6 +124,12 @@ pub fn check_doc_import(bytes: &[u8]) {
                 "doc_reader: a style span is not a sorted in-paragraph range"
             );
             prev_end = s.end;
+        }
+        if let Some(id) = &p.style_id {
+            assert!(
+                doc.styles.contains_key(id),
+                "doc_reader: a paragraph names a style the table does not hold"
+            );
         }
     }
     if let Ok(saved) = format_docx::save_docx(doc)

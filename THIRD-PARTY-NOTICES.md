@@ -34,14 +34,16 @@ Microsoft Open Specifications) is the reference each structure cites.
 |---|---|---|
 | `crates/format-doc/src/fib.rs` | `crates/docbin/src/fib.rs` | Encryption checked on the cleartext `FibBase` first; only the pairs read are named; a short `RgFcLcb` blob is read as far as it goes. |
 | `crates/format-doc/src/piece.rs` | `crates/docbin/src/piece.rs` | Pieces exposed whole and walked in CP order; true byte offsets; a non-ascending CP table is a typed error. |
-| `crates/format-doc/src/fkp.rs` | `crates/docbin/src/fkp.rs` | A lookup returns its FC run (the reader caches one run's formatting); spec `crun` caps; typed errors. |
+| `crates/format-doc/src/fkp.rs` | `crates/docbin/src/fkp.rs` | A lookup returns its FC run (the reader caches one run's formatting) and a PAPX entry's `istd` (issue #575); spec `crun` caps; typed errors. |
 | `crates/format-doc/src/sprm.rs` | `crates/docbin/src/sprm.rs` | Prm0 table limited to the applied sprms, `isprm` 0x05 mapped to `sprmPJc80`. |
-| `crates/format-doc/src/props.rs` | `crates/docbin/src/fmt.rs`, `crates/docbin/src/sections.rs` | Onto this engine's model; RTL sprms and complex-script twins added; physical vs logical justification; every measure clamped to Word's bounds. |
+| `crates/format-doc/src/props.rs` | `crates/docbin/src/fmt.rs`, `crates/docbin/src/sections.rs` | Onto this engine's model; RTL sprms and complex-script twins added; physical vs logical justification against the cascaded direction; toggle operands resolved against the style chain and fonts kept as font-table indices (issue #575); every measure clamped to Word's bounds. |
 | `crates/format-doc/src/sections.rs` | `crates/docbin/src/sections.rs` | Section table only (no header / footer stories); typed errors. |
-| `crates/format-doc/src/reader.rs` | `crates/docbin/src/lib.rs` (the main-document walk) | Piece-order walk; paragraph `Prm` applied; fields kept as their result; special characters mapped through `engine::text_input`; unmodelled content counted for the import report; character budget and paragraph cap. |
+| `crates/format-doc/src/reader.rs` | `crates/docbin/src/lib.rs` (the main-document walk) | Piece-order walk; paragraph `Prm` applied; fields kept as their result; special characters mapped through `engine::text_input`; unmodelled content counted for the import report; character budget and paragraph cap; paragraphs formatted through the engine's one style cascade (issue #575). |
 
 Not borrowed: WordCraft's `crypt.rs`, drawing, list, table, note, media,
-metadata and style-sheet modules; its fonts, icons and other assets; and its
+metadata and style-sheet modules (this project's style sheet and font table
+readers, `stsh.rs`, `styles.rs` and `ffn.rs`, issue #575, are written from
+[MS-DOC]); its fonts, icons and other assets; and its
 `cfb` crate dependency — the OLE compound-file container is read with this
 project's own bounded reader (`crates/format-docx/src/opc/cfb.rs`), so the
 importer adds no third-party crate.

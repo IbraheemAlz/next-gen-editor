@@ -5,14 +5,18 @@
 //! reads raw bytes (a committed seed or a mutation of one) as the file
 //! itself, and every other input as a SPLICE — a small valid image built by
 //! `format_doc::test_builder` from the input's head (text, run / paragraph
-//! flags, an optional section and an out-of-order piece split), then the
-//! rest of the input overwriting bytes of its two streams at input-chosen
-//! offsets before the compound file is assembled. That keeps the random
-//! sweep inside the FIB / piece table / FKP / SEPX parsers instead of
-//! failing on the container signature.
+//! flags, an optional section, an out-of-order piece split and — issue
+//! #575 — an optional style sheet and font table with paragraph and
+//! character styles), then the rest of the input overwriting bytes of its
+//! two streams at input-chosen offsets before the compound file is
+//! assembled. That keeps the random sweep inside the FIB / piece table /
+//! FKP / SEPX / STSH / SttbfFfn parsers instead of failing on the
+//! container signature.
 
 use arbitrary::Unstructured;
-use format_doc::test_builder::{DocSpec, Encoding, Para, PieceSpec, build, run, sprm, streams};
+use format_doc::test_builder::{
+    DocSpec, Encoding, Para, PieceSpec, build, run, sprm, streams, styled_sample,
+};
 
 /// The committed `corpus/doc_reader/` seeds: `(file name, .doc bytes)`.
 /// Written by `examples/regen-seeds`, pinned by
@@ -80,6 +84,8 @@ pub fn doc_seeds() -> Vec<(&'static str, Vec<u8>)> {
         ("seed_plain.doc", build(&plain)),
         ("seed_rtl_section.doc", build(&rtl)),
         ("seed_fast_saved.doc", build(&fast_saved)),
+        /* Issue #575 — a style sheet and a font table. */
+        ("seed_styles.doc", build(&styled_sample())),
     ]
 }
 
@@ -119,7 +125,24 @@ pub fn spliced(data: &[u8]) -> Option<Vec<u8>> {
         if flags & 8 != 0 {
             papx.extend(sprm::jc(u.int_in_range(0u8..=4).ok()?));
         }
-        paras.push(Para::new(vec![run(&text, chpx)], papx));
+        /* Issue #575 — with a style sheet: a paragraph style (Normal,
+        heading 1, an empty slot, a character style), a character style
+        and a font on the run, a toggle relative to the style. */
+        let mut istd = 0;
+        if flags & 128 != 0 {
+            let st: u8 = u.arbitrary().ok()?;
+            istd = [0, 1, 2, 15][usize::from(st % 4)];
+            if st & 4 != 0 {
+                chpx.extend(sprm::char_style(15));
+            }
+            if st & 8 != 0 {
+                chpx.extend(sprm::font(u16::from(st >> 6)));
+            }
+            if st & 16 != 0 {
+                chpx.extend(sprm::bold_operand(0x80 | (st >> 5 & 1)));
+            }
+        }
+        paras.push(Para::new(vec![run(&text, chpx)], papx).styled(istd));
     }
     let mut spec = DocSpec::new(paras);
     let total = spec.ccp_text();
@@ -145,6 +168,11 @@ pub fn spliced(data: &[u8]) -> Option<Vec<u8>> {
         spec.physical_order = vec![1, 0];
     }
     spec.one_table = flags & 64 == 0;
+    if flags & 128 != 0 {
+        let sample = styled_sample();
+        spec.styles = sample.styles;
+        spec.fonts = sample.fonts;
+    }
     let (mut word, mut table) = streams(&spec);
     /* At most 64 overwrites: (stream, offset, value) — only while input
     is left (`Unstructured` answers 0 once it runs dry, which would turn

@@ -963,8 +963,9 @@ pub enum ReadWarningKind {
     /// 97-2003 binary format (`.doc`, `format-doc`) and a class of its
     /// content is not imported yet (tables read as plain paragraphs, list
     /// markers, pictures, fields kept as their last result, headers /
-    /// footers, notes, comments, text boxes, styles and fonts); the detail
-    /// names the class, the count how many. A save writes a `.docx`.
+    /// footers, notes, comments, text boxes, a style sheet or font table
+    /// too damaged to read — issue #575); the detail names the class, the
+    /// count how many. A save writes a `.docx`.
     LegacyContentNotImported,
 }
 

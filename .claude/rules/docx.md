@@ -941,10 +941,30 @@ replayed by `writer::regenerate_table` / `emit_table_row` /
   until classified.
 - **Honest UX.** What the importer does not model (tables as plain
   paragraphs, list markers, pictures, fields kept as their result,
-  subdocuments, styles / fonts) is COUNTED during the walk and rides
-  `DocumentLoaded.warnings` as `ReadWarningKind::LegacyContentNotImported`
-  (one entry per class); a newly modelled class drops its counter, a newly
-  skipped one adds one — never drop content silently.
+  subdocuments, a damaged style sheet / font table) is COUNTED during the
+  walk and rides `DocumentLoaded.warnings` as
+  `ReadWarningKind::LegacyContentNotImported` (one entry per class); a newly
+  modelled class drops its counter, a newly skipped one adds one — never
+  drop content silently.
+- **Styles and fonts (issue #575) go through the ONE cascade.** The STSH
+  (`stsh.rs`) and the `SttbfFfn` (`ffn.rs`) land in the structures the
+  `.docx` reader fills (`styles.rs`): paragraph styles become
+  `DocumentTree::styles` entries holding their OWN `UpxPapx` / `UpxChpx`
+  (`based_on` / `next` by id; Normal, `istd` 0, is `is_default`); the
+  default CHP (10 pt, `Stshif.ftcAsci` / `STSHI.ftcBi`) is
+  `style_run_defaults`; a paragraph keeps `style_id` (`None` for Normal, as
+  Word writes a `.docx`) and its direct PAPX as `direct_overrides`, and its
+  `props` come from `StyleCascade::recompute` — never a second fold in the
+  importer. A run's span is its character-style chain (`sprmCIstd`, id in
+  `char_style`) + direct CHPX; the paragraph style is folded at layout like
+  `.docx`. Toggle operands 0x80 / 0x81 resolve against the chain under the
+  level that carries them (`CharProps::resolve`); a physical `sprmPJc80`
+  against the style's direction. Font slots keep the font table's NAME
+  (`family_from_docx`), so layout substitutes it like a `<w:rFonts>` name.
+  Ids: built-in `sti` -> Word's id (`Heading1`; always for Normal and the
+  headings), others from the name, unique. A damaged sheet / table never
+  refuses the document: what it holds is used and `LegacyContent::Styles`
+  reports the damage.
 - **Borrowed code.** Parts of `format-doc` are modified from WordCraft
   (MIT OR Apache-2.0): every such file carries the "Modified from
   WordCraft ... at commit ..." header and a row in `THIRD-PARTY-NOTICES.md`.
