@@ -11,16 +11,23 @@
 // XML 1.0 cannot carry); inline objects, notes and lists are counted for the
 // import report instead of modelled; every paragraph mark records its table
 // structure (issue #576, `table.rs`); bounded by a character budget and a
-// paragraph cap. See THIRD-PARTY-NOTICES.md at the repository root.
+// paragraph cap; each paragraph is formatted through its style
+// (`PapxInFkp.istd`) and the engine's one style cascade, each run through its
+// character style (issue #575). See THIRD-PARTY-NOTICES.md at the
+// repository root.
 
 //! The main-document walk: characters of CPs `[0, ccpText)` in order,
 //! split into paragraphs at their marks, each character carrying its direct
 //! formatting ([MS-DOC] 2.4.1 Retrieving Text, 2.4.2 Determining Paragraph
 //! Boundaries, 2.4.6.1 Direct Character Formatting, 2.4.6.2 Direct
-//! Paragraph Formatting).
+//! Paragraph Formatting), on top of the paragraph and character styles
+//! ([`crate::styles`]): a paragraph keeps its style id and its direct
+//! formatting (`direct_overrides`), its `props` are the engine's cascade of
+//! the two (`engine::StyleCascade`, as for a `.docx` paragraph); a run's
+//! span is its character style chain plus its direct formatting.
 
 use engine::text_input::{LINE_BREAK, PAGE_BREAK, REPLACEMENT};
-use engine::{Paragraph, StyleRun};
+use engine::{Paragraph, SpanStyle, StyleCascade, StyleRun, TextDirection};
 
 use crate::error::DocError;
 use crate::fkp::Bins;
@@ -28,6 +35,7 @@ use crate::le::{u16_at, u32_at};
 use crate::piece::{Piece, PieceTable, PrmRef, char_in_piece};
 use crate::props::{CharProps, ParaProps};
 use crate::sprm::{Prl, SGC_CHARACTER, SGC_PARAGRAPH, SGC_TABLE, prls, sprm_of_isprm};
+use crate::styles::StyleSheet;
 use crate::table::{MarkKind, TableMark};
 use crate::tap::Tap;
 
@@ -59,6 +67,8 @@ pub(crate) struct Walk<'a> {
     /// The CPs at which sections end, ascending: the section mark (0x0C)
     /// just before each is a paragraph mark, not a page break.
     pub(crate) sect_ends: &'a [u32],
+    /// The paragraph / character styles and the font table.
+    pub(crate) styles: &'a StyleSheet,
 }
 
 /// What the walk could not model, counted for the import report.
@@ -99,11 +109,35 @@ impl ParaBuild {
         }
     }
 
-    fn finish(self, props: engine::ParaProperties) -> Paragraph {
+    /// The paragraph, formatted by `pp` (its direct formatting, not yet
+    /// finished) on its style, its runs by their character formatting and
+    /// `mark` (the paragraph mark's own, `Paragraph::mark_style`).
+    fn finish(
+        self,
+        pp: ParaProps,
+        mark: &CharProps,
+        styles: &StyleSheet,
+        cascade: &StyleCascade<'_>,
+    ) -> Paragraph {
+        let style_id = styles.paragraph_style_id(pp.istd);
+        /* The direction the style gives decides a physical
+        justification's side (`ParaProps::finish`). */
+        let inherited = cascade.para(&styles.para_defaults, style_id.as_deref());
+        let direct = pp
+            .finish(inherited.direction == Some(TextDirection::Rtl))
+            .props;
+        /* What a run shows before its character style: the document
+        defaults and the paragraph style chain (0x81 turns it around). */
+        let para_run = cascade.run(&styles.run_defaults, style_id.as_deref());
+        let span_of = |p: &CharProps| {
+            let base = styles.character_base(p.istd);
+            let shown = para_run.clone().merged_with(base.clone());
+            p.resolve(&base, &shown, &styles.fonts)
+        };
         let mut spans: Vec<StyleRun> = Vec::new();
         for (start, end, p) in self.runs {
-            let style = p.into_span_style();
-            if style == engine::SpanStyle::default() {
+            let style = span_of(&p);
+            if style == SpanStyle::default() {
                 continue;
             }
             match spans.last_mut() {
@@ -111,13 +145,17 @@ impl ParaBuild {
                 _ => spans.push(StyleRun { start, end, style }),
             }
         }
-        Paragraph {
+        let mark_style = span_of(mark);
+        let mut paragraph = Paragraph {
             text: self.text,
             spans,
-            direct_overrides: props.clone(),
-            props,
+            style_id,
+            direct_overrides: direct,
+            mark_style: (mark_style != SpanStyle::default()).then(|| Box::new(mark_style)),
             ..Paragraph::default()
-        }
+        };
+        cascade.recompute(&mut paragraph, &styles.para_defaults);
+        paragraph
     }
 }
 
@@ -218,17 +256,19 @@ impl Walk<'_> {
     }
 
     /// The direct paragraph formatting of the paragraph whose mark is the
-    /// byte at `fc_mark` in `piece`: the FKP's PapxInFkp, then the piece's
-    /// Prm (2.4.6.2).
+    /// byte at `fc_mark` in `piece`: the FKP's PapxInFkp (its style, then
+    /// its sprms), then the piece's Prm (2.4.6.2). Not finished: the
+    /// justification waits for the style's direction.
     fn para_props(&self, piece: &Piece, fc_mark: u32) -> ParaProps {
         let mut pp = ParaProps::default();
         if let Some(run) = self.papx.lookup(self.word, fc_mark) {
+            pp.istd = run.istd;
             for p in prls(self.papx_grpprl(run.grpprl)).filter(|p| p.sgc() == SGC_PARAGRAPH) {
                 pp.apply(&p);
             }
         }
         for_prm_sprms(self.pieces.prm(piece), SGC_PARAGRAPH, |p| pp.apply(p));
-        pp.finish()
+        pp
     }
 
     /// The table properties a row mark at byte `fc_mark` of `piece`
@@ -254,6 +294,8 @@ impl Walk<'_> {
         let mut skipped = Skipped::default();
         let mut pb = ParaBuild::default();
         let mut cache: Option<CharCache> = None;
+        /* The engine's cascade over the imported styles, built once. */
+        let cascade = self.styles.cascade();
         /* One entry per open field: `true` once its separator was seen
         (the cached result shows), `false` in its instruction part. */
         let mut fields: Vec<bool> = Vec::new();
@@ -291,7 +333,7 @@ impl Walk<'_> {
                     let mark = pp.table.mark(c);
                     let tap =
                         (mark.kind == MarkKind::RowEnd).then(|| Box::new(self.tap(piece, fc)));
-                    if pp.in_list {
+                    if pp.list.or(self.styles.paragraph_list(pp.istd)) == Some(true) {
                         skipped.list_paragraphs = skipped.list_paragraphs.saturating_add(1);
                     }
                     /* A field still in its instruction at the paragraph end
@@ -308,8 +350,12 @@ impl Walk<'_> {
                             max: MAX_PARAGRAPHS as u64,
                         });
                     }
+                    /* The mark's own character formatting (`mark_style`);
+                    a cell / row mark's paragraph goes through the same
+                    style cascade as a body paragraph. */
+                    let mark_chp = self.char_props(&mut cache, pi, piece, fc);
                     out.push(ParaOut {
-                        paragraph: built.finish(pp.props),
+                        paragraph: built.finish(pp, &mark_chp, self.styles, &cascade),
                         end_cp: cp + 1,
                         mark,
                         tap,
@@ -374,7 +420,12 @@ impl Walk<'_> {
         always ends with one) still becomes a paragraph. */
         if !pb.text.is_empty() {
             out.push(ParaOut {
-                paragraph: pb.finish(engine::ParaProperties::default()),
+                paragraph: pb.finish(
+                    ParaProps::default(),
+                    &CharProps::default(),
+                    self.styles,
+                    &cascade,
+                ),
                 end_cp: cp_reached,
                 mark: TableMark::default(),
                 tap: None,

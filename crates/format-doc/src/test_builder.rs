@@ -13,10 +13,15 @@
 //!   from byte 1024 piece by piece in the requested physical order (a
 //!   compressed piece one Windows-1252 byte per CP, an uncompressed one a
 //!   UTF-16LE unit per CP), then the CHPX FKP pages and the PAPX FKP pages
-//!   (each 512 bytes, 512-aligned), then each section's `Sepx`.
+//!   (each 512 bytes, 512-aligned; a `PapxInFkp` carries its paragraph's
+//!   [`Para::istd`]), then each section's `Sepx`.
 //! - **`1Table` stream** (`0Table` when asked) — the `Clx` (one `Prc` per
 //!   [`DocSpec::prcs`] entry, then the `Pcdt` / `PlcPcd`), `PlcBteChpx`,
-//!   `PlcBtePapx` and `PlcfSed`.
+//!   `PlcBtePapx` and `PlcfSed`, then — when the spec has them — the
+//!   style sheet (`STSH`: `LPStshi` with an 18-byte `Stshif` and `ftcBi`,
+//!   one `LPStd` per [`StyleSheetSpec::styles`] slot) and the font table
+//!   (`SttbfFfn`: a 1-byte `cchData` and an `FFN` per [`DocSpec::fonts`]
+//!   name).
 //! - **`Data` stream**, only when [`DocSpec::data`] is not empty (what a
 //!   `sprmPHugePapx` points into).
 //! - All inside a version-3 compound file from `format-docx`'s
@@ -38,24 +43,35 @@ pub struct Run {
     pub chpx: Vec<u8>,
 }
 
-/// One paragraph: its runs, its PAPX grpprl and the mark that ends it
-/// (`'\r'`, or `'\u{7}'` for a cell / row end, `'\u{C}'` for a section
-/// mark).
+/// One paragraph: its runs, its PAPX grpprl, its paragraph style and the
+/// mark that ends it (`'\r'`, or `'\u{7}'` for a cell / row end, `'\u{C}'`
+/// for a section mark).
 #[derive(Debug, Clone)]
 pub struct Para {
     pub runs: Vec<Run>,
     pub papx: Vec<u8>,
     pub mark: char,
+    /// `GrpPrlAndIstd.istd`: the paragraph style (0 = Normal).
+    pub istd: u16,
+    /// The paragraph mark's own CHPX grpprl (`Paragraph::mark_style`).
+    pub mark_chpx: Vec<u8>,
 }
 
 impl Para {
-    /// A paragraph of plain runs ending in `'\r'`.
+    /// A paragraph of plain runs ending in `'\r'`, in style 0 (Normal).
     pub fn new(runs: Vec<Run>, papx: Vec<u8>) -> Para {
         Para {
             runs,
             papx,
             mark: '\r',
+            istd: 0,
+            mark_chpx: Vec::new(),
         }
+    }
+
+    /// The same paragraph in style `istd`.
+    pub fn styled(self, istd: u16) -> Para {
+        Para { istd, ..self }
     }
 
     /// A paragraph of one unformatted run.
@@ -72,6 +88,7 @@ impl Para {
             runs: vec![run(text, Vec::new())],
             papx: g,
             mark: '\u{7}',
+            ..Para::new(Vec::new(), Vec::new())
         }
     }
 
@@ -85,6 +102,7 @@ impl Para {
             runs: Vec::new(),
             papx: g,
             mark: '\u{7}',
+            ..Para::new(Vec::new(), Vec::new())
         }
     }
 }
@@ -158,6 +176,10 @@ pub struct DocSpec {
     pub encrypted: bool,
     /// Store the table as `1Table` (`fWhichTblStm` = 1), else `0Table`.
     pub one_table: bool,
+    /// The style sheet (`fcStshf`); `None` writes none.
+    pub styles: Option<StyleSheetSpec>,
+    /// The font table (`fcSttbfFfn`) by `ftc`; empty writes none.
+    pub fonts: Vec<String>,
 }
 
 impl DocSpec {
@@ -172,6 +194,8 @@ impl DocSpec {
             fast_saved: false,
             encrypted: false,
             one_table: true,
+            styles: None,
+            fonts: Vec::new(),
         }
     }
 
@@ -181,31 +205,187 @@ impl DocSpec {
         self.units().len() as u32
     }
 
-    /// The logical text as `(UTF-16 unit, chpx index, paragraph index)`.
-    fn units(&self) -> Vec<(u16, Option<usize>, usize)> {
+    /// The logical text as `(UTF-16 unit, its CHPX grpprl, paragraph
+    /// index)` — a run's grpprl for its text, the paragraph's `mark_chpx`
+    /// for its mark.
+    fn units(&self) -> Vec<(u16, &[u8], usize)> {
         let mut out = Vec::new();
-        let mut chpx_index = 0usize;
         for (pi, p) in self.paragraphs.iter().enumerate() {
             for r in &p.runs {
                 for u in r.text.encode_utf16() {
-                    out.push((u, Some(chpx_index), pi));
+                    out.push((u, r.chpx.as_slice(), pi));
                 }
-                chpx_index += 1;
             }
             let mut buf = [0u16; 2];
             for u in p.mark.encode_utf16(&mut buf) {
-                out.push((*u, None, pi));
+                out.push((*u, p.mark_chpx.as_slice(), pi));
             }
         }
         out
     }
+}
 
-    fn chpxs(&self) -> Vec<&[u8]> {
-        self.paragraphs
-            .iter()
-            .flat_map(|p| p.runs.iter().map(|r| r.chpx.as_slice()))
-            .collect()
+/// `istdBase` / `istdNext` "no style".
+pub const ISTD_NIL: u16 = 0x0FFF;
+/// `sti` of a user-defined style.
+pub const STI_USER: u16 = 0x0FFE;
+
+/// One style of a [`StyleSheetSpec`].
+#[derive(Debug, Clone)]
+pub struct StyleSpec {
+    /// `StdfBase.sti`: 0 Normal, 1-9 heading 1-9, 65 Default Paragraph
+    /// Font, [`STI_USER`] a user style.
+    pub sti: u16,
+    /// `StdfBase.stk`: 1 paragraph, 2 character, 3 table, 4 numbering.
+    pub stk: u8,
+    /// `istdBase` ([`ISTD_NIL`]: none).
+    pub base: u16,
+    /// `istdNext` ([`ISTD_NIL`]: none).
+    pub next: u16,
+    /// `xstzName` (aliases after a comma).
+    pub name: String,
+    /// The `UpxPapx` grpprl (paragraph styles).
+    pub papx: Vec<u8>,
+    /// The `UpxChpx` grpprl (paragraph and character styles).
+    pub chpx: Vec<u8>,
+}
+
+impl StyleSpec {
+    /// A paragraph style.
+    pub fn paragraph(sti: u16, name: &str, base: u16, papx: Vec<u8>, chpx: Vec<u8>) -> StyleSpec {
+        StyleSpec {
+            sti,
+            stk: 1,
+            base,
+            next: ISTD_NIL,
+            name: name.to_string(),
+            papx,
+            chpx,
+        }
     }
+
+    /// A character style.
+    pub fn character(sti: u16, name: &str, base: u16, chpx: Vec<u8>) -> StyleSpec {
+        StyleSpec {
+            sti,
+            stk: 2,
+            base,
+            next: ISTD_NIL,
+            name: name.to_string(),
+            papx: Vec::new(),
+            chpx,
+        }
+    }
+}
+
+/// The style sheet ([`DocSpec::styles`]).
+#[derive(Debug, Clone)]
+pub struct StyleSheetSpec {
+    /// The styles by `istd`; `None` writes an empty `LPStd`.
+    pub styles: Vec<Option<StyleSpec>>,
+    /// `Stshif.ftcAsci` / `ftcOther`: the default Latin font.
+    pub ftc_ascii: u16,
+    /// `STSHI.ftcBi`: the default complex-script font.
+    pub ftc_bi: u16,
+    /// `Stshif.cbSTDBaseInFile`: 10 (`StdfBase` only) or 18 (with
+    /// `StdfPost2000`).
+    pub std_base: u16,
+}
+
+impl StyleSheetSpec {
+    /// A sheet of `styles` in the first font of the table.
+    pub fn new(styles: Vec<Option<StyleSpec>>) -> StyleSheetSpec {
+        StyleSheetSpec {
+            styles,
+            ftc_ascii: 0,
+            ftc_bi: 0,
+            std_base: 10,
+        }
+    }
+
+    /// The `STSH` bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        /* LPStshi: cbStshi, Stshif (18 bytes), ftcBi. */
+        v.extend_from_slice(&20u16.to_le_bytes());
+        v.extend_from_slice(&(self.styles.len() as u16).to_le_bytes()); // cstd
+        v.extend_from_slice(&self.std_base.to_le_bytes()); // cbSTDBaseInFile
+        v.extend_from_slice(&1u16.to_le_bytes()); // fStdStylenamesWritten
+        v.extend_from_slice(&0x005Bu16.to_le_bytes()); // stiMaxWhenSaved
+        v.extend_from_slice(&0x000Fu16.to_le_bytes()); // istdMaxFixedWhenSaved
+        v.extend_from_slice(&0u16.to_le_bytes()); // nVerBuiltInNamesWhenSaved
+        v.extend_from_slice(&self.ftc_ascii.to_le_bytes()); // ftcAsci
+        v.extend_from_slice(&self.ftc_ascii.to_le_bytes()); // ftcFE
+        v.extend_from_slice(&self.ftc_ascii.to_le_bytes()); // ftcOther
+        v.extend_from_slice(&self.ftc_bi.to_le_bytes()); // ftcBi
+        for s in &self.styles {
+            let Some(s) = s else {
+                v.extend_from_slice(&0u16.to_le_bytes());
+                continue;
+            };
+            let mut std = Vec::new();
+            let cupx: u16 = match s.stk {
+                1 => 2,
+                2 => 1,
+                _ => 0,
+            };
+            /* StdfBase: sti | flags, stk | istdBase, cupx | istdNext,
+            bchUpe (patched below), grfstd; then StdfPost2000 (istdLink,
+            rsid, iftcHtml + iPriority) as zeros when the sheet says so. */
+            std.extend_from_slice(&(s.sti & 0x0FFF).to_le_bytes());
+            std.extend_from_slice(&(u16::from(s.stk & 0x0F) | (s.base << 4)).to_le_bytes());
+            std.extend_from_slice(&(cupx | (s.next << 4)).to_le_bytes());
+            std.extend_from_slice(&[0, 0, 0, 0]);
+            std.resize(usize::from(self.std_base.max(10)), 0);
+            /* xstzName. */
+            let name: Vec<u16> = s.name.encode_utf16().collect();
+            std.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            for u in name.iter().chain(&[0]) {
+                std.extend_from_slice(&u.to_le_bytes());
+            }
+            let upx = |std: &mut Vec<u8>, data: &[u8]| {
+                std.extend_from_slice(&(data.len() as u16).to_le_bytes());
+                std.extend_from_slice(data);
+                if data.len() % 2 == 1 {
+                    std.push(0);
+                }
+            };
+            match s.stk {
+                1 => {
+                    /* UpxPapx: this style's istd (unused) + grpprl. */
+                    let mut papx = 0u16.to_le_bytes().to_vec();
+                    papx.extend_from_slice(&s.papx);
+                    upx(&mut std, &papx);
+                    upx(&mut std, &s.chpx);
+                }
+                2 => upx(&mut std, &s.chpx),
+                _ => {}
+            }
+            let len = std.len() as u16;
+            std[6..8].copy_from_slice(&len.to_le_bytes());
+            v.extend_from_slice(&len.to_le_bytes());
+            v.extend_from_slice(&std);
+        }
+        v
+    }
+}
+
+/// The `SttbfFfn` of `fonts`: a non-extended STTB whose entries are FFNs
+/// (a TrueType face of the swiss family, weight 400, then the name).
+pub fn font_table(fonts: &[String]) -> Vec<u8> {
+    let mut v = (fonts.len() as u16).to_le_bytes().to_vec();
+    v.extend_from_slice(&0u16.to_le_bytes()); // cbExtra
+    for f in fonts {
+        let mut ffn = vec![0u8; 39];
+        ffn[0] = 0x26; // prq 2, fTrueType, ff 2
+        ffn[1..3].copy_from_slice(&400u16.to_le_bytes());
+        for u in f.encode_utf16().chain([0]) {
+            ffn.extend_from_slice(&u.to_le_bytes());
+        }
+        v.push(ffn.len() as u8);
+        v.extend_from_slice(&ffn);
+    }
+    v
 }
 
 /// Property-modifier builders ([MS-DOC] 2.6): each returns one `Prl`.
@@ -402,6 +582,162 @@ pub mod sprm {
     pub fn section_start(bkc: u8) -> Vec<u8> {
         prl(0x3009, &[bkc])
     }
+    /// `sprmCFBold` with a raw ToggleOperand (0x80 "the style's value",
+    /// 0x81 "the opposite of the style's value").
+    pub fn bold_operand(operand: u8) -> Vec<u8> {
+        prl(0x0835, &[operand])
+    }
+    /// `sprmCFItalic` with a raw ToggleOperand.
+    pub fn italic_operand(operand: u8) -> Vec<u8> {
+        prl(0x0836, &[operand])
+    }
+    /// `sprmCFCaps`.
+    pub fn caps(on: bool) -> Vec<u8> {
+        prl(0x083B, &[u8::from(on)])
+    }
+    /// `sprmCFSmallCaps`.
+    pub fn small_caps(on: bool) -> Vec<u8> {
+        prl(0x083A, &[u8::from(on)])
+    }
+    /// `sprmCIss`: 0 normal, 1 superscript, 2 subscript.
+    pub fn vert_align(iss: u8) -> Vec<u8> {
+        prl(0x2A48, &[iss])
+    }
+    /// `sprmCHighlight`: an Ico (7 = yellow).
+    pub fn highlight(ico: u8) -> Vec<u8> {
+        prl(0x2A0C, &[ico])
+    }
+    /// `sprmCIstd`: the run's character style.
+    pub fn char_style(istd: u16) -> Vec<u8> {
+        prl(0x4A30, &istd.to_le_bytes())
+    }
+    /// `sprmCRgFtc0`: the ASCII font (an index into the font table).
+    pub fn font(ftc: u16) -> Vec<u8> {
+        prl(0x4A4F, &ftc.to_le_bytes())
+    }
+    /// `sprmCFtcBi`: the complex-script font.
+    pub fn font_cs(ftc: u16) -> Vec<u8> {
+        prl(0x4A5E, &ftc.to_le_bytes())
+    }
+    /// `sprmPIstd`: the paragraph style (overrides the PAPX's istd).
+    pub fn paragraph_style(istd: u16) -> Vec<u8> {
+        prl(0x4600, &istd.to_le_bytes())
+    }
+    /// `sprmPFKeep`.
+    pub fn keep_lines(on: bool) -> Vec<u8> {
+        prl(0x2405, &[u8::from(on)])
+    }
+    /// `sprmPFKeepFollow`.
+    pub fn keep_next(on: bool) -> Vec<u8> {
+        prl(0x2406, &[u8::from(on)])
+    }
+    /// `sprmPFPageBreakBefore`.
+    pub fn page_break_before(on: bool) -> Vec<u8> {
+        prl(0x2407, &[u8::from(on)])
+    }
+    /// `sprmPFWidowControl`.
+    pub fn widow_control(on: bool) -> Vec<u8> {
+        prl(0x2431, &[u8::from(on)])
+    }
+    /// `sprmPOutLvl`: 0-8, 9 body text.
+    pub fn outline_level(lvl: u8) -> Vec<u8> {
+        prl(0x2640, &[lvl])
+    }
+}
+
+/// The fonts of [`styled_sample`], by `ftc`.
+pub const SAMPLE_FONTS: [&str; 3] = ["Times New Roman", "Arial", "Simplified Arabic"];
+/// The paragraph texts of [`styled_sample`].
+pub const SAMPLE_TEXTS: [&str; 4] = [
+    "Plain body text",
+    "Chapter One",
+    "Before quoted after",
+    "Left to right",
+];
+
+/// A styled document (issue #575): Normal (`istd` 0) is right-to-left
+/// with 8 pt after and 1.15-line spacing, in 12 pt Arial (14 pt
+/// Simplified Arabic for complex script); heading 1 (`istd` 1, based on
+/// Normal, followed by Normal) keeps with the next paragraph, has 12 pt
+/// before and an outline level, in bold 16 pt; "Quote Char" (`istd` 15, a
+/// user character style based on Default Paragraph Font, `istd` 10) is
+/// italic dark red. The document defaults are Times New Roman / Simplified
+/// Arabic. Paragraphs ([`SAMPLE_TEXTS`]): an unformatted Normal one, a
+/// heading, a Normal one whose middle word is in "Quote Char", and a
+/// Normal one made left-to-right by direct formatting.
+pub fn styled_sample() -> DocSpec {
+    let cat = |v: &[Vec<u8>]| v.concat();
+    let mut styles: Vec<Option<StyleSpec>> = vec![None; 16];
+    styles[0] = Some(StyleSpec::paragraph(
+        0,
+        "Normal",
+        ISTD_NIL,
+        cat(&[
+            sprm::rtl_paragraph(true),
+            sprm::space_after(160),
+            sprm::line_spacing(276, true),
+        ]),
+        cat(&[
+            sprm::font(1),
+            sprm::size_half_points(24),
+            sprm::font_cs(2),
+            sprm::size_cs_half_points(28),
+        ]),
+    ));
+    styles[1] = Some(StyleSpec {
+        next: 0,
+        ..StyleSpec::paragraph(
+            1,
+            "heading 1,h1",
+            0,
+            cat(&[
+                sprm::keep_next(true),
+                sprm::space_before(240),
+                sprm::outline_level(0),
+            ]),
+            cat(&[
+                sprm::bold(true),
+                sprm::bold_cs(true),
+                sprm::size_half_points(32),
+            ]),
+        )
+    });
+    styles[10] = Some(StyleSpec::character(
+        65,
+        "Default Paragraph Font",
+        ISTD_NIL,
+        Vec::new(),
+    ));
+    styles[15] = Some(StyleSpec::character(
+        STI_USER,
+        "Quote Char",
+        10,
+        cat(&[sprm::italic(true), sprm::color(0x80, 0, 0)]),
+    ));
+    DocSpec {
+        styles: Some(StyleSheetSpec {
+            ftc_ascii: 0,
+            ftc_bi: 2,
+            ..StyleSheetSpec::new(styles)
+        }),
+        fonts: SAMPLE_FONTS.iter().map(|f| f.to_string()).collect(),
+        ..DocSpec::new(vec![
+            Para::plain(SAMPLE_TEXTS[0]),
+            Para::plain(SAMPLE_TEXTS[1]).styled(1),
+            Para::new(
+                vec![
+                    run("Before ", Vec::new()),
+                    run("quoted", sprm::char_style(15)),
+                    run(" after", Vec::new()),
+                ],
+                Vec::new(),
+            ),
+            Para::new(
+                vec![run(SAMPLE_TEXTS[3], Vec::new())],
+                sprm::rtl_paragraph(false),
+            ),
+        ])
+    }
 }
 
 /// A `PrcData` (2.9.209): `cbGrpprl` then the grpprl — what a
@@ -496,10 +832,11 @@ fn write_fkps(word: &mut Vec<u8>, entries: &[Entry<'_>], papx: bool) -> Vec<u8> 
             let data: Vec<u8> = match entries[i].grpprl {
                 None if !papx => Vec::new(),
                 g => {
-                    let g = g.unwrap_or(&[]);
                     if papx {
-                        /* PapxInFkp: cb, [cb'], istd 0, grpprl. */
-                        let len = 2 + g.len();
+                        /* PapxInFkp: cb, [cb'], GrpPrlAndIstd (a gap
+                        between pieces: istd 0, no sprms). */
+                        let g = g.unwrap_or(&[0, 0]);
+                        let len = g.len();
                         let mut d = Vec::new();
                         if len % 2 == 1 {
                             d.push(len.div_ceil(2) as u8);
@@ -507,10 +844,10 @@ fn write_fkps(word: &mut Vec<u8>, entries: &[Entry<'_>], papx: bool) -> Vec<u8> 
                             d.push(0);
                             d.push((len / 2) as u8);
                         }
-                        d.extend_from_slice(&[0, 0]);
                         d.extend_from_slice(g);
                         d
                     } else {
+                        let g = g.unwrap_or(&[]);
                         let mut d = vec![g.len() as u8];
                         d.extend_from_slice(g);
                         d
@@ -569,7 +906,6 @@ const CB_RG_FC_LCB: usize = 0x5D;
 /// The two streams of `spec`: `(WordDocument, table stream)`.
 pub fn streams(spec: &DocSpec) -> (Vec<u8>, Vec<u8>) {
     let units = spec.units();
-    let chpxs = spec.chpxs();
     let total = units.len() as u32;
     let encodable = |u: u16| {
         char::from_u32(u32::from(u))
@@ -639,10 +975,19 @@ pub fn streams(spec: &DocSpec) -> (Vec<u8>, Vec<u8>) {
     let chpx_ranges = units
         .iter()
         .enumerate()
-        .map(|(cp, (_, ci, _))| {
+        .map(|(cp, (_, g, _))| {
             let (fc, len) = cp_fc[cp];
-            let g = ci.map(|i| chpxs[i]).filter(|g| !g.is_empty());
-            (fc, fc + len, g)
+            (fc, fc + len, Some(*g).filter(|g| !g.is_empty()))
+        })
+        .collect();
+    /* GrpPrlAndIstd per paragraph: its istd, then its grpprl. */
+    let grpprl_and_istd: Vec<Vec<u8>> = spec
+        .paragraphs
+        .iter()
+        .map(|p| {
+            let mut d = p.istd.to_le_bytes().to_vec();
+            d.extend_from_slice(&p.papx);
+            d
         })
         .collect();
     let papx_ranges = units
@@ -650,7 +995,7 @@ pub fn streams(spec: &DocSpec) -> (Vec<u8>, Vec<u8>) {
         .enumerate()
         .map(|(cp, (_, _, pi))| {
             let (fc, len) = cp_fc[cp];
-            (fc, fc + len, Some(spec.paragraphs[*pi].papx.as_slice()))
+            (fc, fc + len, Some(grpprl_and_istd[*pi].as_slice()))
         })
         .collect();
     let plc_chpx = write_fkps(&mut word, &entries(chpx_ranges), false);
@@ -712,6 +1057,15 @@ pub fn streams(spec: &DocSpec) -> (Vec<u8>, Vec<u8>) {
         }
         place(&mut table, &plc)
     };
+    let stsh = spec
+        .styles
+        .as_ref()
+        .map_or((0, 0), |s| place(&mut table, &s.bytes()));
+    let ffn = if spec.fonts.is_empty() {
+        (0, 0)
+    } else {
+        place(&mut table, &font_table(&spec.fonts))
+    };
 
     /* The FIB. */
     put_u16(&mut word, 0x00, 0xA5EC); // wIdent
@@ -742,6 +1096,8 @@ pub fn streams(spec: &DocSpec) -> (Vec<u8>, Vec<u8>) {
     pair(6, sed);
     pair(12, bte_chpx);
     pair(13, bte_papx);
+    pair(1, stsh);
+    pair(15, ffn);
     pair(33, clx);
     /* cswNew = 0 right after the blob. */
     put_u16(&mut word, 0x9A + 8 * CB_RG_FC_LCB, 0);

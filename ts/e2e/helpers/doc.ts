@@ -10,7 +10,11 @@
  * pairs), the text from byte 1024 (UTF-16LE, a `\r` mark per paragraph,
  * `\u0007` for a table cell or row), then the CHPX and PAPX FKP pages (512
  * bytes, 512-aligned). 1Table stream: the Clx (one Pcdt with one Pcd), then
- * the two bin tables. Both streams are padded past 4096 bytes so the
+ * the two bin tables, then (issue #575, when `buildDoc` is given styles) the
+ * style sheet (`STSH`, pair 1: `LPStshi` with an 18-byte `Stshif` + `ftcBi`,
+ * one `LPStd` per style slot — `StdfBase`, `xstzName`, the `UpxPapx` /
+ * `UpxChpx`) and the font table (`SttbfFfn`, pair 15: 1-byte `cchData` +
+ * an `FFN` per name). Both streams are padded past 4096 bytes so the
  * compound file needs no mini stream; the container is a version-3 MS-CFB
  * file (512-byte sectors: directory, the two streams, the FAT).
  *
@@ -25,11 +29,14 @@ export interface DocRun {
     bold?: boolean;
     /** `sprmCFBiDi`: a right-to-left run. */
     rtl?: boolean;
+    /** `sprmCIstd`: the run's character style (an index into the sheet). */
+    charStyle?: number;
 }
 
 export interface DocPara {
     runs: DocRun[];
-    /** `sprmPFBiDi`: a right-to-left paragraph. */
+    /** `sprmPFBiDi`: a right-to-left paragraph (`false`: an explicit
+     *  left-to-right one, over its style). */
     rtl?: boolean;
     /** `sprmPJc` 1: centered. */
     center?: boolean;
@@ -41,6 +48,8 @@ export interface DocPara {
     rowEnd?: number[];
     /** `sprmPIlfo` 1: a list paragraph (its marker is not imported). */
     list?: boolean;
+    /** `PapxInFkp.istd`: the paragraph style (default 0, Normal). */
+    istd?: number;
 }
 
 /** `sprmTDefTable` (0xD608): `cb` (the rest + 1), the cell count, the
@@ -58,6 +67,44 @@ function tableBorders80(): number[] {
     for (let i = 0; i < 6; i++) out.push(4, 0x01, 0, 0);
     return out;
 }
+
+/** One style of a `DocStyleSheet` (`STD`). */
+export interface DocStyle {
+    /** `StdfBase.sti`: 0 Normal, 1-9 heading 1-9, 65 Default Paragraph
+     *  Font, 0xFFE a user style. */
+    sti: number;
+    kind: 'paragraph' | 'character';
+    /** `istdBase` (default 0xFFF: none). */
+    base?: number;
+    /** `istdNext` (default 0xFFF: none). */
+    next?: number;
+    name: string;
+    /** The paragraph style's own paragraph sprms (`UpxPapx`). */
+    papx?: number[];
+    /** The style's own character sprms (`UpxChpx`). */
+    chpx?: number[];
+}
+
+/** The style sheet and font table `buildDoc` may write. */
+export interface DocStyleSheet {
+    /** The styles by `istd`; `null` is an empty slot. */
+    styles: (DocStyle | null)[];
+    /** The font table, by `ftc`. */
+    fonts: string[];
+    /** `Stshif.ftcAsci`: the default Latin font (default 0). */
+    ftcAscii?: number;
+}
+
+/** Property modifiers for `DocStyle.papx` / `chpx` ([MS-DOC] 2.6). */
+export const docSprm = {
+    rtlParagraph: (on: boolean) => [0x41, 0x24, on ? 1 : 0],
+    spaceAfter: (twips: number) => [0x14, 0xa4, twips & 0xff, twips >>> 8],
+    bold: (on: boolean) => [0x35, 0x08, on ? 1 : 0],
+    italic: (on: boolean) => [0x36, 0x08, on ? 1 : 0],
+    sizeHalfPoints: (hps: number) => [0x43, 0x4a, hps & 0xff, hps >>> 8],
+    /** `sprmCRgFtc0`: the ASCII font, an index into the font table. */
+    font: (ftc: number) => [0x4f, 0x4a, ftc & 0xff, ftc >>> 8],
+};
 
 const TEXT_AT = 1024;
 const SECTOR = 512;
@@ -118,9 +165,10 @@ function fkpPage(entries: [number, number, number[]][], papx: boolean): number[]
     entries.forEach(([, , grpprl], i) => {
         let data: number[];
         if (papx) {
-            /* PapxInFkp: cb (or 0 + cb'), istd 0, grpprl. */
-            const len = 2 + grpprl.length;
-            data = len % 2 === 1 ? [(len + 1) / 2, 0, 0, ...grpprl] : [0, len / 2, 0, 0, ...grpprl];
+            /* PapxInFkp: cb (or 0 + cb'), then the GrpPrlAndIstd (the
+             * entry's bytes: istd + grpprl). */
+            const len = grpprl.length;
+            data = len % 2 === 1 ? [(len + 1) / 2, ...grpprl] : [0, len / 2, ...grpprl];
         } else {
             if (grpprl.length === 0) {
                 page[4 * (crun + 1) + i] = 0;
@@ -137,8 +185,73 @@ function fkpPage(entries: [number, number, number[]][], papx: boolean): number[]
     return page;
 }
 
+/** The `STSH` bytes of `sheet`. */
+function styleSheet(sheet: DocStyleSheet): number[] {
+    const v = new Bytes();
+    const ftc = sheet.ftcAscii ?? 0;
+    v.u16(20); // cbStshi: Stshif (18) + ftcBi
+    v.u16(sheet.styles.length); // cstd
+    v.u16(10); // cbSTDBaseInFile: StdfBase only
+    v.u16(1); // fStdStylenamesWritten
+    v.u16(0x5b); // stiMaxWhenSaved
+    v.u16(0x0f); // istdMaxFixedWhenSaved
+    v.u16(0); // nVerBuiltInNamesWhenSaved
+    v.u16(ftc); // ftcAsci
+    v.u16(ftc); // ftcFE
+    v.u16(ftc); // ftcOther
+    v.u16(ftc); // ftcBi
+    for (const s of sheet.styles) {
+        if (!s) {
+            v.u16(0);
+            continue;
+        }
+        const std = new Bytes();
+        const paragraph = s.kind === 'paragraph';
+        std.u16(s.sti & 0xfff);
+        std.u16((paragraph ? 1 : 2) | ((s.base ?? 0xfff) << 4));
+        std.u16((paragraph ? 2 : 1) | ((s.next ?? 0xfff) << 4)); // cupx | istdNext
+        std.u16(0); // bchUpe (patched below)
+        std.u16(0); // grfstd
+        std.u16(s.name.length);
+        for (let i = 0; i < s.name.length; i++) std.u16(s.name.charCodeAt(i));
+        std.u16(0);
+        const upx = (data: number[]) => {
+            std.u16(data.length);
+            std.bytes(data);
+            if (data.length % 2 === 1) std.u8(0);
+        };
+        if (paragraph) upx([0, 0, ...(s.papx ?? [])]); // UpxPapx: istd + grpprl
+        upx(s.chpx ?? []);
+        std.put16(6, std.length);
+        v.u16(std.length);
+        v.bytes(std.out());
+    }
+    return v.buf;
+}
+
+/** The `SttbfFfn` bytes of `fonts`. */
+function fontTable(fonts: string[]): number[] {
+    const v = new Bytes();
+    v.u16(fonts.length); // cData
+    v.u16(0); // cbExtra
+    for (const name of fonts) {
+        const ffn = new Bytes();
+        ffn.u8(0x26); // prq 2, fTrueType, ff 2
+        ffn.u16(400); // wWeight
+        ffn.padTo(39); // chs, ixchSzAlt, panose, fs
+        for (let i = 0; i < name.length; i++) ffn.u16(name.charCodeAt(i));
+        ffn.u16(0);
+        v.u8(ffn.length);
+        v.bytes(ffn.out());
+    }
+    return v.buf;
+}
+
 /** The two streams of a document made of `paras`. */
-function streams(paras: DocPara[]): { word: Uint8Array; table: Uint8Array } {
+function streams(
+    paras: DocPara[],
+    sheet?: DocStyleSheet,
+): { word: Uint8Array; table: Uint8Array } {
     const word = new Bytes();
     word.padTo(TEXT_AT);
     const chpx: [number, number, number[]][] = [];
@@ -153,14 +266,18 @@ function streams(paras: DocPara[]): { word: Uint8Array; table: Uint8Array } {
             const g: number[] = [];
             if (r.bold) g.push(0x35, 0x08, 0x01); // sprmCFBold
             if (r.rtl) g.push(0x5a, 0x08, 0x01); // sprmCFBiDi
+            if (r.charStyle !== undefined) {
+                g.push(0x30, 0x4a, r.charStyle & 0xff, r.charStyle >>> 8); // sprmCIstd
+            }
             if (word.length > start) chpx.push([start, word.length, g]);
         }
         const markAt = word.length;
         word.u16(p.cell || p.rowEnd ? 0x0007 : 0x000d);
         cps += 1;
         chpx.push([markAt, word.length, []]);
-        const g: number[] = [];
-        if (p.rtl) g.push(0x41, 0x24, 0x01); // sprmPFBiDi
+        const istd = p.istd ?? 0;
+        const g: number[] = [istd & 0xff, istd >>> 8];
+        if (p.rtl !== undefined) g.push(0x41, 0x24, p.rtl ? 1 : 0); // sprmPFBiDi
         if (p.center) g.push(0x61, 0x24, 0x01); // sprmPJc
         if (p.cell || p.rowEnd) g.push(0x16, 0x24, 0x01); // sprmPFInTable
         if (p.list) g.push(0x0b, 0x46, 0x01, 0x00); // sprmPIlfo 1
@@ -198,6 +315,14 @@ function streams(paras: DocPara[]): { word: Uint8Array; table: Uint8Array } {
     };
     const bteChpx = bin(chpxPn);
     const btePapx = bin(papxPn);
+    const place = (bytes: number[]) => {
+        table.align(2);
+        const at = table.length;
+        table.bytes(bytes);
+        return [at, bytes.length];
+    };
+    const stsh = sheet ? place(styleSheet(sheet)) : [0, 0];
+    const ffn = sheet ? place(fontTable(sheet.fonts)) : [0, 0];
 
     /* The FIB. */
     word.put16(0x00, 0xa5ec); // wIdent
@@ -216,8 +341,10 @@ function streams(paras: DocPara[]): { word: Uint8Array; table: Uint8Array } {
         word.put32(0x9a + 8 * i, fc!);
         word.put32(0x9a + 8 * i + 4, lcb!);
     };
+    pair(1, stsh);
     pair(12, bteChpx);
     pair(13, btePapx);
+    pair(15, ffn);
     pair(33, clx);
     return { word: word.out(), table: table.out() };
 }
@@ -311,9 +438,10 @@ function compoundFile(entries: [string, Uint8Array][]): Uint8Array {
     return out;
 }
 
-/** The `.doc` file of `paras`. */
-export function buildDoc(paras: DocPara[]): Uint8Array {
-    const { word, table } = streams(paras);
+/** The `.doc` file of `paras`, with `sheet`'s style sheet and font table
+ *  when given. */
+export function buildDoc(paras: DocPara[], sheet?: DocStyleSheet): Uint8Array {
+    const { word, table } = streams(paras, sheet);
     return compoundFile([
         ['WordDocument', word],
         ['1Table', table],
