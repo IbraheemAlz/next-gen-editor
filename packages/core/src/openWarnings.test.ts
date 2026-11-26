@@ -61,7 +61,8 @@ describe('describeReadWarning (#406)', () => {
 describe('a legacy .doc import report (#567)', () => {
     const tables: ReadWarning = {
         kind: 'LegacyContentNotImported',
-        detail: 'tables: their cell text was imported as plain paragraphs',
+        detail:
+            "tables nested too deeply: the innermost tables' cell text was imported as plain paragraphs",
         count: 47,
     };
     const styles: ReadWarning = {

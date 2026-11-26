@@ -54,11 +54,7 @@ const P_DYA_BEFORE: u16 = 0xA413;
 const P_DYA_AFTER: u16 = 0xA414;
 const P_DYA_LINE: u16 = 0x6412;
 const P_F_BIDI: u16 = 0x2441;
-/// Table / list membership — read only to report what is not imported.
-pub(crate) const P_F_IN_TABLE: u16 = 0x2416;
-pub(crate) const P_F_TTP: u16 = 0x2417;
-pub(crate) const P_F_INNER_TTP: u16 = 0x244C;
-pub(crate) const P_ITAP: u16 = 0x6649;
+/// List membership — read only to report what is not imported.
 pub(crate) const P_ILFO: u16 = 0x460B;
 
 // Section sprms (2.6.4).
@@ -92,6 +88,15 @@ const ICO: [[u8; 3]; 17] = [
     [128, 128, 128],
     [192, 192, 192],
 ];
+
+/// The colour of an `Ico` (2.9.119), `None` for "automatic" (0) and for
+/// a value outside the palette.
+pub(crate) fn ico_rgb(i: u8) -> Option<[u8; 4]> {
+    match i {
+        0 => None,
+        i => ICO.get(usize::from(i)).map(|[r, g, b]| [*r, *g, *b, 255]),
+    }
+}
 
 fn i16_of(p: &Prl) -> Option<i16> {
     crate::le::u16_at(p.operand, 0).map(|v| v as i16)
@@ -155,12 +160,7 @@ impl CharProps {
                     _ => UnderlineStyle::Single,
                 });
             }
-            C_ICO => {
-                s.color = match p.operand.first().copied().unwrap_or(0) {
-                    0 => None,
-                    i => ICO.get(usize::from(i)).map(|[r, g, b]| [*r, *g, *b, 255]),
-                };
-            }
+            C_ICO => s.color = ico_rgb(p.operand.first().copied().unwrap_or(0)),
             /* COLORREF (2.9.43): red, green, blue, fAuto (0xFF = automatic). */
             C_CV => {
                 if let [r, g, b, auto, ..] = p.operand {
@@ -199,9 +199,10 @@ pub(crate) struct ParaProps {
     /// sprm is in, because a physical value depends on the direction a
     /// later sprm may set.
     jc: Option<(u8, bool)>,
-    /// Membership the importer does not model, reported instead.
-    pub(crate) in_table: bool,
-    pub(crate) row_end: bool,
+    /// Table membership: the paragraph's table depth and whether its
+    /// mark ends a cell or a row ([`crate::table`]).
+    pub(crate) table: crate::table::Membership,
+    /// List membership the importer does not model, reported instead.
     pub(crate) in_list: bool,
 }
 
@@ -275,11 +276,10 @@ impl ParaProps {
                     Some(_) => TextDirection::Rtl,
                 });
             }
-            P_F_IN_TABLE => self.in_table = p.operand.first().is_some_and(|&v| v != 0),
-            P_ITAP => self.in_table |= crate::le::u32_at(p.operand, 0).is_some_and(|v| v != 0),
-            P_F_TTP | P_F_INNER_TTP => self.row_end = p.operand.first().is_some_and(|&v| v != 0),
             P_ILFO => self.in_list = i16_of(p).is_some_and(|v| v != 0 && v != -2047),
-            _ => {}
+            _ => {
+                self.table.apply(p);
+            }
         }
     }
 

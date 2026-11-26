@@ -21,14 +21,19 @@
 //!   italic, underline, strike, size, colour, the right-to-left flag and
 //!   the complex-script bold / italic / size twins), with the piece's
 //!   `Prm` applied on top;
-//! - page size, margins and section starts from every section's SEPX.
+//! - page size, margins and section starts from every section's SEPX;
+//! - tables ([`table`], [`tap`]): cells and rows from their cell / row
+//!   marks, nested tables to the depth the `.docx` model nests, column
+//!   widths, merged cells, borders, shading, row heights, the table's
+//!   direction, alignment and indent from each row mark's table sprms.
 //!
 //! What is not (yet) imported is COUNTED and reported
-//! ([`DocImport::not_imported`]): tables (their cell text becomes plain
-//! paragraphs), list numbering, pictures and drawings, fields (each kept
-//! as the text it last displayed), headers / footers, notes, comments,
-//! text boxes, styles and fonts. Honest UX: the engine turns the report
-//! into open warnings, so a partial import never looks like a clean one.
+//! ([`DocImport::not_imported`]): tables nested deeper than the model
+//! nests (their cell text becomes plain paragraphs), list numbering,
+//! pictures and drawings, fields (each kept as the text it last
+//! displayed), headers / footers, notes, comments, text boxes, styles and
+//! fonts. Honest UX: the engine turns the report into open warnings, so a
+//! partial import never looks like a clean one.
 //!
 //! The input is attacker-shaped and the wasm worker aborts on a panic: the
 //! container goes through `format-docx`'s bounded MS-CFB reader, every
@@ -48,6 +53,8 @@ mod props;
 mod reader;
 mod sections;
 mod sprm;
+mod table;
+mod tap;
 #[doc(hidden)]
 pub mod test_builder;
 #[cfg(test)]
@@ -65,7 +72,9 @@ use crate::sections::Section;
 /// A class of `.doc` content the importer does not model yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LegacyContent {
-    /// Table cells and rows: their text was imported as plain paragraphs.
+    /// Tables nested deeper than the model nests (issue #576): the cells
+    /// of those levels were imported as plain paragraphs of the deepest
+    /// imported cell.
     Tables,
     /// List numbering / bullets: the paragraphs came in without markers.
     Lists,
@@ -90,7 +99,10 @@ impl LegacyContent {
     /// One line for the open-warning details list (never document text).
     pub fn describe(self) -> &'static str {
         match self {
-            LegacyContent::Tables => "tables: their cell text was imported as plain paragraphs",
+            LegacyContent::Tables => {
+                "tables nested too deeply: the innermost tables' cell text was imported as plain \
+                 paragraphs"
+            }
             LegacyContent::Lists => {
                 "list numbering and bullets: the list paragraphs were imported without their \
                  markers"
@@ -119,8 +131,8 @@ pub struct NotImported {
 /// A successful import.
 #[derive(Debug, Clone)]
 pub struct DocImport {
-    /// The document: paragraphs with their direct formatting, every
-    /// section's page setup (interior sections on their closing
+    /// The document: paragraphs with their direct formatting, tables,
+    /// every section's page setup (interior sections on their closing
     /// paragraphs, the last one as `body_section`). No source package —
     /// a save writes a fresh `.docx`.
     pub document: DocumentTree,
@@ -197,12 +209,16 @@ pub fn read_doc(bytes: &[u8]) -> Result<DocImport, DocError> {
     let sections =
         sections::parse(&word, &table, fc, lcb).map_err(|e| e.in_table_stream(table_name))?;
     let sect_ends: Vec<u32> = sections.iter().map(|s| s.end_cp).collect();
+    /* The Data stream holds the properties a PAPX keeps out of its page
+    (sprmPHugePapx); a file without one has none to keep. */
+    let data = stream(&cf, "Data")?.unwrap_or_default();
 
     let walk = reader::Walk {
         word: &word,
         pieces: &pieces,
         chpx: &chpx,
         papx: &papx,
+        data: &data,
         sect_ends: &sect_ends,
     };
     let (mut paragraphs, skipped) = walk.run(fib.ccp.text)?;
@@ -228,10 +244,18 @@ pub fn read_doc(bytes: &[u8]) -> Result<DocImport, DocError> {
             }
         }
     }
-    let mut document = if paragraphs.is_empty() {
+    /* Tables (2.4.3): the cell and row marks group the paragraphs. A
+    document always ends with a paragraph mark after its last table; one
+    whose text ends inside a table gets an empty paragraph after it. */
+    let assembled = table::assemble(paragraphs);
+    let mut blocks = assembled.blocks;
+    if matches!(blocks.last(), Some(engine::Block::Table(_))) {
+        blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
+    }
+    let mut document = if blocks.is_empty() {
         DocumentTree::from_text("")
     } else {
-        DocumentTree::from_rich_paragraphs(paragraphs.into_iter().map(|p| p.paragraph))
+        DocumentTree::from_blocks(blocks)
     };
     if let Some(last) = sections.last() {
         document.body_section = section_props(last);
@@ -244,7 +268,7 @@ pub fn read_doc(bytes: &[u8]) -> Result<DocImport, DocError> {
         }
     };
     let present = |ccp: u32| u32::from(ccp > 0);
-    note(LegacyContent::Tables, skipped.table_paragraphs);
+    note(LegacyContent::Tables, assembled.flattened);
     note(LegacyContent::Lists, skipped.list_paragraphs);
     note(LegacyContent::Pictures, skipped.objects);
     note(LegacyContent::Fields, skipped.fields);
