@@ -408,7 +408,7 @@ fn table_cells_become_paragraphs_and_row_marks_vanish() {
         vec![
             NotImported {
                 content: LegacyContent::Tables,
-                count: 3
+                count: 2
             },
             NotImported {
                 content: LegacyContent::Lists,

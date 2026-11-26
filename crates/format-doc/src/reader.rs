@@ -224,7 +224,7 @@ impl Walk<'_> {
                     paragraph. */
                     let pp = self.para_props(piece, fc);
                     let is_row_end = pp.row_end && pb.text.is_empty();
-                    if pp.in_table || c == '\u{7}' {
+                    if !is_row_end && (pp.in_table || c == '\u{7}') {
                         skipped.table_paragraphs = skipped.table_paragraphs.saturating_add(1);
                     }
                     if pp.in_list {
