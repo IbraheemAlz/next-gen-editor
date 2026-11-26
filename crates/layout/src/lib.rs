@@ -9,6 +9,8 @@ pub mod decor;
 pub mod floats;
 pub mod hyphen;
 pub mod mark;
+#[cfg(test)]
+mod nbsp_tests;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;

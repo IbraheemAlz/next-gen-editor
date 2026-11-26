@@ -31588,6 +31588,11 @@ mod insert_position_tests;
 #[cfg(all(test, feature = "fuzz-native"))]
 mod paste_html_tests;
 
+/// Issue #599 - `&nbsp;` in pasted / opened HTML is U+00A0 through the real
+/// doors (paste, `.html` open, `.docx` save + reopen) (`fuzz-native`).
+#[cfg(all(test, feature = "fuzz-native"))]
+mod paste_html_nbsp_tests;
+
 #[cfg(test)]
 mod a11y_direction_tests;
 
