@@ -254,7 +254,7 @@ fn selected_plain(e: &mut Engine) -> String {
 }
 
 /// The block at `steps` of the live body.
-fn block<'d>(doc: &'d DocumentTree, steps: Vec<BridgePathStep>) -> &'d engine::Block {
+fn block(doc: &DocumentTree, steps: Vec<BridgePathStep>) -> &engine::Block {
     doc.block_at(&bridge_to_engine_path(path(steps)))
         .expect("a block at that path")
 }
