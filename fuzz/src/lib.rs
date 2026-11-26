@@ -9,6 +9,7 @@
 //! are proven to work without `cargo +nightly fuzz run`).
 
 pub mod command_gen;
+pub mod doc_gen;
 pub mod docx_gen;
 pub mod layout_gen;
 pub mod snapshot_gen;
@@ -42,6 +43,81 @@ pub fn run_docx_reader(data: &[u8]) {
         && let Ok(archive) = format_docx::read_docx(&bytes)
     {
         assert_reads_inside_bounds(&archive, "docx_reader (measures)");
+    }
+}
+
+/// `doc_reader` (issue #567) — the legacy Word 97-2003 `.doc` importer
+/// (`format_doc::read_doc`). An input that IS a compound file (a committed
+/// `corpus/doc_reader/` seed, a mutation of one) is read as-is; every input
+/// is also read as a splice (`doc_gen::spliced`: a valid image from the
+/// input's head with the rest overwriting its streams). The importer must
+/// never panic; an `Err` is a correct answer to a hostile file. An import
+/// must hold the model's rules: Word's bounds, text XML can carry, spans
+/// inside their paragraph, and a `.docx` save whose parts carry no
+/// forbidden character.
+pub fn run_doc_reader(data: &[u8]) {
+    if data.starts_with(&format_docx::opc::cfb::CFB_SIGNATURE) {
+        check_doc_import(data);
+    }
+    if let Some(bytes) = doc_gen::spliced(data) {
+        check_doc_import(&bytes);
+    }
+}
+
+/// [`run_doc_reader`]'s invariants over one file `bytes`.
+pub fn check_doc_import(bytes: &[u8]) {
+    let import = match format_doc::read_doc(bytes) {
+        Ok(import) => import,
+        Err(e) => {
+            /* The message is shown verbatim: it must render. */
+            let _ = e.to_string();
+            return;
+        }
+    };
+    let doc = &import.document;
+    if let Some(why) = engine::first_point_field_beyond_bound(doc) {
+        panic!("doc_reader: the imported model holds an out-of-bound field: {why}");
+    }
+    if let Some(why) = engine::first_font_size_beyond_bound(doc) {
+        panic!("doc_reader: the imported model holds an out-of-bound font size: {why}");
+    }
+    assert!(
+        doc.paragraph_count() as usize <= format_doc::MAX_PARAGRAPHS.max(1),
+        "doc_reader: more paragraphs than the importer's cap"
+    );
+    for block in doc.blocks.iter() {
+        let engine::Block::Paragraph(p) = block else {
+            panic!("doc_reader: the importer made a table");
+        };
+        assert!(
+            p.text
+                .chars()
+                .all(|c| c == engine::text_input::PAGE_BREAK || engine::text_input::is_xml_char(c)),
+            "doc_reader: imported text holds a character XML cannot carry"
+        );
+        assert!(
+            !p.text.contains(['\r', '\n']),
+            "doc_reader: a paragraph mark leaked into the text"
+        );
+        let mut prev_end = 0u32;
+        for s in &p.spans {
+            assert!(
+                s.start < s.end
+                    && s.start >= prev_end
+                    && p.text.is_char_boundary(s.start as usize)
+                    && p.text.is_char_boundary(s.end as usize),
+                "doc_reader: a style span is not a sorted in-paragraph range"
+            );
+            prev_end = s.end;
+        }
+    }
+    if let Ok(saved) = format_docx::save_docx(doc)
+        && let Some((part, offset, ch)) = format_docx::first_forbidden_character(&saved)
+    {
+        panic!(
+            "doc_reader: the .docx save of an import holds U+{:04X} in {part} at {offset}",
+            ch as u32
+        );
     }
 }
 
@@ -959,6 +1035,57 @@ pub fn well_formed_docx_seeds() -> Vec<(&'static str, Vec<u8>, WfOutcome)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #567 — the splice mode is not vacuous: a fair share of
+    /// pseudo-random inputs still reach a successful import (the walk, the
+    /// FKPs and the SEPX run), the rest a typed refusal.
+    #[test]
+    fn doc_splices_mostly_reach_the_walk() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut imported = 0usize;
+        const N: usize = 400;
+        for i in 0..N {
+            let len = 8 + i % 200;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            if let Some(bytes) = doc_gen::spliced(&data) {
+                check_doc_import(&bytes);
+                imported += usize::from(format_doc::read_doc(&bytes).is_ok());
+            }
+        }
+        assert!(imported * 5 >= N, "only {imported} of {N} splices imported");
+    }
+
+    /// Issue #567 — the committed `doc_reader` seeds are exactly what
+    /// [`doc_gen::doc_seeds`] builds (re-run `examples/regen-seeds`), each
+    /// imports, and the target's invariants hold on it and on a splice.
+    #[test]
+    fn doc_seeds_are_committed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/doc_reader");
+        for (name, bytes) in doc_gen::doc_seeds() {
+            let committed = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("{name}: {e} — run examples/regen-seeds"));
+            assert!(
+                committed == bytes,
+                "{name} is stale — run examples/regen-seeds"
+            );
+            let import =
+                format_doc::read_doc(&bytes).unwrap_or_else(|e| panic!("{name} must import: {e}"));
+            assert!(import.document.paragraph_count() >= 1, "{name}");
+            run_doc_reader(&bytes);
+        }
+        /* A splice from a short input is a valid image before its
+        overwrites: with none, it imports. */
+        let plain = doc_gen::spliced(&[0, 1, 5, b'a', b'b', b'c', b'd', b'e'])
+            .expect("a splice from eight bytes");
+        assert!(format_doc::read_doc(&plain).is_ok());
+    }
 
     /// Issue #468 — the committed well-formedness seeds are exactly what
     /// [`well_formed_docx_seeds`] builds (re-run `examples/regen-seeds`), and

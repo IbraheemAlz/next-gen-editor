@@ -31,11 +31,34 @@ export const READ_WARNING_LABELS: Record<ReadWarningKind, string> = {
     UnsafeRelationshipTarget: 'A relationship pointing outside the file was ignored.',
     MalformedPart:
         'A part of the file is not well-formed XML; what could be repaired was repaired, and a repaired part will be rewritten on save.',
+    LegacyContentNotImported: 'Not imported from this Word 97-2003 (.doc) file',
 };
 
-/** Total number of issues (coalesced entries count once per occurrence). */
+/** Issue #567 — a class of `.doc` content the importer does not model:
+ *  one issue per class (its `count` is how many occurrences, shown in the
+ *  details line), not one per table cell. */
+const PER_CLASS_KINDS: ReadonlySet<ReadWarning['kind']> = new Set(['LegacyContentNotImported']);
+
+/** Total number of issues (coalesced entries count once per occurrence;
+ *  a per-class entry counts once). */
 export function openWarningCount(warnings: readonly ReadWarning[]): number {
-    return warnings.reduce((n, w) => n + Math.max(1, w.count ?? 1), 0);
+    return warnings.reduce(
+        (n, w) => n + (PER_CLASS_KINDS.has(w.kind) ? 1 : Math.max(1, w.count ?? 1)),
+        0,
+    );
+}
+
+/** The banner's one-sentence summary: a document imported from the legacy
+ *  `.doc` format says so (and that a save writes `.docx`, issue #567);
+ *  any other degraded open keeps the #406 wording. */
+export function openWarningSummary(warnings: readonly ReadWarning[]): string {
+    if (warnings.some((w) => w.kind === 'LegacyContentNotImported')) {
+        return (
+            'This document was imported from the Word 97-2003 (.doc) format. ' +
+            'Content that is not supported yet is listed below; saving writes a .docx file.'
+        );
+    }
+    return 'Some values in this file could not be read as written and were corrected or ignored.';
 }
 
 /**

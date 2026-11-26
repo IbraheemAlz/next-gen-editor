@@ -1,7 +1,8 @@
 /* Phase 4 §10 (D4.10) — drag-and-drop document loading.
  *
- * Drop a .docx file anywhere on the editor to replace the open document. The
- * engine parses it via the existing `LoadDocx` command (format-docx). */
+ * Drop a .docx (or, issue #567, a legacy .doc) file anywhere on the editor to
+ * replace the open document. The engine parses it via the existing
+ * `LoadDocx` command (format-docx, or format-doc for a compound file). */
 import type { EngineClient } from '../engine/engine-client';
 import { topPos } from '../engine/types';
 
@@ -36,7 +37,10 @@ export function attachDragDrop(client: EngineClient): () => void {
     const onDrop = (e: DragEvent): void => {
         e.preventDefault();
         const file = e.dataTransfer?.files?.[0];
-        if (file && file.name.toLowerCase().endsWith('.docx')) {
+        /* Issue #567 — a legacy `.doc` loads through the same command (the
+           engine routes it by its compound-file signature). */
+        const name = file?.name.toLowerCase() ?? '';
+        if (file && (name.endsWith('.docx') || name.endsWith('.doc'))) {
             void loadDroppedDocx(client, file);
         }
     };

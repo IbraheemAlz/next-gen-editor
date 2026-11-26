@@ -66,6 +66,7 @@ crates/
   layout/         hierarchical box model (PageBox→ParagraphBox→LineBox→VisualRun)
   render/         backend-agnostic DisplayList; Canvas2D + Vello backends; DirtyTracker
   format-docx/    .docx reader (zip + quick-xml) + writer (preserves siblings)
+  format-doc/     legacy .doc (Word 97-2003) read-only importer (issue #567, see .claude/rules/docx.md)
   format-pdf/     PDF export (pdf-writer) — box tree + subset font embedding
 ts/               Vite + TS shell, worker, EngineClient, event log, e2e suite
 packages/         pnpm workspace — Monaco Standard SDK split (post-beta.3)

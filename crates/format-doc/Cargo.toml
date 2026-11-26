@@ -1,0 +1,15 @@
+[package]
+name = "format-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Read-only importer for legacy Word 97-2003 binary documents (.doc, [MS-DOC]) into the engine's DocumentTree."
+
+# No new third-party crates: the OLE compound-file container is read with
+# format-docx's bounded in-house MS-CFB reader (`opc::cfb`, issue #345), and
+# the model is the engine's own. Parts of this crate are modified from
+# WordCraft (MIT OR Apache-2.0) — see THIRD-PARTY-NOTICES.md at the repo root.
+[dependencies]
+engine = { path = "../engine" }
+format-docx = { path = "../format-docx" }
