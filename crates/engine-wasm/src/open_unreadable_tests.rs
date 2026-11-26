@@ -93,6 +93,46 @@ fn a_junk_root_and_a_bad_tag_name_are_document_unreadable() {
     }
 }
 
+/// Issues #536 / #530 — a block where no block may stand (a paragraph before
+/// the body; an UNCLOSED one there, which the EOF repair makes enclose the
+/// body; a paragraph the same repair nests in another) used to open, and its
+/// zero-edit save read back duplicated or lost text. It is refused with the
+/// typed `DocumentUnreadable` through the dispatcher, naming the part and the
+/// defect class (never the document's text), with nothing changed.
+#[test]
+fn a_misplaced_paragraph_is_document_unreadable_and_changes_nothing() {
+    let stock = document_xml_with_body(r#"<w:p><w:r><w:t>zzalpha</w:t></w:r></w:p>"#);
+    let (head, body) = stock
+        .split_once("<w:body>")
+        .expect("the stock part has a body");
+    let before_body = format!("{head}<w:p><w:r><w:t>zzbeta</w:t></w:r></w:p><w:body>{body}");
+    /* Truncated inside the body: the EOF repair closes the stray `<w:p>`
+    after `</w:body>`, around the body. */
+    let enclosing = format!("{head}<w:p><w:body><w:p><w:r><w:t>zzbeta</w:t></w:r></w:p>");
+    let nested = format!(
+        "{head}<w:body><w:p><w:r><w:t>zzalpha</w:t></w:r><w:p><w:r><w:t>zzbeta</w:t></w:r>"
+    );
+    let mut engine = Engine::new_headless(DocumentTree::from_text("keep me"));
+    let before = engine.state_fingerprint_for_fuzzing();
+    for (part, class) in [
+        (before_body, "outside the document body"),
+        (enclosing, "outside the document body"),
+        (nested, "inside a paragraph"),
+    ] {
+        let evt = open(
+            &mut engine,
+            package_with_document_xml_bytes(part.as_bytes(), &[]),
+        );
+        let message = assert_unreadable(&evt, "word/document.xml");
+        assert!(message.contains(class), "{message}");
+        assert!(
+            !message.contains("zzalpha") && !message.contains("zzbeta"),
+            "{message}"
+        );
+        assert_eq!(engine.state_fingerprint_for_fuzzing(), before);
+    }
+}
+
 /// A truncated archive is damaged too (not "an unknown format"); a legacy
 /// compound file keeps `InvalidDocument`.
 #[test]
