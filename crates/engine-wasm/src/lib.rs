@@ -2282,7 +2282,12 @@ fn cell_tab_step(
             } else {
                 /* Last cell + forward → append a fresh row and land on
                 its first cell (Word default). `at = n_rows` lands after
-                the current last row under the post-hotfix signature. */
+                the current last row under the post-hotfix signature.
+                Issue #562 — a table at its row / cell cap stays put
+                (the same growth check `InsertRow` validates). */
+                if table.check_growth(1, 0).is_err() {
+                    return stay();
+                }
                 return CellTabStep::AppendRowAndMoveTo {
                     table_path: table_path.clone(),
                     at_row: n_rows as usize,
@@ -15104,25 +15109,33 @@ impl Engine {
                         at_row,
                         caret,
                     } => {
-                        let mut fresh = table_path.clone();
+                        /* Issue #562 — the row goes to `table_path`'s
+                        table at any depth (a nested table's own, never
+                        the outer one), so its first cell exists. Should
+                        the landing cell still not resolve, the step is
+                        refused — the caret never lands on a clamp
+                        fallback outside the table. */
+                        let grown =
+                            doc.insert_row(bridge_to_engine_path(table_path.clone()), at_row);
+                        if grown
+                            .paragraph_at_path(&bridge_to_engine_path(caret.path.clone()))
+                            .is_none()
+                        {
+                            return self.selection_changed();
+                        }
+                        let mut fresh = table_path;
                         fresh.steps.push(BridgePathStep::Cell {
                             row: at_row as u32,
                             col: 0,
                         });
                         tab_cell = Some(fresh);
-                        let epath = bridge_to_engine_path(table_path);
                         if self.story_active() {
                             /* One undo step, in the active part only;
                             the fresh row is empty, so the collapsed
                             caret IS its first cell's content span. */
-                            return self.story_mutate(
-                                move |d| d.insert_row(epath, at_row),
-                                caret,
-                                false,
-                            );
+                            return self.story_mutate(move |_| grown, caret, false);
                         }
-                        let new_doc = self.undo.current().insert_row(epath, at_row);
-                        self.undo.push(new_doc);
+                        self.undo.push(grown);
                         /* Paint the new row (the story adapter does
                         the same inside `story_mutate`). */
                         self.dirty.invalidate(full_page_rect(self.scale()));
@@ -20466,28 +20479,52 @@ impl Engine {
         if let Err(e) = engine::check_table_dims(rows, cols) {
             return Event::error_kind(bridge::ErrorKind::OutOfRange, format!("InsertTable: {e}"));
         }
+        /* Issue #563 — `at` lands in its own container: the body (or the
+        active story's root) for a one-step path, the table cell its earlier
+        steps address otherwise (a caret in a cell nests the table there).
+        The ONE resolution the engine's insert uses, run against the tree
+        the selection addresses; a position that is no block position is a
+        typed refusal BEFORE anything is pushed. */
+        let epath = bridge_to_engine_path(at);
+        let (container, idx) = match self.with_selection_doc(|d| d.resolve_block_insert(&epath)) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                return Event::error_kind(table_error_kind(&e), format!("InsertTable: {e}"));
+            }
+        };
+        /* Issues #563 / #378 — nesting by command is bounded where layout
+        stops drawing grids: a table deeper than `MAX_TABLE_LAYOUT_DEPTH`
+        would be flattened to its paragraphs, and a command-built tower has
+        no other bound (the reader caps a file at 64 levels). */
+        let level = container
+            .iter()
+            .filter(|s| matches!(s, EnginePathStep::Cell { .. }))
+            .count() as u32
+            + 1;
+        if level > MAX_TABLE_LAYOUT_DEPTH {
+            return Event::error_kind(
+                bridge::ErrorKind::OutOfRange,
+                format!(
+                    "InsertTable: a table nested {level} levels deep exceeds the \
+                     {MAX_TABLE_LAYOUT_DEPTH}-level limit"
+                ),
+            );
+        }
         /* Issue #117 — Word parks the caret in the new table's first cell.
         Doing so explicitly (instead of leaving the caret on the block
         index the table now occupies, which resolves to no paragraph)
         keeps the selection valid through the structural edit. The
-        engine clamps the insertion index to the block count, so mirror
-        that to name the cell the table actually lands in. */
-        let at_idx = match at.steps.first() {
-            Some(BridgePathStep::Block { idx }) => Some(*idx as usize),
-            _ => None,
-        };
-        let first_cell = |block_count: usize| -> BridgeLogicalPos {
-            let idx = at_idx.unwrap_or(block_count).min(block_count) as u32;
-            BridgeLogicalPos {
-                path: BridgeBlockPath {
-                    steps: vec![
-                        BridgePathStep::Block { idx },
-                        BridgePathStep::Cell { row: 0, col: 0 },
-                        BridgePathStep::Block { idx: 0 },
-                    ],
-                },
-                offset: 0,
-            }
+        resolved index is already clamped to the container, so it names
+        the cell the table actually lands in. */
+        let mut steps = engine_to_bridge_path(EngineBlockPath { steps: container }).steps;
+        steps.extend([
+            BridgePathStep::Block { idx: idx as u32 },
+            BridgePathStep::Cell { row: 0, col: 0 },
+            BridgePathStep::Block { idx: 0 },
+        ]);
+        let caret = BridgeLogicalPos {
+            path: BridgeBlockPath { steps },
+            offset: 0,
         };
         /* Issue #442 — review mode on: every row (and the escape
         paragraph's mark) recorded as inserted. */
@@ -20495,8 +20532,6 @@ impl Engine {
             .tracking_changes
             .then(|| (self.review_author.clone(), self.current_review_date()));
         if self.story_active() {
-            let caret = first_cell(self.story_doc().map_or(0, |d| d.blocks.len()));
-            let epath = bridge_to_engine_path(at);
             return self.story_mutate(
                 move |d| match &tracked {
                     Some((author, date)) => d.tracked_insert_table(epath, rows, cols, author, date),
@@ -20506,8 +20541,6 @@ impl Engine {
                 false,
             );
         }
-        let caret = first_cell(self.undo.current().blocks.len());
-        let epath = bridge_to_engine_path(at);
         let new_doc = match &tracked {
             Some((author, date)) => self
                 .undo
@@ -21499,7 +21532,8 @@ struct RenderStats {
 
 /// Issue #454 - the typed refusal for a [`engine::TableError`]. Exhaustive
 /// (no wildcard): a new variant cannot compile without choosing a kind.
-/// - the path addresses no table -> `NoSuchTarget`;
+/// - the path addresses no table, or (issue #563) an `InsertTable`
+///   position whose container is no cell -> `NoSuchTarget`;
 /// - a nested table (editing it is unsupported) -> `UnsupportedHere`;
 /// - a merge rectangle that only partly covers an existing merged region
 ///   (issue #471; Word refuses it too) -> `UnsupportedHere`;
@@ -21509,7 +21543,7 @@ struct RenderStats {
 fn table_error_kind(e: &engine::TableError) -> bridge::ErrorKind {
     use engine::TableError as T;
     match e {
-        T::NotATable { .. } => bridge::ErrorKind::NoSuchTarget,
+        T::NotATable { .. } | T::NoInsertPosition { .. } => bridge::ErrorKind::NoSuchTarget,
         T::NestedUnsupported { .. } | T::CrossesMerge { .. } => bridge::ErrorKind::UnsupportedHere,
         T::RowOutOfRange { .. }
         | T::ColOutOfRange { .. }
@@ -32184,6 +32218,12 @@ mod nested_table_hit_tests;
 /// cell that starts with, ends with, or only holds a nested table.
 #[cfg(test)]
 mod cell_select_nested_tests;
+
+/// Issues #563 / #562 / #566 — InsertTable in a cell nests the table there;
+/// Tab in a nested table's last cell grows THAT table; Tab between nested
+/// cells selects the nested cell.
+#[cfg(test)]
+mod nested_table_flow_tests;
 
 /// Issue #379 — the content-keyed table layout cache across repaints.
 #[cfg(test)]
