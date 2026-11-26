@@ -528,10 +528,24 @@ flag. The SDK packages (`@nge/core`, `@nge/ui`) install no globals.
   `Engine::format_targets_in` (character formatting, `attrs_mixed_over`, the
   `ToggleFormatting` state `range_flags`: all on -> clear, else set) and
   `format_pieces` / `fold_pieces` (a paragraph-level command folded over one range
-  per selected cell); a range that is not the live selection's stays linear. An
-  EMPTY paragraph the range covers (an empty cell of a selected rectangle) takes the
-  patch on its mark, so typing there continues it (`RangeTarget::mark`, #293).
-  List markers are stamped over the same deep walk (`visit_rendered_paragraphs` /
+  per selected cell); a range that is not the live selection's stays linear.
+  **A covered paragraph MARK takes character formatting too (issue #489,
+  `RangeTarget::mark`).** A mark is covered when the range runs PAST its paragraph's
+  end (every paragraph but the last of a linear range), and for every paragraph of
+  a rectangle. The last paragraph's mark is covered too when the selection includes
+  it: Select All, a triple-click or a drag by paragraphs (`SelectParagraphAt`,
+  `SelectUnitsInPage { unit: Paragraph }` — both through `select_unit_range`), a
+  cell selection (`SelectCellAt`). The model has no caret position after a mark,
+  so those commands record it (`Engine::mark_selection`, dropped by `apply` once the selection
+  changes) and `format_targets_in` asks `range_targets_with_end_mark`. A range
+  that stops at the last character leaves the mark. The mark's face sizes the last
+  line (`mark_line_metrics`), so "Ctrl+A -> 8 pt" shrinks every line, and an
+  emptied paragraph types with it (#293). Readers (`attrs_mixed_over`,
+  `range_flags`) still sample a mark only for a paragraph with no text. Review
+  mode patches the mark without recording a mark `<w:rPrChange>` (#372). The
+  writer adds the mark's `<w:rPr>` as a pure insertion (`tools/roundtrip` step 66).
+  e2e: `mark-format.spec.ts` reads line heights off the selection overlay. List
+  markers are stamped over the same deep walk (`visit_rendered_paragraphs` /
   `rendered_paragraphs_mut`, also the `.docx` reader's `resolve_markers_blocks`):
   a numId counts in document order through cells; a marker stamp is derived state
   and never dirties a table. Stories: character formatting honours the rectangle,
