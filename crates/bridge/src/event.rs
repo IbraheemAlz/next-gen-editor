@@ -1409,6 +1409,11 @@ pub enum LayoutDegradeReason {
     /// its post-conditions and the table was re-laid from scratch.
     /// Distinct from `CacheMismatch` (the paragraph cache).
     TableCacheMismatch,
+    /// Issue #347 — the paragraph float-wrap composer hit its defensive
+    /// band cap: the rest of the paragraph was composed ignoring its
+    /// float cutouts (painted, nothing dropped). Unreachable for any
+    /// finite plan, so a note means the termination argument broke.
+    FloatWrapCapped,
     /// Issue #499 — a navigation-driven band expansion (`MoveCaret`,
     /// `PageDown`, a hit-test past the band) raised the cull target and
     /// the band did not grow: the cull's running height (an oversize line
@@ -1780,6 +1785,25 @@ mod a11y_note_wire_tests {
         ))
         .unwrap();
         assert_eq!(unreadable["kind"], "DocumentUnreadable");
+    }
+
+    /// Issue #347 — a layout degradation reason is SCREAMING_SNAKE_CASE on
+    /// the wire, the spelling `layout::DegradeReason::as_str` documents.
+    #[test]
+    fn float_wrap_capped_is_a_layout_degrade_reason_on_the_wire() {
+        let note = LayoutDegraded {
+            reason: LayoutDegradeReason::FloatWrapCapped,
+            page: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&note).unwrap(),
+            serde_json::json!({ "reason": "FLOAT_WRAP_CAPPED", "page": null })
+        );
+        let back: LayoutDegraded =
+            serde_json::from_value(serde_json::json!({ "reason": "FLOAT_WRAP_CAPPED", "page": 3 }))
+                .unwrap();
+        assert_eq!(back.reason, LayoutDegradeReason::FloatWrapCapped);
+        assert_eq!(back.page, Some(3));
     }
 
     /// Issue #345 — protection modes spell `w:edit`; the typed refusal.
