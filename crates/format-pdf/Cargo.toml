@@ -17,12 +17,12 @@ png = { workspace = true }
 gif = { workspace = true, optional = true }
 image-webp = { workspace = true, optional = true }
 tiff = { workspace = true, optional = true }
-
-[dev-dependencies]
-# Issue #361 — `src/cff_test_font.rs` reads TrueType outlines through
-# rustybuzz's `ttf_parser` re-export to synthesize a CFF test font at test
-# time (no binary fixture in the tree). Same version text-pipeline already
-# links, so no new crate.
+# Issue #392 — `src/font_descriptor.rs` derives the `/FontDescriptor`
+# values from the face's tables through rustybuzz's `ttf_parser` re-export
+# (`LoadedFont::face_rustybuzz` derefs to a `ttf_parser::Face`). Issue #361
+# — `src/cff_test_font.rs` reads TrueType outlines the same way to
+# synthesize a CFF test font at test time (no binary fixture in the tree).
+# Same version text-pipeline already links, so no new crate in the wasm.
 rustybuzz = { workspace = true }
 
 [features]

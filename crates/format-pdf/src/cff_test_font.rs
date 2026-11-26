@@ -19,6 +19,17 @@ use rustybuzz::ttf_parser::{self, GlyphId, OutlineBuilder};
 
 /// Build the CFF-flavoured twin of the TrueType font `ttf`, named `family`.
 pub(crate) fn cff_from_truetype(ttf: &[u8], family: &str) -> Vec<u8> {
+    cff_from_truetype_with_std_vw(ttf, family, None)
+}
+
+/// [`cff_from_truetype`], plus (issue #392) a Private DICT `StdVW` — the
+/// dominant vertical stem width, in font units — when `std_vw` is given.
+/// `None` builds exactly what [`cff_from_truetype`] does.
+pub(crate) fn cff_from_truetype_with_std_vw(
+    ttf: &[u8],
+    family: &str,
+    std_vw: Option<i32>,
+) -> Vec<u8> {
     let face = ttf_parser::Face::parse(ttf, 0).expect("source TrueType face");
     let n = face.number_of_glyphs();
     let upem = face.units_per_em();
@@ -35,6 +46,7 @@ pub(crate) fn cff_from_truetype(ttf: &[u8], family: &str) -> Vec<u8> {
         upem,
         [bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max],
         &charstrings,
+        std_vw,
     );
 
     /* Copy every table the CFF twin can share; replace the rest. */
@@ -318,7 +330,8 @@ fn index(items: &[Vec<u8>]) -> Vec<u8> {
 /// A name-keyed (SID) CFF font program: header, Name / Top DICT / String /
 /// Global Subr INDEXes, a format-0 charset (custom glyph names `g1`, …),
 /// the CharStrings INDEX and a Private DICT (`defaultWidthX` /
-/// `nominalWidthX` 0 — every charstring carries its width explicitly).
+/// `nominalWidthX` 0 — every charstring carries its width explicitly —
+/// and `StdVW` when `std_vw` is given).
 ///
 /// The Top DICT carries a `Notice` and a `Copyright`, as every real font
 /// does. That is load-bearing for veraPDF (1.30): the subset's Top DICT
@@ -327,7 +340,13 @@ fn index(items: &[Vec<u8>]) -> Vec<u8> {
 /// glyph width by the `ROS` registry operand (≈ ×391 — it evidently does
 /// not clear the operand stack after `ROS`), failing ISO 19005-1 §6.3.6 /
 /// 19005-2 §6.2.11.5 on a correct file.
-fn cff_table(ps_name: &str, upem: u16, bbox: [i16; 4], charstrings: &[Vec<u8>]) -> Vec<u8> {
+fn cff_table(
+    ps_name: &str,
+    upem: u16,
+    bbox: [i16; 4],
+    charstrings: &[Vec<u8>],
+    std_vw: Option<i32>,
+) -> Vec<u8> {
     const STANDARD_STRINGS: u16 = 391;
     let n = charstrings.len();
     let header = [1u8, 0, 4, 4];
@@ -345,6 +364,10 @@ fn cff_table(ps_name: &str, upem: u16, bbox: [i16; 4], charstrings: &[Vec<u8>]) 
     }
     let char_strings = index(charstrings);
     let mut private = Vec::new();
+    if let Some(std_vw) = std_vw {
+        dict_int(&mut private, std_vw, false);
+        private.push(11); // StdVW
+    }
     dict_int(&mut private, 0, false);
     private.push(20); // defaultWidthX
     dict_int(&mut private, 0, false);

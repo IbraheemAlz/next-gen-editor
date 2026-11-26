@@ -167,7 +167,7 @@ use flate2::write::ZlibEncoder;
 use font_program::{FontProgram, GlyphCodes, Outlines};
 use layout::{LayoutBlock, PageBox, ParagraphBox, TabLeaderKind, TableBox, VisualRun};
 use pdf_writer::types::{
-    CidFontType, FontFlags, OutputIntentSubtype, PageMode, SystemInfo, TabOrder, TextRenderingMode,
+    CidFontType, OutputIntentSubtype, PageMode, SystemInfo, TabOrder, TextRenderingMode,
     TrappingStatus, UnicodeCmap,
 };
 use pdf_writer::{Content, Date, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
@@ -179,6 +179,7 @@ use text_pipeline::{FontStack, LoadedFont};
 
 #[cfg(test)]
 mod cff_test_font;
+mod font_descriptor;
 mod font_program;
 mod image;
 #[cfg(test)]
@@ -2679,8 +2680,9 @@ fn embed_font(
     };
     let base = Name(name.as_bytes());
     let data = program.data.as_slice();
-    /* Metrics in 1000-unit em space — the PDF font-descriptor convention. */
-    let m = face.metrics(1000.0);
+    /* Issue #392 — every descriptor value comes from the face's own
+    tables (1000-unit glyph space); see `font_descriptor`. */
+    let m = font_descriptor::descriptor_metrics(face.face_rustybuzz());
 
     pdf.type0_font(fo.type0)
         .base_font(base)
@@ -2725,13 +2727,16 @@ fn embed_font(
         let mut descriptor = pdf.font_descriptor(fo.descriptor);
         descriptor
             .name(base)
-            .flags(FontFlags::SYMBOLIC)
-            .bbox(Rect::new(-500.0, -500.0, 1500.0, 1500.0))
-            .italic_angle(0.0)
+            .flags(m.font_flags())
+            .bbox(m.bbox_rect())
+            .italic_angle(m.italic_angle)
             .ascent(m.ascent)
-            .descent(-m.descent.abs())
-            .cap_height(m.cap_height)
-            .stem_v(80.0);
+            .descent(m.descent)
+            .cap_height(m.cap_height);
+        if let Some(x_height) = m.x_height {
+            descriptor.x_height(x_height);
+        }
+        descriptor.stem_v(m.stem_v);
         match program.outlines {
             Outlines::TrueType => descriptor.font_file2(fo.file),
             Outlines::Cff => descriptor.font_file3(fo.file),
@@ -4438,6 +4443,57 @@ mod tests {
         assert_eq!(count(b"/Length1"), 2);
         assert_eq!(count(b"/CIDToGIDMap /Identity"), 2);
         assert_eq!(count(b"/FontFile3"), 0);
+    }
+
+    /// Issue #392 — every `/FontDescriptor` carries its own face's metrics
+    /// (`font_descriptor`), not the old shared constants: the same values
+    /// for a TrueType face and its CFF twin, and in every profile (the
+    /// tagged one packs its objects into an object stream). Noto Naskh has
+    /// a zero `sCapHeight` / `sxHeight` and no `H` / `x`: its cap height is
+    /// its ascent and `/XHeight` is left out.
+    #[test]
+    fn font_descriptors_carry_each_faces_own_metrics() {
+        /* `/FontName` suffix → the keys from `/Flags` to `/StemV`. */
+        let descriptors = |pdf: &str| -> BTreeMap<String, String> {
+            pdf.split("/Type /FontDescriptor")
+                .skip(1)
+                .map(|d| {
+                    let d = &d[..d.find(">>").expect("dict end")];
+                    let tokens: Vec<&str> = d.split_whitespace().collect();
+                    let name = tokens[1].rsplit('+').next().expect("name").to_string();
+                    let from = tokens.iter().position(|t| *t == "/Flags").expect("/Flags");
+                    let to = tokens.iter().position(|t| *t == "/StemV").expect("/StemV");
+                    (name, tokens[from..to + 2].join(" "))
+                })
+                .collect()
+        };
+        let latin = "/Flags 4 /FontBBox [-544 -303 1302 980] /ItalicAngle 0 \
+                     /Ascent 905 /Descent -212 /CapHeight 688 /XHeight 528 /StemV 86";
+        let arabic = "/Flags 4 /FontBBox [-249 -610 6092 1056] /ItalicAngle 0 \
+                      /Ascent 1069 /Descent -634 /CapHeight 1069 /StemV 86";
+        for (prefix, cff) in [("tt", false), ("cff", true)] {
+            let (stack, _) = script_stack(prefix, cff);
+            let (page, text) = mixed_script_page_with(
+                &stack,
+                &format!("{prefix}-latin"),
+                &format!("{prefix}-arabic"),
+            );
+            for profile in [
+                PdfProfile::Plain,
+                PdfProfile::A1b,
+                PdfProfile::A2u,
+                PdfProfile::X3,
+                PdfProfile::Ua1,
+            ] {
+                let out = export_bytes(&page, &stack, &text, profile);
+                let got = descriptors(&test_support::searchable_text(&out));
+                let want = BTreeMap::from([
+                    (format!("{prefix}-arabic"), arabic.to_string()),
+                    (format!("{prefix}-latin"), latin.to_string()),
+                ]);
+                assert_eq!(got, want, "{prefix} {profile:?}");
+            }
+        }
     }
 
     /// `tools/pdf-validate --native` (issue #361): write the CFF fixture —
