@@ -492,6 +492,7 @@ dependencies = [
  "layout",
  "pdf-writer",
  "png",
+ "rustybuzz",
  "subsetter",
  "text-pipeline",
  "tiff",

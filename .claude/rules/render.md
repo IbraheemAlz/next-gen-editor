@@ -334,6 +334,16 @@ hard failure so CI catches a new loop instead of a silent recovery.
   (`format-pdf/src/cff_test_font.rs`) — never commit a font binary. Keep a
   `Notice`/`Copyright` in any synthesized Top DICT: veraPDF 1.30 mis-scales
   CFF widths when the subset's `FontMatrix` directly follows `ROS`.
+- **The `/FontDescriptor` is derived from the face, in ONE place (issue
+  #392)** — `font_descriptor::descriptor_metrics`, for both outline
+  flavours and both embeddings: the WHOLE face's `head` box (the subsetter
+  copies `head` / the CFF `FontBBox`, so the program declares the same
+  box), typo-or-`hhea` ascent / descent, `OS/2` cap / x height (else the
+  `H` / `x` outline), `post.italicAngle`, `StemV` from a CFF `StdVW` else
+  the weight class, flags from `post` / `OS/2` family class / PANOSE.
+  Always **Symbolic** (an `Identity-H` CIDFont is addressed by CID, never
+  by standard Latin names; veraPDF accepts either flag). Never hard-code
+  a descriptor value again.
 - Tests that inspect content-stream text decode codes through the font's
   own `/ToUnicode` (`format_pdf::test_support::{to_unicode_cmaps,
   decode_codes}`) — comparing them against `LoadedFont::glyph_id` is wrong
