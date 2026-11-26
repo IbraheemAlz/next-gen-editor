@@ -1271,6 +1271,20 @@ pub struct Engine {
     /// carries it) and re-broadcasts on a move, independent of whether
     /// the document itself changed.
     paint_geometry_seq: u64,
+    /// Issue #489 — the ordered `(start, end)` of a live selection that
+    /// INCLUDES the paragraph mark of its last paragraph: Select All, a
+    /// triple-click paragraph selection, a quadruple-click cell selection
+    /// (Word selects the pilcrow / end-of-cell mark with them). The model
+    /// has no caret position after a mark, so the selection's shape cannot
+    /// say it; the command that made it does. Character formatting over
+    /// that selection patches the mark too
+    /// ([`DocumentTree::range_targets_with_end_mark`]). Honoured only while
+    /// the live selection is still exactly this range: `apply` drops it
+    /// after any command that leaves another selection. Not persisted (a
+    /// recovered session replays the command that set it). Stored on
+    /// `Engine`, like `caret_affinity`, so the many `SelectionState`
+    /// literals stay untouched.
+    mark_selection: Option<(BridgeLogicalPos, BridgeLogicalPos)>,
 }
 
 /// A fresh, empty paragraph + table layout cache (issue #457: both are
@@ -1325,6 +1339,7 @@ fn assemble_engine(
         pending_zoom: None,
         pending_base_scale: None,
         paint_geometry_seq: 0,
+        mark_selection: None,
     }
 }
 
@@ -9219,6 +9234,11 @@ impl Engine {
         if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
             self.mutation_seq += 1;
         }
+        /* Issue #489 — "this selection includes its last mark" outlives
+        only the commands that leave that very selection in place. */
+        if self.mark_selection.is_some() && self.live_mark_selection().is_none() {
+            self.mark_selection = None;
+        }
         /* Issue #260 — a handler builds its `SelectionChanged` reply
         before the bump above lands, so stamp the revision the command
         actually left the document at. Issue #387 — and whether the
@@ -13039,7 +13059,35 @@ impl Engine {
                 return targets;
             }
         }
-        doc.range_targets(&to_engine_pos(start.clone()), &to_engine_pos(end.clone()))
+        /* Issue #489 — Select All / a triple-click / a cell selection
+        include the last paragraph's mark too. */
+        let end_mark = self
+            .live_mark_selection()
+            .is_some_and(|(s, e)| s == start && e == end);
+        doc.range_targets_with_end_mark(
+            &to_engine_pos(start.clone()),
+            &to_engine_pos(end.clone()),
+            end_mark,
+        )
+    }
+
+    /// Issue #489 — the recorded mark-including selection
+    /// ([`Engine::mark_selection`]), while the live selection is still
+    /// exactly that range.
+    fn live_mark_selection(&self) -> Option<&(BridgeLogicalPos, BridgeLogicalPos)> {
+        let sel = self.selection.as_ref()?;
+        let marked = self.mark_selection.as_ref()?;
+        (ordered(sel.anchor.clone(), sel.caret.clone()) == *marked).then_some(marked)
+    }
+
+    /// Issue #489 — the selection just set (Select All, a triple-click
+    /// paragraph selection, a cell selection) includes the paragraph mark
+    /// of its last paragraph, as Word selects it with them.
+    fn note_selection_includes_its_mark(&mut self) {
+        self.mark_selection = self
+            .selection
+            .as_ref()
+            .map(|s| ordered(s.anchor.clone(), s.caret.clone()));
     }
 
     /// Issue #509 — the `(start, end)` ranges a PARAGRAPH-level command
@@ -14380,6 +14428,8 @@ impl Engine {
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
+        /* Issue #489 — Word's triple-click selects the paragraph mark. */
+        self.note_selection_includes_its_mark();
         self.selection_changed()
     }
 
@@ -14413,6 +14463,8 @@ impl Engine {
             ideal_x: None,
             kind,
         });
+        /* Issue #489 — a cell selection includes its end-of-cell mark. */
+        self.note_selection_includes_its_mark();
         self.selection_changed()
     }
 
@@ -14435,6 +14487,8 @@ impl Engine {
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
+        /* Issue #489 — Word's Select All includes the final mark. */
+        self.note_selection_includes_its_mark();
         self.selection_changed()
     }
 
@@ -21077,6 +21131,7 @@ mod tests {
             pending_zoom: None,
             pending_base_scale: None,
             paint_geometry_seq: 0,
+            mark_selection: None,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -21953,6 +22008,7 @@ mod tests {
             pending_zoom: None,
             pending_base_scale: None,
             paint_geometry_seq: 0,
+            mark_selection: None,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -22015,6 +22071,7 @@ mod tests {
             pending_zoom: None,
             pending_base_scale: None,
             paint_geometry_seq: 0,
+            mark_selection: None,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -22068,6 +22125,7 @@ mod tests {
             pending_zoom: None,
             pending_base_scale: None,
             paint_geometry_seq: 0,
+            mark_selection: None,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -22200,6 +22258,7 @@ mod tests {
             pending_zoom: None,
             pending_base_scale: None,
             paint_geometry_seq: 0,
+            mark_selection: None,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -22859,6 +22918,7 @@ mod tests {
                 pending_zoom: None,
                 pending_base_scale: None,
                 paint_geometry_seq: 0,
+                mark_selection: None,
             }
         }
 
@@ -26606,6 +26666,7 @@ mod tests {
             pending_zoom: None,
             pending_base_scale: None,
             paint_geometry_seq: 0,
+            mark_selection: None,
         }
     }
 
@@ -31701,6 +31762,10 @@ mod empty_mark_tests;
 /// Issues #475 / #463 — one line-pitch model for every document.
 #[cfg(test)]
 mod line_pitch_tests;
+
+/// Issue #489 — a selection that includes a paragraph mark formats it.
+#[cfg(test)]
+mod mark_format_tests;
 
 /// Issue #387 — comment highlights + the caret-reveal stamp.
 #[cfg(test)]

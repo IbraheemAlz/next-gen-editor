@@ -396,6 +396,9 @@ fn run_default() -> Result<()> {
     /* Step 64 — issue #556: the default paragraph style formats unstyled
     paragraphs; the writer never spells it as direct formatting. */
     default_style::run_default_style_roundtrip()?;
+    /* Step 65 — issue #489: a selection that covers a paragraph mark
+    (Select All) formats it; the mark's `<w:rPr>` is a pure insertion. */
+    reader_cascade::run_mark_selection_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

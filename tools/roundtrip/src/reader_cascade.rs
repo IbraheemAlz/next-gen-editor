@@ -155,6 +155,114 @@ pub(crate) fn run_mark_formatting_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/* ======================= a selection formats the marks it covers (#489) ==== */
+
+/// Three paragraphs: no `<w:pPr>`, a `<w:pPr>` with no mark `<w:rPr>`, and
+/// a bold mark (`<w:pPr><w:rPr><w:b/>`).
+const P_NO_PPR: &str = r#"<w:p w14:paraId="0B100001"><w:r><w:t>first</w:t></w:r></w:p>"#;
+const P_JC: &str = r#"<w:p w14:paraId="0B100002"><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>second</w:t></w:r></w:p>"#;
+const P_BOLD_MARK: &str = r#"<w:p w14:paraId="0B100003"><w:pPr><w:rPr><w:b/></w:rPr></w:pPr><w:r><w:t>third</w:t></w:r></w:p>"#;
+
+/// `<w:sz>` + `<w:szCs>` at 8 pt — the size the toolbar writes to both
+/// script slots.
+const SZ8: &str = r#"<w:sz w:val="16"/><w:szCs w:val="16"/>"#;
+
+fn eight_pt() -> engine::SpanStyle {
+    engine::SpanStyle {
+        font_size: Some(8.0),
+        ..Default::default()
+    }
+    .with_cs_twins()
+}
+
+/// Issue #489 — step 65.
+///
+/// a. Select All -> 8 pt over a Word package: every run AND every
+///    paragraph mark is written at 8 pt, as pure insertions into the
+///    source bytes (#251) — a `<w:pPr><w:rPr>` where the paragraph had no
+///    pPr, a mark `<w:rPr>` inside an existing pPr, a `<w:sz>` inside the
+///    existing bold mark; nothing else moves. The re-read marks are 8 pt.
+/// b. A selection that stops at a paragraph's last character formats its
+///    text but leaves its mark — the pPr bytes are untouched.
+pub(crate) fn run_mark_selection_roundtrip() -> Result<()> {
+    let xml = document_xml(&format!("{P_NO_PPR}{P_JC}{P_BOLD_MARK}"));
+    let fixture = package(&[("word/document.xml", xml.as_str())]);
+    let a = read_docx(&fixture).context("read mark-selection fixture")?;
+    let doc = &a.document;
+    let all = doc.range_targets_with_end_mark(&at(0, 0), &at(2, 5), true);
+    let edited = doc.apply_style_targets(&all, eight_pt());
+    let bytes = save_both(&a, &edited)?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?)?;
+    /* Each paragraph: its source `<w:p>` start tag, the pPr it now has, and
+    its one run with the size inserted. */
+    let para = |id: &str, ppr: &str, text: &str| {
+        format!(
+            r#"<w:p w14:paraId="{id}"><w:pPr>{ppr}</w:pPr><w:r><w:rPr>{SZ8}</w:rPr><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    };
+    let want = document_xml(
+        &[
+            para("0B100001", &format!("<w:rPr>{SZ8}</w:rPr>"), "first"),
+            para(
+                "0B100002",
+                &format!(r#"<w:jc w:val="center"/><w:rPr>{SZ8}</w:rPr>"#),
+                "second",
+            ),
+            para("0B100003", &format!("<w:rPr><w:b/>{SZ8}</w:rPr>"), "third"),
+        ]
+        .concat(),
+    );
+    if out != want {
+        bail!(
+            "select all -> 8 pt is not source + insertions:\n--- expected ---\n{want}\n--- got ---\n{out}"
+        );
+    }
+    let back = read_docx(&bytes).context("re-read select all")?;
+    for i in 0..3 {
+        let p = back
+            .document
+            .nth_paragraph(i)
+            .context("re-read paragraph")?;
+        let mark = p.mark_style.as_deref().context("mark re-read")?;
+        if mark.font_size != Some(8.0) || p.style_at(0).font_size != Some(8.0) {
+            bail!("paragraph {i}: mark {mark:?}, text {:?}", p.style_at(0));
+        }
+    }
+    let third = back.document.nth_paragraph(2).context("third")?;
+    if third.mark_style.as_deref().and_then(|m| m.bold) != Some(true) {
+        bail!("the bold mark lost its bold: {:?}", third.mark_style);
+    }
+    println!(
+        "[roundtrip] step 65a OK — select all -> 8 pt writes every mark's size as pure insertions and re-reads it"
+    );
+
+    let text_only = doc.apply_style(at(1, 0), at(1, 6), eight_pt());
+    let bytes = save_both(&a, &text_only)?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?)?;
+    let want = xml.replacen(
+        "<w:r><w:t>second</w:t></w:r>",
+        &format!("<w:r><w:rPr>{SZ8}</w:rPr><w:t>second</w:t></w:r>"),
+        1,
+    );
+    if out != want {
+        bail!("a selection stopping at the last character touched the mark:\n{out}");
+    }
+    let back = read_docx(&bytes).context("re-read text-only")?;
+    if back
+        .document
+        .nth_paragraph(1)
+        .context("second")?
+        .mark_style
+        .is_some()
+    {
+        bail!("the unselected mark gained formatting");
+    }
+    println!(
+        "[roundtrip] step 65b OK — a selection that stops at the last character leaves the mark's bytes"
+    );
+    Ok(())
+}
+
 /* ================================= sibling namespace prefixes (#394) ==== */
 
 const NS_W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
