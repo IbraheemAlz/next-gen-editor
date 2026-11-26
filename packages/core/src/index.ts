@@ -235,3 +235,14 @@ export type {
     RendererDowngradeReason,
     CommentHighlight,
 } from './types';
+
+/* Issue #312 - a zoom keeps the caret (or the viewport centre) where it is:
+ * the host mounts `createZoomAnchor`; `cmd.setZoom` is the one trigger. */
+export { createZoomAnchor, beginZoomAnchor } from './createZoomAnchor';
+export type { ZoomAnchorOptions } from './createZoomAnchor';
+export {
+    anchoredScrollTop,
+    captureAnchor,
+    chooseAnchorPoint,
+} from './zoomAnchor';
+export type { AnchorView, PageSpan, VerticalBox, ZoomAnchor, ZoomAnchorKind } from './zoomAnchor';

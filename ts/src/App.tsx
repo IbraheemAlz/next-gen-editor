@@ -15,6 +15,7 @@ import { ImageHandlesOverlay } from './components/ImageHandlesOverlay';
 import { StoryModeOverlay } from './components/StoryModeOverlay';
 import { HiddenInput } from './components/HiddenInput';
 import { CaretReveal } from './components/CaretReveal';
+import { ZoomAnchor } from './components/ZoomAnchor';
 import { CommentHighlights } from '@nge/ui';
 import { SdkShelf } from './sdk-bridge';
 import { AccessibilityTree } from './components/AccessibilityTree';
@@ -378,6 +379,8 @@ export function App() {
                     {/* Issue #387 — keyboard-driven caret moves scroll the
                         caret into view (pointer clicks never do). */}
                     <CaretReveal store={store} viewport={() => viewportEl} />
+                    {/* Issue #312 - a zoom keeps the caret (or the viewport centre) in place. */}
+                    <ZoomAnchor store={store} viewport={() => viewportEl} />
                     {/* Phase 6c multi-canvas DOM — one `.editor-page` per
                         paginated page. Page 0 hosts the boot canvas (the
                         engine's INIT surface + selection / caret overlays

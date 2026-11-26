@@ -23,6 +23,7 @@
  */
 import { useEngine, useDocumentDefaults, type EngineHandle } from './EngineProvider';
 import { clearOpenWarnings, createEditorState, type EditorState } from './createEditorState';
+import { beginZoomAnchor } from './createZoomAnchor';
 import type {
     Command,
     Event,
@@ -659,7 +660,13 @@ function build(
         requestPaint: (viewport, dirty) =>
             dispatch({ type: 'REQUEST_PAINT', viewport, dirty }),
 
-        setZoom: (scale) => dispatch({ type: 'SET_ZOOM', scale }),
+        /* Issue #312 - the ONE place a user zoom is requested: a host that
+           scrolls (`createZoomAnchor`) remembers what the user looks at
+           before the page cards resize, and puts it back after the repaint. */
+        setZoom: (scale) => {
+            beginZoomAnchor(engine, scale);
+            return dispatch({ type: 'SET_ZOOM', scale });
+        },
         setDeviceScale: (scale) => dispatch({ type: 'SET_DEVICE_SCALE', scale }),
         setViewport: (rect) => dispatch({ type: 'SET_VIEWPORT', rect }),
         expandLayout: (target_y) => dispatch({ type: 'EXPAND_LAYOUT', target_y }),
