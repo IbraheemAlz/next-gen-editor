@@ -1090,6 +1090,24 @@ struct LineGeom {
     hit_width: f32,
     y_top: f32,
     height: f32,
+    /// Issues #568 / #572 (cursor memo §2) — the line's vertical HIT band,
+    /// `band_top ..= band_bottom`: its box grown over the space its
+    /// paragraph owns. A line on the first row of its paragraph reaches up
+    /// over the paragraph's applied space-before — in a table cell, up to
+    /// the cell's top edge — and a line on its last row down over the
+    /// space-after (to the cell's bottom edge), so a click in that space
+    /// resolves to this paragraph, not to whichever line is nearest. Every
+    /// other line's band is its box. Bands of one container never overlap
+    /// ([`block_hit_claims`]).
+    band_top: f32,
+    band_bottom: f32,
+    /// Issue #568 — the table cells enclosing the line, outermost first
+    /// (one per `Cell` step of `path`, in order): each cell's border box
+    /// (a vertical merge's restart cell spans the merged rows, a
+    /// `<w:bidiVisual>` table's cells are already mirrored by the layout).
+    /// [`nearest_line`] resolves the innermost cell under the pointer
+    /// first, and only then a line inside it. Empty outside tables.
+    cells: Vec<HitRect>,
     /// Issue #557 — the line's baseline in absolute coords
     /// (`y_top + LineBox::baseline`). The caret hangs off it: its top is
     /// the baseline minus the caret run's ascent, never the line box's top
@@ -1109,6 +1127,24 @@ struct LineGeom {
     /// Per-`VisualRun` geometry, in visual order. Selection rectangles clip
     /// the selected byte range against each run (Backlog #7).
     runs: Vec<RunGeom>,
+}
+
+/// Issue #568 — an axis-aligned rectangle in absolute page coordinates
+/// (device px): a table cell's border box, as hit-testing sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HitRect {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl HitRect {
+    /// Half-open, so a point on the edge two cells share belongs to one
+    /// of them only (the right / lower one).
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
 }
 
 /// One `VisualRun` flattened — its source byte span plus its caret slots. A
@@ -6634,15 +6670,26 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32, faces: &FaceMap) -> Vec<
     runs
 }
 
-/// Vertical distance from `y` to a line's band; `0.0` when inside it.
-fn line_y_dist(line: &LineGeom, y: f32) -> f32 {
-    if y < line.y_top {
-        line.y_top - y
-    } else if y > line.y_top + line.height {
-        y - line.y_top - line.height
+/// Distance from `v` to the closed interval `[lo, hi]`; `0.0` inside it.
+fn interval_dist(v: f32, lo: f32, hi: f32) -> f32 {
+    if v < lo {
+        lo - v
+    } else if v > hi {
+        v - hi
     } else {
         0.0
     }
+}
+
+/// Vertical distance from `y` to a line's box; `0.0` when inside it.
+fn line_y_dist(line: &LineGeom, y: f32) -> f32 {
+    interval_dist(y, line.y_top, line.y_top + line.height)
+}
+
+/// Issue #572 — vertical distance from `y` to a line's HIT band (its box
+/// grown over the paragraph spacing / cell space it owns); `0.0` inside.
+fn band_y_dist(line: &LineGeom, y: f32) -> f32 {
+    interval_dist(y, line.band_top, line.band_bottom)
 }
 
 /// Horizontal distance from `x` to a line's hit-target rectangle;
@@ -6660,46 +6707,200 @@ fn line_x_dist(line: &LineGeom, x: f32) -> f32 {
     }
 }
 
-/// The line nearest `(x, y)` — the rectangle containing it, else
-/// the closest by y then x. y dominates because lines stack
-/// vertically; x only matters when multiple lines share the same
-/// y-band (cells in a table row).
-fn nearest_line(geom: &[LineGeom], x: f32, y: f32) -> Option<&LineGeom> {
-    geom.iter().min_by(|a, b| {
-        let ya = line_y_dist(a, y);
-        let yb = line_y_dist(b, y);
-        ya.total_cmp(&yb)
-            .then_with(|| line_x_dist(a, x).total_cmp(&line_x_dist(b, x)))
-    })
+/// Issue #568 — the index in `line.path.steps` of the `Cell` step of
+/// table nesting `level` (0 = the outermost table): the step that
+/// `line.cells[level]` is the rectangle of.
+fn cell_step_index(line: &LineGeom, level: usize) -> Option<usize> {
+    line.path
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, BridgePathStep::Cell { .. }))
+        .nth(level)
+        .map(|(i, _)| i)
 }
 
-/// Flatten one `ParagraphBox` into `LineGeom`s stamped with `path`.
-/// `container_left` / `container_width` define the horizontal
-/// hit-target rectangle each emitted line carries — usually the
-/// containing cell's left edge + content width, or the page content
-/// area for top-level paragraphs. Without this rectangle, multiple
-/// cells in the same row share `y_top` and the first-emitted line
-/// always wins (clicks in column C land in column 0). Issue #557 —
-/// `faces` measures each run's caret extent.
-// The eighth argument is the face map (#557): the frame (origin + hit
-// rectangle), the path and the sink are each independent inputs every
-// caller passes, and bundling any two would only rename them.
-#[allow(clippy::too_many_arguments)]
+/// The line a pointer at `(x, y)` resolves to — the ONE resolution behind
+/// a click, a drag, a double / triple / quadruple click (cursor memo §2).
+///
+/// 1. **The cell first** (issue #568). When the point lies inside a table
+///    cell's border box (`LineGeom::cells`, the merged extent for a
+///    vertical merge, mirrored for a `<w:bidiVisual>` table), only lines
+///    inside the INNERMOST such cell remain candidates. A click in the
+///    empty lower part of a short cell therefore stays in that cell even
+///    when its taller neighbour has a line at that height. A point over no
+///    cell (beside a table, in a gap between cells, beside a nested table
+///    inside its host cell) keeps every line of the enclosing level, and
+///    the y-then-x order below picks the cell of the row nearest to it.
+///    Innermost, not "descend from the outermost": a nested table that
+///    autofit laid out wider than its host cell paints its overflowing
+///    cells over the host's neighbour, and a click on them still reaches
+///    them (issue #377).
+/// 2. **Then the line**, by the hit band (issue #572): the band holding
+///    `y` wins — a paragraph owns its space-before / space-after, a cell's
+///    first / last line the cell space above / below its text — else the
+///    band nearest by `y`; `x` (the line's hit rectangle: its cell, its
+///    column, its float-cut segment) separates lines whose bands are
+///    equally near, and the line box itself breaks what is still tied.
+fn nearest_line(geom: &[LineGeom], x: f32, y: f32) -> Option<&LineGeom> {
+    /* The candidates share this path prefix: the steps down to (and
+    including) the `Cell` step of the innermost cell holding the point. */
+    let mut scope: &[BridgePathStep] = &[];
+    let mut depth = 0usize;
+    for l in geom {
+        for (level, cell) in l.cells.iter().enumerate().skip(depth).rev() {
+            if cell.contains(x, y)
+                && let Some(step) = cell_step_index(l, level)
+            {
+                scope = &l.path.steps[..=step];
+                depth = level + 1;
+                break;
+            }
+        }
+    }
+    geom.iter()
+        .filter(|l| l.path.steps.starts_with(scope))
+        .min_by(|a, b| {
+            band_y_dist(a, y)
+                .total_cmp(&band_y_dist(b, y))
+                .then_with(|| line_x_dist(a, x).total_cmp(&line_x_dist(b, x)))
+                .then_with(|| line_y_dist(a, y).total_cmp(&line_y_dist(b, y)))
+        })
+}
+
+/// Where [`collect_paragraph_line_geom`] puts a paragraph box's lines and
+/// what they hit-test over.
+struct LineFrame<'a> {
+    /// Absolute origin of the space the box's `origin` is relative to.
+    x: f32,
+    y: f32,
+    /// The horizontal hit rectangle (`hit_left`, `hit_width`) of every
+    /// line not cut by a float: the containing cell's border box, the
+    /// paragraph's column for a body paragraph, the band / note / box
+    /// width in a story. Without it, sibling cells (and columns) share
+    /// `y_top` and the first-emitted line always wins — clicks in column C
+    /// landed in column 0.
+    left: f32,
+    width: f32,
+    /// Issue #572 — `(above, below)`: how far beyond its box the paragraph
+    /// owns the flow ([`block_hit_claims`]); it grows the hit band of its
+    /// first / last row.
+    claim: (f32, f32),
+    /// Issue #568 — the enclosing table cells, outermost first
+    /// ([`LineGeom::cells`]).
+    cells: &'a [HitRect],
+}
+
+/// The `(above, below)` claim of a block that owns nothing beyond its box.
+const NO_CLAIM: (f32, f32) = (0.0, 0.0);
+
+/// Issue #572 (cursor memo §2, "Body block") — how far each block of ONE
+/// flow container owns the space around its box, `(above, below)` in
+/// layout px, in `blocks` order. A paragraph owns its applied space-before
+/// above its box and its applied space-after below it: the block a click
+/// in a gap belongs to is "the one whose next sibling starts below y", and
+/// a paragraph starts at its space-before. A table owns nothing (its cells
+/// tile it, see `LineGeom::cells`).
+///
+/// `container` is the vertical extent the blocks were stacked in, in their
+/// own coordinates, when they fill it edge to edge (a table cell: its
+/// first block also owns the cell above it — top padding, a `vAlign`
+/// offset — and its last block the cell below it); `None` for a page's
+/// flow, where only spacing is owned.
+///
+/// A box does not always carry the spacing the paginator applied (a block
+/// that moved to a fresh column opens it without its `before`), so a
+/// claim never reaches past the neighbouring block of the same column: a
+/// block's neighbours are the nearest earlier / later blocks whose
+/// horizontal extent overlaps its own (blocks of another column sit beside
+/// it), and of the gap between two neighbours the upper block's
+/// space-after is served first.
+fn block_hit_claims(blocks: &[LayoutBlock], container: Option<(f32, f32)>) -> Vec<(f32, f32)> {
+    /* `[x0, x1)` x `[top, bottom]` of each box. */
+    let extent = |b: &LayoutBlock| {
+        let (o, s) = (b.origin(), b.size());
+        (o.x, o.x + s.width, o.y, o.y + s.height)
+    };
+    let spacing = |b: &LayoutBlock| {
+        let clean = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
+        match b {
+            LayoutBlock::Paragraph(p) => (clean(p.flow.space_before), clean(p.flow.space_after)),
+            LayoutBlock::Table(_) => NO_CLAIM,
+        }
+    };
+    let boxes: Vec<(f32, f32, f32, f32)> = blocks.iter().map(extent).collect();
+    let beside = |a: usize, b: usize| boxes[a].0 < boxes[b].1 && boxes[b].0 < boxes[a].1;
+    let n = boxes.len();
+    let mut below = vec![0.0_f32; n];
+    for i in 0..n {
+        let after = spacing(&blocks[i]).1;
+        let bottom = boxes[i].3;
+        below[i] = match (i + 1..n).find(|&k| beside(i, k)) {
+            Some(k) => (boxes[k].2 - bottom).max(0.0).min(after),
+            None => match container {
+                Some((_, end)) => (end - bottom).max(0.0),
+                None => after,
+            },
+        };
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let before = spacing(&blocks[i]).0;
+        let top = boxes[i].2;
+        let above = match (0..i).rev().find(|&j| beside(i, j)) {
+            Some(j) => (top - boxes[j].3 - below[j]).max(0.0).min(before),
+            None => match container {
+                Some((start, _)) => (top - start).max(0.0),
+                None => before.min(top.max(0.0)),
+            },
+        };
+        out.push((above, below[i].max(0.0)));
+    }
+    out
+}
+
+/// Flatten one `ParagraphBox` into `LineGeom`s stamped with `path`, placed
+/// and hit-tested by `frame`. Issue #557 — `faces` measures each run's
+/// caret extent.
 fn collect_paragraph_line_geom(
     para_box: &ParagraphBox,
-    parent_origin_x: f32,
-    parent_origin_y: f32,
-    container_left: f32,
-    container_width: f32,
+    frame: &LineFrame<'_>,
     path: &BridgeBlockPath,
     faces: &FaceMap,
     out: &mut Vec<LineGeom>,
 ) {
-    let para_x = parent_origin_x + para_box.origin.x;
-    let para_y = parent_origin_y + para_box.origin.y;
+    let para_x = frame.x + para_box.origin.x;
+    let para_y = frame.y + para_box.origin.y;
+    /* Issue #572 — the paragraph's hit extent: its box plus the spacing
+    (cell space) it owns. Its first row of lines reaches up to the top,
+    its last row down to the bottom (a row: every segment of a band cut by
+    a float shares it). */
+    let claim_top = para_y - frame.claim.0;
+    let claim_bottom = para_y + para_box.size.height + frame.claim.1;
+    let first_row = para_box
+        .lines
+        .iter()
+        .map(|l| l.origin.y)
+        .fold(f32::INFINITY, f32::min);
+    let last_row = para_box
+        .lines
+        .iter()
+        .map(|l| l.origin.y + l.height)
+        .fold(f32::NEG_INFINITY, f32::max);
     for line in &para_box.lines {
         let line_x = para_x + line.origin.x;
         let line_y = para_y + line.origin.y;
+        let line_bottom = line_y + line.height;
+        let band_top = if line.origin.y <= first_row + 0.5 {
+            line_y.min(claim_top)
+        } else {
+            line_y
+        };
+        let band_bottom = if line.origin.y + line.height >= last_row - 0.5 {
+            line_bottom.max(claim_bottom)
+        } else {
+            line_bottom
+        };
         /* Empty lines (a trailing / doubled soft-break placeholder) carry no
         runs, so fall back to the layout-supplied `source_start` instead of
         byte 0. Without this the line reports [0, 0]; a caret at
@@ -6728,7 +6929,7 @@ fn collect_paragraph_line_geom(
         belongs to no line; `nearest_line` snaps it to the closer one. */
         let (hit_left, hit_width) = match line.segment_range() {
             Some(seg) => (para_x + seg.x0, seg.width()),
-            None => (container_left, container_width),
+            None => (frame.left, frame.width),
         };
         out.push(LineGeom {
             path: path.clone(),
@@ -6737,6 +6938,9 @@ fn collect_paragraph_line_geom(
             hit_width,
             y_top: line_y,
             height: line.height,
+            band_top,
+            band_bottom,
+            cells: frame.cells.to_vec(),
             baseline: line_y + line.baseline,
             start_byte,
             end_byte,
@@ -6766,20 +6970,23 @@ fn collect_table_line_geom(
         }],
         table_origin_x,
         table_origin_y,
-        0,
+        &[],
         faces,
         out,
     );
 }
 
-/// Issue #377 — [`collect_table_line_geom`] for a table at nesting
-/// `level` (0 = the outermost table of its story) whose path is
-/// `table_path`. A table nested in a cell recurses with its origin
-/// accumulated onto the cell's (the renderer's own walk: cell origin +
-/// the inner table's `origin`, which carries its cell-local stacking
-/// and `place_table` offset) and its path extended by
-/// `[Cell{r,c}, Block(b)]`, so a click inside it resolves to the inner
-/// paragraph instead of the nearest outer-cell line.
+/// Issue #377 — [`collect_table_line_geom`] for a table whose path is
+/// `table_path`, nested in the cells `enclosing` (outermost first; its
+/// nesting level is their count, 0 = the outermost table of its story).
+/// Issue #568 — every line also carries the rectangles of its cells, the
+/// enclosing ones plus its own ([`LineGeom::cells`]), and the cell's first
+/// / last line own the cell space above / below the text. A table nested
+/// in a cell recurses with its origin accumulated onto the cell's (the
+/// renderer's own walk: cell origin + the inner table's `origin`, which
+/// carries its cell-local stacking and `place_table` offset) and its path
+/// extended by `[Cell{r,c}, Block(b)]`, so a click inside it resolves to
+/// the inner paragraph instead of the nearest outer-cell line.
 ///
 /// Bounded by the layout's nesting cap: only tables at a level below
 /// [`MAX_TABLE_LAYOUT_DEPTH`] are grids, so the recursion is at most
@@ -6795,11 +7002,12 @@ fn collect_table_line_geom_at(
     table_path: &[BridgePathStep],
     table_origin_x: f32,
     table_origin_y: f32,
-    level: u32,
+    enclosing: &[HitRect],
     faces: &FaceMap,
     out: &mut Vec<LineGeom>,
 ) {
-    if level + 1 >= MAX_TABLE_LAYOUT_DEPTH {
+    let level = u32::try_from(enclosing.len()).unwrap_or(u32::MAX);
+    if level.saturating_add(1) >= MAX_TABLE_LAYOUT_DEPTH {
         return;
     }
     for row in &table_box.rows {
@@ -6820,6 +7028,25 @@ fn collect_table_line_geom_at(
             glyphs — and a nested table would compound that per level. */
             let content_x = cell_x + cell.padding_left;
             let content_y = cell_y + cell.padding_top;
+            /* Issue #568 — the cell's border box (a restart cell's
+            `size.height` already spans its vertical merge), pushed onto
+            the enclosing chain for everything inside it. */
+            let mut cells = Vec::with_capacity(enclosing.len() + 1);
+            cells.extend_from_slice(enclosing);
+            cells.push(HitRect {
+                x0: cell_x,
+                y0: cell_y,
+                x1: cell_x + cell.size.width,
+                y1: cell_y + cell.size.height,
+            });
+            /* Issue #568 — the cell's blocks fill it: the first owns the
+            cell above its text (top padding, a `vAlign` offset), the last
+            the cell below it, so a click low in a short cell lands on its
+            last line. Content coordinates, like the blocks' origins. */
+            let claims = block_hit_claims(
+                &cell.content,
+                Some((-cell.padding_top, cell.size.height - cell.padding_top)),
+            );
             for (block_idx, content) in cell.content.iter().enumerate() {
                 let mut steps = Vec::with_capacity(table_path.len() + 2);
                 steps.extend_from_slice(table_path);
@@ -6836,14 +7063,18 @@ fn collect_table_line_geom_at(
                 match content {
                     LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
                         para_box,
-                        content_x,
-                        content_y,
-                        /* Hit-target = the entire cell rectangle, so a
-                        click anywhere in the cell lands on this
-                        paragraph's lines — not the leftmost cell that
-                        happens to share `y_top`. */
-                        cell_x,
-                        cell.size.width,
+                        &LineFrame {
+                            x: content_x,
+                            y: content_y,
+                            /* Hit-target = the entire cell rectangle, so
+                            a click anywhere in the cell lands on this
+                            paragraph's lines — not the leftmost cell that
+                            happens to share `y_top`. */
+                            left: cell_x,
+                            width: cell.size.width,
+                            claim: claims.get(block_idx).copied().unwrap_or(NO_CLAIM),
+                            cells: &cells,
+                        },
                         &BridgeBlockPath { steps },
                         faces,
                         out,
@@ -6853,7 +7084,7 @@ fn collect_table_line_geom_at(
                         &steps,
                         content_x + inner.origin.x,
                         content_y + inner.origin.y,
-                        level + 1,
+                        &cells,
                         faces,
                         out,
                     ),
@@ -14221,15 +14452,20 @@ impl Engine {
             } else {
                 page.footer_band_top()
             };
+        let claims = block_hit_claims(&band.blocks, None);
         for (i, band_block) in band.blocks.iter().enumerate() {
             match band_block {
                 LayoutBlock::Paragraph(para_box) => {
                     collect_paragraph_line_geom(
                         para_box,
-                        content_x,
-                        band_top,
-                        content_x,
-                        content_w,
+                        &LineFrame {
+                            x: content_x,
+                            y: band_top,
+                            left: content_x,
+                            width: content_w,
+                            claim: claims.get(i).copied().unwrap_or(NO_CLAIM),
+                            cells: &[],
+                        },
                         &BridgeBlockPath {
                             steps: vec![BridgePathStep::Block { idx: i as u32 }],
                         },
@@ -14424,20 +14660,33 @@ impl Engine {
         for (pi, page) in pages.iter().enumerate() {
             let content_x = page.margins.left;
             let content_y = page_top + page.margins.top;
-            let content_w = page.size.width - page.margins.left - page.margins.right;
             let paths = page_paths.get(pi).map(|v| v.as_slice()).unwrap_or(&[]);
+            /* Issue #572 — the spacing each block owns (memo §2). */
+            let claims = block_hit_claims(&page.blocks, None);
             for (i, layout_block) in page.blocks.iter().enumerate() {
                 let Some(path) = paths.get(i) else {
                     continue;
                 };
                 match layout_block {
                     LayoutBlock::Paragraph(para_box) => {
+                        /* The hit rectangle is the paragraph's COLUMN (its
+                        box: the paginator places it at the column's x and
+                        lays it out at the column's width) — the page's
+                        content width when the section has one column. Two
+                        columns' lines share `y_top`; with a page-wide
+                        rectangle the first-emitted column took every
+                        click (memo §2: the column by x, split at the
+                        middle of the gap). */
                         collect_paragraph_line_geom(
                             para_box,
-                            content_x,
-                            content_y,
-                            content_x,
-                            content_w,
+                            &LineFrame {
+                                x: content_x,
+                                y: content_y,
+                                left: content_x + para_box.origin.x,
+                                width: para_box.size.width,
+                                claim: claims.get(i).copied().unwrap_or(NO_CLAIM),
+                                cells: &[],
+                            },
                             &engine_to_bridge_path(path.clone()),
                             &self.fonts,
                             &mut geom,
@@ -16613,6 +16862,7 @@ impl Engine {
                     }
                     let entry_top = page_top + band.y + entry.origin.y;
                     let entry_x = content_x + entry.origin.x;
+                    let claims = block_hit_claims(&entry.blocks, None);
                     for (j, block) in entry.blocks.iter().enumerate() {
                         let idx = entry.first_block_index + j as u32;
                         if idx >= story_len {
@@ -16621,10 +16871,14 @@ impl Engine {
                         match block {
                             LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
                                 para_box,
-                                entry_x,
-                                entry_top,
-                                entry_x,
-                                content_w,
+                                &LineFrame {
+                                    x: entry_x,
+                                    y: entry_top,
+                                    left: entry_x,
+                                    width: content_w,
+                                    claim: claims.get(j).copied().unwrap_or(NO_CLAIM),
+                                    cells: &[],
+                                },
                                 &BridgeBlockPath {
                                     steps: vec![BridgePathStep::Block { idx }],
                                 },
@@ -16929,15 +17183,20 @@ impl Engine {
                     tb = ntb;
                     size = n_size;
                 }
+                let claims = block_hit_claims(&tb.blocks, None);
                 for (j, block) in tb.blocks.iter().enumerate() {
                     let idx = j as u32;
                     match block {
                         LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
                             para_box,
-                            cx,
-                            cy,
-                            cx,
-                            size.width,
+                            &LineFrame {
+                                x: cx,
+                                y: cy,
+                                left: cx,
+                                width: size.width,
+                                claim: claims.get(j).copied().unwrap_or(NO_CLAIM),
+                                cells: &[],
+                            },
                             &BridgeBlockPath {
                                 steps: vec![BridgePathStep::Block { idx }],
                             },
@@ -21834,6 +22093,9 @@ mod tests {
             hit_width: 100.0,
             y_top: 5.0,
             height: 20.0,
+            band_top: 5.0,
+            band_bottom: 25.0,
+            cells: Vec::new(),
             baseline: 21.0,
             start_byte: 0,
             end_byte: 8,
@@ -21877,6 +22139,9 @@ mod tests {
             hit_width: 100.0,
             y_top: 5.0,
             height: 20.0,
+            band_top: 5.0,
+            band_bottom: 25.0,
+            cells: Vec::new(),
             baseline: 21.0,
             start_byte: 0,
             end_byte: 4,
@@ -21914,6 +22179,9 @@ mod tests {
             hit_width,
             y_top: 100.0,
             height: 24.0,
+            band_top: 100.0,
+            band_bottom: 124.0,
+            cells: Vec::new(),
             baseline: 119.2,
             start_byte: 0,
             end_byte: 0,
@@ -22749,6 +23017,9 @@ mod tests {
             hit_width: 100.0,
             y_top: 0.0,
             height: 20.0,
+            band_top: 0.0,
+            band_bottom: 20.0,
+            cells: Vec::new(),
             baseline: 16.0,
             start_byte: 0,
             end_byte: 8,
@@ -33498,3 +33769,8 @@ mod nav_cursor_tests;
 /// word-move classes, the empty IME commit).
 #[cfg(test)]
 mod text_cursor_tests;
+
+/// Issues #568 / #572 — a click resolves to the table cell under it first,
+/// and paragraph spacing belongs to its paragraph (cursor memo §2).
+#[cfg(test)]
+mod click_hit_tests;
