@@ -21,6 +21,7 @@ import {
     createEditorState,
     type Color,
 } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './ParagraphControls.css';
 
 const SPACINGS: { label: string; value: number }[] = [
@@ -46,6 +47,11 @@ export const ParagraphControls: Component = () => {
     const [shadingHex, setShadingHex] = createSignal('');
 
     const ready = createMemo(() => state.selection() !== undefined);
+    /* Issue #449 - indent / spacing / shading are refused by every
+       protection mode (no tracked-change record for paragraph props). */
+    const indentGate = protectionGate(state, 'increaseIndent', 'decreaseIndent');
+    const spacingGate = protectionGate(state, 'setLineSpacing');
+    const shadingGate = protectionGate(state, 'setParagraphShading');
     /* Story editing v2 (#72) lifted the engine's story-mode gate for
      * every `Command::SetParagraph*` variant this shelf dispatches. */
 
@@ -81,8 +87,8 @@ export const ParagraphControls: Component = () => {
                     class="nge-btn nge-btn--icon nge-pcontrols__icon"
                     type="button"
                     aria-label="Decrease indent"
-                    title="Decrease indent"
-                    disabled={!ready()}
+                    title={indentGate.title('Decrease indent')}
+                    disabled={!ready() || indentGate.locked()}
                     onClick={() => void dec()}
                 >
                     ⇤
@@ -91,8 +97,8 @@ export const ParagraphControls: Component = () => {
                     class="nge-btn nge-btn--icon nge-pcontrols__icon"
                     type="button"
                     aria-label="Increase indent"
-                    title={`Increase indent (${INDENT_STEP_PT} pt step)`}
-                    disabled={!ready()}
+                    title={indentGate.title(`Increase indent (${INDENT_STEP_PT} pt step)`)}
+                    disabled={!ready() || indentGate.locked()}
                     onClick={() => void inc()}
                 >
                     ⇥
@@ -104,8 +110,8 @@ export const ParagraphControls: Component = () => {
                 <select
                     class="nge-pcontrols__select"
                     aria-label="Line spacing"
-                    title="Line spacing"
-                    disabled={!ready()}
+                    title={spacingGate.title('Line spacing')}
+                    disabled={!ready() || spacingGate.locked()}
                     value={spacing().toString()}
                     onChange={(e) =>
                         void applySpacing(parseFloat(e.currentTarget.value))
@@ -122,8 +128,8 @@ export const ParagraphControls: Component = () => {
                     class="nge-pcontrols__color"
                     type="color"
                     aria-label="Paragraph shading colour"
-                    title="Paragraph shading colour"
-                    disabled={!ready()}
+                    title={shadingGate.title('Paragraph shading colour')}
+                    disabled={!ready() || shadingGate.locked()}
                     value={shadingHex() || '#ffffff'}
                     /* `onChange` fires once on commit; `onInput` would
                      * dispatch a SetParagraphShading on every cursor
@@ -136,8 +142,8 @@ export const ParagraphControls: Component = () => {
                     class="nge-btn nge-btn--icon nge-pcontrols__icon"
                     type="button"
                     aria-label="Clear paragraph shading"
-                    title="Clear paragraph shading"
-                    disabled={!ready() || shadingHex() === ''}
+                    title={shadingGate.title('Clear paragraph shading')}
+                    disabled={!ready() || shadingGate.locked() || shadingHex() === ''}
                     onClick={() => void clearShading()}
                 >
                     ⌫

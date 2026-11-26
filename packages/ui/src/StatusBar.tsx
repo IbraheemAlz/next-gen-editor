@@ -24,6 +24,7 @@ import { createEditorCommands, createEditorState } from '@nge/core';
 import { ZoomControls } from './ZoomControls';
 import { SettingsMenu } from './SettingsMenu';
 import { ProtectionBadge } from './ProtectionBadge';
+import { protectionGate } from './protectionGate';
 import './StatusBar.css';
 
 const LANGUAGES: { value: string; label: string }[] = [
@@ -47,6 +48,9 @@ export interface StatusBarProps {
 export const StatusBar: Component<StatusBarProps> = (props) => {
     const cmd = createEditorCommands();
     const state = createEditorState();
+    /* Issue #449 - the language is character formatting (APPLY_FORMATTING),
+       refused by read-only / comments-only / forms protection. */
+    const languageGate = protectionGate(state, 'applyAttrs');
     const [lang, setLang] = createSignal('en-US');
 
     /* Poll stats so the counts update as the user types. The DevHud
@@ -72,7 +76,7 @@ export const StatusBar: Component<StatusBarProps> = (props) => {
 
     const applyLanguage = async (v: string) => {
         setLang(v);
-        if (!state.selection()) return;
+        if (!state.selection() || languageGate.locked()) return;
         await cmd.applyAttrs({ language: v });
     };
 
@@ -109,6 +113,8 @@ export const StatusBar: Component<StatusBarProps> = (props) => {
                     <select
                         class="nge-statusbar__select"
                         aria-label="Language"
+                        disabled={languageGate.locked()}
+                        title={languageGate.title('Language')}
                         value={lang()}
                         onChange={(e) => void applyLanguage(e.currentTarget.value)}
                     >

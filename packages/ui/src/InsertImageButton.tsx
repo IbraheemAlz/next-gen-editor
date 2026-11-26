@@ -18,6 +18,7 @@ import {
     type ImageFit,
     type ImageBlob,
 } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './InsertImageButton.css';
 
 const ACCEPT = 'image/png,image/jpeg,image/gif,image/webp';
@@ -70,6 +71,8 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
     const cmd = createEditorCommands();
     const state = createEditorState();
     const inStory = () => state.editingStory() !== undefined;
+    /* Issue #449 - INSERT_IMAGE is refused by every protection mode. */
+    const gate = protectionGate(state, 'insertImageAtCaret');
     const [busy, setBusy] = createSignal(false);
     /* Issue #44 — a user-chosen fit mode at insert time (the enum always
        existed on `Command::InsertImage` but no UI ever set it). */
@@ -77,7 +80,7 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
     let inputEl: HTMLInputElement | undefined;
 
     const onPick = async (file: File) => {
-        if (inStory()) return;
+        if (inStory() || gate.locked()) return;
         setBusy(true);
         try {
             const bytes = new Uint8Array(await file.arrayBuffer());
@@ -102,11 +105,10 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
                 type="button"
                 aria-label="Insert image"
                 title={
-                    inStory()
-                        ? 'Not available while editing a header or footer'
-                        : 'Insert image'
+                    gate.refusal()?.title ??
+                    (inStory() ? 'Not available while editing a header or footer' : 'Insert image')
                 }
-                disabled={busy() || inStory()}
+                disabled={busy() || inStory() || gate.locked()}
                 onClick={() => inputEl?.click()}
             >
                 <span class="nge-insert-image__icon" aria-hidden="true">🖼</span>
@@ -116,11 +118,12 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
                 class="nge-insert-image__fit"
                 aria-label="Image fit mode"
                 title={
-                    inStory()
+                    gate.refusal()?.title ??
+                    (inStory()
                         ? 'Not available while editing a header or footer'
-                        : 'Image fit mode'
+                        : 'Image fit mode')
                 }
-                disabled={inStory()}
+                disabled={inStory() || gate.locked()}
                 value={fit()}
                 onChange={(e) => setFit(e.currentTarget.value as ImageFit)}
             >

@@ -9,6 +9,7 @@
  */
 import { createMemo, type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './InsertTableButton.css';
 
 export interface InsertTableButtonProps {
@@ -21,11 +22,13 @@ export const InsertTableButton: Component<InsertTableButtonProps> = (props) => {
     const state = createEditorState();
 
     const ready = createMemo(() => state.selection() !== undefined);
+    /* Issue #449 - INSERT_TABLE is refused by every protection mode. */
+    const gate = protectionGate(state, 'insertTableAtCaret');
     const rows = () => props.rows ?? 3;
     const cols = () => props.cols ?? 3;
 
     const insert = async () => {
-        if (!ready()) return;
+        if (!ready() || gate.locked()) return;
         await cmd.insertTableAtCaret(rows(), cols());
     };
 
@@ -34,8 +37,8 @@ export const InsertTableButton: Component<InsertTableButtonProps> = (props) => {
             class="nge-btn nge-itable"
             type="button"
             aria-label={`Insert ${rows()}×${cols()} table`}
-            title={`Insert ${rows()}×${cols()} table`}
-            disabled={!ready()}
+            title={gate.title(`Insert ${rows()}×${cols()} table`)}
+            disabled={!ready() || gate.locked()}
             onClick={() => void insert()}
         >
             <span class="nge-itable__icon" aria-hidden="true">▦</span>

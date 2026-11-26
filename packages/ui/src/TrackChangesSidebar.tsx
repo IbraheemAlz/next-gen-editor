@@ -21,9 +21,11 @@ import {
 } from 'solid-js';
 import {
     createEditorCommands,
+    createEditorState,
     useEngine,
     type RevisionSnapshot,
 } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import { locationLabel } from './revisionLocation';
 import './TrackChangesSidebar.css';
 
@@ -77,6 +79,11 @@ function fmtDate(iso: string): string {
 export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) => {
     const engine = useEngine();
     const cmd = createEditorCommands();
+    /* Issue #449 - accepting / rejecting a revision is refused by every
+       protection mode (the "Accept all" / "Reject all" buttons of
+       ReviewControls lock for the same reason). */
+    const state = createEditorState();
+    const revisionGate = protectionGate(state, 'acceptRevision', 'rejectRevision');
     const [revisions, setRevisions] = createSignal<RevisionSnapshot[]>([]);
     const [error, setError] = createSignal<string | null>(null);
 
@@ -187,7 +194,8 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
                                         class="nge-btn nge-tc__action nge-tc__action--accept"
                                         type="button"
                                         aria-label="Accept revision"
-                                        title="Accept revision"
+                                        disabled={revisionGate.locked()}
+                                        title={revisionGate.title('Accept revision')}
                                         onClick={() => void accept(rev)}
                                     >
                                         ✓ Accept
@@ -196,7 +204,8 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
                                         class="nge-btn nge-tc__action nge-tc__action--reject"
                                         type="button"
                                         aria-label="Reject revision"
-                                        title="Reject revision"
+                                        disabled={revisionGate.locked()}
+                                        title={revisionGate.title('Reject revision')}
                                         onClick={() => void reject(rev)}
                                     >
                                         ✗ Reject

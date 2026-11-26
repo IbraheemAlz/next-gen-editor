@@ -20,8 +20,10 @@
 import { createRoot, createSignal, onCleanup, type Accessor } from 'solid-js';
 import { caretMoved, type CaretPlacement } from './caretReveal';
 import { useEngine, type EngineHandle } from './EngineProvider';
+import type { EditorCommands } from './createEditorCommands';
 import { errorCommand } from './errorCommand';
 import { layoutCacheStatsFrom, type LayoutCacheStats } from './layoutCaches';
+import { methodRefusal, type ProtectionRefusal } from './protection';
 import type {
     Alignment,
     AttrsMixed,
@@ -198,6 +200,18 @@ export interface EditorState {
      * badge; the engine refuses whatever the mode does not allow.
      */
     protection: Accessor<ProtectionMode | undefined>;
+    /**
+     * Issue #449 — the ONE query a control asks to know whether the open
+     * document's protection (and whether a header / footer / note / text
+     * box story is being edited under it) would refuse what it is about to
+     * dispatch. Name the facade members the control calls; the answer is
+     * the first refusal among the commands they send (derived from the
+     * generated `PROTECTION_ADMITS` table and `FACADE_METHOD_COMMANDS`,
+     * never restated), `undefined` when none would be refused. Reactive: it
+     * reads {@link EditorState.protection} and {@link EditorState.editingStory}.
+     * `refusal.title` is the tooltip for the disabled control.
+     */
+    protectionRefusal: (...methods: (keyof EditorCommands)[]) => ProtectionRefusal | undefined;
     /**
      * Sprint 14 (#14) — engine track-changes recording state.
      * `ReviewControls`'s Track toggle binds its active state to
@@ -788,6 +802,8 @@ export function createEditorState(): EditorState {
         paragraphIndent,
         isTrackingChanges,
         protection,
+        protectionRefusal: (...methods) =>
+            methodRefusal({ mode: protection(), inStory: editingStory() !== undefined }, ...methods),
         paragraphBorders,
         editingStory,
         fieldCodeView,

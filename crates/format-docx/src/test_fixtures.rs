@@ -1261,6 +1261,30 @@ pub fn forms_protected_docx() -> Vec<u8> {
     )
 }
 
+/// Issue #449 — paragraph texts of [`protected_text_docx`], in body order.
+pub const PROTECTED_TEXT_FIXTURE_TEXTS: [&str; 3] = [
+    "This document is protected.",
+    "Its protection is enforced by the editor: the toolbar shows what it refuses.",
+    "Third paragraph, so a selection can span a boundary.",
+];
+
+/// Issue #449 — a three-paragraph document whose `<w:documentProtection>`
+/// enforces `edit` (`readOnly`, `comments`, `trackedChanges` or `forms`).
+/// The shelf must disable every control the mode refuses
+/// (`ts/e2e/protection-controls.spec.ts`); the e2e fixtures
+/// `readonly_protected.docx`, `comments_protected.docx` and
+/// `tracked_protected.docx` are these bytes.
+pub fn protected_text_docx(edit: &str) -> Vec<u8> {
+    let body: String = PROTECTED_TEXT_FIXTURE_TEXTS
+        .iter()
+        .map(|t| format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>"))
+        .collect();
+    protected_docx(
+        &body,
+        &format!("<w:documentProtection w:edit=\"{edit}\" w:enforcement=\"1\"/>"),
+    )
+}
+
 /// Issue #345 — the text of [`encrypted_agile_docx`]'s one paragraph.
 pub const ENCRYPTED_FIXTURE_TEXT: &str = "Top secret: the password is pass.";
 

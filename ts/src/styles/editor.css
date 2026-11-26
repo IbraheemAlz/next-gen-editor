@@ -238,3 +238,13 @@
     overflow: hidden;
     z-index: 1;
 }
+
+/* Issue #449 - a protected document refuses resize / move: the handles
+ * stay (they outline the selection) but are greyed and not draggable. */
+.image-handles[data-locked='true'] .image-handle {
+    opacity: 0.55;
+}
+
+.image-handles[data-locked='true'] .image-body-drag {
+    cursor: not-allowed;
+}

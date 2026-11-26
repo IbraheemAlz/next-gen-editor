@@ -17,6 +17,7 @@ import {
     type Alignment,
     type Direction,
 } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './AlignmentButtons.css';
 
 interface AlignBtn { value: Alignment; label: string; glyph: string }
@@ -40,6 +41,9 @@ export const AlignmentButtons: Component = () => {
     /* Story editing v2 (#72) lifted the engine's story-mode gate for
        SetParagraphAlign / SetParagraphDirection. */
     const ready = () => state.selection() !== undefined;
+    /* Issue #449 - alignment / direction are refused by every protection mode. */
+    const alignGate = protectionGate(state, 'setParagraphAlign');
+    const dirGate = protectionGate(state, 'setParagraphDirection');
     const currentAlign = () => state.paragraphAlignment();
     const currentDir = () => state.paragraphDirection();
 
@@ -53,8 +57,8 @@ export const AlignmentButtons: Component = () => {
                         aria-label={b.label}
                         aria-pressed={currentAlign() === b.value}
                         data-active={currentAlign() === b.value}
-                        title={b.label}
-                        disabled={!ready()}
+                        title={alignGate.title(b.label)}
+                        disabled={!ready() || alignGate.locked()}
                         onClick={() => void cmd.setParagraphAlign(b.value)}
                     >
                         {b.glyph}
@@ -69,8 +73,8 @@ export const AlignmentButtons: Component = () => {
                         aria-label={b.label}
                         aria-pressed={currentDir() === b.value}
                         data-active={currentDir() === b.value}
-                        title={b.label}
-                        disabled={!ready()}
+                        title={dirGate.title(b.label)}
+                        disabled={!ready() || dirGate.locked()}
                         onClick={() => void cmd.setParagraphDirection(b.value)}
                     >
                         {b.glyph}

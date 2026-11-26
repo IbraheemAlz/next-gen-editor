@@ -234,6 +234,38 @@ fn protection_survives_a_save_byte_identically() {
     );
 }
 
+/// Issue #449 - the read-only / comments-only / tracked-changes fixtures
+/// read their mode and text; the e2e copies are current.
+#[test]
+fn protected_text_fixtures_read_their_mode() {
+    for (name, edit, mode) in [
+        (
+            "readonly_protected.docx",
+            "readOnly",
+            ProtectionEdit::ReadOnly,
+        ),
+        (
+            "comments_protected.docx",
+            "comments",
+            ProtectionEdit::Comments,
+        ),
+        (
+            "tracked_protected.docx",
+            "trackedChanges",
+            ProtectionEdit::TrackedChanges,
+        ),
+    ] {
+        let bytes = fx::protected_text_docx(edit);
+        pin_e2e_fixture(name, &bytes);
+        let a = read_docx(&bytes).expect(name);
+        assert_eq!(a.document.protection_mode(), Some(mode), "{name}");
+        let texts: Vec<&str> = (0..3)
+            .map(|i| a.document.paragraph_text(i).unwrap())
+            .collect();
+        assert_eq!(texts, fx::PROTECTED_TEXT_FIXTURE_TEXTS, "{name}");
+    }
+}
+
 /// A content control whose `<w:lock>` locks its content, a disabled form
 /// field and an unprotected section (`<w:formProt w:val="false"/>`).
 #[test]

@@ -110,6 +110,11 @@ export {
     protectionAdmits,
 } from './commandMeta.generated';
 export { COMMAND_FACADE, FACADE_METHOD_COMMANDS } from './facadeMap';
+
+/* Issue #449 - which controls the open document's protection would refuse
+ * (`createEditorState().protectionRefusal(...)` asks `methodRefusal`). */
+export { PROTECTION_MODE_PHRASE, commandRefusal, methodRefusal } from './protection';
+export type { ProtectionContext, ProtectionRefusal, ProtectionRefusalKind } from './protection';
 export type {
     FacadeTarget,
     FacadeMemberTarget,

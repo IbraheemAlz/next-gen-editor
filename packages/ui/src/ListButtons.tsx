@@ -11,6 +11,7 @@
  */
 import { type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './ListButtons.css';
 
 export const ListButtons: Component = () => {
@@ -18,6 +19,8 @@ export const ListButtons: Component = () => {
     const state = createEditorState();
 
     const ready = () => state.selection() !== undefined;
+    /* Issue #449 - TOGGLE_LIST is refused by every protection mode. */
+    const gate = protectionGate(state, 'toggleList');
 
     const removeList = async () => {
         await cmd.toggleList('Off');
@@ -37,8 +40,8 @@ export const ListButtons: Component = () => {
                 class="nge-btn nge-lists__btn"
                 type="button"
                 aria-label="Bulleted list"
-                title="Bulleted list"
-                disabled={!ready()}
+                title={gate.title('Bulleted list')}
+                disabled={!ready() || gate.locked()}
                 onClick={() => void bulletOn()}
             >
                 <span class="nge-lists__icon" aria-hidden="true">•≡</span>
@@ -48,8 +51,8 @@ export const ListButtons: Component = () => {
                 class="nge-btn nge-lists__btn"
                 type="button"
                 aria-label="Numbered list"
-                title="Numbered list"
-                disabled={!ready()}
+                title={gate.title('Numbered list')}
+                disabled={!ready() || gate.locked()}
                 onClick={() => void numberOn()}
             >
                 <span class="nge-lists__icon" aria-hidden="true">1≡</span>
@@ -59,8 +62,8 @@ export const ListButtons: Component = () => {
                 class="nge-btn nge-lists__btn"
                 type="button"
                 aria-label="Remove list"
-                title="Remove list membership from selected paragraphs"
-                disabled={!ready()}
+                title={gate.title('Remove list membership from selected paragraphs')}
+                disabled={!ready() || gate.locked()}
                 onClick={() => void removeList()}
             >
                 <span class="nge-lists__icon" aria-hidden="true">⌫≡</span>

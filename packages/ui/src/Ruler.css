@@ -214,3 +214,17 @@
     border-radius: 2px;
     pointer-events: none;
 }
+
+/* Issue #449 - a protected document refuses indent / tab-stop edits: the
+ * strip, handles and tab markers stay visible (they still show the
+ * paragraph's values) but are greyed and no longer answer the pointer. */
+.nge-ruler[data-locked='true'] .nge-ruler__strip,
+.nge-ruler[data-locked='true'] .nge-ruler__handle,
+.nge-ruler[data-locked='true'] .nge-ruler__tab {
+    cursor: not-allowed;
+}
+
+.nge-ruler[data-locked='true'] .nge-ruler__handle,
+.nge-ruler[data-locked='true'] .nge-ruler__tab {
+    opacity: 0.5;
+}

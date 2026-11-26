@@ -31,6 +31,7 @@ import {
     createEditorState,
     type HeaderFooterArea,
 } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './HeaderFooterButtons.css';
 
 export const HeaderFooterButtons: Component = () => {
@@ -38,6 +39,12 @@ export const HeaderFooterButtons: Component = () => {
     const state = createEditorState();
 
     const ready = createMemo(() => state.selection() !== undefined);
+    /* Issue #449 - opening a band to LOOK at it (ENTER / EXIT) is exempt
+       from protection, but the band's own settings are refused by every
+       mode. */
+    const linkGate = protectionGate(state, 'setHeaderFooterLink');
+    const titlePgGate = protectionGate(state, 'setTitlePage');
+    const evenOddGate = protectionGate(state, 'setEvenOddHeaders');
     /* Issue #80 — `editingStory()` also names footnote / endnote
        stories; this cluster only manages the margin bands (a note's
        Close lives in NoteButtons). */
@@ -87,13 +94,14 @@ export const HeaderFooterButtons: Component = () => {
                             aria-pressed={linked()}
                             data-active={linked()}
                             title={
-                                firstSection()
+                                linkGate.refusal()?.title ??
+                                (firstSection()
                                     ? 'The first section has no previous section to link to'
                                     : linked()
                                       ? 'Same as previous section — click to make this section’s band independent'
-                                      : 'Independent — click to link back to the previous section’s band'
+                                      : 'Independent — click to link back to the previous section’s band')
                             }
-                            disabled={firstSection() && linked() === false}
+                            disabled={(firstSection() && linked() === false) || linkGate.locked()}
                             onClick={() => void cmd.setHeaderFooterLink(!linked())}
                         >
                             <span aria-hidden="true">🔗</span>
@@ -101,11 +109,14 @@ export const HeaderFooterButtons: Component = () => {
                         </button>
                         <label
                             class="nge-hf__check"
-                            title="First page of this section shows its own header/footer"
+                            title={titlePgGate.title(
+                                'First page of this section shows its own header/footer',
+                            )}
                         >
                             <input
                                 type="checkbox"
                                 checked={titlePg()}
+                                disabled={titlePgGate.locked()}
                                 onChange={(e) =>
                                     void cmd.setTitlePage(e.currentTarget.checked)
                                 }
@@ -114,11 +125,14 @@ export const HeaderFooterButtons: Component = () => {
                         </label>
                         <label
                             class="nge-hf__check"
-                            title="Odd and even pages show different headers/footers (whole document)"
+                            title={evenOddGate.title(
+                                'Odd and even pages show different headers/footers (whole document)',
+                            )}
                         >
                             <input
                                 type="checkbox"
                                 checked={evenOdd()}
+                                disabled={evenOddGate.locked()}
                                 onChange={(e) =>
                                     void cmd.setEvenOddHeaders(e.currentTarget.checked)
                                 }

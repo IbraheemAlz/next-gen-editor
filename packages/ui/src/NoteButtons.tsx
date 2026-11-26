@@ -19,6 +19,7 @@
 import { Show, createMemo, type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
 import { focusEditorInput } from './focus';
+import { protectionGate } from './protectionGate';
 import './NoteButtons.css';
 
 export const NoteButtons: Component = () => {
@@ -32,9 +33,16 @@ export const NoteButtons: Component = () => {
         const area = story()?.area;
         return area === 'Footnote' || area === 'Endnote' ? area : undefined;
     });
-    const canInsert = createMemo(() => ready() && !inCell() && story() === undefined);
+    /* Issue #449 - INSERT_FOOTNOTE / INSERT_ENDNOTE are refused by every
+       protection mode. */
+    const gate = protectionGate(state, 'insertFootnote', 'insertEndnote');
+    const canInsert = createMemo(
+        () => ready() && !inCell() && story() === undefined && !gate.locked(),
+    );
 
     const why = (): string | undefined => {
+        const refusal = gate.refusal();
+        if (refusal !== undefined) return refusal.title;
         if (story()?.area === 'TextBox') return 'Close the text box first';
         if (story() !== undefined) return 'Close the header or footer first';
         if (inCell()) return 'Notes inside table cells aren’t supported yet';

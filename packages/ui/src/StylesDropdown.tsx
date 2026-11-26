@@ -29,6 +29,7 @@ import {
     STYLE_PRESETS,
     type ParagraphStyleId,
 } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import { StyleEditDialog } from './StyleEditDialog';
 import './StylesDropdown.css';
 
@@ -66,6 +67,9 @@ export const StylesDropdown: Component = () => {
         optimistic() ?? state.paragraphStyleId() ?? 'Normal';
 
     const ready = () => state.selection() !== undefined;
+    /* Issue #449 - APPLY_STYLE / MODIFY_STYLE are refused by every
+       protection mode, so the whole menu (apply + edit) locks. */
+    const gate = protectionGate(state, 'applyStyle', 'modifyStyle');
 
     const apply = async (id: ParagraphStyleId) => {
         setOptimistic(id);
@@ -105,8 +109,8 @@ export const StylesDropdown: Component = () => {
                 aria-haspopup="menu"
                 aria-expanded={open()}
                 aria-label="Paragraph style"
-                disabled={!ready()}
-                title="Paragraph style"
+                disabled={!ready() || gate.locked()}
+                title={gate.title('Paragraph style')}
                 onClick={() => setOpen((v) => !v)}
             >
                 <span>{activeLabel()}</span>

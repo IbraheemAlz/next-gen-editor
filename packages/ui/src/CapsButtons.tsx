@@ -10,6 +10,7 @@
  */
 import { type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
+import { protectionGate } from './protectionGate';
 import './CapsButtons.css';
 
 export const CapsButtons: Component = () => {
@@ -17,6 +18,8 @@ export const CapsButtons: Component = () => {
     const state = createEditorState();
 
     const ready = () => state.selection() !== undefined;
+    /* Issue #449 - formatting is refused by read-only / comments / forms. */
+    const gate = protectionGate(state, 'toggleFormatting');
     const isCaps = () => state.attrsAtCaret()?.caps === true;
     const isSmallCaps = () => state.attrsAtCaret()?.small_caps === true;
 
@@ -44,8 +47,8 @@ export const CapsButtons: Component = () => {
                 aria-label="All caps"
                 aria-pressed={isCaps()}
                 data-active={isCaps()}
-                disabled={!ready()}
-                title="All caps"
+                disabled={!ready() || gate.locked()}
+                title={gate.title('All caps')}
                 onClick={toggleCaps}
             >
                 AB
@@ -56,8 +59,8 @@ export const CapsButtons: Component = () => {
                 aria-label="Small caps"
                 aria-pressed={isSmallCaps()}
                 data-active={isSmallCaps()}
-                disabled={!ready()}
-                title="Small caps"
+                disabled={!ready() || gate.locked()}
+                title={gate.title('Small caps')}
                 onClick={toggleSmallCaps}
             >
                 A<span class="nge-caps__small">B</span>

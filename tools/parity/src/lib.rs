@@ -20,7 +20,9 @@
 //! stdout / the CI job summary — GitHub Issues stays the backlog, so there
 //! is no committed report file.
 
-use bridge::{CommandKind, CommandMeta, CommandStatus, StoryPolicy, UNFILED};
+use bridge::{
+    CommandKind, CommandMeta, CommandStatus, ProtectionClass, ProtectionMode, StoryPolicy, UNFILED,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -524,6 +526,41 @@ fn story_name(s: StoryPolicy) -> &'static str {
     }
 }
 
+/// Issue #449 - the protection column: which enforced
+/// `w:documentProtection` modes admit a command (`ProtectionClass::
+/// admitted_by`, the table the engine's `protection_gate` and the shell's
+/// `protectionAdmits` both read), with the refinements the engine adds on
+/// top of the class table marked.
+pub fn protection_cell(class: ProtectionClass) -> String {
+    if class == ProtectionClass::Exempt {
+        return "all (exempt)".to_string();
+    }
+    let modes: Vec<String> = ProtectionMode::ALL
+        .iter()
+        .filter(|m| class.admitted_by(**m))
+        .map(|m| {
+            let refined = matches!(
+                (class, *m),
+                (ProtectionClass::Text, ProtectionMode::Forms)
+                    | (
+                        ProtectionClass::ReviewToggle,
+                        ProtectionMode::TrackedChanges
+                    )
+            );
+            if refined {
+                format!("{}*", m.wire_name())
+            } else {
+                m.wire_name().to_string()
+            }
+        })
+        .collect();
+    if modes.is_empty() {
+        "none".to_string()
+    } else {
+        modes.join(", ")
+    }
+}
+
 fn issue_cell(issue: u32) -> String {
     if issue == UNFILED {
         "UNFILED".to_string()
@@ -881,13 +918,13 @@ impl Matrix {
         );
         let _ = writeln!(
             out,
-            "| Command | Status | Logged | Read-only | Story | Facade | UI | e2e | Fuzz |\n\
-             |---|---|---|---|---|---|---|---|---|"
+            "| Command | Status | Logged | Read-only | Story | Protection | Facade | UI | e2e | Fuzz |\n\
+             |---|---|---|---|---|---|---|---|---|---|"
         );
         for r in &self.rows {
             let _ = writeln!(
                 out,
-                "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 r.wire,
                 match r.meta.status {
                     CommandStatus::Implemented => "implemented".to_string(),
@@ -900,6 +937,7 @@ impl Matrix {
                 yes(r.meta.logged),
                 yes(r.meta.read_only),
                 story_name(r.meta.story),
+                protection_cell(r.meta.protection),
                 facade_cell(&r.facade),
                 match (r.ui_controls, r.ui_badges.len()) {
                     (0, 0) => "—".to_string(),
@@ -910,7 +948,15 @@ impl Matrix {
                 if r.fuzz_curated { "curated" } else { "blind" },
             );
         }
-        let _ = writeln!(out, "\n</details>");
+        let _ = writeln!(
+            out,
+            "\nProtection (issue #449): the enforced modes that admit the command \
+             (`bridge::ProtectionClass::admitted_by`); `*` = refined by the engine \
+             (`forms` admits text edits only inside form-field content, \
+             `trackedChanges` admits only turning review mode ON). While a header / \
+             footer / note / text-box story is being edited every non-`exempt` \
+             command is refused under any mode.\n\n</details>"
+        );
         out
     }
 }
@@ -1066,6 +1112,42 @@ mod tests {
             v.contains("an \"Engine pending\" badge without data-nge-pending-issue"),
             "{v}"
         );
+    }
+
+    /// Issue #449 - the protection column mirrors the class table.
+    #[test]
+    fn protection_column_lists_the_admitting_modes() {
+        assert_eq!(protection_cell(ProtectionClass::Exempt), "all (exempt)");
+        assert_eq!(protection_cell(ProtectionClass::Other), "none");
+        assert_eq!(
+            protection_cell(ProtectionClass::Comment),
+            "comments, trackedChanges"
+        );
+        assert_eq!(
+            protection_cell(ProtectionClass::Text),
+            "trackedChanges, forms*"
+        );
+        assert_eq!(
+            protection_cell(ProtectionClass::Formatting),
+            "trackedChanges"
+        );
+        assert_eq!(
+            protection_cell(ProtectionClass::ReviewToggle),
+            "trackedChanges*"
+        );
+        let md = repo_matrix().render_markdown(&[]);
+        assert!(
+            md.contains("| Protection |"),
+            "the full matrix has the column"
+        );
+        assert!(
+            md.contains("| `TOGGLE_FORMATTING` |") && md.contains(" trackedChanges |"),
+            "a formatting command is admitted by trackedChanges only"
+        );
+        /* Every class the table knows renders (no panic, no empty cell). */
+        for class in ProtectionClass::ALL {
+            assert!(!protection_cell(*class).is_empty());
+        }
     }
 
     #[test]

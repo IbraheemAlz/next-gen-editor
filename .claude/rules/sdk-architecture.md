@@ -125,6 +125,27 @@ discipline.
   ```
 - **Disabled states** must not visually disappear — `disabled` + reduced
   opacity + accessible `title` tooltip explaining why.
+- **Document protection (issue #449).** A control that dispatches a command
+  the open document's enforced `w:documentProtection` would refuse renders
+  `disabled` with the reason as its `title`, never a live button that only
+  answers with a `Protected` toast. ONE query decides:
+  `createEditorState().protectionRefusal(...methods)` (`@nge/core`
+  `protection.ts`) names the FACADE members the control calls and answers
+  with the first refusal among the commands they dispatch
+  (`FACADE_METHOD_COMMANDS`), asked of the generated `protectionAdmits`
+  table (`bridge::ProtectionClass::admitted_by`) plus the one refinement a
+  control can see (every non-exempt command is refused while a header /
+  footer / note / text-box story is edited). Never restate the class table
+  in TS. In `@nge/ui` wrap it with `protectionGate(state, 'member', ...)`
+  (`packages/ui/src/protectionGate.ts`: `locked()` / `title(base)` /
+  `refusal()`). `ts/src/protection-coverage.test.ts` fails when a shelf
+  component calls a gated `cmd.<member>()` without naming it in a
+  `protectionGate(` / `protectionRefusal(` call (a dialog is covered by its
+  opener: `OPENED_BY` there). Keyboard paths (typing, shortcuts) still get
+  the engine's refusal toast - they have no control to disable. e2e:
+  `ts/e2e/protection-controls.spec.ts` (fixtures `readonly_protected.docx`,
+  `comments_protected.docx`, `tracked_protected.docx`, from
+  `format_docx::test_fixtures::protected_text_docx`).
 
 ## Honest UX — never ship Phantom UI
 
