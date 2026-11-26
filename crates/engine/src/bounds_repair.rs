@@ -204,6 +204,10 @@ impl DocumentTree {
         if let Some(style) = self.line_number_style.as_mut() {
             n += repair_span_style_sizes(style);
         }
+        /* Issue #558 — the default character style's sizes too. */
+        if let Some(style) = self.default_char_style.as_mut() {
+            n += repair_span_style_sizes(style);
+        }
         for style in self.styles.values_mut() {
             n += repair_para_props(&mut style.para);
             n += repair_span_style_sizes(&mut style.run);

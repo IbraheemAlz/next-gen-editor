@@ -83,9 +83,12 @@ pub struct StyleTable {
     pub default_paragraph: Option<String>,
     /// Issue #556 — the id of the default CHARACTER style
     /// (`w:type="character" w:default="1"`, Word's `DefaultParagraphFont`),
-    /// same last-wins rule. Recorded only: the run cascade does not apply
-    /// it (issue #558 — its properties would have to stay out of the
-    /// spans, which bake the character style they name).
+    /// same last-wins rule. Issue #558 — its folded formatting
+    /// (`StyleResolver::default_character_style`) is mirrored into the
+    /// engine (`DocumentTree::default_char_style`) and applied at
+    /// span-materialize time to every run naming no character style;
+    /// it never enters a span (spans bake only the character style they
+    /// name), so the writer never spells it.
     pub default_character: Option<String>,
 }
 

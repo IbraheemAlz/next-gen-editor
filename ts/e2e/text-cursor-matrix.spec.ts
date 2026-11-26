@@ -1,7 +1,15 @@
 import { test, expect, type Page } from '@playwright/test';
-import { crc32, deflateSync } from 'node:zlib';
-import { appendStoredEntry } from './zip-append';
 import { boot, documentText, settle } from './helpers/editor';
+import { caretBox } from './helpers/images';
+import {
+    REL,
+    docxPackage,
+    floatingPictureRun,
+    pictureDocx,
+    pictureRun,
+    png,
+    sectPr,
+} from './helpers/picture-docx';
 
 /* Epic #555 — the TEXT / OBJECT rows of the cursor-behaviour matrix, each
  * pinned through the REAL shell: Playwright mouse events on a page canvas
@@ -217,99 +225,6 @@ test('row 02: Left/Right step one grapheme cluster and a click never lands insid
 });
 
 /* ------------------------------------------------------------------ */
-/* `.docx` fixtures built in the test (no binary in the tree). */
-
-/** A solid `w` x `h` RGB PNG. */
-function png(w: number, h: number, rgb: [number, number, number]): Uint8Array {
-    const chunk = (type: string, data: Buffer): Buffer => {
-        const len = Buffer.alloc(4);
-        len.writeUInt32BE(data.length);
-        const td = Buffer.concat([Buffer.from(type, 'ascii'), data]);
-        const crc = Buffer.alloc(4);
-        crc.writeUInt32BE(crc32(td) >>> 0);
-        return Buffer.concat([len, td, crc]);
-    };
-    const ihdr = Buffer.alloc(13);
-    ihdr.writeUInt32BE(w, 0);
-    ihdr.writeUInt32BE(h, 4);
-    ihdr[8] = 8; // bit depth
-    ihdr[9] = 2; // RGB
-    const raw = Buffer.alloc((w * 3 + 1) * h);
-    for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) raw.set(rgb, y * (w * 3 + 1) + 1 + x * 3);
-    }
-    return new Uint8Array(
-        Buffer.concat([
-            Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-            chunk('IHDR', ihdr),
-            chunk('IDAT', deflateSync(raw)),
-            chunk('IEND', Buffer.alloc(0)),
-        ]),
-    );
-}
-
-const NS =
-    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ' +
-    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ' +
-    'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" ' +
-    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ' +
-    'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"';
-const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/';
-const XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
-/** A4, 1 in side / bottom margins; `top` (twips) and the header distance
- *  1/2 in. */
-const sectPr = (top: number, refs = ''): string =>
-    `<w:sectPr>${refs}<w:pgSz w:w="11906" w:h="16838"/>` +
-    `<w:pgMar w:top="${top}" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>` +
-    '</w:sectPr>';
-
-type Rel = [id: string, type: string, target: string];
-
-/** A minimal STORED `.docx`: `body` (already holding its `<w:sectPr>`),
- *  an optional header part, and media parts. */
-function docxPackage(p: {
-    body: string;
-    docRels?: Rel[];
-    header?: { xml: string; rels: Rel[] };
-    media?: Array<[string, Uint8Array]>;
-}): Uint8Array {
-    const rels = (rows: Rel[]): string =>
-        `${XML}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-        rows.map(([id, type, target]) => `<Relationship Id="${id}" Type="${type}" Target="${target}"/>`).join('') +
-        '</Relationships>';
-    const text = (s: string): Uint8Array => new TextEncoder().encode(s);
-    const entries: Array<[string, Uint8Array]> = [
-        [
-            '[Content_Types].xml',
-            text(
-                `${XML}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
-                    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
-                    '<Default Extension="xml" ContentType="application/xml"/>' +
-                    '<Default Extension="png" ContentType="image/png"/>' +
-                    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
-                    (p.header
-                        ? '<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>'
-                        : '') +
-                    '</Types>',
-            ),
-        ],
-        ['_rels/.rels', text(rels([['rId1', `${REL}officeDocument`, 'word/document.xml']]))],
-        ['word/document.xml', text(`${XML}<w:document ${NS}><w:body>${p.body}</w:body></w:document>`)],
-        ['word/_rels/document.xml.rels', text(rels(p.docRels ?? []))],
-    ];
-    if (p.header) {
-        entries.push(['word/header1.xml', text(`${XML}<w:hdr ${NS}>${p.header.xml}</w:hdr>`)]);
-        entries.push(['word/_rels/header1.xml.rels', text(rels(p.header.rels))]);
-    }
-    for (const m of p.media ?? []) entries.push(m);
-    const eocd = new Uint8Array(22);
-    new DataView(eocd.buffer).setUint32(0, 0x06054b50, true);
-    let zip = eocd;
-    for (const [name, data] of entries) zip = appendStoredEntry(zip, name, data);
-    return zip;
-}
-
-/* ------------------------------------------------------------------ */
 /* Row 3 — memo §2 "Paragraph": the line under (or nearest to) the pointer;
  * an x outside the line's ink clamps to its logical start or end,
  * mirrored for an RTL paragraph. Pinned where "nearest line" and the
@@ -390,45 +305,10 @@ test('row 03: a click picks the nearest line and clamps outside the ink to its l
 
 /* ------------------------------------------------------------------ */
 /* Row 11 — memo §2 "Drawings are layer-scoped": only the active story's
- * drawing layer is hit-tested. The inert halves are pinned here; the
- * active-story half (a picture of the header being edited is an object)
- * is #573. */
-
-/** One inline picture run, 1 in x 1/2 in, embedding `rid`. */
-const pictureRun = (rid: string): string =>
-    '<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">' +
-    '<wp:extent cx="914400" cy="457200"/><wp:docPr id="1" name="Picture"/>' +
-    '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>' +
-    '<pic:nvPicPr><pic:cNvPr id="1" name="p"/><pic:cNvPicPr/></pic:nvPicPr>' +
-    `<pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
-    '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>' +
-    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>' +
-    '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
-
-/** A page with a picture in its header and another in the body. Margins:
- *  top 2 in, left 1 in, header distance 1/2 in — so the header picture
- *  sits at x 72..144 pt, y 36..72 pt (+ its line's descent). */
-function pictureDocx(): Uint8Array {
-    return docxPackage({
-        body:
-            '<w:p><w:r><w:t xml:space="preserve">Body text above the picture</w:t></w:r></w:p>' +
-            `<w:p>${pictureRun('rId5')}</w:p>` +
-            '<w:p><w:r><w:t xml:space="preserve">Body text below</w:t></w:r></w:p>' +
-            sectPr(2880, '<w:headerReference w:type="default" r:id="rId7"/>'),
-        docRels: [
-            ['rId5', `${REL}image`, 'media/image1.png'],
-            ['rId7', `${REL}header`, 'header1.xml'],
-        ],
-        header: {
-            xml: `<w:p>${pictureRun('rId5')}</w:p>`,
-            rels: [['rId5', `${REL}image`, 'media/image2.png']],
-        },
-        media: [
-            ['word/media/image1.png', png(64, 32, [32, 176, 64])],
-            ['word/media/image2.png', png(64, 32, [208, 32, 32])],
-        ],
-    });
-}
+ * drawing layer is hit-tested. The inert halves first; then the
+ * active-story half (#573: a picture of the header being edited is an
+ * object — click selects it, the first Esc only drops it (§8), Delete
+ * removes it, a handle resizes it). */
 
 test("row 11: only the active story's pictures are hit-testable (header picture inert in the body, body picture inert in the header)", async ({
     page,
@@ -492,8 +372,11 @@ test("row 11: only the active story's pictures are hit-testable (header picture 
        leaves the header active (a single body click is ignored). */
     const imgs = await dispatch(page, { type: 'GET_IMAGE_RECTS' });
     expect(imgs.type).toBe('IMAGE_RECTS');
-    expect(imgs.images, 'only the body picture is an object of the body').toHaveLength(1);
-    const body = (imgs.images as Array<{ rect: Rect }>)[0]!.rect;
+    const bodyImgs = (imgs.images as Array<{ rect: Rect; story_area?: string }>).filter(
+        (im) => !im.story_area,
+    );
+    expect(bodyImgs, 'only the body picture is an object of the body').toHaveLength(1);
+    const body = bodyImgs[0]!.rect;
     await clickAt(page, body.x + body.w / 2, body.y + body.h / 2);
     await settle(page);
     await expect(handles).toHaveCount(0);
@@ -505,6 +388,189 @@ test("row 11: only the active story's pictures are hit-testable (header picture 
     await expect.poll(async () => (await selection(page)).story).toBeNull();
     await clickAt(page, body.x + body.w / 2, body.y + body.h / 2);
     await expect(handles).toHaveCount(1);
+});
+
+interface Pic {
+    rect: Rect;
+    at: number;
+    floating: boolean;
+    width_emu: number;
+    story_area?: string;
+    story_rid?: string;
+}
+
+/** The pictures `GET_IMAGE_RECTS` lists for the header (a query). */
+async function headerPictures(page: Page): Promise<Pic[]> {
+    const evt = await dispatch(page, { type: 'GET_IMAGE_RECTS' });
+    expect(evt.type).toBe('IMAGE_RECTS');
+    return (evt.images as Pic[]).filter((im) => im.story_area === 'Header');
+}
+
+/** A body picture (green) between two lines of text; a header with an
+ *  inline picture (red) in its first paragraph and, anchored in its second,
+ *  a FLOATING picture (blue) 4 in from the page's left edge, 0.4 .. 2.4 in
+ *  from its top — past the 2 in top margin, so its lower part lies where
+ *  the body zone begins. */
+function headerPicturesDocx(): Uint8Array {
+    const IN = 914_400;
+    return docxPackage({
+        body:
+            '<w:p><w:r><w:t xml:space="preserve">Body text above the picture</w:t></w:r></w:p>' +
+            `<w:p>${pictureRun('rId5')}</w:p>` +
+            '<w:p><w:r><w:t xml:space="preserve">Body text below</w:t></w:r></w:p>' +
+            sectPr(2880, '<w:headerReference w:type="default" r:id="rId7"/>'),
+        docRels: [
+            ['rId5', `${REL}image`, 'media/image1.png'],
+            ['rId7', `${REL}header`, 'header1.xml'],
+        ],
+        header: {
+            xml:
+                `<w:p>${pictureRun('rId5')}</w:p>` +
+                `<w:p>${floatingPictureRun('rId6', { x: 4 * IN, y: 0.4 * IN, cx: IN, cy: 2 * IN, id: 9 })}</w:p>`,
+            rels: [
+                ['rId5', `${REL}image`, 'media/image2.png'],
+                ['rId6', `${REL}image`, 'media/image3.png'],
+            ],
+        },
+        media: [
+            ['word/media/image1.png', png(64, 32, [32, 176, 64])],
+            ['word/media/image2.png', png(64, 32, [208, 32, 32])],
+            ['word/media/image3.png', png(32, 64, [32, 64, 208])],
+        ],
+    });
+}
+
+/** Enter the header with a double-click on a blank stretch of its band. */
+async function enterHeader(page: Page): Promise<void> {
+    const scale = (await caretAt(page, 0, 0)).x / 72;
+    const band = await client(page, 450 * scale, 54 * scale);
+    await page.mouse.dblclick(band.x, band.y);
+    await expect.poll(async () => (await selection(page)).story).toBe('Header');
+}
+
+const centre = (r: Rect) => ({ x: r.x + r.w / 2, y: r.y + r.h / 2 });
+
+test("row 11 (#573): a picture of the header being edited is an object — click, Esc, Delete, undo, resize, the float's lower part", async ({
+    page,
+}) => {
+    test.setTimeout(90_000);
+    await openDocx(page, headerPicturesDocx());
+    const handles = page.locator('.image-handles');
+    expect(await headerPictures(page), 'inert while the body is edited').toEqual([]);
+
+    await enterHeader(page);
+    await expect.poll(async () => (await headerPictures(page)).length).toBe(2);
+    const listed = await headerPictures(page);
+    const inline = listed.find((im) => !im.floating)!;
+    const float = listed.find((im) => im.floating)!;
+    expect(inline.at).toBe(0);
+    const pic = centre(inline.rect);
+
+    /* A click on the header's inline picture object-selects it: handles,
+       no caret, the header still the active story. */
+    await clickAt(page, pic.x, pic.y);
+    await expect(handles).toHaveCount(1);
+    expect(await caretBox(page), 'object selection replaces the caret').toBeNull();
+    expect((await selection(page)).story).toBe('Header');
+
+    /* The FIRST Esc only drops the object selection (memo §8): the caret
+       goes before the picture, in the header. */
+    await page.keyboard.press('Escape');
+    await expect(handles).toHaveCount(0);
+    const afterEsc = await selection(page);
+    expect(afterEsc.story).toBe('Header');
+    expect(afterEsc.start).toEqual({ block: 0, offset: 0 });
+    expect(await caretBox(page)).not.toBeNull();
+
+    /* Delete removes it, in ONE undo step. */
+    await clickAt(page, pic.x, pic.y);
+    await expect(handles).toHaveCount(1);
+    await page.keyboard.press('Delete');
+    await expect
+        .poll(async () => (await headerPictures(page)).filter((im) => !im.floating).length)
+        .toBe(0);
+    await expect(handles).toHaveCount(0);
+    expect((await selection(page)).story).toBe('Header');
+    await page.keyboard.press('Control+z');
+    await expect
+        .poll(async () => (await headerPictures(page)).filter((im) => !im.floating).length)
+        .toBe(1);
+
+    /* A handle resizes it (RESIZE_IMAGE addressed in the part). */
+    await clickAt(page, pic.x, pic.y);
+    await expect(handles).toHaveCount(1);
+    const se = await page.locator('.image-handle--se').boundingBox();
+    expect(se).not.toBeNull();
+    const from = { x: se!.x + se!.width / 2, y: se!.y + se!.height / 2 };
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(from.x + 20, from.y + 10, { steps: 4 });
+    await page.mouse.move(from.x + 40, from.y + 20, { steps: 4 });
+    await page.mouse.up();
+    await expect
+        .poll(async () => (await headerPictures(page)).find((im) => !im.floating)?.width_emu ?? 0)
+        .toBeGreaterThan(inline.width_emu);
+    expect((await selection(page)).story).toBe('Header');
+
+    /* The float reaches below the band: a point inside a header drawing
+       counts as that band (memo §2), so its lower part selects it too. */
+    const lowY = float.rect.y + float.rect.h * 0.9;
+    /* Device px per pt: the inline picture is 1 in (72 pt) wide. */
+    const scale = inline.rect.w / 72;
+    expect(lowY, 'below the 2 in top margin').toBeGreaterThan(144 * scale);
+    await page.keyboard.press('Escape');
+    await expect(handles).toHaveCount(0);
+    await clickAt(page, centre(float.rect).x, lowY);
+    await expect(handles).toHaveCount(1);
+    expect((await selection(page)).story).toBe('Header');
+
+    /* Esc drops the object, a second Esc leaves the header; in the body
+       the header's pictures are inert again. */
+    await page.keyboard.press('Escape');
+    await expect(handles).toHaveCount(0);
+    expect((await selection(page)).story).toBe('Header');
+    await page.keyboard.press('Escape');
+    await expect.poll(async () => (await selection(page)).story).toBeNull();
+    await expect.poll(async () => (await headerPictures(page)).length).toBe(0);
+    await clickAt(page, centre(float.rect).x, centre(float.rect).y);
+    await settle(page);
+    await expect(handles).toHaveCount(0);
+});
+
+test('row 11 (#573): a double-click on a body picture from the header leaves the header and selects it', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await openDocx(page, headerPicturesDocx());
+    const handles = page.locator('.image-handles');
+    await enterHeader(page);
+    const evt = await dispatch(page, { type: 'GET_IMAGE_RECTS' });
+    const body = (evt.images as Pic[]).find((im) => !im.story_area)!;
+    const c = centre(body.rect);
+
+    /* A single click on it is ignored (memo §2): nothing selected, still
+       the header. */
+    await clickAt(page, c.x, c.y);
+    await settle(page);
+    await expect(handles).toHaveCount(0);
+    expect((await selection(page)).story).toBe('Header');
+
+    /* A double-click leaves the header (memo §2) and, the press being on
+       an object, selects the picture instead of placing a caret. */
+    const at = await client(page, c.x, c.y);
+    await page.mouse.dblclick(at.x, at.y);
+    await expect.poll(async () => (await selection(page)).story).toBeNull();
+    await expect(handles).toHaveCount(1);
+    expect(await caretBox(page), 'object selection replaces the caret').toBeNull();
+    /* It is the body's picture: Delete removes it from the body. */
+    await page.keyboard.press('Delete');
+    await expect
+        .poll(async () => {
+            const e = await dispatch(page, { type: 'GET_IMAGE_RECTS' });
+            return (e.images as Pic[]).filter((im) => !im.story_area).length;
+        })
+        .toBe(0);
+    expect((await paragraphs(page))[1]).toBe('');
 });
 
 /* ------------------------------------------------------------------ */

@@ -11,7 +11,15 @@
  * the rest of the session. The engine now answers
  * `pending_media_entries()` - the blobs with no (or a stale) bitmap, empty on
  * the common path - and the worker asks after every command that can change
- * the document, decodes what it is given and repaints. */
+ * the document, decodes what it is given and repaints.
+ *
+ * Issue #574 - the repaint follows EVERY decode that registered a bitmap, a
+ * new document's included. The open used to skip it on the theory that its
+ * page canvases are (re)registered next and paint then; they are only when
+ * the open changes the page count, so a one-page document opened over the
+ * one-page boot document kept its grey placeholders until the next edit:
+ * the open's own auto-repaint ran before the decode, and `register_image`
+ * only forgets what each canvas shows - it does not paint. */
 
 /** The two `CommandMeta` flags the decision reads (`commandMeta(type)`). */
 export interface MediaDecodeMeta {
@@ -21,14 +29,12 @@ export interface MediaDecodeMeta {
 
 /** What the worker does about pictures after one answered command. */
 export interface MediaDecodePlan {
-    /** Ask the engine for pending blobs and decode them. */
+    /** Ask the engine for pending blobs, decode them and repaint when one
+     *  was registered (`runMediaPass`). */
     decode: boolean;
-    /** Repaint when something was decoded: the command's own auto-repaint
-     *  already ran with the placeholder, and `register_image` only forgets
-     *  what each canvas shows - it does not paint. A NEW document skips it:
-     *  its page canvases are (re)registered next and paint then (the
-     *  pre-#506 behaviour of an open). */
-    repaint: boolean;
+    /** Forget past decode failures first: a new document has different
+     *  blobs. */
+    reset: boolean;
 }
 
 /** Whether the command can have put a picture blob the engine has no bitmap
@@ -39,7 +45,35 @@ export interface MediaDecodePlan {
  *  never reach the engine's media map, so they cost nothing here. */
 export function mediaDecodePlan(meta: MediaDecodeMeta, replyType: string): MediaDecodePlan {
     const decode = (meta.mutates_doc || meta.new_document) && replyType !== 'ERROR';
-    return { decode, repaint: decode && !meta.new_document };
+    return { decode, reset: decode && meta.new_document };
+}
+
+/** The worker side of one decode pass. */
+export interface MediaPassIo {
+    /** `Engine.pending_media_entries()`. */
+    pending(): readonly MediaEntry[];
+    /** Repaint every registered page canvas (`REQUEST_PAINT`) and broadcast
+     *  the `Painted`. */
+    repaint(): Promise<void>;
+}
+
+/** Carry out `plan` after one answered command: decode what the engine
+ *  lists as pending and, when at least one bitmap was registered, repaint
+ *  ONCE - the command's own paint (an open's first paint included, #574)
+ *  already ran with the placeholder. Runs inside the command's queue task
+ *  (the callers hold it), so every later command - the shell's
+ *  `GET_IMAGE_RECTS` among them - sees the painted picture. Resolves with
+ *  how many bitmaps were registered. */
+export async function runMediaPass<Bitmap>(
+    plan: MediaDecodePlan,
+    decoder: MediaDecoder<Bitmap>,
+    io: MediaPassIo,
+): Promise<number> {
+    if (!plan.decode) return 0;
+    if (plan.reset) decoder.reset();
+    const registered = await decoder.run(io.pending());
+    if (registered > 0) await io.repaint();
+    return registered;
 }
 
 /** One entry of `Engine.pending_media_entries()` / `media_entries()`. */

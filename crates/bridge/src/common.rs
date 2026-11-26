@@ -227,6 +227,18 @@ pub struct ImageRect {
     /// the text flow).
     #[serde(default)]
     pub rtl: bool,
+    /// Issue #573 — the kind of story `path` is rooted in: `None` for a
+    /// body (or table-cell) picture, `TextBox` for a picture inside a
+    /// text-box story (then [`Self::story`] is its chain), `Header` /
+    /// `Footer` for a picture of the header / footer part being EDITED
+    /// (`path` rooted in that part, [`Self::story_rid`] = its rid,
+    /// `SelectionChanged.editing_story.rid`). A header / footer picture is
+    /// listed only while its part is the active story (clean-room cursor
+    /// memo §2: only the active story's drawings are hit-testable), on
+    /// the story's anchor page; the image commands address it with an
+    /// empty `story` (positions resolve in the active part).
+    #[serde(default)]
+    pub story_area: Option<crate::HeaderFooterArea>,
 }
 
 /// Issue #206 — one step into a text-box story: the text box anchored at

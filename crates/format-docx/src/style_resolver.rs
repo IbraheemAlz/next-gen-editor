@@ -15,7 +15,13 @@
 //!    style (`w:default="1"`, usually `Normal`) when it names none or
 //!    one the part does not define ([`StyleTable::applied_paragraph_style`]).
 //! 3. (Runs only) The character style chain, applied on top of the
-//!    paragraph style's run formatting.
+//!    paragraph style's run formatting: the run's `<w:rStyle>`, or — issue
+//!    #558 — the DEFAULT character style (`w:default="1"`, Word's
+//!    `DefaultParagraphFont`) when it names none. The default one is not
+//!    folded into spans: the engine applies it at span-materialize time
+//!    (`DocumentTree::default_char_style`,
+//!    [`StyleResolver::default_character_style`]), so a regenerated run
+//!    never writes it as direct formatting.
 //! 4. Direct `<w:pPr>` (paragraph) / `<w:rPr>` (run).
 //!
 //! ## Cycle protection
@@ -93,8 +99,10 @@ impl<'a> StyleResolver<'a> {
     /// `baseline` is the second tuple value from
     /// [`Self::resolve_paragraph`]. `r_style` is the optional `<w:rStyle>`
     /// reference; `direct_rpr` is the `<w:rPr>` directly on this run.
-    /// A run with no `rStyle` takes no character style: the DEFAULT
-    /// character style is not applied yet (issue #558).
+    /// A run with no `rStyle` takes no character style HERE: the DEFAULT
+    /// character style ([`Self::default_character_style`]) is applied by
+    /// the engine at span-materialize time (issue #558), never baked into
+    /// the span the reader stores.
     pub fn resolve_run(
         &self,
         baseline: SpanStyle,
@@ -147,6 +155,28 @@ impl<'a> StyleResolver<'a> {
             run = run.merged_with(s.run.clone());
         }
         Some(run)
+    }
+
+    /// Issue #558 — the run formatting of the DEFAULT character style
+    /// (`<w:style w:type="character" w:default="1">`, the part's last
+    /// claimant — Word's `DefaultParagraphFont`), its `basedOn` chain
+    /// folded root-first and WITHOUT the docDefaults (the engine folds
+    /// `docDefaults → pStyle chain → this → the run`,
+    /// `engine::StyleCascade::text_style`). It formats every run that
+    /// names no character style (ECMA-376 §17.7.4.17); a run naming an
+    /// undefined one keeps no character style, as before. `None` when the
+    /// part defines no default character style or it formats nothing
+    /// (Word's own carries no `<w:rPr>`), so such a document's model and
+    /// layout are unchanged.
+    pub fn default_character_style(&self) -> Option<SpanStyle> {
+        let id = self.table.default_character.as_deref()?;
+        let mut run = SpanStyle::default();
+        for s in self.collect_chain(id, StyleKind::Character).iter().rev() {
+            run = run.merged_with(s.run.clone());
+        }
+        /* A style's `<w:rPr>` names no character style of its own. */
+        run.char_style = None;
+        (run != SpanStyle::default()).then_some(run)
     }
 
     /// Walk the `<w:basedOn>` chain leaf → root. Stops on cycle (visited),

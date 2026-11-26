@@ -1139,15 +1139,14 @@ fn serialize_paragraph_body(
         `<w:spacing>`). */
         Some(sp) if source_ppr_is_current(sp, para) => push_utf8(&sp.xml, out),
         Some(_) if spliced.is_some() => out.push_str(spliced.as_deref().unwrap_or_default()),
-        /* Issue #556 — regenerated with nothing to splice into: what
-        only the DEFAULT paragraph style gives a paragraph naming no
-        style stays on `styles.xml`. (A splice needs no such step: the
-        recorded side was cascaded through the same style, so those
-        children compare equal and keep the source's absence.) */
+        /* Issues #556 / #560 — regenerated with nothing to splice into:
+        what the paragraph only inherits from its style cascade
+        (docDefaults, its style's chain, `Normal` for no style) stays on
+        `styles.xml`. (A splice needs no such step: the recorded side was
+        cascaded through the same styles, so those children compare equal
+        and keep the source's absence.) */
         sp => emit_ppr(
-            without_default_style(para, &props)
-                .as_ref()
-                .unwrap_or(&props),
+            without_inherited(para, &props).as_ref().unwrap_or(&props),
             para.style_id.as_deref(),
             para.list_item,
             para.section_end.as_deref(),
@@ -1249,76 +1248,68 @@ fn toc_bookmark_carried(para: &Paragraph, name: &str, end: bool) -> bool {
     })
 }
 
-/// Issue #202 — the paragraph direction every style id resolves to
-/// through the cascade (`docDefaults` → `basedOn` chain), published for
-/// the duration of one [`write_docx`] whose output carries the style
-/// table (`serialize_paragraph` has no document in hand — the
-/// [`WRITE_DEFAULT_GEOMETRY`] pattern).
-struct InheritedDirections {
-    /// The direction of a paragraph naming no (defined) style: the
-    /// docDefaults folded with the default paragraph style (#556).
-    defaults: Option<TextDirection>,
-    by_style: HashMap<String, Option<TextDirection>>,
-    /// Issue #556 — the cascade WITH and WITHOUT the default paragraph
-    /// style, `None` when the document has none
-    /// ([`without_default_style`]).
-    default_style: Option<DefaultStyleLink>,
+/// Issues #202 / #556 / #560 — the paragraph properties every style id
+/// resolves to through the cascade (`docDefaults` → applied style's
+/// `basedOn` chain — the engine's ONE `StyleCascade`), published for the
+/// duration of one [`write_docx`] whose output carries the style table
+/// (`serialize_paragraph` has no document in hand — the
+/// [`WRITE_DEFAULT_GEOMETRY`] pattern). What a paragraph only inherits
+/// stays on `styles.xml` ([`direction_is_inherited`],
+/// [`without_inherited`]).
+struct InheritedProps {
+    /// A paragraph naming no (defined) style: the docDefaults folded with
+    /// the default paragraph style (#556).
+    unstyled: ParaProperties,
+    by_style: HashMap<String, ParaProperties>,
 }
 
-/// Issue #556 — what the default paragraph style adds to the cascade of
-/// a paragraph that names no style.
-struct DefaultStyleLink {
-    /// `docDefaults → default style chain` (`resolve_style_cascade(None)`).
-    with: ParaProperties,
-    /// `docDefaults` alone.
-    without: ParaProperties,
-}
-
-thread_local! {
-    static WRITE_INHERITED_DIRECTIONS: std::cell::RefCell<Option<InheritedDirections>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Clears [`WRITE_INHERITED_DIRECTIONS`] when the write ends (early
-/// `?` returns included).
-struct InheritedDirectionsScope;
-
-impl Drop for InheritedDirectionsScope {
-    fn drop(&mut self) {
-        WRITE_INHERITED_DIRECTIONS.with(|c| *c.borrow_mut() = None);
+impl InheritedProps {
+    /// The cascade a `style_id` paragraph is formatted with; an id the
+    /// table lacks is formatted like no id at all (issue #556: the
+    /// default paragraph style).
+    fn of(&self, style_id: Option<&str>) -> &ParaProperties {
+        style_id
+            .and_then(|id| self.by_style.get(id))
+            .unwrap_or(&self.unstyled)
     }
 }
 
-/// Publish `doc`'s cascade directions for this write. Only when the
-/// written file carries `styles.xml` (`styles_travel`): without the
-/// style table the inherited direction exists nowhere else in the file,
-/// so the resolved value stays baked on the paragraph (an engine-authored
+thread_local! {
+    static WRITE_INHERITED_PROPS: std::cell::RefCell<Option<InheritedProps>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Clears [`WRITE_INHERITED_PROPS`] when the write ends (early `?`
+/// returns included).
+struct InheritedPropsScope;
+
+impl Drop for InheritedPropsScope {
+    fn drop(&mut self) {
+        WRITE_INHERITED_PROPS.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Publish `doc`'s style cascades for this write. Only when the written
+/// file carries `styles.xml` (`styles_travel`): without the style table
+/// an inherited value exists nowhere else in the file, so the resolved
+/// value stays baked on the paragraph (an engine-authored
 /// `build_minimal_docx` package without a dirty style table).
-fn publish_inherited_directions(
-    doc: &DocumentTree,
-    styles_travel: bool,
-) -> InheritedDirectionsScope {
+fn publish_inherited_props(doc: &DocumentTree, styles_travel: bool) -> InheritedPropsScope {
     let table = styles_travel.then(|| {
         /* Issue #556 — a paragraph naming no style (or one the table
         lacks) is formatted with the default paragraph style. */
-        let unstyled = doc.resolve_style_cascade(None);
-        InheritedDirections {
-            defaults: unstyled.direction,
+        let cascade = doc.style_cascade();
+        InheritedProps {
+            unstyled: cascade.para(&doc.style_defaults, None),
             by_style: doc
                 .styles
                 .keys()
-                .map(|id| (id.clone(), doc.resolve_style_cascade(Some(id)).direction))
+                .map(|id| (id.clone(), cascade.para(&doc.style_defaults, Some(id))))
                 .collect(),
-            default_style: doc.style_cascade().default_style().is_some().then(|| {
-                DefaultStyleLink {
-                    with: unstyled,
-                    without: ParaProperties::cascade([&doc.style_defaults]),
-                }
-            }),
         }
     });
-    WRITE_INHERITED_DIRECTIONS.with(|c| *c.borrow_mut() = table);
-    InheritedDirectionsScope
+    WRITE_INHERITED_PROPS.with(|c| *c.borrow_mut() = table);
+    InheritedPropsScope
 }
 
 thread_local! {
@@ -1362,65 +1353,80 @@ fn direction_is_inherited(para: &Paragraph) -> bool {
     if para.props.direction.is_none() || para.direct_overrides.direction.is_some() {
         return false;
     }
-    WRITE_INHERITED_DIRECTIONS.with(|c| {
-        c.borrow().as_ref().is_some_and(|t| {
-            let inherited = match para.style_id.as_deref() {
-                /* An id missing from the table is formatted like no id
-                at all (issue #556: the default paragraph style). */
-                Some(id) => t.by_style.get(id).copied().unwrap_or(t.defaults),
-                None => t.defaults,
-            };
-            inherited == para.props.direction
-        })
+    WRITE_INHERITED_PROPS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|t| t.of(para.style_id.as_deref()).direction == para.props.direction)
     })
 }
 
-/// Issue #556 — `props` (a paragraph's resolved properties, about to be
-/// written as a regenerated `<w:pPr>` with no source element to splice
-/// into) without what ONLY the default paragraph style gives it: the
-/// #431 "inherited, so omit" rule for the default-style link. A
-/// paragraph that names no style — or one the document does not define
-/// — is formatted with `Normal`, and the reader folds `Normal` into its
-/// `props`; writing those values as direct formatting would pin them
-/// against a later edit of `Normal` (in Word or here) and grow every new
-/// paragraph's `<w:pPr>`. Lossless by construction: a field is left out
-/// only when the default style's chain changes it (`with != without`),
-/// the live value is exactly the inherited one and the paragraph did not
-/// set it directly (`direct_overrides`) — the re-read resolves the same
-/// value from `styles.xml`. Every field the default style does not touch
-/// is written exactly as before; borders and shading go as a whole (a
-/// paragraph mixing direct edges with the style's keeps them all), and
-/// the direction rides [`direction_is_inherited`]. The list binding is
-/// not covered (a `numPr` on the default style; the reader does not keep
-/// a direct `numPr` apart from an inherited one). `None` when nothing
-/// changes — inside [`write_docx`] only, whose output carries the style
-/// table.
-fn without_default_style(para: &Paragraph, props: &ParaProperties) -> Option<ParaProperties> {
-    WRITE_INHERITED_DIRECTIONS.with(|c| {
+/// Issues #556 / #560 — `props` (a paragraph's resolved properties, about
+/// to be written as a regenerated `<w:pPr>` with no source element to
+/// splice into: a paragraph the engine minted, pasted or rebuilt) without
+/// what it only INHERITS from its style cascade — the #431 "inherited, so
+/// omit" rule for every link of it: `<w:docDefaults>`, the applied
+/// paragraph style's chain (the default one, `Normal`, for a paragraph
+/// naming no style or an undefined one). The engine formats a new
+/// paragraph through the cascade (`StyleCascade::new_paragraph`), so its
+/// `props` hold those values; writing them as direct formatting would pin
+/// them against a later style edit (in Word or here) and grow every new
+/// paragraph's `<w:pPr>` — the regenerated element instead spells only
+/// what the paragraph sets itself, as Word does. Lossless by
+/// construction: a field is left out only when the live value is exactly
+/// the cascade's and the paragraph did not set it directly
+/// (`direct_overrides`) — the re-read resolves the same value from
+/// `styles.xml`. Borders and shading go as a whole (a paragraph mixing
+/// direct edges with the style's keeps them all); the direction rides
+/// [`direction_is_inherited`]; the read-only fields are cleared by the
+/// caller. The list binding is not covered (`emit_ppr` takes the
+/// paragraph's own `list_item`; the reader does not keep a direct `numPr`
+/// apart from an inherited one, issue #630). A splice needs no such step: its
+/// recorded side was cascaded through the same styles, so the inherited
+/// children compare equal and keep the source's absence. `None` when
+/// nothing changes — inside [`write_docx`] only, whose output carries the
+/// style table.
+fn without_inherited(para: &Paragraph, props: &ParaProperties) -> Option<ParaProperties> {
+    WRITE_INHERITED_PROPS.with(|c| {
         let table = c.borrow();
-        let link = table.as_ref()?.default_style.as_ref()?;
-        let names_defined_style = para
-            .style_id
-            .as_deref()
-            .is_some_and(|id| table.as_ref().is_some_and(|t| t.by_style.contains_key(id)));
-        if names_defined_style {
-            return None;
-        }
+        let inherited = table.as_ref()?.of(para.style_id.as_deref());
         let direct = &para.direct_overrides;
-        let (with, without) = (&link.with, &link.without);
         let mut p = props.clone();
-        /* Clear `$field` (to "not written") when the default style set
-        it, `p` holds exactly its value and nothing direct set it. */
+        /* Clear `$field` (to "not written") when `p` holds exactly the
+        cascade's value and nothing direct set it. */
         macro_rules! omit {
             ($($field:ident),+ ; $direct_unset:expr) => {
-                if ($(&with.$field,)+) != ($(&without.$field,)+)
-                    && ($(&p.$field,)+) == ($(&with.$field,)+)
-                    && $direct_unset
-                {
+                if ($(&p.$field,)+) == ($(&inherited.$field,)+) && $direct_unset {
                     $(p.$field = Default::default();)+
                 }
             };
         }
+        /* Exhaustive: a new `ParaProperties` field does not compile here
+        until it is classified. */
+        let ParaProperties {
+            alignment: _,
+            indent: _,
+            spacing: _,
+            line_height: _,
+            keep_next: _,
+            keep_lines: _,
+            page_break_before: _,
+            tab_stops: _,
+            shading: _,
+            shading_pattern: _,
+            borders: _,
+            border_spelling: _,
+            // `direction_is_inherited` (issue #202).
+            direction: _,
+            // `emit_ppr` writes the paragraph's own `list_item`.
+            list_item: _,
+            // Direct only: style definitions carry no bag (issue #84).
+            grab_bag: _,
+            // Read-only, cleared by `serialize_paragraph_body`.
+            outline_level: _,
+            widow_control: _,
+            suppress_auto_hyphens: _,
+            suppress_line_numbers: _,
+        } = props;
         omit!(alignment; direct.alignment.is_none());
         omit!(indent; direct.indent == engine::Indent::default());
         omit!(spacing; direct.spacing == engine::Spacing::default());
@@ -4695,8 +4701,8 @@ fn write_docx_raw(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             .any(|(n, _)| n == names.styles.as_str());
         /* Issue #202 — paragraphs only inheriting their direction keep it
         on styles.xml, not as a direct `<w:bidi/>`. */
-        let _inherited_directions =
-            publish_inherited_directions(doc, styles_already_present || styles_bytes.is_some());
+        let _inherited_props =
+            publish_inherited_props(doc, styles_already_present || styles_bytes.is_some());
         /* Issues #74 / #354 — the settings toggles the engine owns
         (`evenAndOddHeaders`, `trackRevisions`, `mirrorMargins`) are
         patched into `word/settings.xml` IN PLACE, and only those whose
@@ -11975,3 +11981,15 @@ mod forbidden_chars_tests;
 #[cfg(test)]
 #[path = "writer_default_style_tests.rs"]
 mod default_style_tests;
+
+/// Issue #558 — the default character style: mirrored into the engine,
+/// applied at span-materialize time, never written as direct formatting.
+#[cfg(test)]
+#[path = "writer_default_char_style_tests.rs"]
+mod default_char_style_tests;
+
+/// Issue #560 — engine-minted paragraphs carry their cascade; the writer
+/// leaves everything inherited out of their regenerated `<w:pPr>`.
+#[cfg(test)]
+#[path = "writer_minted_paragraph_tests.rs"]
+mod minted_paragraph_tests;

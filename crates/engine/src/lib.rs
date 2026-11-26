@@ -95,6 +95,10 @@ pub use font_size_bounds::{
 pub mod fields;
 mod revision_refs;
 pub use revision_refs::{RevisionEntry, RevisionPick, RevisionRef, RevisionSlot};
+/// Issues #560 / #558 — engine-minted paragraphs take the style cascade;
+/// the default character style formats runs naming none.
+#[cfg(test)]
+mod minted_paragraph_tests;
 #[cfg(test)]
 mod para_border_cascade_tests;
 #[cfg(test)]
@@ -142,6 +146,9 @@ pub mod text_input;
 pub mod theme;
 
 pub mod toc;
+/// Epic #555 rows 20 / 22, issue #598 — the ONE word model (double-click,
+/// drag by words, Ctrl+arrows, Ctrl+Backspace / Delete).
+pub mod words;
 pub use fields::{
     FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TocSwitches,
     TypedField, render_date_time_picture,
@@ -431,6 +438,22 @@ pub struct DocumentTree {
     /// snapshot encodes unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_number_style: Option<SpanStyle>,
+    /// Issue #558 — the run formatting of the document's DEFAULT
+    /// CHARACTER style (`<w:style w:type="character" w:default="1">`,
+    /// Word's `DefaultParagraphFont`), its `basedOn` chain folded
+    /// root-first, WITHOUT the docDefaults: the character style of every
+    /// run that names none (ECMA-376 §17.7.4.17). Folded at
+    /// span-materialize time between the paragraph style chain's
+    /// `<w:rPr>` and the run's own formatting
+    /// ([`StyleCascade::text_style`]), never into a span, so the writer
+    /// never spells it as direct formatting. A run naming a character
+    /// style (`SpanStyle::char_style`) takes that style's chain instead.
+    /// Read-only (`styles.xml` rides the source package verbatim);
+    /// `None` when the document defines no default character style or it
+    /// formats nothing (Word's own is empty) — skipped when `None`, so a
+    /// pre-#558 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_char_style: Option<SpanStyle>,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -4562,40 +4585,15 @@ impl Paragraph {
         snap_offset(&self.text, offset)
     }
 
-    /// Byte range `[start, end)` of the word containing caret position
-    /// `offset` — a whitespace-delimited span (PHASE_4_HEADLESS_UI.md §7,
-    /// double-click select). When `offset` sits on whitespace, the run of
-    /// whitespace is returned. `offset` is clamped to a char boundary.
+    /// Byte range `[start, end)` of the word holding caret position
+    /// `offset` — issue #598, the ONE word model ([`words`]): a text,
+    /// punctuation or object unit plus the separators after it, so a
+    /// double-click on `word` in `word, next` selects `word`, on `,` the
+    /// `, `, and on a space the word that space trails. At the end of the
+    /// text, the last word. `offset` is clamped to a char boundary.
     pub fn word_bounds(&self, offset: u32) -> (u32, u32) {
-        let text = self.text.as_str();
-        let len = text.len();
-        if len == 0 {
-            return (0, 0);
-        }
         let off = self.snap_offset(offset) as usize;
-        /* Classify by the char to the right; at end-of-text, the char left. */
-        let ws = text[off..]
-            .chars()
-            .next()
-            .or_else(|| text[..off].chars().next_back())
-            .is_some_and(char::is_whitespace);
-
-        let mut start = off;
-        for (i, c) in text[..off].char_indices().rev() {
-            if c.is_whitespace() == ws {
-                start = i;
-            } else {
-                break;
-            }
-        }
-        let mut end = off;
-        for (i, c) in text[off..].char_indices() {
-            if c.is_whitespace() == ws {
-                end = off + i + c.len_utf8();
-            } else {
-                break;
-            }
-        }
+        let (start, end) = words::word_at(&self.text, off);
         (start as u32, end as u32)
     }
 
@@ -5660,6 +5658,12 @@ pub enum TableError {
     NestedUnsupported {
         path: BlockPath,
     },
+    /// Issue #563 — an insert position (`InsertTable.at`) whose last step
+    /// indexes no block list: it ends in a `Cell` step, or its earlier
+    /// steps address no table cell.
+    NoInsertPosition {
+        path: BlockPath,
+    },
     RowOutOfRange {
         row: u32,
         rows: usize,
@@ -5704,6 +5708,11 @@ impl std::fmt::Display for TableError {
             TableError::NestedUnsupported { path } => write!(
                 f,
                 "path {:?} addresses a nested table; nested-table editing is not supported yet",
+                path.steps
+            ),
+            TableError::NoInsertPosition { path } => write!(
+                f,
+                "path {:?} is no block position in the body or in a table cell",
                 path.steps
             ),
             TableError::RowOutOfRange { row, rows } => {
@@ -6222,6 +6231,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6278,6 +6288,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6336,6 +6347,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6374,6 +6386,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6412,6 +6425,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6503,6 +6517,7 @@ impl DocumentTree {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
@@ -6899,10 +6914,23 @@ impl DocumentTree {
         if let Some(e) = edit {
             next.remap_text_edit_record(&target, e);
         }
+        /* Word styles note bodies `FootnoteText` / `EndnoteText`; adopt
+        the style when the document defines it so the body picks up the
+        smaller size the template intends. Issue #560 — through the
+        cascade: the body lays out with the style's paragraph properties
+        now, not only after save + reopen. */
+        let style_id = match kind {
+            NoteKind::Footnote => "FootnoteText",
+            NoteKind::Endnote => "EndnoteText",
+        };
         let mut body_para = Paragraph {
             text: format!("{}{}", '\u{FFFC}', ' '),
             dirty: true,
-            ..Default::default()
+            ..self.new_paragraph_in_style(
+                self.styles
+                    .contains_key(style_id)
+                    .then(|| style_id.to_string()),
+            )
         };
         body_para.inline_objects.push(InlineObject {
             at: 0,
@@ -6910,16 +6938,6 @@ impl DocumentTree {
             anchor: None,
             source_xml: None,
         });
-        /* Word styles note bodies `FootnoteText` / `EndnoteText`; adopt
-        the style when the document defines it so the body picks up the
-        smaller size the template intends. */
-        let style_id = match kind {
-            NoteKind::Footnote => "FootnoteText",
-            NoteKind::Endnote => "EndnoteText",
-        };
-        if self.styles.contains_key(style_id) {
-            body_para.style_id = Some(style_id.to_string());
-        }
         let next = next.with_updated_note_story(kind, id as i32, vec![Block::Paragraph(body_para)]);
         (next, id)
     }
@@ -7174,16 +7192,7 @@ impl DocumentTree {
     /// content. `None` when `cell` addresses no cell or the cell holds no
     /// paragraph at any depth — never a `Block` path that ends at a table.
     pub fn cell_paragraph_bounds(&self, cell: &BlockPath) -> Option<(BlockPath, BlockPath)> {
-        let PathStep::Cell { row, col } = *cell.steps.last()? else {
-            return None;
-        };
-        let table = self.table_at_path(&cell.parent())?;
-        let blocks = &table
-            .rows
-            .get(row as usize)?
-            .cells
-            .get(col as usize)?
-            .blocks;
+        let blocks = &self.cell_at_path(cell)?.blocks;
         Some((
             first_paragraph_in_blocks(blocks, cell)?,
             last_paragraph_in_blocks(blocks, cell)?,
@@ -7581,7 +7590,10 @@ impl DocumentTree {
 
     /// Issue #509 — [`Self::tracked_format_change`] over resolved
     /// [`RangeTarget`]s (a `TABLE_CELLS` rectangle's too). Only the
-    /// covered bytes get a revision; an empty paragraph has none.
+    /// covered bytes get a revision; an empty paragraph has none. A
+    /// covered paragraph MARK (issue #489) takes the formatting through
+    /// the same targets ([`Self::apply_style_targets`]) but records no
+    /// mark `<w:rPrChange>` yet (issue #372).
     pub fn tracked_format_change_targets(
         &self,
         targets: &[RangeTarget],
@@ -7628,27 +7640,11 @@ impl DocumentTree {
         it or typing lands in a phantom trailing paragraph. */
         let count = self.paragraph_count();
         if count == 0 && self.path_to_first_paragraph_deep().is_none() {
+            /* Issue #560 — the minted paragraph takes the cascade. */
             blocks.push_back(Block::Paragraph(Paragraph {
                 text: text.to_owned(),
-                spans: Vec::new(),
-                props: ParaProperties::default(),
-                list_item: None,
-                resolved_marker: None,
-                resolved_list_indent: None,
                 dirty: true,
-                source_xml: None,
-                inline_objects: Vec::new(),
-                hyperlinks: Vec::new(),
-                revisions: Vec::new(),
-                fields: Vec::new(),
-                style_id: None,
-                direct_overrides: ParaProperties::default(),
-                section_end: None,
-                bookmarks: Vec::new(),
-                body_xml: None,
-                source_markup: None,
-                mark_revisions: Vec::new(),
-                mark_style: None,
+                ..self.new_paragraph()
             }));
             return Self {
                 blocks,
@@ -7669,6 +7665,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -7819,6 +7816,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -7875,9 +7873,10 @@ impl DocumentTree {
     /// rows, a body -> table boundary, nested tables. Every paragraph it
     /// reaches ([`Self::range_targets`]) is styled — the first from
     /// `start.offset`, the last up to `end.offset`, the ones between
-    /// whole — and an empty paragraph the range passes through gets the
-    /// patch on its mark ([`Self::apply_style_targets`]). Before, ranges
-    /// whose ends had different parents styled the first paragraph only.
+    /// whole — and every paragraph mark the range runs past gets the
+    /// patch too ([`Self::apply_style_targets`], issue #489). Before,
+    /// ranges whose ends had different parents styled the first paragraph
+    /// only.
     pub fn apply_style(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
         let targets = self.range_targets(&start, &end);
         self.apply_style_targets(&targets, patch)
@@ -7887,8 +7886,11 @@ impl DocumentTree {
     /// [`RangeTarget`]s (a linear range's, or a `TABLE_CELLS`
     /// rectangle's: [`Self::cell_rect_targets`]). A target with no
     /// covered bytes and no mark to style is skipped (the paragraph is not
-    /// even marked dirty); an empty paragraph whose mark is covered takes
-    /// the patch on `Paragraph::mark_style`, so typing there continues it.
+    /// even marked dirty); a covered mark ([`RangeTarget::mark`]) takes the
+    /// patch on `Paragraph::mark_style` — an empty paragraph's, so typing
+    /// there continues it (#293), and since issue #489 a paragraph's with
+    /// text too, so a whole paragraph set to 8 pt has an 8 pt last line
+    /// (the mark's face sizes it) and an 8 pt mark when emptied (Word).
     pub fn apply_style_targets(&self, targets: &[RangeTarget], patch: SpanStyle) -> Self {
         let live: Vec<&RangeTarget> = targets.iter().filter(|t| t.lo < t.hi || t.mark).collect();
         if live.is_empty() {
@@ -7901,7 +7903,7 @@ impl DocumentTree {
             if target.lo < target.hi {
                 *para = para.apply_style(target.lo, target.hi, patch.clone());
             }
-            if target.mark && para.text.is_empty() {
+            if target.mark {
                 let mark = para.mark_style.as_deref().cloned().unwrap_or_default();
                 para.mark_style = Some(Box::new(mark.merged_with(patch.clone())));
             }
@@ -7955,6 +7957,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8007,6 +8010,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8100,6 +8104,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8243,6 +8248,7 @@ impl DocumentTree {
             style_defaults: split.style_defaults.clone(),
             style_run_defaults: split.style_run_defaults.clone(),
             line_number_style: split.line_number_style.clone(),
+            default_char_style: split.default_char_style.clone(),
             styles_dirty: split.styles_dirty,
             numbering: split.numbering.clone(),
             hf_dirty: split.hf_dirty.clone(),
@@ -8354,6 +8360,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8451,6 +8458,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8529,6 +8537,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8605,6 +8614,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8644,6 +8654,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8723,6 +8734,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8766,9 +8778,41 @@ impl DocumentTree {
     }
 
     /// Issue #556 — this document's paragraph-style cascade
-    /// ([`StyleCascade`]), the default paragraph style looked up once.
+    /// ([`StyleCascade`]), the default paragraph style looked up once —
+    /// and, issue #558, its default character style.
     pub fn style_cascade(&self) -> StyleCascade<'_> {
-        StyleCascade::new(&self.styles)
+        StyleCascade::new(&self.styles).with_default_character(self.default_char_style.as_ref())
+    }
+
+    /// Issue #558 — the effective formatting of text whose own run
+    /// formatting is `own` (`None`: no span covers it) in a `style_id`
+    /// paragraph: `docDefaults → pStyle chain → the default character
+    /// style (when `own` names no character style) → own`
+    /// ([`StyleCascade::text_style`]).
+    pub fn resolve_text_style(&self, style_id: Option<&str>, own: Option<&SpanStyle>) -> SpanStyle {
+        let cascade = self.style_cascade();
+        cascade.text_style(&cascade.run(&self.style_run_defaults, style_id), own)
+    }
+
+    /// Issue #560 — a paragraph the engine mints, formatted with the
+    /// default paragraph style through the document's ONE cascade
+    /// ([`StyleCascade::new_paragraph`]). Every structural insert takes
+    /// its new paragraphs here, never from `Paragraph::default()`.
+    pub fn new_paragraph(&self) -> Paragraph {
+        self.new_paragraph_in_style(None)
+    }
+
+    /// Issue #560 — [`Self::new_paragraph`] formatted with `style_id`
+    /// (a note body's `FootnoteText`).
+    pub fn new_paragraph_in_style(&self, style_id: Option<String>) -> Paragraph {
+        self.style_cascade()
+            .new_paragraph(&self.style_defaults, style_id)
+    }
+
+    /// Issue #560 — a fresh table cell (Word's default borders) holding
+    /// one [`Self::new_paragraph`].
+    pub fn new_table_cell(&self) -> TableCell {
+        table_cell_holding(self.new_paragraph())
     }
 
     /// Sprint 12 (#11) — apply `style_id` to every paragraph the range
@@ -8811,6 +8855,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8922,6 +8967,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: true,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -8997,6 +9043,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9048,6 +9095,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9102,6 +9150,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9240,6 +9289,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: next_numbering,
             hf_dirty: self.hf_dirty.clone(),
@@ -9302,6 +9352,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9342,6 +9393,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9464,6 +9516,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9529,6 +9582,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9722,6 +9776,8 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let mut placed_at = 0u32;
         let mut edit = None;
+        /* Issue #560 — the box's first paragraph takes the cascade. */
+        let seed = self.new_paragraph();
         let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
             let mut off = (pos.offset as usize).min(para.text.len());
             while !para.text.is_char_boundary(off) {
@@ -9735,6 +9791,7 @@ impl DocumentTree {
                     width_emu: width_emu.max(1),
                     height_emu: height_emu.max(1),
                     story: Box::new(TextBoxStory {
+                        body: vec![Block::Paragraph(seed)],
                         fill: Some([255, 255, 255, 255]),
                         outline: Some(ShapeOutline {
                             color: [0, 0, 0, 255],
@@ -9849,6 +9906,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -9905,6 +9963,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -10049,6 +10108,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -10117,8 +10177,8 @@ impl DocumentTree {
         /* Design review B6 — see `insert_text`: a table-only tree has
         cell paragraphs the deep path reaches. */
         if count == 0 && self.path_to_first_paragraph_deep().is_none() {
-            blocks.push_back(Block::Paragraph(Paragraph::default()));
-            blocks.push_back(Block::Paragraph(Paragraph::default()));
+            blocks.push_back(Block::Paragraph(self.new_paragraph()));
+            blocks.push_back(Block::Paragraph(self.new_paragraph()));
             return Self {
                 blocks,
                 body_section: self.body_section.clone(),
@@ -10138,6 +10198,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -10190,6 +10251,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -10351,7 +10413,7 @@ impl DocumentTree {
         let paras: &[Paragraph] = &paras;
         let mut blocks = self.blocks.clone();
         if self.paragraph_count() == 0 {
-            blocks.push_back(Block::Paragraph(Paragraph::default()));
+            blocks.push_back(Block::Paragraph(self.new_paragraph()));
         }
         let target_path = if self.paragraph_at_path(&at.path).is_some() {
             at.path.clone()
@@ -10362,7 +10424,7 @@ impl DocumentTree {
         let Some(target_para) = self
             .paragraph_at_path(&target_path)
             .cloned()
-            .or_else(|| Some(Paragraph::default()))
+            .or_else(|| Some(self.new_paragraph()))
         else {
             return (self.clone(), at.clone());
         };
@@ -10397,6 +10459,7 @@ impl DocumentTree {
                     style_defaults: self.style_defaults.clone(),
                     style_run_defaults: self.style_run_defaults.clone(),
                     line_number_style: self.line_number_style.clone(),
+                    default_char_style: self.default_char_style.clone(),
                     styles_dirty: self.styles_dirty,
                     numbering: self.numbering.clone(),
                     hf_dirty: self.hf_dirty.clone(),
@@ -10452,6 +10515,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -10606,7 +10670,7 @@ impl DocumentTree {
         }
         let mut blocks = self.blocks.clone();
         if self.paragraph_count() == 0 {
-            blocks.push_back(Block::Paragraph(Paragraph::default()));
+            blocks.push_back(Block::Paragraph(self.new_paragraph()));
         }
         let target_path = if self.paragraph_at_path(&at.path).is_some() {
             at.path.clone()
@@ -10694,6 +10758,7 @@ impl DocumentTree {
                 style_defaults: self.style_defaults.clone(),
                 style_run_defaults: self.style_run_defaults.clone(),
                 line_number_style: self.line_number_style.clone(),
+                default_char_style: self.default_char_style.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
@@ -10777,9 +10842,12 @@ impl DocumentTree {
     ============================================================ */
 
     /// Insert an empty `rows × cols` table at the *block position* given
-    /// by `at` (top-level path only — nested-cell insertion in 5b). The
-    /// new table sits at top-level block index `at.steps[0]`; the
-    /// existing block at that index slides down by one.
+    /// by `at`, at any depth (issue #563): `at`'s last `Block` step indexes
+    /// into the body (a one-step path) or into the table cell its earlier
+    /// steps address — a cell of a nested table included — and the block
+    /// at that index slides down by one. An empty path appends to the body;
+    /// the index is clamped to the container's length. A path whose
+    /// container is no cell is refused ([`Self::resolve_block_insert`]).
     pub fn try_insert_table(
         &self,
         at: BlockPath,
@@ -10787,7 +10855,38 @@ impl DocumentTree {
         cols: u32,
     ) -> Result<Self, TableError> {
         check_table_dims(rows, cols)?;
+        self.resolve_block_insert(&at)?;
         Ok(self.insert_table(at, rows, cols))
+    }
+
+    /// Issue #563 — where a block inserted at `at` lands: `(container,
+    /// index)`, `container` being the steps that lead INTO the block list
+    /// `at`'s last `Block` step indexes (empty = the body / story root,
+    /// `[..., Cell { r, c }]` = a table cell at any depth) and `index` that
+    /// step clamped to the list's length. An empty `at` appends to the root.
+    /// The ONE resolution `InsertTable` (untracked and tracked) and its
+    /// caret go through, so a cell caret's insert nests in that cell —
+    /// never a top-level-only index.
+    pub fn resolve_block_insert(
+        &self,
+        at: &BlockPath,
+    ) -> Result<(Vec<PathStep>, usize), TableError> {
+        let refuse = || TableError::NoInsertPosition { path: at.clone() };
+        match at.steps.split_last() {
+            None => Ok((Vec::new(), self.blocks.len())),
+            Some((PathStep::Block(i), container)) => {
+                let len = if container.is_empty() {
+                    self.blocks.len()
+                } else {
+                    let cell = BlockPath {
+                        steps: container.to_vec(),
+                    };
+                    self.cell_at_path(&cell).ok_or_else(refuse)?.blocks.len()
+                };
+                Ok((container.to_vec(), (*i as usize).min(len)))
+            }
+            Some((PathStep::Cell { .. }, _)) => Err(refuse()),
+        }
     }
 
     /// Infallible sibling of [`Self::try_insert_table`] for internal
@@ -10795,9 +10894,12 @@ impl DocumentTree {
     /// clamped into the caps, so this can never allocate from an
     /// unbounded wire value either; the command boundary uses the
     /// checked variant so the shell sees a typed error instead of a
-    /// silently smaller table.
+    /// silently smaller table. A position that does not resolve is a
+    /// no-op.
     pub fn insert_table(&self, at: BlockPath, rows: u32, cols: u32) -> Self {
-        let idx = top_level_block_index(&at).unwrap_or(self.blocks.len() as u32);
+        let Ok((container, idx)) = self.resolve_block_insert(&at) else {
+            return self.clone();
+        };
         let cols_u32 = cols.clamp(1, MAX_TABLE_COLS);
         let rows = rows
             .clamp(1, MAX_TABLE_ROWS)
@@ -10808,14 +10910,24 @@ impl DocumentTree {
         (9020 twips ≈ 6.26 in) so a fresh table fits the page on
         insert. Phase 5c will switch to `<w:tblLayout w:type="autofit"/>`
         once auto-fit lands; until then a literal grid that matches
-        the page is the pragmatic default. */
-        let per_col = (DEFAULT_A4_CONTENT_TWIPS / cols as i32).max(720);
-        let grid: Vec<i32> = vec![per_col; cols];
+        the page is the pragmatic default. Issue #563 — a table nested
+        in a cell divides that cell's content width instead (Word fits a
+        table inserted in a cell to the cell; an A4-wide grid would make
+        Word widen the outer cell to hold it). */
+        let grid: Vec<i32> = match self.cell_content_twips(&container) {
+            Some(content) => vec![(content / cols as i32).max(1); cols],
+            None => vec![(DEFAULT_A4_CONTENT_TWIPS / cols as i32).max(720); cols],
+        };
+        /* Issue #560 — the cells and the escape paragraph take the
+        document's cascade (a nested table's too: a cell paragraph naming
+        no style reads back through `Normal` like a body one). */
+        let fresh_cell = self.new_table_cell();
+        let escape = self.new_paragraph();
         let mut row_vec: Vec<TableRow> = Vec::with_capacity(rows as usize);
         for _ in 0..rows {
             let mut cells = Vec::with_capacity(cols);
             for _ in 0..cols {
-                cells.push(default_table_cell());
+                cells.push(fresh_cell.clone());
             }
             row_vec.push(TableRow {
                 props: RowProperties::default(),
@@ -10840,54 +10952,83 @@ impl DocumentTree {
             body_xml: None,
             source_markup: None,
         };
-        let mut blocks = self.blocks.clone();
-        let insert_at = (idx as usize).min(blocks.len());
-        blocks.insert(insert_at, Block::Table(table));
         /* OOXML mandates a `<w:p>` after every `<w:tbl>` boundary
-        (the body's last child must be a paragraph). Beyond spec
-        compliance, the trailing paragraph is the caret's escape
-        hatch — without one, pressing Down at the bottom row has
+        (the body's last child must be a paragraph, and so must a cell's).
+        Beyond spec compliance, the trailing paragraph is the caret's
+        escape hatch — without one, pressing Down at the bottom row has
         nowhere to go and traps the caret inside the table. Splice
-        one in unless the next block is already a Paragraph. */
-        let needs_trailing = blocks
-            .get(insert_at + 1)
-            .is_none_or(|b| !matches!(b, Block::Paragraph(_)));
-        if needs_trailing {
-            blocks.insert(insert_at + 1, Block::Paragraph(Paragraph::default()));
-        }
-        let mut out = Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            deleted_comments: self.deleted_comments.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            line_number_style: self.line_number_style.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-            theme: self.theme.clone(),
+        one in unless the next block is already a Paragraph. The same
+        rule in a cell as in the body (issue #563). */
+        let splice = |blocks: &mut dyn BlockList, table: Table| -> (usize, bool) {
+            let insert_at = idx.min(blocks.block_count());
+            blocks.insert_block(insert_at, Block::Table(table));
+            let needs_trailing = blocks
+                .block(insert_at + 1)
+                .is_none_or(|b| !matches!(b, Block::Paragraph(_)));
+            if needs_trailing {
+                blocks.insert_block(insert_at + 1, Block::Paragraph(escape.clone()));
+            }
+            (insert_at, needs_trailing)
         };
+        let mut blocks = self.blocks.clone();
+        let spliced = if container.is_empty() {
+            Some(splice(&mut blocks, table))
+        } else {
+            mutate_cell_blocks_in_top(&mut blocks, &container, |cell| splice(cell, table))
+        };
+        let Some((insert_at, needs_trailing)) = spliced else {
+            return self.clone();
+        };
+        let mut out = self.with_blocks(blocks);
         /* Issue #152 — the table (+ its escape paragraph) slid every
-        later block down: keep comment anchors on their paragraphs. */
-        out.remap_block_indices(insert_at as u32, 1 + i64::from(needs_trailing));
+        later block of its container down: keep comment anchors on their
+        paragraphs. */
+        out.remap_block_splice(
+            &container,
+            insert_at as u32,
+            0,
+            1 + u32::from(needs_trailing),
+        );
         out
+    }
+
+    /// Issue #563 — the cell `cell` addresses (a path ending in its `Cell`
+    /// step, at any depth). `None` when it addresses no cell.
+    pub fn cell_at_path(&self, cell: &BlockPath) -> Option<&TableCell> {
+        let PathStep::Cell { row, col } = *cell.steps.last()? else {
+            return None;
+        };
+        self.table_at_path(&cell.parent())?
+            .rows
+            .get(row as usize)?
+            .cells
+            .get(col as usize)
+    }
+
+    /// Issue #563 — the content width, in twips, of the cell the container
+    /// steps `container` lead into (its spanned grid columns minus its
+    /// resolved left / right margins — the width the layout gives the
+    /// cell's blocks). `None` for the root container, a cell that does not
+    /// exist, or a table without a usable grid.
+    fn cell_content_twips(&self, container: &[PathStep]) -> Option<i32> {
+        let (PathStep::Cell { row, col }, table_steps) = container.split_last()? else {
+            return None;
+        };
+        let table = self.table_at_path(&BlockPath {
+            steps: table_steps.to_vec(),
+        })?;
+        let cells = &table.rows.get(*row as usize)?.cells;
+        let cell = cells.get(*col as usize)?;
+        let first: usize = cells[..*col as usize]
+            .iter()
+            .map(|c| c.props.grid_span.max(1) as usize)
+            .sum();
+        let span = cell.props.grid_span.max(1) as usize;
+        let width: i32 = table.grid.iter().skip(first).take(span).sum();
+        let margins =
+            CellMargins::resolve_edges(cell.props.cell_margins.as_ref(), &table.props.cell_margins);
+        let content = width - margins.left_twips - margins.right_twips;
+        (content > 0).then_some(content)
     }
 
     /// Delete the table at `at.steps[0]` (top-level only at PR 3).
@@ -10920,6 +11061,7 @@ impl DocumentTree {
             style_defaults: self.style_defaults.clone(),
             style_run_defaults: self.style_run_defaults.clone(),
             line_number_style: self.line_number_style.clone(),
+            default_char_style: self.default_char_style.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
@@ -10966,6 +11108,8 @@ impl DocumentTree {
     }
 
     fn insert_row_unmapped(&self, table_path: BlockPath, at: usize) -> Self {
+        /* Issue #560 — the new cells take the document's cascade. */
+        let fresh_cell = self.new_table_cell();
         self.mutate_table(table_path, |t| {
             /* Prefer the grid width: a merged first row has FEWER cells
             than the table has logical columns, and a fresh row must
@@ -10977,7 +11121,7 @@ impl DocumentTree {
             };
             let new_row = TableRow {
                 props: RowProperties::default(),
-                cells: (0..cols).map(|_| default_table_cell()).collect(),
+                cells: (0..cols).map(|_| fresh_cell.clone()).collect(),
                 source_markup: None,
             };
             let insert_at = at.min(t.rows.len());
@@ -11027,14 +11171,13 @@ impl DocumentTree {
         out
     }
 
-    /// Issue #253 — the top-level table `mutate_table` would restructure
-    /// for `table_path` (it addresses the table by the path's FIRST block
-    /// step), with its path. `None` when the command is a no-op.
+    /// Issue #253 — the table `mutate_table` would restructure for
+    /// `table_path`, with its path. Issue #562 — `table_path` addresses
+    /// the table at any depth (a nested table is ITS table, never the
+    /// top-level table around it). `None` when the command is a no-op.
     fn mutated_table_shape(&self, table_path: &BlockPath) -> Option<(BlockPath, &Table)> {
-        let idx = top_level_block_index(table_path)?;
-        let tp = BlockPath::top(idx);
-        let t = self.blocks.get(idx as usize)?.as_table()?;
-        Some((tp, t))
+        let t = self.table_at_path(table_path)?;
+        Some((table_path.clone(), t))
     }
 
     /// Insert a column at `at` (new column occupies that index; rows
@@ -11064,6 +11207,8 @@ impl DocumentTree {
     }
 
     fn insert_column_unmapped(&self, table_path: BlockPath, at: usize) -> Self {
+        /* Issue #560 — the new cells take the document's cascade. */
+        let fresh_cell = self.new_table_cell();
         self.mutate_table(table_path, |t| {
             let insert_at = at.min(t.grid.len());
             /* Re-divide the A4 content width across the new column
@@ -11077,7 +11222,7 @@ impl DocumentTree {
             }
             for row in &mut t.rows {
                 let cell_at = insert_at.min(row.cells.len());
-                row.cells.insert(cell_at, default_table_cell());
+                row.cells.insert(cell_at, fresh_cell.clone());
             }
         })
     }
@@ -11251,6 +11396,9 @@ impl DocumentTree {
         g0: u32,
         g1: u32,
     ) -> Self {
+        /* Issue #560 — a continuation placeholder's paragraph takes the
+        document's cascade, as it reads back. */
+        let placeholder = self.new_paragraph();
         self.mutate_table(table_path, |t| {
             let plan = merge_plan(t, r0, r1, g0, g1);
             let Some(&(first_row, owner_col, _)) = plan.first() else {
@@ -11270,7 +11418,7 @@ impl DocumentTree {
                     let free = is_content_free_placeholder(&row.cells[lo]);
                     let own = std::mem::replace(
                         &mut row.cells[lo].blocks,
-                        vec![Block::Paragraph(Paragraph::default())],
+                        vec![Block::Paragraph(placeholder.clone())],
                     );
                     if !free {
                         appended.extend(own);
@@ -11304,13 +11452,15 @@ impl DocumentTree {
     /// starting *grid column* (cursor walk over per-row `grid_span`s), not
     /// by cell index — preceding cells in a row may themselves span.
     pub fn split_cell(&self, table_path: BlockPath, row: u32, col: u32) -> Self {
-        fn restore_row(row: &mut TableRow, idx: usize, span: usize) {
+        fn restore_row(row: &mut TableRow, idx: usize, span: usize, fresh: &TableCell) {
             row.cells[idx].props.grid_span = 1;
             row.cells[idx].props.v_merge = VMergeRole::None;
             for k in 0..span.saturating_sub(1) {
-                row.cells.insert(idx + 1 + k, default_table_cell());
+                row.cells.insert(idx + 1 + k, fresh.clone());
             }
         }
+        /* Issue #560 — the restored cells take the document's cascade. */
+        let fresh_cell = self.new_table_cell();
         /* Cell index in `row` whose starting grid column == `grid_col`. */
         fn cell_at_grid_col(row: &TableRow, grid_col: usize) -> Option<usize> {
             let mut cursor = 0usize;
@@ -11362,7 +11512,7 @@ impl DocumentTree {
                 .iter()
                 .map(|c| c.props.grid_span.max(1) as usize)
                 .sum();
-            restore_row(&mut t.rows[row as usize], col as usize, span);
+            restore_row(&mut t.rows[row as usize], col as usize, span, &fresh_cell);
             if was_restart {
                 for r in (row as usize + 1)..t.rows.len() {
                     let Some(i) = cell_at_grid_col(&t.rows[r], owner_grid_col) else {
@@ -11371,7 +11521,7 @@ impl DocumentTree {
                     if !matches!(t.rows[r].cells[i].props.v_merge, VMergeRole::Continue) {
                         break;
                     }
-                    restore_row(&mut t.rows[r], i, span);
+                    restore_row(&mut t.rows[r], i, span, &fresh_cell);
                 }
             }
         });
@@ -11429,57 +11579,27 @@ impl DocumentTree {
     }
 
     /// Helper — open `table_path`'s `Block::Table`, run `f`, flip dirty,
-    /// drop source bytes, write back.
+    /// drop source bytes, write back. Issue #562 — `path` addresses the
+    /// table at any depth: a nested table is mutated in place and every
+    /// table around it is dirtied too (the writer regenerates the whole
+    /// chain). A path that addresses no table is a no-op.
     fn mutate_table<F>(&self, path: BlockPath, f: F) -> Self
     where
         F: FnOnce(&mut Table),
     {
-        let idx = match top_level_block_index(&path) {
-            Some(i) => i as usize,
-            None => return self.clone(),
-        };
         let mut blocks = self.blocks.clone();
-        if idx >= blocks.len() {
-            return self.clone();
-        }
-        let mut block = blocks[idx].clone();
-        let Some(table) = block.as_table_mut() else {
-            return self.clone();
-        };
-        f(table);
-        /* Phase 5 PR 3 invariant: every table mutation drops the
-        passthrough — the writer must regenerate from rows. */
-        table.dirty = true;
-        table.source_xml = None;
-        blocks.set(idx, block);
-        Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            deleted_comments: self.deleted_comments.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            line_number_style: self.line_number_style.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-            theme: self.theme.clone(),
+        let mutated = mutate_block_in_top(&mut blocks, &path, |block| {
+            let table = block.as_table_mut()?;
+            f(table);
+            /* Phase 5 PR 3 invariant: every table mutation drops the
+            passthrough — the writer must regenerate from rows. */
+            table.dirty = true;
+            table.source_xml = None;
+            Some(())
+        });
+        match mutated {
+            Some(()) => self.with_blocks(blocks),
+            None => self.clone(),
         }
     }
 }
@@ -11639,6 +11759,10 @@ pub const MAX_STYLE_CHAIN: usize = 10;
 pub struct StyleCascade<'a> {
     styles: &'a std::collections::HashMap<String, ParagraphStyle>,
     default_style: Option<&'a ParagraphStyle>,
+    /// Issue #558 — the default CHARACTER style's folded run formatting
+    /// ([`DocumentTree::default_char_style`]); `None` from [`Self::new`],
+    /// set by [`DocumentTree::style_cascade`].
+    default_char: Option<&'a SpanStyle>,
 }
 
 impl<'a> StyleCascade<'a> {
@@ -11652,12 +11776,26 @@ impl<'a> StyleCascade<'a> {
         Self {
             styles,
             default_style,
+            default_char: None,
         }
+    }
+
+    /// Issue #558 — this cascade with the document's default character
+    /// style ([`DocumentTree::default_char_style`]).
+    pub fn with_default_character(mut self, style: Option<&'a SpanStyle>) -> Self {
+        self.default_char = style;
+        self
     }
 
     /// The document's default paragraph style (`w:default="1"`), if any.
     pub fn default_style(&self) -> Option<&'a ParagraphStyle> {
         self.default_style
+    }
+
+    /// Issue #558 — the folded run formatting of the document's default
+    /// character style, when it formats anything.
+    pub fn default_character(&self) -> Option<&'a SpanStyle> {
+        self.default_char
     }
 
     /// The style a paragraph whose `style_id` is `style_id` is formatted
@@ -11709,6 +11847,28 @@ impl<'a> StyleCascade<'a> {
         out
     }
 
+    /// Issue #558 — the formatting of TEXT whose own run formatting is
+    /// `own` (`None`: text no span covers) in a paragraph whose run
+    /// baseline is `base` ([`Self::run`]): `base → the default character
+    /// style → own`, the default character style only when `own` names
+    /// no character style (`SpanStyle::char_style`: a named style's chain
+    /// is folded into the span by the reader and replaces the default,
+    /// ECMA-376 §17.7.4.17). The ONE fold every consumer of a run's
+    /// effective formatting goes through — span materialization, the
+    /// paragraph mark, the caret / toolbar read-back.
+    pub fn text_style(&self, base: &SpanStyle, own: Option<&SpanStyle>) -> SpanStyle {
+        let mut out = base.clone();
+        if own.is_none_or(|s| s.char_style.is_none())
+            && let Some(default_char) = self.default_char
+        {
+            out = out.merged_with(default_char.clone());
+        }
+        match own {
+            Some(own) => out.merged_with(own.clone()),
+            None => out,
+        }
+    }
+
     /// Recompute `para.props` from its style cascade ∪ its
     /// `direct_overrides`: `style_defaults → chain → direct` in ONE
     /// direction-aware cascade (issue #395 — the logical border edges of
@@ -11721,6 +11881,29 @@ impl<'a> StyleCascade<'a> {
                 .chain(chain.iter().rev().map(|d| &d.para))
                 .chain(std::iter::once(&para.direct_overrides)),
         );
+    }
+
+    /// Issue #560 — a paragraph the ENGINE creates (a table's cells and
+    /// its escape paragraph, a new row / column / split cell, a header /
+    /// footer / text-box / note seed, the first paragraph of an empty
+    /// container) formatted with `style_id` exactly as the reader formats
+    /// a `<w:p>` with no `<w:pPr>` (or only that `<w:pStyle>`): `props` =
+    /// this cascade (`style_defaults → applied style chain`, the default
+    /// paragraph style for `None`), nothing direct. It lays out now as it
+    /// will after save + reopen, and the writer leaves every inherited
+    /// value out of its regenerated `<w:pPr>` (#431,
+    /// `format_docx::writer::without_inherited`).
+    pub fn new_paragraph(
+        &self,
+        style_defaults: &ParaProperties,
+        style_id: Option<String>,
+    ) -> Paragraph {
+        let mut para = Paragraph {
+            style_id,
+            ..Paragraph::default()
+        };
+        self.recompute(&mut para, style_defaults);
+        para
     }
 }
 
@@ -11799,13 +11982,22 @@ pub fn default_word_borders() -> CellBorders {
 /// borders on every edge. Without the placeholder paragraph cells
 /// collapse to zero height; without the borders the table is
 /// invisible until the user dresses it up.
+///
+/// Its paragraph skips every style cascade (a tree with no style table);
+/// engine code takes [`DocumentTree::new_table_cell`] (issue #560).
 pub fn default_table_cell() -> TableCell {
+    table_cell_holding(Paragraph::default())
+}
+
+/// A table cell with Word's default borders holding `para`
+/// ([`default_table_cell`], [`DocumentTree::new_table_cell`]).
+fn table_cell_holding(para: Paragraph) -> TableCell {
     TableCell {
         props: CellProperties {
             borders: Some(default_word_borders()),
             ..CellProperties::default()
         },
-        blocks: vec![Block::Paragraph(Paragraph::default())],
+        blocks: vec![Block::Paragraph(para)],
         source_markup: None,
     }
 }
@@ -12392,6 +12584,112 @@ fn insert_block_after_path_in_vec(
     Some(())
 }
 
+/// Issue #563 — the two block-list shapes a block is inserted into: the
+/// tree's root `im::Vector` and a table cell's `Vec`.
+trait BlockList {
+    fn block_count(&self) -> usize;
+    fn block(&self, i: usize) -> Option<&Block>;
+    fn insert_block(&mut self, i: usize, block: Block);
+}
+
+impl BlockList for Vector<Block> {
+    fn block_count(&self) -> usize {
+        self.len()
+    }
+    fn block(&self, i: usize) -> Option<&Block> {
+        self.get(i)
+    }
+    fn insert_block(&mut self, i: usize, block: Block) {
+        self.insert(i, block);
+    }
+}
+
+impl BlockList for Vec<Block> {
+    fn block_count(&self) -> usize {
+        self.len()
+    }
+    fn block(&self, i: usize) -> Option<&Block> {
+        self.get(i)
+    }
+    fn insert_block(&mut self, i: usize, block: Block) {
+        self.insert(i, block);
+    }
+}
+
+/// Issue #562 / #563 — the block `steps` (relative to the top-level block
+/// `block`, whose own step is already consumed) addresses, at any depth,
+/// for mutation. Every table on the way is marked dirty so the writer
+/// regenerates it (the PR 3 passthrough invariant).
+fn block_in_block_mut<'a>(block: &'a mut Block, steps: &[PathStep]) -> Option<&'a mut Block> {
+    match steps {
+        [] => Some(block),
+        [PathStep::Cell { row, col }, PathStep::Block(n), rest @ ..] => {
+            let Block::Table(t) = block else {
+                return None;
+            };
+            let cell = t
+                .rows
+                .get_mut(*row as usize)?
+                .cells
+                .get_mut(*col as usize)?;
+            let found = block_in_block_mut(cell.blocks.get_mut(*n as usize)?, rest)?;
+            t.dirty = true;
+            t.source_xml = None;
+            Some(found)
+        }
+        _ => None,
+    }
+}
+
+/// Issue #562 — run `f` on the block `path` addresses in `top`, at any
+/// depth; the top-level block is cloned and spliced back (structural
+/// sharing), every table on the way dirtied. `None` — and `top` untouched
+/// — when the path addresses no block or `f` declines.
+fn mutate_block_in_top<R>(
+    top: &mut Vector<Block>,
+    path: &BlockPath,
+    f: impl FnOnce(&mut Block) -> Option<R>,
+) -> Option<R> {
+    let (PathStep::Block(n), rest) = path.steps.split_first()? else {
+        return None;
+    };
+    let n = *n as usize;
+    let mut block = top.get(n)?.clone();
+    let out = f(block_in_block_mut(&mut block, rest)?)?;
+    top.set(n, block);
+    Some(out)
+}
+
+/// Issue #563 — run `f` on the block list of the table cell the container
+/// steps `container` lead into (`[Block(t), Cell { r, c }]`, at any depth),
+/// cloning and splicing the top-level block back like
+/// [`mutate_block_in_top`]; every table on the way, the cell's own
+/// included, is dirtied. `None` when `container` addresses no cell.
+fn mutate_cell_blocks_in_top<R>(
+    top: &mut Vector<Block>,
+    container: &[PathStep],
+    f: impl FnOnce(&mut Vec<Block>) -> R,
+) -> Option<R> {
+    let (PathStep::Cell { row, col }, table) = container.split_last()? else {
+        return None;
+    };
+    let table = BlockPath {
+        steps: table.to_vec(),
+    };
+    mutate_block_in_top(top, &table, |block| {
+        let t = block.as_table_mut()?;
+        let cell = t
+            .rows
+            .get_mut(*row as usize)?
+            .cells
+            .get_mut(*col as usize)?;
+        let out = f(&mut cell.blocks);
+        t.dirty = true;
+        t.source_xml = None;
+        Some(out)
+    })
+}
+
 /// Resolve `path`'s parent container into an owned snapshot
 /// (`Vec<Block>` cloned out of the document). Used by range methods
 /// that need to walk the paragraphs between two same-container
@@ -12586,11 +12884,20 @@ pub struct RangeTarget {
     /// One past the last covered byte (the range end's offset in the last
     /// paragraph, else the paragraph's length).
     pub hi: u32,
-    /// The paragraph MARK is covered and the paragraph has no text: Word
-    /// formats an empty paragraph's mark (its only character) with the
-    /// selection, so typing into it afterwards continues the formatting
-    /// (`Paragraph::mark_style`, issue #293). Never set on a paragraph
-    /// that has text (its mark is not folded into the runs, issue #369).
+    /// The paragraph MARK is covered: the range runs past the
+    /// paragraph's end into what follows (every paragraph but the last
+    /// one of a linear range), or the selection includes the last
+    /// paragraph's mark too ([`DocumentTree::range_targets_with_end_mark`]:
+    /// Select All, a triple-click paragraph selection) and reaches its
+    /// end, or the paragraph sits in a selected cell rectangle (Word
+    /// selects every end-of-cell mark with the cells). Character
+    /// formatting patches the mark as well (`Paragraph::mark_style`,
+    /// issue #489): the mark's face sizes the paragraph's LAST line
+    /// (`mark_line_metrics`) and types into the paragraph once it is
+    /// empty (issue #293). A range that stops at the last character
+    /// without crossing the mark leaves it alone. The mark is still never
+    /// folded into the runs (issue #369) — a reader samples it only for a
+    /// paragraph with no text.
     pub mark: bool,
 }
 
@@ -12601,8 +12908,8 @@ fn collect_range_block(
     block: &Block,
     steps: &mut Vec<PathStep>,
     depth: u32,
-    start: &LogicalPos,
-    end: &LogicalPos,
+    (start, end): (&LogicalPos, &LogicalPos),
+    end_mark: bool,
     out: &mut Vec<RangeTarget>,
 ) -> bool {
     use core::cmp::Ordering;
@@ -12617,13 +12924,16 @@ fn collect_range_block(
             let len = p.text.len() as u32;
             let is_start = steps.as_slice() == start.path.steps.as_slice();
             let is_end = steps.as_slice() == end.path.steps.as_slice();
+            let hi = if is_end { end.offset.min(len) } else { len };
             out.push(RangeTarget {
                 path: BlockPath {
                     steps: steps.clone(),
                 },
                 lo: if is_start { start.offset.min(len) } else { 0 },
-                hi: if is_end { end.offset.min(len) } else { len },
-                mark: len == 0 && !is_end,
+                hi,
+                /* Issue #489 — the range crosses this mark, or the
+                selection includes the last one and reaches it. */
+                mark: !is_end || (end_mark && hi == len),
             });
             !is_end
         }
@@ -12639,8 +12949,14 @@ fn collect_range_block(
                     });
                     for (bi, inner) in cell.blocks.iter().enumerate() {
                         steps.push(PathStep::Block(bi as u32));
-                        let keep_going =
-                            collect_range_block(inner, steps, depth + 1, start, end, out);
+                        let keep_going = collect_range_block(
+                            inner,
+                            steps,
+                            depth + 1,
+                            (start, end),
+                            end_mark,
+                            out,
+                        );
                         steps.pop();
                         if !keep_going {
                             steps.pop();
@@ -12657,7 +12973,9 @@ fn collect_range_block(
 }
 
 /// Every paragraph under `blocks` (nested tables included), WHOLE, with
-/// the mark covered: the shape a cell-rectangle selection formats.
+/// the mark covered (issue #489: a cell selection includes every
+/// paragraph mark and end-of-cell mark in it): the shape a cell-rectangle
+/// selection formats.
 fn collect_whole_paragraphs(
     blocks: &[Block],
     steps: &mut Vec<PathStep>,
@@ -12673,7 +12991,7 @@ fn collect_whole_paragraphs(
                 },
                 lo: 0,
                 hi: p.text.len() as u32,
-                mark: p.text.is_empty(),
+                mark: true,
             }),
             Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => {
                 for (ri, row) in t.rows.iter().enumerate() {
@@ -12706,7 +13024,28 @@ impl DocumentTree {
     /// whole. Endpoints are ordered first; an endpoint that does not
     /// address a paragraph reaches whatever follows / precedes it in
     /// document order. Bounded by [`MAX_REVISION_TABLE_DEPTH`].
+    ///
+    /// Issue #489 — every paragraph the range runs PAST has its mark
+    /// covered ([`RangeTarget::mark`]); the last one's is not (the range
+    /// stops before it). [`Self::range_targets_with_end_mark`] is the
+    /// same walk for a selection that includes that mark too.
     pub fn range_targets(&self, a: &LogicalPos, b: &LogicalPos) -> Vec<RangeTarget> {
+        self.range_targets_with_end_mark(a, b, false)
+    }
+
+    /// Issue #489 — [`Self::range_targets`], with `end_mark` saying
+    /// whether the selection also includes the paragraph mark of its LAST
+    /// paragraph: Word's Select All and triple-click paragraph selection
+    /// select the pilcrow (there is no caret position after it here, so
+    /// the selection's shape cannot say so — the caller knows how it was
+    /// made). The mark is covered only when the range reaches the end of
+    /// that paragraph's text.
+    pub fn range_targets_with_end_mark(
+        &self,
+        a: &LogicalPos,
+        b: &LogicalPos,
+        end_mark: bool,
+    ) -> Vec<RangeTarget> {
         let (start, end) = order_positions(a.clone(), b.clone());
         let (Some(PathStep::Block(first)), Some(PathStep::Block(last))) = (
             start.path.steps.first().copied(),
@@ -12724,7 +13063,8 @@ impl DocumentTree {
                 break;
             };
             steps.push(PathStep::Block(i));
-            let keep_going = collect_range_block(block, &mut steps, 0, &start, &end, &mut out);
+            let keep_going =
+                collect_range_block(block, &mut steps, 0, (&start, &end), end_mark, &mut out);
             steps.pop();
             if !keep_going {
                 break;
@@ -12745,9 +13085,10 @@ impl DocumentTree {
     /// Issue #509 — the paragraphs of the cell rectangle
     /// `rows.0..=rows.1` x `cols.0..=cols.1` of the table at `table`
     /// (cell indices, as `PathStep::Cell` counts them), WHOLE and with
-    /// their marks covered: a `TABLE_CELLS` selection formats every
-    /// paragraph of every selected cell, nested tables included. Empty
-    /// when `table` addresses no table.
+    /// their marks covered (issue #489: every one, text or not): a
+    /// `TABLE_CELLS` selection formats every paragraph of every selected
+    /// cell, nested tables included. Empty when `table` addresses no
+    /// table.
     pub fn cell_rect_targets(
         &self,
         table: &BlockPath,
@@ -15413,9 +15754,10 @@ mod tests {
             mark_revisions: Vec::new(),
             mark_style: None,
         };
-        assert_eq!(p.word_bounds(2), (0, 5));
-        assert_eq!(p.word_bounds(0), (0, 5));
-        assert_eq!(p.word_bounds(5), (5, 6)); // on the space
+        /* Issue #598 — a word carries its trailing space (memo §6). */
+        assert_eq!(p.word_bounds(2), (0, 6));
+        assert_eq!(p.word_bounds(0), (0, 6));
+        assert_eq!(p.word_bounds(5), (0, 6)); // on the space: the word it trails
         assert_eq!(p.word_bounds(8), (6, 11));
         assert_eq!(p.word_bounds(11), (6, 11)); // end of text → last word
     }
@@ -15445,8 +15787,8 @@ mod tests {
             mark_revisions: Vec::new(),
             mark_style: None,
         };
-        assert_eq!(p.word_bounds(4), (0, 10));
-        assert_eq!(p.word_bounds(0), (0, 10));
+        assert_eq!(p.word_bounds(4), (0, 11));
+        assert_eq!(p.word_bounds(0), (0, 11));
         assert_eq!(p.word_bounds(12), (11, 25)); // mid-char offset clamps
     }
 
@@ -16969,6 +17311,7 @@ mod tests {
             style_defaults: ParaProperties::default(),
             style_run_defaults: SpanStyle::default(),
             line_number_style: None,
+            default_char_style: None,
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),

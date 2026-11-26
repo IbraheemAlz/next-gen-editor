@@ -31,6 +31,7 @@
 
 mod comments;
 mod complex_script;
+mod default_char_style;
 mod default_style;
 mod inline_spans;
 mod malformed;
@@ -400,6 +401,13 @@ fn run_default() -> Result<()> {
     /* Step 65 — issue #354: the settings toggles (trackRevisions,
     mirrorMargins) read, and written back only when they change. */
     settings_toggles::run_settings_toggles_roundtrip()?;
+    /* Step 66 — issue #489: a selection that covers a paragraph mark
+    (Select All) formats it; the mark's `<w:rPr>` is a pure insertion. */
+    reader_cascade::run_mark_selection_roundtrip()?;
+    /* Step 67 — issue #558: the default CHARACTER style formats runs
+    naming none; the writer never spells it as direct formatting (66 is
+    #489's). */
+    default_char_style::run_default_char_style_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -5379,6 +5387,20 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             bytes: format_docx::test_fixtures::default_style_rtl_docx(),
             entry: page_decor_fixture_entry(
                 format_docx::test_fixtures::DEFAULT_STYLE_TEXTS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            ),
+        },
+        /* Issue #558 — `DefaultParagraphFont` (the default character
+        style) carries a serif font, bold and 16 pt: every run naming no
+        character style takes it (the e2e `default-character-style.spec.ts`
+        opens it; step 67 edits it). Zero-edit drift 0. */
+        PrebuiltFixture {
+            name: "default_char_style.docx",
+            bytes: format_docx::test_fixtures::default_char_style_docx(),
+            entry: page_decor_fixture_entry(
+                format_docx::test_fixtures::DEFAULT_CHAR_TEXTS
                     .iter()
                     .map(|t| t.to_string())
                     .collect(),

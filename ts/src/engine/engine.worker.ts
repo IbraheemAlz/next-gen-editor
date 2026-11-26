@@ -7,7 +7,7 @@ import type {
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { commandMeta } from '@nge/core/command-meta';
-import { MediaDecoder, mediaDecodePlan, type MediaEntry } from './media-decode';
+import { MediaDecoder, mediaDecodePlan, runMediaPass, type MediaEntry } from './media-decode';
 import {
     openEventLog,
     setActiveLogDb,
@@ -1595,16 +1595,15 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
            `INSERT_IMAGE` mints one, an undo / paste can bring one back),
            decode what the engine has no bitmap for with the browser's
            native pipeline and register the results back on the engine.
-           A new document's first paint picks them up; any other command
-           already painted with the placeholder, so repaint once the
-           bitmaps are in. Queued behind this task: every later command
-           (and the shell's `GET_IMAGE_RECTS`) sees the painted picture. */
-        const mediaPlan = mediaDecodePlan(commandMeta(msg.cmd.type), evt.type);
-        if (mediaPlan.decode) {
-            if (startsNewDocument(msg.cmd)) mediaDecoder.reset();
-            const decoded = await decodeAndRegisterMedia();
-            if (decoded > 0 && mediaPlan.repaint) await repaintAllPages();
-        }
+           The command already painted with the placeholder (an open's
+           first paint too - issue #574: its page canvases are re-registered
+           only when the page count changes), so repaint once the bitmaps
+           are in. Queued behind this task: every later command (and the
+           shell's `GET_IMAGE_RECTS`) sees the painted picture. */
+        await runMediaPass(mediaDecodePlan(commandMeta(msg.cmd.type), evt.type), mediaDecoder, {
+            pending: pendingMedia,
+            repaint: repaintAllPages,
+        });
         /* §10 / Backlog #10: after a document mutation, broadcast an
            accessibility delta. The message carries no `id`, so EngineClient
            fans it out to subscribers — the mirror DOM reconciler patches only
@@ -1815,20 +1814,25 @@ const mediaDecoder = new MediaDecoder<ImageBitmap>({
 });
 
 /**
- * Phase 7 / issue #506 - decode every picture blob the engine holds but has
- * no up-to-date bitmap for, and install the bitmaps on the engine. The engine
- * answers `pending_media_entries()` - after an open or a recovery that is
- * every blob (its cache was just cleared), after an `INSERT_IMAGE` or an
- * undo it is the one new picture, and on any other command it is empty - so
- * this is cheap enough to run after every command that can change the
- * document. Resolves with how many bitmaps were registered. Callers hold the
- * worker's command queue (nothing edits the document between the engine's
- * answer and `register_image`, which fingerprints the blob it decoded).
+ * Phase 7 / issue #506 - every picture blob the engine holds but has no
+ * up-to-date bitmap for. The engine answers `pending_media_entries()` - after
+ * an open or a recovery that is every blob (its cache was just cleared),
+ * after an `INSERT_IMAGE` or an undo it is the one new picture, and on any
+ * other command it is empty - so decoding it is cheap enough to run after
+ * every command that can change the document (`runMediaPass`). Callers hold
+ * the worker's command queue (nothing edits the document between the
+ * engine's answer and `register_image`, which fingerprints the blob it
+ * decoded).
  */
+function pendingMedia(): MediaEntry[] {
+    return engine ? (engine.pending_media_entries() as MediaEntry[]) : [];
+}
+
+/** Decode and register `pendingMedia()`; resolves with how many bitmaps
+ *  were registered. A recovery's fresh page canvases paint them when they
+ *  register; every command goes through `runMediaPass`, which repaints. */
 async function decodeAndRegisterMedia(): Promise<number> {
-    if (!engine) return 0;
-    const entries = engine.pending_media_entries() as MediaEntry[];
-    return mediaDecoder.run(entries);
+    return mediaDecoder.run(pendingMedia());
 }
 
 /** Issue #388 - persist a change of the document's clean state. */

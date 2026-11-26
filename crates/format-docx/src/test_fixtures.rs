@@ -1530,6 +1530,11 @@ pub use cell_decor::*;
 mod default_style;
 pub use default_style::*;
 
+/* Issue #558 — the default CHARACTER style formats runs naming none. */
+#[path = "test_fixtures_default_char_style.rs"]
+mod default_char_style;
+pub use default_char_style::*;
+
 /* Issue #354 — `settings.xml` trackRevisions / mirrorMargins. */
 #[path = "test_fixtures_settings.rs"]
 mod settings;

@@ -393,7 +393,7 @@ impl DocumentTree {
             let alone = container_blocks(self, container).is_some_and(|b| b.len() == 1);
             if alone {
                 let _ =
-                    replace_block_in_top(&mut top, table, Block::Paragraph(Paragraph::default()));
+                    replace_block_in_top(&mut top, table, Block::Paragraph(self.new_paragraph()));
                 self.blocks = top;
                 self.remap_block_splice(container, *idx, 1, 1);
             } else {

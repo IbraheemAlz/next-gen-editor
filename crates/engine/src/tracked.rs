@@ -706,13 +706,13 @@ impl DocumentTree {
         author: &str,
         date: &str,
     ) -> Self {
-        let Some(tp) = crate::top_level_block_index(&table_path).map(BlockPath::top) else {
-            return self.clone();
-        };
-        let Some(rows) = self.table_at_path(&tp).map(|t| t.rows.len()) else {
+        /* Issue #562 — `table_path` addresses its table at any depth,
+        as `insert_row` resolves it. */
+        let Some(rows) = self.table_at_path(&table_path).map(|t| t.rows.len()) else {
             return self.clone();
         };
         let landed = at.min(rows);
+        let tp = table_path.clone();
         let mut out = self.insert_row(table_path, at);
         out.stamp_rows_inserted(&tp, landed..landed + 1, author, date);
         out
@@ -728,22 +728,22 @@ impl DocumentTree {
         author: &str,
         date: &str,
     ) -> Self {
-        let Some(tp) = crate::top_level_block_index(&table_path).map(BlockPath::top) else {
-            return self.clone();
-        };
         if self
-            .table_at_path(&tp)
+            .table_at_path(&table_path)
             .is_none_or(|t| row as usize >= t.rows.len())
         {
             return self.clone();
         }
         let mut out = self.clone();
-        out.mark_rows_deleted(&tp, row, row, author, date);
+        out.mark_rows_deleted(&table_path, row, row, author, date);
         out
     }
 
     /// [`Self::insert_table`] with review mode on (module docs above): the
-    /// table lands at the same block index as the untracked insert.
+    /// table lands at the same block position as the untracked insert —
+    /// in the body or, issue #563, in a table cell at any depth
+    /// ([`Self::resolve_block_insert`]; a position that does not resolve
+    /// is a no-op, like the untracked insert).
     pub fn tracked_insert_table(
         &self,
         at: BlockPath,
@@ -752,38 +752,42 @@ impl DocumentTree {
         author: &str,
         date: &str,
     ) -> Self {
-        let len = self.blocks.len() as u32;
-        let idx = crate::top_level_block_index(&at).unwrap_or(len).min(len);
-        let needs_trailing = !matches!(self.blocks.get(idx as usize), Some(Block::Paragraph(_)));
+        let Ok((container, idx)) = self.resolve_block_insert(&at) else {
+            return self.clone();
+        };
+        let idx = idx as u32;
+        let path_at = |i: u32| crate::block_path_in(&container, i);
+        let needs_trailing = !matches!(self.block_at(&path_at(idx)), Some(Block::Paragraph(_)));
         let prev = idx
             .checked_sub(1)
-            .and_then(|i| self.blocks.get(i as usize))
-            .and_then(Block::as_paragraph);
+            .and_then(|i| self.paragraph_at_path(&path_at(i)));
         let mut out = match (needs_trailing, prev) {
             /* Split the paragraph in front at its end: its text keeps a new
             (inserted) mark, the original mark moves to the empty paragraph
             that now follows the table. */
             (true, Some(p)) => {
-                let end = LogicalPos::new(BlockPath::top(idx - 1), p.text.len() as u32);
+                let end = LogicalPos::new(path_at(idx - 1), p.text.len() as u32);
                 self.tracked_split_paragraph(end, author, date)
-                    .insert_table(BlockPath::top(idx), rows, cols)
+                    .insert_table(path_at(idx), rows, cols)
             }
             (true, None) => {
                 /* No paragraph in front: the escape paragraph is new
                 content of its own. */
-                let mut out = self.insert_table(BlockPath::top(idx), rows, cols);
+                let mut out = self.insert_table(path_at(idx), rows, cols);
                 let mut blocks = out.blocks.clone();
-                let _ = mutate_paragraph_in_top(&mut blocks, &BlockPath::top(idx + 1), |p| {
+                let _ = mutate_paragraph_in_top(&mut blocks, &path_at(idx + 1), |p| {
                     p.mark_revisions = vec![mark_change(RevisionKind::Insert, author, date)];
                 });
                 out.blocks = blocks;
                 out
             }
-            (false, _) => self.insert_table(BlockPath::top(idx), rows, cols),
+            (false, _) => self.insert_table(path_at(idx), rows, cols),
         };
-        if let Some(Block::Table(t)) = out.blocks.get(idx as usize) {
+        if let Some(Block::Table(t)) = out.block_at(&path_at(idx)) {
             let stamped = stamp_inserted(&Block::Table(t.clone()), author, date);
-            out.blocks.set(idx as usize, stamped);
+            let mut blocks = out.blocks.clone();
+            let _ = crate::replace_block_in_top(&mut blocks, &path_at(idx), stamped);
+            out.blocks = blocks;
         }
         out
     }
