@@ -10,9 +10,9 @@ import { documentXml, storedDocx } from './helpers/docx';
  * Backspace at a table's edges). Row 26 (`<w:bidiVisual>`) has no model in
  * the memo: it pins OUR intent (`cell_exit_step`: cell exits and Tab follow
  * the TABLE's reading direction) — Word unverified. Row 27's "the innermost
- * table handles Tab" case is not pinned here: Tab into a nested cell
- * selects the outer cell (#566) and Tab in a nested table's last cell grows
- * the outer table (#562).
+ * table handles Tab" case (Tab between nested cells selects the nested cell,
+ * #566; Tab in a nested table's last cell grows THAT table, #562) is pinned
+ * in `nested-table-flows.spec.ts`.
  *
  * Every action under test is a real key press on the hidden textarea, a
  * toolbar button or a pointer event on the page canvas (`pointer.ts`).

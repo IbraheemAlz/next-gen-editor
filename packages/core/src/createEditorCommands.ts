@@ -59,6 +59,7 @@ import type {
     BridgeStyleProperties,
 } from './types';
 import type { LiveCommand } from './facadeMap';
+import { tableInsertPosition } from './tableInsert';
 
 /** Issue #339 — the `DocFormat` a file opens as, from its name: `.txt` →
  *  `plain_text`, `.html` / `.htm` / `.xhtml` → `html`, anything else (and no
@@ -299,6 +300,9 @@ export interface EditorCommands {
     /* Tables — every method maps 1:1 onto a `Command` variant in
      * `crates/bridge/src/command.rs`. */
     insertTable(at: BlockPath, rows: number, cols: number): Promise<Event>;
+    /** Issue #563 — a `rows × cols` table right after the caret's
+     *  paragraph, in that paragraph's own container: a caret in a table
+     *  cell (at any depth) nests the table in that cell. */
     insertTableAtCaret(rows: number, cols: number): Promise<Event>;
     deleteTable(path: BlockPath): Promise<Event>;
     /** Insert a row at `row` on the named `side` (Before | After).
@@ -765,22 +769,18 @@ function build(
         insertTable: (at, rows, cols) =>
             dispatch({ type: 'INSERT_TABLE', at, rows, cols }),
         insertTableAtCaret: (rows, cols) => {
-            /* Resolve the top-level Block step from the caret and insert
-             * the table immediately after that block — matches the
-             * existing Toolbar.tsx behaviour and keeps nested-cell carets
-             * landing outside the table. */
+            /* Issue #563 — right after the caret's paragraph, in that
+             * paragraph's own container: a caret in a table cell nests
+             * the new table in that cell (`tableInsertPosition`). */
             const sel = state.selection();
             if (!sel) {
                 throw new Error(
                     '[@nge/core] insertTableAtCaret requires a caret; no SELECTION_CHANGED yet.',
                 );
             }
-            const topStep = sel.end.path.steps.find((s) => s.kind === 'BLOCK');
-            const idx =
-                topStep && topStep.kind === 'BLOCK' ? topStep.idx + 1 : 0;
             return dispatch({
                 type: 'INSERT_TABLE',
-                at: { steps: [{ kind: 'BLOCK', idx }] },
+                at: tableInsertPosition(sel.end.path),
                 rows,
                 cols,
             });

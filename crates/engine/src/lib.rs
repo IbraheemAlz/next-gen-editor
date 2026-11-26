@@ -5640,6 +5640,12 @@ pub enum TableError {
     NestedUnsupported {
         path: BlockPath,
     },
+    /// Issue #563 — an insert position (`InsertTable.at`) whose last step
+    /// indexes no block list: it ends in a `Cell` step, or its earlier
+    /// steps address no table cell.
+    NoInsertPosition {
+        path: BlockPath,
+    },
     RowOutOfRange {
         row: u32,
         rows: usize,
@@ -5684,6 +5690,11 @@ impl std::fmt::Display for TableError {
             TableError::NestedUnsupported { path } => write!(
                 f,
                 "path {:?} addresses a nested table; nested-table editing is not supported yet",
+                path.steps
+            ),
+            TableError::NoInsertPosition { path } => write!(
+                f,
+                "path {:?} is no block position in the body or in a table cell",
                 path.steps
             ),
             TableError::RowOutOfRange { row, rows } => {
@@ -7154,16 +7165,7 @@ impl DocumentTree {
     /// content. `None` when `cell` addresses no cell or the cell holds no
     /// paragraph at any depth — never a `Block` path that ends at a table.
     pub fn cell_paragraph_bounds(&self, cell: &BlockPath) -> Option<(BlockPath, BlockPath)> {
-        let PathStep::Cell { row, col } = *cell.steps.last()? else {
-            return None;
-        };
-        let table = self.table_at_path(&cell.parent())?;
-        let blocks = &table
-            .rows
-            .get(row as usize)?
-            .cells
-            .get(col as usize)?
-            .blocks;
+        let blocks = &self.cell_at_path(cell)?.blocks;
         Some((
             first_paragraph_in_blocks(blocks, cell)?,
             last_paragraph_in_blocks(blocks, cell)?,
@@ -10757,9 +10759,12 @@ impl DocumentTree {
     ============================================================ */
 
     /// Insert an empty `rows × cols` table at the *block position* given
-    /// by `at` (top-level path only — nested-cell insertion in 5b). The
-    /// new table sits at top-level block index `at.steps[0]`; the
-    /// existing block at that index slides down by one.
+    /// by `at`, at any depth (issue #563): `at`'s last `Block` step indexes
+    /// into the body (a one-step path) or into the table cell its earlier
+    /// steps address — a cell of a nested table included — and the block
+    /// at that index slides down by one. An empty path appends to the body;
+    /// the index is clamped to the container's length. A path whose
+    /// container is no cell is refused ([`Self::resolve_block_insert`]).
     pub fn try_insert_table(
         &self,
         at: BlockPath,
@@ -10767,7 +10772,38 @@ impl DocumentTree {
         cols: u32,
     ) -> Result<Self, TableError> {
         check_table_dims(rows, cols)?;
+        self.resolve_block_insert(&at)?;
         Ok(self.insert_table(at, rows, cols))
+    }
+
+    /// Issue #563 — where a block inserted at `at` lands: `(container,
+    /// index)`, `container` being the steps that lead INTO the block list
+    /// `at`'s last `Block` step indexes (empty = the body / story root,
+    /// `[..., Cell { r, c }]` = a table cell at any depth) and `index` that
+    /// step clamped to the list's length. An empty `at` appends to the root.
+    /// The ONE resolution `InsertTable` (untracked and tracked) and its
+    /// caret go through, so a cell caret's insert nests in that cell —
+    /// never a top-level-only index.
+    pub fn resolve_block_insert(
+        &self,
+        at: &BlockPath,
+    ) -> Result<(Vec<PathStep>, usize), TableError> {
+        let refuse = || TableError::NoInsertPosition { path: at.clone() };
+        match at.steps.split_last() {
+            None => Ok((Vec::new(), self.blocks.len())),
+            Some((PathStep::Block(i), container)) => {
+                let len = if container.is_empty() {
+                    self.blocks.len()
+                } else {
+                    let cell = BlockPath {
+                        steps: container.to_vec(),
+                    };
+                    self.cell_at_path(&cell).ok_or_else(refuse)?.blocks.len()
+                };
+                Ok((container.to_vec(), (*i as usize).min(len)))
+            }
+            Some((PathStep::Cell { .. }, _)) => Err(refuse()),
+        }
     }
 
     /// Infallible sibling of [`Self::try_insert_table`] for internal
@@ -10775,9 +10811,12 @@ impl DocumentTree {
     /// clamped into the caps, so this can never allocate from an
     /// unbounded wire value either; the command boundary uses the
     /// checked variant so the shell sees a typed error instead of a
-    /// silently smaller table.
+    /// silently smaller table. A position that does not resolve is a
+    /// no-op.
     pub fn insert_table(&self, at: BlockPath, rows: u32, cols: u32) -> Self {
-        let idx = top_level_block_index(&at).unwrap_or(self.blocks.len() as u32);
+        let Ok((container, idx)) = self.resolve_block_insert(&at) else {
+            return self.clone();
+        };
         let cols_u32 = cols.clamp(1, MAX_TABLE_COLS);
         let rows = rows
             .clamp(1, MAX_TABLE_ROWS)
@@ -10788,9 +10827,14 @@ impl DocumentTree {
         (9020 twips ≈ 6.26 in) so a fresh table fits the page on
         insert. Phase 5c will switch to `<w:tblLayout w:type="autofit"/>`
         once auto-fit lands; until then a literal grid that matches
-        the page is the pragmatic default. */
-        let per_col = (DEFAULT_A4_CONTENT_TWIPS / cols as i32).max(720);
-        let grid: Vec<i32> = vec![per_col; cols];
+        the page is the pragmatic default. Issue #563 — a table nested
+        in a cell divides that cell's content width instead (Word fits a
+        table inserted in a cell to the cell; an A4-wide grid would make
+        Word widen the outer cell to hold it). */
+        let grid: Vec<i32> = match self.cell_content_twips(&container) {
+            Some(content) => vec![(content / cols as i32).max(1); cols],
+            None => vec![(DEFAULT_A4_CONTENT_TWIPS / cols as i32).max(720); cols],
+        };
         let mut row_vec: Vec<TableRow> = Vec::with_capacity(rows as usize);
         for _ in 0..rows {
             let mut cells = Vec::with_capacity(cols);
@@ -10820,54 +10864,83 @@ impl DocumentTree {
             body_xml: None,
             source_markup: None,
         };
-        let mut blocks = self.blocks.clone();
-        let insert_at = (idx as usize).min(blocks.len());
-        blocks.insert(insert_at, Block::Table(table));
         /* OOXML mandates a `<w:p>` after every `<w:tbl>` boundary
-        (the body's last child must be a paragraph). Beyond spec
-        compliance, the trailing paragraph is the caret's escape
-        hatch — without one, pressing Down at the bottom row has
+        (the body's last child must be a paragraph, and so must a cell's).
+        Beyond spec compliance, the trailing paragraph is the caret's
+        escape hatch — without one, pressing Down at the bottom row has
         nowhere to go and traps the caret inside the table. Splice
-        one in unless the next block is already a Paragraph. */
-        let needs_trailing = blocks
-            .get(insert_at + 1)
-            .is_none_or(|b| !matches!(b, Block::Paragraph(_)));
-        if needs_trailing {
-            blocks.insert(insert_at + 1, Block::Paragraph(Paragraph::default()));
-        }
-        let mut out = Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            deleted_comments: self.deleted_comments.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            line_number_style: self.line_number_style.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-            theme: self.theme.clone(),
+        one in unless the next block is already a Paragraph. The same
+        rule in a cell as in the body (issue #563). */
+        let splice = |blocks: &mut dyn BlockList, table: Table| -> (usize, bool) {
+            let insert_at = idx.min(blocks.block_count());
+            blocks.insert_block(insert_at, Block::Table(table));
+            let needs_trailing = blocks
+                .block(insert_at + 1)
+                .is_none_or(|b| !matches!(b, Block::Paragraph(_)));
+            if needs_trailing {
+                blocks.insert_block(insert_at + 1, Block::Paragraph(Paragraph::default()));
+            }
+            (insert_at, needs_trailing)
         };
+        let mut blocks = self.blocks.clone();
+        let spliced = if container.is_empty() {
+            Some(splice(&mut blocks, table))
+        } else {
+            mutate_cell_blocks_in_top(&mut blocks, &container, |cell| splice(cell, table))
+        };
+        let Some((insert_at, needs_trailing)) = spliced else {
+            return self.clone();
+        };
+        let mut out = self.with_blocks(blocks);
         /* Issue #152 — the table (+ its escape paragraph) slid every
-        later block down: keep comment anchors on their paragraphs. */
-        out.remap_block_indices(insert_at as u32, 1 + i64::from(needs_trailing));
+        later block of its container down: keep comment anchors on their
+        paragraphs. */
+        out.remap_block_splice(
+            &container,
+            insert_at as u32,
+            0,
+            1 + u32::from(needs_trailing),
+        );
         out
+    }
+
+    /// Issue #563 — the cell `cell` addresses (a path ending in its `Cell`
+    /// step, at any depth). `None` when it addresses no cell.
+    pub fn cell_at_path(&self, cell: &BlockPath) -> Option<&TableCell> {
+        let PathStep::Cell { row, col } = *cell.steps.last()? else {
+            return None;
+        };
+        self.table_at_path(&cell.parent())?
+            .rows
+            .get(row as usize)?
+            .cells
+            .get(col as usize)
+    }
+
+    /// Issue #563 — the content width, in twips, of the cell the container
+    /// steps `container` lead into (its spanned grid columns minus its
+    /// resolved left / right margins — the width the layout gives the
+    /// cell's blocks). `None` for the root container, a cell that does not
+    /// exist, or a table without a usable grid.
+    fn cell_content_twips(&self, container: &[PathStep]) -> Option<i32> {
+        let (PathStep::Cell { row, col }, table_steps) = container.split_last()? else {
+            return None;
+        };
+        let table = self.table_at_path(&BlockPath {
+            steps: table_steps.to_vec(),
+        })?;
+        let cells = &table.rows.get(*row as usize)?.cells;
+        let cell = cells.get(*col as usize)?;
+        let first: usize = cells[..*col as usize]
+            .iter()
+            .map(|c| c.props.grid_span.max(1) as usize)
+            .sum();
+        let span = cell.props.grid_span.max(1) as usize;
+        let width: i32 = table.grid.iter().skip(first).take(span).sum();
+        let margins =
+            CellMargins::resolve_edges(cell.props.cell_margins.as_ref(), &table.props.cell_margins);
+        let content = width - margins.left_twips - margins.right_twips;
+        (content > 0).then_some(content)
     }
 
     /// Delete the table at `at.steps[0]` (top-level only at PR 3).
@@ -11007,14 +11080,13 @@ impl DocumentTree {
         out
     }
 
-    /// Issue #253 — the top-level table `mutate_table` would restructure
-    /// for `table_path` (it addresses the table by the path's FIRST block
-    /// step), with its path. `None` when the command is a no-op.
+    /// Issue #253 — the table `mutate_table` would restructure for
+    /// `table_path`, with its path. Issue #562 — `table_path` addresses
+    /// the table at any depth (a nested table is ITS table, never the
+    /// top-level table around it). `None` when the command is a no-op.
     fn mutated_table_shape(&self, table_path: &BlockPath) -> Option<(BlockPath, &Table)> {
-        let idx = top_level_block_index(table_path)?;
-        let tp = BlockPath::top(idx);
-        let t = self.blocks.get(idx as usize)?.as_table()?;
-        Some((tp, t))
+        let t = self.table_at_path(table_path)?;
+        Some((table_path.clone(), t))
     }
 
     /// Insert a column at `at` (new column occupies that index; rows
@@ -11409,57 +11481,27 @@ impl DocumentTree {
     }
 
     /// Helper — open `table_path`'s `Block::Table`, run `f`, flip dirty,
-    /// drop source bytes, write back.
+    /// drop source bytes, write back. Issue #562 — `path` addresses the
+    /// table at any depth: a nested table is mutated in place and every
+    /// table around it is dirtied too (the writer regenerates the whole
+    /// chain). A path that addresses no table is a no-op.
     fn mutate_table<F>(&self, path: BlockPath, f: F) -> Self
     where
         F: FnOnce(&mut Table),
     {
-        let idx = match top_level_block_index(&path) {
-            Some(i) => i as usize,
-            None => return self.clone(),
-        };
         let mut blocks = self.blocks.clone();
-        if idx >= blocks.len() {
-            return self.clone();
-        }
-        let mut block = blocks[idx].clone();
-        let Some(table) = block.as_table_mut() else {
-            return self.clone();
-        };
-        f(table);
-        /* Phase 5 PR 3 invariant: every table mutation drops the
-        passthrough — the writer must regenerate from rows. */
-        table.dirty = true;
-        table.source_xml = None;
-        blocks.set(idx, block);
-        Self {
-            blocks,
-            body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnote_stories: self.footnote_stories.clone(),
-            endnote_stories: self.endnote_stories.clone(),
-            footnote_props: self.footnote_props,
-            endnote_props: self.endnote_props,
-            notes_dirty: self.notes_dirty.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            deleted_comments: self.deleted_comments.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            line_number_style: self.line_number_style.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-            hf_dirty: self.hf_dirty.clone(),
-            settings_dirty: self.settings_dirty,
-            document_root_attrs: self.document_root_attrs.clone(),
-            part_root_attrs: self.part_root_attrs.clone(),
-            document_envelope: self.document_envelope.clone(),
-            source_package: self.source_package.clone(),
-            theme: self.theme.clone(),
+        let mutated = mutate_block_in_top(&mut blocks, &path, |block| {
+            let table = block.as_table_mut()?;
+            f(table);
+            /* Phase 5 PR 3 invariant: every table mutation drops the
+            passthrough — the writer must regenerate from rows. */
+            table.dirty = true;
+            table.source_xml = None;
+            Some(())
+        });
+        match mutated {
+            Some(()) => self.with_blocks(blocks),
+            None => self.clone(),
         }
     }
 }
@@ -12370,6 +12412,112 @@ fn insert_block_after_path_in_vec(
     t.dirty = true;
     t.source_xml = None;
     Some(())
+}
+
+/// Issue #563 — the two block-list shapes a block is inserted into: the
+/// tree's root `im::Vector` and a table cell's `Vec`.
+trait BlockList {
+    fn block_count(&self) -> usize;
+    fn block(&self, i: usize) -> Option<&Block>;
+    fn insert_block(&mut self, i: usize, block: Block);
+}
+
+impl BlockList for Vector<Block> {
+    fn block_count(&self) -> usize {
+        self.len()
+    }
+    fn block(&self, i: usize) -> Option<&Block> {
+        self.get(i)
+    }
+    fn insert_block(&mut self, i: usize, block: Block) {
+        self.insert(i, block);
+    }
+}
+
+impl BlockList for Vec<Block> {
+    fn block_count(&self) -> usize {
+        self.len()
+    }
+    fn block(&self, i: usize) -> Option<&Block> {
+        self.get(i)
+    }
+    fn insert_block(&mut self, i: usize, block: Block) {
+        self.insert(i, block);
+    }
+}
+
+/// Issue #562 / #563 — the block `steps` (relative to the top-level block
+/// `block`, whose own step is already consumed) addresses, at any depth,
+/// for mutation. Every table on the way is marked dirty so the writer
+/// regenerates it (the PR 3 passthrough invariant).
+fn block_in_block_mut<'a>(block: &'a mut Block, steps: &[PathStep]) -> Option<&'a mut Block> {
+    match steps {
+        [] => Some(block),
+        [PathStep::Cell { row, col }, PathStep::Block(n), rest @ ..] => {
+            let Block::Table(t) = block else {
+                return None;
+            };
+            let cell = t
+                .rows
+                .get_mut(*row as usize)?
+                .cells
+                .get_mut(*col as usize)?;
+            let found = block_in_block_mut(cell.blocks.get_mut(*n as usize)?, rest)?;
+            t.dirty = true;
+            t.source_xml = None;
+            Some(found)
+        }
+        _ => None,
+    }
+}
+
+/// Issue #562 — run `f` on the block `path` addresses in `top`, at any
+/// depth; the top-level block is cloned and spliced back (structural
+/// sharing), every table on the way dirtied. `None` — and `top` untouched
+/// — when the path addresses no block or `f` declines.
+fn mutate_block_in_top<R>(
+    top: &mut Vector<Block>,
+    path: &BlockPath,
+    f: impl FnOnce(&mut Block) -> Option<R>,
+) -> Option<R> {
+    let (PathStep::Block(n), rest) = path.steps.split_first()? else {
+        return None;
+    };
+    let n = *n as usize;
+    let mut block = top.get(n)?.clone();
+    let out = f(block_in_block_mut(&mut block, rest)?)?;
+    top.set(n, block);
+    Some(out)
+}
+
+/// Issue #563 — run `f` on the block list of the table cell the container
+/// steps `container` lead into (`[Block(t), Cell { r, c }]`, at any depth),
+/// cloning and splicing the top-level block back like
+/// [`mutate_block_in_top`]; every table on the way, the cell's own
+/// included, is dirtied. `None` when `container` addresses no cell.
+fn mutate_cell_blocks_in_top<R>(
+    top: &mut Vector<Block>,
+    container: &[PathStep],
+    f: impl FnOnce(&mut Vec<Block>) -> R,
+) -> Option<R> {
+    let (PathStep::Cell { row, col }, table) = container.split_last()? else {
+        return None;
+    };
+    let table = BlockPath {
+        steps: table.to_vec(),
+    };
+    mutate_block_in_top(top, &table, |block| {
+        let t = block.as_table_mut()?;
+        let cell = t
+            .rows
+            .get_mut(*row as usize)?
+            .cells
+            .get_mut(*col as usize)?;
+        let out = f(&mut cell.blocks);
+        t.dirty = true;
+        t.source_xml = None;
+        Some(out)
+    })
 }
 
 /// Resolve `path`'s parent container into an owned snapshot
