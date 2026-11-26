@@ -7,15 +7,26 @@
  * commands; the textarea itself never accumulates text. */
 import { createEffect, onCleanup, onMount } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
-import type { Command, FormattingToggle, MoveDirection } from '../engine/types';
+import type { Command, Event, FormattingToggle, MoveDirection } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
 import {
+    activeStoryForKeys,
     clearSelectedImage,
     editingStoryForPointer,
     fieldCodeViewForKeys,
+    leaveImageSelection,
+    sameImageAddr,
     selectedImageForKeys,
+    type SelectedImageForKeys,
 } from '../state/engine-store';
-import { isModifierOnly, planImageKey, runImageKey } from '../input/image-keys';
+import {
+    isModifierOnly,
+    pictureSelection,
+    planImageKey,
+    runImageKey,
+    selectsPicture,
+    storyMatches,
+} from '../input/image-keys';
 import { ClipboardWriteError, copy, cut, paste, writeSync } from '../input/clipboard';
 import { createClipboardPrefetch } from '../input/clipboard-cache';
 import { devHooksEnabled, installDevHook } from '../dev-hooks';
@@ -180,21 +191,27 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
            then walk from the picture's own line), Escape / typing / Enter
            put the caret before it (see `input/image-keys.ts`). The commands
            are posted synchronously, ahead of any `beforeinput` this key
-           causes, so the worker applies them in key order. */
+           causes, so the worker applies them in key order.
+
+           Issue #506 — Ctrl+C / Ctrl+X keep the object selection (the copy
+           / cut handlers below act on the picture). A key that leaves it
+           keeps the caret overlay hidden until the engine placed the caret,
+           so the stale caret never flashes. The story is the one the next
+           command runs in: a click that is still entering the picture's
+           story counts as entered. */
         if (!isModifierOnly(e.key)) {
             const img = selectedImageForKeys();
-            const story = editingStoryForPointer();
-            const outcome = img
+            const res = img
                 ? runImageKey(
                       planImageKey(e, img),
                       img,
                       props.client,
-                      story && { area: story.area, rid: story.rid },
+                      activeStoryForKeys(),
                       (what, err) => console.error(`${what} failed`, err),
                   )
-                : 'continue';
-            clearSelectedImage();
-            if (outcome === 'consumed') {
+                : undefined;
+            if (!res?.keepObject) leaveImageSelection(res?.settled);
+            if (res?.outcome === 'consumed') {
                 e.preventDefault();
                 return;
             }
@@ -427,12 +444,26 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     const prefetch = createClipboardPrefetch(props.client, props.store, prefetchEnabled);
     installDevHook('__clipboardPrefetch', prefetch);
 
+    /* Issue #506 — copy / cut with a picture object-selected act on the
+       PICTURE: its sentinel becomes the engine's selection first (posted now,
+       so it is queued ahead of the clipboard read), and the cache warmed for
+       the previous text selection is skipped. Answers the engine's reply, or
+       `null` when the picture cannot be addressed (a text-box picture outside
+       the active story): then nothing is copied - never the stale text
+       selection. */
+    const selectPictureForClipboard = (picture: SelectedImageForKeys): Promise<Event> | null => {
+        if (!storyMatches(picture, activeStoryForKeys())) return null;
+        return props.client.dispatch(pictureSelection(picture));
+    };
+
     const onCopy = (e: ClipboardEvent): void => {
         e.preventDefault();
+        const picture = selectedImageForKeys();
+        if (picture && !selectPictureForClipboard(picture)) return;
         /* Issue #57 — cache hit: setData synchronously, no await, no
            focus dependency. A miss falls through to the #48 async path
            unchanged. */
-        const hit = prefetch.take();
+        const hit = picture ? null : prefetch.take();
         if (hit && (hit.plain === '' || writeSync(e, hit))) return;
         copy(props.client).catch((err: unknown) => {
             /* Only a ClipboardWriteError means the BROWSER blocked the
@@ -448,6 +479,36 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     };
     const onCut = (e: ClipboardEvent): void => {
         e.preventDefault();
+        const reportCutFailure = (err: unknown): void => {
+            /* ClipboardWriteError ⇒ the write was blocked and the delete
+               was skipped (write-before-delete), so "nothing was deleted"
+               is a guarantee. Any other rejection may have come from the
+               DELETE dispatch AFTER a successful write — stay vague. */
+            props.store.setUiError(
+                err instanceof ClipboardWriteError
+                    ? 'Cut failed — the browser blocked clipboard access. ' +
+                          'Nothing was deleted; click the document and try again.'
+                    : 'Cut failed — an editor error occurred.',
+            );
+        };
+        /* Issue #506 — a picture object-selected: cut it only once the
+           engine confirms it selected exactly the picture (the cut deletes
+           the selection), and end the object selection in the same task as
+           the delete's reply. */
+        const picture = selectedImageForKeys();
+        if (picture) {
+            const selected = selectPictureForClipboard(picture);
+            if (!selected) return;
+            selected
+                .then(async (evt) => {
+                    if (!selectsPicture(evt, picture)) return;
+                    await cut(props.client);
+                    const sel = props.store.selectedImage();
+                    if (sel && sameImageAddr(sel, picture)) clearSelectedImage();
+                })
+                .catch(reportCutFailure);
+            return;
+        }
         /* Issue #57 — cache hit: the synchronous write already succeeded
            when `writeSync` returns, so the delete may follow
            (write-before-delete holds). The cache is only trusted with no
@@ -463,18 +524,7 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
                 });
             return;
         }
-        cut(props.client).catch((err: unknown) => {
-            /* ClipboardWriteError ⇒ the write was blocked and the delete
-               was skipped (write-before-delete), so "nothing was deleted"
-               is a guarantee. Any other rejection may have come from the
-               DELETE dispatch AFTER a successful write — stay vague. */
-            props.store.setUiError(
-                err instanceof ClipboardWriteError
-                    ? 'Cut failed — the browser blocked clipboard access. ' +
-                          'Nothing was deleted; click the document and try again.'
-                    : 'Cut failed — an editor error occurred.',
-            );
-        });
+        cut(props.client).catch(reportCutFailure);
     };
     const onPaste = (e: ClipboardEvent): void => {
         e.preventDefault();
