@@ -410,22 +410,24 @@ impl Engine {
     /// carried ideal-x column like `Down` / `Up`. `PageDown` first grows
     /// the band until its settled pages reach that depth, so the target
     /// line is laid before it is chosen. Past the document's end / start
-    /// the last / first line is the target (Word parity).
+    /// the last / first line is the target (Word parity). Epic #555 — the
+    /// caret's line is the one [`caret_line`] resolves (its line hint), a
+    /// target inside a table is a line of the cell under the ideal x
+    /// ([`reachable_at_x`]), and the answer carries the [`LineHint`] that
+    /// keeps the caret on the line it landed on.
     pub(crate) fn page_step(
         &mut self,
         sel: &SelectionState,
         down: bool,
-    ) -> Result<(BridgeLogicalPos, Option<f32>), Box<Event>> {
+    ) -> Result<(BridgeLogicalPos, Option<f32>, LineHint), Box<Event>> {
         let scale = self.scale().max(f32::MIN_POSITIVE);
         let gap = render::scene::PAGE_GAP_PT * scale;
         let caret = &sel.caret;
-        let on_caret_line = |l: &LineGeom| {
-            l.path == caret.path && caret.offset >= l.start_byte && caret.offset <= l.end_byte
-        };
+        let hint = self.caret_line_hint;
         let (cur_y, cur_h, ideal) = {
             let geom = self.document_geometry()?;
-            let Some(cur) = geom.iter().find(|l| on_caret_line(l)) else {
-                return Ok((caret.clone(), sel.ideal_x));
+            let Some(cur) = caret_line(&geom, caret, hint) else {
+                return Ok((caret.clone(), sel.ideal_x, hint));
             };
             let ideal = sel
                 .ideal_x
@@ -461,24 +463,39 @@ impl Engine {
                     .min((l.y_top + l.height - target_y).abs())
             }
         };
-        let best = geom.iter().filter(|l| beyond(l)).min_by(|a, b| {
-            dist(a)
-                .partial_cmp(&dist(b))
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| {
-                    x_distance_to_line(a, ideal)
-                        .partial_cmp(&x_distance_to_line(b, ideal))
+        let reachable = reachable_at_x(&geom, ideal);
+        let pick = |only_reachable: bool| {
+            geom.iter()
+                .zip(&reachable)
+                .filter(|(l, ok)| beyond(l) && (**ok || !only_reachable))
+                .map(|(l, _)| l)
+                .min_by(|a, b| {
+                    dist(a)
+                        .partial_cmp(&dist(b))
                         .unwrap_or(core::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            x_distance_to_line(a, ideal)
+                                .partial_cmp(&x_distance_to_line(b, ideal))
+                                .unwrap_or(core::cmp::Ordering::Equal)
+                        })
                 })
-        });
-        let pos = match best {
-            Some(line) => BridgeLogicalPos {
-                path: line.path.clone(),
-                offset: nearest_slot_by_x(&line.slots, ideal).map_or(line.start_byte, |s| s.byte),
-            },
-            None => caret.clone(),
         };
-        Ok((pos, Some(ideal)))
+        let best = pick(true).or_else(|| pick(false));
+        Ok(match best {
+            Some(line) => {
+                let offset =
+                    nearest_slot_by_x(&line.slots, ideal).map_or(line.start_byte, |s| s.byte);
+                (
+                    BridgeLogicalPos {
+                        path: line.path.clone(),
+                        offset,
+                    },
+                    Some(ideal),
+                    LineHint::for_line(line, offset),
+                )
+            }
+            None => (caret.clone(), Some(ideal), hint),
+        })
     }
 }
 
