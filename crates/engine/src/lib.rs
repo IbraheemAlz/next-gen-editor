@@ -10067,7 +10067,7 @@ impl DocumentTree {
         let Block::Table(table) = self.block_at(&table_path)? else {
             return None;
         };
-        let target = first_cell_paragraph_path(table, table_path)?;
+        let target = first_cell_paragraph_path(table, &table_path)?;
         let tail = self.paragraph_at_path(&target)?;
         let shift = head.text.len() as u32;
         let merged = head.concat(tail);
