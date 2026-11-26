@@ -511,3 +511,96 @@ fn a_noncharacter_in_a_nested_field_names_its_path() {
         "{msg}"
     );
 }
+
+/// Issue #580 — the first `U+FFFC` in a paragraph's text with no inline
+/// object at its byte (an orphan sentinel), anywhere in the body (table
+/// cells and nested tables included).
+#[cfg(feature = "fuzz-native")]
+fn orphan_sentinel(doc: &DocumentTree) -> Option<String> {
+    let mut found = None;
+    engine::for_each_paragraph_nested(doc.blocks.iter(), &mut |path, p| {
+        if found.is_some() {
+            return;
+        }
+        for (at, _) in p.text.match_indices('\u{FFFC}') {
+            if !p.inline_objects.iter().any(|o| o.at as usize == at) {
+                found = Some(format!("{path:?} byte {at}: {:?}", p.text));
+                return;
+            }
+        }
+    });
+    found
+}
+
+/// Issue #580 — a bare `U+FFFC` (the plain-text flavour of a copied
+/// picture) through every text door — typing, a single- and multi-line
+/// paste, a replace, an HTML paste, an IME commit — leaves no orphan
+/// picture sentinel: the one text-input table drops it. Through the fuzz
+/// surface (`Engine::apply_sync`), with the `rpc_command` invariants after
+/// every step.
+#[cfg(feature = "fuzz-native")]
+#[test]
+fn a_bare_object_sentinel_never_reaches_the_model() {
+    let mut e = Engine::new_headless(DocumentTree::from_text("ab"));
+    let at1 = bpos_top(0, 1);
+    let caret_at = |e: &mut Engine, p: BridgeLogicalPos| {
+        let _ = e.apply_sync(Command::SetSelection {
+            range: BridgeLogicalRange {
+                start: p.clone(),
+                end: p.clone(),
+            },
+            caret: p,
+        });
+    };
+    let doors: Vec<Command> = vec![
+        Command::InsertText {
+            at: None,
+            text: "\u{FFFC}".into(),
+        },
+        Command::InsertText {
+            at: None,
+            text: "x\u{FFFC}y".into(),
+        },
+        Command::PastePlain {
+            text: "\u{FFFC}".into(),
+        },
+        Command::PastePlain {
+            text: "p\u{FFFC}\nq\u{FFFC}".into(),
+        },
+        Command::ReplaceRange {
+            range: BridgeLogicalRange {
+                start: bpos_top(0, 0),
+                end: bpos_top(0, 1),
+            },
+            text: "\u{FFFC}r".into(),
+        },
+        Command::PasteHtml {
+            html: "<p>h\u{FFFC}&#xFFFC;i</p>".into(),
+        },
+    ];
+    for door in doors {
+        caret_at(&mut e, at1.clone());
+        let reply = e.apply_sync(door.clone());
+        assert!(!matches!(reply, Event::Error { .. }), "{door:?}: {reply:?}");
+        assert_eq!(orphan_sentinel(e.undo.current()), None, "{door:?}");
+        e.check_invariants_for_fuzzing()
+            .unwrap_or_else(|err| panic!("{door:?}: {err}"));
+    }
+    /* An IME commit of the sentinel inserts nothing. */
+    caret_at(&mut e, at1);
+    let before = e.undo.current().to_plain_text();
+    let _ = e.apply_sync(Command::BeginComposition { at: None });
+    let _ = e.apply_sync(Command::UpdateComposition {
+        text: "\u{FFFC}".into(),
+        target_range: None,
+    });
+    let _ = e.apply_sync(Command::EndComposition { commit: true });
+    assert_eq!(e.undo.current().to_plain_text(), before);
+    assert_eq!(orphan_sentinel(e.undo.current()), None);
+    /* The text around it went in: nothing else was dropped. */
+    let text = e.undo.current().to_plain_text();
+    for piece in ["xy", "p", "q", "r", "hi"] {
+        assert!(text.contains(piece), "{piece:?} in {text:?}");
+    }
+    e.check_invariants_for_fuzzing().expect("invariants");
+}

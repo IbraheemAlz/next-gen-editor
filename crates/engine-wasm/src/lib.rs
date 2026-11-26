@@ -8403,6 +8403,37 @@ fn cell_content_span(
     cell_span(doc, &innermost_cell_path(path)?)
 }
 
+/// Issue #561 — `true` when `[start, end]` is exactly the content span of
+/// a cell that holds both ends ([`cell_span`]): a Tab / `SelectCellAt`
+/// selection, which IS that cell's content — the identity
+/// [`tab_origin_cell`] reads too. A cell whose only content is a nested
+/// table spans that table's cells, so `derive_selection_kind` promotes the
+/// selection to the nested table's rectangle; deleting it must still
+/// delete the CELL's content.
+fn is_cell_content_span(
+    doc: &DocumentTree,
+    start: &BridgeLogicalPos,
+    end: &BridgeLogicalPos,
+) -> bool {
+    let steps = &start.path.steps;
+    let common = steps
+        .iter()
+        .zip(&end.path.steps)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let span = (start.clone(), end.clone());
+    steps[..common].iter().enumerate().any(|(i, step)| {
+        matches!(step, BridgePathStep::Cell { .. })
+            && cell_span(
+                doc,
+                &BridgeBlockPath {
+                    steps: steps[..=i].to_vec(),
+                },
+            )
+            .is_some_and(|s| s == span)
+    })
+}
+
 fn doc_paragraph_paths(doc: &DocumentTree) -> Vec<EngineBlockPath> {
     let mut out: Vec<EngineBlockPath> = Vec::new();
     let mut prefix: Vec<EnginePathStep> = Vec::new();
@@ -16641,10 +16672,11 @@ impl Engine {
         };
         let end = typing_replace_end(&temp, &start, end, &text);
         let replaced = replaced_text_style(&temp, &start, &end);
-        let base = if start == end {
-            temp
+        /* Issue #561 — inserted where the range's start landed. */
+        let (base, start) = if start == end {
+            (temp, start)
         } else {
-            temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+            self.delete_range_in(&temp, &start, &end)
         };
         let was_empty = paragraph_is_empty(&base, &start);
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
@@ -16682,12 +16714,12 @@ impl Engine {
         let (base, split_at) = match self.selection.clone() {
             Some(s) => {
                 let (start, end) = ordered(s.anchor, s.caret);
-                let doc = if start == end {
-                    temp
+                if start == end {
+                    (temp, start)
                 } else {
-                    temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
-                };
-                (doc, start)
+                    /* Issue #561 — split where the range's start landed. */
+                    self.delete_range_in(&temp, &start, &end)
+                }
             }
             None => (temp, at),
         };
@@ -16715,8 +16747,9 @@ impl Engine {
         };
         let (start, end) = ordered(sel.anchor, sel.caret.clone());
         if start != end {
-            let new_doc = temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
-            return self.commit_story_edit(&new_doc, start);
+            /* Issue #561 — the one range deletion (and its caret). */
+            let (new_doc, caret) = self.delete_range_in(&temp, &start, &end);
+            return self.commit_story_edit(&new_doc, caret);
         }
         let caret = sel.caret;
         let epath = bridge_to_engine_path(caret.path.clone());
@@ -16847,10 +16880,11 @@ impl Engine {
             return self.story_vanished();
         };
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = if start == end {
-            temp
+        /* Issue #561 — pasted where the range's start landed. */
+        let (base, start) = if start == end {
+            (temp, start)
         } else {
-            temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+            self.delete_range_in(&temp, &start, &end)
         };
         let (new_doc, caret_pos) = base.insert_multiline(to_engine_pos(start), &text);
         let caret = BridgeLogicalPos {
@@ -18290,20 +18324,20 @@ impl Engine {
         let author = self.review_author.clone();
         let date = self.current_review_date();
         let replaced = replaced_text_style(self.undo.current(), &start, &end);
-        let base = if start == end {
-            self.undo.current().clone()
+        /* Issue #561 — the text goes where the range's start landed (a
+        cross-container delete may remove the start's own nested table). */
+        let (base, start) = if start == end {
+            (self.undo.current().clone(), start)
         } else if tracking {
             /* Sprint 14 (#14) — replacing a selection while tracking
             = mark-old-as-delete + insert-new-as-insert (issue #298:
             across paragraphs too). */
             match self.tracked_delete("InsertText", &start, &end) {
-                Ok(t) => t.doc,
+                Ok(t) => (t.doc, start),
                 Err(e) => return *e,
             }
         } else {
-            self.undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+            self.delete_range_in(self.undo.current(), &start, &end)
         };
         let was_empty = paragraph_is_empty(&base, &start);
         let mut new_doc = if tracking {
@@ -18364,17 +18398,16 @@ impl Engine {
         let author = self.review_author.clone();
         let date = self.current_review_date();
         let replaced = replaced_text_style(self.undo.current(), &start, &end);
-        let base = if start == end {
-            self.undo.current().clone()
+        let (base, start) = if start == end {
+            (self.undo.current().clone(), start)
         } else if tracking {
             match self.tracked_delete("ReplaceRange", &start, &end) {
-                Ok(t) => t.doc,
+                Ok(t) => (t.doc, start),
                 Err(e) => return *e,
             }
         } else {
-            self.undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+            /* Issue #561 — inserted where the range's start landed. */
+            self.delete_range_in(self.undo.current(), &start, &end)
         };
         let new_doc = if tracking {
             base.tracked_insert_text(to_engine_pos(start.clone()), &text, author, date)
@@ -18409,11 +18442,7 @@ impl Engine {
                 Err(e) => return *e,
             }
         } else {
-            let d = self
-                .undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
-            (d, start)
+            self.delete_range_in(self.undo.current(), &start, &end)
         };
         self.commit_edit(new_doc, caret)
     }
@@ -18463,23 +18492,21 @@ impl Engine {
         let (base, split_at) = match self.selection.clone() {
             Some(s) => {
                 let (start, end) = ordered(s.anchor, s.caret);
-                let doc = if start == end {
-                    self.undo.current().clone()
+                if start == end {
+                    (self.undo.current().clone(), start)
                 } else if tracking {
                     /* Issue #301 — replacing a selection with a break
                     while tracking = mark the selection deleted, then
                     the tracked break at its start (the typed-replacement
                     path's order). */
                     match self.tracked_delete("SplitParagraph", &start, &end) {
-                        Ok(t) => t.doc,
+                        Ok(t) => (t.doc, start),
                         Err(e) => return *e,
                     }
                 } else {
-                    self.undo
-                        .current()
-                        .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
-                };
-                (doc, start)
+                    /* Issue #561 — split where the range's start landed. */
+                    self.delete_range_in(self.undo.current(), &start, &end)
+                }
             }
             None => (self.undo.current().clone(), at),
         };
@@ -18547,6 +18574,32 @@ impl Engine {
         }
     }
 
+    /// Issue #561 — the untracked deletion of `[start, end]` (ordered) in
+    /// `doc`, the tree the selection's paths address (the body or a story),
+    /// and the caret: where the range's start landed, i.e. where a
+    /// replacement is inserted. The live `TABLE_CELLS` rectangle clears its
+    /// cells (memo §7 — the cells stay); any other range, a Tab-selected
+    /// cell's content included, goes through the engine's one range
+    /// deletion ([`DocumentTree::delete_range_at`]: across containers it
+    /// never merges two of them, whole rows and tables go).
+    fn delete_range_in(
+        &self,
+        doc: &DocumentTree,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+    ) -> (DocumentTree, BridgeLogicalPos) {
+        if let Some(CellRect { table, rows, cols }) = self.cell_rect_for(start, end)
+            && !is_cell_content_span(doc, start, end)
+            && let Some((cleared, caret)) =
+                doc.clear_cell_rect(&bridge_to_engine_path(table), rows, cols)
+        {
+            return (cleared, to_bridge_pos(caret));
+        }
+        let (out, caret) =
+            doc.delete_range_at(to_engine_pos(start.clone()), to_engine_pos(end.clone()));
+        (out, to_bridge_pos(caret))
+    }
+
     /// Sprint 14 (#14) — shared dispatch for "delete a logical range":
     /// route through the tracked deletion when tracking is on (marker-
     /// only: the caret lands at the end of the marked range — or, for a
@@ -18568,11 +18621,7 @@ impl Engine {
             let caret = if backward { t.start } else { t.end };
             Ok((t.doc, to_bridge_pos(caret)))
         } else {
-            let d = self
-                .undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
-            Ok((d, start))
+            Ok(self.delete_range_in(self.undo.current(), &start, &end))
         }
     }
 
@@ -18955,9 +19004,13 @@ impl Engine {
         from inside a story serializes the story's paragraphs (not the
         body's). */
         let doc = self.selection_doc();
+        /* Issue #561 — the plain text walks every paragraph the selection
+        reaches, the paragraphs formatting would act on (#509): across
+        cells, rows and nested tables, a `TABLE_CELLS` rectangle by its
+        rows (cells joined with tabs, rows with newlines). */
+        let plain = doc.targets_plain_text(&self.format_targets_in(&doc, &start, &end));
         let estart = to_engine_pos(start);
         let eend = to_engine_pos(end);
-        let plain = doc.text_range(estart.clone(), eend.clone());
         /* The selection's blocks (paragraphs + any tables it spans),
         clipped at the endpoints — fed to the rich HTML serializer so
         the clipboard carries cell shading + borders + image extents
@@ -19024,7 +19077,7 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = match self.paste_base("PastePlain", &start, end) {
+        let (base, start) = match self.paste_base("PastePlain", &start, end) {
             Ok(d) => d,
             Err(e) => return *e,
         };
@@ -19054,16 +19107,15 @@ impl Engine {
         cmd: &str,
         start: &BridgeLogicalPos,
         end: BridgeLogicalPos,
-    ) -> Result<engine::DocumentTree, Box<Event>> {
+    ) -> Result<(engine::DocumentTree, BridgeLogicalPos), Box<Event>> {
         if *start == end {
-            Ok(self.undo.current().clone())
+            Ok((self.undo.current().clone(), start.clone()))
         } else if self.tracking_changes {
-            self.tracked_delete(cmd, start, &end).map(|t| t.doc)
+            self.tracked_delete(cmd, start, &end)
+                .map(|t| (t.doc, start.clone()))
         } else {
-            Ok(self
-                .undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end)))
+            /* Issue #561 — the paste lands where the range's start landed. */
+            Ok(self.delete_range_in(self.undo.current(), start, &end))
         }
     }
 
@@ -19087,7 +19139,7 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let base = match self.paste_base("PasteHtml", &start, end) {
+        let (base, start) = match self.paste_base("PasteHtml", &start, end) {
             Ok(d) => d,
             Err(e) => return *e,
         };
@@ -32610,6 +32662,11 @@ mod nested_table_hit_tests;
 /// cell that starts with, ends with, or only holds a nested table.
 #[cfg(test)]
 mod cell_select_nested_tests;
+/// Issue #561 — typing over, deleting and copying a selection across
+/// containers (body ↔ cell, a Tab-selected cell through a nested table,
+/// a cell rectangle).
+#[cfg(test)]
+mod cross_range_delete_tests;
 
 /// Issues #563 / #562 / #566 — InsertTable in a cell nests the table there;
 /// Tab in a nested table's last cell grows THAT table; Tab between nested
