@@ -18,12 +18,13 @@ import {
     editingStoryForPointer,
     enginePageTopDevice,
     headerFooterZoneAt,
+    imageAtPoint,
     noteStoryEntry,
+    selectImage,
     selectImageByPoint,
     selectionViewForPointer,
-    storyOfImage,
 } from '../state/engine-store';
-import { storyMatches } from './image-keys';
+import { storyMatches, storyOfImage } from './image-keys';
 
 /** Issue #80 — footnote / endnote stories ride the header/footer story
  *  protocol (`editing_story`) but live in the body's page flow. Issue
@@ -31,6 +32,13 @@ import { storyMatches } from './image-keys';
  *  (inside a box → that box, elsewhere → back to the body). */
 function isNoteArea(area: string): boolean {
     return area === 'Footnote' || area === 'Endnote' || area === 'TextBox';
+}
+
+/** Issue #573 — the stories whose pictures are objects: the body, a text
+ *  box and the header / footer being edited (footnotes / endnotes have no
+ *  picture addressing). */
+function picturesSelectableIn(area: string | undefined): boolean {
+    return area !== 'Footnote' && area !== 'Endnote';
 }
 
 /**
@@ -156,6 +164,28 @@ export function attachPointer(
             }
             return;
         }
+        /* Issue #573 — while a header / footer is edited its pictures are
+           objects (clean-room memo §2: only the active story's drawing
+           layer is hit-tested; "a point inside a header or footer drawing
+           counts as that band", so a floating picture that reaches past
+           the band still selects). Resolved BEFORE the zone gate, which
+           would swallow the lower half of such a picture as a body press.
+           Only the active part's pictures are candidates (`imageAtPoint`
+           filters by the active story); a press that misses them goes on
+           to the gate below. */
+        {
+            const story = editingStoryForPointer();
+            if (story && !isNoteArea(story.area)) {
+                const dpr = deviceRatio();
+                const gCss = toGlobal(e);
+                const hit = imageAtPoint(gCss.x / dpr, gCss.y / dpr, activeStoryForKeys());
+                if (hit) {
+                    gesture += 1;
+                    selectImage(hit);
+                    return;
+                }
+            }
+        }
         /* Phase 3 (#39) — header/footer zone gate, BEFORE any caret
            placement (mirrors the image-hit early-return below). Rules:
            - body mode + press in a band → an ordinary body press
@@ -214,8 +244,10 @@ export function attachPointer(
            consume the event. `selectImageByPoint` also CLEARS a prior
            image selection when the click misses every image, so a normal
            text click deselects. Coordinates are document-absolute CSS
-           px, matching the stored image rects. Skipped in header / footer
-           / note story mode — body images are unreachable behind the dim.
+           px, matching the stored image rects. Skipped in note story mode.
+           Issue #573 — in header / footer mode a hit was taken above;
+           here the press missed every picture of the part, so this only
+           drops the object selection before the caret is placed.
            Issue #206 — while a text box is being edited, a press on a
            picture INSIDE a text box still selects it (the engine accepts
            picture edits in text-box mode).
@@ -233,7 +265,7 @@ export function attachPointer(
            behind the entry; `noteStoryEntry` lets the key path count the
            entry as done meanwhile. */
         const imageStory = editingStoryForPointer();
-        if (!imageStory || imageStory.area === 'TextBox') {
+        if (picturesSelectableIn(imageStory?.area)) {
             const dpr = deviceRatio();
             const gCss = toGlobal(e);
             const hit = selectImageByPoint(gCss.x / dpr, gCss.y / dpr);
@@ -290,7 +322,11 @@ export function attachPointer(
              place the body caret at the click (issue #510, Word / the
              OnlyOffice methods memo §2) — both posted synchronously, so
              the worker queue applies them in order and a keystroke
-             queued behind them types at the clicked spot;
+             queued behind them types at the clicked spot. Issue #573 —
+             on a BODY picture the same exit object-selects the picture
+             (memo §2: objects beat text, a click on an inline picture
+             places no caret), its story being the body the exit lands
+             in;
            - the ACTIVE band → fall through to word selection (the
              critic-flagged hijack: in-band dblclick must keep its
              editing affordance). */
@@ -313,7 +349,28 @@ export function attachPointer(
             void client.dispatch({ type: 'EXIT_HEADER_FOOTER' }).catch((err: unknown) => {
                 console.error('exitHeaderFooter failed', err);
             });
-            placeCaret(toLocal(e));
+            const dpr = deviceRatio();
+            const gCss = toGlobal(e);
+            /* The press is resolved for the story the exit lands in: the
+               body. */
+            const bodyPicture = imageAtPoint(
+                gCss.x / dpr,
+                gCss.y / dpr,
+                undefined,
+                (im) => storyOfImage(im) === undefined,
+            );
+            const placing = client.dispatch({
+                type: 'PLACE_CARET_AT_POINT',
+                page: pageIdx,
+                at: toLocal(e),
+            });
+            placing.catch((err: unknown) => {
+                console.error('placeCaret failed', err);
+            });
+            if (bodyPicture) {
+                selectImage(bodyPicture);
+                noteStoryEntry(undefined, placing);
+            }
             return;
         }
         void client.dispatch({ type: 'SELECT_WORD_AT', at: toGlobal(e) });
