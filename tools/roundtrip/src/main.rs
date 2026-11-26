@@ -401,6 +401,9 @@ fn run_default() -> Result<()> {
     /* Step 65 — issue #354: the settings toggles (trackRevisions,
     mirrorMargins) read, and written back only when they change. */
     settings_toggles::run_settings_toggles_roundtrip()?;
+    /* Step 66 — issue #489: a selection that covers a paragraph mark
+    (Select All) formats it; the mark's `<w:rPr>` is a pure insertion. */
+    reader_cascade::run_mark_selection_roundtrip()?;
     /* Step 67 — issue #558: the default CHARACTER style formats runs
     naming none; the writer never spells it as direct formatting (66 is
     #489's). */

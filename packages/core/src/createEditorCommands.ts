@@ -294,7 +294,10 @@ export interface EditorCommands {
      *  address. Resolve the `Event` and read `images` when it is an
      *  `IMAGE_RECTS` reply. Issue #206 — pictures inside text-box stories
      *  are listed too: pass a rect's `story` back as the optional `story`
-     *  argument of `resizeImage` / `moveImage` / `setImageWrap`. */
+     *  argument of `resizeImage` / `moveImage` / `setImageWrap`. Issue
+     *  #573 — while a header / footer is edited its pictures are listed
+     *  as well (`story_area` `'Header'` / `'Footer'`, `story_rid` the
+     *  part): their `story` is empty, and so is the address they take. */
     getImageRects(): Promise<Event>;
 
     /* Tables — every method maps 1:1 onto a `Command` variant in

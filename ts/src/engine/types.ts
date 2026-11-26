@@ -57,6 +57,7 @@ export type {
     Script,
     SelectionKind,
     SelectionModifier,
+    SelectionUnit,
     TextAttrs,
     TextAttrsPatch,
     UnderlineStyle,

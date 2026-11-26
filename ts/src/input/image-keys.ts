@@ -40,6 +40,7 @@ import type {
     BlockPath,
     Command,
     Event,
+    HeaderFooterArea,
     LogicalPos,
     MoveDirection,
     TextBoxHop,
@@ -63,10 +64,16 @@ export interface KeyInfo {
 export interface KeyedImage {
     path: BlockPath;
     at: number;
-    /** Text-box chain the picture lives in (empty = body). */
+    /** Text-box chain the picture lives in (empty = body, or a header /
+     *  footer part: `storyArea`). */
     story: TextBoxHop[];
-    /** `ImageRect.storyRid` (`''` for a body picture). */
+    /** `ImageRect.storyRid` (`''` for a body picture; the part's rid for a
+     *  header / footer picture). */
     storyRid: string;
+    /** Issue #573 — `ImageRect.story_area`: `'Header'` / `'Footer'` for a
+     *  picture of the part being edited (`path` rooted in it), `'TextBox'`
+     *  for a text-box picture, absent for a body picture. */
+    storyArea?: HeaderFooterArea | undefined;
     /** The picture's paragraph runs right-to-left (`ImageRect.rtl`). */
     rtl: boolean;
 }
@@ -77,6 +84,30 @@ export interface ActiveStory {
      *  absent for the body. */
     area: string;
     rid: string;
+}
+
+/** The picture fields that say which story it belongs to. */
+export type ImageStoryFields = Pick<KeyedImage, 'story' | 'storyRid' | 'storyArea'>;
+
+const isBandArea = (area: string | undefined): boolean => area === 'Header' || area === 'Footer';
+
+/** The story a picture's positions are rooted in, as `ActiveStory`
+ *  (`undefined` = the body). Issue #573 — a header / footer picture's is
+ *  the part it belongs to. */
+export function storyOfImage(img: ImageStoryFields): ActiveStory | undefined {
+    if (isBandArea(img.storyArea)) return { area: img.storyArea!, rid: img.storyRid };
+    return img.story.length === 0 ? undefined : { area: 'TextBox', rid: img.storyRid };
+}
+
+/** Issue #573 — whether a click may select `img` while `active` is the
+ *  story being edited (clean-room memo §2: only the active story's drawing
+ *  layer is hit-tested). A header / footer picture only while its own part
+ *  is edited, and while a part is edited only its pictures; a body or
+ *  text-box picture from the body or a text box (issue #506: the click
+ *  enters the picture's story). */
+export function pictureHittable(img: ImageStoryFields, active?: ActiveStory): boolean {
+    if (isBandArea(img.storyArea) || isBandArea(active?.area)) return storyMatches(img, active);
+    return true;
 }
 
 export type ImageEdge = 'before' | 'after';
@@ -192,9 +223,10 @@ export function caretAtEdge(img: Pick<KeyedImage, 'path' | 'at'>, edge: ImageEdg
 /** Whether the engine's active story is the one the picture's paths are
  *  rooted in — only then may a story-rooted `SET_SELECTION` address it (in
  *  the wrong story the position would resolve against another document). */
-export function storyMatches(img: Pick<KeyedImage, 'story' | 'storyRid'>, active?: ActiveStory): boolean {
-    if (img.story.length === 0) return active === undefined;
-    return active !== undefined && active.area === 'TextBox' && active.rid === img.storyRid;
+export function storyMatches(img: ImageStoryFields, active?: ActiveStory): boolean {
+    const own = storyOfImage(img);
+    if (own === undefined) return active === undefined;
+    return active !== undefined && active.area === own.area && active.rid === own.rid;
 }
 
 /** What the caller does with the key event. */
@@ -249,7 +281,7 @@ export function runImageKey(
                rather than continued: a continued Delete / Backspace would
                delete a character at the engine's stale caret. */
             if (!storyMatches(img, active)) return leave('consumed');
-            if (img.story.length === 0) {
+            if (storyOfImage(img) === undefined) {
                 /* ONE command: one undo entry, caret left at the anchor. */
                 const settled = client.dispatch({
                     type: 'DELETE_RANGE',
@@ -262,9 +294,10 @@ export function runImageKey(
                 return leave('consumed', settled);
             }
             /* `DeleteRange` is body-only: select the sentinel in the story
-               and delete the selection, but only once the engine confirms it
-               selected exactly the picture IN ITS BOX (a stale address, or a
-               press that did not enter the box, must never turn into a
+               (a text box, or the header / footer being edited: #573) and
+               delete the selection, but only once the engine confirms it
+               selected exactly the picture IN ITS STORY (a stale address, or
+               a press that did not enter the box, must never turn into a
                delete at the old caret). */
             const settled = (async () => {
                 const sel = await client.dispatch(pictureSelection(img));
@@ -307,14 +340,11 @@ export function pictureSelection(img: Pick<KeyedImage, 'path' | 'at'>): Command 
  *  box, must never turn into a delete of whatever got selected instead). */
 export function selectsPicture(
     evt: Event,
-    img: Pick<KeyedImage, 'at' | 'story' | 'storyRid'>,
+    img: Pick<KeyedImage, 'at' | 'story' | 'storyRid' | 'storyArea'>,
 ): boolean {
     if (evt.type !== 'SELECTION_CHANGED') return false;
     const story = evt.editing_story;
-    const inStory =
-        img.story.length === 0
-            ? story === undefined
-            : story?.area === 'TextBox' && story.rid === img.storyRid;
+    const inStory = storyMatches(img, story && { area: story.area, rid: story.rid });
     return (
         inStory &&
         evt.range.start.offset === img.at &&

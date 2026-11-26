@@ -146,6 +146,9 @@ pub mod text_input;
 pub mod theme;
 
 pub mod toc;
+/// Epic #555 rows 20 / 22, issue #598 — the ONE word model (double-click,
+/// drag by words, Ctrl+arrows, Ctrl+Backspace / Delete).
+pub mod words;
 pub use fields::{
     FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TocSwitches,
     TypedField, render_date_time_picture,
@@ -4582,40 +4585,15 @@ impl Paragraph {
         snap_offset(&self.text, offset)
     }
 
-    /// Byte range `[start, end)` of the word containing caret position
-    /// `offset` — a whitespace-delimited span (PHASE_4_HEADLESS_UI.md §7,
-    /// double-click select). When `offset` sits on whitespace, the run of
-    /// whitespace is returned. `offset` is clamped to a char boundary.
+    /// Byte range `[start, end)` of the word holding caret position
+    /// `offset` — issue #598, the ONE word model ([`words`]): a text,
+    /// punctuation or object unit plus the separators after it, so a
+    /// double-click on `word` in `word, next` selects `word`, on `,` the
+    /// `, `, and on a space the word that space trails. At the end of the
+    /// text, the last word. `offset` is clamped to a char boundary.
     pub fn word_bounds(&self, offset: u32) -> (u32, u32) {
-        let text = self.text.as_str();
-        let len = text.len();
-        if len == 0 {
-            return (0, 0);
-        }
         let off = self.snap_offset(offset) as usize;
-        /* Classify by the char to the right; at end-of-text, the char left. */
-        let ws = text[off..]
-            .chars()
-            .next()
-            .or_else(|| text[..off].chars().next_back())
-            .is_some_and(char::is_whitespace);
-
-        let mut start = off;
-        for (i, c) in text[..off].char_indices().rev() {
-            if c.is_whitespace() == ws {
-                start = i;
-            } else {
-                break;
-            }
-        }
-        let mut end = off;
-        for (i, c) in text[off..].char_indices() {
-            if c.is_whitespace() == ws {
-                end = off + i + c.len_utf8();
-            } else {
-                break;
-            }
-        }
+        let (start, end) = words::word_at(&self.text, off);
         (start as u32, end as u32)
     }
 
@@ -7612,7 +7590,10 @@ impl DocumentTree {
 
     /// Issue #509 — [`Self::tracked_format_change`] over resolved
     /// [`RangeTarget`]s (a `TABLE_CELLS` rectangle's too). Only the
-    /// covered bytes get a revision; an empty paragraph has none.
+    /// covered bytes get a revision; an empty paragraph has none. A
+    /// covered paragraph MARK (issue #489) takes the formatting through
+    /// the same targets ([`Self::apply_style_targets`]) but records no
+    /// mark `<w:rPrChange>` yet (issue #372).
     pub fn tracked_format_change_targets(
         &self,
         targets: &[RangeTarget],
@@ -7892,9 +7873,10 @@ impl DocumentTree {
     /// rows, a body -> table boundary, nested tables. Every paragraph it
     /// reaches ([`Self::range_targets`]) is styled — the first from
     /// `start.offset`, the last up to `end.offset`, the ones between
-    /// whole — and an empty paragraph the range passes through gets the
-    /// patch on its mark ([`Self::apply_style_targets`]). Before, ranges
-    /// whose ends had different parents styled the first paragraph only.
+    /// whole — and every paragraph mark the range runs past gets the
+    /// patch too ([`Self::apply_style_targets`], issue #489). Before,
+    /// ranges whose ends had different parents styled the first paragraph
+    /// only.
     pub fn apply_style(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
         let targets = self.range_targets(&start, &end);
         self.apply_style_targets(&targets, patch)
@@ -7904,8 +7886,11 @@ impl DocumentTree {
     /// [`RangeTarget`]s (a linear range's, or a `TABLE_CELLS`
     /// rectangle's: [`Self::cell_rect_targets`]). A target with no
     /// covered bytes and no mark to style is skipped (the paragraph is not
-    /// even marked dirty); an empty paragraph whose mark is covered takes
-    /// the patch on `Paragraph::mark_style`, so typing there continues it.
+    /// even marked dirty); a covered mark ([`RangeTarget::mark`]) takes the
+    /// patch on `Paragraph::mark_style` — an empty paragraph's, so typing
+    /// there continues it (#293), and since issue #489 a paragraph's with
+    /// text too, so a whole paragraph set to 8 pt has an 8 pt last line
+    /// (the mark's face sizes it) and an 8 pt mark when emptied (Word).
     pub fn apply_style_targets(&self, targets: &[RangeTarget], patch: SpanStyle) -> Self {
         let live: Vec<&RangeTarget> = targets.iter().filter(|t| t.lo < t.hi || t.mark).collect();
         if live.is_empty() {
@@ -7918,7 +7903,7 @@ impl DocumentTree {
             if target.lo < target.hi {
                 *para = para.apply_style(target.lo, target.hi, patch.clone());
             }
-            if target.mark && para.text.is_empty() {
+            if target.mark {
                 let mark = para.mark_style.as_deref().cloned().unwrap_or_default();
                 para.mark_style = Some(Box::new(mark.merged_with(patch.clone())));
             }
@@ -12899,11 +12884,20 @@ pub struct RangeTarget {
     /// One past the last covered byte (the range end's offset in the last
     /// paragraph, else the paragraph's length).
     pub hi: u32,
-    /// The paragraph MARK is covered and the paragraph has no text: Word
-    /// formats an empty paragraph's mark (its only character) with the
-    /// selection, so typing into it afterwards continues the formatting
-    /// (`Paragraph::mark_style`, issue #293). Never set on a paragraph
-    /// that has text (its mark is not folded into the runs, issue #369).
+    /// The paragraph MARK is covered: the range runs past the
+    /// paragraph's end into what follows (every paragraph but the last
+    /// one of a linear range), or the selection includes the last
+    /// paragraph's mark too ([`DocumentTree::range_targets_with_end_mark`]:
+    /// Select All, a triple-click paragraph selection) and reaches its
+    /// end, or the paragraph sits in a selected cell rectangle (Word
+    /// selects every end-of-cell mark with the cells). Character
+    /// formatting patches the mark as well (`Paragraph::mark_style`,
+    /// issue #489): the mark's face sizes the paragraph's LAST line
+    /// (`mark_line_metrics`) and types into the paragraph once it is
+    /// empty (issue #293). A range that stops at the last character
+    /// without crossing the mark leaves it alone. The mark is still never
+    /// folded into the runs (issue #369) — a reader samples it only for a
+    /// paragraph with no text.
     pub mark: bool,
 }
 
@@ -12914,8 +12908,8 @@ fn collect_range_block(
     block: &Block,
     steps: &mut Vec<PathStep>,
     depth: u32,
-    start: &LogicalPos,
-    end: &LogicalPos,
+    (start, end): (&LogicalPos, &LogicalPos),
+    end_mark: bool,
     out: &mut Vec<RangeTarget>,
 ) -> bool {
     use core::cmp::Ordering;
@@ -12930,13 +12924,16 @@ fn collect_range_block(
             let len = p.text.len() as u32;
             let is_start = steps.as_slice() == start.path.steps.as_slice();
             let is_end = steps.as_slice() == end.path.steps.as_slice();
+            let hi = if is_end { end.offset.min(len) } else { len };
             out.push(RangeTarget {
                 path: BlockPath {
                     steps: steps.clone(),
                 },
                 lo: if is_start { start.offset.min(len) } else { 0 },
-                hi: if is_end { end.offset.min(len) } else { len },
-                mark: len == 0 && !is_end,
+                hi,
+                /* Issue #489 — the range crosses this mark, or the
+                selection includes the last one and reaches it. */
+                mark: !is_end || (end_mark && hi == len),
             });
             !is_end
         }
@@ -12952,8 +12949,14 @@ fn collect_range_block(
                     });
                     for (bi, inner) in cell.blocks.iter().enumerate() {
                         steps.push(PathStep::Block(bi as u32));
-                        let keep_going =
-                            collect_range_block(inner, steps, depth + 1, start, end, out);
+                        let keep_going = collect_range_block(
+                            inner,
+                            steps,
+                            depth + 1,
+                            (start, end),
+                            end_mark,
+                            out,
+                        );
                         steps.pop();
                         if !keep_going {
                             steps.pop();
@@ -12970,7 +12973,9 @@ fn collect_range_block(
 }
 
 /// Every paragraph under `blocks` (nested tables included), WHOLE, with
-/// the mark covered: the shape a cell-rectangle selection formats.
+/// the mark covered (issue #489: a cell selection includes every
+/// paragraph mark and end-of-cell mark in it): the shape a cell-rectangle
+/// selection formats.
 fn collect_whole_paragraphs(
     blocks: &[Block],
     steps: &mut Vec<PathStep>,
@@ -12986,7 +12991,7 @@ fn collect_whole_paragraphs(
                 },
                 lo: 0,
                 hi: p.text.len() as u32,
-                mark: p.text.is_empty(),
+                mark: true,
             }),
             Block::Table(t) if depth < MAX_REVISION_TABLE_DEPTH => {
                 for (ri, row) in t.rows.iter().enumerate() {
@@ -13019,7 +13024,28 @@ impl DocumentTree {
     /// whole. Endpoints are ordered first; an endpoint that does not
     /// address a paragraph reaches whatever follows / precedes it in
     /// document order. Bounded by [`MAX_REVISION_TABLE_DEPTH`].
+    ///
+    /// Issue #489 — every paragraph the range runs PAST has its mark
+    /// covered ([`RangeTarget::mark`]); the last one's is not (the range
+    /// stops before it). [`Self::range_targets_with_end_mark`] is the
+    /// same walk for a selection that includes that mark too.
     pub fn range_targets(&self, a: &LogicalPos, b: &LogicalPos) -> Vec<RangeTarget> {
+        self.range_targets_with_end_mark(a, b, false)
+    }
+
+    /// Issue #489 — [`Self::range_targets`], with `end_mark` saying
+    /// whether the selection also includes the paragraph mark of its LAST
+    /// paragraph: Word's Select All and triple-click paragraph selection
+    /// select the pilcrow (there is no caret position after it here, so
+    /// the selection's shape cannot say so — the caller knows how it was
+    /// made). The mark is covered only when the range reaches the end of
+    /// that paragraph's text.
+    pub fn range_targets_with_end_mark(
+        &self,
+        a: &LogicalPos,
+        b: &LogicalPos,
+        end_mark: bool,
+    ) -> Vec<RangeTarget> {
         let (start, end) = order_positions(a.clone(), b.clone());
         let (Some(PathStep::Block(first)), Some(PathStep::Block(last))) = (
             start.path.steps.first().copied(),
@@ -13037,7 +13063,8 @@ impl DocumentTree {
                 break;
             };
             steps.push(PathStep::Block(i));
-            let keep_going = collect_range_block(block, &mut steps, 0, &start, &end, &mut out);
+            let keep_going =
+                collect_range_block(block, &mut steps, 0, (&start, &end), end_mark, &mut out);
             steps.pop();
             if !keep_going {
                 break;
@@ -13058,9 +13085,10 @@ impl DocumentTree {
     /// Issue #509 — the paragraphs of the cell rectangle
     /// `rows.0..=rows.1` x `cols.0..=cols.1` of the table at `table`
     /// (cell indices, as `PathStep::Cell` counts them), WHOLE and with
-    /// their marks covered: a `TABLE_CELLS` selection formats every
-    /// paragraph of every selected cell, nested tables included. Empty
-    /// when `table` addresses no table.
+    /// their marks covered (issue #489: every one, text or not): a
+    /// `TABLE_CELLS` selection formats every paragraph of every selected
+    /// cell, nested tables included. Empty when `table` addresses no
+    /// table.
     pub fn cell_rect_targets(
         &self,
         table: &BlockPath,
@@ -15726,9 +15754,10 @@ mod tests {
             mark_revisions: Vec::new(),
             mark_style: None,
         };
-        assert_eq!(p.word_bounds(2), (0, 5));
-        assert_eq!(p.word_bounds(0), (0, 5));
-        assert_eq!(p.word_bounds(5), (5, 6)); // on the space
+        /* Issue #598 — a word carries its trailing space (memo §6). */
+        assert_eq!(p.word_bounds(2), (0, 6));
+        assert_eq!(p.word_bounds(0), (0, 6));
+        assert_eq!(p.word_bounds(5), (0, 6)); // on the space: the word it trails
         assert_eq!(p.word_bounds(8), (6, 11));
         assert_eq!(p.word_bounds(11), (6, 11)); // end of text → last word
     }
@@ -15758,8 +15787,8 @@ mod tests {
             mark_revisions: Vec::new(),
             mark_style: None,
         };
-        assert_eq!(p.word_bounds(4), (0, 10));
-        assert_eq!(p.word_bounds(0), (0, 10));
+        assert_eq!(p.word_bounds(4), (0, 11));
+        assert_eq!(p.word_bounds(0), (0, 11));
         assert_eq!(p.word_bounds(12), (11, 25)); // mid-char offset clamps
     }
 

@@ -12,7 +12,7 @@ export type CommandStatus =
     | { readonly kind: 'stub'; readonly issue: number };
 
 /** Story-mode behaviour (`bridge::StoryPolicy`, `Engine::story_gate`). */
-export type StoryPolicy = 'allowed' | 'body_only' | 'text_box_only' | 'exits_story';
+export type StoryPolicy = 'allowed' | 'body_only' | 'picture_stories' | 'exits_story';
 
 /** What an enforced document protection lets through
  *  (`bridge::ProtectionClass`, issue #345). */
@@ -77,9 +77,9 @@ export const COMMAND_META: { readonly [K in CommandType]: CommandMeta } = {
     SPLIT_PARAGRAPH: { variant: 'SplitParagraph', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'text' },
     MERGE_PARAGRAPH: { variant: 'MergeParagraph', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'stub', issue: 396 }, protection: 'other' },
     INSERT_IMAGE: { variant: 'InsertImage', mutates_doc: true, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'other' },
-    RESIZE_IMAGE: { variant: 'ResizeImage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'implemented' }, protection: 'other' },
-    MOVE_IMAGE: { variant: 'MoveImage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'implemented' }, protection: 'other' },
-    SET_IMAGE_WRAP: { variant: 'SetImageWrap', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'text_box_only', status: { kind: 'partial', issue: 137 }, protection: 'other' },
+    RESIZE_IMAGE: { variant: 'ResizeImage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'picture_stories', status: { kind: 'implemented' }, protection: 'other' },
+    MOVE_IMAGE: { variant: 'MoveImage', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'picture_stories', status: { kind: 'implemented' }, protection: 'other' },
+    SET_IMAGE_WRAP: { variant: 'SetImageWrap', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'picture_stories', status: { kind: 'partial', issue: 137 }, protection: 'other' },
     SET_SELECTION: { variant: 'SetSelection', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
     EXTEND_SELECTION: { variant: 'ExtendSelection', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
     SELECT_ALL: { variant: 'SelectAll', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
@@ -159,6 +159,7 @@ export const COMMAND_META: { readonly [K in CommandType]: CommandMeta } = {
     REPLY_TO_COMMENT: { variant: 'ReplyToComment', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'body_only', status: { kind: 'implemented' }, protection: 'comment' },
     MODIFY_STYLE: { variant: 'ModifyStyle', mutates_doc: true, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'other' },
     SET_FONT_PRIORITY: { variant: 'SetFontPriority', mutates_doc: false, moves_selection: false, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
+    SELECT_UNITS_IN_PAGE: { variant: 'SelectUnitsInPage', mutates_doc: false, moves_selection: true, logged: true, read_only: false, new_document: false, story: 'allowed', status: { kind: 'implemented' }, protection: 'exempt' },
 };
 
 /** Issue #345 — the protection classes each enforced mode admits

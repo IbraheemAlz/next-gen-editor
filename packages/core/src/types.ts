@@ -30,6 +30,7 @@ export type {
     ImageFit,
     ImageBlob,
     SelectionModifier,
+    SelectionUnit,
     MoveDirection,
     BridgeBorderStyle,
     BridgeCellBorders,
