@@ -366,9 +366,11 @@ pub struct DocumentTree {
     /// these and passthroughs the rest byte-identical.
     pub hf_dirty: HfDirty,
     /// Issues #74/#43 — flips when the engine mutates `settings`
-    /// (currently only `even_and_odd_headers`); the writer then patches
-    /// `word/settings.xml` in place. Mirror of `styles_dirty` /
-    /// `NumberingDefinitions.dirty`. Never set by reads.
+    /// (currently only `even_and_odd_headers`). Never set by reads.
+    /// Issue #354 — informational only: the writer no longer gates on it,
+    /// it compares every toggle it owns against the SOURCE `settings.xml`
+    /// (`writer_settings_patch.rs`), so an unchanged flag keeps the part
+    /// byte-identical and a changed one is written whatever changed it.
     pub settings_dirty: bool,
     /// Issue #100 — every attribute of the source part root
     /// (`<w:document>`), `(name, escaped value)` in document order: the
@@ -1152,6 +1154,22 @@ pub struct DocumentSettings {
     /// unprotected document's snapshot encodes exactly as before.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protection: Option<DocumentProtection>,
+    /// Issue #354 — `<w:trackRevisions/>` (ECMA-376 §17.15.1.89) as the
+    /// document was READ: a document Word saved with Track Changes on
+    /// opens with the engine's review mode on. The live mode is the
+    /// engine's own flag (toggling it is no document edit and never an
+    /// undo step); a save stamps it here, and the writer patches
+    /// `settings.xml` only where the value differs from the source part.
+    /// Absent from snapshots while off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub track_revisions: bool,
+    /// Issue #354 — `<w:mirrorMargins/>` (§17.15.1.57): every section's
+    /// left / right margins are its INSIDE / OUTSIDE margins, so an
+    /// even-numbered page lays out with them swapped
+    /// (`layout::page_margins`). Read-only ingest (no command sets it
+    /// yet); absent from snapshots while off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mirror_margins: bool,
 }
 
 impl DocumentSettings {
@@ -1177,6 +1195,8 @@ impl Default for DocumentSettings {
             consecutive_hyphen_limit: None,
             do_not_hyphenate_caps: false,
             protection: None,
+            track_revisions: false,
+            mirror_margins: false,
         }
     }
 }

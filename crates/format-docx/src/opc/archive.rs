@@ -815,6 +815,10 @@ fn read_docx_scoped(
         .and_then(|(_, b)| crate::parts::settings::parse_settings_xml(b).ok());
     if let Some(settings) = &settings_part {
         document.settings.even_and_odd_headers = settings.even_and_odd_headers;
+        /* Issue #354 — the review toggle (seeds the engine's review mode;
+        a save writes the live mode back) and mirrored margins (layout). */
+        document.settings.track_revisions = settings.track_revisions;
+        document.settings.mirror_margins = settings.mirror_margins;
         /* Issue #326 — hyphenation (read-only: the part passes through). */
         document.settings.auto_hyphenation = settings.auto_hyphenation;
         document.settings.hyphenation_zone = settings.hyphenation_zone;
